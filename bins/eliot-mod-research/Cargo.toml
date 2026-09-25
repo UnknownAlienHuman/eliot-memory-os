@@ -1,9 +1,9 @@
 [package]
 name = "eliot-mod-research"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Kernel-gated ELIOT Researcher provider process; standalone binary fails closed until admitted"
 
 [lib]
@@ -15,9 +15,15 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-process.workspace = true
+eliot-process-executor.workspace = true
 eliot-research-exchange.workspace = true
 eliot-research-exchange-api.workspace = true
 eliot-researcher.workspace = true
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
-thiserror = "2.0.18"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

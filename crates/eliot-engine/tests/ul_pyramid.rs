@@ -3,8 +3,9 @@ use eliot_engine::{
     capsule_freshness, render_capsule,
 };
 use eliot_types::{
-    CapsuleFreshness, CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueKind, CueMatchMode,
-    CueStrength, HotspotScore, ManifestPackage, MiningRun, ProjectId, ul_token_estimate,
+    CapsuleFreshness, CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueMatchMode,
+    CueStrength, HotspotScore, LegacyCueKindV1, ManifestPackage, MiningRun, ProjectId,
+    ul_token_estimate,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -222,7 +223,7 @@ fn concept(project_id: ProjectId, name: &str, boundary: &str, source_ref: &str) 
         ],
         parent_concept_id: None,
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::Subsystem,
+            cue_kind: LegacyCueKindV1::Subsystem,
             cue_value: name.to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

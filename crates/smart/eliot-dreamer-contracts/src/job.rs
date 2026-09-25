@@ -626,8 +626,8 @@ mod tests {
             wire.strip_suffix('}').expect("object json"),
             "}"
         );
-        let err =
-            serde_json::from_str::<DreamJobAdmission>(&with_extra).expect_err("extra key must fail");
+        let err = serde_json::from_str::<DreamJobAdmission>(&with_extra)
+            .expect_err("extra key must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown field"),

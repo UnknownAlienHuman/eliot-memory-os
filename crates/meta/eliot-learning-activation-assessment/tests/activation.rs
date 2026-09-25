@@ -4,11 +4,12 @@ use eliot_contracts::{
 };
 use eliot_learning_activation_assessment::*;
 use eliot_learning_contracts::{
-    AgentAttemptId, CampaignId, CampaignLearningStateView, ChangeOperation, ChangeSurface,
-    Completeness, InverseChange, LearningStateViewRecipe, MemberId, MemberProjection,
-    OmissionPolicy, OverlayChange, OverlayId, OverlayOrigin, OwnerId, ProofCeiling,
-    SlotDisposition, SlotId, SlotProjection, SlotRequirement, SlotSpec, TargetId, ValueState,
-    WorkScopeId,
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, AgentAttemptId,
+    CampaignId, CampaignLearningStateView, ChangeOperation, ChangeSurface, Completeness,
+    DeliverySection, DeliveryStatus, InverseChange, LearningStateViewRecipe, MemberId,
+    MemberProjection, OmissionPolicy, OverlayChange, OverlayId, OverlayOrigin, OwnerId,
+    ProofCeiling, RetrievalSection, RetrievalStatus, SlotDisposition, SlotId, SlotProjection,
+    SlotRequirement, SlotSpec, TargetId, ValueState, WorkScopeId,
 };
 
 fn aid(value: &str) -> Result<ArtifactId, Box<dyn std::error::Error>> {
@@ -168,6 +169,10 @@ fn fixture() -> Result<
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding: binding.clone(),
         overlay_id: OverlayId::from_artifact(aid("overlay-620")?),
+        campaign_id: view.campaign_id.clone(),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
         base_view_digest: view.canonical_digest.clone(),
         parent_revision: TaskRevision::genesis(),
         admitted_delta_ids: vec![delta.delta_id.clone()],
@@ -195,6 +200,14 @@ fn fixture() -> Result<
         protected_surface_base_digest: digest("protected"),
         protected_surface_proposed_digest: digest("protected"),
         fixed_before_observation_discriminator: aid("overlay-fixed")?,
+        intended_mechanism: "activation-mechanism".to_owned(),
+        prediction: "activation-prediction".to_owned(),
+        expected_observable: "activation-observable".to_owned(),
+        possible_regressions: "activation-regressions".to_owned(),
+        confounders: "activation-confounders".to_owned(),
+        preserved_success_constraint: "activation-preserved".to_owned(),
+        next_discriminator_text: "activation-next".to_owned(),
+        rollback_condition: "activation-rollback".to_owned(),
         expires_at_ms: 2_000,
         invalidated: false,
         canonical_digest: String::new(),
@@ -249,6 +262,7 @@ fn input<'a>(
     activation_request: Option<&'a ArtifactId>,
     assessment_receipt: Option<&'a ArtifactId>,
     stages: &'a [StageObservation],
+    extra: &'a ExtraEvidence,
 ) -> AssessmentInput<'a> {
     AssessmentInput {
         binding,
@@ -269,7 +283,89 @@ fn input<'a>(
         dimensions: &[],
         external_review_refs: &[],
         policy,
+        compiled_view_ref: &extra.compiled_view_ref,
+        context_compiler_revision: &extra.context_compiler_revision,
+        render_profile_revision: &extra.render_profile_revision,
+        stable_harness_refs: &extra.stable_harness_refs,
+        task_family_harness_refs: &extra.task_family_harness_refs,
+        skill_refs: &extra.skill_refs,
+        memory_refs: &extra.memory_refs,
+        procedure_refs: &extra.procedure_refs,
+        preserved_success_ref: extra.preserved_success_ref.as_ref(),
+        eligibility_and_retrieval_reason: extra.eligibility_and_retrieval_reason.as_deref(),
+        retrieval: &extra.retrieval,
+        delivery: &extra.delivery,
+        activation: &extra.activation,
+        adherence: &extra.adherence,
+        conflicts_suppression_or_compaction_loss: &extra.conflicts_suppression_or_compaction_loss,
+        downstream_refs: &extra.downstream_refs,
+        receipt_completeness_and_missing_fields: &extra.receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness: &extra.invalidation_expiry_and_missingness,
     }
+}
+
+/// Owned harness-activation evidence backing one `AssessmentInput`.
+struct ExtraEvidence {
+    compiled_view_ref: ArtifactId,
+    context_compiler_revision: String,
+    render_profile_revision: String,
+    stable_harness_refs: Vec<ArtifactId>,
+    task_family_harness_refs: Vec<ArtifactId>,
+    skill_refs: Vec<ArtifactId>,
+    memory_refs: Vec<ArtifactId>,
+    procedure_refs: Vec<ArtifactId>,
+    preserved_success_ref: Option<ArtifactId>,
+    eligibility_and_retrieval_reason: Option<String>,
+    retrieval: RetrievalSection,
+    delivery: DeliverySection,
+    activation: ActivationSection,
+    adherence: AdherenceSection,
+    conflicts_suppression_or_compaction_loss: Vec<ArtifactId>,
+    downstream_refs: Vec<ArtifactId>,
+    receipt_completeness_and_missing_fields: Vec<String>,
+    invalidation_expiry_and_missingness: Vec<String>,
+}
+
+#[allow(clippy::expect_used)]
+fn extra_evidence(suffix: &str) -> Result<ExtraEvidence, Box<dyn std::error::Error>> {
+    Ok(ExtraEvidence {
+        compiled_view_ref: aid(&format!("compiled-view-{suffix}"))?,
+        context_compiler_revision: format!("compiler-rev-{suffix}"),
+        render_profile_revision: format!("render-rev-{suffix}"),
+        stable_harness_refs: vec![],
+        task_family_harness_refs: vec![],
+        skill_refs: vec![],
+        memory_refs: vec![],
+        procedure_refs: vec![],
+        preserved_success_ref: None,
+        eligibility_and_retrieval_reason: None,
+        retrieval: RetrievalSection {
+            status: RetrievalStatus::Unknown,
+            expansion_or_tool_query_refs: vec![],
+        },
+        delivery: DeliverySection {
+            status: DeliveryStatus::Missing,
+            packet_position: None,
+            serialized_digest: None,
+            bytes: None,
+            actual_tokens: None,
+        },
+        activation: ActivationSection {
+            status: ActivationStatus::Unknown,
+            acknowledgement_ref: None,
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: AdherenceSection {
+            status: AdherenceStatus::Unknown,
+            early_mid_final_checkpoint_refs: vec![],
+            prescribed_or_avoided_action_and_required_verifier_refs: vec![],
+        },
+        conflicts_suppression_or_compaction_loss: vec![],
+        downstream_refs: vec![],
+        receipt_completeness_and_missing_fields: vec![],
+        invalidation_expiry_and_missingness: vec![],
+    })
 }
 
 fn observed_stage(
@@ -312,6 +408,7 @@ fn constructs_candidate_and_retains_unknowns() -> Result<(), Box<dyn std::error:
         },
     }];
     let p = policy();
+    let extra = extra_evidence("620")?;
     let result = assess_learning_activation(&input(
         &view,
         &delta,
@@ -325,6 +422,7 @@ fn constructs_candidate_and_retains_unknowns() -> Result<(), Box<dyn std::error:
         Some(&activation_request),
         Some(&assessment_receipt),
         &stages,
+        &extra,
     ))?;
     let AssessmentResultOrIncomplete::Candidate(result) = result else {
         return Err("unexpected incomplete result".into());
@@ -375,6 +473,7 @@ fn missing_receipts_are_explicit_incomplete_without_fabrication()
     let p = policy();
     let stages: [StageObservation; 0] = [];
     let activation_id = aid("activation-missing")?;
+    let extra = extra_evidence("missing")?;
     let result = assess_learning_activation(&AssessmentInput {
         binding: &binding,
         target: &target,
@@ -394,6 +493,24 @@ fn missing_receipts_are_explicit_incomplete_without_fabrication()
         dimensions: &[],
         external_review_refs: &[],
         policy: &p,
+        compiled_view_ref: &extra.compiled_view_ref,
+        context_compiler_revision: &extra.context_compiler_revision,
+        render_profile_revision: &extra.render_profile_revision,
+        stable_harness_refs: &extra.stable_harness_refs,
+        task_family_harness_refs: &extra.task_family_harness_refs,
+        skill_refs: &extra.skill_refs,
+        memory_refs: &extra.memory_refs,
+        procedure_refs: &extra.procedure_refs,
+        preserved_success_ref: extra.preserved_success_ref.as_ref(),
+        eligibility_and_retrieval_reason: extra.eligibility_and_retrieval_reason.as_deref(),
+        retrieval: &extra.retrieval,
+        delivery: &extra.delivery,
+        activation: &extra.activation,
+        adherence: &extra.adherence,
+        conflicts_suppression_or_compaction_loss: &extra.conflicts_suppression_or_compaction_loss,
+        downstream_refs: &extra.downstream_refs,
+        receipt_completeness_and_missing_fields: &extra.receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness: &extra.invalidation_expiry_and_missingness,
     })?;
     let AssessmentResultOrIncomplete::Incomplete(incomplete) = result else {
         return Err("missing receipts unexpectedly constructed a candidate".into());
@@ -439,6 +556,7 @@ fn skipped_positive_stage_is_rejected_by_canonical_predecessor_rule()
         },
     }];
     let p = policy();
+    let extra = extra_evidence("invalid")?;
     let Err(error) = assess_learning_activation(&AssessmentInput {
         binding: &binding,
         target: &target,
@@ -458,6 +576,24 @@ fn skipped_positive_stage_is_rejected_by_canonical_predecessor_rule()
         dimensions: &[],
         external_review_refs: &[],
         policy: &p,
+        compiled_view_ref: &extra.compiled_view_ref,
+        context_compiler_revision: &extra.context_compiler_revision,
+        render_profile_revision: &extra.render_profile_revision,
+        stable_harness_refs: &extra.stable_harness_refs,
+        task_family_harness_refs: &extra.task_family_harness_refs,
+        skill_refs: &extra.skill_refs,
+        memory_refs: &extra.memory_refs,
+        procedure_refs: &extra.procedure_refs,
+        preserved_success_ref: extra.preserved_success_ref.as_ref(),
+        eligibility_and_retrieval_reason: extra.eligibility_and_retrieval_reason.as_deref(),
+        retrieval: &extra.retrieval,
+        delivery: &extra.delivery,
+        activation: &extra.activation,
+        adherence: &extra.adherence,
+        conflicts_suppression_or_compaction_loss: &extra.conflicts_suppression_or_compaction_loss,
+        downstream_refs: &extra.downstream_refs,
+        receipt_completeness_and_missing_fields: &extra.receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness: &extra.invalidation_expiry_and_missingness,
     }) else {
         return Err("skipped positive stage unexpectedly succeeded".into());
     };
@@ -543,6 +679,7 @@ fn acknowledged_chain_retains_harm_and_attrition_evidence() -> Result<(), Box<dy
     }];
     let attrition = [aid("attrition-evidence")?];
     let p = policy();
+    let extra = extra_evidence("chain")?;
     let result = assess_learning_activation(&AssessmentInput {
         binding: &binding,
         target: &target,
@@ -562,6 +699,24 @@ fn acknowledged_chain_retains_harm_and_attrition_evidence() -> Result<(), Box<dy
         dimensions: &dimensions,
         external_review_refs: &[],
         policy: &p,
+        compiled_view_ref: &extra.compiled_view_ref,
+        context_compiler_revision: &extra.context_compiler_revision,
+        render_profile_revision: &extra.render_profile_revision,
+        stable_harness_refs: &extra.stable_harness_refs,
+        task_family_harness_refs: &extra.task_family_harness_refs,
+        skill_refs: &extra.skill_refs,
+        memory_refs: &extra.memory_refs,
+        procedure_refs: &extra.procedure_refs,
+        preserved_success_ref: extra.preserved_success_ref.as_ref(),
+        eligibility_and_retrieval_reason: extra.eligibility_and_retrieval_reason.as_deref(),
+        retrieval: &extra.retrieval,
+        delivery: &extra.delivery,
+        activation: &extra.activation,
+        adherence: &extra.adherence,
+        conflicts_suppression_or_compaction_loss: &extra.conflicts_suppression_or_compaction_loss,
+        downstream_refs: &extra.downstream_refs,
+        receipt_completeness_and_missing_fields: &extra.receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness: &extra.invalidation_expiry_and_missingness,
     })?;
     let AssessmentResultOrIncomplete::Candidate(result) = result else {
         return Err("complete evidence unexpectedly returned incomplete".into());
@@ -595,6 +750,7 @@ fn duplicate_required_stage_policy_is_rejected_before_owner_validation()
     let assessment_receipt = aid("assessment-receipt-duplicate-policy")?;
     let mut p = policy();
     p.required_stages.push(LifecycleStage::Delivered);
+    let extra = extra_evidence("duplicate-policy")?;
     let Err(error) = assess_learning_activation(&input(
         &view,
         &delta,
@@ -608,6 +764,7 @@ fn duplicate_required_stage_policy_is_rejected_before_owner_validation()
         Some(&activation_request),
         Some(&assessment_receipt),
         &[],
+        &extra,
     )) else {
         return Err("duplicate required stage unexpectedly succeeded".into());
     };
@@ -640,6 +797,7 @@ fn dimension_metric_reference_must_be_supplied() -> Result<(), Box<dyn std::erro
         causal_ceiling: CausalCeiling::Observational,
     }];
     let p = policy();
+    let extra = extra_evidence("metric-reference")?;
     let Err(error) = assess_learning_activation(&AssessmentInput {
         binding: &binding,
         target: &target,
@@ -659,6 +817,24 @@ fn dimension_metric_reference_must_be_supplied() -> Result<(), Box<dyn std::erro
         dimensions: &dimensions,
         external_review_refs: &[],
         policy: &p,
+        compiled_view_ref: &extra.compiled_view_ref,
+        context_compiler_revision: &extra.context_compiler_revision,
+        render_profile_revision: &extra.render_profile_revision,
+        stable_harness_refs: &extra.stable_harness_refs,
+        task_family_harness_refs: &extra.task_family_harness_refs,
+        skill_refs: &extra.skill_refs,
+        memory_refs: &extra.memory_refs,
+        procedure_refs: &extra.procedure_refs,
+        preserved_success_ref: extra.preserved_success_ref.as_ref(),
+        eligibility_and_retrieval_reason: extra.eligibility_and_retrieval_reason.as_deref(),
+        retrieval: &extra.retrieval,
+        delivery: &extra.delivery,
+        activation: &extra.activation,
+        adherence: &extra.adherence,
+        conflicts_suppression_or_compaction_loss: &extra.conflicts_suppression_or_compaction_loss,
+        downstream_refs: &extra.downstream_refs,
+        receipt_completeness_and_missing_fields: &extra.receipt_completeness_and_missing_fields,
+        invalidation_expiry_and_missingness: &extra.invalidation_expiry_and_missingness,
     }) else {
         return Err("missing metric reference unexpectedly succeeded".into());
     };
@@ -668,5 +844,178 @@ fn dimension_metric_reference_must_be_supplied() -> Result<(), Box<dyn std::erro
             field: "dimension.metric_ids"
         }
     ));
+    Ok(())
+}
+
+#[test]
+fn eligible_overlay_without_delivery_stays_not_observed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (view, delta, overlay, binding, target, recipe) = fixture()?;
+    let activation_id = aid("activation-a1")?;
+    let admission = aid("admission-a1")?;
+    let activation_request = aid("activation-request-a1")?;
+    let assessment_receipt = aid("assessment-receipt-a1")?;
+    let stages = [observed_stage(
+        LifecycleStage::CandidateProduced,
+        None,
+        "candidate-a1-receipt",
+        "candidate-a1-evidence",
+    )?];
+    let mut extra = extra_evidence("a1")?;
+    extra.retrieval.status = RetrievalStatus::EligibleNotRetrieved;
+    extra.eligibility_and_retrieval_reason = Some("eligible; not retrieved".to_owned());
+    extra.delivery.status = DeliveryStatus::NotDelivered;
+    extra.activation.status = ActivationStatus::NotObserved;
+    let p = policy();
+    let result = assess_learning_activation(&input(
+        &view,
+        &delta,
+        &overlay,
+        &binding,
+        &target,
+        &recipe,
+        &p,
+        &activation_id,
+        Some(&admission),
+        Some(&activation_request),
+        Some(&assessment_receipt),
+        &stages,
+        &extra,
+    ))?;
+    let AssessmentResultOrIncomplete::Candidate(result) = result else {
+        return Err("eligible overlay unexpectedly returned incomplete".into());
+    };
+    result.validate()?;
+    assert_eq!(
+        result.activation.retrieval.status,
+        RetrievalStatus::EligibleNotRetrieved
+    );
+    assert_eq!(
+        result.activation.delivery.status,
+        DeliveryStatus::NotDelivered
+    );
+    assert_eq!(
+        result.activation.activation.status,
+        ActivationStatus::NotObserved
+    );
+    assert!(
+        result
+            .activation
+            .activation
+            .first_qualifying_observable_use_ref
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn acknowledgement_without_use_stays_not_observed() -> Result<(), Box<dyn std::error::Error>> {
+    let (view, delta, overlay, binding, target, recipe) = fixture()?;
+    let activation_id = aid("activation-a2")?;
+    let admission = aid("admission-a2")?;
+    let activation_request = aid("activation-request-a2")?;
+    let assessment_receipt = aid("assessment-receipt-a2")?;
+    let stages = [observed_stage(
+        LifecycleStage::CandidateProduced,
+        None,
+        "candidate-a2-receipt",
+        "candidate-a2-evidence",
+    )?];
+    let mut extra = extra_evidence("a2")?;
+    let ack = aid("ack-a2")?;
+    extra.activation.status = ActivationStatus::NotObserved;
+    extra.activation.acknowledgement_ref = Some(ack.clone());
+    let p = policy();
+    let result = assess_learning_activation(&input(
+        &view,
+        &delta,
+        &overlay,
+        &binding,
+        &target,
+        &recipe,
+        &p,
+        &activation_id,
+        Some(&admission),
+        Some(&activation_request),
+        Some(&assessment_receipt),
+        &stages,
+        &extra,
+    ))?;
+    let AssessmentResultOrIncomplete::Candidate(result) = result else {
+        return Err("acknowledged attempt unexpectedly returned incomplete".into());
+    };
+    result.validate()?;
+    assert_eq!(result.activation.activation.acknowledgement_ref, Some(ack));
+    assert_eq!(
+        result.activation.activation.status,
+        ActivationStatus::NotObserved
+    );
+    assert!(
+        result
+            .activation
+            .activation
+            .first_qualifying_observable_use_ref
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_violation_retains_checkpoint_and_action_refs() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (view, delta, overlay, binding, target, recipe) = fixture()?;
+    let activation_id = aid("activation-a3")?;
+    let admission = aid("admission-a3")?;
+    let activation_request = aid("activation-request-a3")?;
+    let assessment_receipt = aid("assessment-receipt-a3")?;
+    let stages = [observed_stage(
+        LifecycleStage::CandidateProduced,
+        None,
+        "candidate-a3-receipt",
+        "candidate-a3-evidence",
+    )?];
+    let mut extra = extra_evidence("a3")?;
+    let checkpoints = vec![aid("checkpoint-a3")?];
+    let actions = vec![aid("violated-action-a3")?, aid("verifier-a3")?];
+    extra.adherence.status = AdherenceStatus::ObservedViolated;
+    extra.adherence.early_mid_final_checkpoint_refs = checkpoints.clone();
+    extra
+        .adherence
+        .prescribed_or_avoided_action_and_required_verifier_refs = actions.clone();
+    let p = policy();
+    let result = assess_learning_activation(&input(
+        &view,
+        &delta,
+        &overlay,
+        &binding,
+        &target,
+        &recipe,
+        &p,
+        &activation_id,
+        Some(&admission),
+        Some(&activation_request),
+        Some(&assessment_receipt),
+        &stages,
+        &extra,
+    ))?;
+    let AssessmentResultOrIncomplete::Candidate(result) = result else {
+        return Err("observed violation unexpectedly returned incomplete".into());
+    };
+    result.validate()?;
+    assert_eq!(
+        result.activation.adherence.status,
+        AdherenceStatus::ObservedViolated
+    );
+    assert_eq!(
+        result.activation.adherence.early_mid_final_checkpoint_refs,
+        checkpoints
+    );
+    assert_eq!(
+        result
+            .activation
+            .adherence
+            .prescribed_or_avoided_action_and_required_verifier_refs,
+        actions
+    );
     Ok(())
 }

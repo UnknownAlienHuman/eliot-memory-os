@@ -65,6 +65,7 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
             content_sha256: digest(),
             predecessor: None,
         },
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: "goal".to_owned(),
         },
@@ -152,6 +153,7 @@ fn input() -> AdmissionInput {
             candidates: vec![candidate],
             denominator: recipe.denominator.clone(),
         },
+        learning_tickets: Vec::new(),
         floor: SafetyFloorIdentity {
             floor_id: id("floor"),
             decision: recipe.decision.clone(),

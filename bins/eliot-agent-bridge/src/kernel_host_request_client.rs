@@ -9,12 +9,14 @@
 //! Implementation: I7.1/I7.2 (typed frames over the admitted front-door transport, never raw
 //! frame ingress) and I7.20 (typed outcomes only; no prose drives routing) — envelopes ride
 //! `Request`/`Execute` frames whose payload selects the closed kernel entry
-//! (`agent_host_request_submit`, `agent_host_request_cancel`, or
-//! `agent_host_request_reconcile`) and replies are decoded with the same
+//! (`agent_host_request_submit`, `agent_host_request_cancel`,
+//! `agent_host_request_reconcile`, or `agent_host_request_rehydrate`) and
+//! replies are decoded with the same
 //! connection/digest/fence joins as the activation path.
 //!
-//! Ownership: this module is the sole owner of the invocation/cancellation/reconciliation
-//! envelope builders, the envelope frame builder, the admitted-reply decoder, the replay-cache
+//! Ownership: this module is the sole owner of the invocation/cancellation/reconciliation/
+//! rehydration envelope builders, the envelope frame builder, the admitted-reply decoder
+//! (submit-family and receipt-less rehydrate shapes), the replay-cache
 //! entry shape, and the production `KernelHostRequestPort` impl. Non-ownership: activation,
 //! kernel admission/dispatch, gateway validation/correlation, and any durable ledger.
 
@@ -22,8 +24,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes,
-    sha256_hex,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
@@ -34,7 +36,9 @@ use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, HARD_STRUCTURED_RESPONSE_BYTES,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
     HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody, MessageType,
-    ProtocolPayload, ProtocolVersion, RequestIdentity, host_request_operation_id,
+    ProtocolPayload, ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
+    REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
+    RequestIdentity, host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -61,6 +65,16 @@ const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invok
 const AGENT_HOST_REQUEST_CANCEL_OPERATION: &str = "agent_host_request_cancel";
 /// Closed kernel entry that reconciles one exact operation after an unknown delivery.
 const AGENT_HOST_REQUEST_RECONCILE_OPERATION: &str = "agent_host_request_reconcile";
+/// Closed kernel entry that rehydrates one exact previously admitted operation
+/// from the durable record without resubmission.
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs`
+/// (`AGENT_HOST_REQUEST_REHYDRATE_OPERATION`); the literal is repeated here
+/// because the constant is `pub(crate)` to that binary and this crate takes
+/// no new dependencies. The frame carries the exact (envelope,
+/// admission-receipt) pair the kernel admitted; the typed answer is the
+/// durable record only, with no new receipt and no state advance.
+const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydrate";
 /// Canonical prefix of the kernel-derived opaque operation handle.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
 /// Exact payload-schema identity for the canonical `ToolRequest` bytes.
@@ -74,7 +88,11 @@ const DEFAULT_DEADLINE_PREFERENCE_MS: u64 = 60_000;
 /// Holds no transport of its own: every call borrows the shared owner, so the
 /// admitted transport, runtime, receipt facts, and activation session stay
 /// singular while the activation face serves the one-shot exchange beside it.
-pub(super) struct KernelHostRequestClient {
+///
+/// `pub` for the binary composition root only: the bridge binary threads this
+/// concrete client into its reconnect path to prove the live Kernel binding
+/// before mutating local attach state. Construction stays inside this crate.
+pub struct KernelHostRequestClient {
     pub(super) shared: SharedTransport,
 }
 
@@ -126,20 +144,24 @@ impl ParentLink {
 /// closed into the unknown-outcome path. `result_digest`/`result_response`
 /// ride the record for `RESULT_RECEIVED` (and a `TERMINAL` carrying a result
 /// forward); any other state carrying them fails decoding the same way.
+///
+/// `pub(crate)` so the composition caller driving `rehydrate_operation` can
+/// read the exact durable state the Kernel owner returned; the bridge still
+/// interprets nothing beyond this join.
 #[derive(Clone, Debug, Deserialize)]
-struct AdmittedReplyView {
-    operation_id: String,
-    state: HostRequestRecordState,
+pub(crate) struct AdmittedReplyView {
+    pub(crate) operation_id: String,
+    pub(crate) state: HostRequestRecordState,
     #[serde(default)]
-    result_digest: Option<String>,
+    pub(crate) result_digest: Option<String>,
     #[serde(default)]
-    result_response: Option<serde_json::Value>,
+    pub(crate) result_response: Option<serde_json::Value>,
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum HostRequestRecordState {
+pub(crate) enum HostRequestRecordState {
     Requested,
     Admitted,
     Routed,
@@ -305,6 +327,11 @@ impl KernelHostRequestClient {
             if cached.payload_digest == payload_digest {
                 return Ok(cached.envelope.clone());
             }
+            // Changed payload under a known correlation: the durable Kernel
+            // owner (ORS) is the cross-restart source of truth for which bytes
+            // won, so the bridge sends nothing and reports the typed conflict.
+            // Resolve via `rehydrate_operation` against the Kernel-owned
+            // durable record; never resubmit under a new identity here.
             return Err(PortFailure::IdempotencyConflict);
         }
         let envelope =
@@ -360,6 +387,29 @@ fn build_invocation_envelope(
         task_id: None,
         work_scope_id: None,
         payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
+        payload_sha256: payload_digest.to_owned(),
+    };
+    finish_envelope(facts, HostRequestKind::Invocation, identity)
+}
+
+fn build_restore_envelope(
+    correlation: &str,
+    facts: &TransportFacts,
+    session_id: &str,
+    payload_digest: &str,
+    deadline: u64,
+) -> Result<HostRequestEnvelope, PortFailure> {
+    let identity = HostRequestIdentity {
+        request_id: RequestId::new(correlation).map_err(|_| request_failure())?,
+        idempotency_key: format!("{correlation}:restore"),
+        cancellation_id: format!("{correlation}:restore:cancel"),
+        parent_operation_id: None,
+        deadline_unix_ms: deadline,
+        capability: REACTIVE_RESTORE_CAPABILITY.to_owned(),
+        session_id: Some(session_id.to_owned()),
+        task_id: None,
+        work_scope_id: None,
+        payload_schema_id: REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID.to_owned(),
         payload_sha256: payload_digest.to_owned(),
     };
     finish_envelope(facts, HostRequestKind::Invocation, identity)
@@ -540,18 +590,117 @@ fn host_request_frame_for_envelope(
     Ok(frame)
 }
 
-/// Returns whether one invocation is a local read served with its canonical
-/// tool bytes (Implements #18: local read result).
+/// Builds the cold/operator submit frame with the exact typed request body.
 ///
-/// `eliot.query` and `eliot.packet` ride the invoke-read entry so the kernel
-/// can check tool linkage before reading and serve the exact bounded result
-/// with its revision; every other tool keeps the admission-only submit entry.
-/// `eliot.packet` parity falls out of the same op because the tool bytes are
-/// opaque here: the kernel, not the pipe, owns their meaning.
+/// The envelope remains the authenticated binding for the connection, session,
+/// fence, capability, idempotency key, and canonical payload digest. The
+/// `tool` member is carried only for the UserAutomation Kernel selector to
+/// decode and re-canonicalize before it constructs the authenticated service
+/// request. Reconciliation deliberately carries only the parent envelope and
+/// digest; it never resubmits this body under a new identity.
+fn host_request_user_automation_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?;
+    let tool = serde_json::to_value(&request.tool).map_err(|_| request_failure())?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["tool"] = tool;
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+/// One finite dispatch row for every canonical tool (Implements #1739 item 1).
+///
+/// This is the single recorded dispatch map [`KernelHostRequestClient::invoke`]
+/// consults: exactly one row per [`ToolRequest`] variant, chosen by an
+/// exhaustive match, so adding a tool variant fails to compile until its row
+/// is recorded here. No ninth hot tool can slip through: non-hot carriers
+/// ([`ToolRequest::UserAutomation`], [`ToolRequest::SkillInject`],
+/// [`ToolRequest::SkillDisplay`]) keep their own explicitly non-hot rows and
+/// are never advertised on the canonical eight-tool surface (I7.6).
+///
+/// | tool | bridge entry | Kernel operation | completion boundary |
+/// |---|---|---|---|
+/// | `eliot.state` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; projection-owner readback join missing |
+/// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
+/// | `eliot.observe` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; observation-owner execution join missing |
+/// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
+/// | `eliot.act` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; action-model/authority gate + effect dispatch missing (#1742) |
+/// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
+/// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
+/// | `eliot.finish` | refused | — | refused until the task-bound Finish route exists (#325); never an optimistic outcome |
+/// | `eliot_user_automation` (non-hot) | submit frame (tool bytes) | `agent_host_request_submit` | operator carrier on its own leg; never a hot tool |
+/// | `skill.inject` / `skill.display` (non-hot) | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | Hotset intake served through the linkage-checked leg; never advertised |
+///
+/// An `Accepted` submit reply is an operation handle, not completed work; only
+/// the row's named owner execution plus a retained result completes it. The
+/// `completion_join` / `missing_route` strings name that exact missing
+/// interface per unresolved row instead of claiming seven tools do not exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalDispatchEntry {
+    /// Linkage-checked invoke-read: the Kernel checks capability and
+    /// payload-digest linkage before reading and serves the exact bounded
+    /// result with its revision.
+    InvokeRead,
+    /// Admission-only submit: the Accepted reply is an operation handle.
+    /// `completion_join` names the exact missing owner execution that must
+    /// complete the row before a completed response is legitimate.
+    SubmitAdmitOnly { completion_join: &'static str },
+    /// Non-hot operator carrier on the submit leg with tool bytes. Only
+    /// [`ToolRequest::UserAutomation`] rides here.
+    SubmitCarryingBytes,
+    /// Refused until the named task-bound route exists. `missing_route` names
+    /// it; the bridge never generates an optimistic outcome instead.
+    RefusedUntilRoute { missing_route: &'static str },
+}
+
+/// Returns the recorded dispatch row for one invocation (Implements #1739
+/// item 1: the finite dispatch map as code).
+///
+/// Exhaustive over [`ToolRequest`]: a new variant is a compile error here
+/// until its decoder, capability, owner, receipt and readback are recorded
+/// above. Behavior is byte-identical to the previous scattered predicates.
+fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
+    match tool {
+        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "projection-owner readback: submit-record execution (Kernel pair + daemon flight + task/scope projection owner)",
+        },
+        ToolRequest::Packet(_)
+        | ToolRequest::Query(_)
+        | ToolRequest::SkillInject(_)
+        | ToolRequest::SkillDisplay(_) => CanonicalDispatchEntry::InvokeRead,
+        ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "observation-owner execution: submit-record pair (enqueue, fenced claim, submit result) + daemon flight + retained observation readback",
+        },
+        ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "action-model/authority gate + effect dispatch (#1742 material-context gate)",
+        },
+        ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
+        },
+        ToolRequest::Coordinate(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+            completion_join: "execution-fabric owner join with the same durable work/attempt identity (#1740)",
+        },
+        ToolRequest::Finish(_) => CanonicalDispatchEntry::RefusedUntilRoute {
+            missing_route: "task-bound Finish owner route: shared draft to the existing Finish service; only its validated result supplies the task outcome (#325)",
+        },
+        ToolRequest::UserAutomation(_) => CanonicalDispatchEntry::SubmitCarryingBytes,
+    }
+}
+
+/// Invoke-read membership for tests: true exactly when the recorded dispatch
+/// map ([`canonical_dispatch_entry`]) routes the request to the linkage-checked
+/// invoke-read entry (Implements #18: local read result).
+#[cfg(test)]
 fn invokes_local_read(request: &HostInvocationRequest) -> bool {
     matches!(
-        request.tool,
-        ToolRequest::Query(_) | ToolRequest::Packet(_)
+        canonical_dispatch_entry(&request.tool),
+        CanonicalDispatchEntry::InvokeRead
     )
 }
 
@@ -574,6 +723,32 @@ fn host_request_invoke_read_frame(
         return Err(request_failure());
     };
     payload["tool"] = tool;
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+/// Builds one rehydrate frame carrying the exact (envelope, admission-receipt)
+/// pair the kernel admitted.
+///
+/// Reuses the neutral frame identity of
+/// [`host_request_frame_for_envelope`]; only the payload gains the `receipt`
+/// bytes the kernel re-validates against the presenting envelope before
+/// serving the durable record. The envelope identity is presented unchanged —
+/// never rebuilt, never rebound — so the reply joins still prove the exact
+/// admitted operation. No new receipt is expected, no state advances, and no
+/// replay-cache entry is written: there is exactly one ledger, kernel-side.
+fn host_request_rehydrate_frame(
+    envelope: &HostRequestEnvelope,
+    receipt: &HostRequestAdmissionReceipt,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_REHYDRATE_OPERATION, envelope, facts)?;
+    let receipt_value = serde_json::to_value(receipt).map_err(|_| request_failure())?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["receipt"] = receipt_value;
     frame.validate().map_err(|_| request_failure())?;
     Ok(frame)
 }
@@ -614,16 +789,67 @@ fn decode_admitted_reply(
         serde_json::from_value(value.get("receipt")?.clone()).ok()?;
     receipt.validate().ok()?;
     receipt.validate_envelope(envelope).ok()?;
-    let record: AdmittedReplyView = serde_json::from_value(value.get("record")?.clone()).ok()?;
-    if record.operation_id != receipt.operation_id {
+    let record = decode_record_view(value, envelope, receipt.operation_id.as_str())?;
+    Some((receipt, record))
+}
+
+/// Strictly decodes one receipt-less rehydrate reply against the exact
+/// presented envelope: response/result shape, connection and request joins,
+/// closed `known`/`accepted` status, and the operation join proved against the
+/// envelope-derived handle (no new receipt is issued on this entry).
+/// Any mismatch is an unknown delivery (`None`), never a guessed outcome.
+fn decode_rehydrated_reply(
+    reply: &Frame,
+    envelope: &HostRequestEnvelope,
+) -> Option<AdmittedReplyView> {
+    reply.validate().ok()?;
+    if reply.kind != FrameKind::Response || reply.message_type != MessageType::Result {
         return None;
     }
-    // A result pair where none belongs (or a half-present pair) fails
-    // decoding into the unknown-outcome path: the bridge never guesses which
-    // half to trust. `RESULT_RECEIVED` must carry both; a `TERMINAL` may
-    // carry both forward; every other state must carry neither.
-    let carries_result =
-        record.result_digest.is_some() || record.result_response.is_some();
+    if reply.connection_id != envelope.connection_id {
+        return None;
+    }
+    if reply.request_id.as_ref() != Some(&envelope.identity.request_id) {
+        return None;
+    }
+    if reply.request_identity.is_some() {
+        return None;
+    }
+    let payload = match &reply.payload {
+        ProtocolPayload::Json(value) => value.clone(),
+        _ => return None,
+    };
+    if payload.get("status")?.as_str()? != "known" {
+        return None;
+    }
+    let value = payload.get("value")?;
+    if value.get("accepted")?.as_bool() != Some(true) {
+        return None;
+    }
+    let expected = host_request_operation_id(envelope);
+    if value.get("operation_id")?.as_str()? != expected {
+        return None;
+    }
+    decode_record_view(value, envelope, &expected)
+}
+
+/// Decodes the durable record under one reply value after the caller proved
+/// the operation join: exact operation identity plus the result-pair coherence
+/// rules shared by the submit-family and rehydrate answers. A result pair
+/// where none belongs (or a half-present pair) fails decoding into the
+/// unknown-outcome path: the bridge never guesses which half to trust.
+/// `RESULT_RECEIVED` must carry both; a `TERMINAL` may carry both forward;
+/// every other state must carry neither.
+fn decode_record_view(
+    value: &serde_json::Value,
+    envelope: &HostRequestEnvelope,
+    expected_operation_id: &str,
+) -> Option<AdmittedReplyView> {
+    let record: AdmittedReplyView = serde_json::from_value(value.get("record")?.clone()).ok()?;
+    if record.operation_id != expected_operation_id {
+        return None;
+    }
+    let carries_result = record.result_digest.is_some() || record.result_response.is_some();
     match (&record.state, carries_result) {
         (HostRequestRecordState::ResultReceived | HostRequestRecordState::Terminal, true)
         | (_, false) => {}
@@ -645,7 +871,43 @@ fn decode_admitted_reply(
         .validate()
         .ok()?;
     }
-    Some((receipt, record))
+    Some(record)
+}
+
+/// Builds the typed rejection for a restore reply whose body does not bind
+/// the admitted request.
+fn invalid_restore(detail: &str) -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: format!("kernel restore body is not the admitted answer: {detail}"),
+    }
+}
+
+/// Decodes one restore reply and checks it against the admitted request.
+///
+/// Mirrors `decode_stored_response` binding semantics (request/digest joins
+/// against the exact sent envelope) without tool bindings: the digest must
+/// bind the canonical reply bytes, and the reply must validate. Session and
+/// fence echo equality against the live binding is the composition's
+/// authority check, not transport's.
+fn decode_restore_reply(record: &AdmittedReplyView) -> Result<ReactiveRestoreReply, PortFailure> {
+    let body = record
+        .result_response
+        .clone()
+        .ok_or_else(|| invalid_restore("a received restore must carry its bounded body"))?;
+    let digest = record
+        .result_digest
+        .clone()
+        .ok_or_else(|| invalid_restore("a received restore must carry its digest"))?;
+    let bytes = canonical_json_bytes(&body).map_err(|_| invalid_restore("uncanonicalizable"))?;
+    if sha256_hex(&bytes) != digest {
+        return Err(invalid_restore("digest does not bind the exact body"));
+    }
+    let reply: ReactiveRestoreReply =
+        serde_json::from_value(body).map_err(|_| invalid_restore("body is not a restore reply"))?;
+    reply
+        .validate()
+        .map_err(|error| invalid_restore(&error.to_string()))?;
+    Ok(reply)
 }
 
 /// Builds the typed rejection for a result-bearing reply whose body does not
@@ -668,15 +930,16 @@ fn decode_stored_response(
     request: &HostInvocationRequest,
     envelope: &HostRequestEnvelope,
 ) -> Result<McpResponse, PortFailure> {
-    let body = record.result_response.clone().ok_or_else(|| {
-        invalid_result("a received result must carry its bounded body")
-    })?;
+    let body = record
+        .result_response
+        .clone()
+        .ok_or_else(|| invalid_result("a received result must carry its bounded body"))?;
     let encoded = serde_json::to_vec(&body).map_err(|_| invalid_result("unserializable body"))?;
     if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
         return Err(invalid_result("body exceeds the bounded ceiling"));
     }
-    let response: McpResponse =
-        serde_json::from_value(body).map_err(|_| invalid_result("body is not a bounded response"))?;
+    let response: McpResponse = serde_json::from_value(body)
+        .map_err(|_| invalid_result("body is not a bounded response"))?;
     if response.request_id != envelope.identity.request_id.as_str() {
         return Err(invalid_result("request identity mismatch"));
     }
@@ -761,9 +1024,6 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         request
             .validate()
             .map_err(|error| plan_gap_bind(&error.to_string()))?;
-        if matches!(request.tool, ToolRequest::Finish(_)) {
-            return Err(unsupported_finish());
-        }
         let now_ms = unix_ms()?;
         let facts = self
             .shared
@@ -792,16 +1052,45 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // record state maps to an owner timeout.
             return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
         }
-        let frame = if invokes_local_read(request) {
-            host_request_invoke_read_frame(request, &envelope, &facts)?
-        } else {
-            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)?
+        let frame = match canonical_dispatch_entry(&request.tool) {
+            CanonicalDispatchEntry::InvokeRead => {
+                host_request_invoke_read_frame(request, &envelope, &facts)?
+            }
+            CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                &envelope,
+                &facts,
+            )?,
+            CanonicalDispatchEntry::SubmitCarryingBytes => {
+                host_request_user_automation_frame(request, &envelope, &facts)?
+            }
+            CanonicalDispatchEntry::RefusedUntilRoute { .. } => {
+                return Err(unsupported_finish());
+            }
         };
         let Ok(reply) = self.exchange(&frame) else {
             return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
         };
         match decode_admitted_reply(&reply, &envelope) {
-            Some((receipt, record)) => submit_outcome(&receipt, &record, request, &envelope),
+            Some((receipt, record)) => {
+                // Unresolved durable states are re-read from the Kernel-owned
+                // record instead of assumed: the admitted pair is presented
+                // unchanged to the rehydrate entry and the refreshed state is
+                // mapped. A failed re-read keeps the admitted record the owner
+                // already returned; its handle stays the typed reconcile path.
+                let record = match record.state {
+                    HostRequestRecordState::PossiblyEffected
+                    | HostRequestRecordState::Unknown
+                    | HostRequestRecordState::Reconciling => {
+                        match self.rehydrate_operation(&envelope, &receipt) {
+                            Ok(refreshed) => refreshed,
+                            Err(_) => record,
+                        }
+                    }
+                    _ => record,
+                };
+                submit_outcome(&receipt, &record, request, &envelope)
+            }
             None => self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
         }
     }
@@ -860,11 +1149,191 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             None => self.probe_confirms_parent(&facts, &session, &parent, &envelope, now_ms),
         }
     }
+
+    fn restore_reactive_state(
+        &mut self,
+        query: &ReactiveRestoreQuery,
+    ) -> Result<ReactiveRestoreReply, PortFailure> {
+        query
+            .validate()
+            .map_err(|error| PortFailure::TransportBindingRejected {
+                reason: format!("restore query invalid: {error}"),
+            })?;
+        let now_ms = unix_ms()?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        // Caller-text confusion checks against Kernel-issued facts: the query
+        // must name the live attach session and fence, never another binding.
+        if query.session_id != session {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "restore session does not match the live attach session".to_owned(),
+            });
+        }
+        if query.state_fence != facts.state_fence {
+            return Err(PortFailure::FenceMismatch);
+        }
+        let payload_digest = query.canonical_digest().map_err(|_| request_failure())?;
+        let correlation = restore_correlation(&session, &facts.state_fence);
+        let deadline = now_ms.saturating_add(DEFAULT_DEADLINE_PREFERENCE_MS);
+        if deadline == 0 {
+            return Err(request_failure());
+        }
+        let envelope =
+            build_restore_envelope(&correlation, &facts, &session, &payload_digest, deadline)?;
+        let mut frame =
+            host_request_frame_for_envelope(REACTIVE_RESTORE_OPERATION, &envelope, &facts)?;
+        let query_value = serde_json::to_value(query).map_err(|_| request_failure())?;
+        let ProtocolPayload::Json(payload) = &mut frame.payload else {
+            return Err(request_failure());
+        };
+        payload["restore"] = query_value;
+        frame.validate().map_err(|_| request_failure())?;
+        let reply = self.exchange(&frame).map_err(|_| request_failure())?;
+        let (_, record) = decode_admitted_reply(&reply, &envelope).ok_or_else(|| {
+            PortFailure::TransportBindingRejected {
+                reason: "restore reply is not the admitted answer".to_owned(),
+            }
+        })?;
+        decode_restore_reply(&record)
+    }
 }
 
 impl KernelHostRequestClient {
+    /// Rehydrates one exact previously admitted operation from the Kernel-owned
+    /// durable record without resubmission.
+    ///
+    /// Called from [`KernelHostRequestPort::invoke`] when the admitted record
+    /// arrives in an unresolved state (`PossiblyEffected`, `Unknown`,
+    /// `Reconciling`): the exact admitted (envelope, admission-receipt) pair
+    /// is presented unchanged and the refreshed durable state is mapped. There
+    /// is no `KernelHostRequestPort` rehydrate method in `eliot-mcp`, so this
+    /// stays an inherent consume method, not a trait port.
+    ///
+    /// Caller claims are validated against live kernel-issued facts first:
+    /// envelope/receipt shape and receipt-envelope binding failures fail
+    /// closed as `TransportBindingRejected`; a session or connection or
+    /// descriptor claim that does not name the live attach binding fails as
+    /// `TransportBindingRejected`; a fence that does not equal the live fence
+    /// fails as `FenceMismatch` — mirroring `restore_reactive_state`. No host
+    /// text is ever trusted for session, fence, connection, or descriptor.
+    ///
+    /// The frame carries the presented pair unchanged over the shared admitted
+    /// transport via `self.exchange`. The admitted reply decodes through
+    /// `decode_rehydrated_reply` (same joins as the submit family, minus the
+    /// receipt the kernel never reissues); any undecodable or failed exchange
+    /// is the typed unknown outcome keyed by the exact envelope digest — never
+    /// a blind resubmit, never a second ledger, never a replay-cache write.
+    pub(crate) fn rehydrate_operation(
+        &mut self,
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+    ) -> Result<AdmittedReplyView, PortFailure> {
+        envelope.validate().map_err(|_| request_failure())?;
+        receipt.validate().map_err(|_| request_failure())?;
+        receipt
+            .validate_envelope(envelope)
+            .map_err(|_| request_failure())?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        if envelope.connection_id != facts.connection_id {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "rehydrate connection does not match the live admitted connection"
+                    .to_owned(),
+            });
+        }
+        if envelope.identity.session_id.as_deref() != Some(session.as_str()) {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "rehydrate session does not match the live attach session".to_owned(),
+            });
+        }
+        if envelope.state_fence != facts.state_fence {
+            return Err(PortFailure::FenceMismatch);
+        }
+        if envelope.descriptor_sha256 != facts.descriptor_sha256 {
+            return Err(PortFailure::TransportBindingRejected {
+                reason: "rehydrate descriptor does not match the live admitted descriptor"
+                    .to_owned(),
+            });
+        }
+        let digest = envelope.envelope_sha256.clone();
+        let frame = host_request_rehydrate_frame(envelope, receipt, &facts)?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|_| unknown_outcome(&digest))?;
+        decode_rehydrated_reply(&reply, envelope).ok_or_else(|| unknown_outcome(&digest))
+    }
+
+    /// Proves the live Kernel binding is still current before a reconnect
+    /// mutates local attach state.
+    ///
+    /// Sends one observation-only reconcile probe parented to a retained
+    /// replay-cache entry over the shared admitted transport: success proves
+    /// the Kernel still admits this bridge under the current descriptor,
+    /// generation, fence, and authority epoch, so the replacement connection
+    /// inherits exactly that binding and nothing inferred. Any exchange or
+    /// admission failure fails closed as
+    /// [`PortFailure::TransportBindingRejected`] without touching the replay
+    /// cache, staging no dispatch and reviving no authority: the caller keeps
+    /// the live local binding and reports stale authority.
+    ///
+    /// When no invocation has been admitted yet the cache holds no parent and
+    /// there is no Kernel-side operation binding that could have gone stale,
+    /// so the check passes vacuously and the attach-time Kernel handshake
+    /// stands until the first exchange. The probe stages one observation-only
+    /// reconciliation record kernel-side (the existing unknown-delivery probe
+    /// semantics); it never resubmits an operation and never writes the
+    /// replay cache: there is exactly one ledger, kernel-side.
+    pub fn check_kernel_binding(&mut self) -> Result<(), PortFailure> {
+        let now_ms = unix_ms()?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        let parent = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .replay_cache
+            .values()
+            .next()
+            .map(|entry| ParentLink::of(&entry.envelope));
+        let Some(parent) = parent else {
+            return Ok(());
+        };
+        let probe = build_reconciliation_envelope(&facts, &session, &parent, now_ms)?;
+        let frame = host_request_frame_for_envelope(
+            AGENT_HOST_REQUEST_RECONCILE_OPERATION,
+            &probe,
+            &facts,
+        )?;
+        let reply = self.exchange(&frame).map_err(|_| PortFailure::TransportBindingRejected {
+            reason: "kernel binding check failed: the admitted transport rejected the probe; re-attach and activate for a new admission".to_owned(),
+        })?;
+        match decode_admitted_reply(&reply, &probe) {
+            Some(_) => Ok(()),
+            None => Err(PortFailure::TransportBindingRejected {
+                reason: "kernel binding check failed: the Kernel no longer admits this binding under the current generation, fence, or epoch; re-attach and activate for a new admission".to_owned(),
+            }),
+        }
+    }
+
     /// Sends one observation-only reconcile probe for an invocation whose
     /// delivery is unknown, settling existence as admission.
+    ///
+    /// This is an exact real-operation probe gating per-operation settlement:
+    /// it observes the one operation named by the parent handle and settles
+    /// only that invocation. It is never a readiness label and introduces no
+    /// readiness state.
     ///
     /// The probe carries the exact parent handle: success proves the kernel
     /// staged the operation, so the invoke settles as `Accepted` with the
@@ -899,6 +1368,11 @@ impl KernelHostRequestClient {
 
     /// Sends one observation-only reconcile probe after an unknown
     /// cancellation delivery, reporting the outcome honestly either way.
+    ///
+    /// This is an exact real-operation probe gating per-operation settlement:
+    /// it observes the one parent named by the handle and settles only that
+    /// cancellation. It is never a readiness label and introduces no
+    /// readiness state.
     ///
     /// Probe success proves the parent exists but not that the cancellation
     /// applied, so both probe paths report the unknown cancellation outcome
@@ -1077,6 +1551,98 @@ mod tests {
         assert!(
             empty.is_err(),
             "empty correlation must not deserialize into a dispatchable request"
+        );
+    }
+
+    #[test]
+    fn user_automation_route_binds_capability_digest_and_reconcile_selector() {
+        let (base, facts, _) = test_envelope();
+        let mut value = serde_json::to_value(&base).expect("base request must serialize");
+        value["correlation_id"] = serde_json::json!("host-user-automation-1");
+        value["tool"] = serde_json::json!({
+            "name": "eliot_user_automation",
+            "arguments": {
+                "operation": {"kind": "list", "include_retired": false},
+                "idempotency_key": "operator-retry-1"
+            }
+        });
+        let request: HostInvocationRequest =
+            serde_json::from_value(value).expect("UserAutomation request must deserialize");
+        request
+            .validate()
+            .expect("UserAutomation request must validate");
+        assert_eq!(request.tool.canonical_name(), "eliot_user_automation");
+
+        let payload_digest = canonical_payload_digest(&request.tool)
+            .expect("UserAutomation payload digest must compute");
+        let envelope = build_invocation_envelope(
+            &request,
+            &facts,
+            "kernel-session-1",
+            &payload_digest,
+            1_000_000,
+        )
+        .expect("UserAutomation envelope must build");
+        assert_eq!(envelope.identity.capability, "eliot_user_automation");
+        assert_eq!(envelope.identity.payload_sha256, payload_digest);
+
+        let submit = host_request_user_automation_frame(&request, &envelope, &facts)
+            .expect("UserAutomation submit frame must build");
+        let submit_payload = match &submit.payload {
+            ProtocolPayload::Json(payload) => payload,
+            _ => panic!("submit frame must carry JSON"),
+        };
+        assert_eq!(
+            submit_payload
+                .get("operation")
+                .and_then(|value| value.as_str()),
+            Some(AGENT_HOST_REQUEST_SUBMIT_OPERATION)
+        );
+        assert_eq!(
+            submit_payload
+                .pointer("/envelope/identity/capability")
+                .and_then(|value| value.as_str()),
+            Some("eliot_user_automation")
+        );
+        assert_eq!(
+            submit_payload
+                .pointer("/envelope/identity/payload_sha256")
+                .and_then(|value| value.as_str()),
+            Some(payload_digest.as_str())
+        );
+        assert_eq!(
+            submit_payload.get("tool"),
+            Some(&serde_json::to_value(&request.tool).expect("tool must serialize"))
+        );
+
+        let parent = ParentLink::of(&envelope);
+        let reconcile =
+            build_reconciliation_envelope(&facts, "kernel-session-1", &parent, 1_000_001)
+                .expect("UserAutomation reconciliation envelope must build");
+        assert_eq!(reconcile.identity.capability, "eliot_user_automation");
+        assert_eq!(
+            reconcile.identity.payload_sha256,
+            envelope.identity.payload_sha256
+        );
+        let reconcile_frame = host_request_frame_for_envelope(
+            AGENT_HOST_REQUEST_RECONCILE_OPERATION,
+            &reconcile,
+            &facts,
+        )
+        .expect("UserAutomation reconciliation frame must build");
+        let reconcile_payload = match &reconcile_frame.payload {
+            ProtocolPayload::Json(payload) => payload,
+            _ => panic!("reconciliation frame must carry JSON"),
+        };
+        assert_eq!(
+            reconcile_payload
+                .get("operation")
+                .and_then(|value| value.as_str()),
+            Some(AGENT_HOST_REQUEST_RECONCILE_OPERATION)
+        );
+        assert_eq!(
+            reconcile.identity.parent_operation_id.as_deref(),
+            Some(parent.handle.as_str())
         );
     }
 
@@ -1322,13 +1888,72 @@ mod tests {
                 _ => panic!("invoke-read frame must carry JSON"),
             };
             assert_eq!(
-                payload.get("operation").and_then(|operation| operation.as_str()),
+                payload
+                    .get("operation")
+                    .and_then(|operation| operation.as_str()),
                 Some(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION)
             );
-            let tool = payload.get("tool").expect("invoke-read frame must carry tool bytes");
+            let tool = payload
+                .get("tool")
+                .expect("invoke-read frame must carry tool bytes");
             assert_eq!(
                 tool.get("name").and_then(|name| name.as_str()),
                 Some(read_request.tool.canonical_name())
+            );
+        }
+    }
+
+    #[test]
+    fn skill_carriers_ride_invoke_read_with_canonical_names() {
+        // Skill carriers are non-hot (no semantic profile, never advertised)
+        // but ride the same linkage-checked invoke-read entry so the daemon
+        // can claim and serve Hotset pairs; the tool name doubles as the
+        // session capability the envelope binds.
+        let (request, facts, envelope) = test_envelope();
+        for (tool_json, canonical) in [
+            (
+                serde_json::json!({"name":"skill.inject","arguments":{
+                    "contract_version": 1
+                }}),
+                "skill.inject",
+            ),
+            (
+                serde_json::json!({"name":"skill.display","arguments":{
+                    "contract_version": 1
+                }}),
+                "skill.display",
+            ),
+        ] {
+            let mut value = serde_json::to_value(&request).expect("request must serialize");
+            value["tool"] = tool_json;
+            let skill_request: HostInvocationRequest =
+                serde_json::from_value(value).expect("skill request must deserialize");
+            skill_request
+                .validate()
+                .expect("skill request must validate");
+            assert_eq!(skill_request.tool.canonical_name(), canonical);
+            assert!(
+                invokes_local_read(&skill_request),
+                "skill carriers ride the invoke-read entry"
+            );
+            let frame = host_request_invoke_read_frame(&skill_request, &envelope, &facts)
+                .expect("invoke-read frame must build");
+            let payload = match &frame.payload {
+                ProtocolPayload::Json(payload) => payload.clone(),
+                _ => panic!("invoke-read frame must carry JSON"),
+            };
+            assert_eq!(
+                payload
+                    .get("operation")
+                    .and_then(|operation| operation.as_str()),
+                Some(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION)
+            );
+            let tool = payload
+                .get("tool")
+                .expect("invoke-read frame must carry tool bytes");
+            assert_eq!(
+                tool.get("name").and_then(|name| name.as_str()),
+                Some(canonical)
             );
         }
     }

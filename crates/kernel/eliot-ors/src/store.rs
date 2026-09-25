@@ -19,9 +19,15 @@ use persistence_codec::{decode, decode_named, encode};
 #[path = "store/persistence_models.rs"]
 mod persistence_models;
 use persistence_models::{
-    DurableInboxRecord, DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind,
-    ScopeReservationHead,
+    DurableGrantClosureRecord, DurableGrantGraphRevision, DurableInboxRecord,
+    DurableOperationalRecord, DurableSupervisionLeaseResult, OperationalKind, ScopeReservationHead,
 };
+
+#[path = "store/restore_journal.rs"]
+mod restore_journal;
+
+#[path = "store/backup_snapshot.rs"]
+mod backup_snapshot;
 
 mod recovery_projection;
 
@@ -35,10 +41,12 @@ use crate::{
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
     CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
-    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
-    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence,
+    CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
+    DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
+    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
+    GrantClosureCommitReceipt, GrantClosureProjection, HostRequestRecord, HostRequestState,
     JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
     OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
@@ -117,9 +125,31 @@ const DOCTOR_BUDGETS: TableDefinition<&str, &str> = TableDefinition::new("ors_do
 /// operation/checkpoint identity; retained until explicit disposition.
 const RECOVERY_PROBLEMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_problems_v1");
+/// Durable grant-closure rows: one committed closure operation identity with
+/// its exact commit bytes, phase, and order (issue #2100). Keyed by the
+/// closure operation identity; rows never transition.
+const GRANT_CLOSURE_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_closure_current_v1");
+/// Durable grant-graph revision watermarks: the greatest graph revision
+/// observed for one lineage root (issue #2100). Keyed by the authority root;
+/// the stored revision only moves forward.
+const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_grant_graph_revision_current_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
+/// Ceiling on table names enumerated at store open. Provenance checks and the
+/// restore-journal family check both read this set, so the scan must be bounded
+/// rather than proportional to a malformed database's table count.
+const MAX_ORS_TABLES_SCANNED: usize = 4096;
+/// Ceiling on a persisted marker value read during open, checked before the
+/// value is copied out of Redb.
+const MAX_ORS_MARKER_BYTES: usize = 256;
+/// Base-`META` marker recording that this store has adopted the v2 restore
+/// journal. It lives outside the journal table family so that deleting those
+/// tables is detectable rather than silently re-created as an empty journal.
+/// Owned by the journal initializer; see `store/restore_journal.rs`.
+pub(super) const RESTORE_JOURNAL_ADOPTION_KEY: &str = "restore_journal_adoption";
 
 fn current_unix_ms() -> Result<i64, OrsError> {
     let millis = SystemTime::now()
@@ -299,6 +329,65 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityGrantProjection>, OrsError>;
+    /// Commits one grant-closure row binding a closure operation identity to
+    /// its target, lineage root, exact graph revision, canonical digest,
+    /// complete affected set, and survivor set (issue #2100).
+    ///
+    /// An exact recommit under one operation identity returns the durable
+    /// receipt unchanged; any changed content under one identity fails with
+    /// [`OrsError::DuplicateConflict`] and never overwrites. The row never
+    /// transitions: activation closures commit `Active`, revocation closures
+    /// commit `Fenced`.
+    fn commit_grant_closure(
+        &self,
+        closure: GrantClosureCommit,
+    ) -> Result<GrantClosureCommitReceipt, OrsError>;
+    /// Reads one committed grant-closure row after validating its key,
+    /// content, phase, and store-issued receipt. The returned value is
+    /// operational evidence only; it grants no capability.
+    fn load_grant_closure(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<GrantClosureProjection>, OrsError>;
+    /// Advances the durable grant-graph revision watermark for one lineage
+    /// root and returns the stored revision (issue #2100).
+    ///
+    /// The stored revision is the maximum of the retained value and the
+    /// presented revision: it only moves forward. A nonzero revision is
+    /// required. Callers compare the returned value with the presented
+    /// revision to detect a stale presentation atomically.
+    fn note_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+        revision: u64,
+    ) -> Result<u64, OrsError>;
+    /// Reads the durable grant-graph revision watermark for one lineage
+    /// root, if any.
+    fn load_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+    ) -> Result<Option<u64>, OrsError>;
+    /// Scans the bounded selected set of committed grant-closure rows for
+    /// one lineage selector in operation order (issues #2100/#686).
+    ///
+    /// `lineage` names a lineage root or one closure target grant.
+    /// Selection happens inside the store before any bound applies:
+    /// unrelated rows never count against `limit` and total table size
+    /// never refuses a requested view. The whole selected set is read
+    /// under ONE durable read snapshot together with the per-root
+    /// revision watermark, so the returned response is self-consistent
+    /// with no cross-page torn views and no paging cursor: rows arrive
+    /// in increasing operation order, up to `limit` rows. A selected set
+    /// larger than `limit` refuses with
+    /// [`OrsError::ProjectionLimitExceeded`] instead of truncating, and
+    /// the refusal happens before receipt/projection work. One selector
+    /// resolving to more than one lineage root refuses with
+    /// [`OrsError::IntegrityProblem`].
+    fn scan_grant_closures_for_lineage(
+        &self,
+        lineage: &OpaqueLabel,
+        limit: u16,
+    ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError>;
     fn activate_capability_introduction(
         &self,
         activation: CapabilityIntroductionActivation,
@@ -307,6 +396,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         fence: CapabilityIntroductionFence,
     ) -> Result<CapabilityIntroductionReceipt, OrsError>;
+    /// Reads one current capability-introduction row after validating its
+    /// opaque record, key, kind, subject, phase, and store-issued receipt
+    /// (issues #1110/#2100).
+    ///
+    /// Only `Active` and `Fenced` rows are returned. Any other phase under
+    /// this kind is an integrity problem: introductions never reactivate, so
+    /// a `Fenced` row is fence evidence, never activatable authority.
+    fn load_capability_introduction(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<CapabilityIntroductionProjection>, OrsError>;
     fn logical_snapshot(&self, request: OrsSnapshotRequest)
     -> Result<OrsSnapshotReceipt, OrsError>;
     fn scan_pending(
@@ -612,6 +712,78 @@ pub struct RedbRecoveryStore {
     #[cfg(feature = "test-support")]
     authority_handoff_failpoint:
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
+}
+
+impl RedbRecoveryStore {
+    /// Exports one coherent backup page under a single read transaction.
+    ///
+    /// Delegates to the ORS-owned `backup_snapshot` projection; binds the
+    /// request fence token so pages from different fences never mix.
+    pub fn export_backup_page(
+        &self,
+        request: &crate::backup_snapshot::OrsBackupRequest,
+        page_index: u32,
+    ) -> Result<crate::backup_snapshot::OrsBackupPage, OrsError> {
+        backup_snapshot::export_page(&self.database, request, page_index)
+    }
+
+    /// Exports a bounded coherent backup snapshot (all pages, one fence).
+    ///
+    /// Distinct from the report-only `logical_snapshot`: binds source
+    /// installation/generation/schema, canonical fence, high-water/order,
+    /// exact row-family denominator and digest chain.
+    pub fn export_backup_snapshot(
+        &self,
+        request: &crate::backup_snapshot::OrsBackupRequest,
+    ) -> Result<crate::backup_snapshot::OrsBackupSnapshot, OrsError> {
+        backup_snapshot::export_snapshot(&self.database, request)
+    }
+
+    /// Triages one backup page as quarantined import outcomes without writing.
+    ///
+    /// Every entry returns imported/rejected/forensic/blocked/unresolved;
+    /// unresolved entries stay quarantined for the existing canonical
+    /// reconciliation owner. Never activates authority, never advances
+    /// canonical ordering, never writes durable state.
+    pub fn import_backup_page_quarantined(
+        &self,
+        import: &crate::backup_snapshot::OrsBackupImportRequest,
+        page: &crate::backup_snapshot::OrsBackupPage,
+    ) -> Result<Vec<(String, crate::backup_snapshot::PerEntryOutcome)>, OrsError> {
+        backup_snapshot::import_page_quarantined(&self.database, &self.evidence, import, page)
+    }
+
+    /// Exact row-family backup disposition for every ORS row family.
+    pub fn backup_row_family_denominator() -> Vec<crate::backup_snapshot::RowFamilyDisposition> {
+        backup_snapshot::row_family_denominator()
+    }
+
+    /// Reconciles quarantined per-entry outcomes into one import receipt.
+    ///
+    /// Pure receipt binding over already-triaged outcomes; emits no store
+    /// writes. A new empty target never means old effects are resolved:
+    /// `unresolved_count` is counted from the outcomes, and
+    /// `known_zero_unresolved` must attest complete current-owner validation
+    /// before zero is trusted.
+    pub fn reconcile_backup_import(
+        import: &crate::backup_snapshot::OrsBackupImportRequest,
+        per_entry: &[(String, crate::backup_snapshot::PerEntryOutcome)],
+        import_at_ms: i64,
+    ) -> Result<crate::backup_snapshot::OrsBackupImportReceipt, OrsError> {
+        backup_snapshot::reconcile_import_receipt(import, per_entry, import_at_ms)
+    }
+
+    /// Replays a lost import response without any duplicate effect.
+    ///
+    /// Idempotent clone of the prior receipt: no store read, no store write,
+    /// no re-triage, so a retried response can never double-apply outcomes.
+    /// Unknown import outcomes stay quarantined for the existing canonical
+    /// reconciliation owner; never blindly retried here.
+    pub fn reconcile_lost_backup_import_response(
+        prior: &crate::backup_snapshot::OrsBackupImportReceipt,
+    ) -> crate::backup_snapshot::OrsBackupImportReceipt {
+        backup_snapshot::reconcile_lost_import_response(prior)
+    }
 }
 
 fn same_store_rebind_binding(
@@ -4610,18 +4782,32 @@ impl RedbRecoveryStore {
 
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
-        let table_names = write
-            .list_tables()
-            .map_err(storage)?
-            .map(|table| table.name().to_owned())
-            .collect::<BTreeSet<_>>();
+        // Bounded: provenance below and the journal family check that follows
+        // both depend on this set, so an unbounded table-name scan would be an
+        // unbounded open-time cost on a malformed database.
+        let mut table_names = BTreeSet::new();
+        for table in write.list_tables().map_err(storage)? {
+            table_names.insert(restore_journal::bound_table_name(table.name())?);
+            if table_names.len() > MAX_ORS_TABLES_SCANNED {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
         let store_is_empty = table_names.is_empty();
         let has_resolution_table = table_names.contains(SUPERVISION_LEASE_STAGE_RESOLUTIONS.name());
         let resolution_schema_marker = if table_names.contains(META.name()) {
             let meta = write.open_table(META).map_err(storage)?;
-            meta.get(SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY)
+            // Bounded before it is copied out: a corrupt marker must not be able
+            // to force an unbounded allocation during open.
+            match meta
+                .get(SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY)
                 .map_err(storage)?
-                .map(|value| value.value().to_owned())
+            {
+                Some(value) if value.value().len() > MAX_ORS_MARKER_BYTES => {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                Some(value) => Some(value.value().to_owned()),
+                None => None,
+            }
         } else {
             None
         };
@@ -4637,73 +4823,95 @@ impl RedbRecoveryStore {
                     .to_owned(),
             });
         };
-        {
-            drop(write.open_table(META).map_err(storage)?);
-            drop(write.open_table(ENVELOPES).map_err(storage)?);
-            drop(write.open_table(RESERVATIONS).map_err(storage)?);
-            drop(write.open_table(RESERVATION_ORDERS).map_err(storage)?);
-            drop(write.open_table(OPERATIONS).map_err(storage)?);
-            drop(write.open_table(SCOPE_HEADS).map_err(storage)?);
-            drop(write.open_table(SCOPE_TERMINALS).map_err(storage)?);
-            drop(write.open_table(OPERATIONAL_CURRENT).map_err(storage)?);
-            drop(write.open_table(OPERATIONAL_HISTORY).map_err(storage)?);
-            drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
-            drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
-            drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
-            drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
-            drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_STAGED)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_CURRENT)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_HISTORY)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_RESULTS)
-                    .map_err(storage)?,
-            );
-            drop(
-                write
-                    .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
-                    .map_err(storage)?,
-            );
-            drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
-            drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
-            drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
-            drop(
-                write
-                    .open_table(ACTIVATION_RESULT_RETENTION)
-                    .map_err(storage)?,
-            );
-            drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
-            drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
-            drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
-            drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
-            drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
-            drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
-            drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
-            drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
-            if initialize_resolution_schema {
-                let mut meta = write.open_table(META).map_err(storage)?;
-                meta.insert(
-                    SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY,
-                    SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1,
-                )
-                .map_err(storage)?;
-            }
-        }
+        Self::initialize_ors_tables(&write, initialize_resolution_schema)?;
+        // The journal initializer owns the family AND the base-META adoption
+        // marker, so every entry point that can materialize the family — this
+        // one plus `ensure_restore_journal_schema` and
+        // `bind_restore_journal_stream` — enforces the same adoption rule. It
+        // also re-checks the table ceiling as a postcondition, so the base
+        // tables added above cannot push this transaction past the bound.
+        restore_journal::initialize_restore_journal_schema(&write)?;
         Self::validate_activation_result_retention_table(&write)?;
         write.commit().map_err(storage)
+    }
+
+    /// Materializes the base ORS table family and, when the store is new or
+    /// already carries the exact v1 stage-resolution provenance, the
+    /// stage-resolution schema marker.
+    fn initialize_ors_tables(
+        write: &redb::WriteTransaction,
+        initialize_resolution_schema: bool,
+    ) -> Result<(), OrsError> {
+        drop(write.open_table(META).map_err(storage)?);
+        drop(write.open_table(ENVELOPES).map_err(storage)?);
+        drop(write.open_table(RESERVATIONS).map_err(storage)?);
+        drop(write.open_table(RESERVATION_ORDERS).map_err(storage)?);
+        drop(write.open_table(OPERATIONS).map_err(storage)?);
+        drop(write.open_table(SCOPE_HEADS).map_err(storage)?);
+        drop(write.open_table(SCOPE_TERMINALS).map_err(storage)?);
+        drop(write.open_table(OPERATIONAL_CURRENT).map_err(storage)?);
+        drop(write.open_table(OPERATIONAL_HISTORY).map_err(storage)?);
+        drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
+        drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
+        drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
+        drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
+        drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_STAGED)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_CURRENT)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_HISTORY)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_RESULTS)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SUPERVISION_LEASE_STAGE_RESOLUTIONS)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
+        drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
+        drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
+        drop(
+            write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
+        drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
+        drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
+        drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
+        drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
+        drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
+        drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
+        drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
+        drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
+        drop(
+            write
+                .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                .map_err(storage)?,
+        );
+        if initialize_resolution_schema {
+            let mut meta = write.open_table(META).map_err(storage)?;
+            meta.insert(
+                SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY,
+                SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1,
+            )
+            .map_err(storage)?;
+        }
+        Ok(())
     }
 
     fn validate_activation_result_retention_table(
@@ -5292,6 +5500,52 @@ impl RedbRecoveryStore {
             record.phase,
             crate::model::sha256_hex(encoded.as_bytes()),
         )
+    }
+
+    /// Issues the store receipt bound to one durable grant-closure row.
+    ///
+    /// The receipt binds the closure operation identity, the target grant
+    /// identity, the monotonic row order, the committed phase, and the digest
+    /// of the exact stored bytes. Recomputing it from the stored row makes an
+    /// exact recommit return the identical receipt.
+    fn closure_receipt_for(
+        record: &DurableGrantClosureRecord,
+    ) -> Result<OperationalMutationReceipt, OrsError> {
+        let encoded = encode(record)?;
+        OperationalMutationReceipt::issue(
+            record.commit.operation_id.clone(),
+            record.commit.target_id.clone(),
+            record.operation_order,
+            record.phase,
+            crate::model::sha256_hex(encoded.as_bytes()),
+        )
+    }
+
+    /// Reads the durable grant-graph revision watermark for one lineage
+    /// root label under an already-open read snapshot.
+    ///
+    /// Sharing the caller's snapshot keeps selected closure rows and
+    /// their revision mutually consistent; opening a second snapshot
+    /// here would admit a torn rows-plus-watermark view.
+    fn grant_graph_revision_in(
+        read: &redb::ReadTransaction,
+        authority_root: &str,
+    ) -> Result<Option<u64>, OrsError> {
+        let key = format!("grant_graph_revision:{authority_root}");
+        let current = read
+            .open_table(GRANT_GRAPH_REVISION_CURRENT)
+            .map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let row: DurableGrantGraphRevision = decode_named(value.value(), "grant_graph_revision")?;
+        if row.root.as_str() != authority_root {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        Ok(Some(row.revision))
     }
 
     fn persist_operational_record(
@@ -6568,15 +6822,247 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )))
     }
 
+    fn commit_grant_closure(
+        &self,
+        closure: GrantClosureCommit,
+    ) -> Result<GrantClosureCommitReceipt, OrsError> {
+        closure.validate()?;
+        let phase = closure.state.phase();
+        let key = format!("grant_closure:{}", closure.operation_id.as_str());
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableGrantClosureRecord>(value.value(), "grant_closure")
+                })
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            if existing.commit.operation_id.as_str() != closure.operation_id.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "current grant-closure key or operation identity mismatch".to_owned(),
+                });
+            }
+            if existing.commit == closure && existing.phase == phase {
+                return Ok(GrantClosureCommitReceipt::from_receipt(
+                    Self::closure_receipt_for(&existing)?,
+                ));
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        let operation_order = Self::next_operational_order(&write)?;
+        let record = DurableGrantClosureRecord {
+            commit: closure,
+            phase,
+            operation_order,
+        };
+        let encoded = encode(&record)?;
+        {
+            let mut current = write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+            current
+                .insert(key.as_str(), encoded.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(GrantClosureCommitReceipt::from_receipt(
+            Self::closure_receipt_for(&record)?,
+        ))
+    }
+
+    fn load_grant_closure(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<GrantClosureProjection>, OrsError> {
+        let key = format!("grant_closure:{}", operation_id.as_str());
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
+        if record.commit.operation_id.as_str() != operation_id.as_str() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_closure",
+                reason: "current grant-closure key or operation identity mismatch".to_owned(),
+            });
+        }
+        let receipt = Self::closure_receipt_for(&record)?;
+        Ok(Some(GrantClosureProjection::from_store(
+            record.commit,
+            record.phase,
+            record.operation_order,
+            GrantClosureCommitReceipt::from_receipt(receipt),
+        )))
+    }
+
+    fn scan_grant_closures_for_lineage(
+        &self,
+        lineage: &OpaqueLabel,
+        limit: u16,
+    ) -> Result<(Vec<GrantClosureProjection>, Option<u64>), OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        // One durable read snapshot covers the whole selected set and
+        // the per-root revision watermark, so the returned response is
+        // self-consistent with no paging cursor and no cross-page torn
+        // views. Selection filters by lineage before any bound applies:
+        // unrelated rows never refuse a requested view. An oversize
+        // selected set refuses before receipt/projection work.
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?;
+        let mut rows: Vec<(u64, DurableGrantClosureRecord)> = Vec::new();
+        let mut resolved_root: Option<String> = None;
+        for row in current.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: DurableGrantClosureRecord = decode_named(value.value(), "grant_closure")?;
+            let expected = format!("grant_closure:{}", record.commit.operation_id.as_str());
+            if key.value() != expected.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "grant_closure",
+                    reason: "grant-closure key drifts from its committed operation identity"
+                        .to_owned(),
+                });
+            }
+            let commit = &record.commit;
+            if commit.authority_root.as_str() != lineage.as_str()
+                && commit.target_id.as_str() != lineage.as_str()
+            {
+                continue;
+            }
+            match resolved_root.as_deref() {
+                Some(known) if known != commit.authority_root.as_str() => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "grant_closure",
+                        reason: "one lineage selector resolves to more than one lineage root"
+                            .to_owned(),
+                    });
+                }
+                Some(_) => {}
+                None => resolved_root = Some(commit.authority_root.as_str().to_owned()),
+            }
+            rows.push((record.operation_order, record));
+            if rows.len() > usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
+        rows.sort_by_key(|(order, _)| *order);
+        // The watermark resolves to the matched lineage root when rows
+        // matched, else to the selector itself; both reads share the
+        // snapshot opened above.
+        let watermark_root: &str = match resolved_root.as_deref() {
+            Some(root) => root,
+            None => lineage.as_str(),
+        };
+        let watermark = Self::grant_graph_revision_in(&read, watermark_root)?;
+        let mut projections = Vec::with_capacity(rows.len());
+        for (_, record) in rows {
+            let receipt = Self::closure_receipt_for(&record)?;
+            projections.push(GrantClosureProjection::from_store(
+                record.commit,
+                record.phase,
+                record.operation_order,
+                GrantClosureCommitReceipt::from_receipt(receipt),
+            ));
+        }
+        Ok((projections, watermark))
+    }
+
+    fn note_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+        revision: u64,
+    ) -> Result<u64, OrsError> {
+        if revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "grant_closure_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        let key = format!("grant_graph_revision:{}", authority_root.as_str());
+        let write = self.database.begin_write().map_err(storage)?;
+        let retained = {
+            let current = write
+                .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                .map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableGrantGraphRevision>(value.value(), "grant_graph_revision")
+                })
+                .transpose()?
+        };
+        if let Some(retained) = retained.as_ref()
+            && retained.root.as_str() != authority_root.as_str()
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "grant_graph_revision",
+                reason: "current revision key or lineage root mismatch".to_owned(),
+            });
+        }
+        let retained_revision = retained.as_ref().map_or(0, |row| row.revision);
+        let stored = retained_revision.max(revision);
+        if retained_revision != stored {
+            let operation_order = Self::next_operational_order(&write)?;
+            let row = DurableGrantGraphRevision {
+                root: authority_root.clone(),
+                revision: stored,
+                operation_order,
+            };
+            let encoded = encode(&row)?;
+            {
+                let mut current = write
+                    .open_table(GRANT_GRAPH_REVISION_CURRENT)
+                    .map_err(storage)?;
+                current
+                    .insert(key.as_str(), encoded.as_str())
+                    .map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+        }
+        Ok(stored)
+    }
+
+    fn load_grant_graph_revision(
+        &self,
+        authority_root: &OpaqueLabel,
+    ) -> Result<Option<u64>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::grant_graph_revision_in(&read, authority_root.as_str())
+    }
+
     fn activate_capability_introduction(
         &self,
         activation: CapabilityIntroductionActivation,
     ) -> Result<CapabilityIntroductionReceipt, OrsError> {
+        let input = activation.0;
+        if let Some(existing) = self.load_capability_introduction(&input.subject_id)? {
+            if existing.record() == &input && existing.phase() == OperationalPhase::Active {
+                return Ok(CapabilityIntroductionReceipt::from_receipt(
+                    existing.receipt().clone(),
+                ));
+            }
+            // Restore never reactivates a fenced introduction (I6.15): an
+            // exact replay of the committed activation is idempotent above,
+            // and any other presentation against an existing row — a changed
+            // payload, a new record over an `Active` row, or any record over
+            // a `Fenced` row — is a typed state-machine refusal, never a
+            // second activation.
+            return Err(OrsError::InvalidTransition);
+        }
+        // Only a missing row may enter `Active`: `Fenced` rows are never
+        // reactivated, so the allowed-prior set stays empty and any raced
+        // duplicate still fails closed through the transition check.
         self.mutate_operational(
             OperationalKind::CapabilityIntroduction,
-            activation.0,
+            input,
             false,
-            &[OperationalPhase::Fenced],
+            &[],
             OperationalPhase::Active,
         )
         .map(CapabilityIntroductionReceipt::from_receipt)
@@ -6594,6 +7080,40 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Fenced,
         )
         .map(CapabilityIntroductionReceipt::from_receipt)
+    }
+
+    fn load_capability_introduction(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<CapabilityIntroductionProjection>, OrsError> {
+        let key = Self::operational_key(OperationalKind::CapabilityIntroduction, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if record.kind != OperationalKind::CapabilityIntroduction
+            || record.input.subject_id != *subject_id
+            || !matches!(
+                record.phase,
+                OperationalPhase::Active | OperationalPhase::Fenced
+            )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "capability_introduction",
+                reason: "current capability-introduction key, kind, subject, or phase mismatch"
+                    .to_owned(),
+            });
+        }
+        record.input.validate()?;
+        let receipt = Self::receipt_for(&record)?;
+        Ok(Some(CapabilityIntroductionProjection::from_store(
+            record.input,
+            record.phase,
+            record.operation_order,
+            receipt,
+        )))
     }
 
     #[allow(

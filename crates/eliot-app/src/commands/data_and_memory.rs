@@ -32,39 +32,24 @@ pub async fn run_db_status(config_path: &Path) -> Result<()> {
     }))
 }
 
-pub async fn run_db_smoke(config_path: &Path) -> Result<()> {
-    let config = load_config(config_path)?;
-    let report = SurrealStore::new(config.db.surreal).smoke().await?;
-    let report_path = db_report_path(config_path);
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&report_path, report.to_markdown())?;
-    write_json(&serde_json::json!({
-        "component": "surrealdb",
-        "status": if report.is_ready() { "ready" } else { "not_ready" },
-        "report_path": report_path,
-        "report": report
-    }))?;
-
-    if !report.is_ready() {
-        bail!("SurrealDB smoke write/read failed");
-    }
-    Ok(())
-}
-
 pub async fn run_db_migrate(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
-    let _ = CanonicalStore::new(config.db.surreal.clone())
+    // Issue #19: the schema migration runs entirely through the closed named
+    // operation catalogue. This command used to follow the accepted migration
+    // with a generic `RETURN true;` SurrealQL string through
+    // `SurrealStore::apply_migration`, which takes arbitrary SQL straight to the
+    // provider and then returns a hard-coded "applied" record. That left a
+    // production command able to report a migration that no catalogue operation
+    // performed, and it is the raw-query escape the store boundary requires to
+    // be rejected. The reported record is now the accepted catalogue result, and
+    // the status is derived from that result rather than asserted.
+    let migrated = CanonicalStore::new(config.db.surreal)
         .migrate_schema()
         .await?;
-    let record = SurrealStore::new(config.db.surreal)
-        .apply_migration(NamedSurqlOp::SchemaMigrate.name(), "RETURN true;")
-        .await?;
     write_json(&serde_json::json!({
-        "component": record.component,
-        "status": record.status,
-        "detail": record.detail
+        "component": "surrealdb",
+        "status": if migrated.is_null() { "no_result" } else { "applied" },
+        "detail": migrated
     }))
 }
 

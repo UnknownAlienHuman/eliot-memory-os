@@ -3,8 +3,7 @@
 //! This additive v2 contract represents one exact semantic result for one
 //! Kernel-owned activation ticket. It creates no Session, capability, nonce,
 //! effect authority, or hidden retry loop. The older
-//! `AgentActivationResolutionDecision` remains a success-only compatibility
-//! surface until parent issue #66 migrates every consumer.
+//! `AgentActivationResolutionDecision` was removed by parent issue #66 after every consumer migrated to this closed result.
 
 use std::collections::BTreeSet;
 
@@ -266,7 +265,7 @@ pub enum AgentActivationResolutionDisposition {
 }
 
 impl AgentActivationResolutionDisposition {
-    fn validate(&self) -> Result<(), ProtocolError> {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Resolved { binding } => binding.validate(),
             Self::TaskSelectionRequired { selection } => selection.validate_task_selection(),
@@ -504,10 +503,8 @@ pub const AGENT_ACTIVATION_RESULT_ACK_WIRE_VERSION: u16 = 2;
 
 /// Closed v2 submission carrying exactly one semantic result for one ticket.
 ///
-/// The legacy v1 `AgentActivationResolutionDecision` shape is untouched: it
-/// uses a different wire identity, a different payload key on the daemon
-/// operation, and `deny_unknown_fields` in both directions, so a v1 decoder
-/// structurally cannot trial-decode this envelope or the result inside it.
+/// The removed legacy v1 decision shape used a different wire identity, a different payload key on the daemon
+/// operation, and `deny_unknown_fields` in both directions, so retained v1 traffic structurally cannot trial-decode this envelope or the result inside it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationResultSubmit {

@@ -239,6 +239,19 @@ pub struct HostLaunchScope {
     pub forbidden_paths: Vec<String>,
 }
 
+/// Host-side invocation/result summary (`RETAIN_DISTINCT`, issue #371 `R4`).
+///
+/// This is a tainted host summary, NOT a provider-normalized event: it
+/// carries no attempt/execution-unit lineage, no normalization receipt, no
+/// cursor/sequence, and no admission reference, so it can never satisfy
+/// `NormalizedHostEventEnvelope` admission and can never enter policy,
+/// authority, route, candidate-result, Finish, or closure logic. Its
+/// `event_kind` is an opaque free string (any spelling round-trips; there is
+/// no closed vocabulary to dispatch on), raw content stays behind
+/// `*_ref` handles, and production summaries carry
+/// `taint: TaintClass::ExternalAgent`. There is exactly one producer
+/// (`eliot-engine` host-event summary) and no conversion into the closed
+/// normalized event exists; do not add one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostEventEnvelope {
     pub host_id: AgentHostId,
@@ -378,6 +391,14 @@ pub enum AgentResultStatus {
     UnknownOutcome,
 }
 
+/// Host invocation/result transport envelope (issue #370 disposition:
+/// `RETAIN_DISTINCT`). This is a legacy host-invocation result projection only:
+/// `candidate_only` must hold for candidate transport, and neither a
+/// `Succeeded` status, the `candidate_only` flag itself, nor a supplied
+/// `canonical_receipt` (a host write-receipt reference, not Finish proof)
+/// establishes A-01 attempt attribution or task Finish. Any compatibility
+/// conversion off this envelope stays one-way, loss-visible, and fail-closed
+/// without binding; it is never convertible to a Finish decision or receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentResultEnvelope {
     pub result_id: String,
@@ -531,6 +552,57 @@ pub struct HostContextFootprintReport {
     pub supporting_files_loaded: Vec<String>,
     pub unrelated_architecture_docs_loaded: bool,
     pub result: String,
+}
+
+#[cfg(test)]
+mod host_event_envelope_summary_tests {
+    use super::*;
+
+    fn summary(kind: &str) -> HostEventEnvelope {
+        HostEventEnvelope {
+            host_id: AgentHostId::OpenCode,
+            host_session_id: Some("host-session-1".to_owned()),
+            eliot_session_id: None,
+            task_id: None,
+            work_item_id: None,
+            event_kind: kind.to_owned(),
+            event_time: time::OffsetDateTime::UNIX_EPOCH,
+            tool_or_command: None,
+            normalized_input_hash: "input-hash".to_owned(),
+            output_or_error_ref: None,
+            changed_path_refs: Vec::new(),
+            permission_event: None,
+            compaction_or_resume: None,
+            raw_event_ref: Some("restricted-host:event-1".to_owned()),
+            taint: TaintClass::ExternalAgent,
+        }
+    }
+
+    /// `RETAIN_DISTINCT` pin: `event_kind` is an opaque summary string, not a
+    /// closed policy vocabulary — arbitrary spellings (including
+    /// completion-sounding and empty ones) round-trip verbatim and dispatch
+    /// nothing. The summary keeps its taint and raw refs and gains no
+    /// lineage, receipt, cursor, or admission fields (structural: the type
+    /// has none to populate).
+    #[test]
+    fn event_kind_is_opaque_and_summary_stays_tainted() -> Result<(), serde_json::Error> {
+        for kind in [
+            "assistant_delta",
+            "Completed",
+            "permission:exec",
+            "compacted??",
+            "",
+            "turn/completed",
+        ] {
+            let envelope = summary(kind);
+            assert_eq!(envelope.event_kind, kind);
+            assert_eq!(envelope.taint, TaintClass::ExternalAgent);
+            let json = serde_json::to_string(&envelope)?;
+            let decoded: HostEventEnvelope = serde_json::from_str(&json)?;
+            assert_eq!(decoded, envelope);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

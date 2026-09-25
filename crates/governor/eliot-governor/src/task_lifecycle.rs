@@ -50,8 +50,8 @@ use eliot_contracts::{
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, ScopeId, SecurityContext, StoreFailure,
-    StoreEvidenceHandles, StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
+    OrderingScopeId, ScopeId, SecurityContext, StoreEvidenceHandles, StoreFailure,
+    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
 };
@@ -231,8 +231,8 @@ fn map_store_error(
 /// (`SCREAMING_SNAKE_CASE`), never from a local literal, so the persisted
 /// parameter cannot drift from the admitted event.
 fn state_wire(state: TaskState) -> Result<String, TaskLifecycleError> {
-    let value =
-        serde_json::to_value(state).map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let value = serde_json::to_value(state)
+        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     value.as_str().map(str::to_owned).ok_or_else(|| {
         TaskLifecycleError::Serialization("task state wire form is not a string".to_owned())
     })
@@ -265,8 +265,8 @@ fn task_envelope(
     if record.state_fence != *fence {
         return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
     }
-    let scope_id =
-        ScopeId::new(GOVERNOR_SCOPE_ID).map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
+        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let ordering_scope = OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let admission_digest = sha256_hex(
@@ -486,15 +486,15 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
                 match self.kernel.receipt(operation_id.clone()).await {
                     Ok(Some(receipt)) => receipt,
                     Ok(None) => {
-                        let failure = StoreFailure::from_provider_unknown_outcome(&ctx)
-                            .map_err(|error| {
+                        let failure =
+                            StoreFailure::from_provider_unknown_outcome(&ctx).map_err(|error| {
                                 TaskLifecycleError::Serialization(error.to_string())
                             })?;
                         return Err(TaskLifecycleError::Store(failure));
                     }
                     Err(KernelPortError::Unknown(_)) => {
-                        let failure = StoreFailure::from_provider_unknown_outcome(&ctx)
-                            .map_err(|error| {
+                        let failure =
+                            StoreFailure::from_provider_unknown_outcome(&ctx).map_err(|error| {
                                 TaskLifecycleError::Serialization(error.to_string())
                             })?;
                         return Err(TaskLifecycleError::Store(failure));
@@ -530,79 +530,79 @@ fn check_committed_receipt(
     manifest_digest: &OperationManifestDigest,
     ctx: &StoreFailureIdentityContext,
 ) -> Result<(), TaskLifecycleError> {
-        receipt
-            .validate()
-            .map_err(|error| map_store_error(error, ctx))?;
-        if receipt.operation_id != *operation_id
-            || receipt.state_fence != *fence
-            || receipt.idempotency_key != idempotency_key
-        {
-            let failure = store_failure(
-                StoreFailureDisposition::DeterministicRejection,
-                "TASK_RECEIPT_MISMATCH",
-                StoreMutationDisposition::NotAttempted,
-                StoreRetryDirective::DoNotRetry,
-                StoreRecoveryAction::None,
-                ctx,
-            )?;
-            return Err(TaskLifecycleError::Store(failure));
-        }
-        if receipt.transition_class != TransitionClass::TaskControl
-            || receipt.operation_manifest_digest != *manifest_digest
-        {
-            let failure = store_failure(
-                StoreFailureDisposition::DeterministicRejection,
-                "TASK_TRANSITION_MISMATCH",
-                StoreMutationDisposition::NotAttempted,
-                StoreRetryDirective::DoNotRetry,
-                StoreRecoveryAction::None,
-                ctx,
-            )?;
-            return Err(TaskLifecycleError::Store(failure));
-        }
-        if receipt.status != WriteReceiptStatus::Committed {
-            let (reason, disposition, retry, recovery) = match receipt.status {
-                WriteReceiptStatus::Committed => {
-                    let failure = store_failure(
-                        StoreFailureDisposition::InternalDefect,
-                        "TASK_INTERNAL",
-                        StoreMutationDisposition::NotAttempted,
-                        StoreRetryDirective::ManualRecovery,
-                        StoreRecoveryAction::EscalateInternalDefect,
-                        ctx,
-                    )?;
-                    return Err(TaskLifecycleError::Store(failure));
-                }
-                WriteReceiptStatus::Rejected => (
-                    "TASK_NOT_COMMITTED_REJECTED",
-                    StoreFailureDisposition::DeterministicRejection,
-                    StoreRetryDirective::DoNotRetry,
-                    StoreRecoveryAction::None,
-                ),
-                WriteReceiptStatus::Cancelled => (
-                    "TASK_NOT_COMMITTED_CANCELLED",
-                    StoreFailureDisposition::DeterministicRejection,
-                    StoreRetryDirective::DoNotRetry,
-                    StoreRecoveryAction::None,
-                ),
-                WriteReceiptStatus::DeadLetter => (
-                    "TASK_NOT_COMMITTED_DEAD_LETTER",
+    receipt
+        .validate()
+        .map_err(|error| map_store_error(error, ctx))?;
+    if receipt.operation_id != *operation_id
+        || receipt.state_fence != *fence
+        || receipt.idempotency_key != idempotency_key
+    {
+        let failure = store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "TASK_RECEIPT_MISMATCH",
+            StoreMutationDisposition::NotAttempted,
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        )?;
+        return Err(TaskLifecycleError::Store(failure));
+    }
+    if receipt.transition_class != TransitionClass::TaskControl
+        || receipt.operation_manifest_digest != *manifest_digest
+    {
+        let failure = store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "TASK_TRANSITION_MISMATCH",
+            StoreMutationDisposition::NotAttempted,
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        )?;
+        return Err(TaskLifecycleError::Store(failure));
+    }
+    if receipt.status != WriteReceiptStatus::Committed {
+        let (reason, disposition, retry, recovery) = match receipt.status {
+            WriteReceiptStatus::Committed => {
+                let failure = store_failure(
                     StoreFailureDisposition::InternalDefect,
+                    "TASK_INTERNAL",
+                    StoreMutationDisposition::NotAttempted,
                     StoreRetryDirective::ManualRecovery,
                     StoreRecoveryAction::EscalateInternalDefect,
-                ),
-            };
-            let failure = store_failure(
-                disposition,
-                reason,
-                StoreMutationDisposition::NotAttempted,
-                retry,
-                recovery,
-                ctx,
-            )?;
-            return Err(TaskLifecycleError::Store(failure));
-        }
-        Ok(())
+                    ctx,
+                )?;
+                return Err(TaskLifecycleError::Store(failure));
+            }
+            WriteReceiptStatus::Rejected => (
+                "TASK_NOT_COMMITTED_REJECTED",
+                StoreFailureDisposition::DeterministicRejection,
+                StoreRetryDirective::DoNotRetry,
+                StoreRecoveryAction::None,
+            ),
+            WriteReceiptStatus::Cancelled => (
+                "TASK_NOT_COMMITTED_CANCELLED",
+                StoreFailureDisposition::DeterministicRejection,
+                StoreRetryDirective::DoNotRetry,
+                StoreRecoveryAction::None,
+            ),
+            WriteReceiptStatus::DeadLetter => (
+                "TASK_NOT_COMMITTED_DEAD_LETTER",
+                StoreFailureDisposition::InternalDefect,
+                StoreRetryDirective::ManualRecovery,
+                StoreRecoveryAction::EscalateInternalDefect,
+            ),
+        };
+        let failure = store_failure(
+            disposition,
+            reason,
+            StoreMutationDisposition::NotAttempted,
+            retry,
+            recovery,
+            ctx,
+        )?;
+        return Err(TaskLifecycleError::Store(failure));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -613,8 +613,8 @@ mod tests {
     use std::task::{Context, Poll};
 
     use eliot_contracts::{
-        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration,
-        SessionId, SourceId, StateFence, TaskRevision,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SessionId,
+        SourceId, StateFence, TaskRevision,
     };
     use eliot_protocol::RequestIdentity;
     use eliot_receipts::RequestBinding;
@@ -744,6 +744,12 @@ mod tests {
                     projection_refs: Vec::new(),
                     outbox_refs: Vec::new(),
                     operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    // Issue-#18 bindings are copied exactly from the admitted
+                    // transition, never defaulted; equality is enforced by
+                    // the receipt-issuing path below.
+                    admission_digest: transition.admission_digest.clone(),
+                    mutation_plan_digest: transition.mutation_plan_digest.clone(),
+                    semantic_source_revisions: transition.semantic_source_revisions.clone(),
                     error_code: None,
                     resubmission: eliot_store_api::Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),
@@ -910,7 +916,11 @@ mod tests {
         let committed = kernel.last_transition();
         assert_eq!(committed.transition_class, TransitionClass::TaskControl);
         assert_eq!(
-            committed.named_operations.first().expect("one command").operation,
+            committed
+                .named_operations
+                .first()
+                .expect("one command")
+                .operation,
             NamedMutationOperation::UpdateTaskState
         );
         assert_eq!(param(&committed, "task_id").as_deref(), Some("task-1"));
@@ -920,14 +930,8 @@ mod tests {
         );
         assert_eq!(param(&committed, "from"), None);
         assert_eq!(param(&committed, "to").as_deref(), Some("PROPOSED"));
-        assert_eq!(
-            param(&committed, "expected_revision").as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            param(&committed, "actor_ref").as_deref(),
-            Some("actor-1")
-        );
+        assert_eq!(param(&committed, "expected_revision").as_deref(), Some("1"));
+        assert_eq!(param(&committed, "actor_ref").as_deref(), Some("actor-1"));
 
         // The adapter never publishes authority itself: emulate the daemon
         // refresh by replaying the admitted proposal into a fresh owner and
@@ -968,10 +972,7 @@ mod tests {
         let committed = kernel.last_transition();
         assert_eq!(param(&committed, "from").as_deref(), Some("PROPOSED"));
         assert_eq!(param(&committed, "to").as_deref(), Some("OPEN"));
-        assert_eq!(
-            param(&committed, "expected_revision").as_deref(),
-            Some("1")
-        );
+        assert_eq!(param(&committed, "expected_revision").as_deref(), Some("1"));
 
         // A second refresh rebuilds the moved state: recovery shows OPEN at
         // revision 2 with no second execution of either operation.

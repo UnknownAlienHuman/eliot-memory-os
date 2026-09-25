@@ -13,7 +13,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod reactive_context_delivery;
 pub mod runtime_control;
+pub mod user_automation_durable_job;
+pub mod user_automation_execution;
+pub mod user_automation_wake;
 
 mod service;
 
@@ -22,6 +26,34 @@ pub use service::{
     HostManagedChildBinding, HostService, HostServiceError, HostServiceState, KernelStartReceipt,
     ManagedChildLiveness, ManagedChildReconcileOutcome, ServiceStopReceipt,
 };
+
+pub use reactive_context_delivery::{
+    DeliveryDisposition, DrainOutcome, HostDeliveryAdmission, HostDeliveryState,
+    ReactiveContextAcknowledgementReceipt, ReactiveContextCancelOutcome,
+    ReactiveContextCancelRequest, ReactiveContextChannelCloseOutcome, ReactiveContextClock,
+    ReactiveContextCloseChannelRequest, ReactiveContextDelivery, ReactiveContextDeliveryError,
+    ReactiveContextDeliveryLimits, ReactiveContextDeliveryReceipt, ReactiveContextDeliveryRequest,
+    ReactiveContextEndpointResolution, ReactiveContextQueryOutcome, ReactiveContextQueryRequest,
+    ReactiveContextResolveRequest, ReactiveContextResolvedEndpoint, ReactiveContextSendOutcome,
+    ReactiveContextSendRequest, ReactiveContextTransportError, ReactiveContextTransportPort,
+    ReactiveContextTransportReceipt, RestartReconciliation, SystemReactiveContextClock,
+};
+
+pub use eliot_kernel_service::{
+    USER_AUTOMATION_HOST_EXECUTION_PIPE, UserAutomationDurableJobPort,
+    UserAutomationHostChannelBinding, UserAutomationHostExecutionFailure,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding, UserAutomationRuntimeError,
+    UserAutomationWakePort, decode_user_automation_host_execution_open_frame,
+    decode_user_automation_host_execution_request_frame,
+    user_automation_host_execution_open_response_frame,
+    user_automation_host_execution_response_frame,
+};
+pub use user_automation_durable_job::{
+    HostDurableJobAdapter, HostDurableJobOwner, HostDurableJobOwnerError,
+};
+pub use user_automation_execution::UserAutomationHostExecutionEndpoint;
+pub use user_automation_wake::HostWakeIntentAdapter;
 
 use eliot_contracts::{
     ContractIdentity, ContractVersion, contract_identity as make_contract_identity,

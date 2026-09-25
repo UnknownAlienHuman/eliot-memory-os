@@ -499,20 +499,41 @@ fn current_registry_wire_missing_field(value: &serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_array)
         .is_none_or(|approvals| {
             approvals.iter().any(|approval| {
-                approval
-                    .as_object()
-                    .is_none_or(|approval| !approval.contains_key("service_control_grant"))
+                let Some(approval) = approval.as_object() else {
+                    return true;
+                };
+                let Some(grant) = approval
+                    .get("service_control_grant")
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    return true;
+                };
+                [
+                    "principal_service",
+                    "principal_sid",
+                    "access_mask",
+                    "security_descriptor_owner",
+                    "security_descriptor_group",
+                    "security_descriptor_digest",
+                ]
+                .iter()
+                .any(|field| !grant.contains_key(*field))
             })
         });
     let pending_bridge_field_missing = value
         .get("pending_activation")
         .and_then(serde_json::Value::as_object)
         .is_some_and(|pending| !pending.contains_key("phase_b_agent_bridge_stage_prepared"));
+    let pending_intent_digest_missing = value
+        .get("pending_activation")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|pending| !pending.contains_key("activation_intent_digest"));
     let protected_snapshot_field_missing = registry_runtime_objects(value)
         .any(|runtime| !runtime.contains_key("protected_snapshot_digest"));
     top_level_missing
         || approval_binding_missing
         || pending_bridge_field_missing
+        || pending_intent_digest_missing
         || protected_snapshot_field_missing
 }
 
@@ -535,7 +556,7 @@ pub(super) fn decode_registry_bytes(
         .and_then(serde_json::Value::as_u64);
     if declared_major == Some(10) {
         return Err(InstallationError::MigrationRequired {
-            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v14; nested authority is never synthesized or adopted"
+            reason: "approved-generation registry wire v10 contains the legacy Host owner-epoch/Phase-B rebind digest domain and requires explicit re-stage as v16; nested authority is never synthesized or adopted"
                 .to_owned(),
         });
     }

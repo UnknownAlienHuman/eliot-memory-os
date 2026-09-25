@@ -92,6 +92,11 @@ fn capture_transition(tag: &str) -> (RequestMeta, PreparedTransition) {
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "c".repeat(64),
         operation_manifest_digest: manifest_digest,
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!(SUBJECT))]),
@@ -104,6 +109,7 @@ fn capture_transition(tag: &str) -> (RequestMeta, PreparedTransition) {
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     let view = CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("hash computes");

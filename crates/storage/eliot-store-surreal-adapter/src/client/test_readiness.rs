@@ -51,9 +51,7 @@ pub(crate) async fn connect_with_readiness_retry(
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
                 *slot = None;
-                panic!(
-                    "authenticated provider readiness timed out; last error: {last_error:?}"
-                );
+                panic!("authenticated provider readiness timed out; last error: {last_error:?}");
             }
         }
         // The adapter caches its first connection result. Drop the
@@ -64,10 +62,7 @@ pub(crate) async fn connect_with_readiness_retry(
             Instant::now() < deadline,
             "authenticated provider readiness timed out; last error: {last_error:?}"
         );
-        sleep(
-            Duration::from_millis(100)
-                .min(deadline.saturating_duration_since(Instant::now())),
-        )
-        .await;
+        sleep(Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
     }
 }

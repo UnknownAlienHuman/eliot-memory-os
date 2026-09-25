@@ -76,6 +76,13 @@ fn test_receipt(
         outbox_refs: Vec::new(),
         operation_manifest_digest: eliot_store_api::OperationManifestDigest::new("manifest-1690")
             .expect("manifest"),
+        // Standalone-fixture issue-#18 values (not bound to a transition):
+        // this seed only exercises commit-recovery outcomes, never digest
+        // bindings. Shapes stay valid so `validate()` reaches the behavior
+        // under test.
+        admission_digest: "e".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission,
         committed_at: None,
@@ -320,7 +327,10 @@ async fn rollback_disposition_proceeds_without_self_pause() {
         .expect("load")
         .expect("record kept as terminal evidence");
     assert!(!resolved.is_open());
-    assert!(paused_scopes_snapshot(&paused).is_empty(), "scopes released");
+    assert!(
+        paused_scopes_snapshot(&paused).is_empty(),
+        "scopes released"
+    );
     remove_temp(&dir);
 }
 

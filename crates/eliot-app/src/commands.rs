@@ -59,8 +59,8 @@ use eliot_engine::{
     harness_experiment_record, hash_secret, shutdown_deadline_after, test_request,
 };
 use eliot_store::{
-    BlobStore, CanonicalRecord, CanonicalStore, ControlWal, DbClientSet, NamedSurqlOp,
-    SurrealServerSupervisor, SurrealStore,
+    BlobStore, CanonicalRecord, CanonicalStore, ControlWal, DbClientSet, SurrealServerSupervisor,
+    SurrealStore,
 };
 use eliot_types::{
     ActionKind, ActionLease, AdapterCapability, AdapterObservation, AdapterResult,
@@ -95,9 +95,9 @@ use eliot_types::{
     ModuleManifest, OperationStatus, PatchRequest, PatchRequestId, PatchRun, PatchRunStatus,
     ProfileVerificationRun, ProjectId, QualitySignal, ReadConsistencyMode, RecallL0Request,
     ReplayCase, ReplayCaseKind, ReplayRun, ReplaySet, RuntimeHealthReport, RuntimeLogReport,
-    RuntimeMode, SCHEMA_VERSION, SemanticCommand, ServiceHealthState,
-    ServiceInstallAction, ServiceInstallStatus, ServiceReadinessStatus, ServiceRuntimeStatus,
-    SkillCardV2, SkillCurationAction, SkillCurationDecisionKind, SkillCurationGateDecision,
+    RuntimeMode, SCHEMA_VERSION, SemanticCommand, ServiceHealthState, ServiceInstallAction,
+    ServiceInstallStatus, ServiceReadinessStatus, ServiceRuntimeStatus, SkillCardV2,
+    SkillCurationAction, SkillCurationDecisionKind, SkillCurationGateDecision,
     SkillCurationProposal, SkillCurationReceipt, SkillCuratorRun, SkillExecutionOutcome,
     SkillFailureMode, SkillId, SkillInfluenceReport, SkillInputRequirement, SkillInputSource,
     SkillLifecycleState as SkillState, SkillOutputSpec, SkillScopeRule, SkillStep,

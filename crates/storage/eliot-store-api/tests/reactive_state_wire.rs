@@ -10,17 +10,17 @@
 use std::collections::BTreeMap;
 
 use eliot_store_api::{
-    decode_reactive_mutation, decode_resource_content, encode_resource_content,
-    generated_operation_manifests, named_mutation_operation_by_name, named_mutation_operation_name,
-    named_read_operation_by_name, named_read_operation_name, reactive_ledger_mutation_request,
-    reactive_ledger_read_request, resource_snapshot_mutation_request,
-    resource_snapshot_read_request, validate_reactive_mutation_params, validate_resource_uri,
-    EffectClass, NamedMutationOperation, NamedReadOperation, OperationKind, StoreError,
-    TransitionClass, REACTIVE_LEDGER_CONTRACT_V1, REACTIVE_LEDGER_MUTATION_NAME,
-    REACTIVE_LEDGER_READ_NAME, REACTIVE_STATE_SCHEMA_V1, RESOURCE_SNAPSHOT_MUTATION_NAME,
-    RESOURCE_SNAPSHOT_READ_NAME,
+    EffectClass, NamedMutationOperation, NamedReadOperation, OperationKind,
+    REACTIVE_LEDGER_CONTRACT_V1, REACTIVE_LEDGER_MUTATION_NAME, REACTIVE_LEDGER_READ_NAME,
+    REACTIVE_STATE_SCHEMA_V1, RESOURCE_SNAPSHOT_MUTATION_NAME, RESOURCE_SNAPSHOT_READ_NAME,
+    StoreError, TransitionClass, decode_reactive_mutation, decode_resource_content,
+    encode_resource_content, generated_operation_manifests, named_mutation_operation_by_name,
+    named_mutation_operation_name, named_read_operation_by_name, named_read_operation_name,
+    reactive_ledger_mutation_request, reactive_ledger_read_request,
+    resource_snapshot_mutation_request, resource_snapshot_read_request,
+    validate_reactive_mutation_params, validate_resource_uri,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn ledger_json(items: u32) -> String {
     let items: Vec<Value> = (0..items)
@@ -89,7 +89,7 @@ fn wire_identity_is_stable_and_versioned() {
 #[test]
 fn catalogue_activates_all_four_reactive_operations() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 24);
+    assert_eq!(entries.len(), 33);
     for name in [
         REACTIVE_LEDGER_MUTATION_NAME,
         RESOURCE_SNAPSHOT_MUTATION_NAME,
@@ -100,9 +100,11 @@ fn catalogue_activates_all_four_reactive_operations() {
             .expect("mutation row");
         assert_eq!(mutation.operation_kind, OperationKind::Mutation);
         assert_eq!(mutation.maximum_effect, EffectClass::ReversibleMutation);
-        assert!(mutation
-            .transition_classes
-            .contains(&TransitionClass::ReactiveState));
+        assert!(
+            mutation
+                .transition_classes
+                .contains(&TransitionClass::ReactiveState)
+        );
     }
     for name in [REACTIVE_LEDGER_READ_NAME, RESOURCE_SNAPSHOT_READ_NAME] {
         let read = entries

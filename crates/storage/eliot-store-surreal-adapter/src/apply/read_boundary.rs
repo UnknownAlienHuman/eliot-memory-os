@@ -369,6 +369,18 @@ async fn named_read_payload(
         NamedReadOperation::GetResourceSnapshot => {
             resource_snapshot_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetUserAutomationState => {
+            automation_state_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetExperienceBankRange => {
+            experience_bank_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetAgentFeedbackRange => {
+            experience_feedback_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetAuditRange => {
+            audit_range_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -455,9 +467,10 @@ struct ErasureOutcomeRow {
 
 /// Evidence-backed erased `(scope_id, subject)` pairs for `GetEvidencePack`.
 ///
-/// `Known` carries the sealed suppression set. `Unknown` means the lookup is
-/// unavailable or unparsable; the pack returns an exact empty payload so an
-/// undecidable lookup never serves rows that could include erased records.
+/// `Known` carries the sealed suppression set. `Unknown` means the two-table
+/// join is only half-present and therefore cannot prove complete suppression
+/// or complete absence. Transport, query, and decoding failures are returned
+/// as typed errors before this state is constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ErasureSuppression {
     Known(std::collections::BTreeSet<(String, String)>),
@@ -467,9 +480,10 @@ enum ErasureSuppression {
 impl ErasureSuppression {
     /// Returns the fail-closed suppression verdict for one exact pair.
     ///
-    /// `Unknown` suppresses the whole pack: an undecidable lookup must never
-    /// admit a possibly-erased row, and it must not turn a read into a
-    /// provider-availability error.
+    /// `Unknown` suppresses the whole pack. The production named-read path
+    /// rejects that state before calling this predicate, so an undecidable
+    /// lookup can neither admit a possibly-erased row nor masquerade as a
+    /// complete zero-match result.
     fn check(&self, scope_id: &str, subject: &str) -> bool {
         match self {
             Self::Known(erased) => erased.contains(&(scope_id.to_owned(), subject.to_owned())),
@@ -495,8 +509,7 @@ fn suppressed_pairs(
     for outcome in outcomes {
         if outcome.outcomes.iter().any(|cell| {
             cell.split_once(':').is_some_and(|(state, surface)| {
-                state == "PURGED"
-                    && matches!(surface, "CanonicalPayload" | "Projection" | "Index")
+                state == "PURGED" && matches!(surface, "CanonicalPayload" | "Projection" | "Index")
             })
         }) {
             purged_by_operation.insert(outcome.operation_id.clone());
@@ -524,8 +537,7 @@ fn suppressed_pairs(
 /// `atomic_write`, owned there — never re-declared here). Defined here (not
 /// in `schema.rs`) because only the `GetEvidencePack` read boundary consumes
 /// it on this slice.
-const READ_ERASURE_INTENTS: &str =
-    "SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id } FROM erasure_intent;";
+const READ_ERASURE_INTENTS: &str = "SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id } FROM erasure_intent;";
 
 /// Closed erasure-outcome read: one `(operation_id, outcomes)` row per sealed
 /// outcome (see `READ_ERASURE_OUTCOME` in `atomic_write`, owned there).
@@ -541,9 +553,16 @@ enum ErasureTable<T> {
     /// The table was never defined on this pre-erasure store: the exact
     /// absent-table signal, an empty side of the join.
     Absent,
-    /// Any other provider error or malformed envelope: the pack must refuse
-    /// fail-closed.
-    Unknown,
+}
+
+/// Returns true only for the provider's absent-table statement naming this
+/// exact table identifier. Delimiter matching is deliberate: a substring such
+/// as `erasure_intent_extra` must never prove that `erasure_intent` is absent.
+fn is_exact_absent_table_error(error: &str, table: &str) -> bool {
+    client::is_absent_table(error)
+        && error
+            .split(['\'', '"', '`'])
+            .any(|identifier| identifier == table)
 }
 
 /// Reads one sealed erasure table through its closed single-statement SELECT,
@@ -556,12 +575,11 @@ enum ErasureTable<T> {
 /// the cancelled remainder — which the old `all(is_absent_table)` check
 /// (correctly, but fatally) refused to call absent.
 ///
-/// Only the exact absent-table signal naming `table` maps to `Absent`;
-/// every other error class — including those transaction-cancellation
-/// artifacts — maps to `Unknown` so the pack returns an exact empty payload
-/// instead of silently including erased records. Transport and other query
-/// failures likewise map to `Unknown` on this optional suppression lookup;
-/// they must not surface as `StoreError::Unavailable` from the pack read.
+/// Only the exact absent-table signal naming `table` maps to `Absent`.
+/// Transport failures retain their existing typed adapter cause, other
+/// provider query failures are unavailable, and malformed row envelopes are a
+/// serialization failure. None of those failures is converted into an
+/// authoritative empty suppression set.
 async fn read_erasure_table<T: serde::de::DeserializeOwned>(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -569,23 +587,23 @@ async fn read_erasure_table<T: serde::de::DeserializeOwned>(
     sql: &str,
     table: &str,
 ) -> Result<ErasureTable<T>, AdapterError> {
-    let Ok(mut response) = client::query(db, config, operation, sql, Map::new()).await else {
-        return Ok(ErasureTable::Unknown);
-    };
+    let mut response = client::query(db, config, operation, sql, Map::new()).await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
             .iter()
-            .all(|error| client::is_absent_table(error) && error.contains(table))
+            .all(|error| is_exact_absent_table_error(error, table))
         {
             return Ok(ErasureTable::Absent);
         }
-        return Ok(ErasureTable::Unknown);
+        return Err(StoreError::Unavailable.into());
     }
-    match response.take::<Vec<T>>(0) {
-        Ok(rows) => Ok(ErasureTable::Rows(rows)),
-        Err(_) => Ok(ErasureTable::Unknown),
-    }
+    response
+        .take::<Vec<T>>(0)
+        .map(ErasureTable::Rows)
+        .map_err(|_| {
+            AdapterError::Serialization("erasure suppression rows are malformed".to_owned())
+        })
 }
 
 /// Reads the sealed erasure-suppression set for `GetEvidencePack`.
@@ -597,42 +615,44 @@ async fn read_erasure_table<T: serde::de::DeserializeOwned>(
 /// rule. Never-defined erasure tables on a pre-erasure store observe the
 /// exact absent-table signal and read as the empty side of the join,
 /// matching the reference handler's empty suppression on a fresh store.
-/// Any other provider error or malformed envelope returns `Unknown` so the
-/// pack read returns exact empty fail-closed instead of silently including
-/// erased records.
+/// Any other provider error or malformed envelope is returned as a typed
+/// failure. A half-present intent/outcome join is retained as `Unknown`, then
+/// rejected by the named-read boundary; neither case can report authoritative
+/// zero-match coverage while withholding potentially erased bytes.
 async fn read_erasure_suppression(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
 ) -> Result<ErasureSuppression, AdapterError> {
-    let intents = match read_erasure_table::<ErasureIntentRow>(
+    let intents = read_erasure_table::<ErasureIntentRow>(
         db,
         config,
         "read.erasure_suppression_intents",
         READ_ERASURE_INTENTS,
         "erasure_intent",
     )
-    .await?
-    {
-        ErasureTable::Rows(intents) => intents,
-        ErasureTable::Absent => Vec::new(),
-        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
-    };
-    let outcomes = match read_erasure_table::<ErasureOutcomeRow>(
+    .await?;
+    let outcomes = read_erasure_table::<ErasureOutcomeRow>(
         db,
         config,
         "read.erasure_suppression_outcomes",
         READ_ALL_ERASURE_OUTCOMES,
         "erasure_outcome",
     )
-    .await?
-    {
-        ErasureTable::Rows(outcomes) => outcomes,
-        ErasureTable::Absent => Vec::new(),
-        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
-    };
-    Ok(ErasureSuppression::Known(
-        suppressed_pairs(&intents, &outcomes),
-    ))
+    .await?;
+    match (intents, outcomes) {
+        (ErasureTable::Absent, ErasureTable::Absent) => {
+            Ok(ErasureSuppression::Known(std::collections::BTreeSet::new()))
+        }
+        (ErasureTable::Rows(intents), ErasureTable::Rows(outcomes)) => Ok(
+            ErasureSuppression::Known(suppressed_pairs(&intents, &outcomes)),
+        ),
+        // A half-present join cannot prove either complete suppression or
+        // complete absence. Keep it indeterminate; the named-read boundary
+        // converts that state to a typed unavailable result before payload
+        // construction and never serves potentially erased records.
+        (ErasureTable::Absent, ErasureTable::Rows(_))
+        | (ErasureTable::Rows(_), ErasureTable::Absent) => Ok(ErasureSuppression::Unknown),
+    }
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.
@@ -758,10 +778,9 @@ fn validate_evidence_record(
 ///
 /// 688-STORE-2: an evidence-backed erased `(scope_id, subject)` pair
 /// suppresses its records — the pack returns exact empty with
-/// `matched_total = 0` — even if rows remain in the log. `Unknown` lookup
-/// state returns the same exact empty payload fail-closed instead of
-/// surfacing `StoreError::Unavailable` or serving rows that may include
-/// erased records.
+/// `matched_total = 0` — even if rows remain in the log. Indeterminate
+/// suppression coverage is a typed failure, never a complete zero-match
+/// response and never a reason to serve rows that may include erased bytes.
 #[allow(
     clippy::too_many_lines,
     reason = "the pack payload validates shape, bound, suppression, fence, walk, and provenance in one closed unit"
@@ -820,8 +839,11 @@ fn evidence_pack_payload(
     }
     // Evidence-backed suppression (688-STORE-2, memory parity): a sealed
     // erased pair returns exact empty even when capture rows remain.
-    // `Unknown` lookup state takes the same fail-closed empty path, so the
-    // pack never silently includes erased records or emits Unavailable.
+    // Defence in depth for any internally constructed indeterminate state:
+    // it is unavailable, not a proved empty search, and no record is served.
+    if suppression == &ErasureSuppression::Unknown {
+        return Err(StoreError::Unavailable);
+    }
     if suppression.check(scope_id.as_str(), subject) {
         return Ok(json!({
             "version": EVIDENCE_PACK_PAYLOAD_VERSION,
@@ -962,7 +984,8 @@ async fn read_authority_records(
         "BEGIN TRANSACTION; {READ_AUTHORITY_RECORDS} {} COMMIT TRANSACTION;",
         schema::READ_ALL_RECEIPTS,
     );
-    let mut response = client::query(db, config, "read.authority_records", &sql, Map::new()).await?;
+    let mut response =
+        client::query(db, config, "read.authority_records", &sql, Map::new()).await?;
     if !response.take_errors().is_empty() {
         return Err(StoreError::Serialization("authority snapshot query failed".to_owned()).into());
     }
@@ -1030,7 +1053,9 @@ fn record_operation_count(
     // The receipt row carries the transition's total operation count; when
     // absent (pre-authority shape) the record itself cannot be ordered, so
     // fail closed rather than guessing.
-    let count = row.named_operation_count.ok_or(StoreError::InvalidReceipt)?;
+    let count = row
+        .named_operation_count
+        .ok_or(StoreError::InvalidReceipt)?;
     if count == 0 || record.operation_index >= count {
         return Err(StoreError::InvalidReceipt);
     }
@@ -1098,9 +1123,7 @@ struct IndexedAuthority {
 /// length/bytes-vs-parameters) and its receipt is validated (committed
 /// status, envelope, command-count agreement); any mismatch fails closed.
 /// Scope comes from the validated receipt envelope, never from the caller.
-fn indexed_authorities(
-    rows: &[AuthorityReceiptRow],
-) -> Result<Vec<IndexedAuthority>, StoreError> {
+fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthority>, StoreError> {
     let mut ordered: Vec<&AuthorityReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
     let mut indexed = Vec::new();
@@ -1121,7 +1144,10 @@ fn indexed_authorities(
             {
                 return Err(StoreError::InvalidReceipt);
             }
-            Some((receipt.transition_class, binding.scope_id.as_str().to_owned()))
+            Some((
+                receipt.transition_class,
+                binding.scope_id.as_str().to_owned(),
+            ))
         };
         for record in authorities {
             let parameters = validate_authority_record(row, record)?;
@@ -1412,8 +1438,7 @@ fn capability_evidence_payload(
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
-                && record.operation
-                    == eliot_store_api::NamedMutationOperation::ApplyLifecyclePolicy
+                && record.operation == eliot_store_api::NamedMutationOperation::ApplyLifecyclePolicy
                 && record.parameters.get("skill_id").and_then(Value::as_str) == Some(skill_id)
         })
         .collect();
@@ -1714,6 +1739,570 @@ async fn resource_snapshot_payload(
     }))
 }
 
+/// Reads automation rows and projects the same-fence canonical views
+/// (issue #1779).
+///
+/// Row shapes mirror the writer. `list` projects all same-fence current
+/// pointers in automation-id order (retired rows excluded unless
+/// requested); `current` projects one pointer or explicit absence;
+/// `history` projects the bounded revision set; `invocations` projects
+/// the bounded invocation set; `failure` projects the last same-fence
+/// failure row or explicit absence.
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state.
+async fn automation_state_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetUserAutomationState,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_automation_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let limit = usize::from(decoded.max_records.max(1));
+    match decoded.query.as_str() {
+        eliot_store_api::AUTOMATION_QUERY_LIST => {
+            automation_list_payload(db, config, state_fence, &decoded, limit).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_CURRENT => {
+            automation_current_payload(db, config, state_fence, &decoded).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_HISTORY => {
+            automation_history_payload(db, config, state_fence, &decoded).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS => {
+            automation_invocations_payload(db, config, state_fence, &decoded).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_FAILURE => {
+            automation_failure_payload(db, config, state_fence, &decoded).await
+        }
+        _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
+    }
+}
+
+/// Projects the automation list from current pointers.
+async fn automation_list_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+    limit: usize,
+) -> Result<Value, AdapterError> {
+    let rows = super::surreal_automation::read_currents_for_read(db, config, limit).await?;
+    let mut currents = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if !decoded.include_retired
+            && row.configuration_state == eliot_store_api::AUTOMATION_STATE_RETIRED
+        {
+            continue;
+        }
+        if currents.len() >= limit {
+            break;
+        }
+        currents.push(json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "configuration_state": row.configuration_state,
+        }));
+    }
+    let revision = projection_len(currents.len())?;
+    Ok(json!({
+        "currents": currents,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Requires the exact automation selector carried by a decoded query.
+fn require_automation_id(
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<String, AdapterError> {
+    decoded
+        .automation_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.automation_id",
+            reason: "exact automation selector is required",
+        }))
+}
+
+/// Projects one automation current pointer or explicit absence.
+async fn automation_current_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let row = super::surreal_automation::read_current_for_read(db, config, &automation_id).await?;
+    let (current, revision) = match row {
+        Some(row)
+            if row.state_fence == *state_fence
+                && decoded
+                    .requested_revision
+                    .as_deref()
+                    .is_none_or(|revision| revision == row.revision) =>
+        {
+            (
+                json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "configuration_state": row.configuration_state,
+                }),
+                1,
+            )
+        }
+        _ => (Value::Null, 0),
+    };
+    Ok(json!({
+        "current": current,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Projects the bounded revision set for one automation.
+async fn automation_history_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows = if let Some(requested_revision) = decoded.requested_revision.as_deref() {
+        super::surreal_automation::read_revision_for_read(
+            db,
+            config,
+            &automation_id,
+            requested_revision,
+        )
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        super::surreal_automation::read_revisions_for_read(db, config, &automation_id, limit)
+            .await?
+    };
+    let mut revisions = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if revisions.len() >= limit {
+            break;
+        }
+        revisions.push(json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "revision_json": row.revision_json,
+        }));
+    }
+    let revision = projection_len(revisions.len())?;
+    Ok(json!({
+        "revisions": revisions,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Projects the bounded invocation set for one automation.
+async fn automation_invocations_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows = if let Some(occurrence_id) = decoded.requested_occurrence_id.as_deref() {
+        super::surreal_automation::read_invocation_for_read(
+            db,
+            config,
+            &automation_id,
+            occurrence_id,
+        )
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        super::surreal_automation::read_invocations_for_read(db, config, &automation_id, limit)
+            .await?
+    };
+    let mut invocations = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if decoded
+            .requested_occurrence_id
+            .as_deref()
+            .is_some_and(|occurrence_id| row.occurrence_id != occurrence_id)
+        {
+            continue;
+        }
+        if invocations.len() >= limit {
+            break;
+        }
+        invocations.push(json!({
+            "occurrence_id": row.occurrence_id,
+            "automation_id": row.automation_id,
+            "invocation_json": row.invocation_json,
+        }));
+    }
+    let revision = projection_len(invocations.len())?;
+    Ok(json!({
+        "invocations": invocations,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+async fn automation_failure_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let row = super::surreal_automation::read_failure_for_read(db, config, &automation_id).await?;
+    let failure = match row {
+        Some(row) if row.state_fence == *state_fence => json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "occurrence_id": row.occurrence_id,
+            "fingerprint": row.fingerprint,
+            "failure_json": row.failure_json,
+            "history_ref": eliot_store_api::automation_failure_history_ref(
+                &row.automation_id,
+                &row.revision,
+                &row.fingerprint,
+            ),
+            "source_operation_id": row.source_operation_id,
+        }),
+        _ => Value::Null,
+    };
+    let revision = projection_len(usize::from(!failure.is_null()))?;
+    Ok(json!({
+        "failure": failure,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads capture rows and projects the bounded same-fence audit range
+/// (issue #223).
+///
+/// Projects durable `CaptureObservation` evidence subjects as envelope
+/// candidates through the shared `audit_envelope_candidate` filter
+/// (memory-contour parity: fence-gated, scope-agnostic, ordinary
+/// non-envelope captures skipped, never failed). F2 resolution: no
+/// store-level scope filtering, per the `GetMailbox` precedent (facade
+/// caller scope required, catalogue rows scope-free) with scope gating
+/// at the decision layer per I12-26 — filtering here would diverge the
+/// contours and drop scope-free records the consumer must see. Each
+/// candidate row re-validates its bytes/digest provenance before
+/// shaping, so substituted or truncated evidence fails closed instead
+/// of projecting.
+///
+/// Continuation cursors (optional `cursor` selector): an absent cursor
+/// reads from the start and fails closed with `PayloadTooLarge` past
+/// `MAX_AUDIT_RANGE_RECORDS` instead of truncating; a present cursor
+/// verified by `audit_cursor_parse` against this fence and the current
+/// revision heads resumes paging past that candidate ordinal
+/// (commit-sequence, evidence-position order) with the same bound and
+/// no overflow failure. Cross-fence, stale-heads, or malformed cursors
+/// fail closed (callers restart enumeration); cursors stay valid only
+/// while revision heads are unchanged (the consumer re-proves heads per
+/// read and restarts paging on advance). Candidate-only: full envelope
+/// validation and live-journal presence binding stay downstream, so a
+/// carried candidate can never become a false journal record here.
+async fn audit_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetAuditRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let rows = read_evidence_records(db, config).await?;
+    // Deterministic candidate order across calls: commit sequence, then
+    // per-receipt evidence position. Cursors resume by ordinal in this
+    // order and stay valid only while revision heads are unchanged (the
+    // consumer re-proves heads per read and restarts paging on advance).
+    let mut ordered: Vec<(u64, usize, Value)> = Vec::new();
+    for row in &rows {
+        let fenced = match &row.receipt {
+            Some(receipt) if receipt.state_fence == *state_fence => true,
+            _ => false,
+        };
+        if !fenced {
+            continue;
+        }
+        let sequence = row.commit_sequence.unwrap_or(u64::MAX);
+        for (index, evidence) in row.evidence_records.iter().flatten().enumerate() {
+            validate_evidence_record(row, evidence).map_err(AdapterError::Store)?;
+            if let Some(candidate) = eliot_store_api::audit_envelope_candidate(&evidence.subject) {
+                ordered.push((sequence, index, candidate));
+            }
+        }
+    }
+    ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    let mut records = Vec::new();
+    let mut ordinal: u64 = 0;
+    for (_, _, candidate) in ordered {
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        records.push(candidate);
+        if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+            if start.is_none() {
+                return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+            }
+            records.pop();
+            break;
+        }
+    }
+    Ok(json!({ "records": records }))
+}
+
+/// Reads bank rows and projects the bounded same-fence, same-scope
+/// record set (issue #223).
+///
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state. Scope arrives through the typed
+/// `scope_id` request field; rows project verbatim record documents plus
+/// presented digests in key order with an explicit truncation marker.
+async fn experience_bank_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetExperienceBankRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "experience range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
+    let rows =
+        super::surreal_experience::read_bank_for_read(db, config, scope_id.as_str(), fetch).await?;
+    let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        if records.len() > limit {
+            truncated = true;
+            break;
+        }
+        records.push(json!({
+            "handle": row.handle,
+            "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads feedback rows and projects the bounded same-fence, same-scope
+/// record set (issue #223). Same scope-gated rule as the bank range.
+async fn experience_feedback_range_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetAgentFeedbackRange,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "experience range read requires scope_id",
+    })?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = read_all_revision_heads(db, config)
+        .await?
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, state_fence, &heads)
+                .map_err(AdapterError::Store)?,
+        ),
+    };
+    // Fetch covers the skip window plus one probe row: the row scan is
+    // O(table) like every other range read on this contour, and the
+    // probe decides truncation without a second query.
+    let fetch = start
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+        .saturating_add(1);
+    let fetch = usize::try_from(fetch).unwrap_or(usize::MAX);
+    let rows =
+        super::surreal_experience::read_feedback_for_read(db, config, scope_id.as_str(), fetch)
+            .await?;
+    let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        if records.len() > limit {
+            truncated = true;
+            break;
+        }
+        records.push(json!({
+            "handle": row.handle,
+            "revision": row.revision,
+            "record_json": row.record_json,
+            "record_digest": row.record_digest,
+        }));
+    }
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = projection_len(records.len())?;
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                state_fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(AdapterError::Store)?,
+        )
+    } else {
+        None
+    };
+    Ok(json!({
+        "records": records,
+        "matched_total": matched_total,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Converts a projected row count into the `revision` cardinality
+/// without a lossy cast.
+fn projection_len(len: usize) -> Result<u64, AdapterError> {
+    u64::try_from(len).map_err(|_| {
+        AdapterError::Store(StoreError::Serialization(
+            "automation projection count overflow".to_owned(),
+        ))
+    })
+}
+
 /// One notification row projected by the read SELECT.
 #[derive(Clone, Debug, serde::Deserialize)]
 struct NotificationRow {
@@ -1948,7 +2537,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -1963,6 +2552,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -1974,7 +2568,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     /// Plans one capture through the real planner and renders its durable
@@ -2112,9 +2708,8 @@ mod admitted_read_tests {
             validate_named_against_active_catalogue(&query).is_ok(),
             "activated pack passes the gate"
         );
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("pack builds");
         assert_eq!(
             payload.get("version").and_then(Value::as_u64),
             Some(u64::from(EVIDENCE_PACK_PAYLOAD_VERSION))
@@ -2171,9 +2766,8 @@ mod admitted_read_tests {
         let fence = test_fence();
         let rows = vec![evidence_row_for("op-evidence-2", "evidence-alpha", 1)];
         let query = evidence_query("evidence-missing", "10");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("empty pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("empty pack builds");
         let records = payload
             .get("records")
             .and_then(Value::as_array)
@@ -2253,9 +2847,8 @@ mod admitted_read_tests {
         // successful view of a neighbouring subject.
         for selector in ["observation", "observation-1-extra", "OBSERVATION-1"] {
             let query = evidence_query(selector, "10");
-            let payload =
-                evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                    .expect("non-match builds");
+            let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                .expect("non-match builds");
             assert!(
                 payload
                     .get("records")
@@ -2265,8 +2858,8 @@ mod admitted_read_tests {
             );
         }
         let query = evidence_query("observation-1", "10");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression()).expect("exact builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("exact builds");
         assert_eq!(
             payload
                 .get("records")
@@ -2285,9 +2878,8 @@ mod admitted_read_tests {
             evidence_row_for("op-bulk-3", "evidence-bulk", 3),
         ];
         let query = evidence_query("evidence-bulk", "2");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("bounded pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("bounded pack builds");
         let records = payload
             .get("records")
             .and_then(Value::as_array)
@@ -2315,9 +2907,8 @@ mod admitted_read_tests {
             Some(true)
         );
         let query = evidence_query("evidence-bulk", "3");
-        let payload =
-            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
-                .expect("full pack builds");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+            .expect("full pack builds");
         assert_eq!(
             payload
                 .get("provenance")
@@ -2417,9 +3008,7 @@ mod admitted_read_tests {
         )
         .expect("neighbouring subject still reads");
         assert_eq!(
-            kept.get("records")
-                .and_then(Value::as_array)
-                .map(Vec::len),
+            kept.get("records").and_then(Value::as_array).map(Vec::len),
             Some(1)
         );
         // An `UNKNOWN`-only outcome never suppresses: the row stays visible
@@ -2474,7 +3063,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -2489,11 +3078,19 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::UpdateTaskState,
                 parameters: BTreeMap::from([
                     ("task_id".to_owned(), json!(task_id)),
-                    ("event_id".to_owned(), json!(format!("event-{operation_id}"))),
+                    (
+                        "event_id".to_owned(),
+                        json!(format!("event-{operation_id}")),
+                    ),
                     ("to".to_owned(), json!(to)),
                     ("expected_revision".to_owned(), json!("1")),
                     ("actor_ref".to_owned(), json!("actor-1")),
@@ -2506,7 +3103,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     /// Recovery transition shape awaiting operation-aware persistence (see
@@ -2522,7 +3121,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -2537,6 +3136,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ReconcileRecovery,
                 parameters: BTreeMap::from([
@@ -2565,7 +3169,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn lifecycle_transition(
@@ -2578,7 +3184,7 @@ mod admitted_read_tests {
             SecurityContext, TransitionClass,
         };
         let fence = test_fence();
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
                 idempotency_key: format!("idem-{operation_id}"),
@@ -2593,6 +3199,11 @@ mod admitted_read_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ApplyLifecyclePolicy,
                 parameters: BTreeMap::from([
@@ -2611,7 +3222,9 @@ mod admitted_read_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     /// Plans one transition through the real planner with its real payload
@@ -2739,12 +3352,8 @@ mod admitted_read_tests {
         );
         assert!(payload.get("current").is_some_and(Value::is_null));
         // Unknown task over empty rows is also an exact empty.
-        let empty = task_state_payload(
-            &task_query("task-missing", "10"),
-            &fence,
-            &[],
-        )
-        .expect("empty builds");
+        let empty = task_state_payload(&task_query("task-missing", "10"), &fence, &[])
+            .expect("empty builds");
         assert!(
             empty
                 .get("records")
@@ -2782,10 +3391,7 @@ mod admitted_read_tests {
         let empty =
             attention_problems_payload(&attention_query(None, "2"), &fence, &[]).expect("builds");
         assert_eq!(
-            empty
-                .get("records")
-                .and_then(Value::as_array)
-                .map(Vec::len),
+            empty.get("records").and_then(Value::as_array).map(Vec::len),
             Some(0)
         );
         assert_eq!(empty["provenance"]["matched_total"], json!(0));

@@ -9,6 +9,7 @@ description = "ELIOT canonical generated CLI catalogue and thin client contracts
 [dependencies]
 eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
+eliot-kernel-core.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-ipc.workspace = true
 eliot-mcp.workspace = true
@@ -16,6 +17,7 @@ eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
+eliot-user-broker-core.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

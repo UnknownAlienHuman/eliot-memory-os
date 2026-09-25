@@ -3196,7 +3196,6 @@ fn api_surface_is_pure_and_restricted() {
     assert_pure_fn(eliot_dreamer_claim_grounding::ground_draft_with_controls);
 }
 
-
 // WORK_UNIT_CASE: 602/36
 #[test]
 fn supported_claims_have_complete_exact_coverage_without_promotion() {

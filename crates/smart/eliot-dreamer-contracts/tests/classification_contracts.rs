@@ -573,7 +573,10 @@ fn prior_assignment_closure_is_retained_and_drift_rejected() {
     assert_eq!(decoded.input.prior_assignment, Some(prior));
     assert_eq!(decoded.candidate.before, supplied.before);
     assert_eq!(decoded.candidate.counterevidence_refs, vec![id("e-2")]);
-    assert_eq!(decoded.candidate.rollback.raw_history_handles, vec![id("a")]);
+    assert_eq!(
+        decoded.candidate.rollback.raw_history_handles,
+        vec![id("a")]
+    );
     assert_eq!(
         decoded.input.evidence[0].dependence_groups,
         vec!["group-1".to_owned()]
@@ -606,10 +609,7 @@ fn acceptance_joins_alias_refinement_and_digests_are_fail_closed() {
         canonical_alternative_id: id("alternative-a"),
         refinement_of: Some(id("alternative-b")),
     }];
-    aliased.taxonomy.digest = aliased
-        .taxonomy
-        .computed_digest()
-        .expect("alias digest");
+    aliased.taxonomy.digest = aliased.taxonomy.computed_digest().expect("alias digest");
     aliased.validate().expect("aliased input validates");
     let aliased_candidate = candidate(&aliased);
     let closure =
@@ -708,10 +708,7 @@ fn preservation_coverage_rival_and_rollback_gate_complete_candidate() {
     closure.validate().expect("failed abstention validates");
     let mut partial = input.clone();
     partial.taxonomy.coverage = TaxonomyCoverage::Partial;
-    partial.taxonomy.digest = partial
-        .taxonomy
-        .computed_digest()
-        .expect("partial digest");
+    partial.taxonomy.digest = partial.taxonomy.computed_digest().expect("partial digest");
     let partial_candidate = candidate(&partial);
     assert!(validate_classification(&partial, &partial_candidate, &ctx).is_err());
     let mut single = input.clone();
@@ -759,12 +756,8 @@ fn material_change_changes_identity_and_incompatible_selection_rejected() {
         changed.selected_alternative_id.as_ref(),
     );
     assert_ne!(changed.candidate_id, supplied.candidate_id);
-    let changed_closure =
-        seal_classification(input.clone(), changed, &ctx).expect("changed seals");
-    assert_ne!(
-        changed_closure.result_digest,
-        closure.result_digest
-    );
+    let changed_closure = seal_classification(input.clone(), changed, &ctx).expect("changed seals");
+    assert_ne!(changed_closure.result_digest, closure.result_digest);
     let mut changed_input = input.clone();
     changed_input.evidence[0].dependence_groups = vec!["group-2".to_owned()];
     let changed_digest = classification_input_digest(&changed_input).expect("changed digest");

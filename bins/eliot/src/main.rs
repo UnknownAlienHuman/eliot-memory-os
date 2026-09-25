@@ -5,8 +5,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
-use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use eliot_cli::{
+    CommandCatalogue, CommandPort, CommandPortError, CommandRequest, USER_AUTOMATION_ROUTE,
+    user_automation_route_payload,
+};
 use eliot_doctor::integration;
+use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
@@ -16,15 +20,16 @@ use eliot_installation::{
     parse_installation_transaction_id, registry_projection_pending_ref,
     require_published_source_bundle_journal, validate_installation_transaction_json,
 };
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
 use eliot_platform_windows::{
-    FileIdentity, InstallerRootError, InstallerRootObjectSnapshot,
+    FileIdentity, HostOwnerLease, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
     PackageStagingError, PackageStagingStage, ProtectedRootLease, ProtectedRuntimePathLease,
-    TrustedSourceBundle, TrustedSourceFileLease, WindowsInstallerRootPrimitive,
+    TrustedSourceBundle, TrustedSourceFileLease, UserOwnedRootLease, WindowsInstallerRootPrimitive,
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
@@ -48,6 +53,7 @@ mod bootstrap_draft;
 mod controlboard_status;
 mod first_run_flow;
 mod plugin_preview;
+mod scope_observe;
 mod source_bundle_materializer;
 mod update_installer;
 
@@ -55,6 +61,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
 const FRONT_DOOR_CLOSED_EXIT: i32 = 69;
 const UNKNOWN_OUTCOME_EXIT: i32 = 75;
+/// The serving owner invalidated the generation/session-bound operator
+/// handoff: the UI must restart through a fresh broker-issued binding.
+const RESTART_REQUIRED_EXIT: i32 = 77;
+/// A backup command reached its registered typed Kernel operation and the
+/// Kernel answered honestly, but a named owner is not admitted yet.
+///
+/// This is deliberately neither a usage failure (the bounded typed
+/// arguments were accepted) nor success (no capture, verification, or
+/// rehearsal was proven): backup existence is not recovery proof, so a
+/// process exit never stands in for it.
+const BACKUP_OWNER_ADMISSION_REQUIRED_EXIT: i32 = 78;
 const INSTALLATION_INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 const INSTALLATION_CONTRACT_VERSION: &str = "3.0.0";
 const INSTALLATION_SCOPE: &str = "bounded_all_effects_or_exact_rollback";
@@ -118,10 +135,15 @@ enum Command {
         #[command(subcommand)]
         command: ControlBoardCommand,
     },
-    /// Preview backup creation/restore plans and key coverage (#1873; preview-only, no execution).
+    /// Backup creation/restore previews, issuance, isolated restore runs, key coverage (#1873; previews never issue; restore runs never cut over), and the three advertised `create`/`verify`/`restore-test` catalogue commands routed through the authenticated Kernel front door (#963).
     Backup {
         #[command(subcommand)]
         command: backup_entry::BackupCommand,
+    },
+    /// Observe one explicit workspace root for `WorkScope` attach decisions.
+    Scope {
+        #[command(subcommand)]
+        command: scope_observe::ScopeCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -249,7 +271,7 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: Option<String>,
     },
-    /// Materialize an exact twelve-role Phase-A source bundle and feed it through
+    /// Materialize an exact thirteen-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
@@ -271,6 +293,11 @@ enum InstallationCommand {
         eliot_testd: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliot_native_worker: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_wasm_host: PathBuf,
+        /// Release per-user `eliot-notify.exe` adapter path (I1.3/I1.4).
+        #[arg(long, value_parser = absolute_path)]
+        eliot_notify: PathBuf,
         /// Optional explicit external agent-bridge executable source. Must be
         /// supplied together with `--agent-bridge-account`.
         #[arg(long, value_parser = absolute_path)]
@@ -311,6 +338,41 @@ enum InstallationCommand {
         profile_anchor_root: PathBuf,
         #[arg(long)]
         installation_key: Option<String>,
+    },
+    /// Publish the per-user Notify fallback declaration and register the
+    /// signed Task Scheduler fallback. Runs in the interactive session
+    /// matching `--sid`/`--session-id`; normal launch stays User-Broker
+    /// owned (I11.6). No process is spawned by this command.
+    SetupNotifyFallback {
+        /// Stable installation identity.
+        #[arg(long)]
+        installation: String,
+        /// Declared fallback audience.
+        #[arg(long)]
+        audience: String,
+        /// Non-zero authority epoch.
+        #[arg(long)]
+        authority_epoch: u64,
+        /// Watchdog signing key identifier.
+        #[arg(long)]
+        key_id: String,
+        /// Lowercase hex Watchdog verifying key (public half only).
+        #[arg(long)]
+        public_key: String,
+        /// Absolute installed `eliot-notify.exe` path. The image digest is
+        /// always hashed from these exact bytes at setup time; no
+        /// caller-supplied digest is accepted.
+        #[arg(long, value_parser = absolute_path)]
+        notify_exe: PathBuf,
+        /// Explicit installation profile (`system_service`, `user_mode`, or `portable_dev`).
+        #[arg(long, value_parser = parse_installation_profile)]
+        profile: InstallationProfile,
+        /// Absolute OS-validated profile anchor root.
+        #[arg(long, value_parser = absolute_path)]
+        profile_anchor_root: PathBuf,
+        /// Absolute create-new diagnostic JSON path.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
     },
     /// Stage one update package into a new versioned directory without
     /// overwriting the running executable. `eliot-kernel` and `eliot-host`
@@ -571,6 +633,7 @@ fn run() -> Result<i32> {
         Command::Doctor { command } => run_doctor(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Backup { command } => backup_entry::run_backup(command),
+        Command::Scope { command } => Ok(run_scope(command)),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -808,6 +871,24 @@ fn run_controlboard_status_windows() -> Result<i32> {
         serde_json::to_string_pretty(&controlboard_status::render_status_json(&board)?)?
     );
     Ok(0)
+}
+
+fn run_scope(command: scope_observe::ScopeCommand) -> i32 {
+    match command {
+        scope_observe::ScopeCommand::Observe {
+            repo_root,
+            generation,
+        } => match scope_observe::execute(&repo_root, generation) {
+            Ok(value) => {
+                println!("{value}");
+                0
+            }
+            Err(error) => {
+                println!("{}", error.envelope());
+                error.exit_code()
+            }
+        },
+    }
 }
 
 fn run_bootstrap(command: BootstrapCommand) -> i32 {
@@ -1064,24 +1145,57 @@ fn observe_legacy_governor_config() -> Result<()> {
     // #1687: the legacy Governor file is never adopted as authority. A present
     // file fails closed with the Kernel-surface migration action; an absent
     // file is provisional and lets the canary/install path proceed.
+    // #1858 (I19.5): each legacy-entrypoint refusal additionally emits a
+    // stable machine-readable cutover code with a redirect receipt naming
+    // the canonical Kernel-governed route. The report is observational only:
+    // the returned Err still aborts the operation, so no legacy entrypoint
+    // can initialize an independent Governor, direct store mutation route,
+    // local control channel, or alternate launch journal.
     match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => {
             legacy_governor_config::gate_legacy_config_observation(None)
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Present(read)) => {
-            legacy_governor_config::gate_legacy_config_observation(Some((
+            if let Err(error) = legacy_governor_config::gate_legacy_config_observation(Some((
                 read.path(),
                 read.bytes(),
-            )))
-            .map_err(|error| anyhow::anyhow!(error))?;
+            ))) {
+                write_legacy_governor_cutover_rejection(
+                    legacy_governor_config::LEGACY_GOVERNOR_CONFIG_RETIRED,
+                    &error,
+                );
+                return Err(anyhow::anyhow!(error));
+            }
         }
-        Err(error) => anyhow::bail!("legacy Governor config observation is unknown: {error}"),
+        Err(error) => {
+            let detail = format!("legacy Governor config observation is unknown: {error}");
+            write_legacy_governor_cutover_rejection(
+                legacy_governor_config::LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
+                &detail,
+            );
+            return Err(anyhow::anyhow!(detail));
+        }
     }
-    classify_legacy_governor_process_state(
-        is_eliot_governor_running().map_err(|error| error.to_string()),
-    )
-    .map_err(|error| anyhow::anyhow!(error))
+    let process_state = is_eliot_governor_running().map_err(|error| error.to_string());
+    match &process_state {
+        Ok(false) => {}
+        Ok(true) => {
+            let detail = "legacy eliot-governor.exe is running";
+            write_legacy_governor_cutover_rejection(
+                legacy_governor_config::LEGACY_GOVERNOR_PROCESS_RUNNING,
+                detail,
+            );
+        }
+        Err(error) => {
+            let detail = format!("legacy Governor process state is unknown: {error}");
+            write_legacy_governor_cutover_rejection(
+                legacy_governor_config::LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
+                &detail,
+            );
+        }
+    }
+    classify_legacy_governor_process_state(process_state).map_err(|error| anyhow::anyhow!(error))
 }
 
 #[cfg(windows)]
@@ -1553,6 +1667,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_doctor,
             eliot_testd,
             eliot_native_worker,
+            eliot_wasm_host,
+            eliot_notify,
             agent_bridge_exe,
             agent_bridge_account,
             output_bundle,
@@ -1579,6 +1695,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_doctor,
             eliot_testd,
             eliot_native_worker,
+            eliot_wasm_host,
+            eliot_notify,
             output_bundle,
             output,
             store,
@@ -1595,6 +1713,27 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             installation_key,
             agent_bridge_exe,
             agent_bridge_account,
+        ),
+        InstallationCommand::SetupNotifyFallback {
+            installation,
+            audience,
+            authority_epoch,
+            key_id,
+            public_key,
+            notify_exe,
+            profile,
+            profile_anchor_root,
+            output,
+        } => run_installation_setup_notify_fallback(
+            installation,
+            audience,
+            authority_epoch,
+            key_id,
+            public_key,
+            notify_exe,
+            profile,
+            profile_anchor_root,
+            output,
         ),
         InstallationCommand::StageUpdate {
             install_root,
@@ -1944,6 +2083,80 @@ where
 }
 
 #[allow(
+    clippy::too_many_arguments,
+    reason = "per-user setup carries the full explicit declaration field set"
+)]
+fn run_installation_setup_notify_fallback(
+    installation: String,
+    audience: String,
+    authority_epoch: u64,
+    key_id: String,
+    public_key: String,
+    notify_exe: PathBuf,
+    profile: InstallationProfile,
+    profile_anchor_root: PathBuf,
+    output: PathBuf,
+) -> Result<i32> {
+    use eliot_host::HostError;
+    let portable_root = match profile {
+        InstallationProfile::PortableDev => Some(
+            UserOwnedRootLease::open_existing(&profile_anchor_root).map_err(|error| {
+                anyhow::anyhow!("portable setup root is not provisioned: {error}")
+            })?,
+        ),
+        InstallationProfile::SystemService | InstallationProfile::UserMode => None,
+    };
+    let inputs = NotifyFallbackSetupInputs {
+        installation_identity: cli_handle(installation.clone(), "installation")?,
+        audience: cli_handle(audience.clone(), "audience")?,
+        authority_epoch,
+        key_id: cli_handle(key_id.clone(), "key_id")?,
+        public_key,
+        notify_executable: notify_exe,
+        profile,
+        portable_root,
+    };
+    let setup = match setup_notify_fallback_per_user(&inputs) {
+        Ok(setup) => setup,
+        Err(error) => {
+            if let HostError::RecoveryRequired(_) = &error {
+                write_installation_error(
+                    "NOTIFY_FALLBACK_SETUP_RECOVERY_REQUIRED",
+                    &error.to_string(),
+                );
+                return Ok(UNKNOWN_OUTCOME_EXIT);
+            }
+            write_installation_error("NOTIFY_FALLBACK_SETUP_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let receipt = serde_json::to_string_pretty(&json!({
+        "contract": "eliot.kernel.installation",
+        "contract_version": INSTALLATION_CONTRACT_VERSION,
+        "status": "NOTIFY_FALLBACK_SETUP_PUBLISHED",
+        "output_role": "DIAGNOSTIC_NON_IMPORTABLE",
+        "declaration_path": setup.declaration.declaration_path.display().to_string(),
+        "declaration_digest": setup.declaration.declaration_digest.as_str(),
+        "task_name": setup.registration.task_name,
+        "sid": setup.registration.sid,
+        "session_id": setup.registration.session_id,
+        "notify_artifact_sha256": setup.registration.notify_artifact_sha256,
+        "verifier_sha256": setup.registration.verifier_sha256,
+        "task_xml_sha256": setup.registration.task_xml_sha256,
+    }))?;
+    let mut output_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|error| anyhow::anyhow!("open setup output: {error}"))?;
+    output_file
+        .write_all(receipt.as_bytes())
+        .map_err(|error| anyhow::anyhow!("write setup output: {error}"))?;
+    println!("{receipt}");
+    Ok(0)
+}
+
+#[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_arguments,
     clippy::too_many_lines
@@ -1958,6 +2171,8 @@ fn run_installation_materialize_source_bundle(
     eliot_doctor: PathBuf,
     eliot_testd: PathBuf,
     eliot_native_worker: PathBuf,
+    eliot_wasm_host: PathBuf,
+    eliot_notify: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
     store: PathBuf,
@@ -1985,6 +2200,8 @@ fn run_installation_materialize_source_bundle(
         eliot_doctor_exe: eliot_doctor,
         eliot_testd_exe: eliot_testd,
         eliot_native_worker_exe: eliot_native_worker,
+        eliot_wasm_host_exe: eliot_wasm_host,
+        eliot_notify_exe: eliot_notify,
         agent_bridge_exe,
         agent_bridge_account,
         output_bundle: output_bundle.clone(),
@@ -2117,7 +2334,26 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
         );
         return Ok(INVALID_REQUEST_EXIT);
     }
-    match eliot_runtime_status::collect_status(host_state_root, deadline) {
+    let runtime_health = match load_authenticated_kernel_runtime_health() {
+        Ok(runtime_health) => runtime_health,
+        Err(error) => {
+            let (code, detail) = match error {
+                AuthenticatedRuntimeHealthError::Unavailable(detail) => {
+                    ("KERNEL_RUNTIME_HEALTH_UNAVAILABLE", detail)
+                }
+                AuthenticatedRuntimeHealthError::Invalid(detail) => {
+                    ("KERNEL_RUNTIME_HEALTH_INVALID", detail)
+                }
+            };
+            write_runtime_status_error(code, &detail, false);
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    match eliot_runtime_status::collect_status_with_kernel_health(
+        host_state_root,
+        deadline,
+        &runtime_health,
+    ) {
         Ok(report) => {
             let status_code = if report.status == "RUNTIME_LIVE" {
                 "RUNTIME_LIVE"
@@ -2160,6 +2396,7 @@ fn run_installation_runtime_status(host_state_root: &Path, deadline_ms: u64) -> 
                         "proof_status": report.readiness.proof_status,
                         "gap": report.readiness.age_gap,
                     },
+                    "runtime_health": report.runtime_health,
                     "recovery_command": report.recovery_command,
                     "gaps": report.gaps,
                     "components": report.components,
@@ -2669,7 +2906,15 @@ fn run_installation_effect(
     };
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let outcome = if recover {
-        coordinator.rollback(&transaction_id)
+        if preflight_transaction.has_activation_projection_intent() {
+            rollback_with_activation_owner(
+                &mut coordinator,
+                &preflight_transaction,
+                &transaction_id,
+            )
+        } else {
+            coordinator.rollback(&transaction_id)
+        }
     } else if preflight_transaction.profile == InstallationProfile::SystemService {
         match coordinator.drive_until_host_bootstrap(&transaction_id) {
             Ok(InstallationStepOutcome::Applied { .. }) => {
@@ -2702,11 +2947,16 @@ fn run_installation_effect(
                 )) {
                     Ok(root) => root,
                     Err(error) => {
-                        write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                        // E3: the retained Host root cannot be reopened after
+                        // the bootstrap prefix applied. Persist the same
+                        // durable typed rejection as E4/E5 so a later
+                        // recover/rollback reaches RolledBack; an unconfirmed
+                        // rejection stays INSTALLATION_APPLY_RECOVERY_REQUIRED.
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
                             &format!("retained Host root could not be reopened: {error}"),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
+                        ));
                     }
                 };
                 let registry = match RedbInstallationRegistry::open_at(host_root) {
@@ -2714,16 +2964,15 @@ fn run_installation_effect(
                     Err(error) => {
                         // E4: persist a durable typed rejection so a later
                         // recover/rollback reaches RolledBack and removes exactly
-                        // the CreatedByTransaction service registrations.
-                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
-                        }
-                        write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                        // the CreatedByTransaction service registrations. The
+                        // persist result is projected, never discarded: an
+                        // unconfirmed rejection is
+                        // INSTALLATION_APPLY_RECOVERY_REQUIRED (unknown).
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
                             &format!("pending registry could not be opened: {error}"),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
+                        ));
                     }
                 };
                 let expected_revision = match registry.load() {
@@ -2731,15 +2980,12 @@ fn run_installation_effect(
                     Err(error) => {
                         // E5: same durable rejection as E4 (registry unreadable
                         // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
-                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
-                            let _ = coordinator
-                                .persist_non_effect_rejection(&transaction_id, pending_ref);
-                        }
-                        write_installation_error(
-                            "INSTALLATION_APPLY_ERROR",
+                        // The persist result is projected, never discarded.
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
                             &format!("pending registry preflight failed: {error}"),
-                        );
-                        return Ok(INVALID_REQUEST_EXIT);
+                        ));
                     }
                 };
                 if let Err(error) = coordinator.stage_bootstrap_pending_activation(
@@ -2751,7 +2997,8 @@ fn run_installation_effect(
                     // present (Activating) do NOT persist — mark_unknown is
                     // refused in Activating — and resume via the existing
                     // Activating reconcile / terminal query path. Only persist
-                    // while still Registering (CAS never happened).
+                    // while still Registering (CAS never happened); the persist
+                    // result is projected, never discarded.
                     let still_registering = match coordinator.store().load(&transaction_id) {
                         Ok(Some(current)) => {
                             current.stage() == InstallationStage::Registering
@@ -2759,11 +3006,12 @@ fn run_installation_effect(
                         }
                         Ok(None) | Err(_) => false,
                     };
-                    if still_registering
-                        && let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
-                    {
-                        let _ =
-                            coordinator.persist_non_effect_rejection(&transaction_id, pending_ref);
+                    if still_registering {
+                        return Ok(report_post_bootstrap_failure(
+                            &mut coordinator,
+                            &transaction_id,
+                            &format!("pending registry projection failed: {error}"),
+                        ));
                     }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",
@@ -2949,11 +3197,6 @@ fn run_installation_effect(
     Ok(installation_command_exit_code(overall_status))
 }
 
-/// Reconciles only an exact Host-committed registry terminal.  A missing
-/// terminal is the expected fenced first-install state and remains pending;
-/// this query never starts services, rewrites descriptors, or retries a
-/// credential/SCM effect.
-///
 /// The terminal-reconcile writer open below is short-lived and bounded: it
 /// retries only redb exclusive-lock contention with backoff, then fails
 /// typed with the preserved cause (A13.9:14 no exclusive owner across an
@@ -3010,6 +3253,40 @@ fn open_existing_registry_for_terminal_reconcile(
     Err(cause)
 }
 
+/// Re-enters the installation owner's pre-no-return rollback seam for a
+/// durable activation intent.  The CLI only wires already-owned capabilities:
+/// the protected Host root bounds the one short-lived redb writer, while the
+/// installation-wide Host lease supplies the non-forgeable mutation proof.
+/// No caller-supplied approval, registry revision, or root path is accepted.
+fn rollback_with_activation_owner(
+    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
+    transaction: &InstallationTransaction,
+    transaction_id: &PlatformHandle,
+) -> Result<InstallationStepOutcome, InstallationError> {
+    let host_state_root = Path::new(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str(),
+    );
+    let registry =
+        open_existing_registry_for_terminal_reconcile(host_state_root)?.ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "Host activation registry is absent for owner-aware rollback".to_owned(),
+            )
+        })?;
+    let owner = HostOwnerLease::acquire(&transaction.installation_epoch.installation)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let host = owner.activation_capability();
+    coordinator.rollback_with_activation_owner(&registry, &host, transaction_id)
+}
+
+/// Reconciles only an exact Host-committed registry terminal.  A missing
+/// terminal is the expected fenced first-install state and remains pending;
+/// this query never starts services, rewrites descriptors, or retries a
+/// credential/SCM effect.
 fn reconcile_host_activation_terminal(
     store_path: &Path,
     transaction: &InstallationTransaction,
@@ -3022,7 +3299,9 @@ fn reconcile_host_activation_terminal(
             .host_state_root
             .as_str(),
     );
-    let Some(registry) = open_existing_registry_for_terminal_reconcile(host_state_root)? else {
+    let host_root = ProtectedRootLease::open_existing(host_state_root)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let Some(registry) = RedbInstallationRegistry::inspect_existing_at(host_root)? else {
         return Ok(None);
     };
     let receipt = match registry.read_committed_activation_receipt(
@@ -3342,6 +3621,27 @@ fn run_ui() -> Result<i32> {
             write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
             Ok(FRONT_DOOR_CLOSED_EXIT)
         }
+        Err(eliot_cli::kernel_client::KernelClientError::RestartRequired(detail)) => {
+            // Generation/session-bound handoff invalidated by the serving
+            // owner: restart through a fresh broker-issued binding. The
+            // consumed endpoint, PID, pipe name, and cached environment are
+            // never continuity evidence.
+            write_json_error("KERNEL_OPERATOR_RESTART_REQUIRED", &detail);
+            Ok(RESTART_REQUIRED_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::UnknownOutcome(detail)) => {
+            // Possibly launched: reconcile the same launch operation by its
+            // operation identity; never resubmit a second launch.
+            write_json_error("KERNEL_OPERATOR_LAUNCH_UNKNOWN", &detail);
+            Ok(UNKNOWN_OUTCOME_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "KERNEL_OPERATOR_LAUNCH_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for a broker-admitted operator launch; the identity must arrive through the admitted host request path",
+            );
+            Ok(INVALID_REQUEST_EXIT)
+        }
         Err(error) => {
             write_json_error("KERNEL_OPERATOR_LAUNCH_REJECTED", &error.to_string());
             Ok(FRONT_DOOR_CLOSED_EXIT)
@@ -3523,6 +3823,24 @@ fn write_json_error(code: &str, detail: &str) {
     );
 }
 
+/// Structured legacy-entrypoint cutover rejection (#1858, I19.5). Emits the
+/// stable machine-readable cutover code with a redirect receipt naming the
+/// canonical Kernel-governed route. Observational only: callers still return
+/// Err, so the refusal stays fail-closed with no alternate writer.
+#[cfg(windows)]
+fn write_legacy_governor_cutover_rejection(code: &str, detail: &str) {
+    println!(
+        "{}",
+        json!({
+            "status": "ERROR",
+            "code": code,
+            "detail": detail,
+            "canonical_route": legacy_governor_config::LEGACY_GOVERNOR_CANONICAL_ROUTE,
+            "completed": false,
+        })
+    );
+}
+
 fn write_installation_error(code: &str, detail: &str) {
     println!(
         "{}",
@@ -3548,6 +3866,64 @@ fn write_installation_error_with_reference(code: &str, detail: &str, reference: 
             "scope": INSTALLATION_SCOPE,
         })
     );
+}
+
+/// Projects a post-bootstrap non-effect failure observed after the Host
+/// bootstrap prefix (Host-root reopen, registry open/load, registry
+/// projection staging: `E3`/`E4`/`E5` and the still-`Registering` branch of
+/// `E6`).
+///
+/// The coordinator-owned durable typed rejection is always attempted and its
+/// result is never discarded: success keeps the existing
+/// `INSTALLATION_APPLY_ERROR` with a recoverable-rollback note (the stored
+/// `Registering → RollbackRequired` transition lets a later recover reach
+/// `RolledBack` and remove exactly the `CreatedByTransaction` registrations);
+/// when the rejection cannot be confirmed the outcome stays truthful
+/// `INSTALLATION_APPLY_RECOVERY_REQUIRED` per `I3.15`
+/// (`UNKNOWN_OUTCOME/ROLLBACK_REQUIRED` until read-back reconciliation), never
+/// a plain apply error that would imply durable recovery. The
+/// transaction/fence/owner gates are untouched: a refusal in `Activating` (or
+/// a store CAS failure) surfaces here as unconfirmed, it is never overridden.
+fn report_post_bootstrap_failure<S>(
+    coordinator: &mut WindowsInstallationCoordinator<S>,
+    transaction_id: &PlatformHandle,
+    detail: &str,
+) -> i32
+where
+    S: InstallationTransactionStore,
+{
+    let pending_ref = match registry_projection_pending_ref(transaction_id) {
+        Ok(pending_ref) => pending_ref,
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                &format!(
+                    "{detail}; durable rejection reference could not be built ({error}): recovery is required and rollback readiness is unknown"
+                ),
+            );
+            return INVALID_REQUEST_EXIT;
+        }
+    };
+    match coordinator.persist_non_effect_rejection(transaction_id, pending_ref) {
+        Ok(_) => {
+            write_installation_error(
+                "INSTALLATION_APPLY_ERROR",
+                &format!(
+                    "{detail}; durable typed rejection persisted: run installation recover with the exact --store and --transaction-id to roll back CreatedByTransaction registrations"
+                ),
+            );
+            INVALID_REQUEST_EXIT
+        }
+        Err(error) => {
+            write_installation_error(
+                "INSTALLATION_APPLY_RECOVERY_REQUIRED",
+                &format!(
+                    "{detail}; durable rejection could not be confirmed ({error}): recovery is required and rollback readiness is unknown"
+                ),
+            );
+            INVALID_REQUEST_EXIT
+        }
+    }
 }
 
 fn installation_preflight_error(
@@ -3615,6 +3991,56 @@ fn write_runtime_status_error(code: &str, detail: &str, deadline_exceeded: bool)
     );
 }
 
+#[derive(Debug)]
+enum AuthenticatedRuntimeHealthError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+/// Decodes the exact owner-produced health carrier returned by the
+/// authenticated Kernel front door. Deserialization alone is insufficient:
+/// the consumer boundary must rerun the Kernel carrier invariants before the
+/// evidence reaches the operator projection.
+fn decode_authenticated_kernel_runtime_health(
+    payload: serde_json::Value,
+) -> std::result::Result<KernelRuntimeHealthEvidence, AuthenticatedRuntimeHealthError> {
+    let evidence: KernelRuntimeHealthEvidence = serde_json::from_value(payload).map_err(|error| {
+        AuthenticatedRuntimeHealthError::Invalid(format!(
+            "authenticated Kernel health payload is not the canonical runtime-health carrier: {error}"
+        ))
+    })?;
+    evidence.validate().map_err(|error| {
+        AuthenticatedRuntimeHealthError::Invalid(format!(
+            "authenticated Kernel health carrier failed canonical validation: {error}"
+        ))
+    })?;
+    Ok(evidence)
+}
+
+#[cfg(windows)]
+fn load_authenticated_kernel_runtime_health()
+-> std::result::Result<KernelRuntimeHealthEvidence, AuthenticatedRuntimeHealthError> {
+    let mut port = AuthenticatedKernelPort::load().map_err(|error| {
+        AuthenticatedRuntimeHealthError::Unavailable(format!(
+            "load authenticated Kernel health caller: {error}"
+        ))
+    })?;
+    let payload = port.probe_runtime_health().map_err(|error| {
+        AuthenticatedRuntimeHealthError::Unavailable(format!(
+            "authenticated Kernel health probe did not produce an owner response: {error}"
+        ))
+    })?;
+    decode_authenticated_kernel_runtime_health(payload)
+}
+
+#[cfg(not(windows))]
+fn load_authenticated_kernel_runtime_health()
+-> std::result::Result<KernelRuntimeHealthEvidence, AuthenticatedRuntimeHealthError> {
+    Err(AuthenticatedRuntimeHealthError::Unavailable(
+        "the authenticated Kernel health front door is Windows-only".to_owned(),
+    ))
+}
+
 fn installation_projection_completed(stage: InstallationStage) -> bool {
     stage == InstallationStage::Completed
 }
@@ -3643,6 +4069,12 @@ impl AuthenticatedKernelPort {
         self.client.ensure_operator_launch()
     }
 
+    fn probe_runtime_health(
+        &mut self,
+    ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
+        self.client.probe()
+    }
+
     /// Sends the exact `controlboard.status` operation through the
     /// authenticated EBP Execute seam and returns the served result payload.
     ///
@@ -3667,6 +4099,72 @@ impl CommandPort for AuthenticatedKernelPort {
         request: &CommandRequest,
     ) -> Result<eliot_cli::CommandResponse, CommandPortError> {
         self.client.set_request_identity(request.request.clone());
+        if request.command == eliot_cli::CommandId::UserAutomation {
+            let payload = user_automation_route_payload(request)
+                .map_err(|error| CommandPortError::Rejected(error.to_string()))?;
+            let routed = self
+                .client
+                .transact_json(USER_AUTOMATION_ROUTE, payload)
+                .map_err(|error| match error {
+                    eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract) => {
+                        CommandPortError::FrontDoorClosed { contract }
+                    }
+                    other => CommandPortError::Rejected(other.to_string()),
+                })?;
+            let spec = CommandCatalogue::current()
+                .commands()
+                .iter()
+                .find(|spec| spec.id == request.command)
+                .ok_or_else(|| {
+                    CommandPortError::Rejected(
+                        "UserAutomation command is not catalogued".to_owned(),
+                    )
+                })?;
+            return Ok(eliot_cli::CommandResponse {
+                request: request.request.clone(),
+                command: request.command,
+                effect: spec.effect,
+                proof_ceiling: spec.proof_ceiling,
+                result: eliot_cli::CommandResult::Forwarded { payload: routed },
+            });
+        }
+        // The three advertised backup command IDs map one-to-one onto the
+        // three closed Kernel backup operations. They never travel as a
+        // generic `eliot.cli.command`: a payload that selects another
+        // method, another owner, or a defaulted scope or destination is
+        // refused by the typed surface and by the Kernel route.
+        if matches!(
+            request.command,
+            eliot_cli::CommandId::BackupCreate
+                | eliot_cli::CommandId::BackupVerify
+                | eliot_cli::CommandId::BackupRestoreTest
+        ) {
+            return match request.command {
+                eliot_cli::CommandId::BackupCreate => {
+                    eliot_cli::backup::backup_create(&mut self.client, request)
+                }
+                eliot_cli::CommandId::BackupVerify => {
+                    eliot_cli::backup::backup_verify(&mut self.client, request)
+                }
+                eliot_cli::CommandId::BackupRestoreTest => {
+                    eliot_cli::backup::backup_restore_test(&mut self.client, request)
+                }
+                _ => Err(eliot_cli::backup::BackupClientError::Client(
+                    eliot_cli::CliError::ArgumentCommandMismatch,
+                )),
+            }
+            .map_err(|error| match error {
+                eliot_cli::backup::BackupClientError::Transport(transport) => match transport {
+                    eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract) => {
+                        CommandPortError::FrontDoorClosed { contract }
+                    }
+                    other => CommandPortError::Rejected(other.to_string()),
+                },
+                eliot_cli::backup::BackupClientError::Client(client) => {
+                    CommandPortError::Rejected(client.to_string())
+                }
+            });
+        }
         let payload = serde_json::to_value(request)
             .map_err(|error| CommandPortError::Rejected(error.to_string()))?;
         let response = self
@@ -3681,6 +4179,191 @@ impl CommandPort for AuthenticatedKernelPort {
         serde_json::from_value(response)
             .map_err(|error| CommandPortError::Rejected(error.to_string()))
     }
+}
+
+/// Returns the closed Kernel operation selector a backup catalogue command
+/// routes to, or `None` when the command is not a backup command.
+///
+/// The mapping is one-to-one and closed: the CLI never names an owner, a
+/// method the catalogue does not advertise, or a destination.
+#[cfg(windows)]
+fn backup_operation(command: eliot_cli::CommandId) -> Option<&'static str> {
+    match command {
+        eliot_cli::CommandId::BackupCreate => Some(eliot_cli::backup::BACKUP_CREATE_OPERATION),
+        eliot_cli::CommandId::BackupVerify => Some(eliot_cli::backup::BACKUP_VERIFY_OPERATION),
+        eliot_cli::CommandId::BackupRestoreTest => {
+            Some(eliot_cli::backup::BACKUP_RESTORE_TEST_OPERATION)
+        }
+        _ => None,
+    }
+}
+
+/// Renders the bounded human and JSON projections of one routed backup
+/// command and returns its typed exit status.
+///
+/// Both projections are rendered from the same
+/// [`eliot_cli::backup::BackupOperationOutcome`], so the bounded human text
+/// and the JSON document cannot disagree. A verified outcome exits zero; an
+/// invalid one exits as a usage failure; a refused or blocked one exits as
+/// owner-admission-required. No exit status is ever a capture, verification,
+/// or restore proof.
+#[cfg(windows)]
+fn render_backup_outcome(response: &eliot_cli::CommandResponse) -> Result<i32> {
+    let eliot_cli::CommandResult::Forwarded { payload } = &response.result else {
+        write_json_error(
+            "BACKUP_RESULT_NOT_TYPED",
+            "the backup route returned no typed outcome projection",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    };
+    let outcome: eliot_cli::backup::BackupOperationOutcome =
+        match serde_json::from_value(payload.clone()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                write_json_error("BACKUP_RESULT_NOT_TYPED", &error.to_string());
+                return Ok(INVALID_REQUEST_EXIT);
+            }
+        };
+    print!(
+        "{}",
+        eliot_cli::backup::render_backup_outcome_human(&outcome)
+    );
+    println!("{}", serde_json::to_string(&outcome)?);
+    Ok(match outcome.state.as_str() {
+        eliot_cli::backup::BACKUP_STATE_VERIFIED => 0,
+        eliot_cli::backup::BACKUP_STATE_INVALID => INVALID_REQUEST_EXIT,
+        _ => BACKUP_OWNER_ADMISSION_REQUIRED_EXIT,
+    })
+}
+
+/// Maps one typed backup delegation failure onto its own bounded status.
+///
+/// The typed failures stay distinct across the layer boundary: a closed
+/// front door, an unadmitted request identity, an unproven outcome, and a
+/// typed argument or result mismatch are four different reports. An unproven
+/// outcome is reported with the same-operation reconciliation instruction
+/// and never with a second capture or restore.
+#[cfg(windows)]
+fn report_backup_failure(
+    operation: &str,
+    request: &CommandRequest,
+    error: eliot_cli::backup::BackupClientError,
+) -> Result<i32> {
+    use eliot_cli::backup::BackupClientError;
+    use eliot_cli::kernel_client::KernelClientError;
+
+    match error {
+        BackupClientError::Transport(KernelClientError::FrontDoorClosed(contract)) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            Ok(FRONT_DOOR_CLOSED_EXIT)
+        }
+        BackupClientError::Transport(KernelClientError::UnknownOutcome(detail)) => {
+            let unknown =
+                eliot_cli::backup::backup_unknown_outcome(operation, &request.request, &detail);
+            print!(
+                "{}",
+                eliot_cli::backup::render_backup_unknown_human(&unknown)
+            );
+            println!("{}", serde_json::to_string(&unknown)?);
+            Ok(UNKNOWN_OUTCOME_EXIT)
+        }
+        BackupClientError::Transport(KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "BACKUP_REQUEST_IDENTITY_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for this backup operation; the identity must arrive through the admitted host request path, and the CLI never mints one",
+            );
+            Ok(INVALID_REQUEST_EXIT)
+        }
+        BackupClientError::Transport(KernelClientError::RestartRequired(detail)) => {
+            write_json_error("KERNEL_OPERATOR_RESTART_REQUIRED", &detail);
+            Ok(RESTART_REQUIRED_EXIT)
+        }
+        BackupClientError::Transport(
+            KernelClientError::Rejected(detail) | KernelClientError::Configuration(detail),
+        ) => {
+            write_json_error("BACKUP_OPERATION_REJECTED", &detail);
+            Ok(INVALID_REQUEST_EXIT)
+        }
+        BackupClientError::Client(error) => {
+            let (code, detail): (&str, String) = match error {
+                eliot_cli::CliError::InvalidArgument { field } => (
+                    "BACKUP_ARGUMENT_INVALID",
+                    format!("bounded typed field {field} is missing, blank, oversized, or outside the closed vocabulary"),
+                ),
+                eliot_cli::CliError::ArgumentCommandMismatch => (
+                    "BACKUP_COMMAND_ARGUMENT_MISMATCH",
+                    "the typed arguments do not match the advertised backup command".to_owned(),
+                ),
+                eliot_cli::CliError::CorrelationMismatch => (
+                    "BACKUP_CORRELATION_MISMATCH",
+                    "the Kernel reply is not bound to this request's operation identity".to_owned(),
+                ),
+                eliot_cli::CliError::ResultMismatch => (
+                    "BACKUP_RESULT_NOT_TYPED",
+                    "the Kernel reply does not carry the exact typed domain result for this operation"
+                        .to_owned(),
+                ),
+                other => ("BACKUP_REQUEST_REJECTED", other.to_string()),
+            };
+            write_json_error(code, &detail);
+            Ok(INVALID_REQUEST_EXIT)
+        }
+    }
+}
+
+/// Routes one backup catalogue command through the authenticated Kernel
+/// front door and renders both projections of the same typed result.
+///
+/// The Kernel client is the one already used by every other authenticated
+/// front door in this binary: this creates no second transport and no second
+/// client. The bounded typed arguments were admitted locally by the closed
+/// parsers, the correlated request identity came from the admitted host
+/// request path, and the domain outcome comes back as a typed result or as a
+/// distinct typed failure — never as a fabricated success.
+#[cfg(windows)]
+fn dispatch_backup_command(request: &CommandRequest) -> Result<i32> {
+    use eliot_cli::CliError;
+    use eliot_cli::backup::{BackupClientError, backup_create, backup_restore_test, backup_verify};
+
+    let Some(operation) = backup_operation(request.command) else {
+        write_json_error(
+            "BACKUP_COMMAND_UNKNOWN",
+            "the requested command is not one of the three advertised backup commands",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    };
+    let mut port = match AuthenticatedKernelPort::load() {
+        Ok(port) => port,
+        Err(CommandPortError::FrontDoorClosed { contract }) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(error) => {
+            write_json_error("KERNEL_CLIENT_CONFIGURATION_REJECTED", &error.to_string());
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+    };
+    let routed = match request.command {
+        eliot_cli::CommandId::BackupCreate => backup_create(&mut port.client, request),
+        eliot_cli::CommandId::BackupVerify => backup_verify(&mut port.client, request),
+        eliot_cli::CommandId::BackupRestoreTest => backup_restore_test(&mut port.client, request),
+        _ => Err(BackupClientError::Client(CliError::ArgumentCommandMismatch)),
+    };
+    match routed {
+        Ok(response) => render_backup_outcome(&response),
+        Err(error) => report_backup_failure(operation, request, error),
+    }
+}
+
+/// Non-Windows builds have no authenticated Windows Kernel front door, so
+/// no backup operation is ever admitted there.
+#[cfg(not(windows))]
+fn dispatch_backup_command(_request: &CommandRequest) -> Result<i32> {
+    write_json_error(
+        "KERNEL_APPLICATION_PORT_CLOSED",
+        "Windows authenticated Kernel front door",
+    );
+    Ok(FRONT_DOOR_CLOSED_EXIT)
 }
 
 fn run_catalogue(command: &CatalogueCommand) -> Result<()> {
@@ -3712,6 +4395,17 @@ fn init_tracing() {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_status_caller_rejects_untyped_kernel_health_payload() {
+        let error = decode_authenticated_kernel_runtime_health(json!({ "status": "OPEN" }))
+            .expect_err("an incomplete payload must not reach operator status");
+        assert!(matches!(
+            error,
+            AuthenticatedRuntimeHealthError::Invalid(detail)
+                if detail.contains("canonical runtime-health carrier")
+        ));
+    }
 
     #[test]
     fn command_tree_is_valid_and_catalogue_help_text_parses() {
@@ -3803,7 +4497,8 @@ mod tests {
     fn plugin_install_without_admitted_port_exits_nonsuccess() {
         // End-to-end CLI honesty: a valid manifest still cannot produce an
         // installed-success result without an admitted mutation port.
-        let root = std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create temp root");
         let target = root.join("config.json");
         std::fs::write(&target, b"{\"bridge\":\"demo\"}").expect("write target");
@@ -3837,10 +4532,9 @@ mod tests {
         .expect("install front door executes");
         assert_eq!(code, INVALID_REQUEST_EXIT);
         let receipt_path = rollback_dir.join("demo-bridge.installed.json");
-        let receipt: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&receipt_path).expect("read install receipt"),
-        )
-        .expect("parse install receipt");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read install receipt"))
+                .expect("parse install receipt");
         assert_eq!(receipt["status"], "INSTALL_NOT_ATTEMPTED");
         assert_eq!(receipt["code"], "PLAN_GAP");
         assert_eq!(receipt["completed"], false);

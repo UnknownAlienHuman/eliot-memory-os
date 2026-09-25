@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use eliot_contracts::{EpochId, EpochLineageId, OperationId, ResourceGeneration};
 use eliot_store_api::{
     CommitId, ERASURE_STATE_IRREVERSIBLE_CONSTRAINT, EffectClass, ErasureAdmissionRequest,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest, OperationIdentity,
-    OperationManifestDigest, OrderingScopeId, Resubmission, ScopeId, SecurityContext, StoreError,
-    TransitionClass, WriteReceipt, WriteReceiptStatus, admit_erasure_transition,
-    decode_erasure_surfaces, encode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OperationIdentity, OperationManifestDigest, OrderingScopeId, Resubmission, ScopeId,
+    SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    admit_erasure_transition, decode_erasure_surfaces, encode_erasure_surfaces,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -150,6 +150,9 @@ fn erasure_typed_parameters_are_closed() {
 
     // Missing explicit reason fails as a typed parameter error.
     plan.named_operations[0].parameters.remove("reason");
+    // Re-derive the bound digests after the plan mutation so the typed
+    // parameter gate (not a stale binding) decides the outcome.
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     assert!(matches!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::InvalidField {
@@ -164,6 +167,7 @@ fn erasure_typed_parameters_are_closed() {
     plan.named_operations[0]
         .parameters
         .insert("maintenance_window".to_owned(), json!("nightly"));
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     assert!(matches!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::InvalidField { .. })
@@ -179,6 +183,36 @@ fn erasure_typed_parameters_are_closed() {
         plan.validate_against_catalogue(&entries),
         Err(StoreError::TransitionClassExceeded)
     );
+}
+
+/// Issue #18: the admitted erasure transition binds derived (never
+/// defaulted) decision/plan digests and records no semantic source.
+#[test]
+fn admitted_erasure_transition_binds_derived_issue18_digests() {
+    let plan = admit_erasure_transition(&admission_request()).unwrap();
+    assert_eq!(
+        plan.mutation_plan_digest,
+        eliot_store_api::expected_mutation_plan_digest(&plan).unwrap()
+    );
+    assert_eq!(
+        plan.admission_digest,
+        eliot_store_api::expected_admission_digest(&plan).unwrap()
+    );
+    assert_ne!(
+        plan.admission_digest, plan.admission_contract_set_digest,
+        "the decision digest is distinct from the contract-set input"
+    );
+    assert!(
+        plan.semantic_source_revisions.is_empty(),
+        "fence-scoped erasure records no semantic source revisions"
+    );
+    assert!(plan.validate().is_ok());
+    let mut tampered = plan.clone();
+    tampered.mutation_plan_digest = "0".repeat(64);
+    assert!(matches!(
+        tampered.validate(),
+        Err(StoreError::TransitionDigestMismatch { .. })
+    ));
 }
 
 #[test]
@@ -218,6 +252,11 @@ fn restore_probe_receipt(operation: &str, class: TransitionClass) -> WriteReceip
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: OperationManifestDigest::new("e".repeat(64)).unwrap(),
+        // Frozen probe fixture: no plan content to recompute from, so the
+        // bindings keep format-valid shapes and `[]` source revisions.
+        admission_digest: "d".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{operation}")),
@@ -304,6 +343,9 @@ fn erasure_class_with_generic_reversible_operation_rejected() {
     let entries = generated_operation_manifests().unwrap();
     let mut plan = admit_erasure_transition(&admission_request()).unwrap();
     plan.named_operations[0].operation = NamedMutationOperation::ReconcileRecovery;
+    // Re-derive the bound digests after the plan mutation so the catalogue
+    // gate (not a stale binding) decides the outcome.
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
     assert_eq!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::TransitionClassExceeded),

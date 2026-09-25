@@ -19,8 +19,21 @@ eliot-profile-d2-operational = []
 eliot-profile-full-composition = []
 
 [dependencies]
+eliot-contracts.workspace = true
+eliot-platform.workspace = true
+eliot-process-executor.workspace = true
+eliot-process.workspace = true
 eliot-runtime.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
 eliot-wasm-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eliot-governor.workspace = true
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
+eliot-context-admission = { path = "../../crates/smart/eliot-context-admission", version = "0.1.0" }
+eliot-context-assembly = { path = "../../crates/smart/eliot-context-assembly", version = "0.1.0" }
+eliot-improvement = { path = "../../crates/meta/eliot-improvement", version = "0.1.0" }
 wasmtime.workspace = true
 thiserror.workspace = true
 
@@ -29,3 +42,15 @@ workspace = true
 
 [dev-dependencies]
 wat.workspace = true
+# Joined admitted-execution proof only: real Governor admission, real P03
+# executor lane, and the owner contract crates they thread. Never used by
+# the production composition below.
+eliot-contracts.workspace = true
+eliot-governor.workspace = true
+eliot-observation-contracts.workspace = true
+eliot-platform.workspace = true
+eliot-process.workspace = true
+eliot-process-executor.workspace = true
+eliot-receipts.workspace = true
+eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true

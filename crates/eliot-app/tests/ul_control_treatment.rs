@@ -3,8 +3,8 @@ mod support;
 
 use eliot_types::{
     AgentId, CapsuleBuild, ClaimCardInput, ClaimId, CommandContext, ConceptKind, ConceptNode,
-    CueBinding, CueKind, CueMatchMode, CueStrength, DependencyManifest, EpistemicStatus,
-    InjectionReceipt, LifecycleStatus, ObservabilityKind, ProjectId, PyramidBuildStatus,
+    CueBinding, CueMatchMode, CueStrength, DependencyManifest, EpistemicStatus, InjectionReceipt,
+    LegacyCueKindV1, LifecycleStatus, ObservabilityKind, ProjectId, PyramidBuildStatus,
     PyramidTargetKind, RelationInput, RelationType, SemanticCommand, SubsystemCapsule, TaintClass,
     TaskId, UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, UlTaskClassPolicy,
     Visibility, WriteId, ul_token_estimate,
@@ -843,7 +843,7 @@ fn failure_command(project_id: ProjectId) -> SemanticCommand {
         summary: "negative memory payload must become handle-only".to_owned(),
         payload: json!({
             "cue_bindings": [CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: "src/net/session.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
@@ -873,7 +873,7 @@ fn claim_command(project_id: ProjectId, claim_id: ClaimId) -> SemanticCommand {
             status: EpistemicStatus::Candidate,
             payload: json!({
                 "cue_bindings": [CueBinding {
-                    cue_kind: CueKind::FilePath,
+                    cue_kind: LegacyCueKindV1::FilePath,
                     cue_value: "src/net/session.rs".to_owned(),
                     match_mode: CueMatchMode::Exact,
                     strength: CueStrength::Primary,
@@ -901,7 +901,7 @@ fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId)
         entrypoint_refs: vec!["file:src/invariant/lib.rs".to_owned()],
         parent_concept_id: None,
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::Subsystem,
+            cue_kind: LegacyCueKindV1::Subsystem,
             cue_value: "invariant-subsystem".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
@@ -921,7 +921,7 @@ fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId)
         },
         build_id: build_id.clone(),
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::FilePath,
+            cue_kind: LegacyCueKindV1::FilePath,
             cue_value: "src/invariant/lib.rs".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

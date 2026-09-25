@@ -1,0 +1,27 @@
+{
+  "schema": "watchdog_spool_backup_snapshot_header.v1",
+  "description": "955/T1 owner-held snapshot header + high-water fixture. Digests are redacted placeholders, not payload material.",
+  "installation": "installation-7",
+  "watchdog_generation": 9,
+  "header": {
+    "schema_version": 1,
+    "next_sequence": 42,
+    "first_sequence": 37,
+    "record_count": 5,
+    "bytes": 2048
+  },
+  "high_water": {
+    "schema_version": 1,
+    "high_water_sequence": 41
+  },
+  "requester": {
+    "principal": "watchdog-spool-owner",
+    "request_id": "req-955-t1-0001",
+    "admission": "admit-955-t1-0001"
+  },
+  "operation": {
+    "operation_id": "op-955-t1-snapshot-0001",
+    "kind": "snapshot_backup"
+  },
+  "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

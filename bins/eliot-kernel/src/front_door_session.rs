@@ -286,6 +286,13 @@ impl KernelComposition {
         &self,
         host_expectation: &NamedPipePeerExpectation,
     ) -> Result<NamedPipePeerSet, KernelBuildError> {
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            let error =
+                KernelBuildError::Principal("bridge profile transition lock poisoned".to_owned());
+            observe_front_door_session("kernel.front_door_peer_set_build", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(&error));
+            return Err(error);
+        };
         observe_front_door_session("kernel.front_door_peer_set_build", "attempt");
         let result = self.front_door_peer_set_inner(host_expectation);
         match &result {
@@ -311,7 +318,12 @@ impl KernelComposition {
     ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
         for _ in 0..8 {
             let before = self.agent_bridge_peer_set_revision();
-            let peers = self.front_door_peer_set(host_expectation)?;
+            // The public snapshot boundary already owns the transition read
+            // guard. Re-entering `front_door_peer_set` here could block on a
+            // queued writer because `std::sync::RwLock` does not guarantee
+            // recursive reader acquisition. Keep the whole retry loop under
+            // that one guard and call the uninstrumented builder directly.
+            let peers = self.front_door_peer_set_inner(host_expectation)?;
             let after = self.agent_bridge_peer_set_revision();
             if before == after {
                 return Ok((after, peers));
@@ -327,14 +339,21 @@ impl KernelComposition {
     ///
     /// Diagnostic wrapper: preserves the exact revision pair, emits the
     /// snapshot observation with the retained revision, and keeps one
-    /// designated terminal per underlying failure. A peer-set propagation
-    /// failure already emitted its terminal inside `front_door_peer_set`,
-    /// so only the continuous-churn failure emits here.
+    /// designated terminal per underlying failure. The snapshot path calls
+    /// the uninstrumented builder while it owns the transition read guard, so
+    /// this wrapper emits the terminal for both builder failures and churn.
     #[cfg(windows)]
     pub fn front_door_peer_set_snapshot(
         &self,
         host_expectation: &NamedPipePeerExpectation,
     ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
+        let Ok(_transition) = self.agent_bridge_transition_read() else {
+            let error =
+                KernelBuildError::Principal("bridge profile transition lock poisoned".to_owned());
+            observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(&error));
+            return Err(error);
+        };
         observe_front_door_session("kernel.front_door_peer_set_snapshot", "attempt");
         let result = self.front_door_peer_set_snapshot_inner(host_expectation);
         match &result {
@@ -345,15 +364,179 @@ impl KernelComposition {
                 let is_churn = matches!(error, KernelBuildError::Principal(reason) if reason.contains("changed continuously"));
                 if is_churn {
                     observe_peer_snapshot(self.agent_bridge_peer_set_revision(), "fenced");
-                    super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(
-                        error,
-                    ));
                 } else {
                     observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
                 }
+                super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(error));
             }
         }
         result
+    }
+
+    /// Binds the Host `UserAutomation` owner to the exact live Kernel
+    /// activation contour.
+    ///
+    /// The named-pipe peer set authenticates the presenting Host process. The
+    /// retained candidate, activation receipt, and ready receipt then bind
+    /// the `ClientHello` to the current Kernel generation and activation
+    /// receipt digest. This session advertises only the requester-side
+    /// Dreamer capability; no caller payload can widen it.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn bind_host_user_automation_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_host_user_automation_bind", "attempt");
+        let connection_id = connection_id.into();
+        if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+
+        let (candidate, activation, ready) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if service.state() != KernelServiceState::Ready {
+                return Err(TransportError::SessionFenced);
+            }
+            let candidate = service
+                .candidate_binding()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            let activation = service
+                .activation_receipt()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            let ready = service
+                .ready_receipt()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            (candidate, activation, ready)
+        };
+        candidate
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if activation.candidate_binding_digest
+            != candidate
+                .compute_digest()
+                .map_err(|_| TransportError::SessionFenced)?
+            || activation.authority_epoch != candidate.kernel_epoch
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        ready
+            .validate(&candidate, &activation)
+            .map_err(|_| TransportError::SessionFenced)?;
+
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let activation_digest = sha256_hex(
+            &canonical_json_bytes(&activation).map_err(|_| TransportError::SessionFenced)?,
+        );
+        let expected_fence = StateFence::new(candidate.kernel_epoch.clone(), activation.generation);
+        let peer_binding = peer
+            .process_binding()
+            .ok_or(TransportError::PeerIdentityUnavailable)?;
+        if peer_binding.process_id() != candidate.host_process.process_id
+            || peer_binding.start_time_100ns() != candidate.host_process.start_time_100ns
+            || !peer_binding
+                .image_path()
+                .eq_ignore_ascii_case(&candidate.host_process.image_path)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if client.module_bridge_identity != USER_AUTOMATION_KERNEL_MODULE_ID
+            || client.artifact_hash.as_str() != candidate.artifact_hash.as_str()
+            || client.module_generation.module_id.as_str() != USER_AUTOMATION_KERNEL_MODULE_ID
+            || client.module_generation.generation != activation.generation
+            || client.module_generation.artifact_id.as_str() != candidate.artifact_hash.as_str()
+            || client.module_generation.state != ModuleGenerationState::Active
+            || client.module_generation.state_fence != expected_fence
+            || client.authority_epoch != candidate.kernel_epoch
+            || client.launch_nonce != activation_digest
+            || client.capabilities.len() != 1
+            || client.capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
+            || client.module_contract.required_capabilities.len() != 1
+            || client.module_contract.required_capabilities[0] != USER_AUTOMATION_KERNEL_CAPABILITY
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        if !policy
+            .allowed_capabilities
+            .iter()
+            .any(|capability| capability == USER_AUTOMATION_KERNEL_CAPABILITY)
+            || !policy
+                .allowed_privacy_classes
+                .iter()
+                .any(|privacy| privacy == USER_AUTOMATION_KERNEL_PRIVACY_CLASS)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // `allowed_effects` belongs to the shared daemon policy.  This
+        // server-authored special session deliberately projects no effects;
+        // its Submit request is admitted separately by the typed Dreamer
+        // route and its own canonical request authority.  Do not inherit the
+        // daemon effect set merely because both routes use one front door.
+        let mut session =
+            Session::establish(connection_id.clone(), peer, client, policy.protocol_range)?;
+        session
+            .capabilities
+            .retain(|capability| policy.allowed_capabilities.contains(capability));
+        session
+            .privacy_classes
+            .retain(|privacy| policy.allowed_privacy_classes.contains(privacy));
+        if session.capabilities != vec![USER_AUTOMATION_KERNEL_CAPABILITY.to_owned()]
+            || session.privacy_classes != vec![USER_AUTOMATION_KERNEL_PRIVACY_CLASS.to_owned()]
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session.effects.clear();
+        let config_snapshot = serde_json::json!({
+            "policy": policy.config_snapshot,
+            "eliot.user_automation": {
+                "capability": USER_AUTOMATION_KERNEL_CAPABILITY,
+                "privacy_classes": session.privacy_classes.clone(),
+                "effects": session.effects.clone(),
+                "candidate_binding_sha256": candidate_digest,
+                "activation_receipt_sha256": activation_digest,
+                "connection_id": connection_id,
+            },
+        });
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING.to_owned(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot,
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel,
+            rejection_reason: None,
+            authority_epoch: candidate.kernel_epoch,
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        observe_front_door_session("kernel.front_door_host_user_automation_bind", "success");
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
     }
 
     /// Binds an authenticated local peer to the selected principal/session.
@@ -375,6 +558,10 @@ impl KernelComposition {
             // The bridge has a server-first transport owner. It must never
             // enter the legacy client-first Session/dispatch path.
             return Err(TransportError::SessionFenced);
+        }
+        #[cfg(windows)]
+        if client.module_bridge_identity == USER_AUTOMATION_KERNEL_MODULE_ID {
+            return self.bind_host_user_automation_session(connection_id, peer, client);
         }
         #[cfg(windows)]
         if client.module_bridge_identity == ACTIVE_DAEMON_CALLER {

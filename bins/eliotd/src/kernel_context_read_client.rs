@@ -21,8 +21,10 @@
 //! [`NamedReadOperation::GetCurrentEpistemicPosition`],
 //! [`NamedReadOperation::GetTaskState`],
 //! [`NamedReadOperation::GetAttentionAndProblems`],
-//! [`NamedReadOperation::GetUnderstandingProjectionInputs`] and
-//! [`NamedReadOperation::GetCapabilityEvidenceState`] pass
+//! [`NamedReadOperation::GetUnderstandingProjectionInputs`],
+//! [`NamedReadOperation::GetCapabilityEvidenceState`],
+//! [`NamedReadOperation::GetNotificationState`], and the `#2100` owner-feed
+//! [`NamedReadOperation::GetAuthorityRevocationHistory`] pass
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
@@ -56,7 +58,8 @@ use eliot_protocol::{
 use eliot_read::{LocalReadPort, QueryResult, ReadError};
 use eliot_store_api::{
     CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
+    NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS, ReadConsistency, RevisionHead, RevisionKey,
+    ScopeId, StoreError,
 };
 
 use super::{DaemonKernelClient, SERVICE_NAME};
@@ -117,13 +120,16 @@ impl KernelContextReadClient {
     /// Checks the T11.1–T11.3 execute capability before any transport is touched:
     /// `GetEvidencePack` (scope-bound, structurally valid),
     /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
-    /// Subject required, structurally valid), or one of the four task-bound
+    /// Subject required, structurally valid), one of the four task-bound
     /// reconstruction reads (scope-bound, `ExactFence`, currently no
     /// parameters: this pre-transport gate is deliberately stricter than the
     /// store catalogue, which declares bounded exact selectors for these
     /// reads — parameter-carrying requests fail here until a follow-up
     /// threads the closed selectors, and parameter-free requests fail
-    /// downstream at the catalogue; either way no unvalidated read crosses).
+    /// downstream at the catalogue; either way no unvalidated read crosses),
+    /// or the `#2100` owner-feed `GetAuthorityRevocationHistory`
+    /// (scope-bound, `Eventual`, exactly the catalogue-declared
+    /// `origin_ref`/`max_records` selectors).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
@@ -141,6 +147,26 @@ impl KernelContextReadClient {
             | NamedReadOperation::GetUnderstandingProjectionInputs
             | NamedReadOperation::GetCapabilityEvidenceState => {
                 Self::check_reconstruction_capability(request)
+            }
+            NamedReadOperation::GetNotificationState => Self::check_notification_selectors(request),
+            NamedReadOperation::GetAuthorityRevocationHistory => {
+                Self::check_revocation_history_selectors(request)
+            }
+            NamedReadOperation::GetAuditRange => {
+                if request.scope_id.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetAuditRange is scope-free; scope filtering stays consumer-owned",
+                    });
+                }
+                if !request.parameters.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameters",
+                        reason: "GetAuditRange takes no parameters",
+                    });
+                }
+                request.validate()?;
+                Ok(())
             }
             NamedReadOperation::GetCurrentEpistemicPosition => {
                 if request.scope_id.is_none() {
@@ -174,6 +200,145 @@ impl KernelContextReadClient {
             }
             _ => Err(StoreError::UnknownOperation),
         }
+    }
+
+    /// Checks the closed notification-read selectors before any transport:
+    /// `ExactFence` consistency, a `page_limit` decimal string in `1..=128`,
+    /// an `include_resolved` `"true"`/`"false"` string, optional non-blank
+    /// `scope`/`dedup_key`/`notification_id`/`cursor` text, and no other
+    /// parameter keys. Mirrors the store contract's
+    /// `notification_read_request` bounds without reimplementing its
+    /// catalogue: anything outside the closed selector set fails closed
+    /// here, and the store catalogue re-validates on its leg.
+    fn check_notification_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        const ALLOWED: [&str; 6] = [
+            "scope",
+            "dedup_key",
+            "notification_id",
+            "include_resolved",
+            "page_limit",
+            "cursor",
+        ];
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "GetNotificationState requires ExactFence",
+            });
+        }
+        for key in request.parameters.keys() {
+            if !ALLOWED.contains(&key.as_str()) {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "unknown notification read parameter",
+                });
+            }
+        }
+        let limit = request
+            .parameters
+            .get("page_limit")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "notification.page_limit",
+                reason: "page limit is required",
+            })?;
+        match limit.parse::<u16>() {
+            Ok(value) if (1..=128).contains(&value) => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "notification.page_limit",
+                    reason: "page limit is out of range",
+                });
+            }
+        }
+        match request
+            .parameters
+            .get("include_resolved")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("true" | "false") => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "notification.include_resolved",
+                    reason: "include_resolved must be true or false",
+                });
+            }
+        }
+        for key in ["scope", "dedup_key", "notification_id", "cursor"] {
+            if let Some(value) = request.parameters.get(key) {
+                match value.as_str() {
+                    Some(text)
+                        if !text.trim().is_empty() && !text.chars().any(char::is_control) => {}
+                    _ => {
+                        return Err(StoreError::InvalidField {
+                            field: "operation.parameter",
+                            reason: "notification text selector must be non-blank text",
+                        });
+                    }
+                }
+            }
+        }
+        request.validate()?;
+        Ok(())
+    }
+
+    /// Checks the closed `#2100` owner-feed history selectors before any
+    /// transport: a scope-bound Governor read carrying exactly the
+    /// catalogue-declared `origin_ref`/`max_records` selectors at the
+    /// builder's `Eventual` consistency. `origin_ref` follows the store
+    /// Subject rule (non-blank, no control characters); `max_records` is a
+    /// decimal string within `1..=REVOCATION_HISTORY_MAX_RECORDS`. Anything
+    /// outside this closed shape fails closed here; the admitted-fence
+    /// binding, the catalogue re-validation, the Kernel live-fence check,
+    /// and the evidence decode run on their own legs.
+    fn check_revocation_history_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        if request.scope_id.is_none() {
+            return Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "GetAuthorityRevocationHistory requires an exact scope",
+            });
+        }
+        if request.consistency != ReadConsistency::Eventual {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "GetAuthorityRevocationHistory requires Eventual",
+            });
+        }
+        if request.parameters.len() != 2
+            || !request.parameters.contains_key("origin_ref")
+            || !request.parameters.contains_key("max_records")
+        {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "GetAuthorityRevocationHistory takes exactly origin_ref and max_records",
+            });
+        }
+        let origin = request
+            .parameters
+            .get("origin_ref")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if origin.trim().is_empty() || origin.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "origin_ref must be a non-blank string",
+            });
+        }
+        let bound = request
+            .parameters
+            .get("max_records")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match bound.parse::<u32>() {
+            Ok(value) if value != 0 && value <= REVOCATION_HISTORY_MAX_RECORDS => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records is outside the advertised bound",
+                });
+            }
+        }
+        request.validate()?;
+        Ok(())
     }
 
     /// Checks the local-read execute capability before any read is served:
@@ -696,6 +861,15 @@ impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
             return Err(StoreError::FenceMismatch);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl KernelContextReadClient {
+    /// Test-only entry to the closed capability gate: proves the exact
+    /// notification selector set admitted above without touching transport.
+    pub(crate) fn check_board_read_for_test(request: &NamedReadRequest) -> Result<(), StoreError> {
+        Self::check_execute_capability(request)
     }
 }
 

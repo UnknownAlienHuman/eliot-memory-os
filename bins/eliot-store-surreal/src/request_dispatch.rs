@@ -17,7 +17,10 @@ use eliot_protocol::dreamer_job::DurableJobRequest;
 use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
+use eliot_store_api::NamedReadRequest;
 use eliot_store_api::RequestMeta;
+use eliot_store_api::StoreBackupOperation;
+use eliot_store_api::StoreBackupRequest;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureIdentityContext;
@@ -122,11 +125,14 @@ pub(crate) fn map_composition_error(
     }
 }
 
-fn failure_context_for_fence(
-    state_fence: eliot_contracts::StateFence,
-) -> StoreFailureIdentityContext {
+fn failure_context_for_named_read(request: &NamedReadRequest) -> StoreFailureIdentityContext {
+    // The EBP client admits this exact operation-kind identity for every
+    // named read. Bind failures must echo it (or its SHA-256 digest), not an
+    // independent request digest, or the client correctly rejects them as an
+    // identity conflict before it can preserve StoreError::Unavailable.
     StoreFailureIdentityContext {
-        state_fence_ref_or_exact_safe_projection: Some(state_fence),
+        idempotency_key_ref_or_digest: Some("store-named-read".to_owned()),
+        state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
         ..StoreFailureIdentityContext::default()
     }
 }
@@ -152,6 +158,54 @@ fn failure_context_for_operation(
         operation_id: Some(operation_id),
         idempotency_key_ref_or_digest: Some(idempotency_key),
         state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
+/// Builds the typed-failure identity context for one admitted backup
+/// envelope (issue #975).
+///
+/// The stable mutation identity comes from the operation payload itself:
+/// capture/restore/reconcile operations carry their `OperationIdentity`,
+/// page/close carry the owner-issued handle identity, and status carries
+/// the queried operation. Isolated-destination preparation carries no
+/// mutation identity by construction, so the destination digest stands in
+/// as the correlation ref — mirroring `failure_context_for_recovery` —
+/// with `operation_id` left `None`. The fence always comes from the
+/// admitted envelope context, never from payload mirrors.
+pub(crate) fn failure_context_for_backup(
+    request: &StoreBackupRequest,
+) -> StoreFailureIdentityContext {
+    let (operation_id, idempotency_key_ref_or_digest) = match &request.operation {
+        StoreBackupOperation::Begin(begin) => (
+            Some(begin.operation.operation_id.clone()),
+            Some(begin.operation.idempotency_key.clone()),
+        ),
+        StoreBackupOperation::Page { handle, .. } | StoreBackupOperation::End { handle } => (
+            Some(handle.operation_id.clone()),
+            Some(handle.idempotency_key.clone()),
+        ),
+        StoreBackupOperation::PrepareDestination(destination) => (
+            None,
+            canonical_json_bytes(destination)
+                .ok()
+                .map(|bytes| sha256_hex(&bytes)),
+        ),
+        StoreBackupOperation::RestoreBatch(batch) | StoreBackupOperation::Validate(batch) => (
+            Some(batch.operation.operation_id.clone()),
+            Some(batch.operation.idempotency_key.clone()),
+        ),
+        StoreBackupOperation::Status { operation_id } => (Some(operation_id.clone()), None),
+        StoreBackupOperation::Reconcile { first, .. } => (
+            Some(first.operation_id.clone()),
+            Some(first.idempotency_key.clone()),
+        ),
+    };
+    StoreFailureIdentityContext {
+        request_id: Some(request.context.request_id.clone()),
+        operation_id,
+        idempotency_key_ref_or_digest,
+        state_fence_ref_or_exact_safe_projection: Some(request.context.state_fence.clone()),
         ..StoreFailureIdentityContext::default()
     }
 }
@@ -287,6 +341,14 @@ pub(crate) async fn dispatch_dreamer_job(
     }
 }
 
+async fn dispatch_named_request(store: &StoreComposition, request: NamedReadRequest) -> Response {
+    let context = failure_context_for_named_read(&request);
+    match store.named(request).await {
+        Ok(response) => Response::Named { response },
+        Err(error) => map_store_error(error, context),
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait StoreDispatchBackend: Send + Sync {
     async fn dispatch_request(&self, request: Request) -> Response;
@@ -307,13 +369,7 @@ impl StoreDispatchBackend for StoreComposition {
                 Ok(receipt) => Response::Readiness { receipt },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
-            Request::Named { request } => {
-                let context = failure_context_for_fence(request.state_fence.clone());
-                match self.named(request).await {
-                    Ok(response) => Response::Named { response },
-                    Err(error) => map_store_error(error, context),
-                }
-            }
+            Request::Named { request } => dispatch_named_request(self, request).await,
             Request::Apply {
                 context,
                 transition,
@@ -358,10 +414,28 @@ impl StoreDispatchBackend for StoreComposition {
                     request.transition.identity.operation_id.clone(),
                     request.transition.identity.idempotency_key.clone(),
                 );
-                match self.apply_reserved_write(request).await {
+                match Box::pin(self.apply_reserved_write(request)).await {
                     Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
                     Err(error) => map_composition_error(error, failure_context),
                 }
+            }
+            // Issue #975: one authenticated backup arm. The closed envelope
+            // carries its fence-bound context beside the operation; the
+            // failure context binds the admitted envelope identity and the
+            // arm delegates once to the backup dispatch seam. An
+            // unimplemented/default port refuses with a typed failure
+            // before any provider I/O and never falls back to `Apply` or
+            // any other operation.
+            Request::Backup { request } => {
+                let failure_context = failure_context_for_backup(&request);
+                // Boxed: restore batches carry bounded head lists plus the
+                // admitted context across provider awaits.
+                Box::pin(crate::backup_dispatch::dispatch_backup(
+                    self,
+                    request,
+                    failure_context,
+                ))
+                .await
             }
             Request::RevisionHeads { keys } => match self.revision_heads(keys).await {
                 Ok(heads) => Response::RevisionHeads { heads },
@@ -436,6 +510,13 @@ mod reconcile_mapping_tests {
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-reconcile")
                 .expect("manifest digest"),
+            // Standalone-fixture issue-#18 values (not bound to a
+            // transition): this seed only exercises envelopeless
+            // reconciliation, never digest bindings. Shapes stay valid so
+            // `validate()` reaches the behavior under test.
+            admission_digest: "e".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

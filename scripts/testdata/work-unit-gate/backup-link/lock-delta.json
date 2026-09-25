@@ -1,0 +1,12 @@
+{
+  "base": "9cddf1752596faf971e7c718df76da3a9f2dff00",
+  "delta": "no-manifest-delta: kernel eliot-backup path edge already resolved; kernel lock entry includes eliot-backup; no upgrades",
+  "kernel_lock_includes": [
+    "eliot-backup"
+  ],
+  "forbidden": [
+    "version-upgrade",
+    "unrelated-alias",
+    "members-change"
+  ]
+}

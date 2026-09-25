@@ -1,0 +1,86 @@
+{
+  "capability": "store.backup",
+  "rows": [
+    {
+      "port": "SnapshotBeginRequest",
+      "wire": "Backup/Begin",
+      "capability": "store.backup",
+      "client": "backup_begin",
+      "composition": "StoreComposition::backup_begin",
+      "backend": "CanonicalSnapshotPort::begin_snapshot",
+      "response": "Backup/Begin(SnapshotHandle)"
+    },
+    {
+      "port": "SnapshotHandle+SnapshotCursor",
+      "wire": "Backup/Page",
+      "capability": "store.backup",
+      "client": "backup_page",
+      "composition": "StoreComposition::backup_page",
+      "backend": "CanonicalSnapshotPort::read_snapshot_page",
+      "response": "Backup/Page(SnapshotPage)"
+    },
+    {
+      "port": "SnapshotHandle",
+      "wire": "Backup/End",
+      "capability": "store.backup",
+      "client": "backup_end",
+      "composition": "StoreComposition::backup_end",
+      "backend": "CanonicalSnapshotPort::end_snapshot",
+      "response": "Backup/End(SnapshotEndReceipt)"
+    },
+    {
+      "port": "IsolatedDestination",
+      "wire": "Backup/PrepareDestination",
+      "capability": "store.backup",
+      "client": "backup_prepare_destination",
+      "composition": "StoreComposition::backup_prepare_destination",
+      "backend": "IsolatedRestorePort::prepare_isolated_destination",
+      "response": "Backup/PrepareDestination(IsolationEvidence)"
+    },
+    {
+      "port": "CanonicalRestoreBatch",
+      "wire": "Backup/RestoreBatch",
+      "capability": "store.backup",
+      "client": "backup_restore_batch",
+      "composition": "StoreComposition::backup_restore_batch",
+      "backend": "IsolatedRestorePort::restore_canonical_batch",
+      "response": "Backup/RestoreBatch(RestoreValidationReceipt)"
+    },
+    {
+      "port": "CanonicalRestoreBatch",
+      "wire": "Backup/Validate",
+      "capability": "store.backup",
+      "client": "backup_validate",
+      "composition": "StoreComposition::backup_validate",
+      "backend": "IsolatedRestorePort::validate_restore",
+      "response": "Backup/Validate(RestoreValidationReceipt)"
+    },
+    {
+      "port": "SnapshotHandle",
+      "wire": "Backup/Status",
+      "capability": "store.backup",
+      "client": "backup_status",
+      "composition": "StoreComposition::backup_status",
+      "backend": "RestoreLedger::readback",
+      "response": "Backup/Status(status report)"
+    },
+    {
+      "port": "OperationIdentity x OperationIdentity",
+      "wire": "Backup/Reconcile",
+      "capability": "store.backup",
+      "client": "backup_reconcile",
+      "composition": "StoreComposition::backup_reconcile",
+      "backend": "IsolatedRestorePort::reconcile_operation",
+      "response": "Backup/Reconcile(BackupOperationReconciliation)"
+    },
+    {
+      "port": "ReservedWriteRequest",
+      "wire": "ReservedWrite",
+      "capability": "store.reserved_write",
+      "client": "apply_reserved_write",
+      "composition": "StoreComposition::apply_reserved_write",
+      "backend": "CanonicalStoreClient::apply_reserved_write",
+      "response": "Transaction/Unknown"
+    }
+  ]
+}

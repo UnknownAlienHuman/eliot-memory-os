@@ -2781,9 +2781,7 @@ fn assumption_and_investigation_cannot_serialize_as_support() -> CaseResult {
     for wire in [encoded(&held)?, encoded(&inquiry)?] {
         let value: serde_json::Value =
             serde_json::from_str(&wire).map_err(|_| ContractError::Canonicalization)?;
-        let member = value
-            .as_object()
-            .ok_or(ContractError::Canonicalization)?;
+        let member = value.as_object().ok_or(ContractError::Canonicalization)?;
         for forbidden in ["result", "handles", "verdict", "support"] {
             assert!(
                 !member.contains_key(forbidden),

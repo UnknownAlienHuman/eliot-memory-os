@@ -68,7 +68,7 @@ fn frame_rejection_defect(
                 conflict: None,
                 retry_after_ms: None,
                 retry_after_dependency_revision: None,
-                evidence_handles: Default::default(),
+                evidence_handles: eliot_store_api::StoreEvidenceHandles::default(),
                 evidence_ref: None,
                 human_detail,
             };
@@ -120,13 +120,11 @@ fn enforce_store_compatibility(
 }
 
 #[cfg(windows)]
-#[allow(clippy::print_stdout)]
-async fn run() -> Result<(), String> {
-    let mode = parse_launch_mode(std::env::args_os().skip(1))?;
+fn emit_bootstrap_descriptor(mode: &LaunchMode) -> Result<bool, String> {
     if let LaunchMode::EmitBootstrapDescriptor {
         config_path,
         output_path,
-    } = &mode
+    } = mode
     {
         let config = load_config(Some(config_path))?;
         let descriptor = store_bootstrap_descriptor(&config)?;
@@ -134,26 +132,19 @@ async fn run() -> Result<(), String> {
             .map_err(|error| format!("serialize neutral bootstrap descriptor: {error}"))?;
         std::fs::write(output_path, bytes)
             .map_err(|error| format!("write neutral bootstrap descriptor: {error}"))?;
-        return Ok(());
+        return Ok(true);
     }
-    let Some(config) = prepare_launch(mode).await? else {
-        return Ok(());
-    };
-    enforce_store_compatibility(&config)?;
-    let composition = StoreComposition::new(&config)?;
-    composition.connect().await?;
-    // Post-connect re-verification (issue #1932): the adapter has now proved
-    // spawned-artifact identity, listener ownership and server major over its
-    // ownership-verified channel. Reload the decision record and require the
-    // same admission before serving: a record swapped, revoked or drifted
-    // across the provider-startup window must fail closed here, never at the
-    // first canonical write.
-    enforce_store_compatibility(&config)?;
-    // Observed-identity binding (issue #1932, backend handoff §3): the
-    // adapter proved the live version and spawn-validated digest over its
-    // ownership-verified channel during connect. Bind the record echo to
-    // that observation before serving: a rotated binary or drifted record
-    // fails closed here, never at the first canonical write.
+    Ok(false)
+}
+
+#[cfg(windows)]
+// This standalone service has no initialized telemetry sink before startup;
+// stderr is the only fail-closed launch diagnostic available to its supervisor.
+#[allow(clippy::print_stderr)]
+fn bind_observed_identity(
+    composition: &StoreComposition,
+    config: &eliot_store_surreal::StoreLaunchConfig,
+) -> Result<(), String> {
     let observed = composition
         .observed_provider_identity()
         .ok_or_else(|| "provider identity was not proved by connect".to_owned())?;
@@ -169,12 +160,14 @@ async fn run() -> Result<(), String> {
         &observed.artifact_digest,
     )?;
     eprintln!("{SERVICE_NAME}: {bound_report}");
-    let readiness = composition
-        .readiness()
-        .await
-        .map_err(|error| format!("semantic Store readiness failed: {error}"))?;
-    require_semantic_ready_for_pipe(&readiness, &config.schema_generation)?;
+    Ok(())
+}
 
+#[cfg(windows)]
+async fn serve_handshake_loop(
+    composition: &StoreComposition,
+    config: &eliot_store_surreal::StoreLaunchConfig,
+) -> Result<(), String> {
     let limits = TransportLimits::default();
     let expectation = eliot_platform_windows::NamedPipePeerExpectation::new(
         config.expected_client_sid.clone(),
@@ -204,7 +197,7 @@ async fn run() -> Result<(), String> {
         }),
     );
     let (mut session, server_hello) =
-        admit_handshake(hello_frame, limits, &config, &handshake_identity)?;
+        admit_handshake(hello_frame, limits, config, &handshake_identity)?;
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes();
     let handshake_frame = control_frame(
@@ -225,7 +218,7 @@ async fn run() -> Result<(), String> {
             .await
             .map_err(|error| format!("EBP frame rejected: {error}"))?;
         let response = match validate_request_frame(&mut session, &frame) {
-            Ok(request) => Box::pin(dispatch(&composition, request)).await,
+            Ok(request) => Box::pin(dispatch(composition, request)).await,
             Err(error) => frame_rejection_defect(frame.request_id.clone(), error),
         };
         let response_frame = eliot_store_api::response_frame(
@@ -240,6 +233,40 @@ async fn run() -> Result<(), String> {
             .await
             .map_err(|error| format!("EBP response failed: {error}"))?;
     }
+}
+
+#[cfg(windows)]
+#[allow(clippy::print_stdout)]
+async fn run() -> Result<(), String> {
+    let mode = parse_launch_mode(std::env::args_os().skip(1))?;
+    if emit_bootstrap_descriptor(&mode)? {
+        return Ok(());
+    }
+    let Some(config) = prepare_launch(mode).await? else {
+        return Ok(());
+    };
+    enforce_store_compatibility(&config)?;
+    let composition = StoreComposition::new(&config)?;
+    composition.connect().await?;
+    // Post-connect re-verification (issue #1932): the adapter has now proved
+    // spawned-artifact identity, listener ownership and server major over its
+    // ownership-verified channel. Reload the decision record and require the
+    // same admission before serving: a record swapped, revoked or drifted
+    // across the provider-startup window must fail closed here, never at the
+    // first canonical write.
+    enforce_store_compatibility(&config)?;
+    // Observed-identity binding (issue #1932, backend handoff §3): the
+    // adapter proved the live version and spawn-validated digest over its
+    // ownership-verified channel during connect. Bind the record echo to
+    // that observation before serving: a rotated binary or drifted record
+    // fails closed here, never at the first canonical write.
+    bind_observed_identity(&composition, &config)?;
+    let readiness = composition
+        .readiness()
+        .await
+        .map_err(|error| format!("semantic Store readiness failed: {error}"))?;
+    require_semantic_ready_for_pipe(&readiness, &config.schema_generation)?;
+    serve_handshake_loop(&composition, &config).await
 }
 
 #[cfg(not(windows))]

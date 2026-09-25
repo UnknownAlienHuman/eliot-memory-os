@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 
 use eliot_mcp::{
     CANONICAL_DEFINITION_VERSION, CANONICAL_TOOL_NAMES, OperationalProjection, StateInput,
-    ToolMethodIdentity, ToolRequest, canonical_known_tools, canonical_registry,
-    invalidation_on_profile_change, known_tool_profile, profile_version_changed,
-    published_mcp_tool_surface, routing_decision, validate_operational_projection,
-    validate_tool_request_owner,
+    ToolMethodIdentity, ToolRequest, UserAutomationInput, canonical_known_tools,
+    canonical_registry, invalidation_on_profile_change, known_tool_profile,
+    profile_version_changed, published_mcp_tool_surface, routing_decision,
+    validate_operational_projection, validate_tool_request_owner,
 };
 
 fn identity(name: &str) -> ToolMethodIdentity {
@@ -118,6 +118,52 @@ fn contract_request_and_transport_surface_join_to_the_owner() {
         .map(|descriptor| descriptor.name.as_str())
         .collect();
     assert_eq!(names, CANONICAL_TOOL_NAMES);
+}
+
+/// H-A adapter predicate: the production canonical registry value answers
+/// exactly what the Skill-owned `CanonicalToolSource` port will delegate to
+/// (`definition_version` binding + `resolve(...).is_ok()` membership at the
+/// bound version). Proves the impl body against the real registry; the trait
+/// `impl` itself applies verbatim once the Skill owner's trait merges.
+#[test]
+fn canonical_registry_value_answers_version_bound_skill_membership() {
+    let registry = canonical_registry().expect("canonical registry builds");
+    // The bound version the port reports is the frozen pinned version.
+    assert_eq!(CANONICAL_DEFINITION_VERSION, "1.2.0");
+    // Membership is exactly the registry's answer at the bound version.
+    for name in CANONICAL_TOOL_NAMES {
+        assert!(
+            registry.resolve(name, CANONICAL_DEFINITION_VERSION).is_ok(),
+            "profiled method must be known: {name}"
+        );
+    }
+    assert!(
+        registry
+            .resolve("vendor.effect", CANONICAL_DEFINITION_VERSION)
+            .is_err(),
+        "unprofiled method must be absent, never synthesized"
+    );
+}
+
+#[test]
+fn user_automation_route_is_typed_but_not_a_hot_tool_owner() {
+    let request = ToolRequest::UserAutomation(UserAutomationInput {
+        operation: eliot_kernel_core::UserAutomationOperation::List {
+            include_retired: false,
+        },
+        idempotency_key: "operator-retry-1".to_owned(),
+    });
+    assert!(
+        validate_tool_request_owner(&request).is_err(),
+        "cold operator route must not resolve through the hot-tool registry"
+    );
+    assert!(!CANONICAL_TOOL_NAMES.contains(&request.canonical_name()));
+    let surface = published_mcp_tool_surface().expect("material surface builds");
+    assert!(
+        !surface
+            .iter()
+            .any(|descriptor| descriptor.name == "eliot_user_automation")
+    );
 }
 
 /// Single owner: one disagreeing MCP/WIT/EBP view fails against the profile.

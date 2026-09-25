@@ -202,16 +202,31 @@ mod tests {
         let digest = Sha256Digest::of_bytes(b"shadow-gate-fixture");
         let limits = crate::typed_execution::default_experimental_limits(digest.clone());
         let usage = EngineUsage {
-            attempted_output_bytes: 0, output_bytes: 0, host_calls: 0, fuel_consumed: 7,
-            peak_memory_bytes: Some(1024), table_elements: Some(0), instances: 1, stack_bytes: None,
-            enforced_stack_limit_bytes: Some(limits.max_stack_bytes), elapsed_ms: 3,
-            effective_epoch_policy: limits.epoch, epoch_ticks: Some(9), artifact_reads: 1,
-            artifact_bytes: 1024, accessed_artifact_digests: vec![digest.clone()],
+            attempted_output_bytes: 0,
+            output_bytes: 0,
+            host_calls: 0,
+            fuel_consumed: 7,
+            peak_memory_bytes: Some(1024),
+            table_elements: Some(0),
+            instances: 1,
+            stack_bytes: None,
+            enforced_stack_limit_bytes: Some(limits.max_stack_bytes),
+            elapsed_ms: 3,
+            effective_epoch_policy: limits.epoch,
+            epoch_ticks: Some(9),
+            artifact_reads: 1,
+            artifact_bytes: 1024,
+            accessed_artifact_digests: vec![digest.clone()],
         };
         let mut report = EngineReport {
-            request_digest: digest.clone(), termination: EngineTermination::Completed, usage,
-            output: Vec::new(), host_calls: Vec::new(), proposed_effects: Vec::new(),
-            observed_state_delta: Vec::new(), post_commit_known: true,
+            request_digest: digest.clone(),
+            termination: EngineTermination::Completed,
+            usage,
+            output: Vec::new(),
+            host_calls: Vec::new(),
+            proposed_effects: Vec::new(),
+            observed_state_delta: Vec::new(),
+            post_commit_known: true,
         };
         let shadow = ExecutionContour::Shadow;
         assert_eq!(enforce_shadow_no_effect(shadow, &limits, &report), Ok(()));
@@ -219,7 +234,10 @@ mod tests {
             effect_kind: CapabilityId::new("effect").expect("effect"),
             payload_digest: digest.clone(),
         }];
-        assert_eq!(enforce_shadow_no_effect(ExecutionContour::Active, &limits, &report), Ok(()));
+        assert_eq!(
+            enforce_shadow_no_effect(ExecutionContour::Active, &limits, &report),
+            Ok(())
+        );
         assert_eq!(
             enforce_shadow_no_effect(shadow, &limits, &report),
             Err(ShadowError::CanonicalEffectDenied("proposed-effects"))

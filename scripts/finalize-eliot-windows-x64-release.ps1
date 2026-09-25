@@ -46,7 +46,7 @@ Set-StrictMode -Version Latest
 $script:AuthenticodeCodeSigningEku = '1.3.6.1.5.5.7.3.3'
 $script:X509EnhancedKeyUsageExtensionOid = '2.5.29.37'
 $script:AuthenticodeSigningPolicy = 'authenticode-rfc3161'
-$script:AuthenticodeSigningScope = 'runtime-materializer-nine-plus-cli-pe-roles'
+$script:AuthenticodeSigningScope = 'runtime-materializer-eleven-plus-cli-pe-roles'
 $script:StagingOwnerMarker = '.eliot-release-staging-owner'
 $script:Rfc3161TimestampAttributeOid = '1.3.6.1.4.1.311.3.3.1'
 $script:Rfc3161TstInfoContentTypeOid = '1.2.840.113549.1.9.16.1.4'
@@ -601,7 +601,7 @@ function Close-NativeDirectoryPin([object]$Pin) {
 }
 
 function Get-AuthenticodeRoleDefinitions {
-    # The nine non-CLI executable roles are admitted by
+    # The eleven non-CLI executable roles are admitted by
     # bins/eliot/src/source_bundle_materializer.rs::REQUIRED_ROLES.  The Rust
     # CLI is an additional trust role: it is the install-authoritative front
     # door named by the production handoff, but it is not a Phase-A payload
@@ -622,6 +622,8 @@ function Get-AuthenticodeRoleDefinitions {
         [ordered]@{ role = 'doctor'; path = 'runtime/eliot-doctor.exe' }
         [ordered]@{ role = 'testd'; path = 'runtime/eliot-testd.exe' }
         [ordered]@{ role = 'native_worker'; path = 'runtime/eliot-native-worker.exe' }
+        [ordered]@{ role = 'wasm_host'; path = 'runtime/eliot-wasm-host.exe' }
+        [ordered]@{ role = 'notify'; path = 'runtime/eliot-notify.exe' }
     )
 }
 
@@ -633,11 +635,15 @@ function Get-CodeBearingExecutableExtensions {
     # plugin/governor binaries (.exe/.dll), and runtime PEs all fall in this
     # set.  All other extensions carry an explicit non-executable disposition
     # (data, manifests, resources, docs) and must never be executed.
-    # GATED (#1189/#1217): legacy eliot-governor/Codex bridge binaries remain
-    # canonical on disk at this base; they are NOT deleted here.  They fail
-    # closed in Assert-CompleteCodeBearingDenominator as
-    # unmanifested/unsigned executables until their owners land retirement or
-    # an explicit signed role.
+    # GATED (#1189/#1217/#1719): legacy eliot-governor/Codex bridge binaries
+    # and the flagged #1719 Claude Code front-door bridge
+    # (eliot-agent-bridge.exe) remain canonical on disk at this base; they
+    # are NOT deleted here.  They fail closed in
+    # Assert-CompleteCodeBearingDenominator as unmanifested/unsigned
+    # executables until their owners land retirement or an explicit signed
+    # role.  Full governor retire/re-home is BLOCKED-BY #18
+    # (legacy-deletion owner); the Codex entry re-home additionally awaits
+    # the eliot-mcp behavior track per canon.
     @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node')
 }
 
@@ -709,7 +715,7 @@ function Assert-CompleteCodeBearingDenominator([string]$Bundle) {
             continue
         }
         if (-not $roleSet.Contains($relative)) {
-            throw "release bundle contains an unmanifested code-bearing executable outside the exact signing scope: $relative (expected one of the exact Authenticode roles; Operator/plugin/governor legacy gated on #1189/#1217 — retirement or explicit signed role required, never silent adoption)"
+            throw "release bundle contains an unmanifested code-bearing executable outside the exact signing scope: $relative (expected one of the exact Authenticode roles; Operator/plugin/governor/front-door legacy gated on #1189/#1217/#1719 - retirement or explicit signed role required, never silent adoption)"
         }
     }
     foreach ($role in $roles) {

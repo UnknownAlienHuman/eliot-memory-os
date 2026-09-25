@@ -2,9 +2,9 @@
 mod support;
 
 use eliot_types::{
-    AgentId, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength, InjectionReceipt,
-    LifecycleStatus, ObservabilityKind, ProjectId, SemanticCommand, TaintClass, Visibility,
-    WriteId, WriteStatus,
+    AgentId, CommandContext, CueBinding, CueMatchMode, CueStrength, InjectionReceipt,
+    LegacyCueKindV1, LifecycleStatus, ObservabilityKind, ProjectId, SemanticCommand, TaintClass,
+    Visibility, WriteId, WriteStatus,
 };
 use serde_json::{Value, json};
 use support::{Harness, TestResult, rerun_with_credential_gate, test_guard};
@@ -154,7 +154,7 @@ fn failure_command(
         payload: json!({
             "source_revision": source_revision,
             "cue_bindings": [CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: "src/net/session.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,

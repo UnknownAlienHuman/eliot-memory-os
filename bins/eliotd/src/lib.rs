@@ -7,20 +7,20 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
 use eliot_governor::{
-    CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
-    GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
+    CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
+    FinishDecisionReceipt, GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig,
+    KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
+use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
-use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket,
-};
+use eliot_protocol::{AgentActivationResolutionResult, AgentActivationResolutionTicket};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -47,22 +47,35 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
+pub mod improvement_intake;
 mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub mod notification_board_attach;
 mod observation_adapters;
+mod owner_feed;
+mod process_origin;
+mod reactive_feed;
 mod route_receipts;
+mod skill_acceptance_read;
+mod skill_bridge_adapter;
+pub mod skill_dispatch;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
+pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
 mod store_failure_projection;
+pub mod supervision_progress;
+pub mod swarm_composition;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
+pub mod testd_terminal_completion;
 
 pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
@@ -75,14 +88,11 @@ pub use agent_fabric::{
     FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION, FABRIC_PLAN_GAP_REASON, FabricAdmission,
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
-    SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config, plan_candidate,
-    prereq_ports,
+    SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
+    build_admitted_provider_capability, daemon_coordinator_config, plan_candidate, prereq_ports,
 };
 
 use controlboard_adapters::SharedOperatorReplay;
-
-#[cfg(test)]
-use activation_projection::map_activation_snapshot;
 
 pub use canonical_config_precedence::{
     ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
@@ -130,6 +140,13 @@ pub use dreamer_model_adapter::{
     DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
     KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
 };
+pub use experience_runtime::{
+    CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
+    ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
+    UnderstandingEventInputs, commit_experience_event_records, derive_commit_ingress,
+    produce_journal_projection, propose_memory_extinction_candidate, read_current_position,
+    run_experience_quality_event, run_experience_quality_event_with_revision,
+};
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
     recommend_for_disabled_automation, resolve_first_run_routes,
@@ -147,6 +164,15 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
+pub use process_origin::{
+    CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
+    OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY, PhysicalProcessBinding,
+    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
+    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, request_origin_control,
+};
+pub use reactive_feed::{ReactiveFeedError, ReactiveFeedOutcome, drive_reactive_delivery_once};
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
@@ -158,6 +184,13 @@ pub use startup_evidence_producer::{
     publish_daemon_startup_evidence, summarize_retained_capabilities,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
+pub use supervision_progress::{
+    DAEMON_SUPERVISION_PROGRESS_OPERATION, DaemonReadySupervision, STORE_DEPENDENCY_WAIT_NAME,
+    SupervisionProducerDeps, SupervisionProgressAnswer, SupervisionProgressHead,
+    SupervisionProgressLineage, SupervisionProgressProducer, SupervisionTickInputs,
+    parse_daemon_ready_supervision, parse_progress_answer, progress_submit_payload,
+    store_dependency_dimension,
+};
 
 /// Builds the production P-07 authority adapter over an already-connected
 /// authenticated Kernel client.
@@ -216,12 +249,53 @@ pub enum DaemonError {
     /// Exact Kernel/provider or Governor recovery admission failed.
     #[error("Governor composition: {0}")]
     Composition(#[from] CompositionError),
+    /// Governor-owned FinishAttempt evaluation or canonical persistence
+    /// rejected the candidate.
+    #[error("Governor FinishAttempt: {0}")]
+    Finish(#[from] FinishAttemptError),
     /// Authenticated Kernel B1 transport or admission failed.
     #[error("Kernel B1 transport: {0}")]
     Kernel(String),
     /// A second daemon owner cannot be admitted in this process.
     #[error("daemon lifecycle: {0}")]
     Lifecycle(String),
+    /// Verified provider admission (issue #1108) failed fail-closed. The
+    /// coordinator/owner rejection is preserved unchanged, never
+    /// stringified, so the driver distinguishes blocked evidence from
+    /// retryable transport without collapsing the typed failure.
+    #[error(transparent)]
+    ProviderAdmission(#[from] FabricError),
+}
+
+/// Typed revision-fence match failure for the daemon cache gate (issue #18
+/// W6/A5).
+///
+/// Daemon caches and hot mirrors are revision-keyed and rebuildable. This
+/// gate guards cache refresh/admission only: it never swallows or
+/// reinterprets a durable store receipt. No `HeadMismatch` arm exists here
+/// by intent — [`eliot_governor::KernelGenerationSnapshot`] carries no
+/// revision heads, so head comparison stays with the #15 port.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum RevisionFenceMismatch {
+    /// No fence was ever cached (the composition never admitted one).
+    #[error("daemon revision fence was never built")]
+    NeverBuilt,
+    /// The dependent view is already stale/pending: the caller drops this
+    /// composition and re-runs authenticated connect+start.
+    #[error("daemon view is stale; drop and re-run authenticated connect+start")]
+    StaleView,
+    /// The cached fence no longer equals the live Kernel fence.
+    ///
+    /// Both fences are boxed: [`StateFence`] carries epoch/revision
+    /// identity and would otherwise push this `Err` variant past the
+    /// `result_large_err` bound (and inflate every future holding it).
+    #[error("daemon cached revision fence does not match the live Kernel fence")]
+    FenceMismatch {
+        /// Fence the cache was built against.
+        expected: Box<StateFence>,
+        /// Fence observed on the live snapshot.
+        observed: Box<StateFence>,
+    },
 }
 
 fn unix_ms() -> u64 {
@@ -234,6 +308,18 @@ fn unix_ms() -> u64 {
 
 fn unix_ms_i64() -> i64 {
     i64::try_from(unix_ms()).unwrap_or(i64::MAX)
+}
+
+/// Reports whether a finish may carry pending learning-closure debt.
+///
+/// Thin composition-root tag only (issue #1866 W1/W4/A1/A2, I12.24): the
+/// named closure owner and review condition come from Governor policy, never
+/// from this crate. `terminal` is supplied by the caller owning finish
+/// semantics; this helper only forwards it so the finish hook stays honest
+/// and non-blocking.
+#[must_use]
+pub fn closure_debt_pending(terminal: bool) -> bool {
+    terminal
 }
 
 /// Readiness/status projection emitted by the daemon. It is derived only
@@ -255,6 +341,26 @@ pub struct DaemonStatus {
     pub health: String,
     /// Whether normal admission is closed while the process remains observable.
     pub degraded: bool,
+}
+
+/// Versioned canonical tool view the tool owner supplies for a versioned
+/// Skill install (issue #1882).
+///
+/// Bundles the live tool-owner source, the Skill-owned alias table, and the
+/// Governor-admitted definition version so the composition seam
+/// ([`DaemonComposition::skill_install_package_versioned`]) carries every
+/// owner term explicitly without exceeding the arity lint. The admitted
+/// version must equal the install context's recorded version; drift fails
+/// closed inside the shared handle before any catalogue write. The view is
+/// `Copy` so the by-value seam parameter introduces no pass-by-value lint.
+#[derive(Clone, Copy)]
+pub struct VersionedToolView<'a> {
+    /// Live tool-owner source reporting the definition version it binds.
+    pub source: &'a dyn eliot_skill::CanonicalToolSource,
+    /// Skill-owned alias table resolving provider renames to canonical names.
+    pub aliases: &'a eliot_skill::ToolAliasTable,
+    /// Governor-admitted definition version the install records.
+    pub admitted_definition_version: &'a str,
 }
 
 /// The one production daemon composition. Application scheduling belongs here;
@@ -279,6 +385,34 @@ pub struct DaemonComposition {
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
     view_stale: bool,
+    /// Revision fence the daemon cache was built against (issue #18 W6/A5).
+    ///
+    /// Caches and hot mirrors are revision-keyed and rebuildable: this
+    /// cached fence never creates freshness or authority, it only keys the
+    /// dependent view so a fence move surfaces as an exact mismatch instead
+    /// of silent divergence. Admitted at [`Self::start`] from the Kernel
+    /// snapshot, re-keyed only when
+    /// [`Self::require_revision_fence_match`] observes an exact match after
+    /// a store commit, and never cleared by a refresh. Daemon loss leaves
+    /// the Kernel able to fence, cancel, and reconcile: durable truth stays
+    /// downstream, never here.
+    ///
+    /// Boxed so the composition stays small for futures holding it.
+    cached_revision_fence: Option<Box<StateFence>>,
+    /// Owner receipts for experience-bank/feedback records this composition
+    /// already committed, keyed by deterministic idempotency key (P1-1,
+    /// issue #1942).
+    ///
+    /// The store idempotency rule matches on the operation+key+hash triple:
+    /// re-submitting a committed key under freshly derived expected heads
+    /// builds a different hash and wedges permanently in `IdentityConflict`.
+    /// The commit entry therefore consults this map first and reuses the
+    /// retained receipt instead of re-deriving expectations for an
+    /// already-attempted key, so retry converges by construction without
+    /// weakening the triple rule and without minting new operation
+    /// identities. Volatile fast path only, like `operator_replay`: durable
+    /// truth stays with the owner receipts, never with this map.
+    committed_experience: BTreeMap<String, eliot_store_api::WriteReceipt>,
     /// Already-validated Kernel-issued owner session facts threaded once by
     /// the daemon runtime where the concrete client and this composition meet
     /// (AUD-C02-B, Implements #1187). Facts only, never the client itself:
@@ -286,6 +420,16 @@ pub struct DaemonComposition {
     /// binding from them. `None` until the runtime notes a live session, so
     /// boards keep the empty (unadmitted) behaviour without one.
     owner_session: Option<OwnerSessionFacts>,
+    /// Canonical notification records hydrated from the closed
+    /// `GetNotificationState` read (issue #1780).
+    ///
+    /// Mirrors `capability_admission`: constructed empty at
+    /// [`DaemonComposition::start`], hydrated by the daemon runtime attach
+    /// where the concrete client and this composition meet (see
+    /// `notification_board_attach`), and consumed by
+    /// [`DaemonComposition::controlboard`]. An empty supply reads as an
+    /// empty inbox, never as resolved or suppressed state.
+    notification_snapshot: Vec<Notification>,
     /// Shared Governor Skill catalogue handle for catalogue-guarded skill
     /// promotion. Empty until catalogue installation wiring lands; absent
     /// entries forward open-world.
@@ -343,6 +487,7 @@ impl DaemonComposition {
             &config.launch().kernel,
             QueueLimits::default(),
         )?;
+        let cached_revision_fence = Some(Box::new(governor.kernel_snapshot().state_fence()));
         Ok(Self {
             governor,
             config_lease,
@@ -351,8 +496,11 @@ impl DaemonComposition {
             state_root: config.state_root,
             started: true,
             view_stale: false,
+            cached_revision_fence,
+            committed_experience: BTreeMap::new(),
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
+            notification_snapshot: Vec::new(),
             skill_catalogue: Arc::new(
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
@@ -367,6 +515,15 @@ impl DaemonComposition {
     /// envelope; substitution fails closed inside `commit_canonical` without
     /// a local rehash. No Store client or second ledger is involved: the
     /// only write path is the retained neutral Kernel port.
+    ///
+    /// The write is material-readiness gated (issue #1789): `readiness`
+    /// carries the presented onboarding facts and this method commits through
+    /// the Governor readiness-gated path instead of `commit_canonical`
+    /// directly, so a typed denial (`TASK_SELECTION_REQUIRED`,
+    /// `AMBIGUOUS_RESULT`, `GOVERNING_CONTEXT_REQUIRED`,
+    /// `READINESS_REEVALUATION_REQUIRED`) fails the write before any commit.
+    /// A denial propagates as [`DaemonError::Composition`] and never reaches
+    /// the refresh below.
     ///
     /// Post-commit behavior:
     /// - The refresh runs before a receipt is returned. A failed refresh
@@ -385,20 +542,223 @@ impl DaemonComposition {
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
         envelope: eliot_governor::CanonicalWriteEnvelope,
+        readiness: &eliot_workscope::MaterialReadinessInputs<'_>,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
         // #740: request/result span over the neutral handoff boundary. The
         // handoff (prepared envelope submitted) and the commitment (validated
         // owner receipt) stay distinguishable in the sink.
         let _span = tracing::info_span!("eliotd.canonical_commit").entered();
+        // Issue #1787: the scope-sensitive canonical-write trigger runs before
+        // any commit. When a WorkScope binding is retained, a write addressing
+        // another scope quarantines here instead of committing against the
+        // wrong workspace; with no retained binding there is nothing to
+        // revalidate and the write proceeds unchanged.
+        self.governor
+            .check_canonical_write_work_scope(envelope.scope_id.as_str())
+            .map_err(DaemonError::Composition)?;
         let receipt = self
             .governor
-            .commit_canonical(identity, envelope)
+            .commit_canonical_with_readiness(identity, envelope, readiness)
             .await
             .map_err(DaemonError::Composition)?;
         if self.governor.refresh_from_kernel().is_err() {
             self.view_stale = true;
         }
+        // Revision-fence match gate (issue #18 W6/A5): the cache is
+        // revision-keyed, so a fence move must surface as stale instead of
+        // silent divergence. A gate rejection marks the dependent view
+        // stale/pending but never swallows the already durable receipt.
+        if let Err(mismatch) = self.require_revision_fence_match() {
+            self.view_stale = true;
+            let _ = crate::diagnostics::ErrorRecord::of(
+                crate::diagnostics::OwningComponent::DaemonRuntime,
+                "revision-fence",
+                &mismatch.to_string(),
+            )
+            .emit();
+        } else {
+            self.cached_revision_fence =
+                Some(Box::new(self.governor.kernel_snapshot().state_fence()));
+        }
         Ok(receipt)
+    }
+
+    /// Requires the cached revision fence to match the live Kernel fence
+    /// exactly (issue #18 W6/A5).
+    ///
+    /// Rejects [`RevisionFenceMismatch::NeverBuilt`] when no fence was ever
+    /// cached, [`RevisionFenceMismatch::StaleView`] when the dependent view
+    /// is already stale/pending, and
+    /// [`RevisionFenceMismatch::FenceMismatch`] when the cached fence no
+    /// longer exactly equals the live snapshot fence. Called from
+    /// [`Self::commit_canonical_and_refresh`] after the store commit: the
+    /// caller marks the view stale on rejection and still returns the
+    /// durable receipt, so this gate guards cache refresh/admission without
+    /// creating freshness or authority.
+    fn require_revision_fence_match(&self) -> Result<(), RevisionFenceMismatch> {
+        if self.view_stale {
+            return Err(RevisionFenceMismatch::StaleView);
+        }
+        let cached = self
+            .cached_revision_fence
+            .as_ref()
+            .ok_or(RevisionFenceMismatch::NeverBuilt)?;
+        let live = self.governor.kernel_snapshot().state_fence();
+        if !eliot_contracts::fences_match_exact(cached, &live) {
+            return Err(RevisionFenceMismatch::FenceMismatch {
+                expected: cached.clone(),
+                observed: Box::new(live),
+            });
+        }
+        Ok(())
+    }
+
+    /// Commits one ledger-sequenced experience-bank record through the
+    /// canonical Governor experience-commit caller, then publishes the
+    /// resulting owner change.
+    ///
+    /// Same refresh/stale discipline as
+    /// [`Self::commit_canonical_and_refresh`]: the receipt is returned
+    /// unmodified and a failed refresh marks the dependent view
+    /// stale/pending instead of hiding divergence. The identity must be
+    /// admitted ingress agreeing with the record (fence, scope,
+    /// idempotency); the owner re-validates everything downstream.
+    pub async fn commit_experience_bank_record(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        record: &eliot_observation_contracts::ExperienceBankRecord,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = eliot_governor::commit_experience_bank(
+            &self.governor,
+            identity,
+            ledger,
+            record,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(receipt)
+    }
+
+    /// Commits one ledger-sequenced agent-feedback record through the
+    /// canonical Governor experience-commit caller. Same refresh/stale
+    /// rule as [`Self::commit_experience_bank_record`].
+    pub async fn commit_experience_feedback_record(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        ledger: &eliot_observation::bank_admission::ExperienceRevisionLedger,
+        record: &eliot_observation_contracts::AgentFeedbackRecord,
+        scope_id: eliot_store_api::ScopeId,
+        proof_refs: Vec<String>,
+        expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let receipt = eliot_governor::commit_experience_feedback(
+            &self.governor,
+            identity,
+            ledger,
+            record,
+            scope_id,
+            proof_refs,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map_err(DaemonError::Composition)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(receipt)
+    }
+    /// Returns the retained owner receipt for an already-committed
+    /// experience record, if this composition committed its idempotency
+    /// key (P1-1, issue #1942).
+    ///
+    /// The commit entry consults this map before deriving ingress: a hit
+    /// means the record is durable under its deterministic key, so the
+    /// caller must reuse the receipt instead of re-submitting under fresh
+    /// expected heads (which would build a different request hash and
+    /// wedge in `IdentityConflict`). A miss carries no opinion — including
+    /// no claim that the record is absent downstream.
+    #[must_use]
+    pub fn committed_experience_receipt(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<eliot_store_api::WriteReceipt> {
+        self.committed_experience.get(idempotency_key).cloned()
+    }
+
+    /// Retains the owner receipt for a newly committed experience record
+    /// under its deterministic idempotency key (P1-1, issue #1942).
+    ///
+    /// Called by the commit entry immediately after the owner returns the
+    /// receipt, before any later record in the batch is attempted, so a
+    /// mid-batch failure followed by retry skips exactly the durable
+    /// prefix. Keys and receipts are owner-derived; nothing here mints
+    /// identity, heads, or proofs.
+    pub fn note_experience_committed(
+        &mut self,
+        idempotency_key: String,
+        receipt: eliot_store_api::WriteReceipt,
+    ) {
+        self.committed_experience.insert(idempotency_key, receipt);
+    }
+
+    /// Submits one candidate finish through the Governor owner, commits the
+    /// derived decision through the canonical `RecordFinishDecision` path,
+    /// and rehydrates the daemon projection before returning the decision
+    /// receipt. The caller supplies only a candidate draft; task completion,
+    /// evidence binding, and persistence remain Governor/Canonical-owned.
+    ///
+    /// A committed receipt is preserved when the post-commit refresh cannot
+    /// publish the new projection. In that case the daemon is marked stale,
+    /// matching [`Self::commit_canonical_and_refresh`], and the receipt still
+    /// reports the durable operation rather than a false failure.
+    pub async fn finish_attempt(
+        &mut self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<FinishDecisionReceipt, DaemonError> {
+        let _span = tracing::info_span!("eliotd.finish_attempt").entered();
+        let decision = self
+            .governor
+            .finish_attempt(identity, operation_id, draft)
+            .await
+            .map_err(DaemonError::Finish)?;
+        // Issue #1866 W1/W4/A1/A2 (I12.24): best-effort non-blocking closure
+        // assessment. Closure never blocks the finish ceremony: the honest
+        // decision above is already durable, owner/review semantics live in
+        // the Governor/eliot-improvement owners, and this hook only emits
+        // observability. No `?`, no propagation, return path unchanged.
+        {
+            let _closure_span = tracing::info_span!("eliotd.finish_closure_assessment").entered();
+            // Honest assessment from receipt fields (Governor-owned semantics):
+            // debt pends while no closing disposition is bound to this finish.
+            let debt_pending = closure_debt_pending(decision.closure_authority_ref.is_none());
+            tracing::info!(
+                decision_id = %decision.decision_id,
+                debt_pending,
+                has_closure_authority = decision.closure_authority_ref.is_some(),
+                unresolved_descendants = decision.unresolved_descendant_refs.len(),
+                "campaign closure assessment: honest finish while learning closure completes asynchronously; owner/review condition from Governor policy"
+            );
+        }
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(decision)
     }
 
     /// Returns the admitted Kernel snapshot.
@@ -477,58 +837,6 @@ impl DaemonComposition {
             degraded: !self.started
                 || self.view_stale
                 || self.readiness() != CompositionReadiness::Ready,
-        }
-    }
-
-    /// v1 compatibility projection: resolves one Kernel-issued semantic ticket
-    /// to the legacy decision shape through the sole Governor.
-    ///
-    /// v1-compat only. This method must not consume v2 typed-result data;
-    /// `resolve_agent_activation_v2` is the single production resolver spine.
-    /// Behavior is preserved (only `Resolved` maps; every other outcome is an
-    /// error, never coerced to success) so existing compatibility consumers keep
-    /// working. The runtime production path already resolves through v2 (the
-    /// `daemon_runtime` claim arm); this v1 method has no production caller.
-    ///
-    /// Final v1 retirement is tracked by #66 (#204 removes the success-only
-    /// compatibility path after the complete migration passes); this method is
-    /// not removed as opportunistic cleanup.
-    ///
-    /// The Governor typed outcome is the sole discriminator: only `Resolved`
-    /// produces a decision. Every other outcome is surfaced as an error and is
-    /// never coerced to success.
-    pub fn resolve_agent_activation(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
-    ) -> Result<AgentActivationResolutionDecision, DaemonError> {
-        ticket
-            .validate()
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        if self.readiness() != CompositionReadiness::Ready {
-            return Err(DaemonError::Lifecycle(
-                "semantic activation resolution requires a ready Governor".to_owned(),
-            ));
-        }
-        if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
-            return Err(DaemonError::Lifecycle(
-                "semantic activation ticket deadline has expired".to_owned(),
-            ));
-        }
-        match self.governor.resolve_activation_outcome(now) {
-            GovernorActivationOutcome::Resolved(snapshot) => {
-                if snapshot.state_fence != ticket.state_fence {
-                    return Err(DaemonError::Lifecycle(
-                        "semantic activation ticket fence does not match the Governor snapshot"
-                            .to_owned(),
-                    ));
-                }
-                activation_projection::map_activation_snapshot(ticket, snapshot)
-            }
-            outcome => Err(DaemonError::Lifecycle(format!(
-                "semantic activation did not resolve: {}",
-                outcome.kind_str()
-            ))),
         }
     }
 
@@ -647,6 +955,17 @@ impl DaemonComposition {
         self.owner_session = Some(facts);
     }
 
+    /// Notes verified canonical notification records into this composition.
+    ///
+    /// Called once by the daemon runtime attach holding both the concrete
+    /// [`DaemonKernelClient`] and this composition, mirroring
+    /// [`Self::note_owner_session_binding`]. Stores records only, never the
+    /// client; no new thread, no new handshake. Until noted, boards built by
+    /// [`Self::controlboard`] keep the empty inbox behaviour.
+    pub fn note_notification_snapshot(&mut self, records: Vec<Notification>) {
+        self.notification_snapshot = records;
+    }
+
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
@@ -682,6 +1001,9 @@ impl DaemonComposition {
             snapshot,
             &self.operator_replay,
             admitted,
+            // #1780: pre-fetched canonical records noted by the runtime
+            // attach; empty until that attach lands, never fabricated.
+            self.notification_snapshot.clone(),
         ))
     }
 
@@ -722,26 +1044,59 @@ impl DaemonComposition {
         )
     }
 
+    /// Enforces the recovered Governor lifecycle standing before any
+    /// catalogue write (issue #1191).
+    ///
+    /// Reads the Governor-recovered Skill registry — rebuilt from the
+    /// canonical `Skill` named read at every recovery, advanced only through
+    /// canonical promotion commits — and refuses installs the lifecycle
+    /// owner revoked, superseded, drifted, or never fenced current. Covered
+    /// Skills must stand fence-current with exact registration revision and
+    /// material digest; uncovered Skills install provisional and the
+    /// lifecycle follows through propose/promote. The fence is always the
+    /// caller-observed live admitted fence, never a transported claim.
+    ///
+    /// The crate error travels by value here like every neighboring
+    /// composition seam feeding the Governor lifecycle API, so the size
+    /// lint is allowed for this seam.
+    #[allow(clippy::result_large_err)]
+    fn check_skill_lifecycle_standing(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        admitted_fence: &StateFence,
+    ) -> Result<(), eliot_skill::SkillError> {
+        eliot_skill::check_lifecycle_standing(
+            &self.governor.owners().skill,
+            &package.registration.skill_id,
+            package,
+            admitted_fence,
+        )
+    }
+
     /// Installs one canonical package source into the shared Governor Skill
     /// catalogue (population caller, issue #1882).
     ///
     /// Composition seam for the runtime population driver: the Governor
-    /// owner hands over a validated package claim, its actual materialization
-    /// inputs, the explicit install context, and the tool-owner view; the
-    /// shared handle records the projected entry. No readiness gate: this
-    /// operates purely on daemon-held catalogue state (validated insert),
-    /// never on Governor recovery owners; promotion keeps the Governor
-    /// canonical gates, and drivers call post-admission. Returns the
-    /// installed Skill identity.
+    /// owner hands over the accepted candidate, a validated package claim,
+    /// its actual materialization inputs, the explicit install context, and
+    /// the tool-owner view; the recovered lifecycle standing gates entry
+    /// first, then the shared handle records the projected entry after the
+    /// candidate binding. No readiness gate: the insert operates purely on
+    /// daemon-held catalogue state (validated insert); promotion keeps the
+    /// Governor canonical gates, and drivers call post-admission. Returns
+    /// the installed Skill identity.
     pub fn skill_install_package(
         &self,
+        candidate: &eliot_skill::PortableSkillPackageCandidate,
         package: &eliot_skill::SkillPackage,
         inputs: &eliot_skill::MaterializationInputs,
         context: &eliot_skill::CatalogueInstallContext,
         tools: &dyn eliot_skill::KnownTools,
     ) -> Result<String, eliot_skill::SkillError> {
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(package, &admitted)?;
         self.shared_skill_adapter()
-            .install_package(package, inputs, context, tools)
+            .install_package(candidate, package, inputs, context, tools)
     }
 
     /// Issues the Hotset delivery receipt the runtime injector carries
@@ -780,6 +1135,230 @@ impl DaemonComposition {
     ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
         self.shared_skill_adapter()
             .acknowledge_and_display(skill_id, receipt, ack, tools)
+    }
+
+    /// Binds the runtime receiver's ack to its exact receipt under the live
+    /// canonical tool view, then displays (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: the driver
+    /// supplies the receipt/ack pair the receiver acted on plus the LIVE
+    /// tool-owner source, alias table, and admitted version, and the shared
+    /// handle refuses the display when the live source drifted past the
+    /// admitted definition version. Receipt and ack travel by value,
+    /// mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_acknowledge_and_display_versioned(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+        display_source: &dyn eliot_skill::CanonicalToolSource,
+        aliases: &eliot_skill::ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .acknowledge_and_display_versioned(
+                skill_id,
+                receipt,
+                ack,
+                display_source,
+                aliases,
+                admitted_definition_version,
+            )
+    }
+
+    /// Installs one canonical package source under the versioned canonical
+    /// tool view (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`], plus the
+    /// admitted-definition-version gate: the source reports the version it
+    /// binds (MCP canonical registry via its `CanonicalToolSource` impl),
+    /// the driver states the Governor-admitted version, and drift fails
+    /// closed before the shared handle is touched. The accepted candidate
+    /// binds at the Skill boundary. The Skill never hardcodes
+    /// the version; the composition never invents a registry. Drivers call
+    /// post-admission with the injector's real inputs. The versioned tool
+    /// view travels as one [`VersionedToolView`] so the seam keeps every
+    /// owner term explicit within the arity lint.
+    pub fn skill_install_package_versioned(
+        &self,
+        candidate: &eliot_skill::PortableSkillPackageCandidate,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        view: VersionedToolView<'_>,
+    ) -> Result<String, eliot_skill::SkillError> {
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(package, &admitted)?;
+        self.shared_skill_adapter().install_package_versioned(
+            candidate,
+            package,
+            inputs,
+            context,
+            view.source,
+            view.aliases,
+            view.admitted_definition_version,
+        )
+    }
+
+    /// Runs versioned install, availability and sealed gates, and Hotset
+    /// receipt issuance as one runtime delivery act (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: the driver
+    /// supplies the accepted candidate plus the real package, inputs,
+    /// context, provider readiness and materialization scope, versioned tool
+    /// source plus alias table and admitted version, Hotset identity, and
+    /// injector approval in one
+    /// [`VersionedDeliveryAct`](skill_lifecycle_adapters::VersionedDeliveryAct);
+    /// the shared handle records the act. The candidate rehydrates against
+    /// owner issuance and the live scope/fence before install. The
+    /// composition observes the live admitted Governor fence itself and the
+    /// act's scope fence must equal it: a Governor refresh crossing the
+    /// drive fails closed before any catalogue write or receipt mint. The
+    /// receipt carries the provisional ceiling until evidence promotion; the
+    /// receiver ack re-enters through [`Self::skill_acknowledge_and_display`].
+    pub fn skill_run_install_to_receipt(
+        &self,
+        act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
+        record: &skill_acceptance_read::AcceptanceRecord,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(act.package, &admitted)?;
+        self.shared_skill_adapter()
+            .run_install_to_receipt(act, &admitted, record)
+    }
+
+    /// Runs the Hotset injector call end to end through the composed
+    /// delivery act (issue #1882).
+    ///
+    /// Production injector entry the Hotset transport lane calls with one
+    /// injector-carried [`SkillHotsetRequest`](skill_lifecycle_adapters::SkillHotsetRequest):
+    /// accepted candidate, package, inputs, Governor-owned install context,
+    /// provider readiness, scope identities, Hotset identity, and injector
+    /// approval — no literals, no defaults. The composition observes the
+    /// live terms itself: the canonical tool source plus admitted definition
+    /// version from the Governor hook
+    /// ([`eliot_governor::canonical_skill_tool_source`]), the default-empty
+    /// Skill-owned alias table (the frozen H-A composition call site), and
+    /// the live admitted Governor fence. Returns the installed identity
+    /// plus the receipt the injector carries to the receiver; the receiver
+    /// ack re-enters through [`Self::skill_carry_receipt_to_display`].
+    pub fn skill_inject_hotset(
+        &self,
+        request: skill_lifecycle_adapters::SkillHotsetRequest<'_>,
+        record: &skill_acceptance_read::AcceptanceRecord,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(request.package, &fence)?;
+        self.shared_skill_adapter().inject_hotset(
+            request,
+            source.as_ref(),
+            &aliases,
+            &admitted_version,
+            &fence,
+            record,
+        )
+    }
+
+    /// Drives one owner-accepted intake through the injector call end to end
+    /// (issues #1882, #1191).
+    ///
+    /// Daemon-side handler for a decoded Hotset intake the poller drive
+    /// already bound to its committed acceptance row: the
+    /// [`SkillIntakePayload`](eliot_agent_bridge_core::SkillIntakePayload)
+    /// arrives decoded (shape and package↔inputs binding verified from the
+    /// bytes, driven as-is — never re-produced), and the
+    /// [`AcceptanceRecord`](skill_acceptance_read::AcceptanceRecord) arrives
+    /// from the store owner via the authenticated acceptance read. The
+    /// composition observes every remaining authority term itself — the live
+    /// admitted fence, the recovered lifecycle standing, and the canonical
+    /// tool source plus Governor-admitted definition version — and drives
+    /// the composed delivery act. Owner-issued install context and
+    /// provider-signed readiness beyond shape/binding checks still arrive
+    /// with the injector-carried handoff; acquiring them from their owners
+    /// belongs to the external v2 producer/ack lanes.
+    /// Returns the installed identity plus the receipt the injector carries
+    /// to the receiver.
+    ///
+    /// The crate error travels by value here like every neighboring
+    /// composition seam feeding the Governor lifecycle API, so the size
+    /// lint is allowed for this seam.
+    #[allow(clippy::result_large_err)]
+    pub fn skill_ingest_accepted_intake(
+        &self,
+        payload: &eliot_agent_bridge_core::SkillIntakePayload,
+        record: &skill_acceptance_read::AcceptanceRecord,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.check_skill_lifecycle_standing(&payload.package, &fence)?;
+        self.shared_skill_adapter().ingest_wire_intake(
+            payload,
+            record,
+            source.as_ref(),
+            &aliases,
+            &admitted_version,
+            &fence,
+        )
+    }
+
+    /// Carries the receiver ack back to the display boundary under a fresh
+    /// tool-owner read (issue #1882).
+    ///
+    /// Receiver-ack transport wiring the Hotset lane calls once the receiver
+    /// returns its ack for an issued receipt: the composition rebuilds the
+    /// canonical tool source through the Governor hook (a FRESH registry
+    /// value, so the display-time drift gate always reads live tool-owner
+    /// state, never a stale source object) and binds the ack through
+    /// [`Self::skill_acknowledge_and_display_versioned`]. Receipt and ack
+    /// travel by value, mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_carry_receipt_to_display(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        self.shared_skill_adapter()
+            .acknowledge_and_display_versioned(
+                skill_id,
+                receipt,
+                ack,
+                source.as_ref(),
+                &aliases,
+                &admitted_version,
+            )
+    }
+
+    /// Reconciles installed entries against the live canonical tool view,
+    /// marking changed bases stale (issue #1882).
+    ///
+    /// Production startup/refresh driver: builds the canonical tool source
+    /// through the Governor hook with the default-empty Skill-owned alias
+    /// table (frozen H-A call site) and marks every installed entry whose
+    /// declared tool references no longer resolve. Returns the count of
+    /// newly staled entries. Entries installed under provider renames need
+    /// their alias table at install time; this pass assumes the composed-act
+    /// invariant (canonical references, see `inject_hotset`). Definition-
+    /// version drift is NOT rechecked here: entries carry no admitted-version
+    /// record, so standing version comparison needs the entry-schema seam
+    /// (reported); version drift is caught at install and display time.
+    pub fn skill_reconcile_tool_basis(&self) -> Result<usize, eliot_skill::SkillError> {
+        let (source, _) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        self.shared_skill_adapter()
+            .reconcile_tool_basis(source.as_ref(), &aliases)
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding
@@ -833,6 +1412,32 @@ impl DaemonComposition {
         }
         Ok(skill_surface_adapters::GovernorSkillForwarder::new(
             self.skill_lifecycle()?,
+        ))
+    }
+
+    /// Borrows the single Governor Skill lifecycle owner as the agent-bridge
+    /// [`SkillLifecyclePort`](eliot_agent_bridge_core::SkillLifecyclePort).
+    ///
+    /// In-process binding for bridge cores running in the same process as
+    /// this composition: reads and proposals forward to the Governor
+    /// canonical path, and receiver-ack display resolves the live canonical
+    /// tool source per call through the Governor hook. No policy, admission,
+    /// or semantic rules live here; a stale fence fails closed in the
+    /// Governor owner, and tool-authority verdicts stay with the Skill owner.
+    /// A remote bridge process MUST NOT hold this forwarder — cross-process
+    /// Skill traffic crosses the authenticated transport as messages. Callers
+    /// take a fresh port per operation so a Governor refresh surfaces as an
+    /// exact-view mismatch instead of silent divergence.
+    pub fn skill_bridge_port(
+        &self,
+    ) -> Result<impl eliot_agent_bridge_core::SkillLifecyclePort + '_, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(skill_bridge_adapter::BridgeSkillForwarder::new(
+            self.shared_skill_adapter(),
         ))
     }
 
@@ -1053,6 +1658,156 @@ impl DaemonComposition {
         plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
+    /// Resolves one admitted provider capability from live session-observed
+    /// owner currentness (issue #1108, production composition caller for
+    /// W4/A1/A2).
+    ///
+    /// Per-operation resolution, mirroring [`Self::agent_fabric_plan`]:
+    /// readiness is checked first, then the owner half is resolved
+    /// exclusively from the live authenticated session — the freshly
+    /// observed live fence from the caller-held [`DaemonKernelClient`] plus
+    /// the validated Kernel-issued session binding threaded once via
+    /// [`Self::note_owner_session_binding`]. Caller-supplied session halves
+    /// in `material` are unconditionally overwritten, never trusted; the
+    /// threaded Governor expectation is epoch-bound to the live session
+    /// fence (a stale or foreign expectation fails closed here, never at
+    /// first effect). The composition retains no client, no capability, and
+    /// no owner half: the driver re-resolves per admitted operation, so a
+    /// fence move surfaces as an exact mismatch instead of silent
+    /// divergence, and currency is re-checked on every coordinator
+    /// `verify` call. Without a validated handshake the composition has no
+    /// live session and resolution fails closed — the daemon stays
+    /// plan-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Composition`] when the Governor is not ready,
+    /// [`DaemonError::Kernel`] when no validated session binding exists, or
+    /// [`DaemonError::ProviderAdmission`] carrying the fabric/coordinator
+    /// owner rejection unchanged (stale, revoked, foreign, or conflicting
+    /// evidence).
+    pub fn agent_fabric_verified_capability(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        material: VerifiedProviderMaterial,
+    ) -> Result<eliot_agent_coordinator::AdmittedProviderCapability, DaemonError> {
+        // #1108: verified-admission span over the admitted resolution. The
+        // presented halves travel by identity only; digests and revisions
+        // never enter the sink.
+        let _span = tracing::info_span!("eliotd.fabric_verified_capability").entered();
+        let material = self.resolve_verified_material(kernel, material)?;
+        Ok(build_admitted_provider_capability(material)?)
+    }
+
+    /// Constructs the one verified coordinator fabric on freshly resolved
+    /// owner material (issue #1108, production composition caller for W4).
+    ///
+    /// Builds the capability through
+    /// [`Self::agent_fabric_verified_capability`], then constructs the
+    /// fabric through
+    /// [`AgentFabric::new_with_admitted_provider`](crate::agent_fabric::AgentFabric::new_with_admitted_provider)
+    /// under the deterministic [`daemon_coordinator_config`]. The injected
+    /// `ports` stay driver-supplied (prerequisite owner ports #694/#696/
+    /// #698/#839/#837 remain OPEN): this composition invents no port
+    /// implementation and reimplements no owner. The per-operation driver
+    /// (executor) binds this seam per admitted operation without changing
+    /// executor semantics here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::agent_fabric_verified_capability`] rejection, a
+    /// coordinator config rejection, or the verified-construction owner
+    /// rejection unchanged.
+    pub fn agent_fabric_new_verified(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+    ) -> Result<AgentFabric, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_new_verified").entered();
+        let capability = self.agent_fabric_verified_capability(kernel, material)?;
+        let config = daemon_coordinator_config()?;
+        Ok(AgentFabric::new_with_admitted_provider(
+            config, ports, capability,
+        )?)
+    }
+
+    /// Restores the fabric on freshly resolved owner material in one call
+    /// (issue #1108, production composition caller for A8).
+    ///
+    /// Resolves owner halves through the private session-bound resolution,
+    /// then restores through
+    /// [`AgentFabric::restore_verified`](crate::agent_fabric::AgentFabric::restore_verified).
+    /// Missing, stale, or revoked evidence propagates typed and stays
+    /// blocked: the restore never downgrades silently to plan-only, and a
+    /// stored `Verified` label alone restores nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session-resolution rejection (not ready, no live
+    /// session, stale expectation epoch), the capability construction
+    /// rejection, the coordinator owner restore rejection, or a
+    /// stale-config conflict unchanged.
+    pub fn agent_fabric_restore_verified(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        snapshot: FabricSnapshot,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+    ) -> Result<AgentFabric, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_restore_verified").entered();
+        let material = self.resolve_verified_material(kernel, material)?;
+        let config = daemon_coordinator_config()?;
+        Ok(AgentFabric::restore_verified(
+            snapshot, config, ports, material,
+        )?)
+    }
+
+    /// Resolves the session-observed owner half of one verified provider
+    /// material over the live authenticated session.
+    ///
+    /// Readiness plus the exact live fence and the validated session binding
+    /// gate the resolution: the threaded expectation must be current under
+    /// the live session epoch (`is_same_authority`, the same rule the
+    /// coordinator enforces), and caller-supplied `live_fence` /
+    /// `session_binding` values are replaced with the session-observed
+    /// ones. Presented halves and the Governor expectation travel through
+    /// untouched for the coherence gates downstream to judge.
+    fn resolve_verified_material(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        mut material: VerifiedProviderMaterial,
+    ) -> Result<VerifiedProviderMaterial, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let live_fence = kernel.kernel_fence();
+        let session_binding = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned())
+            .ok_or_else(|| {
+                DaemonError::Kernel(
+                    "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
+                        .to_owned(),
+                )
+            })?;
+        if !material
+            .expectation
+            .live_authority_epoch
+            .is_same_authority(&live_fence.authority_epoch)
+        {
+            return Err(FabricError::StaleEpoch(
+                "provider expectation epoch is not current under the live Kernel session"
+                    .to_owned(),
+            )
+            .into());
+        }
+        material.live_fence = live_fence;
+        material.session_binding = session_binding;
+        Ok(material)
+    }
+
     /// Borrows the daemon-held Governor capability admission view (#1957).
     ///
     /// Post-`start` attach-style accessor, mirroring
@@ -1196,14 +1951,6 @@ fn failed_internal_or_mapping_error(
 }
 
 impl AgentActivationResolver for DaemonComposition {
-    fn resolve_agent_activation(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
-    ) -> Result<AgentActivationResolutionDecision, DaemonError> {
-        DaemonComposition::resolve_agent_activation(self, ticket, now)
-    }
-
     fn resolve_agent_activation_v2(
         &self,
         ticket: &AgentActivationResolutionTicket,

@@ -16,7 +16,7 @@ use eliot_store_api::{
     ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
     RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
     canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde_json::Value;
 
@@ -274,8 +274,8 @@ fn committed_at_for(next_commit_sequence: u64) -> String {
 /// Sole owner of every allocative field: `commit_sequence`, the derived
 /// `committed_at` instant, `next_commit_sequence`, the outbox record
 /// sequences plus `next_outbox_sequence`, and the evidence capture order.
-/// The caller's [`build_receipt`] then rebinds the receipt fields that
-/// carry those allocation values. Every semantic field — event and
+/// The caller's [`build_receipt_with_expected_heads`] then rebinds the
+/// receipt fields that carry those allocation values. Every semantic field — event and
 /// command identities, payloads and digests, projections, relations,
 /// revision deltas, ordering-head results, semantic receipt bindings — is
 /// preserved byte-for-byte from `semantic_plan`, never re-derived: the
@@ -460,6 +460,11 @@ fn bound_payload_digest(
 }
 
 /// Builds and validates the immutable write receipt for a planned transition.
+///
+/// Test-only scaffolding: binds the supplied claim verbatim so unit tests
+/// can construct historical/placeholder receipts. Production binds the
+/// recomputed digest via [`build_receipt_with_expected_heads`].
+#[cfg(test)]
 pub(crate) fn build_receipt(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -488,6 +493,11 @@ pub(crate) fn build_receipt(
             .map(|record| record.outbox_id.clone())
             .collect(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // Issue-#18 bindings are derived from the admitted transition, never
+        // defaulted; equality is enforced by the receipt-issuing path.
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(plan.committed_at.clone()),
@@ -548,16 +558,19 @@ pub(crate) fn recomputed_canonical_request_hash(
 /// Verifies the supplied claim against the recomputed digest and returns the
 /// recomputed value for receipt binding.
 ///
-/// Supplied != recomputed is [`StoreError::TransitionDigestMismatch`] with no
+/// The carried ordering scopes must also still equal the hashed expected
+/// ordering heads (a post-admission scope edit leaves the shared digest
+/// unchanged but changes head advancement). Supplied != recomputed, or a
+/// scope/head divergence, is [`StoreError::TransitionDigestMismatch`] with no
 /// transaction and no lookup success. Callers must invoke this BEFORE any
 /// idempotency-lookup success is returned and BEFORE any transaction/receipt.
-#[allow(dead_code)]
 pub(crate) fn verify_apply_canonical_hash(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<String, StoreError> {
+    verify_ordering_scope_binding(transition, expected_ordering_heads)?;
     let view = CanonicalRequestView::from_apply(
         ctx,
         transition,
@@ -568,16 +581,12 @@ pub(crate) fn verify_apply_canonical_hash(
     canonical_request_hash(&view)
 }
 
-/// Builds the receipt bound to the recomputed digest (slice C).
+/// Builds the receipt bound to the recomputed digest (issue #63).
 ///
 /// Verifies first, then binds `WriteReceipt.canonical_request_hash` to the
-/// recomputed value (never a blind copy of the supplied claim).
-/// Residual wiring (cannot edit `apply.rs` here): `apply.rs:622`
-/// `build_receipt(ctx, &transition, &plan)` must switch to this function with
-/// the `expected_revision_heads` / `expected_ordering_heads` available in
-/// `apply_prepared_with_authority`, otherwise the live Surreal path keeps the
-/// legacy blind-copy receipt for non-empty-heads applies.
-#[allow(dead_code)]
+/// recomputed value (never a blind copy of the supplied claim). This is the
+/// live receipt path for `apply_prepared_with_authority` (via `apply.rs`),
+/// so non-empty-heads applies bind the identical digest Governor computed.
 pub(crate) fn build_receipt_with_expected_heads(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -614,6 +623,12 @@ pub(crate) fn build_receipt_with_expected_heads(
             .map(|record| record.outbox_id.clone())
             .collect(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // Issue-#18 bindings are copied exactly from the admitted
+        // transition, never defaulted; equality is enforced by the
+        // receipt-issuing path.
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(plan.committed_at.clone()),
@@ -629,13 +644,12 @@ pub(crate) fn build_receipt_with_expected_heads(
     Ok(receipt)
 }
 
-/// Validates receipt identity plus the recomputed digest (slice C).
+/// Validates receipt identity plus the recomputed digest (issue #63).
 ///
 /// Checks supplied == recomputed (typed mismatch otherwise), receipt ==
-/// recomputed, and the legacy identity/envelope rules. Residual wiring:
-/// `apply.rs:581` and `apply.rs:638` `validate_receipt_identity` calls must
-/// switch here with the expected heads from `apply_prepared_with_authority`.
-#[allow(dead_code)]
+/// recomputed, and the legacy identity/envelope rules. This is the live
+/// replay/commit validation for `apply.rs` idempotency and post-commit
+/// receipt checks.
 pub(crate) fn validate_receipt_identity_with_expected_heads(
     receipt: &WriteReceipt,
     ctx: &RequestMeta,
@@ -824,7 +838,7 @@ mod tests {
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
         OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, ReceiptEnvelope,
-        ScopeId, SecurityContext, StateFence, TransitionClass,
+        ScopeId, SecurityContext, StateFence, TransitionClass, bind_issue18_digests,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -857,7 +871,7 @@ mod tests {
             },
         };
         let operation = "op-envelope";
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
                 idempotency_key: format!("idem-{operation}"),
@@ -871,6 +885,11 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; no semantic source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -883,6 +902,9 @@ mod tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        bind_issue18_digests(&mut transition)?;
+        let view = CanonicalRequestView::from_apply(&context, &transition, &[], &[]);
+        transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
         Ok((context, transition))
     }
 

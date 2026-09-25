@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ApplicationRequest, ContractViolation, McpProtocolVersion, QueryInput, QueryMode, ToolRequest,
-    TypedRejection, decode_protected_request_bytes, validate_proof_ceiling,
+    ApplicationRequest, ContractViolation, LEGACY_FINISH_INPUT_REJECTED, McpProtocolVersion,
+    QueryInput, QueryMode, ToolRequest, TypedRejection, decode_protected_request_bytes,
+    validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1387,6 +1388,12 @@ fn raw_rejection_to_bridge(rejection: TypedRejection) -> BridgeError {
         TypedRejection::UnknownVariant { variant } => {
             BridgeError::invalid("tool.name", format!("unsupported tool variant: {variant}"))
         }
+        TypedRejection::LegacyFinishProof { member } => BridgeError::invalid(
+            "tool.arguments",
+            format!(
+                "{LEGACY_FINISH_INPUT_REJECTED}: caller-supplied finish proof member `{member}` is not accepted; submit only the strict FinishAttemptDraft fields"
+            ),
+        ),
         TypedRejection::Malformed { reason } => BridgeError::invalid("request", reason),
         TypedRejection::Oversized { actual, maximum } => {
             BridgeError::ResourceRequired { actual, maximum }

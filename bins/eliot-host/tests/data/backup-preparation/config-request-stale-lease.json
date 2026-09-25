@@ -1,0 +1,12 @@
+{
+  "installation_id": "install-958-a",
+  "owner_lease_ref": "lease-958-a-STALE",
+  "generation": 6,
+  "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "build_digests": [
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  ],
+  "purge_ledger_revision": 3,
+  "audit": null
+}

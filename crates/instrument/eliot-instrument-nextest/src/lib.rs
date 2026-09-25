@@ -23,6 +23,12 @@ use thiserror::Error;
 
 /// Stable identity used when an invocation is admitted to nextest.
 pub const NEXTEST_INSTRUMENT: &str = "eliot.instrument.nextest";
+/// Explicit machine-readable reporter contract admitted for nextest 0.9.143.
+pub const NEXTEST_LIBTEST_JSON_FORMAT_VERSION: &str = "0.1";
+/// Content type used by TestD for the stdout event stream.
+pub const NEXTEST_STDOUT_CONTENT_TYPE: &str = "application/x-nextest-libtest-json-plus";
+/// Content type used by TestD for stderr, which is never parsed as events.
+pub const NEXTEST_STDERR_CONTENT_TYPE: &str = "text/plain";
 /// Maximum complete stream accepted by the bounded parser.
 pub const MAX_NEXTEST_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 256 * 1024;
@@ -38,7 +44,8 @@ pub struct NextestCommand {
 }
 
 impl NextestCommand {
-    /// Builds the canonical command arguments for `cargo nextest run`.
+    /// Builds the canonical command arguments for the admitted
+    /// `cargo-nextest run` executable.
     pub fn run(
         target: impl Into<String>,
         profile: impl Into<String>,
@@ -47,16 +54,19 @@ impl NextestCommand {
         let target = checked_text(target.into(), "target")?;
         let profile = checked_text(profile.into(), "profile")?;
         let mut arguments = vec![
-            "nextest".to_owned(),
             "run".to_owned(),
             "--profile".to_owned(),
             profile.clone(),
+            "--message-format".to_owned(),
+            "libtest-json-plus".to_owned(),
+            "--message-format-version".to_owned(),
+            NEXTEST_LIBTEST_JSON_FORMAT_VERSION.to_owned(),
         ];
         for filter in filters {
             arguments.push(checked_text(filter.clone(), "filter")?);
         }
         Ok(Self {
-            executable: "cargo".to_owned(),
+            executable: "cargo-nextest".to_owned(),
             arguments,
             target,
             profile,
@@ -111,13 +121,63 @@ impl NextestReport {
     }
 }
 
-/// Parse nextest's machine-readable JSONL stream.
-pub fn parse_jsonl(bytes: &[u8]) -> Result<NextestReport, NextestError> {
+/// Terminal status emitted for one libtest-compatible nextest test event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NextestTestStatus {
+    Pass,
+    Fail,
+    Skip,
+    Timeout,
+    Leak,
+    Cancelled,
+}
+
+/// One parsed test lifecycle event from `libtest-json` or
+/// `libtest-json-plus`.  Suite/progress events are deliberately omitted;
+/// callers receive only test events which can contribute to verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NextestTestEvent {
+    Started {
+        name: String,
+    },
+    Completed {
+        name: String,
+        status: NextestTestStatus,
+    },
+}
+
+/// Returns the catalog identity for a nextest test event.
+///
+/// Retries are emitted as `catalog-id#<retry-number>` by nextest. The numeric
+/// suffix is execution metadata, not a second admitted test. A non-numeric or
+/// non-terminal `#` segment remains part of the identity.
+#[must_use]
+pub fn catalog_test_id(name: &str) -> &str {
+    let Some((base, suffix)) = name.rsplit_once('#') else {
+        return name;
+    };
+    if !base.is_empty() && !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        base
+    } else {
+        name
+    }
+}
+
+/// Parse nextest's machine-readable JSONL test events.
+///
+/// The productive profile uses `libtest-json-plus`, whose top-level event
+/// names follow libtest (`ok`, `failed`, `ignored`). The `nextest` subobject
+/// is suite metadata and is never consulted for test status. Older nextest
+/// fixtures used `completed` plus a top-level `status`; that spelling remains
+/// accepted only as a compatibility form. Suite events, progress events, and
+/// stderr text are outside this parser and are ignored by the caller.
+pub fn parse_test_events(bytes: &[u8]) -> Result<Vec<NextestTestEvent>, NextestError> {
     if bytes.len() > MAX_NEXTEST_OUTPUT_BYTES {
         return Err(NextestError::OutputTooLarge);
     }
-    let mut report = NextestReport::default();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut events = Vec::new();
+    let mut seen_started = std::collections::BTreeSet::new();
+    let mut seen_completed = std::collections::BTreeSet::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.len() > MAX_LINE_BYTES {
             return Err(NextestError::LineTooLarge);
@@ -131,88 +191,62 @@ pub fn parse_jsonl(bytes: &[u8]) -> Result<NextestReport, NextestError> {
         if event.kind.as_deref() != Some("test") {
             continue;
         }
-        let name = event.name.ok_or(NextestError::MalformedEvent)?;
         let event_name = event.event.as_deref().ok_or(NextestError::MalformedEvent)?;
         if matches!(event_name, "started" | "STARTED") {
-            if !seen.insert(format!("{name}\u{1f}started")) {
+            let name = event.name.ok_or(NextestError::MalformedEvent)?;
+            if !seen_started.insert(name.clone()) {
                 return Err(NextestError::DuplicateEvent);
             }
-            report.started = report
-                .started
-                .checked_add(1)
-                .ok_or(NextestError::CounterOverflow)?;
+            events.push(NextestTestEvent::Started { name });
             continue;
         }
-        if !matches!(event_name, "completed" | "COMPLETED") {
+        let Some(status) = completion_status(&event, event_name)? else {
             continue;
-        }
-        let status = event.status.ok_or(NextestError::MalformedEvent)?;
-        if !seen.insert(format!("{name}\u{1f}completed")) {
+        };
+        let name = event.name.ok_or(NextestError::MalformedEvent)?;
+        if !seen_completed.insert(name.clone()) {
             return Err(NextestError::DuplicateEvent);
         }
-        match status.as_str() {
-            "PASS" | "pass" => {
-                report.passed = report
-                    .passed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-                report.completed = report
-                    .completed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
+        events.push(NextestTestEvent::Completed { name, status });
+    }
+    Ok(events)
+}
+
+/// Parse nextest's machine-readable JSONL stream into bounded counters.
+pub fn parse_jsonl(bytes: &[u8]) -> Result<NextestReport, NextestError> {
+    let events = parse_test_events(bytes)?;
+    let mut report = NextestReport::default();
+    let mut started_names = std::collections::BTreeSet::new();
+    let mut final_statuses = std::collections::BTreeMap::new();
+    for event in events {
+        match event {
+            NextestTestEvent::Started { name } => {
+                started_names.insert(catalog_test_id(&name).to_owned());
             }
-            "FAIL" | "fail" | "XPASS" | "xpass" => {
-                report.failed = report
-                    .failed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-                report.completed = report
-                    .completed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
+            NextestTestEvent::Completed { name, status } => {
+                // A retry is another physical event for the same catalog
+                // test. The terminal attempt, rather than an earlier retry
+                // failure, determines the catalog result.
+                final_statuses.insert(catalog_test_id(&name).to_owned(), status);
             }
-            "SKIP" | "skip" | "XFAIL" | "xfail" => {
-                report.skipped = report
-                    .skipped
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-                report.completed = report
-                    .completed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-            }
-            "TIMEOUT" | "timeout" => {
-                report.timed_out = report
-                    .timed_out
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-                report.completed = report
-                    .completed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-            }
-            "LEAK" | "leak" => {
-                report.leaked = report
-                    .leaked
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-                report.completed = report
-                    .completed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-            }
-            "CANCEL" | "cancel" | "CANCELLED" | "cancelled" => {
-                report.cancelled = report
-                    .cancelled
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-                report.completed = report
-                    .completed
-                    .checked_add(1)
-                    .ok_or(NextestError::CounterOverflow)?;
-            }
-            _ => return Err(NextestError::UnsupportedStatus(status)),
         }
+    }
+    report.started =
+        u32::try_from(started_names.len()).map_err(|_| NextestError::CounterOverflow)?;
+    report.completed =
+        u32::try_from(final_statuses.len()).map_err(|_| NextestError::CounterOverflow)?;
+    for status in final_statuses.values() {
+        let counter = match status {
+            NextestTestStatus::Pass => &mut report.passed,
+            NextestTestStatus::Fail => &mut report.failed,
+            NextestTestStatus::Skip => &mut report.skipped,
+            NextestTestStatus::Timeout => &mut report.timed_out,
+            NextestTestStatus::Leak => &mut report.leaked,
+            NextestTestStatus::Cancelled => &mut report.cancelled,
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or(NextestError::CounterOverflow)?;
     }
     Ok(report)
 }
@@ -293,8 +327,38 @@ struct JsonEvent {
     name: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
     #[serde(flatten)]
     _extra: std::collections::BTreeMap<String, Value>,
+}
+
+fn completion_status(
+    event: &JsonEvent,
+    event_name: &str,
+) -> Result<Option<NextestTestStatus>, NextestError> {
+    let status = match event_name {
+        "completed" | "COMPLETED" => event
+            .status
+            .as_deref()
+            .ok_or(NextestError::MalformedEvent)?,
+        "ok" | "OK" => "PASS",
+        "failed" | "FAILED" => "FAIL",
+        "ignored" | "IGNORED" => "SKIP",
+        "timeout" | "TIMEOUT" => "TIMEOUT",
+        "leak" | "LEAK" => "LEAK",
+        "cancel" | "CANCEL" | "cancelled" | "CANCELLED" => "CANCELLED",
+        _ => return Ok(None),
+    };
+    let normalized = match status {
+        "PASS" | "pass" | "ok" => NextestTestStatus::Pass,
+        "FAIL" | "fail" | "XPASS" | "xpass" | "failed" => NextestTestStatus::Fail,
+        "SKIP" | "skip" | "XFAIL" | "xfail" | "ignored" => NextestTestStatus::Skip,
+        "TIMEOUT" | "timeout" => NextestTestStatus::Timeout,
+        "LEAK" | "leak" => NextestTestStatus::Leak,
+        "CANCEL" | "cancel" | "CANCELLED" | "cancelled" => NextestTestStatus::Cancelled,
+        other => return Err(NextestError::UnsupportedStatus(other.to_owned())),
+    };
+    Ok(Some(normalized))
 }
 
 #[derive(Debug, Error)]

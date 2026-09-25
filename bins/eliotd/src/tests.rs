@@ -69,21 +69,30 @@ fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
         plan_id: "plan-1".to_owned(),
         plan_revision: "plan-revision-1".to_owned(),
     };
-    let decision = map_activation_snapshot(&ticket, snapshot)?;
-    decision.validate_against(&ticket)?;
-    assert_eq!(decision.principal_id, "principal-1");
-    assert_eq!(decision.task_revision, "7");
-    assert_eq!(decision.plan_revision, "plan-revision-1");
+    let result = super::activation_projection::map_governor_outcome_to_protocol(
+        &ticket,
+        eliot_governor::GovernorActivationOutcome::Resolved(snapshot),
+        50,
+    )?;
+    result.validate_against(&ticket)?;
+    match &result.disposition {
+        eliot_protocol::AgentActivationResolutionDisposition::Resolved { binding } => {
+            assert_eq!(binding.principal_id, "principal-1");
+            assert_eq!(binding.task_revision, "7");
+            assert_eq!(binding.plan_revision, "plan-revision-1");
+        }
+        _ => panic!("expected Resolved"),
+    }
 
     let mut substituted = ticket.clone();
     substituted.ticket_id = "ticket-other".to_owned();
     substituted.ticket_sha256 = substituted.compute_digest()?;
-    assert!(decision.validate_against(&substituted).is_err());
+    assert!(result.validate_against(&substituted).is_err());
 
     let mut stale = ticket.clone();
     stale.state_fence = StateFence::new(test_epoch(1)?, ResourceGeneration::new(2)?);
     stale.ticket_sha256 = stale.compute_digest()?;
-    assert!(decision.validate_against(&stale).is_err());
+    assert!(result.validate_against(&stale).is_err());
     Ok(())
 }
 

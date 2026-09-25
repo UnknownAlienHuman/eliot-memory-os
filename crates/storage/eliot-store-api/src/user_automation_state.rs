@@ -1,7 +1,7 @@
 //! Canonical user-automation wire contract (issue #1779, I5/I11).
 //!
 //! This module owns the serialization-only wire boundary for durable
-//! UserAutomation revisions, admission state, and invocations: versioned
+//! `UserAutomation` revisions, admission state, and invocations: versioned
 //! identity, closed parameter declarations support, per-leg completeness
 //! validation on raw parameter maps, and request builders. It contains no
 //! automation semantics, no lineage decisions, and no receipt validation:
@@ -30,6 +30,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -77,6 +78,10 @@ pub const AUTOMATION_PARAM_CONFIGURATION_STATE: &str = "configuration_state";
 pub const AUTOMATION_PARAM_OCCURRENCE_ID: &str = "occurrence_id";
 /// Opaque canonical invocation document (run-now leg).
 pub const AUTOMATION_PARAM_INVOCATION_JSON: &str = "invocation_json";
+/// Opaque canonical failure document (failure leg): JSON object with the
+/// class `fingerprint`, the typed `reason` wire value, and the
+/// `notification_dedup_key` echoed from the failure projection.
+pub const AUTOMATION_PARAM_FAILURE_JSON: &str = "failure_json";
 /// Read query discriminator parameter.
 pub const AUTOMATION_PARAM_QUERY: &str = "query";
 /// `"true"`/`"false"` retired-row inclusion (list query, required).
@@ -85,7 +90,7 @@ pub const AUTOMATION_PARAM_INCLUDE_RETIRED: &str = "include_retired";
 pub const AUTOMATION_PARAM_MAX_RECORDS: &str = "max_records";
 
 /// Mutation leg discriminator values (mirror the domain operation
-/// snake_case kinds).
+/// `snake_case` kinds).
 pub const AUTOMATION_OPERATION_CREATE: &str = "create";
 /// Mutation leg discriminator values.
 pub const AUTOMATION_OPERATION_EDIT: &str = "edit";
@@ -97,6 +102,8 @@ pub const AUTOMATION_OPERATION_RESUME: &str = "resume";
 pub const AUTOMATION_OPERATION_REMOVE: &str = "remove";
 /// Mutation leg discriminator values.
 pub const AUTOMATION_OPERATION_RUN_NOW: &str = "run-now";
+/// Mutation leg discriminator values (failure-history writer leg).
+pub const AUTOMATION_OPERATION_FAILURE: &str = "failure";
 
 /// Read query discriminator values (mirror the domain query kinds minus
 /// `Preflight`, which is B-owned).
@@ -107,12 +114,12 @@ pub const AUTOMATION_QUERY_CURRENT: &str = "current";
 pub const AUTOMATION_QUERY_HISTORY: &str = "history";
 /// Read query discriminator values.
 pub const AUTOMATION_QUERY_INVOCATIONS: &str = "invocations";
-/// Read query discriminator values (explicit absence until a failure
-/// writer path exists; never a fabricated failure).
+/// Read query discriminator values (the failure writer leg records the
+/// last failure row; absence stays explicit, never fabricated).
 pub const AUTOMATION_QUERY_FAILURE: &str = "failure";
 
 /// Closed admission-state wire values (mirror the domain
-/// SCREAMING_SNAKE_CASE states).
+/// `SCREAMING_SNAKE_CASE` states).
 pub const AUTOMATION_STATE_ACTIVE: &str = "ACTIVE";
 /// Closed admission-state wire values.
 pub const AUTOMATION_STATE_PAUSED: &str = "PAUSED";
@@ -219,6 +226,21 @@ pub enum DecodedAutomationMutation {
         /// Verbatim canonical invocation document.
         invocation_json: String,
     },
+    /// Record one revision-bound configuration failure as immutable
+    /// history. The named revision must exist; repeats of one failure
+    /// class converge on the existing row.
+    Failure {
+        /// Stable automation identity.
+        automation_id: String,
+        /// Immutable revision that owns the failure class (must exist).
+        revision: String,
+        /// Stable occurrence identity retained as history context.
+        occurrence_id: String,
+        /// Verbatim canonical failure document.
+        failure_json: String,
+        /// Parsed canonical failure document.
+        failure: AutomationFailureDocument,
+    },
 }
 
 /// Decoded read query with its closed selectors.
@@ -228,6 +250,10 @@ pub struct DecodedAutomationRead {
     pub query: String,
     /// Exact automation selector (required except list).
     pub automation_id: Option<String>,
+    /// Optional exact immutable revision selector for current/history owner reads.
+    pub requested_revision: Option<String>,
+    /// Optional exact occurrence selector for invocation-owner reads.
+    pub requested_occurrence_id: Option<String>,
     /// Retired-row inclusion (list only).
     pub include_retired: bool,
     /// Page-size bound (list/history/invocations only).
@@ -282,12 +308,8 @@ pub fn automation_edit_params(
     configuration_state: String,
     revision_json: String,
 ) -> BTreeMap<String, Value> {
-    let mut params = automation_create_params(
-        automation_id,
-        revision,
-        configuration_state,
-        revision_json,
-    );
+    let mut params =
+        automation_create_params(automation_id, revision, configuration_state, revision_json);
     params.insert(
         AUTOMATION_PARAM_OPERATION.to_owned(),
         Value::String(AUTOMATION_OPERATION_EDIT.to_owned()),
@@ -358,6 +380,37 @@ pub fn automation_run_now_params(
     ])
 }
 
+/// Builds a failure-leg parameter map.
+pub fn automation_failure_params(
+    automation_id: String,
+    revision: String,
+    occurrence_id: String,
+    failure_json: String,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            AUTOMATION_PARAM_OPERATION.to_owned(),
+            Value::String(AUTOMATION_OPERATION_FAILURE.to_owned()),
+        ),
+        (
+            AUTOMATION_PARAM_AUTOMATION_ID.to_owned(),
+            Value::String(automation_id),
+        ),
+        (
+            AUTOMATION_PARAM_REVISION.to_owned(),
+            Value::String(revision),
+        ),
+        (
+            AUTOMATION_PARAM_OCCURRENCE_ID.to_owned(),
+            Value::String(occurrence_id),
+        ),
+        (
+            AUTOMATION_PARAM_FAILURE_JSON.to_owned(),
+            Value::String(failure_json),
+        ),
+    ])
+}
+
 /// Builds the closed `GetUserAutomationState` read request.
 pub fn automation_read_request(
     query: String,
@@ -367,10 +420,7 @@ pub fn automation_read_request(
     state_fence: StateFence,
 ) -> Result<NamedReadRequest, StoreError> {
     let mut parameters = BTreeMap::new();
-    parameters.insert(
-        AUTOMATION_PARAM_QUERY.to_owned(),
-        Value::String(query),
-    );
+    parameters.insert(AUTOMATION_PARAM_QUERY.to_owned(), Value::String(query));
     if let Some(automation_id) = automation_id {
         parameters.insert(
             AUTOMATION_PARAM_AUTOMATION_ID.to_owned(),
@@ -392,6 +442,59 @@ pub fn automation_read_request(
         state_fence,
         parameters,
     };
+    request.validate()?;
+    Ok(request)
+}
+
+/// Builds an exact immutable-revision read for the canonical owner boundary.
+///
+/// The selector is accepted only by the closed `current`/`history` read
+/// contract. Provider adapters must use it to address the immutable row by
+/// identity; it is not a page cursor or a caller-authored revision document.
+pub fn automation_revision_read_request(
+    query: String,
+    automation_id: String,
+    revision: String,
+    include_retired: bool,
+    max_records: u16,
+    state_fence: StateFence,
+) -> Result<NamedReadRequest, StoreError> {
+    let mut request = automation_read_request(
+        query,
+        Some(automation_id),
+        include_retired,
+        max_records,
+        state_fence,
+    )?;
+    request.parameters.insert(
+        AUTOMATION_PARAM_REVISION.to_owned(),
+        Value::String(revision),
+    );
+    request.validate()?;
+    Ok(request)
+}
+
+/// Builds an exact invocation read for one owner-issued occurrence.
+///
+/// The selector addresses the immutable invocation row by its occurrence
+/// identity. It is accepted only by the closed `invocations` query and never
+/// falls back to the bounded invocation page.
+pub fn automation_invocation_read_request(
+    automation_id: String,
+    occurrence_id: String,
+    state_fence: StateFence,
+) -> Result<NamedReadRequest, StoreError> {
+    let mut request = automation_read_request(
+        AUTOMATION_QUERY_INVOCATIONS.to_owned(),
+        Some(automation_id),
+        false,
+        1,
+        state_fence,
+    )?;
+    request.parameters.insert(
+        AUTOMATION_PARAM_OCCURRENCE_ID.to_owned(),
+        Value::String(occurrence_id),
+    );
     request.validate()?;
     Ok(request)
 }
@@ -455,6 +558,15 @@ pub fn validate_automation_mutation_params(
             )?;
             Ok(())
         }
+        AUTOMATION_OPERATION_FAILURE => {
+            validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
+            validate_occurrence_id(text_param(parameters, AUTOMATION_PARAM_OCCURRENCE_ID)?)?;
+            parse_automation_failure_document(text_param(
+                parameters,
+                AUTOMATION_PARAM_FAILURE_JSON,
+            )?)?;
+            Ok(())
+        }
         _ => Err(StoreError::UnknownOperation),
     }
 }
@@ -504,11 +616,25 @@ pub fn decode_automation_mutation(
             occurrence_id: text_of(AUTOMATION_PARAM_OCCURRENCE_ID)?,
             invocation_json: text_of(AUTOMATION_PARAM_INVOCATION_JSON)?,
         }),
+        AUTOMATION_OPERATION_FAILURE => {
+            let failure_json = text_of(AUTOMATION_PARAM_FAILURE_JSON)?;
+            Ok(DecodedAutomationMutation::Failure {
+                automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
+                revision: text_of(AUTOMATION_PARAM_REVISION)?,
+                occurrence_id: text_of(AUTOMATION_PARAM_OCCURRENCE_ID)?,
+                failure: parse_automation_failure_document(&failure_json)?,
+                failure_json,
+            })
+        }
         _ => Err(StoreError::UnknownOperation),
     }
 }
 
 /// Validates the closed read selectors and decodes the query.
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed query-discriminator table; one arm per read kind"
+)]
 pub fn validate_automation_read_params(
     parameters: &BTreeMap<String, Value>,
 ) -> Result<DecodedAutomationRead, StoreError> {
@@ -519,6 +645,20 @@ pub fn validate_automation_read_params(
         .map(str::to_owned);
     if let Some(id) = automation_id.as_deref() {
         validate_automation_id(id)?;
+    }
+    let requested_revision = parameters
+        .get(AUTOMATION_PARAM_REVISION)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(revision) = requested_revision.as_deref() {
+        validate_revision_id(revision)?;
+    }
+    let requested_occurrence_id = parameters
+        .get(AUTOMATION_PARAM_OCCURRENCE_ID)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(occurrence_id) = requested_occurrence_id.as_deref() {
+        validate_occurrence_id(occurrence_id)?;
     }
     let include_retired = parameters
         .get(AUTOMATION_PARAM_INCLUDE_RETIRED)
@@ -544,13 +684,10 @@ pub fn validate_automation_read_params(
             field: "automation.max_records",
             reason: "page bound is required",
         })?;
-    let max_records: u16 =
-        max_records
-            .parse()
-            .map_err(|_| StoreError::InvalidField {
-                field: "automation.max_records",
-                reason: "page bound must be a decimal count",
-            })?;
+    let max_records: u16 = max_records.parse().map_err(|_| StoreError::InvalidField {
+        field: "automation.max_records",
+        reason: "page bound must be a decimal count",
+    })?;
     if max_records == 0 || max_records > MAX_AUTOMATION_PAGE_RECORDS {
         return Err(StoreError::InvalidField {
             field: "automation.max_records",
@@ -558,24 +695,86 @@ pub fn validate_automation_read_params(
         });
     }
     match query {
-        AUTOMATION_QUERY_LIST => Ok(DecodedAutomationRead {
-            query: query.to_owned(),
-            automation_id: None,
-            include_retired,
-            max_records,
-        }),
-        AUTOMATION_QUERY_CURRENT
-        | AUTOMATION_QUERY_HISTORY
-        | AUTOMATION_QUERY_INVOCATIONS
-        | AUTOMATION_QUERY_FAILURE => {
-            let automation_id =
-                automation_id.ok_or(StoreError::InvalidField {
-                    field: "automation.automation_id",
-                    reason: "exact automation selector is required",
-                })?;
+        AUTOMATION_QUERY_LIST => {
+            if requested_revision.is_some() || requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: if requested_revision.is_some() {
+                        AUTOMATION_PARAM_REVISION
+                    } else {
+                        AUTOMATION_PARAM_OCCURRENCE_ID
+                    },
+                    reason: "selector is not valid for list reads",
+                });
+            }
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: None,
+                requested_revision: None,
+                requested_occurrence_id: None,
+                include_retired,
+                max_records,
+            })
+        }
+        AUTOMATION_QUERY_CURRENT | AUTOMATION_QUERY_HISTORY => {
+            if requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_OCCURRENCE_ID,
+                    reason: "occurrence selector is only valid for invocations reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: Some(automation_id),
+                requested_revision,
+                requested_occurrence_id: None,
+                include_retired,
+                max_records,
+            })
+        }
+        AUTOMATION_QUERY_INVOCATIONS => {
+            if requested_revision.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_REVISION,
+                    reason: "revision selector is only valid for current/history reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: Some(automation_id),
+                requested_revision: None,
+                requested_occurrence_id,
+                include_retired,
+                max_records,
+            })
+        }
+        AUTOMATION_QUERY_FAILURE => {
+            if requested_revision.is_some() || requested_occurrence_id.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: if requested_revision.is_some() {
+                        AUTOMATION_PARAM_REVISION
+                    } else {
+                        AUTOMATION_PARAM_OCCURRENCE_ID
+                    },
+                    reason: "selector is not valid for failure reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: Some(automation_id),
+                requested_revision: None,
+                requested_occurrence_id: None,
                 include_retired,
                 max_records,
             })
@@ -655,8 +854,8 @@ pub fn validate_automation_doc(document: &str, field: &'static str) -> Result<()
             reason: "automation document is outside the bounded length",
         });
     }
-    let value: Value =
-        serde_json::from_str(document).map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let value: Value = serde_json::from_str(document)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
     if !value.is_object() {
         return Err(StoreError::InvalidField {
             field,
@@ -666,8 +865,96 @@ pub fn validate_automation_doc(document: &str, field: &'static str) -> Result<()
     Ok(())
 }
 
+/// Canonical failure document persisted verbatim by the failure leg
+/// (issue #1779). The fingerprint is the deterministic class digest
+/// minted by the Kernel-owned revision; the reason wire value and the
+/// notification dedup key travel opaque so the Store never interprets
+/// failure semantics. Failure content validity (fingerprint derivation,
+/// notification shape) stays Kernel-owned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationFailureDocument {
+    /// Deterministic failure-class fingerprint (lowercase SHA-256 hex).
+    pub fingerprint: String,
+    /// Typed failure-reason wire value (canonical JSON).
+    pub reason: String,
+    /// Notification dedup key echoed from the failure projection.
+    pub notification_dedup_key: String,
+}
+
+/// Validates one failure document structurally plus its closed fields.
+pub fn validate_automation_failure_document(
+    document: &AutomationFailureDocument,
+) -> Result<(), StoreError> {
+    if document.fingerprint.len() != 64
+        || !document
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(StoreError::InvalidField {
+            field: "automation.fingerprint",
+            reason: "failure fingerprint must be SHA-256 hex",
+        });
+    }
+    validate_failure_text(&document.reason, "automation.reason")?;
+    validate_failure_text(
+        &document.notification_dedup_key,
+        "automation.notification_dedup_key",
+    )?;
+    Ok(())
+}
+
+fn validate_failure_text(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "failure text must be non-blank wire text",
+        });
+    }
+    if value.len() > MAX_AUTOMATION_DOC_BYTES {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "failure text exceeds the document bound",
+        });
+    }
+    Ok(())
+}
+
+/// Parses and validates the `failure_json` leg parameter into its
+/// canonical document.
+pub fn parse_automation_failure_document(
+    failure_json: &str,
+) -> Result<AutomationFailureDocument, StoreError> {
+    validate_automation_doc(failure_json, AUTOMATION_PARAM_FAILURE_JSON)?;
+    let document: AutomationFailureDocument = serde_json::from_str(failure_json)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    validate_automation_failure_document(&document)?;
+    Ok(document)
+}
+
+/// Storage key for one failure row: automation, revision, fingerprint.
+/// Repeats of one failure class converge on this key; the first writer
+/// wins and later repeats keep the existing row.
+#[must_use]
+pub fn automation_failure_key(automation_id: &str, revision: &str, fingerprint: &str) -> String {
+    format!("{automation_id}\x1f{revision}\x1f{fingerprint}")
+}
+
+/// Canonical failure-history record reference for one failure row.
+/// Deterministic over the row key, so replays and converged repeats
+/// resolve the identical reference.
+#[must_use]
+pub fn automation_failure_history_ref(
+    automation_id: &str,
+    revision: &str,
+    fingerprint: &str,
+) -> String {
+    format!("automation-failure:{automation_id}:{revision}:{fingerprint}")
+}
+
 /// Returns whether the value names a closed admission state (mirror of
-/// the domain SCREAMING_SNAKE_CASE states; membership only, transitions
+/// the domain `SCREAMING_SNAKE_CASE` states; membership only, transitions
 /// stay Kernel-owned).
 #[must_use]
 pub const fn is_configuration_state_wire(value: &str) -> bool {

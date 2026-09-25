@@ -270,9 +270,7 @@ fn check_argument_keys(keys: &[String]) -> Result<(), GateValidationError> {
 }
 
 fn object_fields(value: &Value) -> Result<&serde_json::Map<String, Value>, GateValidationError> {
-    value
-        .as_object()
-        .ok_or(GateValidationError::NotAnObject)
+    value.as_object().ok_or(GateValidationError::NotAnObject)
 }
 
 fn require_shape(object: &serde_json::Map<String, Value>) -> Result<(), GateValidationError> {
@@ -324,9 +322,7 @@ fn require_string_list(
         .ok_or(GateValidationError::Field(field))?;
     let mut keys = Vec::with_capacity(values.len());
     for value in values {
-        let key = value
-            .as_str()
-            .ok_or(GateValidationError::Field(field))?;
+        let key = value.as_str().ok_or(GateValidationError::Field(field))?;
         keys.push(key.to_owned());
     }
     Ok(keys)
@@ -514,11 +510,7 @@ pub fn validate_skipped_tool_receipt(
     payload: &Value,
 ) -> Result<ValidatedSkippedReceipt, GateValidationError> {
     let object = object_fields(payload)?;
-    let binding = validate_binding(
-        object,
-        OPENCODE_SKIPPED_EVENT_KIND,
-        GateToolClass::ReadOnly,
-    )?;
+    let binding = validate_binding(object, OPENCODE_SKIPPED_EVENT_KIND, GateToolClass::ReadOnly)?;
     Ok(ValidatedSkippedReceipt {
         tool: binding.tool,
         argument_keys: binding.argument_keys,
@@ -558,8 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn mutation_gate_accepts_plugin_vector_and_binds_tool_to_digest(
-    ) -> Result<(), GateValidationError> {
+    fn mutation_gate_accepts_plugin_vector_and_binds_tool_to_digest()
+    -> Result<(), GateValidationError> {
         let payload = gate_fixture();
         let validated = validate_mutation_gate_payload(&payload)?;
         assert_eq!(validated.tool, "bash");

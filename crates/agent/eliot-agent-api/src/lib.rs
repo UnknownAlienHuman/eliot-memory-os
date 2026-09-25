@@ -45,7 +45,8 @@ pub use route_receipts::{
     LegacyQuarantineReason, LegacyRouteQuarantine, MAX_EVIDENCE_REFS, MAX_REJECTED_CANDIDATES,
     MAX_ROUTE_CANDIDATES, MAX_SAFE_ERROR_CHARS, MAX_TEXT_REF_CHARS, NoRouteDisposition,
     PhysicalRouteObservationReceipt, RejectedRouteCandidate, RouteObservationState,
-    RouteSelectionCandidate, candidate_digest_for, route_divergence_fields,
+    RouteSelectionCandidate, candidate_digest_for, route_divergence_fields, sanitize_adapter_error,
+    validate_safe_public_error,
 };
 
 /// Wire revision v7 hardens the #228 effect trio (T4 S-effect, Implements #228):
@@ -66,7 +67,23 @@ pub use route_receipts::{
 /// (governor `eliot-authority::EffectReceipt` with `CanonicalEffectReceipt`
 /// obligations remains the authoritative owner; no unilateral rename in this
 /// slice, see disposition below).
-pub const CONTRACT_VERSION: &str = "eliot-agent-api/v7";
+///
+/// Post-#369 result revision v8 (issue #370 W12/W23): the provider-neutral
+/// candidate result wire stays structurally candidate-only
+/// ([`ResultDisposition`] carries no completion spelling and [`AgentResult`]
+/// carries no authoritative receipt field), while every versioned observation
+/// receipt stamped from this constant moves to v8. Stamps are enforced, not
+/// advisory: [`PhysicalRouteObservationReceipt::validate`] and
+/// [`AdmittedRouteReceipt::validate`] reject any `schema_version !=
+/// CONTRACT_VERSION` with [`ContractError::UnknownContractVersion`], so
+/// v7-stamped wires fail closed instead of silently upgrading. The outer
+/// result wire version is this constant, applied through
+/// [`AgentResult::contract_version`]; no outer `schema_version` member is
+/// added to [`AgentResult`] itself so the nine direct reverse consumers keep
+/// compiling without a flag-day struct migration (bounded companion: the two
+/// exact version pins in `src/lib.rs` tests and
+/// `tests/effect_ceiling_non_widening.rs`).
+pub const CONTRACT_VERSION: &str = "eliot-agent-api/v8";
 
 /// Compatibility spelling retained as an exact alias of the canonical owner.
 pub type AttemptId = AgentAttemptId;
@@ -189,6 +206,8 @@ pub enum ContractError {
     OversizeField { field: &'static str },
     #[error("unknown route contract version")]
     UnknownContractVersion,
+    #[error("{field} carries forbidden secret or credential content")]
+    ForbiddenContent { field: &'static str },
 }
 
 /// Whether an admission may expose only safe observations or material work.
@@ -995,6 +1014,35 @@ pub struct AgentResult {
 }
 
 impl AgentResult {
+    /// Execution/ownership consistency contract (issue #370 P1): the outer
+    /// [`ResultDisposition`] never overrides the embedded physical execution
+    /// axis. While the embedded
+    /// [`PhysicalRouteObservationReceipt::execution_outcome`] is
+    /// [`ExecutionOutcome::UnknownOutcome`], the execution is genuinely
+    /// unreconciled and intake owners must retain writer/resource ownership
+    /// under the same reconciliation identity (the embedded `recovery_ref`)
+    /// until the existing owner proves termination or fencing — regardless of
+    /// the outer disposition. Only an
+    /// [`ExecutionOutcome::Observed`] result may release ownership or settle
+    /// terminally. This predicate is the single definition of that rule; the
+    /// coordinator `submit_result` intake applies it at the state transition
+    /// (retention, never rejection: a contradictory pair still validates here
+    /// so the existing owner can reconcile it under its recovery identity).
+    pub fn execution_unknown(&self) -> bool {
+        self.actual_route.execution_outcome == ExecutionOutcome::UnknownOutcome
+    }
+
+    /// Outer result-wire version owned by this candidate schema (issue #370
+    /// W12/W23). The version governs the whole [`AgentResult`] wire: every
+    /// versioned observation receipt embedded in the result is stamped from
+    /// this same constant at assembly and rejected on mismatch at validation,
+    /// so a stale wire fails closed instead of decoding as a current
+    /// candidate. This accessor is the single definition of that binding; it
+    /// constructs no Finish state and raises no proof ceiling.
+    pub fn contract_version() -> &'static str {
+        CONTRACT_VERSION
+    }
+
     pub fn validate(&self, ceiling: &EffectCeiling) -> Result<(), ContractError> {
         self.actual_route.validate()?;
         for effect in &self.proposed_effects {
@@ -1036,6 +1084,12 @@ impl AgentResult {
     ///   closes);
     /// - existing shape/ceiling/unknown-reason checks via [`Self::validate`]
     ///   (per-effect ceiling/scope plus unknown-reason).
+    ///
+    /// Execution/ownership consistency is deliberately not rejected here (no
+    /// disposition/execution pairing check): [`Self::execution_unknown`]
+    /// exposes the rule and intake owners retain ownership on unknown
+    /// execution, so a contradictory pair stays recorded under its recovery
+    /// identity and the existing owner can reconcile it.
     pub fn validate_for_binding(
         &self,
         binding: &ProviderExecutionBinding,
@@ -1063,6 +1117,24 @@ impl AgentResult {
         }
         self.validate(ceiling)
     }
+}
+
+/// Decodes one candidate result wire at the live production Serde boundary
+/// (issue #370 A2). `serde_json::from_str::<AgentResult>` enforces the closed
+/// candidate schema in production code: `deny_unknown_fields` rejects
+/// `effect_receipts` and any unknown member, while the closed
+/// `SCREAMING_SNAKE_CASE` [`ResultDisposition`] enum rejects
+/// `VERIFIED_COMPLETE` and the legacy `verified_complete`/`COMPLETE`/`DONE`/
+/// `FINISHED` spellings, unknown aliases, and untagged numeric forms at
+/// decode. Shape, binding linkage, and ceiling are then enforced with
+/// [`AgentResult::validate`]; a decoded wire is never silently mapped — a
+/// failure stays an error for the caller to quarantine. The coordinator
+/// snapshot boundary screens misdirected result wires through this function
+/// (`eliot-agent-coordinator::decode_snapshot_wire`); legacy pre-candidate
+/// wires additionally classify to structured errors there, never to candidate
+/// success.
+pub fn decode_agent_result_json(json: &str) -> Result<AgentResult, serde_json::Error> {
+    serde_json::from_str(json)
 }
 
 /// Stable schema for downstream generators and fixture comparison.
@@ -1234,9 +1306,10 @@ mod tests {
             route_state: RouteObservationState::Matched,
             diverged_fields: Vec::new(),
             execution_outcome: ExecutionOutcome::Observed,
-            request_digest: fixture_digest(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )?,
+            // The reported commitment is the bound start request preserved
+            // verbatim: `validate_against` rejects any substituted value, so
+            // the happy-path fixture must carry the binding's commitment.
+            request_digest: fixture_digest(&binding.start_request_sha256)?,
             translation_digest: None,
             raw_evidence_digest: None,
             raw_evidence_ref: None,
@@ -2356,8 +2429,10 @@ mod tests {
     fn api_case_21_v6_effect_wire_and_version_are_rejected_loss_visible() -> TestResult {
         // #228 narrow slice: v6 string effect wires do not silently upgrade
         // to v7 typed fields; `schema_version == v6` is rejected as
-        // `UnknownContractVersion` on versioned receipts.
-        assert_eq!(CONTRACT_VERSION, "eliot-agent-api/v7");
+        // `UnknownContractVersion` on versioned receipts. Post-#369 result
+        // revision v8 (issue #370 W12/W23) keeps rejecting v6 while the live
+        // contract moves on.
+        assert_eq!(CONTRACT_VERSION, "eliot-agent-api/v8");
         let v6_effect = serde_json::json!({
             "effect_id": "effect-case-21",
             "attempt_id": "attempt-case-21",

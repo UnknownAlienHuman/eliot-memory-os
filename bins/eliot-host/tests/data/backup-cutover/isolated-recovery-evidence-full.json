@@ -1,0 +1,1 @@
+{"fixture":"isolated-recovery-evidence-full","is_degraded":false,"is_isolated":true,"issue":961,"note":"fixed owner receipt shape for unit dev; live Windows proof deferred (T19 TEST-PHASE)","recovery_digest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","verified":true}

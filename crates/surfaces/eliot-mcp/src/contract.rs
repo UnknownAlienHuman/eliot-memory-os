@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use eliot_kernel_core::UserAutomationOperation;
 use eliot_protocol::{HARD_STRUCTURED_RESPONSE_BYTES, RequestIdentity};
 use eliot_receipts::{ProofCeiling, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
@@ -58,7 +59,16 @@ pub struct ApplicationRequest {
     pub tool: ToolRequest,
 }
 
-/// Exact canonical tool requests.
+/// Authenticated Kernel selector for the UserAutomation operator route.
+pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
+
+/// Closed typed requests used by the MCP hot surface and the authenticated
+/// Host/operator bridge.
+///
+/// `UserAutomation` is deliberately a cold/operator route. It remains typed
+/// here so the Host bridge and CLI share one payload contract, but it is not
+/// admitted by [`ADMITTED_TOOL_NAMES`], published by the canonical MCP schema,
+/// or assigned a semantic hot-tool profile.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments", deny_unknown_fields)]
 pub enum ToolRequest {
@@ -86,6 +96,20 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
+    /// Authenticated UserAutomation operator operation carried by Host/CLI.
+    #[serde(rename = "eliot_user_automation")]
+    UserAutomation(UserAutomationInput),
+    /// Hotset intake for Skill delivery (host-request skill leg only).
+    ///
+    /// Non-hot carrier: no semantic profile, never advertised on the MCP
+    /// surface, always rejected by profile-driven dispatch. Carries the
+    /// versioned Skill intake payload as opaque arguments validated at the
+    /// Skill boundary, never here.
+    #[serde(rename = "skill.inject")]
+    SkillInject(Value),
+    /// Display request for a delivered Skill (same non-hot status).
+    #[serde(rename = "skill.display")]
+    SkillDisplay(Value),
 }
 
 impl ToolRequest {
@@ -101,6 +125,9 @@ impl ToolRequest {
             Self::Verify(_) => "eliot.verify",
             Self::Coordinate(_) => "eliot.coordinate",
             Self::Finish(_) => "eliot.finish",
+            Self::UserAutomation(_) => USER_AUTOMATION_ROUTE,
+            Self::SkillInject(_) => "skill.inject",
+            Self::SkillDisplay(_) => "skill.display",
         }
     }
 
@@ -114,7 +141,44 @@ impl ToolRequest {
             Self::Verify(value) => value.validate(),
             Self::Coordinate(value) => value.validate(),
             Self::Finish(value) => value.validate(),
+            Self::UserAutomation(value) => value.validate(),
+            Self::SkillInject(value) | Self::SkillDisplay(value) => {
+                if !value.is_object() {
+                    return Err(ContractViolation::InvalidField {
+                        field: "tool.arguments",
+                        reason: "skill carrier arguments must be a JSON object",
+                    });
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+/// Typed UserAutomation operator input for the authenticated Host/MCP route.
+///
+/// The surface carries only the closed Kernel-owned operation vocabulary and a
+/// retry-stable idempotency key. Principal, session, request metadata,
+/// StateFence, WorkScope authority, provider identity, scheduler state and
+/// Store receipts are authenticated and supplied by Kernel composition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationInput {
+    /// Existing Kernel-owned closed operator operation.
+    pub operation: UserAutomationOperation,
+    /// Retry-stable caller key; it is not an authority or Store identity.
+    pub idempotency_key: String,
+}
+
+impl UserAutomationInput {
+    fn validate(&self) -> Result<(), ContractViolation> {
+        self.operation
+            .validate()
+            .map_err(|_error| ContractViolation::InvalidField {
+                field: "user_automation.operation",
+                reason: "closed UserAutomation operation is invalid",
+            })?;
+        non_blank(&self.idempotency_key, "user_automation.idempotency_key")
     }
 }
 
@@ -797,6 +861,26 @@ pub const ADMITTED_TOOL_NAMES: [&str; 8] = [
     "eliot.finish",
 ];
 
+/// Canonical selector of the strict finish tool.
+const FINISH_TOOL_NAME: &str = "eliot.finish";
+
+/// Stable agent-facing reason code for a legacy caller-supplied finish proof.
+///
+/// I7.9 pins this exact code: a legacy caller-supplied proof is rejected with
+/// `LEGACY_FINISH_INPUT_REJECTED`; absence of strict fields never selects a
+/// weaker path. I7.20 carries the code in the cognition/proof group of the
+/// open reason registry. It is emitted by `TypedRejection::LegacyFinishProof`
+/// at the protected ingress and by the Governor finish-service guard for the
+/// wrapper-level proof field; no other rejection may use it.
+pub const LEGACY_FINISH_INPUT_REJECTED: &str = "LEGACY_FINISH_INPUT_REJECTED";
+
+/// Exact legacy member spelling rejected from `eliot.finish` arguments.
+///
+/// This is the `completion_proof` field the Governor finish wrapper captures
+/// solely to reject; the strict `FinishAttemptDraft` contract has no such
+/// member. Only this exact spelling is recognized — no aliases are invented.
+const LEGACY_FINISH_PROOF_MEMBER: &str = "completion_proof";
+
 /// Maximum decoded control-name length echoed in diagnostics. Longer names
 /// are truncated so diagnostics never echo protected bodies.
 const MAX_CONTROL_NAME_CHARS: usize = 64;
@@ -819,6 +903,15 @@ pub enum TypedRejection {
     UnknownVariant {
         /// Bounded variant name (tool selector).
         variant: String,
+    },
+    /// A legacy caller-supplied finish proof member was observed in an
+    /// `eliot.finish` request (Implements #1741: reject with
+    /// `LEGACY_FINISH_INPUT_REJECTED`). Only the exact static member
+    /// spelling is carried; no caller bytes are echoed.
+    #[error("LEGACY_FINISH_INPUT_REJECTED: {member}")]
+    LegacyFinishProof {
+        /// Exact static legacy member spelling that was rejected.
+        member: &'static str,
     },
     /// Raw bytes are not a well-formed protected envelope.
     #[error("MALFORMED_PROTECTED_REQUEST: {reason}")]
@@ -864,6 +957,20 @@ pub fn decode_protected_request_bytes(bytes: &[u8]) -> Result<ApplicationRequest
             variant: bound_control_name(&variant),
         });
     }
+    // A legacy caller-supplied proof in an `eliot.finish` request is rejected
+    // with its pinned reason code before strict typed decoding (which would
+    // otherwise report only a generic unknown-field failure). Strict
+    // `FinishAttemptDraft` requests without the member decode unchanged;
+    // other unknown members and missing strict fields keep their existing
+    // generic rejections — absence of strict fields never selects a weaker
+    // path and never becomes proof.
+    if tool_variant_name(&value).as_deref() == Some(FINISH_TOOL_NAME)
+        && finish_arguments_contain_legacy_proof(&value)
+    {
+        return Err(TypedRejection::LegacyFinishProof {
+            member: LEGACY_FINISH_PROOF_MEMBER,
+        });
+    }
     serde_json::from_slice::<ApplicationRequest>(bytes).map_err(|error| {
         let message = error.to_string();
         if message.starts_with("duplicate field") {
@@ -903,6 +1010,20 @@ fn field_between_backticks(message: &str) -> Option<String> {
 
 fn tool_variant_name(value: &Value) -> Option<String> {
     value.get("tool")?.get("name")?.as_str().map(str::to_owned)
+}
+
+/// Returns whether an `eliot.finish` request carries the legacy
+/// caller-supplied proof member in its arguments object.
+///
+/// Detection only: the collapsed `Value` is consulted for the exact static
+/// member spelling after the raw duplicate-key scan has already run, so this
+/// never weakens duplicate protection and never decodes caller bytes.
+fn finish_arguments_contain_legacy_proof(value: &Value) -> bool {
+    value
+        .get("tool")
+        .and_then(|tool| tool.get("arguments"))
+        .and_then(|arguments| arguments.get(LEGACY_FINISH_PROOF_MEMBER))
+        .is_some()
 }
 
 fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), TypedRejection> {

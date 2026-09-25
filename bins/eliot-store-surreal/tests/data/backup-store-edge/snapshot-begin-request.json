@@ -1,0 +1,96 @@
+{
+  "contract_version": { "major": 1, "minor": 0, "patch": 0 },
+  "operation": {
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "source": {
+    "installation_id": "install-975",
+    "store_id": "store-975-1",
+    "schema": "eliot.store.snapshot.v1",
+    "generation": 1
+  },
+  "scope": {
+    "scope_id": "scope-975-1",
+    "revision_heads": [
+      {
+        "key": "rev-975-1",
+        "revision": 3,
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      }
+    ],
+    "ordering_heads": [
+      {
+        "scope": "scope-975-1",
+        "sequence": 6,
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      }
+    ],
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    }
+  },
+  "event_interval": { "first_sequence": 1, "last_sequence": 9 },
+  "denominator": {
+    "members": [
+      {
+        "member_id": "member-975-1",
+        "member_type": "RECORD",
+        "content_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "residency": {
+          "domain": "INLINE_CANONICAL",
+          "residency_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "byte_count": 128
+        },
+        "reference_digest": null
+      },
+      {
+        "member_id": "member-975-2",
+        "member_type": "REFERENCE",
+        "content_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "residency": {
+          "domain": "CONTENT_BLOB",
+          "residency_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "byte_count": 256
+        },
+        "reference_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    ],
+    "is_complete": true
+  },
+  "bounds": {
+    "max_members": 1024,
+    "max_bytes": 8388608,
+    "max_pages": 4096,
+    "max_work": 1000000,
+    "max_duration_ms": 3600000
+  },
+  "expires_at_unix_ms": 1800000000000,
+  "privacy_proof_refs": ["proof-975-1"]
+}

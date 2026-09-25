@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
-    AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
-    CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
-    HostEventNormalizationReceipt, HostEventQuarantineReason, HostEventReplayDisposition,
-    NormalizedHostEventEnvelope, ProviderExecutionBinding, ProviderObservationLineage,
-    RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate, WorkLeaseId,
-    candidate_digest_for, validate_execution_binding,
+    AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AttemptState, AuthorityEnvelope,
+    CancellationState, CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling,
+    EffectKind, HostEventNormalizationReceipt, HostEventQuarantineReason,
+    HostEventReplayDisposition, NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, RejectedRouteCandidate,
+    ResultDisposition, RouteSelectionCandidate, WorkLeaseId, candidate_digest_for,
+    validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
@@ -23,15 +24,18 @@ use crate::model::{
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CoordinatedAttemptState,
     CoordinatorConfig, CoordinatorError, CoordinatorEvent, CoordinatorSnapshot,
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
-    ExecutionContext, LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt,
-    PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ExecutionContext, LegacyResultWireKind, LostWorkerReceipt, OperationId,
+    OutcomeReconciliationId, PeerMessageReceipt, PlanGap, ProviderAdmissionReceipt,
+    ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
     ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
     StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
     UnknownOutcomeFinalReceipt, WorkerId, validate_text,
 };
-use crate::provider_admission::{AdmittedProviderCapability, KernelProviderVerifier};
+use crate::provider_admission::{
+    AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProviderProofKind {
@@ -59,6 +63,12 @@ pub(crate) enum ProviderProofKind {
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
+    /// Input-only issue #265 selection/health observation bound at
+    /// admission, if any. Route selection reads this; the verifier never
+    /// does, and it never mints admission.
+    fn selection_health(&self) -> Option<&ProviderSelectionHealth> {
+        None
+    }
     fn verify(
         &self,
         kind: ProviderProofKind,
@@ -103,6 +113,110 @@ struct AdmissionRecord {
 struct IdempotentRecord<T> {
     canonical_input: String,
     receipt: T,
+}
+
+/// Whether result intake must retain writer/resource ownership (issue #370
+/// P1): the outer disposition never overrides the embedded physical
+/// execution axis. Genuinely unknown execution retains ownership and the
+/// same reconciliation identity until the owner proves termination/fencing;
+/// see `AgentResult::execution_unknown` for the shared contract.
+fn retains_ownership_on_unknown_execution(result: &AgentResult) -> bool {
+    result.disposition == ResultDisposition::UnknownOutcome || result.execution_unknown()
+}
+
+/// Binding-gated result intake checks shared by `submit_result` (issue
+/// #370 S5 closure + #361 exact execution-unit binding): requested must
+/// equal the admitted route; attempt identity must match; the exact stored
+/// provider execution binding must exist and match exactly; the stored
+/// externally-issued admission must exist and the full triple must close
+/// via `validate_for_binding`. A missing stored binding fails closed with
+/// [`CoordinatorError::MissingExecutionBinding`]: a caller-presented unit is
+/// never accepted without a stored admitted unit to authenticate it against.
+/// No state mutation here.
+fn validate_result_intake_binding(
+    current: &AttemptRecord,
+    result: &AgentResult,
+    effect_ceiling: &EffectCeiling,
+) -> Result<(), CoordinatorError> {
+    let actual = &result.actual_route;
+    if actual.requested_route != current.route {
+        return Err(CoordinatorError::RouteMismatch);
+    }
+    if actual.attempt_id != current.attempt_id {
+        return Err(CoordinatorError::IdentityConflict("attempt_id"));
+    }
+    let stored = current
+        .provider_binding
+        .as_ref()
+        .ok_or(CoordinatorError::MissingExecutionBinding)?;
+    if &actual.binding != stored {
+        return Err(CoordinatorError::IdentityConflict("execution_binding"));
+    }
+    if actual.state_fence != current.state_fence {
+        return Err(CoordinatorError::IdentityConflict("execution_binding"));
+    }
+    let stored_admission = current
+        .admitted_route
+        .as_ref()
+        .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+    validate_intake_observation(actual, &actual.binding, stored_admission)?;
+    result
+        .validate_for_binding(&actual.binding, stored_admission, effect_ceiling)
+        .map_err(binding_contract)?;
+    Ok(())
+}
+
+/// Classifies a duplicate result intake against the accepted observation
+/// boundary for one attempt (issue #369 W15/W16/A14/A19). The accepted
+/// [`PhysicalRouteObservationReceipt`] stored with the first intake is the
+/// boundary: [`PhysicalRouteObservationReceipt::validate_replay_against`]
+/// compares the incoming observation against it, so a replay with changed
+/// wall-clock text cannot create a new causal event. Identical replays and
+/// different-identity observations fall through to the duplicate path; a
+/// conflicting observation under the same receipt/execution identity fails
+/// closed with `IdempotencyConflict` for quarantine, never overwriting the
+/// accepted record.
+fn classify_route_replay(
+    coordinator: &AgentCoordinator,
+    attempt_id: &AttemptId,
+    incoming: &PhysicalRouteObservationReceipt,
+) -> Result<(), CoordinatorError> {
+    let accepted = coordinator
+        .result_by_attempt
+        .get(attempt_id)
+        .and_then(|submission_id| coordinator.submissions.get(submission_id))
+        .map(|record| record.receipt.actual_route());
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
+    match incoming.validate_replay_against(accepted) {
+        Err(ContractError::ConflictingObservation) => Err(CoordinatorError::IdempotencyConflict),
+        Ok(()) | Err(_) => Ok(()),
+    }
+}
+
+/// Production observation-intake gate for one candidate result (issue #369
+/// A31/W34): the embedded physical observation is validated against the
+/// stored admission and the exact stored execution binding via
+/// [`PhysicalRouteObservationReceipt::validate_against`], and its usable
+/// proof ceiling is pinned to [`ProofCeiling::Observation`] via
+/// `observation_ceiling()`. Requested/observed divergence, absence, and
+/// unknown outcome therefore enter intake as capped observation evidence,
+/// never as a stronger proof. The surrounding [`CandidateResultReceipt`]
+/// keeps its own `CandidateArtifact` ceiling (issue #370) for the candidate
+/// layer; that ceiling never describes the observation.
+fn validate_intake_observation(
+    observation: &PhysicalRouteObservationReceipt,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+) -> Result<(), CoordinatorError> {
+    observation
+        .validate_against(binding, admission)
+        .map_err(binding_contract)?;
+    if observation.observation_ceiling() != ProofCeiling::Observation {
+        return Err(CoordinatorError::IdentityConflict("observation_ceiling"));
+    }
+    Ok(())
 }
 
 /// Accepted v7 host-event observation entry (issue #371 S7). The canonical
@@ -159,6 +273,71 @@ pub struct AgentCoordinator {
     peer_messages: BTreeMap<MessageId, IdempotentRecord<PeerMessageReceipt>>,
     peer_message_payloads: BTreeMap<MessageId, LivePeerMessage>,
     events: Vec<CoordinatorEvent>,
+}
+
+/// Reports whether raw snapshot JSON names an unsupported schema version
+/// (issue #370 W24). A decode failure on a version-mismatched wire maps to
+/// the structured [`CoordinatorError::UnsupportedSnapshot`] instead of a
+/// generic serialization string.
+fn snapshot_schema_unsupported(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_str().map(str::to_owned))
+        .is_some_and(|version| version != SNAPSHOT_SCHEMA_VERSION)
+}
+
+/// Structural walk confirming legacy pre-candidate-only markers inside
+/// snapshot JSON: a `VERIFIED_COMPLETE` string literal or an
+/// `effect_receipts` map key.
+fn walk_legacy_result_wire(
+    value: &serde_json::Value,
+    verified_complete: &mut bool,
+    effect_receipts: &mut bool,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text == "VERIFIED_COMPLETE" {
+                *verified_complete = true;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key("effect_receipts") {
+                *effect_receipts = true;
+            }
+            for item in map.values() {
+                walk_legacy_result_wire(item, verified_complete, effect_receipts);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_legacy_result_wire(item, verified_complete, effect_receipts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Classifies a legacy pre-candidate-only result wire (issue #370 W24):
+/// completion-alias dispositions and provider-supplied authoritative effect
+/// receipts. Returns `None` when no legacy marker is present, so genuinely
+/// malformed JSON still maps to the generic serialization error.
+fn legacy_result_wire_kind(json: &str) -> Option<LegacyResultWireKind> {
+    // Cheap substring pre-filter; the structural walk below confirms the
+    // markers so incidental text can never misclassify.
+    if !json.contains("VERIFIED_COMPLETE") && !json.contains("effect_receipts") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut verified_complete = false;
+    let mut effect_receipts = false;
+    walk_legacy_result_wire(&value, &mut verified_complete, &mut effect_receipts);
+    if verified_complete {
+        Some(LegacyResultWireKind::VerifiedCompleteDisposition)
+    } else if effect_receipts {
+        Some(LegacyResultWireKind::ProviderEffectReceipts)
+    } else {
+        None
+    }
 }
 
 impl AgentCoordinator {
@@ -360,8 +539,13 @@ impl AgentCoordinator {
             if !lane_keys.insert((lane.work_unit_id.clone(), lane.role_id.clone())) {
                 return Err(CoordinatorError::DuplicateIdentity("work_unit_role"));
             }
-            let routing =
-                select_route(&self.config, &request, role, lane.route_candidates.clone())?;
+            let routing = select_route(
+                &self.config,
+                &request,
+                role,
+                lane.route_candidates.clone(),
+                self.provider.selection_health(),
+            )?;
             let selected_route = routing
                 .selected
                 .clone()
@@ -511,10 +695,7 @@ impl AgentCoordinator {
                 .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
             // Candidate itself must still validate: an invalid selection
             // (e.g. selected absent from set) rejects here, never at intake.
-            candidate_lane
-                .routing
-                .validate()
-                .map_err(provider_contract)?;
+            validate_staffing_lane_routing(candidate_lane)?;
             if lane.route != *selected_route
                 || lane.routing_receipt_digest != routing_digest
                 || lane.role_revision != candidate_lane.role_revision
@@ -642,11 +823,7 @@ impl AgentCoordinator {
             left.work_class
                 .rank()
                 .cmp(&right.work_class.rank())
-                .then_with(|| {
-                    right
-                        .priority
-                        .cmp(&left.priority)
-                })
+                .then_with(|| right.priority.cmp(&left.priority))
                 .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
                 .then_with(|| left.role_id.cmp(&right.role_id))
                 .then_with(|| left.attempt_id.cmp(&right.attempt_id))
@@ -1210,9 +1387,34 @@ impl AgentCoordinator {
             return Err(CoordinatorError::StaleResult);
         }
         if self.result_by_attempt.contains_key(&current.attempt_id) {
+            // Accepted-observation boundary (issue #369 W14-W16/A13/A14/A19):
+            // the stored accepted observation is the last-observation
+            // boundary for this attempt. An identical replay under the same
+            // identity stays a duplicate; a conflicting observation under the
+            // same receipt/execution identity is quarantined as an
+            // idempotency conflict, never last-write-wins.
+            classify_route_replay(self, &current.attempt_id, &submission.result.actual_route)?;
             return Err(CoordinatorError::DuplicateResult);
         }
-        if current.state != CoordinatedAttemptState::Running {
+        // Cancellation authority gate (issue #370 A12): `CancelledObserved`
+        // is an observation requiring owned cancellation authority, never
+        // cancellation authority itself. A `Running` attempt with no recorded
+        // cancellation request cannot yield a cancellation observation; after
+        // `request_cancellation` the attempt admits only the cancellation
+        // observation, never a fresh candidate outcome.
+        let cancellation_observed =
+            submission.result.disposition == ResultDisposition::CancelledObserved;
+        if current.state == CoordinatedAttemptState::CancellationRequested && !cancellation_observed
+        {
+            return Err(CoordinatorError::InvalidAttemptState(current.state));
+        }
+        if current.state != CoordinatedAttemptState::Running
+            && current.state != CoordinatedAttemptState::CancellationRequested
+        {
+            return Err(CoordinatorError::InvalidAttemptState(current.state));
+        }
+        if cancellation_observed && current.state != CoordinatedAttemptState::CancellationRequested
+        {
             return Err(CoordinatorError::InvalidAttemptState(current.state));
         }
         let work_unit = self.work_unit_for(&current)?;
@@ -1220,63 +1422,31 @@ impl AgentCoordinator {
             .result
             .validate(&work_unit.effect_ceiling)
             .map_err(provider_contract)?;
-        let actual = &submission.result.actual_route;
-        // Requested must equal the admitted/assigned route; a mismatch is an
-        // invalid candidate selection and rejects. Observed divergence or
-        // absence is retained evidence (DIVERGED/UNOBSERVED) at a capped
-        // ceiling, never a mismatch rejection.
-        if actual.requested_route != current.route {
-            return Err(CoordinatorError::RouteMismatch);
-        }
-        if actual.attempt_id != current.attempt_id {
-            return Err(CoordinatorError::IdentityConflict("attempt_id"));
-        }
-        // Binding-gated intake: an exact stored binding must match exactly;
-        // without a stored binding, the presented binding must still agree on
-        // attempt/lease/fence/route, otherwise it is forged and rejects.
-        if let Some(stored) = &current.provider_binding {
-            if &actual.binding != stored {
-                return Err(CoordinatorError::IdentityConflict("execution_binding"));
-            }
-        } else if actual.binding.attempt_id != current.attempt_id
-            || actual.binding.lease_id != current.lease_id
-            || actual.binding.state_fence != current.state_fence
-            || actual.binding.route != current.route
-        {
-            return Err(CoordinatorError::IdentityConflict("execution_binding"));
-        }
-        if actual.state_fence != current.state_fence {
-            return Err(CoordinatorError::IdentityConflict("execution_binding"));
-        }
-        // S5 binding closure (issue #370): the stored externally-issued
-        // admitted decision must exist and the result must close the full
-        // triple via the shared S5 validator. Stored-only, never
-        // provider-supplied: the observation already carries the digest link
-        // (`admitted_route_digest`), and equality against stored is enforced
-        // inside `validate_for_binding`. Missing stored admission fails
-        // closed as `admitted_route`; validator mismatches map via the
-        // existing binding convention (`execution_binding`).
-        let stored_admission = current
-            .admitted_route
-            .as_ref()
-            .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
-        submission
-            .result
-            .validate_for_binding(&actual.binding, stored_admission, &work_unit.effect_ceiling)
-            .map_err(binding_contract)?;
+        validate_result_intake_binding(&current, &submission.result, &work_unit.effect_ceiling)?;
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }
-        let receipt = CandidateResultReceipt {
-            submission_id: submission.submission_id.clone(),
-            attempt_id: current.attempt_id.clone(),
-            provider_disposition: submission.result.disposition,
-            proof_ceiling: ProofCeiling::CandidateArtifact,
-            actual_route: submission.result.actual_route.clone(),
-            evidence_refs: submission.result.evidence_refs.clone(),
-            proposed_effect_count: submission.result.proposed_effects.len(),
-        };
-        let next_state = if submission.result.disposition == ResultDisposition::UnknownOutcome {
+        let receipt = CandidateResultReceipt::new(
+            submission.submission_id.clone(),
+            current.attempt_id.clone(),
+            submission.result.disposition,
+            submission.result.actual_route.clone(),
+            submission.result.evidence_refs.clone(),
+            submission.result.proposed_effects.len(),
+        );
+        // Ownership retention on unknown execution (issue #370 P1): the outer
+        // disposition never overrides the embedded physical execution axis;
+        // `result_by_attempt` below preserves the submission linkage the
+        // `reconcile_unknown_outcome` leg requires. Only observed execution
+        // releases the writer or settles terminally. An authority-gated
+        // cancellation observation (issue #370 A12) likewise retains
+        // ownership: the state stays `CancellationRequested` until
+        // `reconcile_cancellation` completes with the provider reconciliation
+        // receipt, so the observation links for the descendant projection
+        // without settling anything terminally.
+        let next_state = if current.state == CoordinatedAttemptState::CancellationRequested {
+            CoordinatedAttemptState::CancellationRequested
+        } else if retains_ownership_on_unknown_execution(&submission.result) {
             CoordinatedAttemptState::UnknownOutcome
         } else {
             self.release_writer(&current);
@@ -1574,13 +1744,28 @@ impl AgentCoordinator {
                 | CoordinatedAttemptState::UnknownOutcome => {
                     DescendantTerminalState::UnknownOutcome
                 }
-                CoordinatedAttemptState::LostFenced => DescendantTerminalState::Stale,
+                // A fenced lost worker is unreachable, not merely stale
+                // (issue #370 W6; I10-15 `NoLostChildInvariant`: a parent
+                // cannot finish while a descendant is unreachable). An
+                // unreconciled loss projects as `UnknownOutcome`, so the
+                // `Complete` ceiling validation rejects it until the loss is
+                // resolved. Only a loss already taken over by reassignment
+                // (`superseded_by`) is fenced-and-handed-off history and may
+                // project as `Stale`; the replacement attempt's own
+                // disposition then governs the ceiling.
+                CoordinatedAttemptState::LostFenced => {
+                    if attempt.superseded_by.is_some() {
+                        DescendantTerminalState::Stale
+                    } else {
+                        DescendantTerminalState::UnknownOutcome
+                    }
+                }
                 CoordinatedAttemptState::Cancelled => DescendantTerminalState::Cancelled,
                 CoordinatedAttemptState::CandidateResultSubmitted => self
                     .result_by_attempt
                     .get(&attempt.attempt_id)
                     .and_then(|submission_id| self.submissions.get(submission_id))
-                    .map(|record| match record.receipt.provider_disposition {
+                    .map(|record| match record.receipt.provider_disposition() {
                         ResultDisposition::CandidateSucceeded => DescendantTerminalState::Completed,
                         ResultDisposition::Partial => DescendantTerminalState::Partial,
                         ResultDisposition::CancelledObserved => DescendantTerminalState::Cancelled,
@@ -1793,14 +1978,64 @@ impl AgentCoordinator {
         )
     }
 
+    /// Shared snapshot-wire decode owned by the production restore boundary
+    /// (issue #370 W24/A2). Typed decode succeeds only for current-schema
+    /// snapshots; every failure classifies into a structured error instead of
+    /// a generic serialization string, loss-visibly:
+    /// - a version-mismatched wire maps to
+    ///   [`CoordinatorError::UnsupportedSnapshot`];
+    /// - completion-alias dispositions (`VERIFIED_COMPLETE` and legacy
+    ///   spellings) and provider-supplied authoritative `effect_receipts`
+    ///   classify to [`CoordinatorError::LegacyResultWire`], never migrated
+    ///   into candidate success;
+    /// - a well-formed current candidate result presented to the snapshot
+    ///   boundary is a misdirected wire, not a snapshot: it is rejected with
+    ///   [`CoordinatorError::UnsupportedSnapshot`] (screened through the live
+    ///   A-01 Serde boundary `eliot_agent_api::decode_agent_result_json`,
+    ///   which enforces the closed candidate schema), never ingested;
+    /// - genuinely malformed JSON keeps the generic serialization error.
+    fn decode_snapshot_wire(json: &str) -> Result<CoordinatorSnapshot, CoordinatorError> {
+        match serde_json::from_str(json) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                if snapshot_schema_unsupported(json) {
+                    return Err(CoordinatorError::UnsupportedSnapshot);
+                }
+                if let Some(kind) = legacy_result_wire_kind(json) {
+                    return Err(CoordinatorError::LegacyResultWire(kind));
+                }
+                if eliot_agent_api::decode_agent_result_json(json).is_ok() {
+                    return Err(CoordinatorError::UnsupportedSnapshot);
+                }
+                Err(CoordinatorError::Serialization(error.to_string()))
+            }
+        }
+    }
+
     pub fn restore_json(
         json: &str,
         live_config: CoordinatorConfig,
         gap: PlanGap,
     ) -> Result<Self, CoordinatorError> {
-        let snapshot = serde_json::from_str(json)
-            .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
+        let snapshot = Self::decode_snapshot_wire(json)?;
         Self::restore(snapshot, live_config, gap)
+    }
+
+    /// Production JSON restore on freshly supplied Kernel admission (issue
+    /// #370 W24). This is the entry the daemon JSON-restore path migrates to:
+    /// unlike hand-decoding a snapshot and calling the typed restore (which
+    /// bypasses legacy-wire classification), this entry decodes through
+    /// [`Self::decode_snapshot_wire`], so pre-candidate-only wires and
+    /// misdirected result wires fail with structured errors before any replay.
+    /// Every replayed event then re-verifies through the admitted provider
+    /// exactly as [`Self::restore_with_admitted_provider`] does.
+    pub fn restore_snapshot_json(
+        json: &str,
+        live_config: CoordinatorConfig,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, CoordinatorError> {
+        let snapshot = Self::decode_snapshot_wire(json)?;
+        Self::restore_with_admitted_provider(snapshot, live_config, capability)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -1838,7 +2073,19 @@ impl AgentCoordinator {
         }
         let expected_events = snapshot.events.clone();
         let mut coordinator = Self::with_provider(live_config, provider)?;
-        for event in expected_events.clone() {
+        coordinator.replay_snapshot_events(&expected_events)?;
+        if coordinator.events != expected_events {
+            return Err(CoordinatorError::SnapshotDigest);
+        }
+        Ok(coordinator)
+    }
+
+    fn replay_snapshot_events(
+        &mut self,
+        expected_events: &[CoordinatorEvent],
+    ) -> Result<(), CoordinatorError> {
+        let coordinator = &mut *self;
+        for event in expected_events.iter().cloned() {
             match event {
                 CoordinatorEvent::PlanCreated { request } => {
                     coordinator.plan(*request)?;
@@ -1922,7 +2169,7 @@ impl AgentCoordinator {
         if coordinator.events != expected_events {
             return Err(CoordinatorError::SnapshotDigest);
         }
-        Ok(coordinator)
+        Ok(())
     }
 
     fn deliver_message(
@@ -2176,6 +2423,7 @@ fn select_route(
     request: &StaffingPlanRequest,
     role: &RoleProfileManifest,
     mut candidates: Vec<RouteCandidateEvidence>,
+    health: Option<&ProviderSelectionHealth>,
 ) -> Result<RouteSelectionCandidate, CoordinatorError> {
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
@@ -2233,7 +2481,6 @@ fn select_route(
     let policy_revision = request
         .state_fence
         .policy_revision
-        .clone()
         .unwrap_or_else(PolicyRevision::genesis);
     let capability = role.required_competence.join("+");
     let query_intent = request.candidate_id.as_str().to_owned();
@@ -2242,6 +2489,25 @@ fn select_route(
         request.candidate_id.as_str(),
         role.role_id.as_str()
     );
+    // Issue #265 catalogue/quota/liveness observation rides the selection
+    // lineage only: the refs record which current-account observations
+    // informed this selection. Input-only — never read by the verifier,
+    // never minting admission, never gating selection.
+    let mut evidence_refs = selected.evidence_refs.clone();
+    if let Some(health) = health {
+        for observed in [
+            health.catalogue_revision(),
+            health.quota_knowledge_ref(),
+            health.liveness_observation_ref(),
+        ] {
+            if !evidence_refs
+                .iter()
+                .any(|existing| existing.as_str() == observed)
+            {
+                evidence_refs.push(observed.to_owned());
+            }
+        }
+    }
     let candidate = RouteSelectionCandidate {
         capability,
         query_intent,
@@ -2251,7 +2517,7 @@ fn select_route(
         selected: Some(selected.route.clone()),
         rejected,
         selection: CandidateSelectionDisposition::Selected,
-        evidence_refs: selected.evidence_refs.clone(),
+        evidence_refs,
     };
     candidate.validate().map_err(provider_contract)?;
     Ok(candidate)
@@ -2347,6 +2613,21 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
         validate_text(scope, "mutation_scope")?;
     }
     Ok(())
+}
+
+/// Validates the routing projection embedded in one staffing lane candidate
+/// (issue #369 W7/A3). The coordinator imports the owner schema
+/// ([`RouteSelectionCandidate`]) and embeds it as
+/// [`StaffingLaneCandidate::routing`]; there is no second shared routing
+/// receipt. This is the single production validator over the
+/// `StaffingLaneCandidate` symbol: the admit path invokes it for every
+/// admitted lane before any digest or admission linkage is compared, so the
+/// candidate digest and the admission binding below always describe a valid
+/// candidate.
+fn validate_staffing_lane_routing(
+    candidate: &StaffingLaneCandidate,
+) -> Result<(), CoordinatorError> {
+    candidate.routing.validate().map_err(provider_contract)
 }
 
 /// Validates the externally-issued admitted route decision carried by one
@@ -2447,8 +2728,7 @@ fn selected_route_key(candidate: &RouteSelectionCandidate) -> String {
     candidate
         .selected
         .as_ref()
-        .map(route_key)
-        .unwrap_or_else(|| "<no-route>".to_owned())
+        .map_or_else(|| "<no-route>".to_owned(), route_key)
 }
 
 fn canonical(value: &impl Serialize) -> Result<String, CoordinatorError> {

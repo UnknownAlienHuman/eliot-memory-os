@@ -25,8 +25,8 @@ use crate::{
 use eliot_runtime_contracts::SupervisionLeaseVerifier;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct S08wTerminalSink {
@@ -150,8 +150,7 @@ async fn s08w_sensor_port_recovery_containment_export() {
     let ors_path = supervision_fixture_path();
     let store = eliot_ors::RedbRecoveryStore::open(&ors_path)
         .unwrap_or_else(|error| panic!("s08w ors store: {error}"));
-    let now_ms =
-        crate::current_unix_ms().unwrap_or_else(|error| panic!("s08w clock: {error}"));
+    let now_ms = crate::current_unix_ms().unwrap_or_else(|error| panic!("s08w clock: {error}"));
     let binding = supervision_fixture_binding(now_ms.saturating_sub(200))
         .unwrap_or_else(|error| panic!("s08w lease binding: {error}"));
     let request = supervision_fixture_request(
@@ -222,10 +221,7 @@ async fn s08w_sensor_port_recovery_containment_export() {
         .unwrap_or_else(|error| panic!("s08w retained: {error}"));
     assert_eq!(retained.len(), 3, "heartbeat plus two containment gaps");
     assert!(
-        matches!(
-            retained[0].payload,
-            WatchdogSpoolPayload::Heartbeat { .. }
-        ),
+        matches!(retained[0].payload, WatchdogSpoolPayload::Heartbeat { .. }),
         "first record must be the admitted heartbeat"
     );
     assert!(
@@ -316,9 +312,7 @@ async fn s08w_sensor_port_recovery_containment_export() {
         .retained_spool_entries_for_export_driver_test()
         .unwrap_or_else(|error| panic!("s08w tail: {error}"));
     assert_eq!(
-        tail.iter()
-            .map(|entry| entry.sequence)
-            .collect::<Vec<_>>(),
+        tail.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
         vec![3]
     );
 

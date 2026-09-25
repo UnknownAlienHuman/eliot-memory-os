@@ -7,6 +7,12 @@
 
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
+// The crate error carries the full store failure for typed recovery; every
+// lifecycle function returns it by value like the existing catalogue API.
+// Boxing it here would diverge from that contract, so the size lint is
+// allowed at the crate root (same precedent as the catalogue/install modules,
+// which carry the identical module-level allow).
+#![allow(clippy::result_large_err)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,20 +24,35 @@ use thiserror::Error;
 
 pub mod catalogue;
 pub use catalogue::*;
+pub mod canonical_tools;
+pub use canonical_tools::{
+    CanonicalToolSource, ToolAliasTable, VersionBoundTools, install_package_versioned,
+    readiness_available_for_package, readiness_names_known_to_source, sealed_materialization_check,
+};
 pub mod install;
-pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
+pub use install::{
+    CatalogueInstallContext, check_lifecycle_standing, install_package, project_package_to_entry,
+    stamp_materialization_digests, validate_candidate_materialization,
+};
 
 /// Canonical package-source types consumed at the installation boundary.
 ///
 /// Re-exported so the composition owner calls
-/// [`install_package`] without taking a second surface dependency; the types
-/// stay canonical (no duplicates, no bridges).
+/// [`install_package`] and drives the accepted-candidate chain without taking
+/// a second surface dependency; the types stay canonical (no duplicates, no
+/// bridges). This includes the governed-procedure projection surface the
+/// daemon rehydrates before install.
 pub use eliot_skills::{
-    AdvisoryRuleClaim, CapabilityVersion, ConflictState, DeliveryProjection, DependencyMaterial,
-    DistractorState, FreshnessState, HostLimits, HostProfile, LifecycleProposal,
-    MaterializationInputs, PackageDigests, QuarantineState, RegistrationIdentity, SkillBehavior,
-    SkillCounters, SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial,
-    VersionedRequirement,
+    AdvisoryRuleClaim, Availability, AvailabilityField, CapabilityVersion, ConflictState,
+    DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState,
+    GOVERNED_PROCEDURE_PROJECTION_SCHEMA_VERSION, GovernedProcedureProjection, HostLimits,
+    HostProfile, InertAsset, LifecycleProposal, MaterializationInputs, MaterializationScope,
+    PackageDigests, PortableSkillPackageCandidate, ProcedureDefinition, ProcedureEvidence,
+    ProcedureState, ProcedureVerifier, QuarantineState, ReadinessClaims, ReceiptClaim,
+    RegistrationIdentity, SafetyPrivacyDisclosure, SkillBehavior, SkillCounters,
+    SkillInteractionProjection, SkillPackage, SkillState, TargetProfile, ToolDefinitionMaterial,
+    UnavailableCode, VersionedObservation, VersionedRequirement,
+    project_governed_procedure_to_portable_skill_candidates,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";
@@ -40,11 +61,11 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 pub mod activation;
 
 pub use activation::{
-    AdherenceCheckpoints, AttemptLifecycleSummary, InstructionConflict, OrderingBasis,
-    SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
+    AdherenceCheckpoints, AttemptLifecycleSummary, InstructionConflict, LifecycleEvidence,
+    OrderingBasis, SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
     SkillHarnessActivationReceipt, SkillRetrievalStatus, apply_dependency_staleness,
-    changed_dependency_names, derive_attempt_summary, detect_dependency_staleness,
-    material_use_allowed, record_instruction_conflict,
+    changed_dependency_names, derive_attempt_summary, derive_lifecycle_view,
+    detect_dependency_staleness, material_use_allowed, record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
@@ -649,6 +670,12 @@ pub struct PromotionGate {
     pub verifier_ref: String,
     pub evidence_refs: Vec<String>,
     pub independent_route_count: u32,
+    /// Route-proportional depth marker (`I7.13`, issue #1882 W6): `true`
+    /// when the candidate is a shared cross-route Skill or carries
+    /// Material/Critical instructions. A shared/critical promotion requires
+    /// two materially different routes plus human approval; a
+    /// host/task-specific promotion requires one matching real route.
+    pub is_shared_or_critical: bool,
     pub human_approval_ref: Option<String>,
     pub reversible: bool,
     pub state_fence: StateFence,
@@ -669,11 +696,27 @@ impl PromotionGate {
         if self.evidence_refs.is_empty() || self.independent_route_count == 0 {
             return Err(SkillError::IndependentEvidenceRequired);
         }
+        // The route count is bound to evidence identities, never a bare
+        // number: more claimed independent routes than evidence references
+        // fails closed.
+        let refs =
+            u32::try_from(self.evidence_refs.len()).map_err(|_| SkillError::InvalidField {
+                field: "gate.evidence_refs",
+                reason: "too many evidence references",
+            })?;
+        if self.independent_route_count > refs {
+            return Err(SkillError::IndependentEvidenceRequired);
+        }
         if self.state_fence != candidate.state_fence {
             return Err(SkillError::FenceMismatch);
         }
         if !self.reversible {
             return Err(SkillError::NonReversiblePromotion);
+        }
+        if self.is_shared_or_critical
+            && (self.independent_route_count < 2 || self.human_approval_ref.is_none())
+        {
+            return Err(SkillError::IndependentEvidenceRequired);
         }
         if (candidate.proposed_action == LifecycleAction::Merge
             || candidate.proposed_action == LifecycleAction::Split
@@ -777,6 +820,151 @@ impl SkillRegistry {
         self.views.get(skill_id)
     }
 
+    /// Derives one lifecycle view strictly from immutable evidence and records
+    /// it. This is the runtime derivation entry (I7.25): delivery, activation,
+    /// step/artifact/verifier/outcome, interaction and dependency evidence fold
+    /// into counters, status and interactions through
+    /// [`derive_lifecycle_view`](activation::derive_lifecycle_view); the stored
+    /// view always resolves to exact underlying records.
+    pub fn derive_and_record(
+        &mut self,
+        evidence: LifecycleEvidence<'_>,
+    ) -> Result<SkillLifecycleView, SkillError> {
+        let view = derive_lifecycle_view(evidence)?;
+        self.record_view(view.clone())?;
+        Ok(view)
+    }
+
+    /// Refreshes the stored view against the live dependency versions. A
+    /// pinned-set disagreement marks the view `Stale` with the detection
+    /// reason and blocks Material use until governed review or restore;
+    /// agreement, an identical stale reason, and quarantine report no change.
+    /// Returns `true` when the view became stale.
+    pub fn refresh_staleness(
+        &mut self,
+        skill_id: &str,
+        current: &[DependencyVersion],
+    ) -> Result<bool, SkillError> {
+        let view = self
+            .views
+            .get(skill_id)
+            .ok_or(SkillError::NotFound)?
+            .clone();
+        let Some(marked) = apply_dependency_staleness(&view, current)? else {
+            return Ok(false);
+        };
+        self.record_view(marked)?;
+        Ok(true)
+    }
+
+    /// Records an instruction conflict between two stored Skills, preserving
+    /// the explicitly specified or observed ordering and mutual exclusion.
+    /// Packet order is never consulted: the only accepted bases are
+    /// [`OrderingBasis::ExplicitlySpecified`] and [`OrderingBasis::Observed`].
+    /// Both views gain the conflict id, the preserved first-skill ordering and
+    /// — on mutual exclusion — the rival id, then re-record at the next
+    /// lifecycle revision.
+    ///
+    /// The `skill_a_id`/`skill_b_id` pair names are intentional domain vocabulary.
+    #[allow(clippy::similar_names, clippy::too_many_arguments)]
+    pub fn record_conflict(
+        &mut self,
+        conflict_id: String,
+        skill_a_id: String,
+        skill_b_id: String,
+        reason: String,
+        first_skill_id: String,
+        ordering_basis: OrderingBasis,
+        mutual_exclusion: bool,
+    ) -> Result<InstructionConflict, SkillError> {
+        let conflict = record_instruction_conflict(
+            conflict_id,
+            skill_a_id,
+            skill_b_id,
+            reason,
+            first_skill_id,
+            ordering_basis,
+            mutual_exclusion,
+        )?;
+        let mut first_view = self
+            .views
+            .get(&conflict.skill_a_id)
+            .ok_or(SkillError::NotFound)?
+            .clone();
+        let mut second_view = self
+            .views
+            .get(&conflict.skill_b_id)
+            .ok_or(SkillError::NotFound)?
+            .clone();
+        for view in [&mut first_view, &mut second_view] {
+            if !view
+                .interactions
+                .conflict_refs
+                .contains(&conflict.conflict_id)
+            {
+                view.interactions
+                    .conflict_refs
+                    .push(conflict.conflict_id.clone());
+            }
+            if !view
+                .interactions
+                .ordering_refs
+                .contains(&conflict.first_skill_id)
+            {
+                view.interactions
+                    .ordering_refs
+                    .push(conflict.first_skill_id.clone());
+            }
+            if conflict.mutual_exclusion {
+                let rival = if view.skill_id() == conflict.skill_a_id {
+                    &conflict.skill_b_id
+                } else {
+                    &conflict.skill_a_id
+                };
+                if !view.interactions.mutual_exclusion_refs.contains(rival) {
+                    view.interactions.mutual_exclusion_refs.push(rival.clone());
+                }
+            }
+            view.lifecycle_revision = view.lifecycle_revision.saturating_add(1);
+            view.validate()?;
+        }
+        self.record_view(first_view)?;
+        self.record_view(second_view)?;
+        Ok(conflict)
+    }
+
+    /// Admits one attempt for Material use behind its exact harness receipt.
+    ///
+    /// The receipt is validated, bound to the stored view's exact skill
+    /// revision and package digest, and gated on review state: stale and
+    /// quarantined Skills stay blocked until governed review or restore. The
+    /// returned summary keeps delivered, retrieved, activated, adhered and
+    /// useful distinct; absent adherence evidence stays unassessed or unknown,
+    /// never compliance, and usefulness additionally requires verifier-backed
+    /// outcome refs — never installation, retrieval, repetition or agreement.
+    pub fn admit_material_attempt(
+        &self,
+        receipt: &SkillHarnessActivationReceipt,
+    ) -> Result<AttemptLifecycleSummary, SkillError> {
+        receipt.validate()?;
+        let view = self
+            .views
+            .get(receipt.skill_id.as_str())
+            .ok_or(SkillError::NotFound)?;
+        if receipt.skill_revision != view.skill_ref.registration.revision
+            || receipt.package_digest != view.skill_ref.package_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if !material_use_allowed(view.status) {
+            return Err(SkillError::InvalidField {
+                field: "view.status",
+                reason: "stale or quarantined Skills are blocked from Material use until governed review or restore",
+            });
+        }
+        Ok(derive_attempt_summary(receipt))
+    }
+
     /// Explicit fields mirror the public lifecycle/API contract.
     #[allow(clippy::too_many_arguments)]
     pub fn propose(
@@ -817,6 +1005,38 @@ impl SkillRegistry {
             .views
             .get(candidate.base_skill_ref.skill_id())
             .ok_or(SkillError::NotFound)?;
+        if !material_use_allowed(base.status)
+            && candidate.proposed_action != LifecycleAction::Restore
+        {
+            return Err(SkillError::InvalidField {
+                field: "candidate.proposed_action",
+                reason: "stale or quarantined Skills require governed restoration before reuse",
+            });
+        }
+        // Live pre-commit dependency observation (`I7.13`, issue #1882 W6):
+        // the candidate commits an exact dependency set. When that set moves
+        // past the standing pins, the change must be revalidated into the
+        // about-to-commit view: a promotion that commits new dependency
+        // versions while pinning the old set would publish lineage
+        // disagreeing with its own candidate. Governed restoration bypasses,
+        // like the stale-base rule above; unchanged sets pass trivially, and
+        // a re-derived view carrying the committed set passes as evolution.
+        if candidate.proposed_action != LifecycleAction::Restore {
+            let mut standing = base.dependencies.clone();
+            standing.sort();
+            let mut committed = candidate.dependency_versions.clone();
+            committed.sort();
+            if standing != committed {
+                let mut promoted = promoted_view.dependencies.clone();
+                promoted.sort();
+                if promoted != committed {
+                    return Err(SkillError::InvalidField {
+                        field: "candidate.dependency_versions",
+                        reason: "promotion commits changed dependency versions the promoted view does not pin; re-derive the view against the committed set",
+                    });
+                }
+            }
+        }
         if base.identity_digest()? != candidate.base_view_digest
             || promoted_view.skill_id() != candidate.base_skill_ref.skill_id()
             || promoted_view.state_fence != candidate.state_fence

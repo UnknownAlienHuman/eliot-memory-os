@@ -1,0 +1,26 @@
+{
+  "backup_id": "capture-959-relation-fail",
+  "class": "full_recovery",
+  "source_adapter": "kernel-capture-959",
+  "schema_generation": "schema-959",
+  "scope_id": null,
+  "store_generation": "store-959",
+  "lineage": "550e8400-e29b-41d4-a716-446655440099",
+  "capture_times_match": true,
+  "cursors": {
+    "receipt": 9,
+    "event": 9,
+    "outbox": 3
+  },
+  "pending_ops": ["op-pending-959-9"],
+  "budgets": {
+    "max_events": 8,
+    "max_bytes": 1048576,
+    "max_blobs": 4,
+    "max_artifacts": 8
+  },
+  "cancel_requested": false,
+  "control_reserve_preserved": true,
+  "drift": "none",
+  "expected_state": "refused_relation_incoherent"
+}

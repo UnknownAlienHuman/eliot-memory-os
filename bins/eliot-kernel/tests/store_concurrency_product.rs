@@ -42,7 +42,7 @@ use eliot_kernel_service::{
     HostStoreBootstrapRequirement, KernelActivationPermit, KernelControlCommand,
     KernelReadyReceipt, KernelService, KernelServiceState, KernelStoreGateway, ObservedHead,
     ProcessObservation, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER, RESERVATION_VISIBILITY,
-    ReservationSeed, RestartBudget,
+    ReservationSeed, RestartBudget, StoreClientFault, StoreClientFaultHarness,
 };
 use eliot_ors::test_support::KernelRouteStoreFixture;
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
@@ -63,7 +63,8 @@ use eliot_store_api::{
 };
 use eliot_store_memory::MemoryStore;
 use eliot_store_surreal_adapter::{
-    PINNED_SURREALDB_MAJOR, SchemaGeneration, SurrealAdapterConfig, SurrealStoreAdapter,
+    PINNED_SURREALDB_MAJOR, PoolAdmission, PoolOccupancy, SchemaGeneration, SessionRole,
+    SurrealAdapterConfig, SurrealStoreAdapter, join_cleanup_result,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
@@ -186,6 +187,11 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: set_digest(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -198,6 +204,7 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     transition.identity.canonical_request_hash = canonical_request_hash(
         &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
     )
@@ -459,6 +466,22 @@ impl Harness {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Fallible root cleanup for 994/18 follow-up binding (issue #2030):
+    /// same removal loop as [`Self::cleanup`], but returns the failure
+    /// instead of panicking so the caller can join it with the primary
+    /// outcome through `join_cleanup_result` and retain both errors.
+    async fn cleanup_result(mut self) -> Result<(), String> {
+        self.adapter = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while std::fs::remove_dir_all(&self.root).is_err() {
+            if Instant::now() >= deadline {
+                return Err(format!("case {} root cleanup failed", self.case));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 }
 
@@ -1300,6 +1323,119 @@ async fn postcommit_response_loss_recovers_original_receipt() {
     harness.cleanup().await;
 }
 
+// WORK_UNIT_CASE: 994/11 (follow-up binding, issue #2030)
+#[tokio::test]
+async fn precommit_crash_hook_stays_unknown_without_provider_effect() {
+    case_entry(11);
+    let harness = Harness::fresh("11h").await;
+    harness
+        .adapter()
+        .install_concurrent_execution(
+            NonZeroUsize::new(profile_usize("lanes")).expect("lanes"),
+            NonZeroUsize::new(profile_usize("max_pending")).expect("pending"),
+            SchemaGeneration::v2(),
+            "kernel-994-test".to_owned(),
+            fence(),
+        )
+        .expect("concurrent install");
+    let route = kernel_route("11h", harness.adapter_shared()).await;
+    // Arm the production fault hook (issue #2030) on the proven route and
+    // drive the owner-bound reserved path: the crash fires before any
+    // provider send, so the write stays unknown with zero provider effect.
+    let (ctx, transition, rev, ord, seed) =
+        reserved_inputs("op-994-fault-pre", "scope-994-a", "subject-994-11h", 1);
+    route.gateway.arm_store_fault(
+        &StoreClientFaultHarness::test_harness(),
+        StoreClientFault::PreCommitCrash,
+    );
+    let _ = route
+        .gateway
+        .apply_reserved(&ctx, transition, rev, ord, seed)
+        .await
+        .expect_err("armed pre-commit crash stays unknown");
+    // Zero provider effect: reconcile proves absence by exact operation identity.
+    let absent = harness
+        .adapter()
+        .reconcile(ApiOperationId::new("op-994-fault-pre").expect("operation"))
+        .await
+        .expect("reconcile");
+    assert!(absent.is_none(), "crashed write left no provider effect");
+    // Unknown is never retried blindly: the same reserved inputs are refused
+    // while the faulted attempt's ORS reservation stands.
+    let (ctx_dup, transition_dup, rev_dup, ord_dup, seed_dup) =
+        reserved_inputs("op-994-fault-pre", "scope-994-a", "subject-994-11h", 1);
+    let _ = route
+        .gateway
+        .apply_reserved(&ctx_dup, transition_dup, rev_dup, ord_dup, seed_dup)
+        .await
+        .expect_err("blind same-identity retry refused");
+    // One-shot hook consumed without poisoning the route: a different
+    // reserved operation commits normally through the same gateway.
+    // (Same-identity retry after unknown is correctly refused while the
+    // faulted attempt's ORS reservation stands — unknown is never retried
+    // blindly; case 11 proves same-identity commit after proven absence on
+    // the direct path.)
+    let (ctx2, transition2, rev2, ord2, seed2) =
+        reserved_inputs("op-994-fault-next", "scope-994-b", "subject-994-11h", 1);
+    let receipt = route
+        .gateway
+        .apply_reserved(&ctx2, transition2, rev2, ord2, seed2)
+        .await
+        .expect("route unpoisoned after consumed fault");
+    assert_eq!(receipt.operation_id.as_str(), "op-994-fault-next");
+    assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+    finish_route(route).await;
+    harness.cleanup().await;
+}
+
+// WORK_UNIT_CASE: 994/12 (follow-up binding, issue #2030)
+#[tokio::test]
+async fn postcommit_loss_hook_recovers_original_receipt() {
+    case_entry(12);
+    let harness = Harness::fresh("12h").await;
+    harness
+        .adapter()
+        .install_concurrent_execution(
+            NonZeroUsize::new(profile_usize("lanes")).expect("lanes"),
+            NonZeroUsize::new(profile_usize("max_pending")).expect("pending"),
+            SchemaGeneration::v2(),
+            "kernel-994-test".to_owned(),
+            fence(),
+        )
+        .expect("concurrent install");
+    let route = kernel_route("12h", harness.adapter_shared()).await;
+    // Arm post-commit response loss: the provider commits, but the caller
+    // observes unknown — recovery must return the ORIGINAL receipt.
+    let (ctx, transition, rev, ord, seed) =
+        reserved_inputs("op-994-fault-post", "scope-994-a", "subject-994-12h", 1);
+    route.gateway.arm_store_fault(
+        &StoreClientFaultHarness::test_harness(),
+        StoreClientFault::PostCommitResponseLoss,
+    );
+    let _ = route
+        .gateway
+        .apply_reserved(&ctx, transition, rev, ord, seed)
+        .await
+        .expect_err("armed post-commit loss stays unknown");
+    let recovered = harness
+        .adapter()
+        .reconcile(ApiOperationId::new("op-994-fault-post").expect("operation"))
+        .await
+        .expect("reconcile")
+        .expect("committed operation must reconcile");
+    assert_eq!(recovered.operation_id.as_str(), "op-994-fault-post");
+    assert_eq!(recovered.status, WriteReceiptStatus::Committed);
+    // Gateway-level recovery returns the same original through the route.
+    let via_route: Option<WriteReceipt> = route
+        .gateway
+        .receipt(&fence(), recovered.operation_id.clone())
+        .await
+        .expect("receipt query");
+    assert_eq!(via_route.as_ref(), Some(&recovered), "same original");
+    finish_route(route).await;
+    harness.cleanup().await;
+}
+
 // WORK_UNIT_CASE: 994/13
 #[tokio::test]
 async fn independent_scope_progress_under_delay_poison() {
@@ -1508,6 +1644,100 @@ fn bounded_capacity_with_protected_recovery() {
         .uninstall_drained_execution()
         .expect("drained uninstall");
     let _ = std::fs::remove_dir_all(&platform_root);
+}
+
+// WORK_UNIT_CASE: 994/14 (follow-up binding, issue #2030)
+#[tokio::test]
+async fn capacity_occupancy_admission_live_observation_surface() {
+    case_entry(14);
+    let harness = Harness::fresh("14o").await;
+    // Idle live pool: totals are the fixed construction bounds from the
+    // frozen profile, nothing is checked out, every lane admits.
+    let occupancy: PoolOccupancy = harness
+        .adapter()
+        .pool_occupancy()
+        .expect("live pool observed");
+    assert_eq!(
+        (
+            occupancy.read.total,
+            occupancy.normal_write.total,
+            occupancy.health_admin.total
+        ),
+        (5, 2, 1),
+        "pool totals match profile construction bounds"
+    );
+    assert_eq!(
+        (
+            occupancy.read.checked_out,
+            occupancy.normal_write.checked_out,
+            occupancy.health_admin.checked_out
+        ),
+        (0, 0, 0),
+        "idle observation checks nothing out"
+    );
+    assert!(
+        harness
+            .adapter()
+            .pool_admission(SessionRole::NormalWrite)
+            .expect("normal admission")
+            .admitted(),
+        "idle normal lane admits"
+    );
+    let protected: PoolAdmission = harness
+        .adapter()
+        .pool_admission(SessionRole::HealthAdmin)
+        .expect("protected admission");
+    assert!(protected.admitted(), "protected lane admits independently");
+    // No execution installed on the plain harness: honest None, never
+    // fabricated zeros.
+    assert!(harness.adapter().execution_capacity().is_none());
+    assert!(harness.adapter().scheduler_occupancy().is_none());
+    assert!(harness.adapter().scheduler_admission().is_none());
+    // Install the concurrent generation: live capacity and scheduler
+    // snapshots observe real bounds with an empty queue.
+    harness
+        .adapter()
+        .install_concurrent_execution(
+            NonZeroUsize::new(profile_usize("lanes")).expect("lanes"),
+            NonZeroUsize::new(profile_usize("max_pending")).expect("pending"),
+            SchemaGeneration::v2(),
+            "kernel-994-test".to_owned(),
+            fence(),
+        )
+        .expect("concurrent install");
+    let capacity = harness
+        .adapter()
+        .execution_capacity()
+        .expect("installed capacity observed");
+    assert_eq!(
+        capacity.max_pending,
+        profile_usize("max_pending"),
+        "capacity bound matches profile"
+    );
+    assert!(capacity.accepts_submits(), "empty queue accepts submits");
+    assert!(
+        capacity.protected_progress_open(),
+        "protected recovery lane open"
+    );
+    let scheduled = harness
+        .adapter()
+        .scheduler_occupancy()
+        .expect("scheduler observed");
+    assert_eq!(
+        (scheduled.pending, scheduled.in_flight, scheduled.uncertain),
+        (0, 0, 0),
+        "idle scheduler holds nothing"
+    );
+    assert!(!scheduled.draining, "no drain running");
+    assert!(
+        harness
+            .adapter()
+            .scheduler_admission()
+            .expect("scheduler admission")
+            .admitted(),
+        "idle scheduler admits"
+    );
+    harness.cleanup().await;
 }
 
 // WORK_UNIT_CASE: 994/15
@@ -1743,7 +1973,11 @@ async fn session_process_root_cleanup() {
         Path::new(&provider_path).exists(),
         "staged provider present"
     );
-    harness.cleanup().await;
+    // 994/18 follow-up binding (issue #2030): join the proven primary
+    // receipt with the fallible cleanup so BOTH errors are retained instead
+    // of panicking on cleanup alone.
+    let joined = join_cleanup_result(Ok(primary), harness.cleanup_result().await);
+    let _primary = joined.expect("case 18 retains primary and cleanup outcomes together");
     // Both primary and cleanup outcomes are retained here as assertions:
     // the receipt was proven above, and the isolated root is fully gone.
     assert!(!root.exists(), "isolated root removed");

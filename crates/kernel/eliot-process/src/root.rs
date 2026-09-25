@@ -21,6 +21,13 @@ pub use stream_evidence::{
     StreamPreviewRepresentation, StreamTransportStatus,
 };
 
+mod origin_challenge;
+pub use origin_challenge::{
+    ORIGIN_CHALLENGE_SCHEMA_VERSION, OriginChallenge, OriginChallengeAuthority,
+    OriginChallengeReplayEntry, OriginChallengeReplaySnapshot, OriginChallengeRequest,
+    OriginControlGrant, OriginControlOperation, OriginControlPresentation,
+};
+
 mod stream_sink;
 pub use stream_sink::{
     PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm, ProcessStreamSinkAbortReason,

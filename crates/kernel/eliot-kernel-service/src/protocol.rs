@@ -2,6 +2,7 @@
 
 use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_ipc::TransportError;
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
 use eliot_process::{
@@ -62,7 +63,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 4;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 5;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1094,7 +1095,10 @@ impl DaemonStartupEvidence {
                 field: "daemon_evidence.fence",
             });
         }
-        handle(&self.config_mirror_digest, "daemon_evidence.config_mirror_digest")?;
+        handle(
+            &self.config_mirror_digest,
+            "daemon_evidence.config_mirror_digest",
+        )?;
         if let Some(policy) = &self.policy_mirror_digest {
             handle(policy, "daemon_evidence.policy_mirror_digest")?;
         }
@@ -1395,6 +1399,9 @@ pub struct KernelControlResponse {
     pub state: KernelServiceState,
     /// Receipt returned only after Kernel-owned readiness observation.
     pub receipt: Option<KernelReadyReceipt>,
+    /// Owner-produced authenticated runtime-health carrier returned with a
+    /// Kernel-authored readiness receipt.
+    pub runtime_health: Option<KernelRuntimeHealthEvidence>,
     /// Exact receipt returned after one activation permit is consumed, or
     /// after a nonce-free operation-identity reconciliation finds it.
     pub activation_receipt: Option<KernelActivationReceipt>,
@@ -1423,6 +1430,7 @@ impl KernelControlResponse {
             request_digest: &'a str,
             state: KernelServiceState,
             receipt: &'a Option<KernelReadyReceipt>,
+            runtime_health: &'a Option<KernelRuntimeHealthEvidence>,
             activation_receipt: &'a Option<KernelActivationReceipt>,
             store_rebind_receipt: &'a Option<StoreRebindReceipt>,
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
@@ -1435,6 +1443,7 @@ impl KernelControlResponse {
             request_digest: &self.request_digest,
             state: self.state,
             receipt: &self.receipt,
+            runtime_health: &self.runtime_health,
             activation_receipt: &self.activation_receipt,
             store_rebind_receipt: &self.store_rebind_receipt,
             supervision_lease: &self.supervision_lease,
@@ -1487,6 +1496,29 @@ impl KernelControlResponse {
                 field: "control.supervision_lease",
                 reason: "must accompany exactly one Kernel-authored ready receipt",
             });
+        }
+        if self.receipt.is_some() != self.runtime_health.is_some() {
+            return Err(KernelServiceError::InvalidField {
+                field: "control.runtime_health",
+                reason: "must accompany exactly one Kernel-authored ready receipt",
+            });
+        }
+        if let (Some(receipt), Some(runtime_health)) = (&self.receipt, &self.runtime_health) {
+            runtime_health
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "control.runtime_health",
+                    reason: "must be an exact validated Kernel health carrier",
+                })?;
+            let process_health = runtime_health.process_health();
+            if process_health.process_id() != receipt.process.process_id.as_str()
+                || process_health.process_state() != receipt.process.state
+                || process_health.health().canonical != receipt.health
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "control.runtime_health.ready_binding",
+                });
+            }
         }
         if let Some(snapshot) = &self.supervision_lease {
             snapshot
@@ -1991,9 +2023,11 @@ pub fn semantic_store_config_hash_from_json(
         doctor_artifact_digest: serde_json::Value,
         testd_artifact_digest: serde_json::Value,
         native_worker_artifact_digest: serde_json::Value,
+        wasm_host_artifact_digest: serde_json::Value,
         doctor_executable_path: serde_json::Value,
         testd_executable_path: serde_json::Value,
         native_worker_executable_path: serde_json::Value,
+        wasm_host_executable_path: serde_json::Value,
         descriptor_digest: serde_json::Value,
     }
 
@@ -2045,9 +2079,11 @@ pub fn semantic_store_config_hash_from_json(
                 "doctor_artifact_digest",
                 "testd_artifact_digest",
                 "native_worker_artifact_digest",
+                "wasm_host_artifact_digest",
                 "doctor_executable_path",
                 "testd_executable_path",
                 "native_worker_executable_path",
+                "wasm_host_executable_path",
                 "descriptor_digest",
             ],
         )?;
@@ -2149,9 +2185,11 @@ pub fn semantic_store_config_hash_from_json(
             doctor_artifact_digest: field(value, "doctor_artifact_digest")?,
             testd_artifact_digest: field(value, "testd_artifact_digest")?,
             native_worker_artifact_digest: field(value, "native_worker_artifact_digest")?,
+            wasm_host_artifact_digest: field(value, "wasm_host_artifact_digest")?,
             doctor_executable_path: field(value, "doctor_executable_path")?,
             testd_executable_path: field(value, "testd_executable_path")?,
             native_worker_executable_path: field(value, "native_worker_executable_path")?,
+            wasm_host_executable_path: field(value, "wasm_host_executable_path")?,
             descriptor_digest: field(value, "descriptor_digest")?,
         })
     }
@@ -2912,10 +2950,7 @@ impl HostStartupEvidence {
     /// generation binding) is checked by the request boundary and the Kernel
     /// consumer; this rejects malformed carriers fail-closed.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
-        validate_digest(
-            &self.candidate_digest,
-            "startup_evidence.candidate_digest",
-        )?;
+        validate_digest(&self.candidate_digest, "startup_evidence.candidate_digest")?;
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::InvalidField {
@@ -3699,9 +3734,11 @@ mod tests {
                 "doctor_artifact_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "testd_artifact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "native_worker_artifact_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "wasm_host_artifact_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 "doctor_executable_path": "C:/eliot/eliot-doctor.exe",
                 "testd_executable_path": "C:/eliot/eliot-testd.exe",
                 "native_worker_executable_path": "C:/eliot/eliot-native-worker.exe",
+                "wasm_host_executable_path": "C:/eliot/eliot-wasm-host.exe",
                 "descriptor_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
         }"#,
@@ -3981,8 +4018,7 @@ mod tests {
             "host-scm-watchdog:4242".to_owned(),
         ] {
             let mut bad = good.clone();
-            bad.scm_watchdog_observation_digest =
-                handle_value(&bad_scm);
+            bad.scm_watchdog_observation_digest = handle_value(&bad_scm);
             assert!(
                 bad.validate().is_err(),
                 "malformed SCM digest must fail: {bad_scm}"
@@ -4388,10 +4424,7 @@ mod tests {
             config_mirror_digest: handle_value("config-mirror-1"),
             policy_mirror_digest: Some(handle_value("policy-mirror-1")),
             capability_registry_digest: Some(registry),
-            required_capabilities: Some(vec![
-                "blob.read".to_owned(),
-                "config.read".to_owned(),
-            ]),
+            required_capabilities: Some(vec!["blob.read".to_owned(), "config.read".to_owned()]),
             capability_outcomes: Some(outcomes),
             evidence_refs: vec![handle_value("daemon-evidence-ref-1")],
         }
@@ -4399,10 +4432,7 @@ mod tests {
 
     #[test]
     fn daemon_startup_evidence_validates_shaped_fields() {
-        assert_eq!(
-            DAEMON_STARTUP_EVIDENCE_OPERATION,
-            "daemon_startup_evidence"
-        );
+        assert_eq!(DAEMON_STARTUP_EVIDENCE_OPERATION, "daemon_startup_evidence");
         daemon_evidence()
             .validate()
             .expect("absence-marked evidence must validate");
@@ -4479,8 +4509,9 @@ mod tests {
         assert_eq!(forward, reversed, "digest must not depend on outcome order");
         assert_eq!(forward.len(), 64, "digest must be SHA-256 hex");
         assert!(
-            forward.bytes().all(|byte| byte.is_ascii_hexdigit()
-                && !byte.is_ascii_uppercase()),
+            forward
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
             "digest must be lowercase hex"
         );
         let altered = daemon_capability_registry_digest(&[

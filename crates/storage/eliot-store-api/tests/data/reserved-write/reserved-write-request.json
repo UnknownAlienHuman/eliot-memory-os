@@ -47,6 +47,11 @@
     "requested_effect_ceiling": "CANDIDATE",
     "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "operation_manifest_digest": "manifest-991-1",
+    "admission_digest": "65d841961651858bb39f2aae9be0caa546f3a63bd19ad26f3034a378dcfd2da9",
+    "mutation_plan_digest": "cd3207fea3533719d0445bc2cd73c9501dea5bb0a1cdd6195dbf13260f744ab6",
+    "semantic_source_revisions": [
+      "rev-991-1@3"
+    ],
     "named_operations": [
       {
         "operation": "CaptureObservation",
@@ -77,8 +82,8 @@
     "operation_id": "op-991-1",
     "idempotency_key": "idem-991-1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "8a6a2ab9b3b0b0552eb833ea42fcc13c332335c05e09e30b2692b33517e11c04",
-    "reservation_token_digest": "751493c7a1ca64de108306db7363b42986149a98fa26b134b5cfd11480d12f02",
+    "prepared_transition_digest": "030c1c31ccd378e38f8f090c8cba568e6b3dd10c456efb63ccc339f827c7bf62",
+    "reservation_token_digest": "e2402b85ab962f72c9490eb15770779cfc6e59cd5d24fbac6fa1e6cf1ce10f39",
     "scopes": [
       {
         "scope": "scope-991-1",

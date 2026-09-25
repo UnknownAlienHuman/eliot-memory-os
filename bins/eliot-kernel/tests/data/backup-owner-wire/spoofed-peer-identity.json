@@ -1,0 +1,13 @@
+{
+  "description": "Spoofed peer identity presentations (issue #962). Each presented peer must refuse against the exact expectation; similarity never authorizes.",
+  "expected_host_peer": "host-backup-owner",
+  "expected_watchdog_peer": "watchdog-backup-owner",
+  "presented_peers": [
+    "attacker-spoofed-peer",
+    "host-backup-owner ",
+    "HOST-BACKUP-OWNER",
+    "host-backup-owner-v2",
+    ""
+  ],
+  "verdict": "rejected"
+}

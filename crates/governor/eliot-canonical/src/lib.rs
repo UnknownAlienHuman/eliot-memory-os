@@ -21,7 +21,8 @@ use eliot_store_api::{
     OrderingHead, OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
     RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreConflictObservation,
     StoreError, StoreFailure, StoreFailureDisposition, StoreHealth, StoreMutationDisposition,
-    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
+    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt, bind_issue18_digests,
+    render_semantic_source_revisions,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -542,7 +543,7 @@ impl CanonicalWriteEnvelope {
     /// contract consumed by Kernel and the canonical store.
     pub fn prepare(&self) -> Result<PreparedTransition, CanonicalError> {
         self.validate()?;
-        let transition = PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: self.operation_id.clone(),
                 idempotency_key: self.idempotency_key.clone(),
@@ -560,11 +561,17 @@ impl CanonicalWriteEnvelope {
             requested_effect_ceiling: self.requested_effect_ceiling,
             admission_contract_set_digest: self.admission_contract_set_digest.clone(),
             operation_manifest_digest: self.operation_manifest_digest.clone(),
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: render_semantic_source_revisions(
+                &self.expected_revision_heads,
+            ),
             named_operations: self.semantic_commands.clone(),
             event_projection_relation_intents: self.event_projection_relation_intents.clone(),
             security: self.security.clone(),
             required_proof_and_approval_refs: self.required_proof_and_approval_refs.clone(),
         };
+        bind_issue18_digests(&mut transition)?;
         transition.validate()?;
         Ok(transition)
     }
@@ -892,6 +899,9 @@ pub struct FinishEvidence {
     pub task_id: String,
     /// Current canonical task revision.
     pub current_task_revision: u64,
+    /// Artifact handles rehydrated from canonical state.
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
     /// Per-acceptance evidence and verifier bindings.
     pub acceptance: Vec<AcceptanceCoverage>,
     /// Executed verifier handles in the exact current scope.
@@ -914,6 +924,10 @@ impl FinishEvidence {
                 field: "finish.evidence.current_task_revision",
                 reason: "must be non-zero",
             });
+        }
+        unique(self.artifact_refs.iter(), "finish.evidence.artifact_refs")?;
+        for reference in &self.artifact_refs {
+            text(reference, "finish.evidence.artifact_ref")?;
         }
         if self.acceptance.is_empty() {
             return Err(CanonicalError::Empty {
@@ -1036,12 +1050,38 @@ pub fn derive_finish_decision(
         .iter()
         .map(String::as_str)
         .collect();
+    // Issue #325 W3: `executed_current` is the gate's explicit pass-and-exact
+    // outcome check. The canonical owner (`produce_finish_evidence`) records
+    // every terminal run in `executed_verifier_run_refs` but stale-marks each
+    // run that is not executed, passing, and exactly fresh
+    // (`certifies_completion`: job, receipt, and run `Succeeded`, outcome
+    // `Pass`, coverage `CompleteForScope`, `Exact*` freshness, unchanged
+    // source, complete artifacts). Only refs surviving this difference are
+    // proven executed/passing/current evidence; set membership in `executed`
+    // alone never suffices below.
+    let executed_current: BTreeSet<&str> = executed.difference(&stale).copied().collect();
     let mut verifier_gap = false;
+    let mut artifact_gap = false;
     let mut all_satisfied = true;
-    let mut bindings = draft.artifact_refs.clone();
-    bindings.extend(draft.verifier_run_refs.iter().cloned());
+    let mut bindings = evidence.artifact_refs.clone();
+    bindings.extend(evidence.executed_verifier_run_refs.iter().cloned());
+    for artifact in &draft.artifact_refs {
+        if !evidence.artifact_refs.iter().any(|known| known == artifact) {
+            artifact_gap = true;
+            missing.push(format!("artifact:{artifact}"));
+        }
+    }
     for verifier in &draft.verifier_run_refs {
-        if !executed.contains(verifier.as_str()) || stale.contains(verifier.as_str()) {
+        if !evidence
+            .executed_verifier_run_refs
+            .iter()
+            .any(|known| known == verifier)
+        {
+            verifier_gap = true;
+        }
+    }
+    for verifier in &draft.verifier_run_refs {
+        if !executed_current.contains(verifier.as_str()) {
             verifier_gap = true;
             missing.push(format!("verifier:{verifier}"));
         }
@@ -1054,9 +1094,7 @@ pub fn derive_finish_decision(
         coverage.push(format!("{}={}", item.item_id, item.satisfied));
         for verifier in &item.verifier_run_refs {
             bindings.push(verifier.clone());
-            if item.requires_verifier
-                && (!executed.contains(verifier.as_str()) || stale.contains(verifier.as_str()))
-            {
+            if item.requires_verifier && !executed_current.contains(verifier.as_str()) {
                 verifier_gap = true;
                 missing.push(format!("verifier:{verifier}"));
             }
@@ -1072,9 +1110,28 @@ pub fn derive_finish_decision(
     unresolved.extend(draft.remaining_unknowns_declared_by_caller.iter().cloned());
     unresolved.sort();
     unresolved.dedup();
+    // Issue #325 W3: every verifier-bound obligation must be proven by
+    // executed, passing, current evidence — a `satisfied` flag alone never
+    // carries a verifier-bound item to `VerifiedComplete`. Items without a
+    // verifier requirement keep their upstream disposition.
+    let verifier_items_proven = evidence
+        .acceptance
+        .iter()
+        .filter(|item| item.requires_verifier)
+        .all(|item| {
+            !item.verifier_run_refs.is_empty()
+                && item
+                    .verifier_run_refs
+                    .iter()
+                    .all(|verifier| executed_current.contains(verifier.as_str()))
+        });
     let outcome = match draft.requested_outcome {
         RequestedFinishOutcome::CompleteCandidate
-            if all_satisfied && !verifier_gap && unresolved.is_empty() =>
+            if all_satisfied
+                && verifier_items_proven
+                && !verifier_gap
+                && !artifact_gap
+                && unresolved.is_empty() =>
         {
             FinishDecisionOutcome::VerifiedComplete
         }
@@ -1288,6 +1345,102 @@ mod tests {
             representative
                 .canonical_request_hash()
                 .expect("shared hash recomputes")
+        );
+    }
+
+    /// Issue #63 A2 cross-crate golden manifest: neutral single-manifest
+    /// values admitting the chain envelope's class and ceiling, so the
+    /// digest is code-derived identically in every crate.
+    fn golden_chain_manifest() -> eliot_store_api::NamedOperationManifest {
+        eliot_store_api::NamedOperationManifest::new(
+            "governor-golden-chain-63",
+            eliot_store_api::CONTRACT_VERSION,
+            vec![TransitionClass::CaptureCandidate],
+            EffectClass::Candidate,
+            1024,
+            1024,
+            1000,
+        )
+        .expect("chain manifest builds")
+    }
+
+    /// Issue #63 A2 cross-crate golden envelope: fixed Governor admission
+    /// inputs whose prepared transition `eliot-store-memory` commits
+    /// verbatim, so Governor, store-api and the memory store bind one
+    /// digest.
+    fn golden_chain_envelope(fence: &StateFence) -> CanonicalWriteEnvelope {
+        CanonicalWriteEnvelope {
+            operation_id: OperationId::new("op-golden-chain-63").expect("operation id"),
+            request: RequestMetadata {
+                request_id: eliot_contracts::RequestId::new("request-golden-chain-63")
+                    .expect("request id"),
+                session_id: None,
+                task_id: None,
+                product_id: eliot_contracts::ProductId::new("product-golden-chain")
+                    .expect("product id"),
+                source_id: eliot_contracts::SourceId::new("source-golden-chain")
+                    .expect("source id"),
+                state_fence: fence.clone(),
+                clock: eliot_contracts::ClockReading {
+                    valid_time_ms: Some(1),
+                    known_time_ms: Some(1),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+            },
+            idempotency_key: "idem-golden-chain-63".to_owned(),
+            scope_id: ScopeId::new("scope-golden-chain-63").expect("scope"),
+            task_id: None,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: golden_chain_manifest().digest.clone(),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-golden-chain-63"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![EventId::new("event-golden-chain-1").expect("event id")],
+                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                relation_kinds: vec!["relation-golden-chain-1".to_owned()],
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: vec!["approval-golden-chain-1".to_owned()],
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("revision-golden-chain-a").expect("key"),
+                expected_revision: 1,
+                state_fence: fence.clone(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-golden-chain-63").expect("ordering scope"),
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        }
+    }
+
+    /// Pinned digest of [`golden_chain_envelope`], derived by running the
+    /// shared hash over those fixed inputs (not hand-written):
+    /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
+        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+
+    #[test]
+    fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
+        let fence = test_fence();
+        let envelope = golden_chain_envelope(&fence);
+        let hash = envelope
+            .canonical_request_hash()
+            .expect("chain hash computes");
+        assert_eq!(hash, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        // prepare() carries the same Governor-admitted claim downstream.
+        let transition = envelope.prepare().expect("chain envelope prepares");
+        assert_eq!(
+            transition.identity.canonical_request_hash,
+            ISSUE_63_GOLDEN_CHAIN_DIGEST
         );
     }
 }

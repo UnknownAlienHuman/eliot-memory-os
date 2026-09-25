@@ -3,13 +3,15 @@
 mod request_input;
 
 use eliot_agent_bridge::{
-    BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
-    InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap, kernel_ports_with_declaration,
-    parse_args,
+    AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
+    CurrentAssessment, FiringEvidence, HotResourceView, InjectionReceipt, ItemDisposition,
+    KernelHostRequestClient, NormalizedCue, Profile, UnderstandingBootstrap, UseOutcome,
+    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
-    AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
-    ReconnectRequest, SessionId,
+    ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
+    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
+    FencingToken, Generation, HostEventEnvelope, ReconnectRequest, SessionId,
 };
 use eliot_contracts::EpochId;
 #[cfg(test)]
@@ -130,6 +132,45 @@ enum Request {
     ForwardEvent {
         event: EventEnvelope,
     },
+    /// Admits one caller-supplied reactive-context injection for the live
+    /// session (I7.19 admit step over the live stdio intake).
+    ///
+    /// The caller supplies the normalized cue, exact firing evidence, bounded
+    /// relations, and admission basis; the bridge only records them against
+    /// the live attach session via [`BridgeRunner::admit_reactive_injection`].
+    /// `invalidations` names sources whose revision/risk condition changed and
+    /// is applied first via [`BridgeRunner::invalidate_reactive_source`], so
+    /// this single entry carries the invalidation-aware session dedup of the
+    /// settled-plan transport into the live flow.
+    ReactiveAdmit {
+        cue: NormalizedCue,
+        firing: FiringEvidence,
+        relations: Vec<String>,
+        admission: AdmissionBasis,
+        invalidations: Vec<String>,
+    },
+    /// Records a later observable use, influence, or outcome update for a
+    /// delivered item addressed by ledger identity (I7.19 use/outcome step).
+    ReactiveRecordUse {
+        item_id: String,
+        update: UseOutcome,
+    },
+    /// Records a later observable use, influence, or outcome update addressed
+    /// by the canonical observer memory handle
+    /// (`reactive-item-{seq}@{session}`).
+    ReactiveRecordUseByHandle {
+        memory_handle: String,
+        update: UseOutcome,
+    },
+    /// Records a durable resolved, waived, or superseded disposition for an
+    /// item; only a terminal disposition clears critical stickiness.
+    ReactiveRecordDisposition {
+        item_id: String,
+        disposition: ItemDisposition,
+    },
+    /// Exports the live ledger bytes for durable persistence by the Store
+    /// owner (I7.19 persist step; the attach-time restore already imports).
+    ReactiveSnapshot,
     ReconcileExternal {},
     Bootstrap {
         context: Option<BootstrapContext>,
@@ -139,6 +180,25 @@ enum Request {
     Reconnect {
         expected_connection_id: ConnectionId,
         new_connection_id: ConnectionId,
+        session_id: String,
+        activation_generation: u64,
+        authority_epoch: EpochId,
+        fence_nonce: String,
+    },
+    /// Closed host-facing transport release carrying bearer claims only.
+    ///
+    /// Validates the exact live attach like [`Request::Reconnect`] and then
+    /// answers with a typed acknowledgement instead of replacing anything:
+    /// no connection is minted, no session is terminated, no authority is
+    /// minted, widened, or revived, and the kernel transport is untouched.
+    /// `session_id`, `activation_generation`, `authority_epoch`, and
+    /// `fence_nonce` are bearer claims compared against the live activation
+    /// binding, and any mismatch fails closed with typed `DETACH_*` errors.
+    /// A match releases only the host-facing transport correlation for
+    /// `expected_connection_id`; the durable session persists kernel-side
+    /// and a replacement connection still requires a new admission.
+    Detach {
+        expected_connection_id: ConnectionId,
         session_id: String,
         activation_generation: u64,
         authority_epoch: EpochId,
@@ -163,7 +223,7 @@ enum Response {
         activation_port: &'static str,
         host_request_port: &'static str,
         observation_forwarding_port: &'static str,
-        recovery: &'static str,
+        recovery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reactive: Option<ReactiveStatusView>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,11 +244,43 @@ enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
+    /// Typed acknowledgement of one host-facing transport release.
+    ///
+    /// Carries only owner-derived echoes of the live activation binding the
+    /// bearer claims matched: no new connection, session, generation, epoch,
+    /// or fence is minted here, and the durable session is not terminated.
+    /// Deliberately distinct from [`Response::Reconnected`]: reusing that
+    /// shape would imply a replacement transport was admitted, which detach
+    /// never performs.
+    Detached {
+        connection_id: String,
+        session_id: String,
+        activation_generation: u64,
+        authority_epoch: EpochId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
     Invocation {
         result: HostInvocationResult,
         completion: HostCorrelationReceipt,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        /// Delivery/Injection Receipts issued by draining the live session's
+        /// pending reactive injections inside this response (I7.19
+        /// next-response delivery). Absent while nothing was pending, exactly
+        /// like [`Response::Forwarded`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reactive_receipts: Vec<InjectionReceipt>,
+        /// Bounded hot-resource projection recorded for this delivery.
+        ///
+        /// Present only when the delivered result was snapshotted into the
+        /// attach-scoped evidence projection (supported kind with content
+        /// beyond the hot preview bound): the handle URI plus digest names
+        /// the immutable bytes, the preview carries the hot-visible prefix,
+        /// and full bytes require explicit expansion through the owning
+        /// reader. Absent otherwise — never estimated, never invented.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<HotResourceView>,
     },
     Cancellation {
         result: HostCancellationResult,
@@ -200,6 +292,39 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reactive_receipts: Vec<InjectionReceipt>,
+    },
+    /// Typed acknowledgement of one live reactive admission.
+    ///
+    /// Carries the minted ledger item identity plus how many delivered items
+    /// the entry invalidations reopened for re-admission. Deliberately
+    /// distinct from [`Response::Invocation`]: reusing the admitted/responded
+    /// shape would imply kernel admission, which the bridge never performs
+    /// here — the bridge only records owner-supplied admission decisions.
+    ReactiveAdmitted {
+        item_id: String,
+        invalidations_applied: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Typed acknowledgement of one live reactive use/outcome or disposition
+    /// record, addressed by the resolved ledger item identity.
+    ReactiveRecorded {
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Live durable export of the reactive delivery-record ledger for the
+    /// Store owner.
+    ///
+    /// `ledger_json` carries the exact bounded canonical bytes of
+    /// [`BridgeRunner::reactive_ledger_snapshot`]; `pending` counts the
+    /// live-session injections still awaiting delivery through a host hook or
+    /// next response.
+    ReactiveLedger {
+        ledger_json: String,
+        pending: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Reconciled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,7 +522,7 @@ fn main() {
             std::process::exit(INVALID_ARGUMENT_EXIT);
         }
     };
-    let (host_activation, mut host_request_port, mcp_forwarding) =
+    let (host_activation, mut host_request_client, mcp_forwarding) =
         match kernel_ports_with_declaration(&config.client_declaration) {
             Ok(ports) => ports,
             Err(error) => {
@@ -537,55 +662,77 @@ fn main() {
         total_records = next_total;
         let mut response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => Response::Attached { bootstrap: None },
+                Ok(_) => {
+                    // Best-effort durable restore for the fresh attach: a
+                    // refused or absent restore keeps the current empty-ledger
+                    // behavior and is reported on stderr without failing the
+                    // attach that already succeeded.
+                    if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
+                        &mut runner,
+                        &mut host_request_client,
+                        &[],
+                    ) {
+                        emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+                    }
+                    Response::Attached { bootstrap: None }
+                }
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
                     bridge_error(&error)
                 }
             },
             Ok(Request::Invoke { request }) => {
-                handle_invocation(&host_gateway, &mut *host_request_port, &request)
+                let mut response =
+                    handle_invocation(&host_gateway, &mut host_request_client, &request);
+                record_invocation_delivery(&mut runner, &mut response);
+                drain_reactive_pending_into_invocation(
+                    &mut runner,
+                    request.correlation_id.as_str(),
+                    &mut response,
+                );
+                response
             }
             Ok(Request::Cancel { request }) => {
-                handle_cancellation(&host_gateway, &mut *host_request_port, &request)
+                handle_cancellation(&host_gateway, &mut host_request_client, &request)
             }
             Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
-            Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
-                Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
-                    Ok(receipts) => Response::Forwarded {
-                        bootstrap: None,
-                        reactive_receipts: receipts,
-                    },
-                    Err(error) => Response::Error {
-                        code: "REACTIVE_RECEIPT_REJECTED",
-                        detail: error.to_string(),
-                    },
-                },
-                Err(error) => {
-                    provider_failure |= is_provider_failure(&error);
-                    bridge_error(&error)
-                }
-            },
-            Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
-                Ok(_) => {
-                    let response_id = format!("forward-event:{}", event.event_id);
-                    match runner.deliver_reactive_pending_via_response(&response_id) {
-                        Ok(receipts) => Response::Forwarded {
-                            bootstrap: None,
-                            reactive_receipts: receipts,
-                        },
-                        Err(error) => Response::Error {
-                            code: "REACTIVE_RECEIPT_REJECTED",
-                            detail: error.to_string(),
-                        },
-                    }
-                }
-                Err(error) => {
-                    provider_failure |= is_provider_failure(&error);
-                    bridge_error(&error)
-                }
-            },
+            Ok(Request::ForwardHook { event }) => {
+                let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+                provider_failure |= provider_failed;
+                response
+            }
+            Ok(Request::ForwardEvent { event }) => {
+                let (response, provider_failed) = handle_forward_event(&mut runner, &event);
+                provider_failure |= provider_failed;
+                response
+            }
+            Ok(Request::ReactiveAdmit {
+                cue,
+                firing,
+                relations,
+                admission,
+                invalidations,
+            }) => handle_reactive_admit(
+                &mut runner,
+                cue,
+                firing,
+                relations,
+                admission,
+                &invalidations,
+            ),
+            Ok(Request::ReactiveRecordUse { item_id, update }) => {
+                handle_reactive_record_use(&mut runner, &item_id, update)
+            }
+            Ok(Request::ReactiveRecordUseByHandle {
+                memory_handle,
+                update,
+            }) => handle_reactive_record_use_by_handle(&mut runner, &memory_handle, update),
+            Ok(Request::ReactiveRecordDisposition {
+                item_id,
+                disposition,
+            }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
+            Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
                 Ok(_) => Response::Reconciled { bootstrap: None },
                 Err(error) => {
@@ -607,8 +754,25 @@ fn main() {
                 fence_nonce,
             }) => handle_reconnect(
                 &mut runner,
+                &mut host_request_client,
+                ReconnectClaim {
+                    expected_connection_id: &expected_connection_id,
+                    new_connection_id: &new_connection_id,
+                    session_id: &session_id,
+                    activation_generation,
+                    authority_epoch,
+                    fence_nonce: &fence_nonce,
+                },
+            ),
+            Ok(Request::Detach {
+                expected_connection_id,
+                session_id,
+                activation_generation,
+                authority_epoch,
+                fence_nonce,
+            }) => handle_detach(
+                &runner,
                 &expected_connection_id,
-                &new_connection_id,
                 &session_id,
                 activation_generation,
                 authority_epoch,
@@ -666,9 +830,13 @@ fn main() {
 /// Serves one bounded `GetUnderstandingBootstrap` retrieval.
 ///
 /// An optional context establishes the session inputs first; invalid context
-/// fails closed and stores nothing. The first successful retrieval in a
-/// session also satisfies the once-per-session auto-boot; later retrievals
-/// use the explicit path so they stay available after auto-boot delivery.
+/// fails closed and stores nothing. The context is noted together with the
+/// supplied task inputs as one owner-produced snapshot sealed to the live
+/// attach, so the once-per-session auto-boot below composes from the same
+/// snapshot rather than a separate empty task set. The first successful
+/// retrieval in a session also satisfies the once-per-session auto-boot;
+/// later retrievals use the explicit path so they stay available after
+/// auto-boot delivery.
 fn handle_bootstrap(
     runner: &mut BridgeRunner,
     context: Option<BootstrapContext>,
@@ -676,7 +844,7 @@ fn handle_bootstrap(
     requested_assessment: CurrentAssessment,
 ) -> Response {
     if let Some(context) = context {
-        if let Err(error) = runner.note_bootstrap_context(context) {
+        if let Err(error) = runner.note_owner_snapshot(context, tasks.clone()) {
             return Response::Error {
                 code: "BOOTSTRAP_CONTEXT_REJECTED",
                 detail: error.to_string(),
@@ -699,16 +867,24 @@ fn handle_bootstrap(
 ///
 /// Error and dry-run responses never carry a bootstrap: a dry run is a
 /// zero-side-effect preview, not a successful ELIOT response, and its
-/// envelope has no bootstrap slot. When no valid context is noted
-/// the response is left untouched rather than carrying invented authority.
+/// envelope has no bootstrap slot. When no owner snapshot is noted, or the
+/// live attach moved away from the noted seal, the response is left
+/// untouched rather than carrying invented authority. The composed task
+/// inputs are always the retained owner-supplied snapshot tasks — never a
+/// separate empty candidate set — so the agent identifies or explicitly
+/// requests the intended task from owner-produced inputs alone.
 fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
     let slot = match response {
         Response::Status { bootstrap, .. }
         | Response::Attached { bootstrap }
         | Response::Reconnected { bootstrap, .. }
+        | Response::Detached { bootstrap, .. }
         | Response::Invocation { bootstrap, .. }
         | Response::Cancellation { bootstrap, .. }
         | Response::Forwarded { bootstrap, .. }
+        | Response::ReactiveAdmitted { bootstrap, .. }
+        | Response::ReactiveRecorded { bootstrap, .. }
+        | Response::ReactiveLedger { bootstrap, .. }
         | Response::Reconciled { bootstrap }
         | Response::Stopped { bootstrap, .. } => bootstrap,
         Response::Bootstrap { .. } | Response::Error { .. } | Response::DryRun { .. } => {
@@ -716,11 +892,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         }
     };
     if slot.is_none() {
-        let tasks = BootstrapTaskInputs {
-            scope_level: ScopeLevel::Session,
-            candidates: Vec::new(),
-            authoritative_selection: None,
-        };
+        let tasks = runner.retained_auto_boot_tasks();
         *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
     }
 }
@@ -756,8 +928,304 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             result,
             completion,
             bootstrap: None,
+            evidence: None,
+            reactive_receipts: Vec::new(),
         },
         Err(error) => host_gateway_error(&error),
+    }
+}
+
+/// Records one supported tool-result delivery after gateway return and
+/// projects its handle onto the outgoing Invocation response.
+///
+/// Runs on the normal Invoke path with the exact authenticated outcome the gateway
+/// produced. The gateway-shaped result and completion are never touched: only the
+/// additive `evidence` slot is filled, and only when recording yields a snapshot
+/// (supported kind with content beyond the hot preview bound). Auxiliary only: a
+/// `None` (admission, rejection, gap, unsupported kind, small inline content,
+/// detached runner, or full registry) leaves the response exactly as the gateway
+/// shaped it, with the key absent on the wire.
+/// See [`BridgeRunner::record_tool_result_delivery`].
+fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response) {
+    if let Response::Invocation {
+        result, evidence, ..
+    } = response
+    {
+        if evidence.is_none()
+            && let Some(view) = runner.record_tool_result_delivery(result.outcome())
+        {
+            *evidence = Some(view);
+        }
+    }
+}
+
+/// Classifies one forward-dispatch failure into its recovery stage.
+///
+/// The stages name where the failure happened, not who owns the data:
+/// `durability` covers the durable acknowledgement and reconciliation
+/// gates, `normalization` covers contract, identity, and projection-shape
+/// rejections, and `application` covers admission, authority, and provider
+/// dispatch itself. Receipt failures never reach this classifier: the
+/// reactive receipt drain reports them under `REACTIVE_RECEIPT_REJECTED`
+/// with the receipt stage named in the detail.
+fn forward_stage(error: &BridgeError) -> &'static str {
+    match error {
+        BridgeError::MissingDurableAck
+        | BridgeError::OutstandingDeliveryReconciliationRequired { .. }
+        | BridgeError::ExternalAttachReconciliationRequired
+        | BridgeError::ExternalReconciliationDenied(_) => "durability",
+        BridgeError::InvalidContract { .. }
+        | BridgeError::ProviderContract(_)
+        | BridgeError::AckIdentityMismatch
+        | BridgeError::InvalidResourceUri { .. }
+        | BridgeError::UnknownResource { .. }
+        | BridgeError::ResourceDigestMismatch
+        | BridgeError::ResourceImmutableConflict
+        | BridgeError::ResourceRegistryFull { .. }
+        | BridgeError::ResourceTooLarge { .. }
+        | BridgeError::IncompleteDelivery { .. }
+        | BridgeError::UnmeasuredTokens { .. }
+        | BridgeError::Skill(_) => "normalization",
+        _ => "application",
+    }
+}
+
+/// Shapes one forward-dispatch failure with staged typed recovery.
+///
+/// Keeps the exact [`bridge_error`] code mapping and fail-closed behavior;
+/// only the detail is sharpened to name the failing stage, the unadmitted
+/// event-delivery capability with its durable owner reference (the Kernel
+/// observation route, #77 req 4), and the pending-identity preservation.
+/// No ledger is built and no readiness is claimed: pending entries stay
+/// pending under their original identity, and no reconcile-then-retry loop
+/// is advertised because retry cannot succeed until the owner route admits
+/// this bridge.
+fn forward_dispatch_error(error: &BridgeError) -> (Response, bool) {
+    let provider_failed = is_provider_failure(error);
+    let response = match bridge_error(error) {
+        Response::Error { code, detail } => Response::Error {
+            code,
+            detail: format!(
+                "forward {} stage: {detail}; event delivery unavailable: no admitted Kernel \
+                observation/ORS event route (front door admits activation and host-request \
+                envelopes only); owner: Kernel observation route (#77 req 4 allocates the \
+                event-delivery/reconciliation child there); pending entries stay pending \
+                under their original stream, event, and sequence identity; retry cannot \
+                succeed until that route is admitted",
+                forward_stage(error),
+            ),
+        },
+        other => other,
+    };
+    (response, provider_failed)
+}
+
+/// Shapes one reactive-receipt failure with staged typed recovery.
+///
+/// The forward itself already succeeded at this point: only the per-item
+/// Delivery/Injection Receipt drain failed, so the code stays
+/// `REACTIVE_RECEIPT_REJECTED` while the detail names the receipt stage,
+/// the durable owner (the Kernel observation route, which this bridge holds
+/// unadmitted), and the reconcile path. No ledger is built and no readiness
+/// is claimed.
+fn forward_receipt_error(error: &BridgeError) -> Response {
+    Response::Error {
+        code: "REACTIVE_RECEIPT_REJECTED",
+        detail: format!(
+            "reactive receipt stage: {error}; durable owner: Kernel observation route (not admitted); \
+            delivered items keep their live-session identity — reconcile explicitly, then retry the forward"
+        ),
+    }
+}
+
+/// Delivers hook-carried reactive injections through the live stdio consumer.
+///
+/// Runs the exact ForwardHook dispatch step: forwards the owner-observed
+/// hook event, then drains the live session's pending injections through
+/// that hook, issuing one Delivery/Injection Receipt per item on the
+/// Forwarded response. Pure wiring over [`BridgeRunner`]: no planning, no
+/// assessment, no minting — admitted items arrive through the transport and
+/// this consumer only carries them to the host. Returns the response with
+/// whether the failure (if any) was a provider failure for exit accounting.
+fn handle_forward_hook(runner: &mut BridgeRunner, event: &HostEventEnvelope) -> (Response, bool) {
+    match runner.forward_hook(event) {
+        Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
+            Ok(receipts) => (
+                Response::Forwarded {
+                    bootstrap: None,
+                    reactive_receipts: receipts,
+                },
+                false,
+            ),
+            Err(error) => (forward_receipt_error(&error), false),
+        },
+        Err(error) => forward_dispatch_error(&error),
+    }
+}
+
+/// Delivers response-piggybacked reactive injections through the live stdio
+/// consumer.
+///
+/// Runs the exact ForwardEvent dispatch step: forwards the event, then
+/// drains the live session's pending injections inside the next bridge
+/// response named by that event. Same wiring contract as
+/// [`handle_forward_hook`]: no planning, no assessment, no minting.
+fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Response, bool) {
+    match runner.forward_event(event) {
+        Ok(_) => {
+            let response_id = format!("forward-event:{}", event.event_id);
+            match runner.deliver_reactive_pending_via_response(&response_id) {
+                Ok(receipts) => (
+                    Response::Forwarded {
+                        bootstrap: None,
+                        reactive_receipts: receipts,
+                    },
+                    false,
+                ),
+                Err(error) => (forward_receipt_error(&error), false),
+            }
+        }
+        Err(error) => forward_dispatch_error(&error),
+    }
+}
+
+/// Delivers live-session pending reactive injections inside one successful
+/// invocation response (I7.19 next-response delivery).
+///
+/// Runs after the gateway returned, so `response` is the exact
+/// [`Response::Invocation`] frame that will reach the host: each pending item
+/// is delivered through `DeliveryPoint::NextBridgeResponse` named by the
+/// invocation correlation, issuing one Delivery/Injection Receipt per item on
+/// that response. Other responses are untouched. A drain failure keeps the
+/// gateway response exactly as shaped and reports on stderr: the items stay
+/// pending under their original identity for the next hook or response, so a
+/// receipt-stage failure never rewrites an already-admitted invocation.
+fn drain_reactive_pending_into_invocation(
+    runner: &mut BridgeRunner,
+    correlation_id: &str,
+    response: &mut Response,
+) {
+    if let Response::Invocation {
+        reactive_receipts, ..
+    } = response
+    {
+        debug_assert!(reactive_receipts.is_empty());
+        match runner.deliver_reactive_pending_via_response(correlation_id) {
+            Ok(receipts) => {
+                *reactive_receipts = receipts;
+            }
+            Err(error) => emit_error("REACTIVE_RECEIPT_REJECTED", &error.to_string()),
+        }
+    }
+}
+
+/// Admits one live reactive-context injection through the stdio intake.
+///
+/// Applies the caller-nominated source invalidations first (a changed
+/// source/revision/risk condition reopens delivered items for re-admission),
+/// then records the caller-supplied normalized cue, exact firing evidence,
+/// bounded relations, and admission basis against the live attach session.
+/// Every ledger rejection fails closed without touching the ledger; the live
+/// session binding is never read from caller text.
+fn handle_reactive_admit(
+    runner: &mut BridgeRunner,
+    cue: NormalizedCue,
+    firing: FiringEvidence,
+    relations: Vec<String>,
+    admission: AdmissionBasis,
+    invalidations: &[String],
+) -> Response {
+    let mut invalidations_applied = 0;
+    for source in invalidations {
+        invalidations_applied += runner.invalidate_reactive_source(source);
+    }
+    match runner.admit_reactive_injection(cue, Some(firing), relations, admission) {
+        Ok(item_id) => Response::ReactiveAdmitted {
+            item_id,
+            invalidations_applied,
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Records one live observable use, influence, or outcome update addressed by
+/// ledger item identity. Absence of evidence stays unknown by doing nothing:
+///
+/// [`UseOutcome::Unknown`] is rejected as the absence of an update, exactly
+/// like the ledger gate.
+fn handle_reactive_record_use(
+    runner: &mut BridgeRunner,
+    item_id: &str,
+    update: UseOutcome,
+) -> Response {
+    match runner.record_reactive_use(item_id, update) {
+        Ok(()) => Response::ReactiveRecorded {
+            item_id: item_id.to_owned(),
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Records one live observable use, influence, or outcome update addressed by
+/// the canonical observer memory handle. The handle session must equal the
+/// ledger session or nothing is recorded.
+fn handle_reactive_record_use_by_handle(
+    runner: &mut BridgeRunner,
+    memory_handle: &str,
+    update: UseOutcome,
+) -> Response {
+    match runner.record_reactive_use_by_handle(memory_handle, update) {
+        Ok(item_id) => Response::ReactiveRecorded {
+            item_id,
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Records one live durable disposition. Only a terminal disposition lands;
+/// open or self-superseding records fail closed with critical stickiness kept.
+fn handle_reactive_record_disposition(
+    runner: &mut BridgeRunner,
+    item_id: &str,
+    disposition: ItemDisposition,
+) -> Response {
+    match runner.record_reactive_disposition(item_id, disposition) {
+        Ok(()) => Response::ReactiveRecorded {
+            item_id: item_id.to_owned(),
+            bootstrap: None,
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Exports the live reactive ledger for the Store owner.
+///
+/// Returns the exact bounded canonical bytes of
+/// [`BridgeRunner::reactive_ledger_snapshot`] as text plus the live-session
+/// pending count. Crash-safe persistence of these bytes is the Store owner's
+/// handoff; the bridge holds delivery records only for the life of this
+/// process. Non-UTF-8 snapshot bytes fail closed: they are never partially
+/// reported.
+///
+// Живая проводка I7.19: приём, выдача квитанций, учёт использования,
+// снятие залипания и выгрузка журнала идут через этот мост, а не через тесты.
+fn handle_reactive_snapshot(runner: &BridgeRunner) -> Response {
+    match runner.reactive_ledger_snapshot() {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(ledger_json) => Response::ReactiveLedger {
+                pending: runner.reactive_pending_count(),
+                ledger_json,
+                bootstrap: None,
+            },
+            Err(_) => Response::Error {
+                code: "REACTIVE_SNAPSHOT_REJECTED",
+                detail: "ledger snapshot is not valid UTF-8; nothing was exported".to_owned(),
+            },
+        },
+        Err(error) => bridge_error(&error),
     }
 }
 
@@ -823,7 +1291,10 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
         | ToolRequest::Act(_)
         | ToolRequest::Verify(_)
         | ToolRequest::Coordinate(_)
-        | ToolRequest::Finish(_) => (
+        | ToolRequest::Finish(_)
+        | ToolRequest::UserAutomation(_)
+        | ToolRequest::SkillInject(_)
+        | ToolRequest::SkillDisplay(_) => (
             "effectful",
             DRY_RUN_ROUTE_WITHHELD,
             DRY_RUN_UNSUPPORTED_DISPOSITION,
@@ -911,6 +1382,22 @@ fn dry_run_cancellation(runner: &BridgeRunner, request: &HostCancellationRequest
     }
 }
 
+/// Closed reconnect claim: the expected live connection, its replacement,
+/// and the bearer authority triple the host presents for the live binding.
+///
+/// Borrowed straight from the decoded stdin record: no minting, no widening,
+/// no inference. Shaped once at the dispatch site so [`handle_reconnect`]
+/// stays within its argument bound while the claim fields keep their exact
+/// validation order inside.
+struct ReconnectClaim<'a> {
+    expected_connection_id: &'a ConnectionId,
+    new_connection_id: &'a ConnectionId,
+    session_id: &'a str,
+    activation_generation: u64,
+    authority_epoch: EpochId,
+    fence_nonce: &'a str,
+}
+
 /// Validates one closed reconnect claim and advances the host-facing transport binding.
 ///
 /// This follows the [`HostRequestGateway`] pattern without adding gateway
@@ -924,20 +1411,33 @@ fn dry_run_cancellation(runner: &BridgeRunner, request: &HostCancellationRequest
 /// kernel-issued — sealed at activation from the admission receipt established
 /// by `kernel_ports_with_declaration` (declaration lease, front-door
 /// expectation/SID, challenge → hello → receipt, fence joins) — and are never
-/// minted, widened, or inferred from process identity here. Cursors and replay
-/// inheritance survive only through that exact owner-authorized match; the
-/// kernel transport itself is untouched, so kernel envelopes keep riding the
-/// admitted receipt connection until a new process admission replaces it (the
-/// activation one-shot guard is preserved: this path never reactivates).
+/// minted, widened, or inferred from process identity here.
+///
+/// Local authority match alone does not move the binding: after the claims
+/// shape up, the live Kernel binding is proven current through
+/// [`KernelHostRequestClient::check_kernel_binding`] — one observation-only
+/// reconcile probe over the shared admitted transport — before
+/// `Runner::reconnect` runs. A failed probe fails closed with
+/// `RECONNECT_STALE_AUTHORITY` without mutating the runner, so a fenced,
+/// rotated, or dead Kernel binding can never be papered over with a fresh
+/// local label. Cursors and replay inheritance survive only through that
+/// exact owner-authorized match; the kernel transport itself is untouched, so
+/// kernel envelopes keep riding the admitted receipt connection until a new
+/// process admission replaces it (the activation one-shot guard is preserved:
+/// this path never reactivates).
 fn handle_reconnect(
     runner: &mut BridgeRunner,
-    expected_connection_id: &ConnectionId,
-    new_connection_id: &ConnectionId,
-    session_id: &str,
-    activation_generation: u64,
-    authority_epoch: EpochId,
-    fence_nonce: &str,
+    client: &mut KernelHostRequestClient,
+    claim: ReconnectClaim<'_>,
 ) -> Response {
+    let ReconnectClaim {
+        expected_connection_id,
+        new_connection_id,
+        session_id,
+        activation_generation,
+        authority_epoch,
+        fence_nonce,
+    } = claim;
     let Some(live) = runner.attach_view() else {
         return Response::Error {
             code: "BRIDGE_NOT_ATTACHED",
@@ -990,6 +1490,19 @@ fn handle_reconnect(
             };
         }
     };
+    // The bearer claims shaped up against the live local binding; the
+    // binding itself is proven current against the Kernel before anything
+    // mutates. A failed probe leaves the runner untouched: the replacement
+    // inherits only a Kernel-current binding, never a fresh label over a
+    // fenced, rotated, or dead one.
+    if let Err(error) = client.check_kernel_binding() {
+        return Response::Error {
+            code: "RECONNECT_STALE_AUTHORITY",
+            detail: format!(
+                "reconnect refused: the live Kernel binding is no longer current ({error}); the local attach is unchanged — re-attach and activate for a new admission; a replacement connection requires a new admission and cached state cannot revive the prior one"
+            ),
+        };
+    }
     match runner.reconnect(request) {
         Ok(view) => Response::Reconnected {
             previous_connection_id: expected_connection_id.as_str().to_owned(),
@@ -1011,6 +1524,93 @@ fn handle_reconnect(
                 .to_owned(),
         },
         Err(error) => bridge_error(&error),
+    }
+}
+
+/// Validates one closed detach claim and releases the host-facing transport correlation.
+///
+/// This mirrors [`handle_reconnect`] validation without adding replacement
+/// surface: inert claims are shaped into typed authority facts *before* the
+/// runner is read, and host text is never trusted — `session_id`,
+/// `activation_generation`, `authority_epoch`, and `fence_nonce` are bearer
+/// claims compared field-for-field against the live activation binding, with
+/// any mismatch failing closed under typed `DETACH_*` errors. The session,
+/// generation, and fence stay kernel-issued and are never minted, widened,
+/// or inferred from process identity here.
+///
+/// A match releases only the host-facing transport correlation for the
+/// presented connection: the runner is deliberately not mutated (this binary
+/// owns no detach port, and mutating attach state here would invent
+/// authority), so the kernel transport is untouched, the activation one-shot
+/// guard is preserved, and cursors, replay, and ledger projections survive
+/// exactly as the owner sealed them — survival rides only on that exact
+/// owner-authorized match. The durable session is NOT terminated and
+/// authority is NOT revived: process exit drops only this process's
+/// projections while the durable record persists kernel-side, recoverable
+/// solely through the kernel-owned
+/// `AGENT_HOST_REQUEST_REHYDRATE_OPERATION` exact (envelope,
+/// admission-receipt) pair. A replacement connection requires a new
+/// admission; cached state cannot revive the prior one.
+fn handle_detach(
+    runner: &BridgeRunner,
+    expected_connection_id: &ConnectionId,
+    session_id: &str,
+    activation_generation: u64,
+    authority_epoch: EpochId,
+    fence_nonce: &str,
+) -> Response {
+    let Some(live) = runner.attach_view() else {
+        return Response::Error {
+            code: "BRIDGE_NOT_ATTACHED",
+            detail: "bridge is not attached; nothing holds a host-facing transport correlation to release"
+                .to_owned(),
+        };
+    };
+    if expected_connection_id.as_str() != live.binding().connection_id().as_str() {
+        return Response::Error {
+            code: "DETACH_STALE_CONNECTION",
+            detail: format!(
+                "detach presents stale connection `{}`; the live connection is `{}` — re-read status for the live facts and retry; wrong/stale targets fail closed",
+                expected_connection_id.as_str(),
+                live.binding().connection_id().as_str(),
+            ),
+        };
+    }
+    let Ok(session) = SessionId::new(session_id) else {
+        return Response::Error {
+            code: "DETACH_INVALID",
+            detail: "detach session_id is not a valid opaque identity; present the exact live session from status".to_owned(),
+        };
+    };
+    let Ok(generation) = Generation::new(activation_generation) else {
+        return Response::Error {
+            code: "DETACH_INVALID",
+            detail: "detach activation_generation must be non-zero; present the exact live generation from status".to_owned(),
+        };
+    };
+    let Ok(fence) = FencingToken::new(authority_epoch, generation, fence_nonce) else {
+        return Response::Error {
+            code: "DETACH_INVALID",
+            detail: "detach authority_epoch must be non-zero and fence_nonce must be a non-blank opaque value; present the exact live fence from status".to_owned(),
+        };
+    };
+    if session.as_str() != live.binding().session_id().as_str()
+        || generation.get() != live.binding().activation_generation().get()
+        || !fence.matches(live.binding().state_fence())
+    {
+        return Response::Error {
+            code: "DETACH_STALE_AUTHORITY",
+            detail: format!(
+                "detach session, generation, or fence does not match the live attach; the host-facing correlation is not released. The durable session persists kernel-side and recovers solely through the kernel-owned `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair; a replacement connection requires a new admission and cached state cannot revive the prior one"
+            ),
+        };
+    }
+    Response::Detached {
+        connection_id: live.binding().connection_id().as_str().to_owned(),
+        session_id: live.binding().session_id().as_str().to_owned(),
+        activation_generation: live.binding().activation_generation().get(),
+        authority_epoch: live.binding().state_fence().authority_epoch().clone(),
+        bootstrap: None,
     }
 }
 
@@ -1070,8 +1670,10 @@ fn handle_stop(runner: &BridgeRunner) -> Response {
 /// Pre-activation reports `not-attached` with no liveness text; post-activation
 /// reports the admitted-session facts but never a probe-backed readiness claim —
 /// dispatch still traverses the live admitted transport per operation, and
-/// staleness surfaces as typed `RECONNECT_*` failures pointing back at this
-/// status and the reconnect operation.
+/// staleness surfaces as typed `RECONNECT_*`/`DETACH_*` failures pointing back
+/// at this status, the reconnect/detach operations, and the kernel-owned
+/// `AGENT_HOST_REQUEST_REHYDRATE_OPERATION` exact (envelope, admission-receipt)
+/// pair path. A replacement connection always requires a new admission.
 fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
     match runner.attach_view() {
         None => Response::Status {
@@ -1086,7 +1688,12 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             activation_port: "not-attached",
             host_request_port: "no-session: attach and activate before host-request dispatch",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: "attach and activate before host requests; reconnect requires a live attach",
+            recovery: format!(
+                "attach and activate before host requests; reconnect requires a live attach; \
+                one exact operation recovers only through the kernel-owned \
+                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
+                and a replacement connection requires a new admission"
+            ),
             reactive: None,
             bootstrap: None,
             resources: None,
@@ -1103,7 +1710,12 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             activation_port: "attached",
             host_request_port: "session-bound: dispatch joins the admitted Kernel session",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
+            recovery: format!(
+                "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; \
+                stale targets fail closed; one exact operation recovers only through the kernel-owned \
+                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
+                and a replacement connection requires a new admission"
+            ),
             reactive: Some(reactive_status_view(runner)),
             bootstrap: None,
             resources: Some(resource_status_view(runner)),
@@ -1159,11 +1771,50 @@ fn bridge_error(error: &BridgeError) -> Response {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
         }
+    } else if let BridgeError::ActivationDenied(report) = error {
+        Response::Error {
+            code: activation_denial_host_code(report.disposition()),
+            detail: report.agent_detail(),
+        }
+    } else if let BridgeError::ActivationDeadlineExceeded {
+        operation,
+        deadline_unix_ms,
+    } = error
+    {
+        Response::Error {
+            code: "ACTIVATION_DEADLINE_EXCEEDED",
+            detail: format!(
+                "activation observed no terminal result before deadline {deadline_unix_ms} for operation {operation}; never a typed denial"
+            ),
+        }
+    } else if let BridgeError::ActivationUnknownOutcome { operation } = error {
+        Response::Error {
+            code: "ACTIVATION_UNKNOWN_OUTCOME",
+            detail: format!(
+                "activation outcome unknown for operation {operation}: transport ended with no terminal result before the deadline; never a typed denial, never authority"
+            ),
+        }
     } else {
         Response::Error {
             code: "BRIDGE_REQUEST_REJECTED",
             detail: error.to_string(),
         }
+    }
+}
+
+/// Maps an I7.20 activation denial disposition to its stable host-facing
+/// error code. The producer (`agent_disposition_for_denial`) is exhaustive
+/// over the four catalogue dispositions, so the fallback is unreachable by
+/// construction and exists only to keep the host code total.
+fn activation_denial_host_code(disposition: &str) -> &'static str {
+    if disposition == ACTIVATION_DISPOSITION_INVALID_REQUEST {
+        "ACTIVATION_INVALID_REQUEST"
+    } else if disposition == ACTIVATION_DISPOSITION_STALE_OR_CONFLICT {
+        "ACTIVATION_STALE_OR_CONFLICT"
+    } else if disposition == ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY {
+        "ACTIVATION_UNAVAILABLE_OR_CAPACITY"
+    } else {
+        "ACTIVATION_FAILED"
     }
 }
 
@@ -1366,6 +2017,7 @@ fn write_response(response: &Response) -> StdioWriteReceipt {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_agent_bridge::ScopeLevel;
     use serde_json::Value;
 
     const INVOKE: &str = r#"{
@@ -1395,6 +2047,36 @@ mod tests {
             "deadline_preference_ms":2000,
             "observed_context":{
                 "host_session_hint":null,
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
+    /// W3 (#77) stdin line: one `eliot.query` invoke through the public
+    /// bridge protocol. The tool shape mirrors the proven-valid query fixture
+    /// (verification intent, exact-subject selector, no resource URI).
+    const INVOKE_QUERY: &str = r#"{
+        "op":"invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-query-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"eliot.query","arguments":{
+                "intent":{
+                    "mode":"verification",
+                    "time_scope":"session-window",
+                    "branch_environment_scope":"branch",
+                    "freshness_policy":"exact-fence",
+                    "required_assurance":"evidence-provenance"
+                },
+                "query":"subject:evidence-alpha",
+                "exact_resource_uri": null
+            }},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
                 "observed_resource_refs":[],
                 "event_cursors":[],
                 "trace_context":{}
@@ -1443,6 +2125,23 @@ mod tests {
             "correlation_id":"host-dryrun-send-1",
             "client_capabilities":{"tasks":false},
             "tool":{"name":"eliot.coordinate","arguments":{"operation":"send","recipient_ref":"peer-1","message":{"text":"hello"}}},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
+    const DRY_RUN_SKILL: &str = r#"{
+        "op":"dry_run_invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-dryrun-skill-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"skill.inject","arguments":{"contract_version":1}},
             "deadline_preference_ms":5000,
             "observed_context":{
                 "host_session_hint":"host-turn-1",
@@ -1614,6 +2313,36 @@ mod tests {
                 && !evidence.statement.contains("admitted"),
             "unsupported preview must not assert external validation occurred"
         );
+    }
+
+    #[test]
+    fn dry_run_skill_carrier_returns_unsupported_without_dispatch() {
+        // Skill carriers are effectful (install/issue) with no bridge-owned
+        // simulator: the dry run stays a static preview naming the skill
+        // route, dispatching nothing.
+        let Request::DryRunInvoke { request } =
+            serde_json::from_str::<Request>(DRY_RUN_SKILL).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        assert_eq!(request.tool.canonical_name(), "skill.inject");
+        let runner = dry_run_test_runner();
+        let response = dry_run_invocation(&runner, &request);
+        let Response::DryRun {
+            disposition,
+            preview,
+            evidence,
+            ..
+        } = response
+        else {
+            panic!("skill dry run must stay a dry-run envelope");
+        };
+        assert_eq!(disposition, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(preview.canonical_tool_name.as_deref(), Some("skill.inject"));
+        assert_eq!(preview.effect_class, "effectful");
+        assert_eq!(preview.route, "withheld-no-simulator");
+        assert!(!preview.simulated);
+        assert!(evidence.statement.contains("DRY_RUN_UNSUPPORTED"));
     }
 
     #[test]
@@ -2050,8 +2779,16 @@ mod tests {
                         Request::DryRunCancel { .. } => "dry_run_cancel",
                         Request::ForwardHook { .. } => "forward_hook",
                         Request::ForwardEvent { .. } => "forward_event",
+                        Request::ReactiveAdmit { .. } => "reactive_admit",
+                        Request::ReactiveRecordUse { .. } => "reactive_record_use",
+                        Request::ReactiveRecordUseByHandle { .. } => {
+                            "reactive_record_use_by_handle"
+                        }
+                        Request::ReactiveRecordDisposition { .. } => "reactive_record_disposition",
+                        Request::ReactiveSnapshot => "reactive_snapshot",
                         Request::ReconcileExternal {} => "reconcile_external",
                         Request::Reconnect { .. } => "reconnect",
+                        Request::Detach { .. } => "detach",
                         Request::Status => "status",
                         Request::Stop => "stop",
                         Request::Bootstrap { .. } => "bootstrap",
@@ -2199,8 +2936,7 @@ mod tests {
         // Main-side bounded decode dispatches known operations — including
         // the bridge-side bootstrap op through the admitted envelope shape —
         // and rejects malformed input without dispatch.
-        let decoded =
-            decode_bounded_request(r#"{"op":"status"}"#).expect("status op must decode");
+        let decoded = decode_bounded_request(r#"{"op":"status"}"#).expect("status op must decode");
         assert!(
             matches!(decoded, Request::Status),
             "status op must decode to its own request"
@@ -2223,20 +2959,16 @@ mod tests {
             "unknown operations must reject"
         );
         assert!(
-            decode_bounded_request(
-                &BOOTSTRAP_OP.replace(
-                    "\"requested_assessment\":\"READY\"",
-                    "\"requested_assessment\":\"READY\",\"extra\":1"
-                )
-            )
+            decode_bounded_request(&BOOTSTRAP_OP.replace(
+                "\"requested_assessment\":\"READY\"",
+                "\"requested_assessment\":\"READY\",\"extra\":1"
+            ))
             .is_err(),
             "extra envelope members must reject"
         );
         assert!(
-            decode_bounded_request(
-                &BOOTSTRAP_OP.replace("source-gen-9", &"g".repeat(600_000))
-            )
-            .is_err(),
+            decode_bounded_request(&BOOTSTRAP_OP.replace("source-gen-9", &"g".repeat(600_000)))
+                .is_err(),
             "oversized records must reject"
         );
         // Bridge-side bootstrap injection: the first successful response
@@ -2244,8 +2976,7 @@ mod tests {
         // evidence; the second carries none, while explicit retrieval
         // stays available (including via the admitted stdio op above).
         let mut runner = fixture_runner();
-        let context: BootstrapContext =
-            serde_json::from_str(BOOTSTRAP_CONTEXT_JSON).unwrap();
+        let context: BootstrapContext = serde_json::from_str(BOOTSTRAP_CONTEXT_JSON).unwrap();
         runner
             .note_bootstrap_context(context)
             .expect("valid context must note");
@@ -2284,5 +3015,724 @@ mod tests {
             .get_understanding_bootstrap(&empty_tasks(), CurrentAssessment::Ready)
             .expect("explicit retrieval stays available");
         assert_eq!(explicit.governance.profile_ref, "governance-profile-1");
+    }
+
+    /// C3 production-path proof: supported Kernel read-result bytes reaching the normal
+    /// Invoke path populate the attach-scoped evidence registry through the real caller
+    /// chain (gateway → authenticated outcome → runner record), and the snapshot expands
+    /// back to the exact bytes. No manual publisher feed: the only producer here is the
+    /// stubbed trusted port standing in for the Kernel boundary, exactly as the
+    /// `UnavailableKernelHostRequestPort` placeholder does for rejections.
+    mod tool_result_delivery_tests {
+        use super::super::{BridgeRunner, Profile, record_invocation_delivery, status_response};
+        use super::{
+            HostInvocationRequest, PortFailure, decode_bounded_request, handle_invocation,
+        };
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
+            Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
+            SessionId, TaskId, WorkUnitId,
+        };
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use eliot_mcp::{
+            HostInvocationPortOutcome, HostOperationHandle, KernelHostRequestPort, McpResponse,
+            ResponseKind,
+        };
+        use eliot_receipts::ProofCeiling;
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        struct StaticActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StaticActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        fn attached_runner() -> BridgeRunner {
+            let generation = Generation::new(5).expect("non-zero test generation");
+            let fence = FencingToken::new(
+                EpochId::new(
+                    EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                    NonZeroU64::new(2).expect("nonzero test sequence"),
+                )
+                .expect("valid test epoch"),
+                generation,
+                "fence-delivery-5",
+            )
+            .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-delivery-1").expect("valid principal"),
+                SessionId::new("session-delivery-1").expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-delivery-1").expect("valid task"),
+                WorkUnitId::new("work-unit-delivery-1").expect("valid work unit"),
+                "scope-delivery-1",
+                "task-revision-1",
+                "plan-delivery-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StaticActivation { result })),
+                None,
+            )
+            .expect("runner composes");
+            runner
+                .attach(AttachRequest::managed(
+                    DemandId::new("demand-delivery-1").expect("valid demand"),
+                    super::super::ConnectionId::new("conn-delivery-1").expect("valid connection"),
+                ))
+                .expect("managed attach admits");
+            runner
+        }
+
+        fn projection_response(kind: ResponseKind, content: serde_json::Value) -> McpResponse {
+            McpResponse {
+                request_id: "req-delivery-1".to_owned(),
+                idempotency_key: "idem-delivery-1".to_owned(),
+                canonical_request_sha256: DIGEST_A.to_owned(),
+                kind,
+                canonical_tool_name: "eliot.state".to_owned(),
+                content,
+                artifacts: Vec::new(),
+                proof_ceiling: ProofCeiling::Observation,
+                resource: None,
+                job: None,
+            }
+        }
+
+        struct RespondedPort {
+            response: McpResponse,
+        }
+
+        impl KernelHostRequestPort for RespondedPort {
+            fn invoke(
+                &mut self,
+                _request: &HostInvocationRequest,
+            ) -> Result<HostInvocationPortOutcome, PortFailure> {
+                Ok(HostInvocationPortOutcome::Responded {
+                    operation_handle: HostOperationHandle::new("kernel-operation-9")
+                        .expect("valid handle"),
+                    response: Box::new(self.response.clone()),
+                })
+            }
+
+            fn cancel(
+                &mut self,
+                _request: &super::super::HostCancellationRequest,
+            ) -> Result<super::HostCancellationPortOutcome, PortFailure> {
+                Err(PortFailure::PlanGap {
+                    missing_capability: "test.responded-port.cancel".to_owned(),
+                    reason: "cancel not exercised".to_owned(),
+                })
+            }
+        }
+
+        fn invoke_request() -> HostInvocationRequest {
+            let decoded = decode_bounded_request(super::INVOKE).expect("invoke must decode");
+            match decoded {
+                super::Request::Invoke { request } => request,
+                _ => panic!("expected invoke"),
+            }
+        }
+
+        fn large_content() -> serde_json::Value {
+            serde_json::json!({"evidence": "x".repeat(4096)})
+        }
+
+        #[test]
+        fn large_supported_tool_result_populates_registry_and_expands() {
+            use eliot_agent_bridge::MAX_PREVIEW_BYTES;
+
+            let mut runner = attached_runner();
+            assert_eq!(runner.resource_registry_len(), 0);
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            // Exact production order: gateway dispatch, then delivery recording.
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            let super::Response::Invocation {
+                result, evidence, ..
+            } = &response
+            else {
+                panic!("invoke must answer an invocation envelope");
+            };
+            assert_eq!(result.correlation_id().as_str(), "host-request-1");
+            assert!(
+                evidence.is_some(),
+                "large supported delivery must carry its recorded view"
+            );
+            // The response itself is forwarded exactly as the gateway shaped it.
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("invocation".to_owned())
+            );
+            // The recorded handle rides the response: host-discoverable with
+            // its immutable URI, digest, and bounded preview.
+            let evidence = value
+                .get("evidence")
+                .expect("large supported delivery must project its handle");
+            let uri = evidence["handle"]["uri"]
+                .as_str()
+                .expect("handle must carry its canonical URI");
+            assert!(
+                uri.starts_with("eliot://evidence/"),
+                "evidence handle must be content-addressed, got {uri}"
+            );
+            let digest = evidence["handle"]["digest"]
+                .as_str()
+                .expect("handle must carry its content digest");
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "handle digest must stay lowercase SHA-256 hex"
+            );
+            // The real caller path populated the registry with one snapshot.
+            assert_eq!(runner.resource_registry_len(), 1);
+            let stored = serde_json::to_vec(&large_content()).expect("content serializes");
+            assert!(stored.len() > MAX_PREVIEW_BYTES);
+            // Recording the same delivered bytes again rebinds the same handle:
+            // content-addressing is idempotent, never a second entry.
+            let again = runner
+                .record_tool_result_delivery(result.outcome())
+                .expect("re-record rebinds");
+            assert_eq!(runner.resource_registry_len(), 1);
+            // Expansion retrieves the exact delivered bytes behind a bounded preview.
+            assert!(again.preview().len() <= MAX_PREVIEW_BYTES);
+            assert!(again.is_truncated());
+            let expanded = runner
+                .expand_resource(again.handle())
+                .expect("expand resolves the issued handle");
+            assert_eq!(expanded, stored);
+            // Status projects the populated registry.
+            let status = status_response(Profile::SpineFunctional, &runner);
+            let status_value = serde_json::to_value(&status).expect("status must serialize");
+            assert_eq!(
+                status_value["resources"]["entries"],
+                serde_json::Value::from(1)
+            );
+        }
+
+        #[test]
+        fn unsupported_small_and_failed_tool_results_record_nothing() {
+            let mut runner = attached_runner();
+            let request = invoke_request();
+            // Unsupported kind carries no result semantics: nothing snapshotted.
+            let mut unsupported = RespondedPort {
+                response: projection_response(ResponseKind::Unsupported, large_content()),
+            };
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut unsupported, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "unsupported delivery must not project a handle"
+            );
+            // Small inline content stays fully visible: nothing withheld, nothing stored.
+            let mut small = RespondedPort {
+                response: projection_response(
+                    ResponseKind::Projection,
+                    serde_json::json!({"ok": true}),
+                ),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "small inline delivery must not project a handle"
+            );
+            // Rejected invocations carry no result: the error envelope records nothing.
+            let mut unavailable = super::UnavailableKernelHostRequestPort;
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut unavailable, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+        }
+
+        #[test]
+        fn detached_runner_records_nothing() {
+            let mut runner = super::fixture_runner();
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "detached recording must not project a handle"
+            );
+        }
+
+        /// Owning-operation answer served through the invoke-read leg.
+        fn query_answer() -> McpResponse {
+            McpResponse {
+                request_id: "req-query-1".to_owned(),
+                idempotency_key: "idem-query-1".to_owned(),
+                canonical_request_sha256: DIGEST_A.to_owned(),
+                kind: ResponseKind::Projection,
+                canonical_tool_name: "eliot.query".to_owned(),
+                content: serde_json::json!({"subject":"evidence-alpha"}),
+                artifacts: Vec::new(),
+                proof_ceiling: ProofCeiling::Observation,
+                resource: None,
+                job: None,
+            }
+        }
+
+        /// Scripted stand-in for the Kernel/Governor side of one query
+        /// invocation: the first invoke admits the operation (the owning
+        /// operation has not answered yet); the re-invoke under the same host
+        /// correlation serves the owner's answer. Never a guessed outcome:
+        /// each step returns exactly one staged port outcome.
+        struct QueryTwoStepPort {
+            answer: McpResponse,
+            calls: usize,
+        }
+
+        impl KernelHostRequestPort for QueryTwoStepPort {
+            fn invoke(
+                &mut self,
+                _request: &HostInvocationRequest,
+            ) -> Result<HostInvocationPortOutcome, PortFailure> {
+                self.calls += 1;
+                let operation_handle =
+                    HostOperationHandle::new("kernel-operation-query-1").expect("valid handle");
+                if self.calls == 1 {
+                    Ok(HostInvocationPortOutcome::Accepted { operation_handle })
+                } else {
+                    Ok(HostInvocationPortOutcome::Responded {
+                        operation_handle,
+                        response: Box::new(self.answer.clone()),
+                    })
+                }
+            }
+
+            fn cancel(
+                &mut self,
+                _request: &super::super::HostCancellationRequest,
+            ) -> Result<super::HostCancellationPortOutcome, PortFailure> {
+                Err(PortFailure::PlanGap {
+                    missing_capability: "test.query-port.cancel".to_owned(),
+                    reason: "cancel not exercised".to_owned(),
+                })
+            }
+        }
+
+        #[test]
+        fn query_invoke_keeps_host_correlation_from_admission_to_answer() {
+            // W3 (#77): one op end-to-end through the public stdin protocol.
+            // A query invoke decodes from its stdin line, dispatches through
+            // the gateway, and answers with the exact host correlation on
+            // both the admission step and the re-invoke step after the owning
+            // Governor operation serves the answer.
+            let request = match decode_bounded_request(super::INVOKE_QUERY)
+                .expect("query invoke must decode")
+            {
+                super::Request::Invoke { request } => request,
+                _ => panic!("expected invoke"),
+            };
+            assert_eq!(request.tool.canonical_name(), "eliot.query");
+            assert_eq!(request.correlation_id.as_str(), "host-query-1");
+            let mut runner = attached_runner();
+            let mut port = QueryTwoStepPort {
+                answer: query_answer(),
+                calls: 0,
+            };
+            // Exact production order: gateway dispatch, then delivery recording.
+            let mut admitted = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut admitted);
+            let mut answered = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut answered);
+            assert_eq!(port.calls, 2);
+            assert_eq!(runner.resource_registry_len(), 0);
+            for response in [&admitted, &answered] {
+                let super::Response::Invocation {
+                    result, completion, ..
+                } = response
+                else {
+                    panic!("invoke must answer an invocation envelope");
+                };
+                assert_eq!(result.correlation_id().as_str(), "host-query-1");
+                assert_eq!(completion.correlation_id().as_str(), "host-query-1");
+                let value = serde_json::to_value(response).expect("response must serialize");
+                assert_eq!(
+                    value["result"]["correlation_id"],
+                    serde_json::Value::String("host-query-1".to_owned())
+                );
+                assert_eq!(
+                    value["completion"]["correlation_id"],
+                    serde_json::Value::String("host-query-1".to_owned())
+                );
+            }
+            // The admission step carries no answer; the re-invoke step carries
+            // the owning operation's answer verbatim under the same correlation.
+            let admitted_value = serde_json::to_value(&admitted).expect("admission must serialize");
+            assert_eq!(
+                admitted_value["result"]["outcome"]["disposition"],
+                serde_json::Value::String("ACCEPTED".to_owned())
+            );
+            let answered_value = serde_json::to_value(&answered).expect("answer must serialize");
+            assert_eq!(
+                answered_value["result"]["outcome"]["disposition"],
+                serde_json::Value::String("RESPONDED".to_owned())
+            );
+            assert_eq!(
+                answered_value["result"]["outcome"]["response"]["canonical_tool_name"],
+                serde_json::Value::String("eliot.query".to_owned())
+            );
+            assert_eq!(
+                answered_value["result"]["outcome"]["response"]["content"]["subject"],
+                serde_json::Value::String("evidence-alpha".to_owned())
+            );
+        }
+    }
+
+    /// C1 live-consumer proof: items admitted through the REAL production
+    /// chain (hand batch → live Governor derivation → transport → ledger)
+    /// are consumed by the REAL stdio ForwardHook dispatch step, and the
+    /// issued receipts ride the Forwarded wire frame. Withheld items yield
+    /// an empty Forwarded frame with no receipt key. No stub assessor, no
+    /// stub ledger, no direct ledger calls: the only producer is the
+    /// transport, the only consumer the extracted dispatch step.
+    mod reactive_hook_consumer_tests {
+        #![allow(clippy::expect_used)]
+
+        use super::super::handle_forward_hook;
+        use eliot_agent_bridge::{
+            BridgeRunner, Profile, RiskTier, SettledPlanAdmission, governor_assess,
+        };
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest, CoverageGap,
+            DemandId, EventEnvelope, EventPortOutcome, FencingToken, Generation,
+            HostActivationPort, HostEventEnvelope, McpForwardingPort, PrincipalId, ProviderFailure,
+            ProviderReadiness, ReconciliationPortOutcome, SessionId, TaskId, WorkUnitId,
+        };
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+        use eliot_integration_coverage::{
+            ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
+            GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
+            WatchdogEvidence,
+        };
+        use eliot_reactive_context_plan::{
+            BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionInstruction,
+            BridgeAdmissionSeverity,
+        };
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const TEST_SESSION: &str = "session-consumer-1";
+        const TEST_DIGEST: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        struct StaticActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StaticActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        struct OkForwarder;
+
+        impl McpForwardingPort for OkForwarder {
+            fn forward_hook(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &HostEventEnvelope,
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
+            }
+            fn forward_event(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &EventEnvelope,
+            ) -> Result<EventPortOutcome, ProviderFailure> {
+                Ok(EventPortOutcome::BestEffortForwarded)
+            }
+            fn forward_gap(
+                &mut self,
+                _binding: &AttachBinding,
+                _gap: &CoverageGap,
+            ) -> Result<(), ProviderFailure> {
+                Err(ProviderFailure::new("test-forwarder", "gap not exercised"))
+            }
+            fn reconcile_external(
+                &mut self,
+                _binding: &AttachBinding,
+            ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+                Err(ProviderFailure::new(
+                    "test-forwarder",
+                    "reconciliation not exercised",
+                ))
+            }
+        }
+
+        fn test_epoch(sequence: u64) -> EpochId {
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch")
+        }
+
+        fn test_fence() -> StateFence {
+            StateFence::new(
+                test_epoch(3),
+                ResourceGeneration::new(7).expect("non-zero test generation"),
+            )
+        }
+
+        fn consumer_runner() -> BridgeRunner {
+            let generation = Generation::new(7).expect("non-zero test generation");
+            let fence = FencingToken::new(test_epoch(3), generation, "fence-consumer-7")
+                .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-consumer-1").expect("valid principal"),
+                SessionId::new(TEST_SESSION).expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-consumer-1").expect("valid task"),
+                WorkUnitId::new("work-unit-consumer-1").expect("valid work unit"),
+                "scope-consumer-1",
+                "task-revision-1",
+                "plan-consumer-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StaticActivation { result })),
+                Some(Box::new(OkForwarder)),
+            )
+            .expect("runner composes");
+            runner
+                .attach(AttachRequest::managed(
+                    DemandId::new("demand-consumer-1").expect("valid demand"),
+                    super::super::ConnectionId::new("conn-consumer-1").expect("valid connection"),
+                ))
+                .expect("managed attach admits");
+            runner
+        }
+
+        fn hook_event(hook_id: &str) -> HostEventEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "event_id": hook_id,
+                "attempt_id": "attempt-consumer-1",
+                "sequence": 1,
+                "cursor": "cursor-consumer-1",
+                "kind": "tool_result",
+                "route": {
+                    "host_family": "test",
+                    "adapter": "test",
+                    "protocol_transport": "stdio",
+                    "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "provider": "provider",
+                    "model": "model",
+                    "auth_billing": "test",
+                    "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "reasoning_mode": "test",
+                    "continuation_behavior": "fresh",
+                    "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                },
+                "raw_payload_digest": "digest-consumer-1",
+                "normalized_payload": {},
+                "parent_event_id": null,
+                "observed_at": "2026-09-21T00:00:00Z"
+            }))
+            .expect("valid hook fixture")
+        }
+
+        fn live_derivation() -> GovernorCoverageDerivation {
+            let events: Vec<EventCoverage> = ALL_EVENTS
+                .iter()
+                .map(|event| EventCoverage {
+                    event: *event,
+                    disposition: if matches!(
+                        event,
+                        LogicalEvent::PreToolUse | LogicalEvent::PermissionRequest
+                    ) {
+                        EventDisposition::Enforced
+                    } else {
+                        EventDisposition::Observed
+                    },
+                    ordering: DispatchOrdering::PreDispatch,
+                    completeness: EventCompleteness::Complete,
+                    proof_ceiling: "test-ceiling".to_owned(),
+                    source: "test-source".to_owned(),
+                    gaps: Vec::new(),
+                })
+                .collect();
+            let coverage = IntegrationCoverageProfile::candidate(
+                "fingerprint-1",
+                events,
+                EventCompleteness::Complete,
+                "test-ceiling",
+                "test-source",
+                Vec::new(),
+            )
+            .expect("candidate")
+            .verify("fingerprint-1", true)
+            .expect("verified");
+            let mut derivation = GovernorCoverageDerivation::new();
+            derivation
+                .derive(
+                    &coverage,
+                    &WatchdogEvidence {
+                        supervisor_id: "watchdog-1".to_owned(),
+                        fresh: true,
+                        summary: "test supervision".to_owned(),
+                    },
+                    TraceFreshness::Fresh,
+                )
+                .expect("derive");
+            derivation
+        }
+
+        fn instruction(item_id: &str) -> BridgeAdmissionInstruction {
+            BridgeAdmissionInstruction {
+                cue_id: item_id.to_owned(),
+                cue_source: "tool-surface-1".to_owned(),
+                cue_source_revision: "rev-1".to_owned(),
+                cue_digest: TEST_DIGEST.to_owned(),
+                rule_id: "reactive-activation:plan-digest-1".to_owned(),
+                relations: vec!["rel-a".to_owned()],
+                scope_id: "scope-consumer-1".to_owned(),
+                status: "EVENT_PLAN".to_owned(),
+                governance_profile_rev: "policy-digest-1".to_owned(),
+                fence: test_fence(),
+                severity: BridgeAdmissionSeverity::Critical,
+                delivery: BridgeAdmissionDelivery::HostHook,
+                dedup_key: format!("plan-digest-1:{item_id}"),
+                plan_item_id: item_id.to_owned(),
+                plan_result_digest: "plan-digest-1".to_owned(),
+                item_reason: "fixture reason".to_owned(),
+                attention: None,
+            }
+        }
+
+        fn batch(item_id: &str) -> BridgeAdmissionBatch {
+            BridgeAdmissionBatch {
+                session_id: eliot_contracts::SessionId::new(TEST_SESSION).expect("valid session"),
+                scope_id: eliot_receipts::WorkScopeId::new("scope-consumer-1")
+                    .expect("valid scope"),
+                invalidations: Vec::new(),
+                items: vec![instruction(item_id)],
+                skipped_sticky: 0,
+                skipped_ineligible: 0,
+            }
+        }
+
+        #[test]
+        fn admitted_item_rides_the_live_hook_frame_with_governor_receipt() {
+            let mut runner = consumer_runner();
+            let mut driver = SettledPlanAdmission::new();
+            let derivation = live_derivation();
+            // Production chain only: batch → live Governor assessment →
+            // transport → ledger. No direct ledger calls.
+            let report = driver
+                .admit_batch(&mut runner, &batch("item-hook-1"), |item, critical| {
+                    governor_assess(&derivation, item, critical)
+                })
+                .expect("live assessment admits");
+            assert_eq!(report.admitted.len(), 1);
+            assert!(report.withheld.is_empty());
+            assert_eq!(runner.reactive_pending_count(), 1);
+            // Live stdio consumer: the extracted ForwardHook dispatch step
+            // drains the pending item through the real forwarded event.
+            let event = hook_event("hook-consumer-1");
+            let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+            assert!(!provider_failed);
+            let super::Response::Forwarded {
+                reactive_receipts, ..
+            } = &response
+            else {
+                panic!("hook consumer answers a forwarded envelope");
+            };
+            assert_eq!(reactive_receipts.len(), 1);
+            let receipt = &reactive_receipts[0];
+            assert_eq!(receipt.session_id, TEST_SESSION);
+            assert_eq!(receipt.admission.risk, RiskTier::Severe);
+            assert_eq!(receipt.admission.fence_epoch, format!("{TEST_LINEAGE}:3"));
+            assert_eq!(receipt.admission.fence_generation, 7);
+            assert_eq!(runner.reactive_pending_count(), 0);
+            // The receipt rides the wire frame with the Governor tier.
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("forwarded".to_owned())
+            );
+            let wire = value["reactive_receipts"]
+                .as_array()
+                .expect("receipts must list");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(
+                wire[0]["admission"]["risk"],
+                serde_json::Value::String("SEVERE".to_owned())
+            );
+            assert_eq!(
+                wire[0]["delivery"]["hook_id"],
+                serde_json::Value::String("hook-consumer-1".to_owned())
+            );
+        }
+
+        #[test]
+        fn withheld_item_yields_an_empty_hook_frame() {
+            let mut runner = consumer_runner();
+            let mut driver = SettledPlanAdmission::new();
+            // Nothing derived: the real assessment withholds, the ledger
+            // stays empty, and the live consumer emits a receipt-less frame.
+            let bare = GovernorCoverageDerivation::new();
+            let report = driver
+                .admit_batch(&mut runner, &batch("item-hook-2"), |item, critical| {
+                    governor_assess(&bare, item, critical)
+                })
+                .expect("withhold is honest, not failure");
+            assert!(report.admitted.is_empty());
+            assert_eq!(report.withheld.len(), 1);
+            let event = hook_event("hook-consumer-2");
+            let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+            assert!(!provider_failed);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("forwarded".to_owned())
+            );
+            assert!(
+                value.get("reactive_receipts").is_none(),
+                "no delivery means no receipt key on the wire"
+            );
+        }
     }
 }

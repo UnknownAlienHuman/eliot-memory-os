@@ -82,6 +82,7 @@ fn candidate(
             content_sha256: digest(b'b'),
             predecessor: None,
         },
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: content.to_owned(),
         },
@@ -285,6 +286,7 @@ fn input_with_optional(optional_cost: AdmissionMeasuredCost) -> AdmissionInput {
             candidates: vec![required.clone(), optional.clone()],
             denominator: denominator.clone(),
         },
+        learning_tickets: Vec::new(),
         floor: SafetyFloorIdentity {
             floor_id: id("floor"),
             decision: recipe.decision.clone(),
@@ -972,14 +974,8 @@ fn push_extractive(
 ) {
     let context = input.binding.clone();
     let slot = input.candidates.candidates[1].provider_role.clone();
-    let mut atom_candidate = candidate(
-        &context,
-        atom,
-        slot,
-        content,
-        LossPolicy::Extractive,
-        false,
-    );
+    let mut atom_candidate =
+        candidate(&context, atom, slot, content, LossPolicy::Extractive, false);
     atom_candidate.representation = AtomRepresentation::Extractive {
         content: content.to_owned(),
         manifest,
@@ -991,10 +987,8 @@ fn push_extractive(
         .find(|policy| policy.role == SemanticRole::Optional)
     {
         policy.loss_policy = LossPolicy::Extractive;
-        policy.allowed_representations = vec![
-            RepresentationKind::Whole,
-            RepresentationKind::Extractive,
-        ];
+        policy.allowed_representations =
+            vec![RepresentationKind::Whole, RepresentationKind::Extractive];
     }
     let cost = AdmissionMeasuredCost::ExactUtf8Bytes { value: cost_value };
     input.measurements.push(measurement(
@@ -1082,19 +1076,27 @@ fn add_provider_slot(
     };
     if !input.candidates.denominator.requested.contains(&slot) {
         input.candidates.denominator.requested.push(slot.clone());
-        input.candidates.denominator.dispositions.push(ProviderDisposition {
-            slot: slot.clone(),
-            state: AtomAvailability::PresentCurrent,
-            evidence: None,
-        });
+        input
+            .candidates
+            .denominator
+            .dispositions
+            .push(ProviderDisposition {
+                slot: slot.clone(),
+                state: AtomAvailability::PresentCurrent,
+                evidence: None,
+            });
     }
     if !input.recipe.denominator.requested.contains(&slot) {
         input.recipe.denominator.requested.push(slot.clone());
-        input.recipe.denominator.dispositions.push(ProviderDisposition {
-            slot: slot.clone(),
-            state: AtomAvailability::PresentCurrent,
-            evidence: None,
-        });
+        input
+            .recipe
+            .denominator
+            .dispositions
+            .push(ProviderDisposition {
+                slot: slot.clone(),
+                state: AtomAvailability::PresentCurrent,
+                evidence: None,
+            });
     }
     refresh_recipe(input);
     slot
@@ -1180,11 +1182,16 @@ fn promote_to_floor(input: &mut AdmissionInput, atom: &str) {
             .providers
             .requested
             .push(found.provider_role.clone());
-        input.floor.floor.providers.dispositions.push(ProviderDisposition {
-            slot: found.provider_role.clone(),
-            state: found.availability,
-            evidence: None,
-        });
+        input
+            .floor
+            .floor
+            .providers
+            .dispositions
+            .push(ProviderDisposition {
+                slot: found.provider_role.clone(),
+                state: found.availability,
+                evidence: None,
+            });
     }
     if let Some(policy) = input
         .recipe
@@ -1298,7 +1305,8 @@ fn unsupported_input_recipe_policy_measurement_schemas_are_distinct() {
         Err(ContextError::UnknownMeasurement)
     );
 
-    let mut binding_schema = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut binding_schema =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     binding_schema.measurements[0].binding.schema_version = ContractVersion::new(9, 9, 9);
     assert_eq!(
         admit_context(&binding_schema),
@@ -1319,7 +1327,8 @@ fn task_mismatch_is_rejected_before_selection() {
         Err(ContextError::IdentityConflict)
     );
 
-    let mut candidate_task = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut candidate_task =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     candidate_task.candidates.candidates[0].binding.task_id =
         TaskId::new("other-task").expect("task");
     assert_eq!(
@@ -1382,11 +1391,15 @@ fn recipe_provider_role_mismatch_is_denominator_error() {
     let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     let ghost = role("ghost-provider", SemanticRole::Optional);
     input.recipe.denominator.requested.push(ghost.clone());
-    input.recipe.denominator.dispositions.push(ProviderDisposition {
-        slot: ghost,
-        state: AtomAvailability::PresentCurrent,
-        evidence: None,
-    });
+    input
+        .recipe
+        .denominator
+        .dispositions
+        .push(ProviderDisposition {
+            slot: ghost,
+            state: AtomAvailability::PresentCurrent,
+            evidence: None,
+        });
     refresh_recipe(&mut input);
     assert_eq!(
         admit_context(&input),
@@ -1410,29 +1423,33 @@ fn missing_provider_disposition_is_denominator_error() {
 fn duplicate_and_extra_provider_dispositions_are_denominator_errors() {
     let mut duplicate = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     let repeated = duplicate.candidates.denominator.dispositions[0].clone();
-    duplicate
-        .candidates
-        .denominator
-        .dispositions
-        .push(repeated);
+    duplicate.candidates.denominator.dispositions.push(repeated);
     assert_eq!(
         admit_context(&duplicate),
         Err(ContextError::DenominatorMismatch)
     );
 
     let mut extra = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
-    extra.candidates.denominator.dispositions.push(ProviderDisposition {
-        slot: role("ghost-provider", SemanticRole::Optional),
-        state: AtomAvailability::PresentCurrent,
-        evidence: None,
-    });
-    assert_eq!(admit_context(&extra), Err(ContextError::DenominatorMismatch));
+    extra
+        .candidates
+        .denominator
+        .dispositions
+        .push(ProviderDisposition {
+            slot: role("ghost-provider", SemanticRole::Optional),
+            state: AtomAvailability::PresentCurrent,
+            evidence: None,
+        });
+    assert_eq!(
+        admit_context(&extra),
+        Err(ContextError::DenominatorMismatch)
+    );
 }
 
 // WORK_UNIT_CASE: 608/10
 #[test]
 fn duplicate_atom_and_duplicate_measurement_are_rejected() {
-    let mut duplicate_atom = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut duplicate_atom =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     let repeated = duplicate_atom.candidates.candidates[0].clone();
     duplicate_atom.candidates.candidates.push(repeated);
     assert_eq!(
@@ -1457,7 +1474,8 @@ fn duplicate_atom_and_duplicate_measurement_are_rejected() {
 // WORK_UNIT_CASE: 608/11
 #[test]
 fn same_id_changed_content_source_measurement_conflicts() {
-    let mut changed_content = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut changed_content =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     if let AtomRepresentation::Whole { content } =
         &mut changed_content.candidates.candidates[0].representation
     {
@@ -1468,7 +1486,8 @@ fn same_id_changed_content_source_measurement_conflicts() {
         Err(ContextError::IdentityConflict)
     );
 
-    let mut changed_source = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut changed_source =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     changed_source.candidates.candidates[0].source.revision = "r2".to_owned();
     assert_eq!(
         admit_context(&changed_source),
@@ -1477,7 +1496,9 @@ fn same_id_changed_content_source_measurement_conflicts() {
 
     let mut changed_measurement =
         input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
-    changed_measurement.candidates.candidates[0].measurement.digest = digest(b'd');
+    changed_measurement.candidates.candidates[0]
+        .measurement
+        .digest = digest(b'd');
     assert_eq!(
         admit_context(&changed_measurement),
         Err(ContextError::IdentityConflict)
@@ -1557,7 +1578,8 @@ fn foreign_serializer_schema_route_model_tokenizer_are_rejected() {
         Err(ContextError::IdentityConflict)
     );
 
-    let mut foreign_schema = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut foreign_schema =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     foreign_schema.measurements[0].binding.schema_version = ContractVersion::new(9, 9, 9);
     assert_eq!(
         admit_context(&foreign_schema),
@@ -1580,7 +1602,8 @@ fn foreign_serializer_schema_route_model_tokenizer_are_rejected() {
         Err(ContextError::IdentityConflict)
     );
 
-    let mut tokenizer_cost = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut tokenizer_cost =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     tokenizer_cost.measurements[0].cost = AdmissionMeasuredCost::ExactTokenizer {
         observation: TokenizerObservation {
             tokenizer_id: "tok".to_owned(),
@@ -1597,13 +1620,12 @@ fn foreign_serializer_schema_route_model_tokenizer_are_rejected() {
 
     let mut stu_observation =
         input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
-    stu_observation.measurements[0].observation =
-        Some(AdmissionMeasuredCost::ConservativeStu {
-            estimate: StuEstimate {
-                value: 99,
-                empirical: false,
-            },
-        });
+    stu_observation.measurements[0].observation = Some(AdmissionMeasuredCost::ConservativeStu {
+        estimate: StuEstimate {
+            value: 99,
+            empirical: false,
+        },
+    });
     // An unqualified STU observation can never authorize additive fit.
     assert_eq!(
         admit_context(&stu_observation),
@@ -1633,7 +1655,9 @@ fn unknown_measurement_cannot_prove_fit() {
     assert_eq!(gap.unknown, vec![id("required")]);
     assert!(gap.measurements.contains(&id("required-measurement")));
     assert!(!gap.reopening_requirements.is_empty());
-    result.validate_for(&input).expect("incomplete conservation");
+    result
+        .validate_for(&input)
+        .expect("incomplete conservation");
 }
 
 // WORK_UNIT_CASE: 608/17
@@ -1673,10 +1697,7 @@ fn one_byte_over_boundary_does_not_pass_optional() {
 fn fixed_overhead_overflow_precedes_selection() {
     let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     set_capacity(&mut input, 100, 90, 10, 10);
-    assert_eq!(
-        admit_context(&input),
-        Err(ContextError::CapacityExceeded)
-    );
+    assert_eq!(admit_context(&input), Err(ContextError::CapacityExceeded));
 }
 
 // WORK_UNIT_CASE: 608/20
@@ -1755,10 +1776,7 @@ fn non_droppable_cannot_use_weaker_form_to_fit() {
     input.candidates.candidates[0].representation = AtomRepresentation::Handle {
         handle: id("handle-required"),
     };
-    assert_eq!(
-        admit_context(&input),
-        Err(ContextError::WholeUnitRequired)
-    );
+    assert_eq!(admit_context(&input), Err(ContextError::WholeUnitRequired));
 }
 
 // WORK_UNIT_CASE: 608/25
@@ -1796,7 +1814,8 @@ fn stale_foreign_expired_expansion_is_unavailable() {
         Err(ContextError::OmissionHandleInvalid)
     );
 
-    let mut foreign_source = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut foreign_source =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     make_handle_optional(&mut foreign_source);
     foreign_source.supplied_omissions[0]
         .expansion
@@ -1900,10 +1919,7 @@ fn absent_or_changed_extract_receipt_blocks_selection() {
     {
         content.push_str(" plus more");
     }
-    assert_eq!(
-        admit_context(&changed),
-        Err(ContextError::IdentityConflict)
-    );
+    assert_eq!(admit_context(&changed), Err(ContextError::IdentityConflict));
 }
 
 // WORK_UNIT_CASE: 608/29
@@ -1991,10 +2007,7 @@ fn absent_or_changed_summary_receipt_blocks_selection() {
     {
         content.push_str(" plus more");
     }
-    assert_eq!(
-        admit_context(&changed),
-        Err(ContextError::IdentityConflict)
-    );
+    assert_eq!(admit_context(&changed), Err(ContextError::IdentityConflict));
 }
 
 // WORK_UNIT_CASE: 608/31
@@ -2013,12 +2026,10 @@ fn admission_implements_no_extract_summary_or_truncation() {
             AtomRepresentation::Whole { .. }
         ));
     }
-    assert!(
-        admitted.records.iter().all(|record| !matches!(
-            record.candidate.representation,
-            AtomRepresentation::Extractive { .. } | AtomRepresentation::Summary { .. }
-        ))
-    );
+    assert!(admitted.records.iter().all(|record| !matches!(
+        record.candidate.representation,
+        AtomRepresentation::Extractive { .. } | AtomRepresentation::Summary { .. }
+    )));
     result.validate_for(&input).expect("result conservation");
 }
 
@@ -2069,10 +2080,7 @@ fn required_dependency_closure_is_atomic() {
     add_dependency(&mut input, "required", "optional");
     let result = admit_context(&input).expect("closed floor fits");
     let admitted = complete_set(&result);
-    assert_eq!(
-        admitted_ids(admitted),
-        vec![id("optional"), id("required")]
-    );
+    assert_eq!(admitted_ids(admitted), vec![id("optional"), id("required")]);
     assert_eq!(admitted.economy.allocations.admitted_required, 40);
     assert_eq!(admitted.economy.allocations.admitted_optional, 0);
     result.validate_for(&input).expect("result conservation");
@@ -2222,7 +2230,9 @@ fn one_over_floor_yields_canonical_incomplete() {
     assert!(gap.measurements.contains(&id("required-measurement")));
     assert!(!gap.reopening_requirements.is_empty());
     gap.validate().expect("canonical gap validates");
-    result.validate_for(&input).expect("incomplete conservation");
+    result
+        .validate_for(&input)
+        .expect("incomplete conservation");
 }
 
 // WORK_UNIT_CASE: 608/39
@@ -2238,7 +2248,9 @@ fn missing_mandatory_stays_missing() {
         gap.provider_gaps[0].slot,
         input.candidates.candidates[0].provider_role
     );
-    result.validate_for(&input).expect("incomplete conservation");
+    result
+        .validate_for(&input)
+        .expect("incomplete conservation");
 }
 
 // WORK_UNIT_CASE: 608/40
@@ -2277,10 +2289,7 @@ fn blocked_unavailable_unmeasured_mandatory_are_exact() {
     let mut unmeasured = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     unmeasured.measurements[0].cost = AdmissionMeasuredCost::Unavailable;
     let result = admit_context(&unmeasured).expect("unmeasured is explicit");
-    assert_eq!(
-        incomplete_gap(&result).unavailable,
-        vec![id("required")]
-    );
+    assert_eq!(incomplete_gap(&result).unavailable, vec![id("required")]);
 }
 
 // WORK_UNIT_CASE: 608/42
@@ -2289,11 +2298,16 @@ fn required_provider_coverage_gap_is_incomplete() {
     let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     let slot = add_provider_slot(&mut input, "quiet-provider", SemanticRole::Verifier);
     input.floor.floor.providers.requested.push(slot.clone());
-    input.floor.floor.providers.dispositions.push(ProviderDisposition {
-        slot: slot.clone(),
-        state: AtomAvailability::Stale,
-        evidence: None,
-    });
+    input
+        .floor
+        .floor
+        .providers
+        .dispositions
+        .push(ProviderDisposition {
+            slot: slot.clone(),
+            state: AtomAvailability::Stale,
+            evidence: None,
+        });
     for dispositions in [
         &mut input.candidates.denominator.dispositions,
         &mut input.recipe.denominator.dispositions,
@@ -2312,7 +2326,9 @@ fn required_provider_coverage_gap_is_incomplete() {
     assert_eq!(gap.provider_gaps[0].slot, slot);
     assert!(gap.missing.is_empty());
     assert!(gap.stale.is_empty());
-    result.validate_for(&input).expect("incomplete conservation");
+    result
+        .validate_for(&input)
+        .expect("incomplete conservation");
 }
 
 // WORK_UNIT_CASE: 608/43
@@ -2380,7 +2396,9 @@ fn incomplete_retains_capacity_member_dependency_reopen_evidence() {
     assert!(!gap.reopening_requirements.is_empty());
     assert_eq!(result.floor_id, id("floor"));
     assert_eq!(result.recipe_digest, input.recipe.recipe_sha256);
-    result.validate_for(&input).expect("incomplete conservation");
+    result
+        .validate_for(&input)
+        .expect("incomplete conservation");
 }
 
 // WORK_UNIT_CASE: 608/46
@@ -2389,10 +2407,7 @@ fn incomplete_cannot_convert_to_thinner_admitted_complete() {
     let mut input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     set_availability(&mut input, "required", AtomAvailability::Missing);
     let result = admit_context(&input).expect("missing is explicit");
-    assert!(matches!(
-        result.outcome,
-        ContextOutcome::Incomplete(_)
-    ));
+    assert!(matches!(result.outcome, ContextOutcome::Incomplete(_)));
     assert!(result.evidence.economy.is_none());
     assert_eq!(result.evidence.decisions.len(), 2);
     assert!(
@@ -2428,18 +2443,14 @@ fn optional_flood_cannot_crowd_or_alter_floor() {
     }
     let result = admit_context(&input).expect("floor survives flood");
     let admitted = complete_set(&result);
-    assert_eq!(
-        admitted_ids(admitted),
-        vec![id("optional"), id("required")]
-    );
+    assert_eq!(admitted_ids(admitted), vec![id("optional"), id("required")]);
     let required_record = admitted
         .records
         .iter()
         .find(|record| record.candidate.atom_id == id("required"))
         .expect("floor record");
     assert_eq!(
-        &required_record.candidate,
-        &input.candidates.candidates[0],
+        &required_record.candidate, &input.candidates.candidates[0],
         "floor representation must be unaltered"
     );
     assert_eq!(admitted.economy.allocations.admitted_required, 20);
@@ -2496,10 +2507,7 @@ fn optional_cannot_consume_protected_headroom() {
         invalidation: None,
     });
     protected.candidates.candidates.push(guarded);
-    assert_eq!(
-        admit_context(&protected),
-        Err(ContextError::MissingFloor)
-    );
+    assert_eq!(admit_context(&protected), Err(ContextError::MissingFloor));
 }
 
 // WORK_UNIT_CASE: 608/49
@@ -2721,7 +2729,10 @@ fn reversible_omission_carries_exact_identity_reason_decision_expansion() {
     assert_eq!(expansion.handle_id, id("handle-optional"));
     assert_eq!(expansion.atom_id, id("optional"));
     assert_eq!(expansion.decision, input.recipe.decision);
-    assert_eq!(omission.task_revision, TaskRevision::new(1).expect("revision"));
+    assert_eq!(
+        omission.task_revision,
+        TaskRevision::new(1).expect("revision")
+    );
     result.validate_for(&input).expect("result conservation");
 }
 
@@ -2840,15 +2851,14 @@ fn removing_optional_material_keeps_floor_valid() {
     let full_result = admit_context(&full).expect("full admission");
     let full_floor = admitted_ids(complete_set(&full_result))
         .into_iter()
-        .filter(|atom| {
-            full.floor.floor.mandatory_atoms.contains(atom)
-        })
+        .filter(|atom| full.floor.floor.mandatory_atoms.contains(atom))
         .collect::<Vec<_>>();
 
     let mut reduced = full.clone();
-    reduced.candidates.candidates.retain(|candidate| {
-        candidate.atom_id != id("optional")
-    });
+    reduced
+        .candidates
+        .candidates
+        .retain(|candidate| candidate.atom_id != id("optional"));
     reduced
         .measurements
         .retain(|item| item.atom_id != id("optional"));
@@ -2888,7 +2898,8 @@ fn malformed_inputs_are_panic_free_and_permutations_deterministic() {
     duplicated.candidates.candidates.push(repeated);
     assert!(admit_context(&duplicated).is_err());
 
-    let mut foreign_digest = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let mut foreign_digest =
+        input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     foreign_digest.measurements[0].binding.input_digest = "ab".repeat(32);
     assert!(admit_context(&foreign_digest).is_err());
 

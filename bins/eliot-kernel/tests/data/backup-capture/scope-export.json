@@ -1,0 +1,26 @@
+{
+  "backup_id": "capture-959-scope",
+  "class": "scope_export",
+  "source_adapter": "kernel-capture-959",
+  "schema_generation": "schema-959",
+  "scope_id": "scope-959-1",
+  "store_generation": "store-959",
+  "lineage": "550e8400-e29b-41d4-a716-446655440000",
+  "capture_times_match": true,
+  "cursors": {
+    "receipt": 0,
+    "event": 1,
+    "outbox": 0
+  },
+  "pending_ops": [],
+  "budgets": {
+    "max_events": 8,
+    "max_bytes": 65536,
+    "max_blobs": 2,
+    "max_artifacts": 4
+  },
+  "cancel_requested": false,
+  "control_reserve_preserved": true,
+  "drift": "none",
+  "expected_state": "complete_scope_export"
+}

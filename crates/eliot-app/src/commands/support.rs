@@ -13,13 +13,6 @@ where
     Ok(())
 }
 
-fn db_report_path(config_path: &Path) -> PathBuf {
-    runtime_root(config_path)
-        .join("reports")
-        .join("db")
-        .join("smoke-latest.md")
-}
-
 fn runtime_root(config_path: &Path) -> PathBuf {
     let resolved = if config_path.is_absolute() {
         config_path.to_path_buf()

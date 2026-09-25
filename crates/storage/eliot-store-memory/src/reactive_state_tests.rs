@@ -20,9 +20,10 @@ use eliot_receipts::EffectClass;
 use eliot_store_api::{
     CanonicalRequestView, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, OperationIdentity, OrderingScopeId, PreparedTransition, RequestMeta,
-    ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt, canonical_request_hash,
-    operation_manifest_set_digest, reactive_ledger_mutation_request, reactive_ledger_read_request,
-    resource_snapshot_mutation_request, resource_snapshot_read_request,
+    ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt, bind_issue18_digests,
+    canonical_request_hash, operation_manifest_set_digest, reactive_ledger_mutation_request,
+    reactive_ledger_read_request, resource_snapshot_mutation_request,
+    resource_snapshot_read_request,
 };
 use serde_json::{Value, json};
 
@@ -90,6 +91,11 @@ fn transition_with(
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: "c".repeat(64),
         operation_manifest_digest: manifest_digest,
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; no semantic source is bound here (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation,
             parameters,
@@ -102,6 +108,7 @@ fn transition_with(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
     let view = CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]);
     transition.identity.canonical_request_hash =
         canonical_request_hash(&view).expect("hash computes");

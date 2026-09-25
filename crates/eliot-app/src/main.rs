@@ -7,7 +7,9 @@ mod cognitive_runner;
 mod commands;
 mod config;
 mod delegation_runtime;
+mod disposition;
 mod dogfood;
+mod front_door_cutover;
 mod host_runtime;
 mod mcp_stdio;
 mod named_pipe_ipc;
@@ -21,6 +23,7 @@ mod windows_service;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use disposition::run_facade_disposition_guards;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -594,7 +597,6 @@ enum DbCommand {
     Start,
     Stop,
     Status,
-    Smoke,
     Migrate,
 }
 
@@ -2032,6 +2034,8 @@ fn main() -> Result<()> {
         .stack_size(32 * 1024 * 1024)
         .spawn(move || -> Result<()> {
             init_tracing();
+            run_facade_disposition_guards()
+                .map_err(|reason| anyhow::anyhow!("facade disposition guard failed: {reason}"))?;
             let cli = Cli::parse();
             let (config, implicit_instance) = match cli.config {
                 Some(config) => (config, None),
@@ -2118,6 +2122,10 @@ async fn dispatch_command(
                 force,
             } => commands::run_daemon_init_default(config, &source_config, force),
             DaemonCommand::Run { instance } => {
+                // #1858 step 1': `daemon run` is the retained shared runtime for
+                // the hosts that have not cut over (codex/opencode/claude-desktop
+                // per #1719). The front-door gate intentionally does not cover it;
+                // refusing here would break those retained paths.
                 commands::run_daemon(
                     config,
                     selected_instance(instance, implicit_instance).as_deref(),
@@ -2190,7 +2198,6 @@ async fn dispatch_command(
             DbCommand::Start => commands::run_db_start(config).await,
             DbCommand::Stop => commands::run_db_stop(config).await,
             DbCommand::Status => commands::run_db_status(config).await,
-            DbCommand::Smoke => commands::run_db_smoke(config).await,
             DbCommand::Migrate => commands::run_db_migrate(config).await,
         },
         Command::Writer { command } => match command {
@@ -2436,7 +2443,12 @@ async fn dispatch_command(
         Command::Logs { command } => dispatch_logs_command(config, command),
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
         Command::Verifier { command } => dispatch_verifier_command(config, command).await,
-        Command::Hook { command } => dispatch_hook_command(config, command),
+        Command::Hook { command } => {
+            // #1858 step 1': hook arms are the retained plugin-lifecycle path.
+            // The front-door gate intentionally does not apply here; hook cutover
+            // is owned by #1719/#13. See front_door_cutover disposition docs.
+            dispatch_hook_command(config, command)
+        }
         Command::Mcp {
             command:
                 McpCommand::Stdio {
@@ -2445,6 +2457,23 @@ async fn dispatch_command(
                     instance,
                 },
         } => {
+            // #1858 (I19.5, I19.10): once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge
+            // selects the new stack, the retired `claude` host edge refuses
+            // with a stable cutover code plus the canonical-route receipt.
+            // The refusal precedes ensure_daemon_ready, so a cut-over
+            // invocation never auto-launches the daemon, starts a store, or
+            // constructs a ControlWal/WriterActor. Remaining hosts proceed on
+            // the retained legacy path while their cutover is pending.
+            if let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
+                "eliot-governor mcp stdio",
+                host.as_deref(),
+            ) {
+                front_door_cutover::write_cutover_rejection(
+                    front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                    &detail,
+                );
+                return Err(anyhow::anyhow!(detail));
+            }
             mcp_stdio::run(
                 config,
                 &profile,

@@ -5,7 +5,7 @@ Native WinUI 3 operator client for the existing ELIOT Governor. It is a thin ren
 Pinned toolchain:
 
 - .NET 10 SDK, x64
-- `Microsoft.WindowsAppSDK` `2.2.0` stable
+- `Microsoft.WindowsAppSDK` `2.3.1` stable (see `Eliot.Operator.csproj` and `packages.lock.json`)
 - unpackaged, self-contained `win-x64`
 
 Build and verify with the installed x64 .NET SDK `10.0.302`:

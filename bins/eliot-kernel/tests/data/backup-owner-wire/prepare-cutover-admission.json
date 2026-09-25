@@ -1,0 +1,13 @@
+{
+  "description": "Prepare and cutover admissions live in separate domains (issue #962). Cross-domain presentation refuses; cutover additionally never follows rehearsal.",
+  "prepare_admission": {
+    "domain": "prepare",
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "cutover_admission": {
+    "domain": "cutover",
+    "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "cross_use_verdict": "rejected",
+  "rehearsal_proves_cutover": false
+}

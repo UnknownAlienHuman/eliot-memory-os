@@ -25,8 +25,18 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::{Path, PathBuf};
+
+use eliot_bootstrap::capture::observe_workspace_instance;
 use eliot_contracts::StateFence;
+use eliot_governor::{
+    GenerationEvidence, GoverningSourceSet, PrivacyProfile, ScopeBinding,
+    ScopeRelocationOrAttachReceipt, TaskScopeOutcome, WorkScopeBindingOwner, WorkScopeDescriptor,
+    WorkspaceInstanceIdentity, check_task_observation, derive_observed_resources,
+    produce_attach_receipt,
+};
 use eliot_observation::TaskSelectionEvidence;
+use eliot_security_contracts::PrivacyClass;
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -241,6 +251,287 @@ pub fn admit_task_bound(
             "task selection is incompatible with the target WorkScope",
         )),
     }
+}
+
+/// Admits one task-relative transition with observed workspace identity.
+///
+/// Extends [`admit_task_bound`] with the scope-identity legs for the first
+/// tool-event trigger: the evidence's `WorkScope` claim is checked against
+/// the retained Governor binding (`expected`) and the host-observed workspace
+/// instance and generation. A mismatching checkout fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` naming the exact disposition
+/// (`DIFFERENT_INSTANCE`, `AMBIGUOUS`, or `STALE_BINDING`); the retained
+/// binding, task state, and project memory are untouched. When the
+/// observation agrees, the existing alias, fence, and compatibility checks
+/// run unchanged. Lineage is enforced on lineage-observing paths, not here:
+/// the daemon edge does not observe it.
+///
+/// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "admission joins the retained binding, live observation, fence, and compatibility in one edge"
+)]
+pub fn admit_task_bound_with_observed_scope(
+    selection: Option<&TaskSelectionEvidence>,
+    expected_task_ref: &str,
+    expected: &ScopeBinding,
+    observed_instance: &WorkspaceInstanceIdentity,
+    observed_generation: &GenerationEvidence,
+    expected_fence: &StateFence,
+    compatibility: CompatibilityDisposition,
+) -> Result<(), TaskBindingError> {
+    let Some(evidence) = selection else {
+        return admit_task_bound(
+            None,
+            expected_task_ref,
+            &expected.scope.scope_ref,
+            expected_fence,
+            compatibility,
+        );
+    };
+    let check = check_task_observation(
+        expected,
+        &evidence.work_scope_ref,
+        observed_instance,
+        observed_generation,
+    );
+    match check.outcome {
+        TaskScopeOutcome::Clear => {}
+        TaskScopeOutcome::DifferentInstance
+        | TaskScopeOutcome::Ambiguous
+        | TaskScopeOutcome::StaleBinding => {
+            return Err(TaskBindingError::scope_incompatible(format!(
+                "task observation scope identity check {:?}: {}",
+                check.outcome, check.detail
+            )));
+        }
+    }
+    admit_task_bound(
+        selection,
+        expected_task_ref,
+        &expected.scope.scope_ref,
+        expected_fence,
+        compatibility,
+    )
+}
+
+/// Observes one explicit workspace root and admits one task-relative
+/// transition against the live observation.
+///
+/// This is the daemon trigger ingress for scope identity: absent selection
+/// stays on the cold path with no observation performed, while a present
+/// selection observes the explicit root mechanically (filesystem/VCS/project
+/// facts, never invented), derives the observed instance and generation, and
+/// admits only through [`admit_task_bound_with_observed_scope`]. A root that
+/// cannot be observed, or an observation that disagrees with the retained
+/// binding, fails closed with `TASK_SCOPE_INCOMPATIBLE`; the retained
+/// binding, task state, and project memory are untouched. The root is always
+/// explicit — the daemon never infers a workspace from cwd, proximity, or
+/// recency.
+///
+/// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+pub fn observe_and_admit_task(
+    workspace_root: &Path,
+    selection: Option<&TaskSelectionEvidence>,
+    expected_task_ref: &str,
+    expected: &ScopeBinding,
+    expected_fence: &StateFence,
+    compatibility: CompatibilityDisposition,
+) -> Result<(), TaskBindingError> {
+    if selection.is_none() {
+        return admit_task_bound(
+            None,
+            expected_task_ref,
+            &expected.scope.scope_ref,
+            expected_fence,
+            compatibility,
+        );
+    }
+    let facts = observe_workspace_instance(workspace_root).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
+    })?;
+    let observed = derive_observed_resources(&facts, expected_fence.resource_generation, None)
+        .map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "observed workspace resources invalid: {error}"
+            ))
+        })?;
+    let instance = observed.instances.first().ok_or_else(|| {
+        TaskBindingError::scope_incompatible("observed workspace has no instance".to_owned())
+    })?;
+    admit_task_bound_with_observed_scope(
+        selection,
+        expected_task_ref,
+        expected,
+        instance,
+        &observed.generation,
+        expected_fence,
+        compatibility,
+    )
+}
+
+/// Authenticated attach ingress payload assembled from owned evidence.
+///
+/// The attach trigger builds exactly one of these per attach attempt from
+/// evidence it already owns — never inferred from the activation ticket
+/// (correlation-only by contract), the current directory, proximity, or
+/// recency:
+///
+/// - `explicit_root`: the explicit host/session workspace path the trigger
+///   was asked to attach (absolute; observed live, never a display name);
+/// - `receipt_ref`: fresh bounded receipt identity minted per attempt;
+/// - `descriptor`: the retained scope description the trigger resolves from
+///   the onboarding path (the producer requires it to describe the live
+///   owner binding on every identity field);
+/// - `authorizing_ref`: the authenticated session/host authorization evidence
+///   reference (the explicit Human/host binding token or session attach
+///   record the trigger authenticated through owned IPC/session state) — a
+///   reference only; the producer enforces non-blank, the trigger owns the
+///   authentication;
+/// - `privacy_class`, `governing_source_generation`, `sources`, `privacy`:
+///   the scope's admitted privacy class and the onboarding-retained source
+///   closure that authenticates the observed instance;
+/// - `owner_revision`: caller-sequenced durable revision for the admitted
+///   owner (same convention as the sibling admission entries).
+///
+/// [`ScopeAttachIngress::validate`] checks shape only: it never authenticates
+/// the scope, the lineage, or the authorization — the live owner read at the
+/// fence, the `MATCHED` guard, and the source closure inside
+/// `GovernorComposition::admit_observed_scope_attach` do. Call sequence:
+/// `validate`, then `observe_workspace_instance` on `explicit_root`,
+/// `derive_observed_resources` at the admission fence generation, then
+/// `GovernorComposition::admit_observed_scope_attach` with every field below.
+///
+/// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+#[derive(Clone, Debug)]
+pub struct ScopeAttachIngress {
+    /// Explicit absolute workspace root to observe live and attach.
+    pub explicit_root: PathBuf,
+    /// Fresh bounded receipt identity minted per attempt.
+    pub receipt_ref: String,
+    /// Retained scope description the observed instance attaches to.
+    pub descriptor: WorkScopeDescriptor,
+    /// Trigger-authenticated session/host authorization evidence reference.
+    pub authorizing_ref: String,
+    /// Admitted privacy class for the new binding.
+    pub privacy_class: PrivacyClass,
+    /// Source generation the onboarding closure authenticates.
+    pub governing_source_generation: u64,
+    /// Onboarding-retained governing sources for the observed instance.
+    pub sources: GoverningSourceSet,
+    /// Privacy boundary the new binding must satisfy.
+    pub privacy: PrivacyProfile,
+    /// Caller-sequenced durable revision for the admitted owner.
+    pub owner_revision: u64,
+}
+
+impl ScopeAttachIngress {
+    /// Validates the payload shape without authenticating anything.
+    ///
+    /// Malformed caller fields (blank references, zero counters) fail as
+    /// `TASK_SELECTION_REQUIRED`; scope-identity disagreements (a descriptor
+    /// that does not validate, a privacy class outside the admitted
+    /// boundary) fail as `TASK_SCOPE_INCOMPATIBLE`. A non-absolute root
+    /// fails as incompatible: only an explicit absolute path may be
+    /// observed. The governing source set itself is checked at admission
+    /// against the observed scope, never here.
+    pub fn validate(&self) -> Result<(), TaskBindingError> {
+        if !self.explicit_root.is_absolute() {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress explicit_root must be absolute",
+            ));
+        }
+        if self.receipt_ref.trim().is_empty() || self.receipt_ref.chars().any(char::is_control) {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress receipt_ref is blank",
+            ));
+        }
+        if self.authorizing_ref.trim().is_empty()
+            || self.authorizing_ref.chars().any(char::is_control)
+        {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress authorizing_ref is blank",
+            ));
+        }
+        if self.governing_source_generation == 0 {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress governing_source_generation is zero",
+            ));
+        }
+        if self.owner_revision == 0 {
+            return Err(TaskBindingError::selection_required(
+                "attach ingress owner_revision is zero",
+            ));
+        }
+        self.descriptor.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress descriptor invalid: {error}"
+            ))
+        })?;
+        self.privacy.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress privacy boundary invalid: {error}"
+            ))
+        })?;
+        if !self.privacy.admits(self.privacy_class) {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress privacy class is outside the admitted boundary",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Observes one explicit workspace root and produces an authorized attach
+/// receipt for the newly observed instance.
+///
+/// This is the daemon trigger ingress for scope attach: the explicit root is
+/// observed mechanically (filesystem/VCS/project facts, never invented), the
+/// observation is derived at the admission fence generation through the same
+/// `derive_observed_resources` the CLI scope-observe ingress runs, and the
+/// owner-issued attach receipt is produced from that live observation, the
+/// retained descriptor and owner, and the explicit authorization reference. A
+/// root that cannot be observed, or an observation that is not exactly one
+/// new same-lineage instance of the bound scope, fails closed with
+/// `TASK_SCOPE_INCOMPATIBLE` carrying the exact producer detail; the retained
+/// binding, task state, and project memory are untouched.
+///
+/// The returned receipt binds nothing by itself: admission runs in the owning
+/// caller through the Governor relocation entry (`admit_scope_relocation`),
+/// which rebinds with the receipt and requires a fresh `MATCHED`
+/// source-closure check for the observed instance. The root is always
+/// explicit — the daemon never infers a workspace from cwd, proximity, or
+/// recency.
+///
+/// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+pub fn observe_and_produce_attach_receipt(
+    workspace_root: &Path,
+    receipt_ref: &str,
+    descriptor: &WorkScopeDescriptor,
+    owner: &WorkScopeBindingOwner,
+    authorizing_ref: &str,
+    fence: &StateFence,
+) -> Result<ScopeRelocationOrAttachReceipt, TaskBindingError> {
+    let facts = observe_workspace_instance(workspace_root).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("workspace observation failed: {error}"))
+    })?;
+    let observed =
+        derive_observed_resources(&facts, fence.resource_generation, None).map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "observed workspace resources invalid: {error}"
+            ))
+        })?;
+    produce_attach_receipt(
+        receipt_ref,
+        descriptor,
+        owner,
+        &observed,
+        authorizing_ref,
+        fence,
+    )
+    .map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("attach receipt production failed: {error}"))
+    })
 }
 
 #[cfg(test)]

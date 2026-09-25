@@ -11,6 +11,11 @@ Closed dispositions (exactly one per candidate row):
   current-closed | named-legacy | exact-internal | specific-owner |
   needs-repair | unknown
 
+Every row also carries a machine-typed refusal (what a future decoder repair
+must refuse before admission, derived from scanned shape and disposition;
+never a numeric bound) and the frozen fixture identities exhibiting the
+row's own shape (never invented).
+
 Repair readiness, inventory coverage and safety are independent: a known
 unsafe decoder with a complete accepted allocation is READY_FOR_REPAIR but
 never safe; missing owner/contract/profile blocks dispatch without blocking
@@ -247,6 +252,21 @@ BRIDGE_CORPUS_CASES = 32
 BRIDGE_ACCEPTANCE_REL = "scripts/testdata/serde-boundary-inventory/bridge_profile_acceptance.json"
 LEGACY_RECORD_REL = "crates/eliot-store/src/canonical_record.rs"
 MCP_SPECIFIC_OWNER_REL = "crates/eliot-types/src/mcp_contract.rs"
+
+# Frozen fixture identities (scripts/testdata/serde-boundary-inventory/).
+# Rows bind only fixtures exhibiting the row's own scanned shape; the set is
+# fixed and every entry must exist (see the freeze test in case 1 setup).
+FIXTURE_PREFIX = "scripts/testdata/serde-boundary-inventory/"
+FIXTURE_DERIVE_BASIC = FIXTURE_PREFIX + "derive_basic.rs"
+FIXTURE_DERIVE_MULTILINE = FIXTURE_PREFIX + "derive_multiline.rs"
+FIXTURE_CUSTOM_REMOTE = FIXTURE_PREFIX + "custom_remote.rs"
+FIXTURE_SHAPES = FIXTURE_PREFIX + "shapes.rs"
+FIXTURE_VALUE_CONVERSION = FIXTURE_PREFIX + "value_conversion.rs"
+FIXTURE_COMMENTS_STRINGS = FIXTURE_PREFIX + "comments_strings.rs"
+FIXTURE_UNSUPPORTED = FIXTURE_PREFIX + "unsupported.rs"
+FIXTURE_TEST_SCOPE = FIXTURE_PREFIX + "test_scope.rs"
+FIXTURE_PROFILE_BRIDGE = FIXTURE_PREFIX + "profile_bridge.json"
+FIXTURE_BRIDGE_ACCEPTANCE = FIXTURE_PREFIX + "bridge_profile_acceptance.json"
 
 ALLOWED_COMMANDS = (
     ("git", "ls-files"),
@@ -1391,6 +1411,77 @@ def _child_for_rel(rel: str) -> str:
     return ""
 
 
+def _fixture_binding(cand: dict) -> list[str]:
+    """Bind frozen fixture identities exhibiting the row's own scanned shape.
+
+    Pure evidence linkage from the candidate's kind/attributes/path/test
+    scope; never invents limits, owners, or numeric thresholds. A row with no
+    matching frozen shape binds nothing rather than an invented fixture.
+    """
+    rel: str = cand["path"]
+    kind: str = cand["kind"]
+    attrs: dict = cand["attributes"]
+    bound: set[str] = set()
+    if kind in ("unreadable-source", "unsupported-macro"):
+        bound.add(FIXTURE_UNSUPPORTED)
+    if cand.get("test_scope"):
+        bound.add(FIXTURE_TEST_SCOPE)
+    is_bridge = rel.startswith("bins/eliot-agent-bridge/src/")
+    if is_bridge:
+        bound.add(FIXTURE_PROFILE_BRIDGE)
+        bound.add(FIXTURE_BRIDGE_ACCEPTANCE)
+    if attrs.get("remote") or attrs.get("with") or attrs.get("deserialize_with"):
+        bound.add(FIXTURE_CUSTOM_REMOTE)
+    if attrs.get("tag") or attrs.get("untagged") or attrs.get("flatten") or attrs.get("alias") or attrs.get("default"):
+        bound.add(FIXTURE_SHAPES)
+    if cand.get("value_routing"):
+        bound.add(FIXTURE_VALUE_CONVERSION)
+    if kind == "decoder-callsite" and not is_bridge:
+        bound.add(FIXTURE_VALUE_CONVERSION)
+    if kind in ("visitor", "manual-impl"):
+        bound.add(FIXTURE_DERIVE_MULTILINE)
+    if kind == "derive":
+        if attrs.get("deny_unknown_fields"):
+            bound.add(FIXTURE_DERIVE_BASIC)
+        else:
+            bound.add(FIXTURE_SHAPES)
+    return sorted(bound)
+
+
+def _refusal_typing(cand: dict, verdict: dict) -> str:
+    """Machine-typed refusal for the row: what a future decoder repair must
+    refuse before admission. Derived from the scanned kind/attributes and the
+    assigned disposition only, mirroring the _classify branch order; never a
+    numeric bound and never an invented owner. Unowned/unknown rows refuse on
+    the exact allocation row as evidence (owner + BLOCKED reason stay bound).
+    """
+    disposition: str = verdict["disposition"]
+    kind: str = cand["kind"]
+    attrs: dict = cand["attributes"]
+    if disposition == "unknown":
+        return "refuse-admission:unparseable-evidence"
+    if disposition == "exact-internal":
+        return "none:test-scope-no-shipped-acquisition"
+    if disposition == "specific-owner":
+        return "none:owner-closure-proof-required"
+    if disposition == "named-legacy":
+        return "none:legacy-precedence-proof-required"
+    if disposition == "current-closed":
+        return "none:strict-shape-no-bypass"
+    if verdict.get("owner") == "#977":
+        return "refuse-dispatch-before-bounded-acquisition"
+    shapes = [s for s in ("flatten", "untagged", "alias") if attrs.get(s)]
+    if kind == "visitor" or kind == "manual-impl":
+        return "refuse-bypass-admission:manual-visitor"
+    if shapes:
+        return "refuse-bypass-admission:" + "+".join(sorted(shapes))
+    if cand.get("value_routing"):
+        return "refuse-unvalidated-value-conversion"
+    if not attrs.get("deny_unknown_fields"):
+        return "refuse-unknown-fields"
+    return "refuse-unowned-admission"
+
+
 def _classify(row: dict, profile: dict, legacy: dict) -> dict:
     """Assign exactly one disposition plus ownership/readiness (first match wins)."""
     rel: str = row["path"]
@@ -1733,7 +1824,8 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
             "canonical_impact": verdict["canonical_impact"],
             "schema_class": verdict["schema_class"],
             "evidence": cand["evidence"],
-            "fixtures": [],
+            "refusal": _refusal_typing(cand, verdict),
+            "fixtures": _fixture_binding(cand),
         }
         rows.append(row)
     rows.sort(key=lambda r: r["id"])
@@ -2069,6 +2161,7 @@ def _render_toml(inventory: dict) -> bytes:
         lines.append("schema_class = %s" % _escape_toml_str(str(row["schema_class"])))
         lines.append("canonical_impact = %s" % _escape_toml_str(str(row["canonical_impact"])))
         lines.append("limit_binding = %s" % _escape_toml_str(str(row["limit_binding"])))
+        lines.append("refusal = %s" % _escape_toml_str(str(row["refusal"])))
         lines.append("invalidation = %s" % _escape_toml_str(str(row["invalidation"])))
         lines.append("evidence = %s" % _escape_toml_str(str(row["evidence"])))
         attrs = row["attributes"]

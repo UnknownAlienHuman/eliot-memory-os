@@ -7,12 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+mod architecture;
 mod error;
-mod projection;
 mod synthesis;
 
+pub use architecture::{ArchitectureBriefProjection, project_architecture_brief};
 pub use error::ArchitectureBriefError;
-pub use projection::{ArchitectureBriefProjection, project_architecture_brief};
 pub use synthesis::{
     DataAvailability, ModelSynthesis, MonetaryCostAvailability, RivalModels, RouteAvailability,
     RouteCostEnvelope,

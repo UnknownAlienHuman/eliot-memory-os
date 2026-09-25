@@ -129,6 +129,13 @@ fn receipt_for(operation: &str) -> eliot_store_api::WriteReceipt {
             "manifest-runner-1873x",
         )
         .expect("manifest"),
+        // Standalone-fixture issue-#18 values (not bound to a transition):
+        // this seed only exercises restore-runner retention, never digest
+        // bindings. Shapes stay valid so `validate()` reaches the behavior
+        // under test.
+        admission_digest: "e".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: eliot_store_api::Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -445,4 +452,68 @@ fn runner_refuses_stale_lineage_before_any_effect() {
     );
     // No phase ran: the journal has no completed record and no phase receipts.
     assert!(!root.path().join("phase-receipts").exists());
+}
+
+// WORK_UNIT_CASE: 1873x/runtime-non-active (issue #1873 A4)
+#[test]
+fn restore_leaves_runtime_state_non_active_without_owner_receipts() {
+    let bundle = BackupBundle::build(full_input()).expect("full bundle builds");
+    let manifest = key_manifest();
+    let root = IsolatedRoot::create("runtime-nonactive-1873x").expect("isolated root creates");
+    let outcome = execute_isolated_restore(
+        &bundle,
+        target_context(),
+        epoch(2),
+        ResourceGeneration::new(2).expect("generation"),
+        &root,
+        Some(&manifest),
+    )
+    .expect("isolated run completes");
+    // No active authority is restored (I05-13 restore: no active
+    // SessionBinding, user-broker registration, `UserBrokerEpoch`, launch
+    // lease or route continuation as current authority).
+    assert!(!outcome.evidence.active_authority_restored);
+    // No session/broker/lease/route artifacts beyond suspended-recovery evidence.
+    let mut offending = Vec::new();
+    let mut stack = vec![outcome.root.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).expect("isolated root reads");
+        for entry in entries {
+            let entry = entry.expect("dir entry reads");
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let path = entry.path();
+            let is_runtime = name.contains("session")
+                || name.contains("broker")
+                || name.contains("lease")
+                || name.contains("route");
+            if path.is_dir() {
+                if is_runtime {
+                    offending.push(path.clone());
+                }
+                stack.push(path);
+            } else if is_runtime && name != "suspended_ors.json" {
+                offending.push(path.clone());
+            }
+        }
+    }
+    assert!(
+        offending.is_empty(),
+        "runtime artifacts must stay non-active: {offending:?}"
+    );
+    // Runtime obligations stay not-satisfied without exact owner receipts
+    // (never self-attested `Satisfied` by this runner).
+    let obligations = &outcome.evidence.obligations;
+    for state in [
+        obligations.runtime_invalidation.state,
+        obligations.session_invalidation.state,
+        obligations.lease_invalidation.state,
+        obligations.route_invalidation.state,
+    ] {
+        assert_ne!(
+            state,
+            eliot_backup::RestoreObligationState::Satisfied,
+            "runtime/session/lease/route must not be self-attested"
+        );
+    }
+    assert!(!obligations.all_satisfied(), "exact-owner receipts absent");
 }

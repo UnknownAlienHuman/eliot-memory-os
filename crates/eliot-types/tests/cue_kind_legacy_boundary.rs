@@ -206,6 +206,15 @@ fn consume_char_or_lifetime(bytes: &[u8], index: usize, out: &mut String) -> usi
         return cursor;
     }
     let start = cursor;
+    // Double-quote character literal (`'"'`): the inner quote must not
+    // open a string, or every later quote toggles phantom string state
+    // and real string contents leak back as code.
+    if bytes.get(cursor) == Some(&b'"') && bytes.get(cursor + 1) == Some(&b'\'') {
+        for _ in index..cursor + 2 {
+            out.push(' ');
+        }
+        return cursor + 2;
+    }
     while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') {
         cursor += 1;
     }
@@ -561,6 +570,127 @@ fn scan_files(dirs: &[&str], needle: &str) -> Result<Vec<String>, Box<dyn std::e
     Ok(hits)
 }
 
+/// Scans stripped code for a whole-word `enum <name>` declaration.
+///
+/// String literals, comments, and longer identifiers never match: only a
+/// real enum declaration with a non-identifier boundary after the name
+/// counts. Fixture text that legitimately spells definitions (boundary
+/// oracle data, classifier unit snippets) stays invisible to duplicate
+/// detection without weakening it: a real new definition still trips it.
+fn scan_enum_definitions(
+    dirs: &[&str],
+    enum_name: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let mut hits = Vec::new();
+    for dir in dirs {
+        let candidate = root.join(dir);
+        if candidate.is_dir() {
+            collect_enum_definitions(&candidate, enum_name, &mut hits)?;
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    Ok(hits)
+}
+
+/// Whether stripped code declares `enum <name>` as a real definition.
+///
+/// Both token boundaries hold on both sides: the `enum` keyword itself
+/// must start and end on a boundary (longer identifiers such as
+/// `myenum` or `enumCueKind` never match), all Rust whitespace forms
+/// may separate it from the name (space, tab, newline), and an `r#`
+/// raw-identifier prefix on the name still counts as a declaration of
+/// that name. A raw `r#enum` token is an identifier, never a keyword,
+/// and is skipped explicitly. Longer names on either side never match.
+/// Anything else where the target name is involved but unparseable
+/// (bare `enum` at end of input, unexpected punctuation) fails closed
+/// as a hit so unknown syntax never silently passes; other identifiers
+/// are affirmative non-matches.
+fn declares_enum(stripped: &str, name: &str) -> bool {
+    fn is_ident(cell: u8) -> bool {
+        cell.is_ascii_alphanumeric() || cell == b'_'
+    }
+    let bytes = stripped.as_bytes();
+    let mut index = 0;
+    while index + 4 <= bytes.len() {
+        if &bytes[index..index + 4] == b"enum"
+            && (index == 0 || !is_ident(bytes[index - 1]))
+            && !is_raw_enum_token(bytes, index)
+        {
+            let mut cursor = index + 4;
+            if cursor < bytes.len() && is_ident(bytes[cursor]) {
+                // The keyword never ends here (`enumCueKind` is one
+                // ordinary identifier): not a declaration.
+                index += 1;
+                continue;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if bytes.get(cursor..cursor + 2) == Some(b"r#") {
+                cursor += 2;
+            }
+            if bytes
+                .get(cursor..)
+                .is_some_and(|rest| rest.starts_with(name.as_bytes()))
+            {
+                let after = cursor + name.len();
+                if after >= bytes.len() || !is_ident(bytes[after]) {
+                    return true;
+                }
+                index = after;
+                continue;
+            }
+            if cursor >= bytes.len() {
+                return true;
+            }
+            let cell = bytes[cursor];
+            if !(cell.is_ascii_alphabetic() || cell == b'_') {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Whether `enum` at `index` is really a raw `r#enum` identifier token.
+///
+/// `r#` can only prefix non-strict keywords, so `r#enum` never declares;
+/// it is an identifier and must not enter keyword handling. Anything
+/// else (including a `#` from an attribute fragment) is not this token.
+fn is_raw_enum_token(bytes: &[u8], index: usize) -> bool {
+    index >= 2 && bytes[index - 2] == b'r' && bytes[index - 1] == b'#'
+}
+
+fn collect_enum_definitions(
+    root: &Path,
+    enum_name: &str,
+    hits: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = std::fs::read_dir(root).map_err(boxed)?;
+    for entry in entries {
+        let entry = entry.map_err(boxed)?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_enum_definitions(&path, enum_name, hits)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let text = std::fs::read_to_string(&path).map_err(boxed)?;
+            let stripped = strip_code(&text);
+            if declares_enum(&stripped, enum_name) {
+                let relative = path
+                    .strip_prefix(workspace_root()?)
+                    .map_err(boxed)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                hits.push(relative);
+            }
+        }
+    }
+    Ok(())
+}
+
 const LEGACY_DIRS: [&str; 5] = [
     "crates/eliot-types",
     "crates/eliot-app",
@@ -909,10 +1039,10 @@ fn case_11_no_production_alias_use() -> TestResult {
         }
     }
     assert_eq!(
-        bare, 1,
-        "only the frozen alias definition may name bare CueKind"
+        bare, 0,
+        "retired alias must leave no bare CueKind use in production code"
     );
-    assert!(prod.contains("pub type CueKind = LegacyCueKindV1;"));
+    assert!(!prod.contains("pub type CueKind = LegacyCueKindV1;"));
     Ok(())
 }
 
@@ -920,7 +1050,7 @@ fn case_11_no_production_alias_use() -> TestResult {
 #[test]
 fn case_12_at_most_one_transitional_alias() -> TestResult {
     let prod = production_code()?;
-    assert_eq!(prod.matches("type CueKind").count(), 1);
+    assert_eq!(prod.matches("type CueKind").count(), 0);
     Ok(())
 }
 
@@ -928,20 +1058,14 @@ fn case_12_at_most_one_transitional_alias() -> TestResult {
 #[test]
 fn case_13_alias_names_migrations_and_removal() -> TestResult {
     let source = cue_rs_source()?;
-    let marker = "note = \"";
-    let start = source
-        .find(marker)
-        .ok_or_else(|| boxed(std::io::Error::other("deprecated note missing")))?
-        + marker.len();
-    let rest = &source[start..];
-    let end = rest
-        .find('"')
-        .ok_or_else(|| boxed(std::io::Error::other("deprecated note unterminated")))?;
-    let note = &rest[..end];
-    for issue in ["#831", "#832", "#833", "#834", "#835"] {
-        assert!(note.contains(issue), "alias note omits {issue}");
-    }
-    assert!(note.contains("removal"), "alias note omits removal");
+    assert!(
+        !source.contains("pub type CueKind"),
+        "transitional alias definition still present"
+    );
+    assert!(
+        !source.contains("#[deprecated"),
+        "transitional deprecation still present in cue.rs"
+    );
     Ok(())
 }
 
@@ -949,7 +1073,7 @@ fn case_13_alias_names_migrations_and_removal() -> TestResult {
 #[test]
 fn case_14_alias_adds_no_alternate_wire() -> TestResult {
     let prod = production_code()?;
-    assert!(prod.contains("pub type CueKind = LegacyCueKindV1;"));
+    assert!(!prod.contains("pub type CueKind = LegacyCueKindV1;"));
     assert!(!prod.contains("impl CueKind"));
     let schema = schemars::schema_for!(LegacyCueKindV1);
     let schema_value = serde_json::to_value(&schema).map_err(boxed)?;
@@ -1230,7 +1354,11 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
     let inventory = read_workspace(
         "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
     )?;
-    assert!(inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind"));
+    assert!(inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:LegacyCueKindV1"));
+    assert!(
+        !inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind\""),
+        "stale bare-name inventory row for the renamed V1 seam"
+    );
     Ok(())
 }
 
@@ -1320,15 +1448,41 @@ fn case_28_new_duplicate_fails() -> TestResult {
     let def_needle = ["enum", "CueKind"].join(" ");
     let synthetic = ["pub ", &def_needle, " {\n    FilePath,\n}\n"].concat();
     assert_eq!(matched_lines(&synthetic, &def_needle).len(), 1);
-    let live = scan_files(
+    // The live scan shares declares_enum: pin its lexical boundaries on
+    // synthetic inputs (stripped exactly like live files).
+    assert!(declares_enum(
+        &strip_code("pub enum CueKind {\n"),
+        "CueKind"
+    ));
+    assert!(declares_enum(&strip_code("enum\nCueKind {\n"), "CueKind"));
+    assert!(declares_enum(&strip_code("enum\tCueKind {\n"), "CueKind"));
+    assert!(declares_enum(&strip_code("enum r#CueKind {}\n"), "CueKind"));
+    assert!(!declares_enum(&strip_code("// enum CueKind\n"), "CueKind"));
+    assert!(!declares_enum(
+        &strip_code("let s = \"enum CueKind\";\n"),
+        "CueKind"
+    ));
+    assert!(!declares_enum(
+        &strip_code("enum CueKindProvenance {}\n"),
+        "CueKind"
+    ));
+    assert!(!declares_enum(
+        &strip_code("myenum CueKind {}\n"),
+        "CueKind"
+    ));
+    assert!(!declares_enum(&strip_code("enumCueKind {}\n"), "CueKind"));
+    assert!(!declares_enum(&strip_code("let r = r#enum;\n"), "CueKind"));
+    assert!(!declares_enum(
+        &strip_code("fn f() { let q = '\"'; }\nlet s = \"enum CueKind\";\n"),
+        "CueKind"
+    ));
+    assert!(declares_enum(&strip_code("enum"), "CueKind"));
+    assert!(declares_enum(&strip_code("enum {\n"), "CueKind"));
+    let live = scan_enum_definitions(
         &["crates/smart", "crates/foundation", "crates/eliot-types"],
-        &def_needle,
+        "CueKind",
     )?;
-    let mut expected = vec![
-        "crates/smart/eliot-context/src/lib.rs".to_owned(),
-        "crates/smart/eliot-cue-contracts/src/normalization.rs".to_owned(),
-        "crates/smart/eliot-cues/src/lib.rs".to_owned(),
-    ];
+    let mut expected = vec!["crates/smart/eliot-cue-contracts/src/normalization.rs".to_owned()];
     expected.sort();
     assert_eq!(live, expected, "new duplicate definition or lost row");
     Ok(())
@@ -1353,8 +1507,7 @@ fn case_29_oracle_detects_forbidden_local_alias_use() -> TestResult {
             hits.push(line.trim().to_owned());
         }
     }
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0], "pub type CueKind = LegacyCueKindV1;");
+    assert_eq!(hits.len(), 0);
     Ok(())
 }
 

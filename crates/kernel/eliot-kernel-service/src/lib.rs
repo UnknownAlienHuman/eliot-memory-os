@@ -29,11 +29,19 @@ mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
+mod lifecycle_persist;
+#[cfg(test)]
+mod lifecycle_persist_tests;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
+mod notify_grant;
+mod owner_history;
 mod process_execution_client;
 mod protocol;
+mod reactive_state;
+#[cfg(test)]
+mod reactive_state_tests;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -41,6 +49,16 @@ mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
 mod testd_front_door;
+mod user_automation;
+mod user_automation_execution;
+mod user_automation_execution_client;
+mod user_automation_failure_history;
+#[cfg(test)]
+mod user_automation_failure_history_tests;
+mod user_automation_store;
+#[cfg(test)]
+mod user_automation_store_tests;
+mod wasm_dispatch;
 mod write_coordinator;
 
 pub use capacity_evidence::{
@@ -65,6 +83,7 @@ pub use doctor_front_door::{
     AuthenticatedDoctorSession, handle_doctor_repair_attempt, handle_doctor_repair_cancellation,
     is_doctor_diagnosis_only_envelope, reconcile_doctor_repair_delivery,
 };
+pub use eliot_kernel_core::user_automation::AutomationExecutionReference;
 pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use eliot_protocol::{
     AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
@@ -74,6 +93,12 @@ pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
+pub use lifecycle_persist::{
+    AuthenticatedLifecycleSession, BuiltLeg, BuiltLegKind, HopMutation, HopMutationInput,
+    LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
+    LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
+    build_persist_transitions, handle_lifecycle_persist_request,
+};
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
     NotificationServiceError, NotificationStateMutation, NotificationStateReadRequest,
@@ -81,17 +106,21 @@ pub use notification_state::{
     handle_notification_state_read, handle_notification_state_request,
     reconcile_notification_state,
 };
+pub use notify_grant::{
+    NOTIFY_GRANT_OPERATION_PREFIX, NOTIFY_IMAGE_FILE_NAME, NotifyGrantInputs,
+    NotifyLaunchAuthorization, bind_notify_launch_grant,
+};
+pub use owner_history::serve_authority_revocation_history;
 pub use process_execution_client::{
     KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,
     ProcessStarterFuture,
 };
 pub use protocol::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
-    AGENT_BRIDGE_MODULE_ID, DAEMON_STARTUP_EVIDENCE_OPERATION,
-    AgentBridgeAdmissionDescriptor, AgentBridgeCallerSessionPolicy,
-    AgentBridgeProcessPolicy, ContainmentAction, DaemonStartupEvidence, EliotdLaunchDescriptor,
-    HostFileIdentity,
-    HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
+    AGENT_BRIDGE_MODULE_ID, AgentBridgeAdmissionDescriptor, AgentBridgeCallerSessionPolicy,
+    AgentBridgeProcessPolicy, ContainmentAction, DAEMON_STARTUP_EVIDENCE_OPERATION,
+    DaemonStartupEvidence, EliotdLaunchDescriptor, HostFileIdentity, HostJobBinding,
+    HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
     HostStartupEvidence, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
     KERNEL_CONTROL_WIRE_ID, KERNEL_CONTROL_WIRE_VERSION, KernelActivationPermit,
     KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
@@ -120,8 +149,15 @@ pub use protocol::{
     StoreBootstrapDescriptor, StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff,
     StoreRebindQuery, StoreRebindReceipt, admit_replay_request, control_request_frame,
     control_response_frame, daemon_capability_registry_digest, decode_control_request_frame,
-    decode_control_response_frame,
-    replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
+    decode_control_response_frame, replay_stream_id, semantic_store_config_hash_from_json,
+    verify_provider_capability,
+};
+pub use reactive_state::{
+    AuthenticatedReactiveSession, ReactiveLedgerReadRequest, ReactiveLedgerReadResponse,
+    ReactiveLedgerRequest, ReactiveLedgerResponse, ReactiveServiceContext, ReactiveServiceError,
+    ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, ResourceSnapshotRequest,
+    ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
+    handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
@@ -147,6 +183,58 @@ pub use testd_front_door::{
     TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
     handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
     reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+};
+pub use user_automation::{
+    USER_AUTOMATION_SERVICE_CONTRACT_NAME, USER_AUTOMATION_SERVICE_CONTRACT_VERSION,
+    UserAutomationMutationResult, UserAutomationReadResult, UserAutomationService,
+    UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
+    UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
+};
+pub use user_automation_execution::{
+    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationFailureHistory, UserAutomationFailureHistoryPort,
+    UserAutomationFailurePublication, UserAutomationFailureRecord,
+    UserAutomationNotificationDelivery, UserAutomationNotificationPort,
+    UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationTarget, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback,
+};
+#[cfg(windows)]
+pub use user_automation_execution_client::AuthenticatedUserAutomationHostExecutionTransport;
+pub use user_automation_execution_client::{
+    USER_AUTOMATION_HOST_EXECUTION_PIPE, USER_AUTOMATION_HOST_EXECUTION_WIRE_ID,
+    USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION, USER_AUTOMATION_KERNEL_CAPABILITY,
+    USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_OPERATION,
+    USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING, USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
+    UserAutomationHostChannelBinding, UserAutomationHostExecutionClient,
+    UserAutomationHostExecutionFailure, UserAutomationHostExecutionOperation,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationHostExecutionSession, UserAutomationHostExecutionTransport,
+    UserAutomationHostOwnerBinding, decode_user_automation_host_execution_open_frame,
+    decode_user_automation_host_execution_open_response_frame,
+    decode_user_automation_host_execution_request_frame,
+    decode_user_automation_host_execution_response_frame,
+    user_automation_host_execution_open_frame, user_automation_host_execution_open_response_frame,
+    user_automation_host_execution_request_frame, user_automation_host_execution_response_frame,
+};
+pub use user_automation_failure_history::{
+    StoreUserAutomationFailureHistory, build_failure_transition,
+};
+pub use user_automation_store::{
+    CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,
+    UserAutomationOwnerReadProvenance, UserAutomationOwnerSnapshot,
+};
+pub use wasm_dispatch::{
+    JoinDeny, WASM_DISPATCH_AUTHORITY_PREFIX, WASM_DISPATCH_DERIVATION_DOMAIN,
+    WASM_DISPATCH_GRANT_WINDOW_MS, WASM_DISPATCH_LAUNCH_GRANT_HEAD, WASM_DISPATCH_MATERIAL_WIRE_ID,
+    WASM_DISPATCH_MATERIAL_WIRE_VERSION, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+    WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, WasmAssuranceRecord,
+    WasmDispatchDerivation, WasmDispatchError, WasmDispatchGrant, WasmDispatchMaterial,
+    WasmGuestCeilings, WasmJoinGate, WasmJoinTable, WasmManifestRecord, WasmOwnerClaim,
+    WasmPromotionRecord, WasmPublishedBundle, WasmSnapshotRecord, WasmWorkRecord, material_bytes,
+    publish_wasm_dispatch_bundle, publish_wasm_dispatch_material, wasm_dispatch_derivation,
+    wasm_dispatch_derivation_from_epoch_json, wasm_dispatch_grant_for, wasm_join_gate,
 };
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,

@@ -120,6 +120,35 @@ pub struct CliConfig {
     pub experimental_typed_component: Option<std::path::PathBuf>,
     /// Explicit frozen world selection for the experimental path.
     pub experimental_world: Option<String>,
+    /// One-shot P03-admitted guest execution: run the artifact's `run`
+    /// export over the input bytes inside this process and emit raw output
+    /// bytes on stdout. `None` unless `--guest-exec` is passed with its full
+    /// argument set. This is how a reaped child executes an admitted guest:
+    /// the parent spawns this binary with these exact arguments through the
+    /// P03 staged intent, so every value here is admission-bound, never
+    /// ambient.
+    pub guest_exec: Option<GuestExecArgs>,
+}
+
+/// Bounded argument set for one-shot admitted guest execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestExecArgs {
+    /// Component artifact file (bounded, preflighted, digest-checked).
+    pub artifact: std::path::PathBuf,
+    /// Raw input file (bounded).
+    pub input: std::path::PathBuf,
+    /// Expected SHA-256 hex of the artifact bytes (TOCTOU check on read).
+    pub artifact_digest: String,
+    /// Output byte ceiling enforced by the guest Store.
+    pub max_output_bytes: u64,
+    /// Fuel ceiling enforced by the guest Store.
+    pub max_fuel: u64,
+    /// Memory byte ceiling enforced by the guest Store.
+    pub max_memory_bytes: u64,
+    /// Wall deadline (ms) enforced by the epoch driver.
+    pub wall_deadline_ms: u64,
+    /// Epoch deadline ticks enforced by the epoch driver.
+    pub epoch_deadline_ticks: u64,
 }
 
 /// Parses B-12's profile and transport arguments without adding a CLI crate.
@@ -134,6 +163,15 @@ where
     let mut transport = Transport::Stdio;
     let mut experimental_typed_component: Option<std::path::PathBuf> = None;
     let mut experimental_world: Option<String> = None;
+    let mut guest_exec = false;
+    let mut guest_artifact: Option<std::path::PathBuf> = None;
+    let mut guest_input: Option<std::path::PathBuf> = None;
+    let mut guest_artifact_digest: Option<String> = None;
+    let mut guest_max_output: Option<u64> = None;
+    let mut guest_max_fuel: Option<u64> = None;
+    let mut guest_max_memory: Option<u64> = None;
+    let mut guest_wall_ms: Option<u64> = None;
+    let mut guest_epoch_ticks: Option<u64> = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -217,6 +255,83 @@ where
                 experimental_world = Some(value.to_owned());
                 index += 1;
             }
+            "--guest-exec" => {
+                guest_exec = true;
+                index += 1;
+            }
+            "--guest-exec-artifact" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument("--guest-exec-artifact requires a value".to_owned())
+                })?;
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--guest-exec-artifact requires a value".to_owned(),
+                    ));
+                }
+                guest_artifact = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            "--guest-exec-input" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument("--guest-exec-input requires a value".to_owned())
+                })?;
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--guest-exec-input requires a value".to_owned(),
+                    ));
+                }
+                guest_input = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            "--guest-exec-artifact-digest" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument(
+                        "--guest-exec-artifact-digest requires a value".to_owned(),
+                    )
+                })?;
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--guest-exec-artifact-digest requires a value".to_owned(),
+                    ));
+                }
+                guest_artifact_digest = Some(value.clone());
+                index += 2;
+            }
+            "--guest-exec-max-output" => {
+                guest_max_output = Some(parse_guest_limit(
+                    "--guest-exec-max-output",
+                    &arguments,
+                    &mut index,
+                )?);
+            }
+            "--guest-exec-max-fuel" => {
+                guest_max_fuel = Some(parse_guest_limit(
+                    "--guest-exec-max-fuel",
+                    &arguments,
+                    &mut index,
+                )?);
+            }
+            "--guest-exec-max-memory" => {
+                guest_max_memory = Some(parse_guest_limit(
+                    "--guest-exec-max-memory",
+                    &arguments,
+                    &mut index,
+                )?);
+            }
+            "--guest-exec-wall-ms" => {
+                guest_wall_ms = Some(parse_guest_limit(
+                    "--guest-exec-wall-ms",
+                    &arguments,
+                    &mut index,
+                )?);
+            }
+            "--guest-exec-epoch-ticks" => {
+                guest_epoch_ticks = Some(parse_guest_limit(
+                    "--guest-exec-epoch-ticks",
+                    &arguments,
+                    &mut index,
+                )?);
+            }
             value => return Err(CliError::MalformedArgument(value.to_owned())),
         }
     }
@@ -230,10 +345,156 @@ where
         }
         (None, None) => {}
     }
+    let guest_exec = if guest_exec {
+        Some(GuestExecArgs {
+            artifact: guest_artifact.ok_or_else(|| {
+                CliError::MalformedArgument(
+                    "--guest-exec requires --guest-exec-artifact".to_owned(),
+                )
+            })?,
+            input: guest_input.ok_or_else(|| {
+                CliError::MalformedArgument("--guest-exec requires --guest-exec-input".to_owned())
+            })?,
+            artifact_digest: guest_artifact_digest.ok_or_else(|| {
+                CliError::MalformedArgument(
+                    "--guest-exec requires --guest-exec-artifact-digest".to_owned(),
+                )
+            })?,
+            max_output_bytes: guest_max_output.ok_or_else(|| {
+                CliError::MalformedArgument(
+                    "--guest-exec requires --guest-exec-max-output".to_owned(),
+                )
+            })?,
+            max_fuel: guest_max_fuel.ok_or_else(|| {
+                CliError::MalformedArgument(
+                    "--guest-exec requires --guest-exec-max-fuel".to_owned(),
+                )
+            })?,
+            max_memory_bytes: guest_max_memory.ok_or_else(|| {
+                CliError::MalformedArgument(
+                    "--guest-exec requires --guest-exec-max-memory".to_owned(),
+                )
+            })?,
+            wall_deadline_ms: guest_wall_ms.ok_or_else(|| {
+                CliError::MalformedArgument("--guest-exec requires --guest-exec-wall-ms".to_owned())
+            })?,
+            epoch_deadline_ticks: guest_epoch_ticks.ok_or_else(|| {
+                CliError::MalformedArgument(
+                    "--guest-exec requires --guest-exec-epoch-ticks".to_owned(),
+                )
+            })?,
+        })
+    } else if guest_artifact.is_some()
+        || guest_input.is_some()
+        || guest_artifact_digest.is_some()
+        || guest_max_output.is_some()
+        || guest_max_fuel.is_some()
+        || guest_max_memory.is_some()
+        || guest_wall_ms.is_some()
+        || guest_epoch_ticks.is_some()
+    {
+        return Err(CliError::MalformedArgument(
+            "guest execution arguments require --guest-exec".to_owned(),
+        ));
+    } else {
+        None
+    };
     Ok(CliConfig {
         profile: profile.ok_or(CliError::MissingProfile)?,
         transport,
         experimental_typed_component,
         experimental_world,
+        guest_exec,
     })
+}
+
+/// Parses one guest-execution numeric ceiling: present, non-empty, and a
+/// valid `u64`. Zero and over-ceiling values are rejected later by
+/// guest-execution validation with a process exit code, keeping parse
+/// errors (malformed text) distinct from admission errors (bad values).
+fn parse_guest_limit(
+    flag: &'static str,
+    arguments: &[String],
+    index: &mut usize,
+) -> Result<u64, CliError> {
+    let malformed = || CliError::MalformedArgument(format!("{flag} requires a value"));
+    let value = arguments.get(*index + 1).ok_or_else(malformed)?;
+    if value.is_empty() {
+        return Err(malformed());
+    }
+    let parsed: u64 = value
+        .parse()
+        .map_err(|_| CliError::MalformedArgument(format!("{flag} requires a u64 value")))?;
+    *index += 2;
+    Ok(parsed)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn guest_argv() -> Vec<String> {
+        [
+            "--profile",
+            "D2_OPERATIONAL",
+            "--guest-exec",
+            "--guest-exec-artifact",
+            "artifact.bin",
+            "--guest-exec-input",
+            "input.bin",
+            "--guest-exec-artifact-digest",
+            "ab",
+            "--guest-exec-max-output",
+            "64",
+            "--guest-exec-max-fuel",
+            "100000",
+            "--guest-exec-max-memory",
+            "1048576",
+            "--guest-exec-wall-ms",
+            "10000",
+            "--guest-exec-epoch-ticks",
+            "100",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn guest_exec_args_parse_with_all_ceilings() {
+        let config = parse_args(guest_argv()).expect("guest argv parses");
+        let guest = config.guest_exec.expect("guest mode selected");
+        assert_eq!(guest.max_output_bytes, 64);
+        assert_eq!(guest.max_fuel, 100_000);
+        assert_eq!(guest.max_memory_bytes, 1_048_576);
+        assert_eq!(guest.wall_deadline_ms, 10000);
+        assert_eq!(guest.epoch_deadline_ticks, 100);
+        assert_eq!(guest.artifact_digest, "ab");
+    }
+
+    #[test]
+    fn guest_exec_args_fail_closed() {
+        // Missing artifact piece.
+        let mut argv = guest_argv();
+        argv.drain(3..5);
+        assert!(matches!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(_))
+        ));
+        // Non-numeric ceiling.
+        let mut argv = guest_argv();
+        argv[13] = "lots".to_owned();
+        assert!(matches!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(_))
+        ));
+        // Stray guest piece without the mode flag.
+        let mut argv = guest_argv();
+        argv.remove(2);
+        assert!(matches!(
+            parse_args(argv),
+            Err(CliError::MalformedArgument(_))
+        ));
+    }
 }

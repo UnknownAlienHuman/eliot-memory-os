@@ -387,7 +387,7 @@ mod tests {
     }
 
     fn transition(op: &str, idem: &str, hash: &str) -> PreparedTransition {
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(op).expect("op"),
                 idempotency_key: idem.to_owned(),
@@ -402,6 +402,12 @@ mod tests {
             admission_contract_set_digest: "c".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-gate")
                 .expect("manifest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`). The caller-supplied hash stays
+            // untouched: this fixture probes hash-mismatch refusal.
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: Vec::new(),
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: Vec::new(),
@@ -410,7 +416,9 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     #[test]

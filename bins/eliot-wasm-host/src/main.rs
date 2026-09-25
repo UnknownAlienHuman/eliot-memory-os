@@ -3,8 +3,9 @@
 use std::io::{self, Write};
 
 use eliot_wasm_host::{
-    CliError, TypedWorld, default_experimental_limits, execute_describe_experimental, parse_args,
-    read_bounded_artifact, resolve_kernel_port_grant,
+    CliError, PrototypeContourDecision, TypedWorld, admit_generation, admit_prototype,
+    default_experimental_limits, execute_describe_experimental, experimental_manifest, parse_args,
+    read_bounded_artifact, resolve_kernel_port_grant, run_guest_exec, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -56,6 +57,15 @@ fn main() {
         }
     };
 
+    // One-shot P03-admitted guest execution: the reaped child runs the
+    // admitted guest inside containment and emits raw output bytes on
+    // stdout. This branch runs before anything else once parsed: no
+    // experimental describe, no grant path, and no other output may
+    // contaminate stdout.
+    if let Some(guest) = &config.guest_exec {
+        std::process::exit(run_guest_exec(guest));
+    }
+
     if let (Some(component_path), Some(world_name)) = (
         config.experimental_typed_component,
         config.experimental_world,
@@ -72,8 +82,38 @@ fn main() {
             }
         };
         let limits = default_experimental_limits(preflight.digest.clone());
+        // Contour admission, phase one (pre-execution): the experimental
+        // prototype is admitted under the automatic default-WASM decision
+        // before any guest code runs. Denial exits before describe.
+        let manifest = experimental_manifest(
+            preflight.digest.clone(),
+            &world_name,
+            typed_wit_digest(),
+            &limits,
+        );
+        let decision = PrototypeContourDecision::default_for_new_prototype();
+        if let Err(error) = admit_prototype(Some(&decision), &manifest) {
+            emit_error("ADMISSION_DENIED", &error.to_string());
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
         match execute_describe_experimental(world, &artifact, &limits) {
             Ok((receipt, descriptor)) => {
+                // Contour admission, phase two (pre-receipt): the full
+                // admission sequence runs over the actually observed imports
+                // before any success receipt is emitted. A manifest using an
+                // undeclared import is rejected here, never admitted.
+                // Governor-bound host-call authorization and admitted-request
+                // dispatch (`execute_admitted`) belong to the governed lane
+                // holding sealed invocations and real request identities;
+                // this pre-Governor callsite constructs neither, and the
+                // Governor grant carrier (`AuthorityResolution` via
+                // `AuthorityResolutionPort`) is honestly absent here.
+                if let Err(error) =
+                    admit_generation(Some(&decision), &manifest, &receipt.actual_imports)
+                {
+                    emit_error("ADMISSION_DENIED", &error.to_string());
+                    std::process::exit(ADMISSION_REQUIRED_EXIT);
+                }
                 let output_bytes = receipt.output_bytes.to_string();
                 let artifact_bytes = receipt.artifact_bytes.to_string();
                 let abi_revision = descriptor.abi_revision.to_string();

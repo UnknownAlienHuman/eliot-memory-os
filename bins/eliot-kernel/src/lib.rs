@@ -41,6 +41,10 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod backup_capture;
+mod backup_capture_ports;
+mod backup_restore;
+mod backup_restore_ports;
 mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
@@ -54,7 +58,32 @@ pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
+mod testd_terminal_completion_route;
 
+/// Public wire-operation name for the authenticated TestD completion route.
+pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
+
+pub use backup_capture::{
+    CaptureReport, CaptureRequest, CaptureState, KernelBackupCapture, request_from_ports,
+};
+pub use backup_capture_ports::{
+    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
+    PublicationPort, PublicationReceipt, PublishedArchive, SnapshotRelation,
+    require_capture_admitted,
+};
+pub use backup_restore::{
+    BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,
+    InvalidationOwnerClient, KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient,
+    PurgeOwnerClient, phase_owner,
+};
+pub use backup_restore_ports::{
+    DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
+    KernelRestoreError, MAX_DESTINATION_LABEL_LEN, OrsRestoreBinding, OrsRestoreJournal,
+    PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
+    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL, RESTORE_JOURNAL_PAYLOAD_AREA,
+    RestorePorts, backup_to_kernel, check_kernel_effect_fence, kernel_to_backup, ors_to_backup,
+    require_production_admitted,
+};
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
     BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
@@ -136,9 +165,12 @@ mod native_worker_reconcile_route;
 mod native_worker_replay_route;
 pub mod notify_operation_identity;
 mod provider_capability_route;
+pub mod reactive_restore_serve;
+mod request_dispatch;
 mod runtime_identity;
 mod shutdown_drain;
 mod startup_coordinator;
+mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -160,10 +192,10 @@ use runtime_identity::{
     observed_session_principal_binding,
 };
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// DISPATCH-CONTOUR-2 Slice B launch contour (issues #461 and #22).
@@ -209,14 +241,16 @@ pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_led
 pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
+    canonical_json_bytes,
 };
 use eliot_ipc::{
     AcceptedAgentBridgeTransport, HandshakeResult, PeerIdentity, ServerFirstConnection,
     ServerHandshakePolicy, Session, TransportError, TransportLimits,
 };
 use eliot_kernel_core::{
-    AuthoritySnapshotBinding, DispatchSnapshotCodec, GenerationRoute, GenerationRouter,
-    KernelError, ProcessDispatchAuthorityController, RouteScope,
+    AuthoritySnapshotBinding, BoundCanonicalOwner, DispatchSnapshotCodec, GenerationRoute,
+    GenerationRouter, GovernorClosureRestore, KernelError, ProcessDispatchAuthorityController,
+    RouteScope, bind_canonical_owner, owner_bundle_digest,
 };
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
@@ -229,6 +263,8 @@ use eliot_kernel_service::{
     KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
     KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    USER_AUTOMATION_KERNEL_CAPABILITY, USER_AUTOMATION_KERNEL_MODULE_ID,
+    USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING, USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
 };
 /// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
 ///
@@ -316,13 +352,13 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
-    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
-    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResultAck,
-    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
-    AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
-    AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
-    AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
-    MessageType, ProtocolPayload,
+    AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition,
+    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
+    AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
+    AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+    RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 #[cfg(test)]
@@ -356,6 +392,16 @@ use eliot_store_api::{
 pub use generation_control::ActiveGenerationRegistryProjection;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+/// WASM runtime port-grant seam for the front-door dispatch arm (#1780).
+///
+/// The dispatch arm (`frame_dispatch`) admits through this closed grant
+/// constructor; bundle publication and launch composition live in
+/// `daemon_request_dispatch`. The grant attests transport + freshness only
+/// and issues no permits, Governor observations, or keys.
+pub use wasm_runtime_port_grant::{
+    HostBinaryFacts, KernelObservedGrantFacts, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
+    WasmPortGrant, handle_wasm_port_grant, issue_wasm_port_grant, validate_wasm_port_grant,
+};
 
 #[cfg(all(test, windows))]
 use canonical_store_runtime::attach_then_retain_canonical_store;
@@ -411,9 +457,11 @@ const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publ
 #[cfg(windows)]
 const AGENT_BRIDGE_ACTIVATION_WINDOW_MS: u64 = 30_000;
 #[cfg(windows)]
-/// A daemon claim is retained for a short, bounded interval.  If semantic
-/// resolution fails transiently, the same Kernel-owned ticket becomes
-/// claimable again without allocating a new request or ticket identity.
+/// A daemon claim admission is recorded for a short, bounded interval. The
+/// mark below is a single-admission record, not a retry timer: a ticket whose
+/// claim was already admitted is never re-queued while result-less (#66
+/// C4/A3). Reconsideration requires a retained typed transient result with a
+/// changed-dependency discriminator on the submit path, never the lease clock.
 const AGENT_ACTIVATION_CLAIM_LEASE_MS: u64 = 1_000;
 #[cfg(windows)]
 const ELIOTD_MAX_RECOVERY_ATTEMPTS: u64 = 1;
@@ -454,6 +502,12 @@ pub struct KernelComposition {
     daemon_active_launch: Mutex<Option<EliotdLaunchDescriptor>>,
     kernel_artifact_sha256: Option<String>,
     eliotd_descriptor_artifact_sha256: Option<String>,
+    /// Host-approved WASM-host executable path retained for the grant-arm
+    /// host-facts call-in (#1780). `None` fails that arm closed; the live
+    /// image digest is re-proved at launch, never cached as authority here.
+    wasm_host_executable_path: Option<PathBuf>,
+    /// Digest bound to `wasm_host_executable_path`, validated at assembly.
+    wasm_host_artifact_sha256: Option<String>,
     daemon_runtime: Mutex<DaemonRuntimeState>,
     daemon_status_changed: tokio::sync::Notify,
     #[cfg(windows)]
@@ -474,6 +528,14 @@ pub struct KernelComposition {
     /// while no approved blob manifest was injected; `Some` validates the
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
+    /// Kernel-owned production restore adapter (issue #960). Held without
+    /// effects until the #962 owner-channel turn drives restores through it;
+    /// the durable journal is injected per execution, never constructed here.
+    backup_restore: KernelBackupRestore,
+    /// Kernel-owned cross-owner backup capture coordinator (issue #959).
+    /// Holds the work root only; every capture consumes already-accepted
+    /// owner evidence and publishes once through the admitted owner port.
+    backup_capture: KernelBackupCapture,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -482,6 +544,12 @@ pub struct KernelComposition {
     /// declaration, if the active candidate supplied one.
     #[cfg(windows)]
     agent_bridge_profile: Mutex<Option<AgentBridgeProfile>>,
+    /// Serializes the complete bridge profile transition boundary. Promotion
+    /// holds the write guard while it fences, drains, and publishes a profile;
+    /// synchronous bridge and host ingress holds one read guard across its
+    /// state publication. The guard is never held across an async wait.
+    #[cfg(windows)]
+    agent_bridge_transition: RwLock<()>,
     #[cfg(windows)]
     /// Host-carried descriptor retained as inert composition input. It is
     /// never exposed to the front door until the matching candidate is Ready.
@@ -501,8 +569,7 @@ pub struct KernelComposition {
     /// result ledger only; it never contains pending entries or live bindings.
     ///
     /// Every one of the seven closed dispositions shares one
-    /// exact-replay/conflict ledger here, independent of the legacy
-    /// success-only decision ledger on the pending entry. Only a `Resolved`
+    /// exact-replay/conflict ledger here. Only a `Resolved`
     /// disposition can later yield a transport Session, and that Session is
     /// created exactly once by the bridge activation path. The map lives
     /// beside the pending table (rather than inside its entries) so the
@@ -526,6 +593,62 @@ pub struct KernelComposition {
     /// Material/Critical admission paths instead of inferring readiness from
     /// process liveness or pipe availability.
     startup_coordinator: Mutex<StartupCoordinator>,
+    /// Canonical P-07 durable owner binding (`#2100`). `None` until the
+    /// Governor feed publishes the first owner bundle; `Some` once
+    /// [`KernelComposition::bind_p07_owner`] binds the port at the exact
+    /// admitted revision. Refresh and recovery rebind through the same
+    /// retained ORS handle below, never through a second store.
+    p07_owner: Mutex<Option<BoundCanonicalOwner>>,
+    /// Canonical content digest of the bound owner bundle, computed by the
+    /// one shared definition both sides call. The owner readback serves it
+    /// so the Governor feed can prove the Kernel bound its exact bytes.
+    p07_owner_digest: Mutex<Option<String>>,
+    /// ORS handle retained for P-07 owner bind/refresh/recovery. Cloned
+    /// from the assembly store so later owner operations never reopen the
+    /// database file or invent a second recovery store.
+    p07_ors: Arc<RedbRecoveryStore>,
+}
+
+impl KernelComposition {
+    /// Returns the Kernel-owned production restore adapter (issue #960).
+    ///
+    /// Invocation arrives with the #962 owner-channel turn; until then the
+    /// adapter is held without effects.
+    #[must_use]
+    pub fn backup_restore(&self) -> &KernelBackupRestore {
+        &self.backup_restore
+    }
+
+    /// Returns the Kernel-owned cross-owner backup capture coordinator
+    /// (issue #959). Invocation arrives with the #962 owner-channel turn;
+    /// until then the coordinator is held without effects.
+    #[must_use]
+    pub fn backup_capture(&self) -> &KernelBackupCapture {
+        &self.backup_capture
+    }
+
+    /// Runs one isolated restore on the composition-owned durable ORS journal
+    /// (issue #960).
+    ///
+    /// This is the production entry: the journal is the `RedbRecoveryStore`
+    /// this composition already opened and owns, so a caller cannot substitute
+    /// an in-memory, JSON-file or no-op journal for a production restore, and
+    /// the per-execution journal is built from that owner handle plus the
+    /// Kernel's own live effect fence.
+    ///
+    /// The owner-channel transport that reaches this entry is #962's frame
+    /// arm; until it lands, nothing dispatches here, and no placeholder call
+    /// stands in for it.
+    pub fn backup_restore_with_ors_journal(
+        &self,
+        bundle: &eliot_backup::BackupBundle,
+        target: eliot_backup::RestoreContext,
+        ports: &RestorePorts<'_>,
+        identity: &OrsRestoreBinding,
+    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
+        self.backup_restore
+            .restore_with_ors_journal(&self.p07_ors, bundle, target, ports, identity)
+    }
 }
 
 #[cfg(windows)]
@@ -563,7 +686,9 @@ struct AgentActivationPendingState {
     /// Governor read. Retention never expires on the ticket deadline; a
     /// terminal accepted result outlives it.
     results: BTreeMap<String, AgentActivationResultRecord>,
-    /// Insertion order of `results` for bounded eviction.
+    /// Insertion order of `results` for bounded eviction. Live pending
+    /// entries are skipped when this order is pruned so an active bridge
+    /// waiter can never lose the result it is waiting to project.
     result_order: VecDeque<String>,
 }
 
@@ -572,12 +697,16 @@ struct AgentActivationPendingState {
 struct AgentActivationPending {
     ticket: AgentActivationResolutionTicket,
     request: AgentBridgeActivationRequest,
-    decision: Option<AgentActivationResolutionDecision>,
-    /// Private Kernel claim lease; it is deliberately absent from the wire
-    /// ticket so retries cannot mint or select a caller-owned identity.
+    /// Private Kernel single-admission mark; it is deliberately absent from
+    /// the wire ticket so retries cannot mint or select a caller-owned
+    /// identity. Once set, the ticket is never handed out again while
+    /// result-less (#66 C4/A3): an unanswered ticket rests until the
+    /// Kernel-owned deadline instead of looping the resolver.
     claim_lease_until_unix_ms: Option<u64>,
 }
 
+/// Replay/commit/conflict disposition shared by the activation result
+/// entry classifiers (v2 result legs).
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationDecisionDisposition {
@@ -586,25 +715,13 @@ enum ActivationDecisionDisposition {
     Conflict,
 }
 
-#[cfg(windows)]
-fn classify_activation_decision(
-    existing: Option<&AgentActivationResolutionDecision>,
-    incoming: &AgentActivationResolutionDecision,
-) -> ActivationDecisionDisposition {
-    match existing {
-        None => ActivationDecisionDisposition::Commit,
-        Some(existing) if existing == incoming => ActivationDecisionDisposition::ExactReplay,
-        Some(_) => ActivationDecisionDisposition::Conflict,
-    }
-}
-
 /// Submission phase of one retained v2 semantic result.
 ///
 /// Absence of a record means the ticket is still awaiting its result. A
-/// retained record is never re-queued by claim-lease expiry: the lease only
-/// recycles result-less tickets for transient resolver failure. The sole
+/// retained record is never re-queued by claim admission: admission is not a
+/// semantic delta. A result-less ticket is admitted at most once; the sole
 /// re-queue path for a deferred ticket is a gated superseding submission on
-/// the submit path, never the lease clock.
+/// the submit path, never the admission mark.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentActivationResultPhase {
@@ -632,9 +749,8 @@ struct AgentActivationResultRecord {
     retention_order: u64,
 }
 
-/// Pure replay classifier for v2 results, mirroring the v1 decision
-/// classifier. The `NotReady` supersede gate is applied by the submit path
-/// only when this classifier reports `Conflict`.
+/// Pure replay classifier for v2 results. The `NotReady` supersede gate is
+/// applied by the submit path only when this classifier reports `Conflict`.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationResultDisposition {
@@ -664,24 +780,23 @@ impl AgentActivationPendingState {
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
             // A retained semantic result (v2) is terminal-or-deferred
-            // durable state: claim-lease expiry is not a semantic delta and
-            // never re-queues it. Only result-less tickets recycle through
-            // the lease for transient resolver failure.
+            // durable state: admission is not a semantic delta and never
+            // re-queues it. A result-less ticket is admitted at most once:
+            // re-admitting it would repeat the same semantic resolution
+            // against the same owner state without a typed transient result
+            // or changed-dependency discriminator (#66 C4/A3). An unanswered
+            // ticket rests until the Kernel-owned deadline, which projects
+            // result-less expiry instead of looping the resolver.
             if self.results.contains_key(&ticket_id) {
                 continue;
             }
             let Some(entry) = self.entries.get_mut(&ticket_id) else {
                 continue;
             };
-            if entry.decision.is_some()
-                || activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms)
-            {
+            if activation_deadline_expired(now, entry.ticket.kernel_deadline_unix_ms) {
                 continue;
             }
-            if entry
-                .claim_lease_until_unix_ms
-                .is_some_and(|lease_until| now < lease_until)
-            {
+            if entry.claim_lease_until_unix_ms.is_some() {
                 self.fifo.push_back(ticket_id);
                 continue;
             }
@@ -696,24 +811,117 @@ impl AgentActivationPendingState {
         None
     }
 
-    /// Retains one exact result record under its ticket identity, evicting the
-    /// oldest retained ticket when the bounded ledger is full. Eviction only
-    /// affects daemon-leg replay/reconcile memory; the bridge leg for an
-    /// evicted ticket is already projected or gone, and a resubmission for an
-    /// evicted ticket without a pending entry is answered `UnknownRequest`
-    /// rather than fabricated.
-    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
-        const MAX_RETAINED_ACTIVATION_RESULTS: usize = 64;
-        let ticket_id = record.result.ticket_id.clone();
-        if !self.results.contains_key(&ticket_id) {
-            self.result_order.push_back(ticket_id.clone());
-            while self.result_order.len() > MAX_RETAINED_ACTIVATION_RESULTS {
-                if let Some(oldest) = self.result_order.pop_front() {
-                    self.results.remove(&oldest);
+    /// Checks the canonical result map and its insertion order without
+    /// changing either representation. The order is a bijection with the map:
+    /// every ticket occurs exactly once and no ticket is omitted or extraneous.
+    #[cfg(windows)]
+    fn result_ledger_is_consistent(&self) -> bool {
+        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
+        if self.results.len() > max || self.result_order.len() > max {
+            return false;
+        }
+        let mut ordered = BTreeSet::new();
+        for ticket_id in &self.result_order {
+            if !self.results.contains_key(ticket_id) || !ordered.insert(ticket_id) {
+                return false;
+            }
+        }
+        ordered.len() == self.results.len()
+            && self
+                .results
+                .iter()
+                .all(|(ticket_id, record)| ticket_id == &record.result.ticket_id)
+            && self
+                .results
+                .keys()
+                .all(|ticket_id| ordered.contains(ticket_id))
+    }
+
+    /// Determines the only safe eviction plan for one incoming result. This
+    /// is deliberately pure: an impossible bound or order/map state returns
+    /// `None` before durable ORS publication can begin.
+    #[cfg(windows)]
+    fn result_retention_eviction_plan(&self, ticket_id: &str) -> Option<Vec<String>> {
+        if !self.result_ledger_is_consistent() {
+            return None;
+        }
+        if self.results.contains_key(ticket_id) {
+            return Some(Vec::new());
+        }
+        let max = eliot_ors::MAX_ACTIVATION_RESULT_RETENTION_RECORDS;
+        let required = self.results.len().saturating_add(1).saturating_sub(max);
+        let mut victims = Vec::with_capacity(required);
+        for candidate in &self.result_order {
+            if !self.entries.contains_key(candidate) {
+                victims.push(candidate.clone());
+                if victims.len() == required {
+                    break;
                 }
             }
         }
-        self.results.insert(ticket_id, record);
+        (victims.len() == required).then_some(victims)
+    }
+
+    /// Stages the canonical result map/order update before the durable write.
+    /// The returned copies are not published until ORS has committed, so an
+    /// impossible capacity or order state leaves the live ledger untouched.
+    #[cfg(windows)]
+    fn stage_result_retention(
+        &self,
+        record: AgentActivationResultRecord,
+    ) -> Option<(
+        BTreeMap<String, AgentActivationResultRecord>,
+        VecDeque<String>,
+    )> {
+        let ticket_id = record.result.ticket_id.clone();
+        let victims = self.result_retention_eviction_plan(&ticket_id)?;
+        let mut results = self.results.clone();
+        let mut result_order = self.result_order.clone();
+        for victim in victims {
+            results.remove(&victim)?;
+            let before = result_order.len();
+            result_order.retain(|candidate| candidate != &victim);
+            if result_order.len().saturating_add(1) != before {
+                return None;
+            }
+        }
+        if !results.contains_key(&ticket_id) {
+            result_order.push_back(ticket_id.clone());
+        }
+        results.insert(ticket_id, record);
+        Some((results, result_order))
+    }
+
+    /// Publishes a previously staged canonical result after durable ORS
+    /// success. `stage_result_retention` proves the ticket exists in the copy;
+    /// the debug assertion documents that internal invariant without adding a
+    /// post-commit error path for an otherwise unreachable state.
+    #[cfg(windows)]
+    fn publish_staged_result_retention(
+        &mut self,
+        mut staged: (
+            BTreeMap<String, AgentActivationResultRecord>,
+            VecDeque<String>,
+        ),
+        ticket_id: &str,
+        retention_order: u64,
+    ) {
+        debug_assert!(staged.0.contains_key(ticket_id));
+        if let Some(record) = staged.0.get_mut(ticket_id) {
+            record.retention_order = retention_order;
+        }
+        self.results = staged.0;
+        self.result_order = staged.1;
+    }
+
+    #[cfg(test)]
+    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
+        let ticket_id = record.result.ticket_id.clone();
+        let retention_order = record.retention_order;
+        let staged = self
+            .stage_result_retention(record)
+            .expect("test result ledger must have a safe retention state");
+        self.publish_staged_result_retention(staged, &ticket_id, retention_order);
     }
 }
 
@@ -780,6 +988,9 @@ pub enum KernelFrameAction {
     Testd {
         /// Correlation identity to echo in the response.
         request_id: RequestId,
+        /// Exact authenticated owner identity from the EBP frame. The
+        /// terminal route compares it with the durable pre-dispatch binding.
+        identity: RequestIdentity,
         /// Closed operation name; must equal `TESTD_ADMISSION_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying the typed admission request.
@@ -1014,6 +1225,33 @@ impl KernelComposition {
 }
 
 impl KernelComposition {
+    /// Acquires the read side of the bridge profile transition boundary.
+    ///
+    /// Each synchronous ingress acquires this exactly once and passes through
+    /// private under-transition helpers. In particular, callers must not
+    /// reacquire it from a nested helper while a promotion writer may be
+    /// queued: `std::sync::RwLock` can block recursive readers in that state.
+    #[cfg(windows)]
+    pub(crate) fn agent_bridge_transition_read(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, ()>, TransportError> {
+        self.agent_bridge_transition
+            .read()
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Acquires the write side of the bridge profile transition boundary.
+    /// The caller must keep it through profile fencing, ownership drain, and
+    /// replacement publication.
+    #[cfg(windows)]
+    pub(crate) fn agent_bridge_transition_write(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, ()>, TransportError> {
+        self.agent_bridge_transition
+            .write()
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
     /// Monotonic revision of the promoted bridge profile. The production
     /// listener uses this to rebuild a pending pipe after Host activation
     /// changes the bounded DACL/peer set.
@@ -2528,7 +2766,7 @@ impl KernelComposition {
         Ok(decision)
     }
 
-    /// Typed progress renewal entry (issue #88, wave 2): renews the current
+    /// Typed progress renewal entry (issue #88, wave 3): renews the current
     /// supervision lease from an observed daemon progress request, not from
     /// `StoreHealth`.
     ///
@@ -2547,10 +2785,6 @@ impl KernelComposition {
     /// after live-receipt publication, so a renewal can never ship without
     /// its publication evidence.
     #[cfg(windows)]
-    #[allow(
-        dead_code,
-        reason = "wave 3 (MGR02) wires the eliotd per-tick DaemonProgressObservation into this typed progress route; ProbeReady keeps the policy-driven legacy renew until then"
-    )]
     fn renew_current_supervision_with_progress(
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
@@ -2678,16 +2912,127 @@ impl KernelComposition {
         Ok((contour, snapshot))
     }
 
-    // Wave-3 handoff (MGR02, `eliotd` per-tick observation, Implements #88):
-    // this ProbeReady path still renews through the policy-driven legacy
-    // `renew_current_supervision` because the daemon does not yet submit a
-    // per-tick `DaemonProgressObservation`. Wave 3 must build that observation
-    // in `eliotd`, retain a `DaemonSupervisionProgressState` for the active
-    // lease, build the join state with `daemon_supervision_current_state`,
-    // and call `renew_current_supervision_with_progress` here instead, then
-    // assemble the receipt with `daemon_renewal_receipt_for_decision` after
-    // live-receipt publication. `StoreHealth` (`health_view::daemon_health`)
-    // stays evidence-only and must never be passed as renewal evidence.
+    // Issue #88, wave 3: the ProbeReady path renews through the typed
+    // progress route when the latest retained per-tick observation cites the
+    // exact durable head, so ProbeReady and the per-tick submits decide on
+    // the same evidence. Without a current retained observation the
+    // policy-driven bootstrap renew covers the pre-observation window.
+    // `StoreHealth` (`health_view::daemon_health`) stays evidence-only and
+    // must never be passed as renewal evidence.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "probe renewal threads the exact launch, process, ready, contour, and head identities explicitly"
+    )]
+    fn progress_renewal_for_probe(
+        &self,
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+        launch: &EliotdLaunchDescriptor,
+        process: &ProcessStartReceipt,
+        ready: &EliotdLiveReadyEvidence,
+        head: &SupervisionLeaseSnapshot,
+    ) -> Result<Option<(SupervisionLeaseSnapshot, EliotdLiveReceipt)>, KernelServiceError> {
+        let retained = self
+            .daemon_runtime
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?
+            .last_progress_observation
+            .clone();
+        let Some(observation) = retained else {
+            return Ok(None);
+        };
+        // The retained observation must cite this exact head. Anything older
+        // (including a predecessor advanced by a per-tick submit since) keeps
+        // the bootstrap path instead of deciding from stale evidence.
+        if observation.lease_id != head.record.lease_id.as_str()
+            || observation.lease_revision != head.record.revision
+            || observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256
+        {
+            return Ok(None);
+        }
+        let predecessor = eliot_runtime_contracts::SupervisionLeasePredecessorProof {
+            lease_id: head.record.lease_id.as_str().to_owned(),
+            record_id: head.record.record_id.as_str().to_owned(),
+            lease_revision: head.record.revision,
+            receipt_sha256: head.receipt.receipt_sha256.clone(),
+            envelope_sha256: head
+                .record
+                .artifact
+                .envelope_digest()
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+        };
+        let request = DaemonSupervisionRenewalRequest {
+            request_id: observation.observation_id.clone(),
+            observation: observation.clone(),
+            predecessor,
+        };
+        request
+            .validate()
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let mut progress = {
+            let mut state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            std::mem::replace(
+                &mut state.supervision_progress,
+                DaemonSupervisionProgressState::unbound(),
+            )
+        };
+        let renewal = Self::renew_current_supervision_with_progress(
+            authority,
+            contour,
+            &request,
+            &mut progress,
+            &SUPERVISION_LEASE_RENEWAL_POLICY,
+            unix_ms(),
+        );
+        let put_back = |progress: DaemonSupervisionProgressState,
+                        expired: Option<bool>|
+         -> Result<(), KernelServiceError> {
+            let mut state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            state.supervision_progress = progress;
+            state.last_progress_observation = Some(request.observation.clone());
+            if let Some(expired) = expired {
+                state.supervision_expired = expired;
+            }
+            Ok(())
+        };
+        let Ok((snapshot, decision, receipt)) = renewal else {
+            // Any refusal or authority failure keeps the bootstrap path:
+            // ProbeReady must not turn a stale retained observation into
+            // a readiness failure while the policy renew still applies.
+            // An expired lease fails closed in the bootstrap renew below.
+            put_back(progress, None)?;
+            return Ok(None);
+        };
+        put_back(progress, Some(false))?;
+        // A non-renewing decision still publishes the unchanged head
+        // so the live receipt tracks the durable revision.
+        let published =
+            self.publish_eliotd_live_receipt(launch, process, ready, contour, Some(&snapshot))?;
+        if decision.outcome == DaemonSupervisionRenewalOutcome::Renewed {
+            let live_sha256 = sha256_hex(
+                &eliot_contracts::canonical_json_bytes(&published)
+                    .map_err(|_| KernelServiceError::ReadinessNotProven)?,
+            );
+            // The renewal receipt is validated for coherence here and
+            // then stays with the ORS/live-receipt evidence; ProbeReady
+            // returns the head pair like the legacy path.
+            let _ = daemon_renewal_receipt_for_decision(
+                &decision,
+                Some(snapshot.receipt.receipt_sha256.clone()),
+                Some(live_sha256),
+            )
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        } else {
+            let _ = receipt.ok_or(KernelServiceError::ReadinessNotProven)?;
+        }
+        Ok(Some((snapshot, published)))
+    }
+
     #[cfg(windows)]
     fn renew_daemon_supervision_for_probe(
         &self,
@@ -2698,6 +3043,14 @@ impl KernelComposition {
                 KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
             })?;
             if state.status != DaemonRuntimeStatus::Ready {
+                return Err(KernelServiceError::ReadinessNotProven);
+            }
+            if state.supervision_expired {
+                // Issue #88, A6: the progress route already reported terminal
+                // lease expiry for this contour. Fail readiness closed on the
+                // expired marker until a new admitted generation rebinds (the
+                // rebind clears the marker); the durable-head verify below
+                // would fail identically on the expired binding.
                 return Err(KernelServiceError::ReadinessNotProven);
             }
             (
@@ -2757,10 +3110,22 @@ impl KernelComposition {
         // skipping over the receipt that still names the older ORS head.
         let _ =
             self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&before))?;
-        let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
-            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-        let published =
-            self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&renewed))?;
+        let (renewed, published) = if let Some(pair) = self
+            .progress_renewal_for_probe(authority, &contour, &launch, &process, &ready, &before)?
+        {
+            pair
+        } else {
+            let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
+                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            let published = self.publish_eliotd_live_receipt(
+                &launch,
+                &process,
+                &ready,
+                &contour,
+                Some(&renewed),
+            )?;
+            (renewed, published)
+        };
         Ok((renewed, published))
     }
 

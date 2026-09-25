@@ -25,13 +25,27 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod isolated_restore;
+mod owner_adapters;
+mod portable_adapters;
 mod portable_recovery;
 mod product_command;
+mod product_run;
 mod restore_runner;
 
 pub use isolated_restore::{
     CutoverAuthorization, CutoverReceipt, IsolatedRestorePlan, IsolatedRoot, authorize_cutover,
     plan_isolated_restore,
+};
+pub use owner_adapters::{
+    DestinationRestoreAdapter, DestinationScope, RESTORE_ENVELOPE_ALGORITHM,
+    RESTORE_ENVELOPE_VERSION, RestoredSealedBlob, SealedEnvelope,
+};
+pub use portable_adapters::{
+    AdmittedKeyMap, PORTABLE_ENVELOPE_ALGORITHM, PORTABLE_ENVELOPE_VERSION, PORTABLE_KEY_BYTES,
+    PORTABLE_NONCE_BYTES, PORTABLE_TAG_BYTES, PortableKeyVault, PortableSealedEnvelope,
+    PortableSecretKey, portable_blob_ad, portable_keywrap_ad, restore_portable_blob,
+    restore_portable_blob_admitted, rewrap_portable_data_key, seal_portable_envelope,
+    verify_portable_restorable,
 };
 pub use portable_recovery::{
     BlobRestorationReceipt, FullRecoveryPackage, MAX_WRAPPED_KEY_BYTES, WrappedKeyEntry,
@@ -41,6 +55,7 @@ pub use product_command::{
     BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,
     preview_backup_create, preview_restore,
 };
+pub use product_run::{IssueReport, RestoreEpochSpec, RestoreRunReport, issue_backup, run_restore};
 pub use restore_runner::{
     FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,
 };
@@ -150,35 +165,13 @@ impl BackupClass {
     }
 }
 
-/// Event interval captured by one consistent export fence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EventRange {
-    pub first_sequence: Option<u64>,
-    pub last_sequence: Option<u64>,
-    pub count: u64,
-}
-
-impl EventRange {
-    pub fn validate(&self) -> Result<(), BackupError> {
-        match (self.first_sequence, self.last_sequence, self.count) {
-            (None, None, 0) => Ok(()),
-            (Some(first), Some(last), count) if first <= last && count > 0 => {
-                if last.saturating_sub(first).saturating_add(1) < count {
-                    return Err(BackupError::InvalidField {
-                        field: "event_range.count",
-                        reason: "cannot exceed the declared sequence interval",
-                    });
-                }
-                Ok(())
-            }
-            _ => Err(BackupError::InvalidField {
-                field: "event_range",
-                reason: "empty and non-empty ranges must use matching bounds",
-            }),
-        }
-    }
-}
+/// Canonical ECXF event interval captured by one consistent export fence.
+///
+/// The type is owned solely by `eliot-ecxf` (issue #862): `eliot-backup`
+/// consumes the interchange contract and keeps no second range definition or
+/// validator. The reexport keeps existing `eliot_backup::EventRange` paths
+/// compiling against the single owner with identical wire bytes.
+pub use eliot_ecxf::EventRange;
 
 /// The coherent logical boundary of an ECXF export.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -206,7 +199,12 @@ impl ExportFence {
         if !self.consistent {
             return Err(BackupError::InconsistentBoundary);
         }
-        self.event_range.validate()?;
+        self.event_range.validate().map_err(|error| match error {
+            eliot_ecxf::EcxfError::InvalidField { field, reason } => {
+                BackupError::InvalidField { field, reason }
+            }
+            error => BackupError::Foundation(error.to_string()),
+        })?;
         unique(
             self.revision_heads.iter().map(|head| head.key.clone()),
             "revision_heads",
@@ -1435,6 +1433,21 @@ impl RestorePlan {
         {
             return Err(BackupError::PlanMismatch);
         }
+        // A hand-constructed or decoded plan cannot combine a target from one
+        // request with the fence of another: the compiled target proposal and
+        // the restored fence must agree exactly (issue #949).
+        if self.target.target_authority_epoch != self.restored_fence.authority_epoch
+            || self.target.target_resource_generation != self.restored_fence.resource_generation
+        {
+            return Err(BackupError::PlanMismatch);
+        }
+        // The destination must be an isolated root, never the source archive
+        // itself (issue #949). Active (non-advancing) destinations are refused
+        // by `RestoredFence::validate`; foreign destinations conflict on the
+        // transaction identity below.
+        if self.target.target_id == bundle.manifest.backup_id {
+            return Err(BackupError::PlanMismatch);
+        }
         let transaction = self.transaction()?;
         let journal_key = self.journal_key()?;
         let phases = restore_phases(bundle);
@@ -1455,10 +1468,10 @@ impl RestorePlan {
             journal.compare_and_swap(&journal_key, 0, initial.clone())?;
             initial
         };
-        validate_journal_record(&record, &journal_key, &transaction, &phases)?;
+        validate_journal_record(self, bundle, &record, &journal_key, &transaction, &phases)?;
 
         loop {
-            validate_journal_record(&record, &journal_key, &transaction, &phases)?;
+            validate_journal_record(self, bundle, &record, &journal_key, &transaction, &phases)?;
             match record.state {
                 RestoreJournalState::Completed => {
                     return record
@@ -1679,6 +1692,8 @@ fn next_revision(revision: u64) -> Result<u64, BackupError> {
 }
 
 fn validate_journal_record(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
     record: &RestoreJournalRecord,
     journal_key: &str,
     transaction: &RestoreTransaction,
@@ -1749,31 +1764,14 @@ fn validate_journal_record(
             }
         }
         RestoreJournalState::Completed => {
-            if completed_phases != phases.len()
-                || !matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
-                || record.final_receipt.is_none()
-            {
-                return Err(BackupError::RestoreJournalCorrupt);
-            }
-            let final_receipt = record
-                .final_receipt
-                .as_ref()
-                .ok_or(BackupError::RestoreJournalCorrupt)?;
-            if final_receipt.bundle_sha256 != transaction.bundle_sha256 {
-                return Err(BackupError::RestoreJournalMismatch);
-            }
-            let effect_receipt = record
-                .receipt
-                .as_ref()
-                .ok_or(BackupError::RestoreJournalCorrupt)?;
-            let intent = record
-                .intent
-                .as_ref()
-                .ok_or(BackupError::RestoreJournalCorrupt)?;
-            validate_effect_receipt(intent, effect_receipt)?;
-            if final_receipt.effect_receipt_sha256 != sha256(effect_receipt)? {
-                return Err(BackupError::RestoreJournalCorrupt);
-            }
+            validate_completed_record(
+                plan,
+                bundle,
+                record,
+                transaction,
+                completed_phases,
+                phases.len(),
+            )?;
         }
         RestoreJournalState::RollbackRequired => {
             if record.intent.is_none() || record.receipt.is_some() || record.final_receipt.is_some()
@@ -1781,6 +1779,59 @@ fn validate_journal_record(
                 return Err(BackupError::RestoreJournalCorrupt);
             }
         }
+    }
+    Ok(())
+}
+
+/// Binds a resumed `Completed` record to the current plan. A stored record
+/// cannot authenticate itself by bundle digest alone: the stored
+/// intent/receipt must bind the current transaction and final phase, and the
+/// final receipt must bind the current plan, destination, restored fence, and
+/// class proof level (issue #949). A forged foreign intent/receipt pair that
+/// agrees with each other still fails here.
+fn validate_completed_record(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
+    record: &RestoreJournalRecord,
+    transaction: &RestoreTransaction,
+    completed_phases: usize,
+    phases_len: usize,
+) -> Result<(), BackupError> {
+    if completed_phases != phases_len
+        || !matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
+        || record.final_receipt.is_none()
+    {
+        return Err(BackupError::RestoreJournalCorrupt);
+    }
+    let final_receipt = record
+        .final_receipt
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    let intent = record
+        .intent
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    let effect_receipt = record
+        .receipt
+        .as_ref()
+        .ok_or(BackupError::RestoreJournalCorrupt)?;
+    if intent.transaction_id != transaction.transaction_id
+        || intent.phase != record.phase
+        || intent.input_digest != sha256(&(transaction.transaction_id.as_str(), &record.phase))?
+        || effect_receipt.transaction_id != transaction.transaction_id
+        || effect_receipt.phase != record.phase
+    {
+        return Err(BackupError::RestoreJournalCorrupt);
+    }
+    validate_effect_receipt(intent, effect_receipt)?;
+    if final_receipt.bundle_sha256 != transaction.bundle_sha256
+        || final_receipt.plan_id != plan.plan_id
+        || final_receipt.target_id != plan.target.target_id
+        || final_receipt.restored_fence != plan.restored_fence
+        || final_receipt.effect_receipt_sha256 != sha256(effect_receipt)?
+        || final_receipt.evidence_level != RestoreEvidenceLevel::for_class(bundle.manifest.class)
+    {
+        return Err(BackupError::RestoreJournalMismatch);
     }
     Ok(())
 }
@@ -3417,9 +3468,10 @@ mod restore_tests {
     #[test]
     fn phase_skip_is_rejected_fail_closed() {
         let plan = plan();
+        let bundle = bundle_for(&plan);
         let journal_key = plan.journal_key().expect("journal key");
         let transaction = plan.transaction().expect("transaction");
-        let phases = restore_phases(&bundle_for(&plan));
+        let phases = restore_phases(&bundle);
         let record = RestoreJournalRecord {
             journal_key,
             transaction: transaction.clone(),
@@ -3432,7 +3484,14 @@ mod restore_tests {
             final_receipt: None,
         };
         assert_eq!(
-            validate_journal_record(&record, &record.journal_key, &transaction, &phases),
+            validate_journal_record(
+                &plan,
+                &bundle,
+                &record,
+                &record.journal_key,
+                &transaction,
+                &phases
+            ),
             Err(BackupError::RestorePhaseMismatch)
         );
     }
@@ -3599,6 +3658,13 @@ mod backup_verify_tests_948 {
                 "manifest-{operation}"
             ))
             .expect("manifest digest"),
+            // Standalone-fixture issue-#18 values (not bound to a
+            // transition): this seed only exercises backup/restore
+            // retention, never digest bindings. Shapes stay valid so
+            // `validate()` reaches the behavior under test.
+            admission_digest: "e".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

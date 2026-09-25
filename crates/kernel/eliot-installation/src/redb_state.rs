@@ -882,7 +882,7 @@ impl RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v23 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v24 state"
                         .to_owned(),
             });
         }
@@ -1609,7 +1609,7 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
             return Err(InstallationError::InvalidField {
                 field: "transaction".to_owned(),
                 reason:
-                    "create_planned accepts only constructor-produced Planned/Pending v23 state"
+                    "create_planned accepts only constructor-produced Planned/Pending v24 state"
                         .to_owned(),
             });
         }
@@ -2735,6 +2735,8 @@ mod tests {
             ("eliot-doctor.exe", true),
             ("eliot-testd.exe", true),
             ("eliot-native-worker.exe", true),
+            ("eliot-wasm-host.exe", true),
+            ("eliot-notify.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),

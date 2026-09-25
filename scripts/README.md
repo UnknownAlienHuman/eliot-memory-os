@@ -50,6 +50,7 @@ committed as repository authority.
 | `wasm_component_lane.py` | Affected-component WASM build/test lane selector and evidence helper (#764) | Build/test lane selection only |
 | `verify-legacy-config-retirement.py` | Verify legacy config filenames, modes, roots, and module manifests stay retired (#1219) | Static source and packaging evidence only |
 | `context_measurement_inventory.py` | Deterministic source-bound inventory of serialized-context measurement cases with closed classification and frozen denominator (#866) | Static source classification only |
+| `audit_cue_kind_retirement.py` | Cross-package `CueKind` retirement oracle library over the static source/wire/caller denominator (#835); exercised by `scripts/tests/test_cue_kind_retirement.py` | Static source denominator evidence only |
 | `verify-excluded-dispositions-1811.py` | Fail-closed excluded/standalone disposition gate over standalone packages and root exclude entries with consumption evidence checks (#1811) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
@@ -130,8 +131,10 @@ be promoted to live multi-agent/runtime proof.
 
 | Script | Purpose | Boundary |
 |---|---|---|
+| `provision-surrealdb-release.py` | Materialize pinned SurrealDB evidence into project-local ignored state | Local evidence provision only |
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
+| `write-operator-build-receipt.ps1` | Write the commit-bound Eliot.Operator build receipt consumed by `build-eliot-windows-x64-release.ps1` (#2391) | Operator build-input evidence only |
 | `install-pipeline.ps1` | Root-controller install pipeline executing materialization and installation apply | Installation orchestration only |
 | `invoke-eliot-windows-x64-production.ps1` | Execute the manifest-bound production invocation/installation flow | Live acceptance remains issue #11 |
 | `reset-developer-install.ps1` | Reset developer installation state across services, processes, directories, and credentials | Developer machine reset only |

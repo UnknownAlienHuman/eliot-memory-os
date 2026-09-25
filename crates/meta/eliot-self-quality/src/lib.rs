@@ -16,6 +16,7 @@
 pub mod diagnose;
 pub mod error;
 pub mod identity;
+pub mod improvement_handoff;
 pub mod routing;
 
 pub use diagnose::{SelfQualityOutcome, diagnose_self_quality};

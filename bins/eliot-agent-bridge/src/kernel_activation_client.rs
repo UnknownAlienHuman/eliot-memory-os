@@ -38,36 +38,153 @@ use eliot_protocol::ProtocolPayload;
 use crate::KernelTransportOwner;
 use crate::SharedTransport;
 
-/// Surfaces one typed activation denial as its stable agent-visible reason
-/// string. The match is exhaustive with no wildcard arm, so a future denial
-/// code breaks compilation here instead of collapsing into another string.
-pub(super) fn denial_reason_code(reason_code: AgentBridgeActivationDenialCode) -> &'static str {
-    match reason_code {
-        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
-            eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE
+/// I7.20 agent-facing disposition projection for a typed activation denial.
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, every
+/// non-success response carries a two-layer `disposition` + exact
+/// `reason_code` pair: bridges switch on the stable disposition and MAY
+/// specialise known reason codes. Catalogue groups: `TASK_SELECTION_REQUIRED` is
+/// request/identity; `AMBIGUOUS_RESULT` / `STALE_STATE_FENCE` is state/conflict;
+/// `DEADLINE_EXCEEDED` is capacity; `UNKNOWN_OUTCOME` is security/recovery.
+/// Exhaustive with no wildcard arm so a future denial code breaks compilation.
+pub(super) fn agent_disposition_for_denial(code: AgentBridgeActivationDenialCode) -> &'static str {
+    use eliot_agent_bridge_core::{
+        ACTIVATION_DISPOSITION_FAILED, ACTIVATION_DISPOSITION_INVALID_REQUEST,
+        ACTIVATION_DISPOSITION_STALE_OR_CONFLICT, ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+    };
+    match code {
+        AgentBridgeActivationDenialCode::TaskSelectionRequired
+        | AgentBridgeActivationDenialCode::ScopeSelectionRequired => {
+            ACTIVATION_DISPOSITION_INVALID_REQUEST
         }
-        AgentBridgeActivationDenialCode::TaskSelectionRequired => {
-            eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED
-        }
-        AgentBridgeActivationDenialCode::ScopeSelectionRequired => {
-            eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED
-        }
-        AgentBridgeActivationDenialCode::ScopeAmbiguous => {
-            eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS
-        }
-        AgentBridgeActivationDenialCode::NotReady => eliot_protocol::AGENT_BRIDGE_NOT_READY,
-        AgentBridgeActivationDenialCode::StaleFence => eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
-        AgentBridgeActivationDenialCode::FailedInternal => {
-            eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL
+        AgentBridgeActivationDenialCode::ScopeAmbiguous
+        | AgentBridgeActivationDenialCode::StaleFence => ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
+        AgentBridgeActivationDenialCode::NotReady => ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+        AgentBridgeActivationDenialCode::FailedInternal
+        | AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
+            ACTIVATION_DISPOSITION_FAILED
         }
     }
 }
 
+/// Bridge-alias projection from the Kernel↔bridge transport denial code to
+/// the exact I7.20 catalogue `reason_code` carried at the agent face.
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, legacy
+/// transport names translate only through the bridge-alias mapping and never
+/// create host-specific semantic control enums. Every output below is a
+/// verbatim member of the I7.20 Appendix D catalogue: `TASK_SELECTION_REQUIRED`
+/// (request/identity), `TASK_SCOPE_INCOMPATIBLE` (request/identity),
+/// `AMBIGUOUS_RESULT` (state/conflict), `DEFERRED_CAPACITY`
+/// (capacity/availability), `STALE_STATE_FENCE` (state/conflict),
+/// `RUNTIME_FAILED` (route/integration), `UNKNOWN_OUTCOME`
+/// (security/recovery). Exhaustive with no wildcard arm.
+pub(super) fn agent_reason_for_denial(code: AgentBridgeActivationDenialCode) -> &'static str {
+    match code {
+        AgentBridgeActivationDenialCode::TaskSelectionRequired => "TASK_SELECTION_REQUIRED",
+        AgentBridgeActivationDenialCode::ScopeSelectionRequired => "TASK_SCOPE_INCOMPATIBLE",
+        AgentBridgeActivationDenialCode::ScopeAmbiguous => "AMBIGUOUS_RESULT",
+        AgentBridgeActivationDenialCode::NotReady => "DEFERRED_CAPACITY",
+        AgentBridgeActivationDenialCode::StaleFence => "STALE_STATE_FENCE",
+        AgentBridgeActivationDenialCode::FailedInternal => "RUNTIME_FAILED",
+        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => "UNKNOWN_OUTCOME",
+    }
+}
+
+/// I7.20 Recovery / Conflict Directive kind for a typed activation denial.
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, every
+/// non-success response includes the applicable Recovery or Conflict
+/// Directive. Selection denials carry candidate-recovery with no
+/// auto-selection; `NOT_READY` requires a new ticket on retry; stale fence is
+/// fail-closed; internal failures resolve to the failure capsule. The
+/// Kernel-owned no-result refusal carries no failure capsule (none exists),
+/// so its honest recovery is a new ticket. Exhaustive with no wildcard arm.
+pub(super) fn denial_directive_kind(code: AgentBridgeActivationDenialCode) -> &'static str {
+    use eliot_agent_bridge_core::{
+        ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY, ACTIVATION_DIRECTIVE_FAILURE_CAPSULE,
+        ACTIVATION_DIRECTIVE_FENCE_CLOSED, ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET,
+    };
+    match code {
+        AgentBridgeActivationDenialCode::TaskSelectionRequired
+        | AgentBridgeActivationDenialCode::ScopeSelectionRequired
+        | AgentBridgeActivationDenialCode::ScopeAmbiguous => {
+            ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY
+        }
+        AgentBridgeActivationDenialCode::NotReady
+        | AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
+            ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET
+        }
+        AgentBridgeActivationDenialCode::StaleFence => ACTIVATION_DIRECTIVE_FENCE_CLOSED,
+        AgentBridgeActivationDenialCode::FailedInternal => ACTIVATION_DIRECTIVE_FAILURE_CAPSULE,
+    }
+}
+
+/// I7.20 agent-facing denial report for one typed wire denial.
+///
+/// Routes through [`agent_reason_for_denial`]
+/// (catalogue alias), [`agent_disposition_for_denial`], and
+/// [`denial_directive_kind`], and carries the exact owner-issued `detail`
+/// verbatim: candidate/recovery handles, retry dependency plus observed
+/// revision plus earliest-retry bound, observed fence, or failure handle.
+/// A typed detail is never dropped into a code-only denial; a
+/// `SemanticResolutionUnavailable` code never carries a typed detail and a
+/// typed code never arrives without one. Any mismatch fails closed as a
+/// transport rejection, never as a fabricated negative.
+pub(super) fn denial_report_for(
+    code: AgentBridgeActivationDenialCode,
+    detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
+    operation: &str,
+) -> Result<eliot_agent_bridge_core::ActivationDenialReport, ProviderFailure> {
+    let coherent = match &detail {
+        None => code == AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+        Some(eliot_protocol::AgentActivationResolutionDisposition::Resolved { .. }) => false,
+        Some(_) => code != AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+    };
+    if !coherent {
+        return Err(provider_failure());
+    }
+    eliot_agent_bridge_core::ActivationDenialReport::new(
+        agent_reason_for_denial(code),
+        agent_disposition_for_denial(code),
+        denial_directive_kind(code),
+        operation.to_owned(),
+        detail,
+    )
+}
+
+/// Transport failure stays distinct from a typed denial: deadline/unknown
+/// transport outcomes surface as the distinct `DeadlineExceeded` /
+/// `UnknownOutcome` port outcomes and never collapse into a known negative
+/// reason/disposition/directive triple.
 fn provider_failure() -> ProviderFailure {
     ProviderFailure::new(
         "eliot-kernel-front-door",
         "authenticated Kernel application exchange was rejected",
     )
+}
+
+/// Maps a transport exchange that ended with no terminal result to its
+/// distinct port outcome: past the ticket deadline the result can never
+/// arrive (`DeadlineExceeded`); before the deadline the outcome is genuinely
+/// unknown (`UnknownOutcome`) rather than any known negative. Neither mints
+/// authority and neither is a denial.
+fn observe_no_result_outcome(operation: &str, deadline_unix_ms: u64) -> ActivationPortOutcome {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u64::MAX, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    if now_unix_ms >= deadline_unix_ms {
+        ActivationPortOutcome::DeadlineExceeded {
+            operation: operation.to_owned(),
+            deadline_unix_ms,
+        }
+    } else {
+        ActivationPortOutcome::UnknownOutcome {
+            operation: operation.to_owned(),
+        }
+    }
 }
 
 #[allow(
@@ -307,11 +424,11 @@ impl KernelTransportOwner {
                 "activation exchange already consumed; restart/reconnect contour not admitted",
             ));
         }
-        self.activation_used = true;
         let demand = request.demand_id().as_str().to_owned();
         let activation_request =
             build_neutral_activation_request(request, &self.admitted.receipt, &demand)?;
         let frame = activation_frame_for_request(&activation_request)?;
+        let deadline_unix_ms = self.admitted.receipt.activation_deadline_unix_ms;
         let wire = self.runtime.block_on(async {
             self.admitted
                 .transport
@@ -323,13 +440,42 @@ impl KernelTransportOwner {
                 .receive_frame(self.limits)
                 .await
                 .map_err(|_| provider_failure())
-        })?;
+        });
+        // A failed transport exchange consumes no one-shot: nothing terminal
+        // was observed, so a retry may still reach the Kernel exactly once.
+        // Only a completed, decoded response below marks the exchange
+        // consumed. A retry after a half-completed exchange still fails
+        // closed: the Kernel revoked or completed the connection, so the
+        // second send lands on `IdentityConflict`/`SessionFenced`, never on
+        // a second Session.
+        let Ok(wire) = wire else {
+            return Ok(observe_no_result_outcome(&demand, deadline_unix_ms));
+        };
         let response =
             decode_activation_response(&wire, &activation_request, &self.admitted.receipt)?;
+        // A decoded response completes the one-shot even when its projection
+        // below fails closed: the Kernel completed or revoked the connection
+        // when it projected, so a second exchange on it can never mint a
+        // fresh Session. Only a transport failure above (no terminal bytes
+        // observed) leaves the one-shot open for one exact retry.
+        self.activation_used = true;
         match response.disposition {
-            eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
-                let code: &'static str = denial_reason_code(reason_code);
-                Ok(ActivationPortOutcome::Denied { reason_code: code })
+            eliot_protocol::AgentBridgeActivationDisposition::Denied {
+                reason_code,
+                detail,
+            } => {
+                // I7.20 agent-facing denial report: catalogue reason alias,
+                // disposition, directive, operation correlation, and the exact
+                // owner-issued detail. Selection denials carry their exact
+                // candidate/recovery handles with no auto-selection; NOT_READY
+                // carries the dependency revision plus earliest-retry bound
+                // and requires a new ticket on retry; stale fence is
+                // fail-closed with its observed fence; internal failures carry
+                // the exact failure capsule handle. Transport deadline/unknown
+                // never collapses into a known negative: those surface as the
+                // distinct `DeadlineExceeded`/`UnknownOutcome` port outcomes.
+                let report = denial_report_for(reason_code, detail, &demand)?;
+                Ok(ActivationPortOutcome::Denied(report))
             }
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;

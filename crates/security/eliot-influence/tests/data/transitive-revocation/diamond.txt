@@ -1,0 +1,5 @@
+# Transitive revocation fixture: branching graph converging on one leaf.
+origin:alpha branch:b
+origin:alpha branch:c
+branch:b leaf:delta
+branch:c leaf:delta

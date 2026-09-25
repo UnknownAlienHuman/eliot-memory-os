@@ -503,6 +503,81 @@ fn readiness_supervision_snapshot(
 }
 
 #[cfg(windows)]
+fn runtime_health_for_ready(
+    fixture: &ReadinessFixture,
+    ready: &KernelReadyReceipt,
+) -> Result<eliot_kernel_core::KernelRuntimeHealthEvidence, TestError> {
+    use eliot_kernel_core::{
+        CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
+        NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector, StateMigrationClass,
+        VersionRange, admit_handshake, expected_seal_tag,
+    };
+    use eliot_runtime_contracts::{GenerationCutoverState, ModuleGenerationState};
+
+    let architecture_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST.to_owned();
+    let contract_digest = "a".repeat(64);
+    let epoch = fixture.candidate.kernel_epoch.clone();
+    let normative_pair = NormativePairReceipt::new(
+        architecture_digest.clone(),
+        expected_seal_tag(&architecture_digest),
+    )?;
+    let candidate = CompatibilityEnvelope::new(
+        VersionRange::new(1, 2)?,
+        contract_digest.clone(),
+        VersionRange::new(1, 2)?,
+        architecture_digest.clone(),
+        normative_pair,
+        fixture.activation.generation,
+        epoch.clone(),
+        vec!["worker.execute".to_owned()],
+        Vec::new(),
+        StateMigrationClass::NoMigration,
+    )?;
+    let durable = DurableCompatibilityState::new(
+        VersionRange::new(1, 2)?,
+        contract_digest,
+        VersionRange::new(1, 2)?,
+        architecture_digest,
+        epoch.clone(),
+        vec!["worker.execute".to_owned()],
+        StateMigrationClass::NoMigration,
+    )?;
+    let compatibility_evidence = admit_handshake(&candidate, &durable)?;
+    let process_health = ProcessHealthStatus::new(
+        ready.process.process_id.as_str().to_owned(),
+        ready.process.state,
+        ProcessHealthVector::new(
+            ready.health,
+            eliot_runtime_contracts::HealthDimension::Healthy,
+        ),
+        ModuleGenerationState::Active,
+        GenerationCutoverState::Completed,
+    )?;
+    let capability = CapabilityReadiness::new(
+        "worker.execute",
+        vec![
+            HealthDimensionKind::Liveness,
+            HealthDimensionKind::Readiness,
+            HealthDimensionKind::Compatibility,
+            HealthDimensionKind::Integrity,
+            HealthDimensionKind::Capacity,
+            HealthDimensionKind::SupervisionCoverage,
+        ],
+    )?;
+    Ok(eliot_kernel_core::KernelRuntimeHealthEvidence::new(
+        "OPEN",
+        epoch,
+        fixture.activation.generation,
+        compatibility_evidence,
+        eliot_kernel_core::CURRENT_NORMATIVE_PAIR_KEY,
+        eliot_kernel_core::CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+        process_health,
+        vec![capability],
+        false,
+    )?)
+}
+
+#[cfg(windows)]
 fn probe_exchange(
     fixture: &ReadinessFixture,
     validation_revision: u64,
@@ -553,6 +628,7 @@ fn probe_exchange(
         request_digest: request.payload_digest.clone(),
         state: KernelServiceState::Ready,
         receipt: Some(ready.clone()),
+        runtime_health: Some(runtime_health_for_ready(fixture, &ready)?),
         activation_receipt: None,
         store_rebind_receipt: None,
         supervision_lease: Some(supervision_lease),
@@ -569,7 +645,8 @@ fn authenticated_proof(
     validation_revision: u64,
 ) -> Result<AuthenticatedKernelReadiness, TestError> {
     let (request, response, _ready) = probe_exchange(fixture, validation_revision)?;
-    let ready = validate_probe_response(&request, &fixture.activation, &response)?;
+    let (ready, runtime_health) =
+        validate_probe_response(&request, &fixture.activation, &response)?;
     let supervision_lease = response
         .supervision_lease
         .clone()
@@ -585,6 +662,7 @@ fn authenticated_proof(
         request,
         response,
         ready,
+        runtime_health,
         supervision_lease,
         store_fence,
         peer_evidence: PlatformHandle::new("kernel-peer:test-authenticated")?,
@@ -812,9 +890,11 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         doctor_executable_path: path(&portable, "eliot-doctor.exe"),
         testd_executable_path: path(&portable, "eliot-testd.exe"),
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
+        wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch.with_computed_digest()?;
@@ -828,6 +908,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         kernel_executable_path: path(&portable, "eliot-kernel.exe"),
         store_bridge_executable_path: bridge_path,
         canonical_store_executable_path: provider_path,
@@ -835,6 +916,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         doctor_executable_path: path(&portable, "eliot-doctor.exe"),
         testd_executable_path: path(&portable, "eliot-testd.exe"),
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
+        wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
         config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure")],
         license_refs: vec![handle("evidence:licenses")],
@@ -1996,6 +2078,26 @@ fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_
     let mut renewed = proof.supervision_lease.clone();
     renewed.receipt.receipt_sha256 = "d".repeat(64);
     assert!(require_exact_supervision_head(&proof.supervision_lease, || Ok(renewed)).is_err());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn probe_response_rejects_missing_or_foreign_runtime_health_carrier() -> TestResult {
+    let fixture = active_readiness_fixture()?;
+    let (request, response, ready) = probe_exchange(&fixture, 46)?;
+
+    let mut missing = response.clone();
+    missing.runtime_health = None;
+    let missing = missing.with_computed_digest()?;
+    assert!(validate_probe_response(&request, &fixture.activation, &missing).is_err());
+
+    let mut foreign_ready = ready;
+    foreign_ready.process.process_id = PlatformHandle::new("pid:foreign:start:11")?;
+    let mut foreign = response;
+    foreign.runtime_health = Some(runtime_health_for_ready(&fixture, &foreign_ready)?);
+    let foreign = foreign.with_computed_digest()?;
+    assert!(validate_probe_response(&request, &fixture.activation, &foreign).is_err());
     Ok(())
 }
 
@@ -3658,8 +3760,13 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
             jobs,
             readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
             phase_b: None,
+            watchdog_start_recovery: None,
             runtime_restarts: std::collections::HashMap::new(),
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            #[cfg(windows)]
+            user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
             store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,

@@ -70,7 +70,21 @@ impl HostComposition {
             Some(&pending),
         ) {
             if pending.prior_active_generation.is_none() {
-                self.abort_pending_durable(&pending, &host_capability)?;
+                if let Err(abort_error) = self.abort_pending_durable(&pending, &host_capability) {
+                    let reason = format!("pending activation abort was refused: {abort_error}");
+                    if let Err(recovery_error) = persist_pending_recovery(
+                        &self.registry_host_root.clone(),
+                        &mut self.registry,
+                        &host_capability,
+                        &pending,
+                        &reason,
+                    ) {
+                        return Err(HostError::RecoveryRequired(format!(
+                            "pending activation abort was refused ({abort_error}); retaining recovery carrier also failed: {recovery_error}"
+                        )));
+                    }
+                    return Err(abort_error);
+                }
             } else {
                 let reason = error.to_string();
                 persist_pending_recovery(
@@ -852,6 +866,70 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn require_pre_no_return_abort_eligibility(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        if pending.prior_active_generation.is_some() {
+            return Err(HostError::RecoveryRequired(
+                "first-install abort requires no prior active generation".to_owned(),
+            ));
+        }
+        if !matches!(pending.state, PendingActivationState::Pending) {
+            return Err(HostError::RecoveryRequired(
+                "pending activation is already in recovery and must retain its carrier".to_owned(),
+            ));
+        }
+        if pending.phase_b_intent.is_some()
+            || pending.phase_b_prepared.is_some()
+            || pending.phase_b_prepared_receipt.is_some()
+            || pending.phase_b_agent_bridge_stage_prepared.is_some()
+            || pending.phase_b_receipt.is_some()
+            || self.phase_b.is_some()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Phase-B progress exists; abort would erase a durable recovery carrier".to_owned(),
+            ));
+        }
+        let state = self.journal.snapshot()?;
+        let activation = state.activation.ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "pre-no-return abort has no durable Host activation record".to_owned(),
+            )
+        })?;
+        if activation.state != ActivationState::Starting {
+            return Err(HostError::RecoveryRequired(
+                "Host activation crossed the Starting-only abort boundary".to_owned(),
+            ));
+        }
+        let pending_binding = pending_activation_binding(pending)?;
+        if !activation
+            .trigger_evidence
+            .iter()
+            .any(|evidence| evidence == &pending_binding)
+        {
+            return Err(HostError::RecoveryRequired(
+                "Host activation journal is not bound to this pending transaction".to_owned(),
+            ));
+        }
+        if state.kernel.is_some() || state.prior_kernel.is_some() {
+            return Err(HostError::RecoveryRequired(
+                "Host journal retains service progress for the pending activation".to_owned(),
+            ));
+        }
+        if state.prior_kernel_unknown {
+            return Err(HostError::RecoveryRequired(
+                "Host journal retains unknown prior Kernel authority for the pending activation"
+                    .to_owned(),
+            ));
+        }
+        self.reconcile_watchdog_start_for_abort(pending)?;
+        self.jobs
+            .pre_no_return_abort_liveness()
+            .map_err(HostError::RecoveryRequired)
+    }
+
+    #[cfg(windows)]
     fn abort_pending_durable(
         &mut self,
         pending: &eliot_installation::PendingActivation,
@@ -859,52 +937,94 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — pending activation abort requested.
         host_activation_observe("host.activation abort requested");
-        let expected_revision = self.registry.revision();
-        let expected_post_revision = if self.registry.pending_activation().is_some() {
-            expected_revision.checked_add(1).ok_or_else(|| {
+        let activation_intent_digest =
+            pending.activation_intent_digest.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
-                    "pending activation abort registry revision overflow".to_owned(),
+                    "pending activation has no transaction-owned intent digest".to_owned(),
                 )
-            })?
-        } else {
-            expected_revision
-        };
-        let outcome = self.open_registry_store()?.abort_pending_activation(
+            })?;
+
+        // A prior exact receipt is the only replay acknowledgement.  It is
+        // checked before any new mutation so a lost CAS response cannot cause
+        // a second abort or rely on absence-based inference.
+        let prior_ack = self
+            .open_registry_store()?
+            .read_exact_aborted_activation_ack(
+                host_capability,
+                &pending.transaction_id,
+                &pending.plan_digest,
+                &pending.manifest.generation,
+                &pending.manifest_digest,
+                &pending.approval,
+                activation_intent_digest,
+            )
+            .map_err(HostError::Installation)?;
+        if prior_ack.is_some() {
+            self.registry = self.open_registry_store()?.load().map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "exact pending activation abort receipt was found but registry reload failed: {error}"
+                ))
+            })?;
+            host_activation_observe("host.activation aborted readback");
+            return Ok(());
+        }
+
+        self.require_pre_no_return_abort_eligibility(pending)?;
+        let registry_store = self.open_registry_store()?;
+        let expected_revision = registry_store
+            .read_exact_pending_activation_revision(
+                host_capability,
+                &pending.transaction_id,
+                &pending.plan_digest,
+                &pending.approval,
+                activation_intent_digest,
+            )
+            .map_err(HostError::Installation)?;
+        let outcome = registry_store.abort_pending_activation_exact(
             host_capability,
             expected_revision,
             &pending.approval,
+            activation_intent_digest,
         );
-        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
+        drop(registry_store);
+
+        let readback_store = self.open_registry_store()?;
+        let durable = readback_store.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "pending activation abort outcome is unknown and registry readback failed: {readback_error}"
             ))
         })?;
-        let exact_readback = durable.revision() == expected_post_revision
-            && durable.pending_activation().is_none()
-            && durable.active().is_none()
-            && !durable
-                .generations()
-                .iter()
-                .any(|generation| generation.manifest.generation == pending.manifest.generation);
+        let exact_ack = readback_store
+            .read_exact_aborted_activation_ack(
+                host_capability,
+                &pending.transaction_id,
+                &pending.plan_digest,
+                &pending.manifest.generation,
+                &pending.manifest_digest,
+                &pending.approval,
+                activation_intent_digest,
+            )
+            .map_err(HostError::Installation)?;
         self.registry = durable;
         match outcome {
-            Ok(()) if exact_readback => {
-                // WORK_UNIT_CASE: 893/14 — pending activation aborted by
-                // direct CAS; distinct from commit.
+            Ok(()) if exact_ack.is_some() => {
+                // WORK_UNIT_CASE: 893/14 — pending activation aborted by the
+                // exact owner CAS and confirmed by its durable receipt.
                 host_activation_observe("host.activation aborted");
                 Ok(())
             }
-            Ok(()) => Err(HostError::RecoveryRequired(
-                "pending activation abort succeeded but exact registry readback failed".to_owned(),
-            )),
-            Err(_error) if exact_readback => {
-                // WORK_UNIT_CASE: 893/14 — abort confirmed by exact readback
-                // after an unknown CAS outcome.
+            Err(_error) if exact_ack.is_some() => {
+                // WORK_UNIT_CASE: 893/14 — abort confirmed by the exact
+                // operation-bound receipt after an unknown CAS outcome.
                 host_activation_observe("host.activation aborted readback");
                 Ok(())
             }
+            Ok(()) => Err(HostError::RecoveryRequired(
+                "pending activation abort succeeded without the exact durable ABORTED receipt"
+                    .to_owned(),
+            )),
             Err(error) => Err(HostError::RecoveryRequired(format!(
-                "pending activation abort failed and exact readback did not confirm it: {error}"
+                "pending activation abort failed and exact durable ABORTED receipt did not confirm it: {error}"
             ))),
         }
     }

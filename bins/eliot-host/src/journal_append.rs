@@ -588,11 +588,9 @@ mod governance_profile_tests {
             ActivationState::Starting,
             "host-open",
         )?;
-        assert_eq!(
-            starting.governance_profile.as_str(),
-            "runtime-degraded-v3"
-        );
-        let active = transition_activation_record(&starting, ActivationState::Active, "host-active")?;
+        assert_eq!(starting.governance_profile.as_str(), "runtime-degraded-v3");
+        let active =
+            transition_activation_record(&starting, ActivationState::Active, "host-active")?;
         assert_eq!(active.governance_profile.as_str(), "runtime-live-v3");
         Ok(())
     }

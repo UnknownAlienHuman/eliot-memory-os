@@ -19,14 +19,14 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use eliot_host::host_diagnostics::{
+    DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, HOST_TERMINAL_CODE_CONSOLE_FAILED,
+    HOST_TERMINAL_CODE_DISPATCHER_FAILED, MAX_DIAGNOSTIC_DETAIL_BYTES, MAX_DIAGNOSTIC_FIELD_BYTES,
     bound_detail, bound_field, install_host_diagnostics, observe_entrypoint,
-    observe_terminal_error, sink_status, DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET,
-    HOST_TERMINAL_CODE_CONSOLE_FAILED, HOST_TERMINAL_CODE_DISPATCHER_FAILED,
-    MAX_DIAGNOSTIC_DETAIL_BYTES, MAX_DIAGNOSTIC_FIELD_BYTES,
+    observe_terminal_error, sink_status,
 };
 use eliot_host::windows_event_log::{
-    event_log_sink_status, report_event, AdmittedEvent, EventLogRecord, WindowsEventLogError,
-    WindowsEventLogQueue, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SOURCE,
+    AdmittedEvent, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SOURCE, EventLogRecord,
+    WindowsEventLogError, WindowsEventLogQueue, event_log_sink_status, report_event,
 };
 use serde_json::Value;
 

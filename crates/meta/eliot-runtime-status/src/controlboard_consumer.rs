@@ -743,6 +743,7 @@ mod tests {
             ],
             reviews: vec![review("review-1")],
             provenance: Vec::new(),
+            notifications: Vec::new(),
         }
     }
 

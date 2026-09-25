@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""Verify the provider-free ELIOT cross-route swarm Product Pulse."""
+"""Verify the provider-free ELIOT cross-route swarm Product Pulse.
+
+provider-free swarm control-plane FIXTURE; validates fixture consistency only,
+never observed processes/providers; receipt ceiling
+DETERMINISTIC_CONTROL_PLANE_SHAPE_ONLY, provider_executions=0,
+eligible_for_route_promotion=false; NOT live swarm or Product-Pulse (#11)
+evidence; execution status NOT_EXECUTED.
+"""
 from __future__ import annotations
 
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Callable
 
 from swarm_product_pulse import (
     CONTRACT_PATH,
     SCENARIO_PATH,
+    VERIFIER_VERSION,
     SwarmPulseError,
     canonical_json_bytes,
     load_json,
     run_swarm_pulse,
+    sha256_json,
 )
 
 
@@ -75,9 +85,17 @@ def self_test(root: Path) -> None:
     _expect_failure("worker result authority", lambda: _execute(root, contract, result_authority))
 
     unknown_descendant = copy.deepcopy(scenario)
-    unknown_descendant["cancellation_receipts"][0]["descendants_closed"] = False
+    unknown_descendant["cancellation_receipts"][0]["expected_descendants_closed"] = False
     unknown_descendant["cancellation_receipts"][0]["unknown_live_descendants"] = True
     _expect_failure("unknown live descendant", lambda: _execute(root, contract, unknown_descendant))
+
+    observed_closure = copy.deepcopy(scenario)
+    observed_closure["cancellation_receipts"][0]["process_tree_closed"] = True
+    _expect_failure("observed process closure smuggling", lambda: _execute(root, contract, observed_closure))
+
+    observed_outcome = copy.deepcopy(scenario)
+    observed_outcome["cancellation_receipts"][0]["outcome"] = "cancelled_confirmed"
+    _expect_failure("observed cancellation outcome", lambda: _execute(root, contract, observed_outcome))
 
     no_dissent = copy.deepcopy(scenario)
     no_dissent["concilium"]["preserved_dissent"] = []
@@ -88,6 +106,20 @@ def self_test(root: Path) -> None:
     worker_decision["decision"]["disposition"] = "promote"
     worker_decision["decision"]["eligible_for_route_promotion"] = True
     _expect_failure("worker vote/promotion", lambda: _execute(root, contract, worker_decision))
+
+
+def _assert_no_observed_closure(value: object) -> None:
+    """Fail if the emitted receipt presents fixture closure as observed process receipt."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in ("process_tree_closed", "descendants_closed"):
+                raise AssertionError(f"receipt presents observed closure field: {key}")
+            _assert_no_observed_closure(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_no_observed_closure(child)
+    elif value == "cancelled_confirmed":
+        raise AssertionError("receipt presents observed cancellation outcome")
 
 
 def verify_current(root: Path) -> dict:
@@ -113,7 +145,77 @@ def verify_current(root: Path) -> dict:
     for key, value in expected.items():
         if receipt.get(key) != value:
             raise AssertionError(f"receipt field drifted: {key}")
+    for key in (
+        "source_commit",
+        "source_tree",
+        "contract_sha256",
+        "scenario_sha256",
+        "verifier_version",
+        "route_profile_digests",
+        "provider_execution_status",
+        "process_observation_status",
+        "runtime_execution_status",
+    ):
+        if key not in receipt:
+            raise AssertionError(f"receipt provenance drifted: {key}")
+    if receipt.get("verifier_version") != VERIFIER_VERSION:
+        raise AssertionError("receipt verifier version drifted")
+    if receipt.get("contract_sha256") != sha256_json(contract):
+        raise AssertionError("receipt contract digest drifted")
+    if receipt.get("scenario_sha256") != sha256_json(scenario):
+        raise AssertionError("receipt scenario digest drifted")
+    digests = receipt.get("route_profile_digests")
+    if not isinstance(digests, list) or [
+        (entry.get("host"), entry.get("sha256")) for entry in digests if isinstance(entry, dict)
+    ] != sorted((host, receipt["route_profile_sha256"][host]) for host in receipt["hosts"]):
+        raise AssertionError("receipt route profile digests drifted")
+    for key in ("provider_execution_status", "process_observation_status", "runtime_execution_status"):
+        if receipt.get(key) != "NOT_EXECUTED":
+            raise AssertionError(f"receipt execution status drifted: {key}")
+    _assert_no_observed_closure(receipt)
     return receipt
+
+
+def _emit_receipt_create_new(root: Path, candidate: Path, payload: bytes) -> None:
+    evidence_root = (root / ".eliot").resolve()
+    absolute_candidate = candidate if candidate.is_absolute() else (root / candidate)
+    if os.path.islink(absolute_candidate):
+        raise SwarmPulseError("refusing swarm pulse receipt over symlink final path")
+    for ancestor in [absolute_candidate, *absolute_candidate.parents]:
+        if os.path.islink(ancestor):
+            raise SwarmPulseError("refusing swarm pulse receipt through symlink path")
+        if ancestor == ancestor.parent:
+            break
+    resolved_candidate = absolute_candidate.resolve()
+    try:
+        resolved_candidate.relative_to(evidence_root)
+    except ValueError:
+        raise SwarmPulseError("swarm pulse receipt path escapes <root>/.eliot/") from None
+    parent = resolved_candidate.parent
+    try:
+        parent.relative_to(evidence_root)
+    except ValueError:
+        raise SwarmPulseError("swarm pulse receipt parent escapes <root>/.eliot/") from None
+    parent.mkdir(parents=True, exist_ok=True)
+    current: Path = parent
+    while True:
+        if os.path.islink(current):
+            raise SwarmPulseError("refusing swarm pulse receipt through symlink parent")
+        try:
+            current.relative_to(evidence_root)
+        except ValueError:
+            raise SwarmPulseError("swarm pulse receipt parent escapes <root>/.eliot/") from None
+        if current == evidence_root or current == current.parent:
+            break
+        current = current.parent
+    if os.path.islink(resolved_candidate) or os.path.lexists(resolved_candidate):
+        # lexists covers dangling symlink/reparse without following it.
+        raise SwarmPulseError("swarm pulse receipt already exists (create-new only, no overwrite)")
+    try:
+        with open(resolved_candidate, "xb") as handle:
+            handle.write(payload)
+    except FileExistsError:
+        raise SwarmPulseError("swarm pulse receipt already exists (create-new only, no overwrite)") from None
 
 
 def main() -> int:
@@ -126,13 +228,12 @@ def main() -> int:
 
     if arguments.self_test:
         self_test(root)
-        print("SWARM_PRODUCT_PULSE_SELF_TEST: PASS cases=9")
+        print("SWARM_PRODUCT_PULSE_SELF_TEST: PASS cases=11")
         return 0
 
     receipt = verify_current(root)
     if arguments.emit_receipt:
-        arguments.emit_receipt.parent.mkdir(parents=True, exist_ok=True)
-        arguments.emit_receipt.write_bytes(canonical_json_bytes(receipt) + b"\n")
+        _emit_receipt_create_new(root, arguments.emit_receipt, canonical_json_bytes(receipt) + b"\n")
     else:
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2))
     return 0

@@ -927,11 +927,17 @@ fn classify_codex_payload(
                 execution_unit: bound_unit.clone(),
                 start_ref: bound_turn.to_owned(),
             }),
-            omitted_fields: omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]),
+            omitted_fields: omitted_top_level_keys(
+                params,
+                &["threadId", "thread_id", "turn", "turnId"],
+            ),
             warnings: Vec::new(),
             privacy_class: HostEventPrivacyClass::RedactedSummary,
-            coverage: if omitted_top_level_keys(params, &["threadId", "thread_id", "turn"])
-                .is_empty()
+            coverage: if omitted_top_level_keys(
+                params,
+                &["threadId", "thread_id", "turn", "turnId"],
+            )
+            .is_empty()
             {
                 NormalizationCoverage::Complete
             } else {
@@ -1013,7 +1019,8 @@ fn classify_codex_payload(
         }
         "turn/completed" => {
             if let Some(status) = terminal_status_from(params) {
-                let omitted = omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]);
+                let omitted =
+                    omitted_top_level_keys(params, &["threadId", "thread_id", "turn", "turnId"]);
                 let coverage = if omitted.is_empty() {
                     NormalizationCoverage::Complete
                 } else {
@@ -1036,7 +1043,7 @@ fn classify_codex_payload(
                     method,
                     UnsupportedEventReason::UnknownMethod,
                     vec!["non-terminal-turn-status".to_owned()],
-                    omitted_top_level_keys(params, &["threadId", "thread_id"]),
+                    omitted_top_level_keys(params, &["threadId", "thread_id", "turnId"]),
                 ))
             }
         }
@@ -1100,15 +1107,34 @@ fn validate_binding_for_codex(binding: &ProviderExecutionBinding) -> Result<(), 
     Ok(())
 }
 
-/// Extract the exact opaque turn ID with the real JSON parser: only
-/// `params.turn.id` as a string counts as turn evidence. Absent, null, or
-/// non-string turn identity is missing evidence, never a guessed turn.
+/// Extract the exact opaque turn ID with the real JSON parser, from both
+/// upstream turn-identity positions: `params.turn.id` (turn-scoped
+/// notifications: `turn/started` and `turn/completed` carry
+/// `{ threadId, turn: Turn }` with `Turn.id`) and top-level `params.turnId`
+/// (item delta notifications: `item/agentMessage/delta` carries
+/// `{ threadId, turnId, itemId, delta }`).
+///
+/// Only exact nonblank strings count as turn evidence. Absent, null,
+/// non-string, or blank turn identity is missing evidence, never a guessed
+/// turn. Two present string identities that disagree are conflicting evidence
+/// and yield no turn: the caller fails closed instead of choosing one.
 fn wire_turn_id(params: &Value) -> Option<&str> {
-    params
+    let nested = params
         .get("turn")
         .and_then(Value::as_object)
         .and_then(|turn| turn.get("id"))
         .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty());
+    let top_level = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty());
+    match (nested, top_level) {
+        (Some(nested), Some(top_level)) if nested == top_level => Some(nested),
+        (Some(nested), None) => Some(nested),
+        (None, Some(top_level)) => Some(top_level),
+        _ => None,
+    }
 }
 
 fn validate_wire_session_against_binding(
@@ -1550,6 +1576,190 @@ fn validate_terminal_observation(
 /// observation is always `UNOBSERVED` with an explicit reason (the adapter
 /// records no separate physical route), and the admitted/binding linkage is
 /// enforced via `validate_against(binding, admission)`.
+/// Evidence references carried by a translated Codex result: a content hash
+/// of the provider output text when present, otherwise the terminal-event
+/// identity the outcome was derived from. Pure projection, no I/O.
+fn codex_result_evidence_refs(input: &CodexResultInput) -> Vec<String> {
+    let output_digest = input
+        .output
+        .as_deref()
+        .map(|text| blake3::hash(text.as_bytes()).to_hex().to_string());
+    let mut evidence_refs = output_digest
+        .into_iter()
+        .map(|digest| format!("codex-output:{digest}"))
+        .collect::<Vec<_>>();
+    if evidence_refs.is_empty()
+        && let Some(terminal) = &input.terminal_observation
+    {
+        evidence_refs.push(format!("codex-terminal:{}", terminal.event_id.as_str()));
+    }
+    evidence_refs
+}
+
+/// Result disposition for a translated Codex result: cancellation is
+/// observed; a missing terminal observation is an unknown outcome with an
+/// explicit reason; an owner-bound terminal observation with observed wall
+/// time is a partial candidate success; a terminal observation without
+/// observed wall time stays unknown (outcome time genuinely unproven, no
+/// timestamp invented) so ownership is retained until reconciliation.
+fn codex_result_disposition(input: &CodexResultInput) -> (ResultDisposition, Option<String>) {
+    if input.cancelled {
+        (
+            ResultDisposition::CancelledObserved,
+            input.unknown_reason.clone(),
+        )
+    } else if input.terminal_observation.is_none() {
+        (
+            ResultDisposition::UnknownOutcome,
+            Some(
+                input
+                    .unknown_reason
+                    .clone()
+                    .unwrap_or_else(|| "terminal observation absent".into()),
+            ),
+        )
+    } else if codex_terminal_time_known(input) {
+        (ResultDisposition::Partial, input.unknown_reason.clone())
+    } else {
+        (
+            ResultDisposition::UnknownOutcome,
+            Some(
+                input
+                    .unknown_reason
+                    .clone()
+                    .unwrap_or_else(|| "terminal observation carries no observed wall time".into()),
+            ),
+        )
+    }
+}
+
+/// Whether the terminal observation carries observed wall-clock time.
+/// Disposition follows proven termination, never wall-clock availability
+/// alone; this predicate keeps the two axes consistent without inventing
+/// a timestamp. Pure projection, no I/O.
+fn codex_terminal_time_known(input: &CodexResultInput) -> bool {
+    input
+        .terminal_observation
+        .as_ref()
+        .is_some_and(|observation| observation.observed_at.valid_time_ms.is_some())
+}
+
+/// Terminal reading for a translated Codex result: the observation's own
+/// time when execution is observed, otherwise the default unobserved
+/// reading. Never invents wall time; `ClockReading` is `Copy`, so the
+/// observed value is copied, not cloned.
+fn codex_terminal_reading(
+    input: &CodexResultInput,
+    execution_outcome: ExecutionOutcome,
+) -> ClockReading {
+    if execution_outcome == ExecutionOutcome::Observed
+        && !input.cancelled
+        && let Some(terminal) = &input.terminal_observation
+        && terminal.observed_at.valid_time_ms.is_some()
+    {
+        terminal.observed_at
+    } else {
+        ClockReading::default()
+    }
+}
+
+/// Execution-outcome axis for a translated Codex result, kept independent
+/// of the route axis: cancelled carries observed cancellation; an
+/// owner-bound terminal observation with observed wall time is observed
+/// execution (termination proven under the exact binding, no handle minted);
+/// every other outcome stays unknown with a quarantine recovery handle,
+/// preserving evidence without fabricating wall time.
+fn codex_execution_outcome(
+    input: &CodexResultInput,
+    unknown_reason: Option<&String>,
+) -> (ExecutionOutcome, Option<CancellationState>, Option<String>) {
+    if input.cancelled {
+        (
+            ExecutionOutcome::Observed,
+            Some(CancellationState::Acknowledged),
+            None,
+        )
+    } else if let Some(terminal) = &input.terminal_observation {
+        if terminal.observed_at.valid_time_ms.is_some() {
+            (ExecutionOutcome::Observed, None, None)
+        } else {
+            let handle = format!("codex-terminal:{}", terminal.event_id.as_str());
+            (ExecutionOutcome::UnknownOutcome, None, Some(handle))
+        }
+    } else {
+        (
+            ExecutionOutcome::UnknownOutcome,
+            None,
+            Some(
+                unknown_reason
+                    .cloned()
+                    .unwrap_or_else(|| "terminal observation absent".to_owned()),
+            ),
+        )
+    }
+}
+
+/// Binding-gated physical observation for a translated Codex result:
+/// `UNOBSERVED` with an explicit reason, never observed=requested. The
+/// request commitment is the bound start request preserved verbatim, and
+/// the sealed receipt is enforced against the live binding/admission here,
+/// never at a later intake.
+fn codex_observation_receipt(
+    input: &CodexResultInput,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+    request_digest: LowercaseSha256,
+    execution_outcome: ExecutionOutcome,
+    cancellation: Option<CancellationState>,
+    recovery_ref: Option<String>,
+) -> Result<PhysicalRouteObservationReceipt, CodexAdapterError> {
+    let terminal = codex_terminal_reading(input, execution_outcome);
+    let mut actual_route = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: binding.attempt_id.clone(),
+        state_fence: binding.state_fence.clone(),
+        runtime_generation: binding.runtime_generation,
+        admitted_route_digest: admission.self_digest.clone(),
+        binding: binding.clone(),
+        requested_route: input.route.clone(),
+        observed_route: None,
+        route_state: RouteObservationState::Unobserved,
+        diverged_fields: Vec::new(),
+        execution_outcome,
+        request_digest,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: input.usage.clone(),
+        started: ClockReading::default(),
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal,
+        event_cursor: EventCursor::new("codex-result")?,
+        event_sequence: 1,
+        cancellation,
+        unobserved_reason: Some(
+            "codex physical route not separately observed; requested retained without synthesis"
+                .to_owned(),
+        ),
+        recovery_ref,
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: serde_json::from_value(serde_json::Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?,
+    };
+    actual_route.self_digest = actual_route
+        .compute_digest()
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    // Enforce exact binding/attempt/lease/fence/generation/admission
+    // agreement and requested==admitted-selected; forged or mismatched
+    // linkage fails closed here, never at a later intake.
+    actual_route.validate_against(binding, admission)?;
+    Ok(actual_route)
+}
+
 pub fn translate_result(
     input: CodexResultInput,
     binding: &ProviderExecutionBinding,
@@ -1574,108 +1784,29 @@ pub fn translate_result(
     if let Some(terminal) = &input.terminal_observation {
         validate_terminal_observation(terminal, binding, admission)?;
     }
-    let output_digest = input
-        .output
-        .as_deref()
-        .map(|text| blake3::hash(text.as_bytes()).to_hex().to_string());
-    let mut evidence_refs = output_digest
-        .into_iter()
-        .map(|digest| format!("codex-output:{digest}"))
-        .collect::<Vec<_>>();
-    if evidence_refs.is_empty()
-        && let Some(terminal) = &input.terminal_observation
-    {
-        evidence_refs.push(format!("codex-terminal:{}", terminal.event_id.as_str()));
-    }
-    let (disposition, unknown_reason) = if input.cancelled {
-        (ResultDisposition::CancelledObserved, input.unknown_reason)
-    } else if input.terminal_observation.is_none() {
-        (
-            ResultDisposition::UnknownOutcome,
-            Some(
-                input
-                    .unknown_reason
-                    .unwrap_or_else(|| "terminal observation absent".into()),
-            ),
-        )
-    } else {
-        (ResultDisposition::Partial, input.unknown_reason)
-    };
-    let zero_digest: LowercaseSha256 = serde_json::from_value(serde_json::Value::String(
-        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-    ))
-    .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    let evidence_refs = codex_result_evidence_refs(&input);
+    let (disposition, unknown_reason) = codex_result_disposition(&input);
+    // The request commitment is the bound start request preserved verbatim:
+    // a substituted digest fails `validate_against` below, so two different
+    // start requests can never report the same commitment.
+    let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+        .map_err(CodexAdapterError::Contract)?;
     // Binding-gated physical observation: UNOBSERVED with explicit reason,
-    // never observed=requested. Cancelled carries observed cancellation;
-    // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
-    // handle, preserving evidence without fabricating wall time.
-    let (execution_outcome, cancellation, recovery_ref) = if input.cancelled {
-        (
-            ExecutionOutcome::Observed,
-            Some(CancellationState::Acknowledged),
-            None,
-        )
-    } else if input.terminal_observation.is_some() {
-        let handle = input
-            .terminal_observation
-            .as_ref()
-            .map(|terminal| format!("codex-terminal:{}", terminal.event_id.as_str()))
-            .unwrap_or_else(|| "codex-partial-recovery".to_owned());
-        (ExecutionOutcome::UnknownOutcome, None, Some(handle))
-    } else {
-        (
-            ExecutionOutcome::UnknownOutcome,
-            None,
-            Some(
-                unknown_reason
-                    .clone()
-                    .unwrap_or_else(|| "terminal observation absent".to_owned()),
-            ),
-        )
-    };
-    let mut actual_route = PhysicalRouteObservationReceipt {
-        schema_version: CONTRACT_VERSION.to_owned(),
-        attempt_id: binding.attempt_id.clone(),
-        state_fence: binding.state_fence.clone(),
-        runtime_generation: binding.runtime_generation,
-        admitted_route_digest: admission.self_digest.clone(),
-        binding: binding.clone(),
-        requested_route: input.route.clone(),
-        observed_route: None,
-        route_state: RouteObservationState::Unobserved,
-        diverged_fields: Vec::new(),
+    // never observed=requested. Cancelled carries observed cancellation; an
+    // owner-bound terminal observation with observed wall time is observed
+    // execution with the observation's own terminal time propagated (never
+    // invented); every other outcome stays unknown with its recovery handle.
+    let (execution_outcome, cancellation, recovery_ref) =
+        codex_execution_outcome(&input, unknown_reason.as_ref());
+    let actual_route = codex_observation_receipt(
+        &input,
+        binding,
+        admission,
+        request_digest,
         execution_outcome,
-        request_digest: zero_digest,
-        translation_digest: None,
-        raw_evidence_digest: None,
-        raw_evidence_ref: None,
-        usage: input.usage.clone(),
-        started: ClockReading::default(),
-        first_byte: ClockReading::default(),
-        first_semantic: ClockReading::default(),
-        terminal: ClockReading::default(),
-        event_cursor: EventCursor::new("codex-result")?,
-        event_sequence: 1,
         cancellation,
-        unobserved_reason: Some(
-            "codex physical route not separately observed; requested retained without synthesis"
-                .to_owned(),
-        ),
         recovery_ref,
-        safe_public_error: None,
-        restricted_raw_error_ref: None,
-        self_digest: serde_json::from_value(serde_json::Value::String(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        ))
-        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?,
-    };
-    actual_route.self_digest = actual_route
-        .compute_digest()
-        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
-    // Enforce exact binding/attempt/lease/fence/generation/admission
-    // agreement and requested==admitted-selected; forged or mismatched
-    // linkage fails closed here, never at a later intake.
-    actual_route.validate_against(binding, admission)?;
+    )?;
     let result = AgentResult {
         attempt_id: binding.attempt_id.clone(),
         disposition,
@@ -1689,6 +1820,38 @@ pub fn translate_result(
     };
     result.validate(authority)?;
     Ok(result)
+}
+
+/// Production terminal assembly for Codex provider output (issue #370
+/// W29/A22): the in-crate production driver that turns one assembled
+/// [`CodexResultInput`] into a provider-neutral candidate [`AgentResult`].
+///
+/// The input contract requires assembly from a *complete* event stream — the
+/// terminal observation is the exact bound envelope from the validated
+/// stream, never a boolean completion claim — but [`translate_result`] cannot
+/// verify that: it sees only the input. This driver closes the gap by forcing
+/// the assembler to attest stream completeness explicitly: `stream_complete`
+/// must hold exactly when the input was drained from a complete stream, and a
+/// `false` attestation fails closed with [`CodexAdapterError::MalformedWire`]
+/// before any translation, so an incomplete stream can never yield even an
+/// unknown-outcome candidate through this entry. Success still maps to
+/// candidate-only `Partial`, cancellation keeps its typed meaning, and every
+/// other outcome stays unknown with its recovery handle, exactly as
+/// [`translate_result`] defines; this entry adds the attestation gate and
+/// changes no mapping.
+pub fn assemble_candidate_result(
+    input: CodexResultInput,
+    stream_complete: bool,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+    authority: &EffectCeiling,
+) -> Result<AgentResult, CodexAdapterError> {
+    if !stream_complete {
+        return Err(CodexAdapterError::MalformedWire(
+            "codex result stream incomplete; terminal observation unattested",
+        ));
+    }
+    translate_result(input, binding, admission, authority)
 }
 
 /// Checked interrupt construction: targets the exact bound turn on the exact
@@ -2829,6 +2992,116 @@ mod tests {
             started.payload,
             NormalizedHostEventPayload::ExecutionStarted(_)
         ));
+        Ok(())
+    }
+
+    /// Upstream turn identity arrives in two exact positions: `params.turn.id`
+    /// for turn-scoped notifications (`turn/started`, `turn/completed`) and
+    /// top-level `params.turnId` for item deltas
+    /// (`item/agentMessage/delta` carries `{ threadId, turnId, itemId, delta }`).
+    /// Both are exact bound-turn evidence; anything else quarantines.
+    #[test]
+    fn top_level_turn_id_is_exact_turn_evidence() -> TestResult {
+        let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
+        // Positive: upstream delta shape with the exact bound top-level turn.
+        let (delta, _) = normalize_bound(
+            "item/agentMessage/delta",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "hello",
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            delta.payload,
+            NormalizedHostEventPayload::AssistantDelta(ref observation)
+                if observation.delta_chars == 5
+        ));
+        assert_eq!(delta.lineage.attributable_binding()?, &binding);
+        // Negative (cross-turn): same thread, foreign top-level turn.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "item/agentMessage/delta",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-2",
+                "itemId": "item-1",
+                "delta": "hello",
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Negative (loss): delta with no turn identity anywhere is missing
+        // evidence, never convenient attribution.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "item/agentMessage/delta",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "itemId": "item-1",
+                "delta": "hello",
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Negative (conflict): `turn.id` and top-level `turnId` disagree, so
+        // neither is chosen.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "turn/completed",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-2",
+                "turn": {"id": "turn-1", "status": "completed"},
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Agreement: both positions present and equal still attributes.
+        let (agreed, _) = normalize_bound(
+            "turn/started",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            agreed.payload,
+            NormalizedHostEventPayload::ExecutionStarted(_)
+        ));
+        // Robustness: a non-string top-level turn is not evidence; the exact
+        // `turn.id` still attributes.
+        let (numeric, _) = normalize_bound(
+            "turn/started",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": 42,
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            }),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            numeric.payload,
+            NormalizedHostEventPayload::ExecutionStarted(_)
+        ));
+        assert_eq!(numeric.lineage.attributable_binding()?, &binding);
         Ok(())
     }
 

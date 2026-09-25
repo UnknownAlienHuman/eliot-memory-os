@@ -35,7 +35,7 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
-use eliot_mcp::KernelHostRequestPort;
+use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -45,7 +45,10 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
+pub mod reactive_runtime_composition;
+pub mod settled_plan_transport;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
@@ -53,13 +56,19 @@ use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
-    denial_reason_code,
 };
-use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
+pub use kernel_host_request_client::KernelHostRequestClient;
+use kernel_host_request_client::ReplayCacheEntry;
+pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
-    AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
+    AdmissionBasis, AttentionItem, CueOrigin, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
+};
+pub use settled_plan_transport::{
+    AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
+    PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
+    admit_producer_feed, governor_assess, render_admission_fence,
 };
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
@@ -106,8 +115,17 @@ struct AdmittedConnection {
 /// identity. `replay_cache` makes exact host replays byte-identical (the
 /// kernel deduplicates by envelope digest) and turns a changed payload under
 /// a known correlation into a local `IdempotencyConflict` with no wire
-/// traffic. Neither is durable: both die with this process, which spans
-/// exactly one admitted connection.
+/// traffic.
+///
+/// Durability boundary: `replay_cache` and `activated_session` are process
+/// memory only; both die with this process, which spans exactly one admitted
+/// connection. Durable idempotency and unknown-outcome settlement belong to
+/// the Kernel ORS record, reachable after re-attach through the reconcile and
+/// restore entries owned by `KernelHostRequestClient`
+/// (`agent_host_request_reconcile`, `REACTIVE_RESTORE_OPERATION`). Neither
+/// the gateway client nor the reply parser holds a second ledger: the replay
+/// cache is a byte-identity aid for the live connection, never a
+/// redelivery or reconciliation log.
 struct KernelTransportOwner {
     admitted: AdmittedConnection,
     runtime: tokio::runtime::Runtime,
@@ -120,6 +138,23 @@ struct KernelTransportOwner {
 
 type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 
+/// Fail-closed event-route face: the Kernel front door admits activation
+/// and host-request envelopes, but no MCP/event forwarding route.
+///
+/// Every method fails closed while distinguishing the four acknowledgement
+/// phases honestly. Receipt is owned by the bridge: the core journals the
+/// host event (`observe_host_event`) before the port is called, so the
+/// receipt stands in the bridge journal even though forwarding is refused.
+/// Durability, normalization, and application are owned by the Kernel
+/// observation route, which has not admitted this bridge — so no Kernel ORS
+/// durable record is staged, nothing is normalized, and nothing is applied.
+/// The event-delivery capability is therefore exposed as unavailable with
+/// its owner/dependency reference (#77 req 4 allocates the bounded
+/// event-delivery/reconciliation child to the Kernel observation/ORS
+/// owner): neither `ReconcileExternal` (also unadmitted here) nor a retry
+/// can succeed until that route is admitted. Host-request
+/// submit/cancel/reconcile entries carry invocation intent and are not
+/// event delivery; never resubmit a refused event as a host request.
 struct KernelMcpForwardingPort;
 
 impl McpForwardingPort for KernelMcpForwardingPort {
@@ -130,7 +165,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<(), ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "forwarding not admitted",
+            "hook forwarding unavailable: no admitted Kernel observation/ORS event route \
+             (front door admits activation and host-request envelopes only); receipt stands \
+             in the bridge journal, no Kernel durable record staged, nothing normalized or \
+             applied; owner: Kernel observation route (#77 req 4 allocates the \
+             event-delivery/reconciliation child there); retry cannot succeed until that \
+             route is admitted; host-request submit is not event delivery",
         ))
     }
     fn forward_event(
@@ -140,7 +180,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<EventPortOutcome, ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "forwarding not admitted",
+            "event forwarding unavailable: no admitted Kernel observation/ORS event route \
+             (front door admits activation and host-request envelopes only); receipt stands \
+             in the bridge journal, no Kernel ORS durable record staged, nothing normalized \
+             or applied; owner: Kernel observation route (#77 req 4 allocates the \
+             event-delivery/reconciliation child there); retry cannot succeed until that \
+             route is admitted; host-request submit is not event delivery",
         ))
     }
     fn forward_gap(
@@ -150,7 +195,10 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<(), ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "forwarding not admitted",
+            "gap forwarding unavailable: no admitted Kernel observation/ORS event route, so \
+             no durable, normalized, or applied phase reached; owner: Kernel observation \
+             route (#77 req 4 allocates the event-delivery/reconciliation child there); \
+             retry cannot succeed until that route is admitted",
         ))
     }
     fn reconcile_external(
@@ -159,14 +207,19 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
         Err(ProviderFailure::new(
             "eliot-kernel-front-door",
-            "reconciliation not admitted",
+            "event-route reconciliation unavailable: no admitted Kernel observation/ORS \
+             event route; durable idempotency and unknown-outcome belong to the Kernel ORS \
+             record once that route admits this bridge; owner: Kernel observation route \
+             (#77 req 4 allocates the event-delivery/reconciliation child there); the \
+             KernelHostRequestClient reconcile entry settles host-request operations only \
+             and is not event durability; host-request forwarding is not event delivery",
         ))
     }
 }
 
 pub type KernelPorts = (
     Box<dyn HostActivationPort>,
-    Box<dyn KernelHostRequestPort>,
+    KernelHostRequestClient,
     Box<dyn McpForwardingPort>,
 );
 
@@ -205,6 +258,18 @@ fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, Runtime
     }
 }
 
+/// Admits one front-door connection and splits the single retained
+/// transport owner into its three kernel faces.
+///
+/// The `SharedTransport` clone handed to `KernelHostRequestClient` is the
+/// only rehydrate hook: the Kernel-owned reconcile/restore entries
+/// (`agent_host_request_reconcile`, `REACTIVE_RESTORE_OPERATION`) reuse it,
+/// so no second transport and no duplicated envelope state machine exist
+/// here. The forwarding face deliberately holds no transport: refused events
+/// expose the unadmitted event-delivery capability with its Kernel
+/// observation-route owner reference, never by resubmitting them
+/// as host requests and never through a reconcile-then-retry loop that
+/// cannot succeed until that route is admitted.
 pub fn kernel_ports_with_declaration(
     declaration_path: &Path,
 ) -> Result<KernelPorts, RuntimeBuildError> {
@@ -300,8 +365,7 @@ pub fn kernel_ports_with_declaration(
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
         shared: owner.clone(),
     });
-    let host_request: Box<dyn KernelHostRequestPort> =
-        Box::new(KernelHostRequestClient { shared: owner });
+    let host_request = KernelHostRequestClient { shared: owner };
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort);
     Ok((host, host_request, fwd))
 }
@@ -319,7 +383,112 @@ pub struct BridgeRunner {
     core: AgentBridgeCore,
     reactive_ledger: ReactiveInjectionLedger,
     bootstrap_session: BootstrapSession,
-    bootstrap_context: Option<BootstrapContext>,
+    bootstrap_snapshot: Option<BootstrapSnapshot>,
+}
+
+/// Owner-supplied bootstrap inputs sealed to the live attach binding.
+///
+/// The snapshot carries exactly what the owner produced through the
+/// bootstrap operation (context plus task inputs) together with the
+/// authenticated [`AttachBinding`] live at note time (`None` when noted
+/// while detached). Composition requires the live binding to still equal
+/// the noted seal: a different session after re-attach, a moved State
+/// Fence, or another scope/task binding refuses instead of projecting
+/// stale authority as current. Noting again under the current attach
+/// reseals the snapshot.
+#[derive(Clone, Debug)]
+struct BootstrapSnapshot {
+    context: BootstrapContext,
+    tasks: BootstrapTaskInputs,
+    binding: Option<AttachBinding>,
+}
+
+impl BootstrapSnapshot {
+    /// Returns the live binding when it still equals the noted seal.
+    ///
+    /// Strict option equality: a snapshot noted while detached (`None`
+    /// seal) composes only while still detached, and a snapshot noted
+    /// under a live attach composes only under that exact authenticated
+    /// binding — principal, session, connection, activation generation,
+    /// State Fence, and owner-resolved task binding. A wrong session after
+    /// re-attach, a stale fence, or a changed scope/task binding refuses
+    /// instead of projecting stale authority as current, so none of them
+    /// can ever compose to `READY`. Re-noting under the current attach
+    /// reseals the snapshot.
+    fn sealed_live_binding(&self, live: Option<AttachView>) -> Option<AttachBinding> {
+        let live_binding = live.map(|view| view.binding().clone());
+        if live_binding == self.binding {
+            live_binding
+        } else {
+            None
+        }
+    }
+
+    /// Binds noted context content to the sealed owner binding.
+    ///
+    /// The host supplies context text; the attach binding supplies truth.
+    /// A noted principal or `WorkScope` that disagrees with the sealed
+    /// binding is a wrong-principal/wrong-worktree packet and is refused
+    /// here, before any readiness can be projected from it.
+    fn content_matches_binding(
+        context: &BootstrapContext,
+        binding: &AttachBinding,
+    ) -> Result<(), BootstrapError> {
+        if context.principal_ref != binding.principal_id().as_str() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_PRINCIPAL_MISMATCH",
+                detail: "noted principal disagrees with the live attach principal".to_owned(),
+            });
+        }
+        if context.workscope_ref != binding.task_binding().work_scope_id() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_SCOPE_MISMATCH",
+                detail: "noted WorkScope disagrees with the live attach task binding".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Requires a composed task selection to agree with the sealed activation task.
+    ///
+    /// The sealed attach binding carries the activation-resolved task; a
+    /// `BOUND`/`UNIQUE` selection that names any other task is a forged or
+    /// stale packet (host-authored readiness naming a task the activation
+    /// never resolved) and is refused here, so it can never compose to
+    /// `READY`. A selection that claims a bound task but carries none is
+    /// refused the same way. `AMBIGUOUS`/`NONE` selections never project
+    /// readiness and need no agreement: they stay available as honest typed
+    /// non-ready outcomes.
+    fn selection_matches_sealed_task(
+        bootstrap: &UnderstandingBootstrap,
+        seal: &AttachBinding,
+    ) -> Result<(), BootstrapError> {
+        let selected = match bootstrap.task_selection.disposition {
+            TaskSelectionDisposition::Bound | TaskSelectionDisposition::Unique => {
+                match &bootstrap.task_selection.selected_task_and_revision {
+                    Some(selected) => selected,
+                    None => {
+                        return Err(BootstrapError {
+                            code: "BOOTSTRAP_TASK_MISMATCH",
+                            detail:
+                                "bound task selection carries no selected task; refusing to project"
+                                    .to_owned(),
+                        });
+                    }
+                }
+            }
+            TaskSelectionDisposition::Ambiguous | TaskSelectionDisposition::None => return Ok(()),
+        };
+        if selected.task_ref != seal.task_binding().task_id().as_str() {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_TASK_MISMATCH",
+                detail:
+                    "composed task selection disagrees with the sealed attach task binding; refusing to project"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl BridgeRunner {
@@ -347,6 +516,14 @@ impl BridgeRunner {
             None,
         )
         .map_err(RuntimeBuildError::Runtime)?;
+        // Cursor policy: durable-control cursors advance only on a Durable
+        // (or later) ack, durable-observation cursors only on Normalized (or
+        // later). The production forwarding face (`KernelMcpForwardingPort`)
+        // fails closed, so no ack ever arrives here: no cursor advances, no
+        // outstanding delivery is recorded, and recovery awaits the admitted
+        // Kernel observation route (#77 req 4). `ReconcileExternal` stays
+        // fail-closed on this face until that route is admitted. The policy still
+        // declares the honest requirement for any future admitted route.
         let cursor_policy = CursorPolicy::new(AckPhase::Durable, AckPhase::Normalized)
             .map_err(RuntimeBuildError::BridgeContract)?;
         Ok(Self {
@@ -355,7 +532,7 @@ impl BridgeRunner {
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
             reactive_ledger: ReactiveInjectionLedger::new(),
             bootstrap_session: BootstrapSession::default(),
-            bootstrap_context: None,
+            bootstrap_snapshot: None,
         })
     }
     #[must_use]
@@ -631,12 +808,63 @@ impl BridgeRunner {
     pub fn resource_registry_len(&self) -> usize {
         self.core.resource_registry_len()
     }
+    /// Records one supported tool-result delivery into the attach-scoped
+    /// evidence projection, at the normal Invoke callsite after the gateway
+    /// returns with the exact authenticated outcome.
+    ///
+    /// Only `Responded` outcomes carrying a supported typed result
+    /// (`Candidate` or `Projection` — never `PlanGap`/`Unsupported` gaps, admissions,
+    /// or rejections) whose canonical content bytes exceed the hot preview bound are
+    /// snapshotted, content-addressed, into the registry; everything else yields `None`.
+    /// Snapshot failures (full registry, oversize, unserializable) also yield `None`
+    /// WITHOUT affecting forwarding: the emitted response stays authoritative and this
+    /// substrate is purely auxiliary delivery-record augmentation.
+    ///
+    /// Evidence content-addressing is NOT admission authority: the URI is a pure function
+    /// of the exact delivered bytes, grants nothing, admits nothing, and resolves nothing.
+    /// The bytes were already delivered inline to the host in the same response, so no new
+    /// disclosure occurs here. Tokens rendered and route delivery stay unknowable at the
+    /// bridge and are never estimated — completing a `ToolResultReceipt` remains the
+    /// route owner's job (`project_tool_result_receipt`).
+    ///
+    /// Verify-before-handout (I7.18 explicit expansion): the full bytes behind
+    /// a hot handle are retrievable only through [`Self::expand_resource`].
+    /// The just-issued handle is expanded here, on the normal Invoke path,
+    /// and the expanded bytes must equal the published bytes before the view
+    /// reaches the response. A handle that does not resolve to the exact
+    /// bytes withholds the evidence slot (`None`) instead of emitting a
+    /// dangling reference; the gateway response itself is never rewritten.
+    pub fn record_tool_result_delivery(
+        &mut self,
+        outcome: &HostInvocationOutcome,
+    ) -> Option<HotResourceView> {
+        let HostInvocationOutcome::Responded { response, .. } = outcome else {
+            return None;
+        };
+        match response.kind {
+            ResponseKind::Candidate | ResponseKind::Projection => {}
+            ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
+        }
+        let bytes = serde_json::to_vec(&response.content).ok()?;
+        if bytes.len() <= MAX_PREVIEW_BYTES {
+            return None;
+        }
+        let view = self.core.publish_evidence(bytes.clone()).ok()?;
+        if self.expand_resource(view.handle()).ok()? != bytes {
+            return None;
+        }
+        Some(view)
+    }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
     /// Validates fail-closed without composing authority: an invalid context
     /// is rejected and never stored. Noting context never delivers the
     /// once-per-session auto-boot; delivery happens only through
-    /// [`Self::take_first_response_bootstrap`].
+    /// [`Self::take_first_response_bootstrap`]. The noted snapshot is sealed
+    /// to the live attach binding when attached (principal/WorkScope content
+    /// is bound to the authenticated binding; a wrong-principal or
+    /// wrong-worktree packet is refused); a snapshot noted while detached
+    /// stays unsealed until it is noted again under the live attach.
     pub fn note_bootstrap_context(
         &mut self,
         context: BootstrapContext,
@@ -647,39 +875,113 @@ impl BridgeRunner {
             authoritative_selection: None,
         };
         get_understanding_bootstrap(&context, &empty_tasks, CurrentAssessment::NotOnboarded)?;
-        self.bootstrap_context = Some(context);
+        let binding = self.attach_view().map(|view| view.binding().clone());
+        if let Some(seal) = &binding {
+            BootstrapSnapshot::content_matches_binding(&context, seal)?;
+        }
+        self.bootstrap_snapshot = Some(BootstrapSnapshot {
+            context,
+            tasks: empty_tasks,
+            binding,
+        });
         Ok(())
+    }
+    /// Notes one owner-produced bootstrap snapshot: context plus the task
+    /// inputs supplied with it, sealed to the live attach binding.
+    ///
+    /// This is the auto-boot source of record: the once-per-session
+    /// auto-boot composes from exactly these retained task inputs rather
+    /// than a separate empty task set, so the agent can identify or
+    /// explicitly request the intended task without filesystem search. A
+    /// wrong-principal or wrong-worktree packet is refused at note time; a
+    /// later session, fence, or scope/task move refuses at compose time.
+    pub fn note_owner_snapshot(
+        &mut self,
+        context: BootstrapContext,
+        tasks: BootstrapTaskInputs,
+    ) -> Result<(), BootstrapError> {
+        get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
+        let binding = self.attach_view().map(|view| view.binding().clone());
+        if let Some(seal) = &binding {
+            BootstrapSnapshot::content_matches_binding(&context, seal)?;
+        }
+        self.bootstrap_snapshot = Some(BootstrapSnapshot {
+            context,
+            tasks,
+            binding,
+        });
+        Ok(())
+    }
+    /// Task inputs retained by the noted owner snapshot for auto-boot.
+    ///
+    /// Returns exactly what the owner supplied with the snapshot, or an
+    /// empty session-level task set when nothing was ever noted (in which
+    /// case composition below still yields `None`). The auto-boot path
+    /// never invents its own candidate set.
+    #[must_use]
+    pub fn retained_auto_boot_tasks(&self) -> BootstrapTaskInputs {
+        self.bootstrap_snapshot.as_ref().map_or_else(
+            || BootstrapTaskInputs {
+                scope_level: ScopeLevel::Session,
+                candidates: Vec::new(),
+                authoritative_selection: None,
+            },
+            |snapshot| snapshot.tasks.clone(),
+        )
     }
     /// Bounded explicit retrieval of the canonical `UnderstandingBootstrap`.
     ///
     /// Always available, including after the once-per-session auto-boot was
-    /// delivered. Requires a noted context; fails closed otherwise.
+    /// delivered. Requires a noted snapshot and a live attach still equal
+    /// to the noted seal; a wrong session, stale fence, or changed
+    /// scope/task binding fails closed instead of projecting `READY`. A
+    /// composed selection that names any task other than the sealed
+    /// activation task is refused the same way, so a forged or stale packet
+    /// can never retrieve `READY` through this path either.
     pub fn get_understanding_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
         requested_assessment: CurrentAssessment,
     ) -> Result<UnderstandingBootstrap, BootstrapError> {
-        let Some(context) = &self.bootstrap_context else {
+        let Some(snapshot) = &self.bootstrap_snapshot else {
             return Err(BootstrapError {
                 code: "BOOTSTRAP_CONTEXT_MISSING",
                 detail: "no bootstrap context noted for this session".to_owned(),
             });
         };
-        get_understanding_bootstrap(context, tasks, requested_assessment)
+        let Some(sealed) = snapshot.sealed_live_binding(self.attach_view()) else {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_SEAL_MISMATCH",
+                detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
+            });
+        };
+        let bootstrap =
+            get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
+        BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        Ok(bootstrap)
     }
     /// Takes the once-per-session auto-boot for the first successful response.
     ///
-    /// Returns `None` after the first delivery or when no valid context is
-    /// noted; composition failures also yield `None` without marking delivery
+    /// Returns `None` after the first delivery, when no valid snapshot is
+    /// noted, or when the live attach moved away from the noted seal;
+    /// composition failures also yield `None` without marking delivery
     /// so a later response with complete inputs can still carry the bootstrap.
+    /// A composed selection that names any task other than the sealed
+    /// activation task yields `None` the same way, without consuming the
+    /// once-per-session slot, so a forged or stale packet can never
+    /// auto-boot `READY` and a later coherent response can still deliver.
     pub fn take_first_response_bootstrap(
         &mut self,
         tasks: &BootstrapTaskInputs,
         requested_assessment: CurrentAssessment,
     ) -> Option<UnderstandingBootstrap> {
-        let context = self.bootstrap_context.clone()?;
+        let snapshot = self.bootstrap_snapshot.clone()?;
+        let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        let preview =
+            get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
+        BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         self.bootstrap_session
-            .take_auto_boot(&context, tasks, requested_assessment)
+            .take_auto_boot(&snapshot.context, tasks, requested_assessment)
     }
     /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
     ///
@@ -1245,6 +1547,7 @@ mod tests {
         let resp = AgentBridgeActivationResponse::denied(
             &req,
             eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )
         .unwrap();
         let resp_frame = Frame {
@@ -1308,6 +1611,7 @@ mod tests {
         let resp = AgentBridgeActivationResponse::denied(
             &req,
             eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )
         .unwrap();
         assert!(resp.validate_request(&req).is_ok());
@@ -1328,41 +1632,103 @@ mod tests {
             ConnectionId::new("conn-1").unwrap(),
         );
         let req = build_neutral_activation_request(&core_req, &receipt, "demand-1").unwrap();
-        let cases = [
+        // Each typed code round-trips together with its exact owner-issued
+        // detail: selection codes with distinct candidate sets, NOT_READY
+        // with its retry directive, STALE_FENCE with its observed fence, and
+        // FAILED_INTERNAL with its failure handle. The Kernel-owned
+        // no-result code travels detail-less.
+        let selection = |handles: &[&str]| {
+            eliot_protocol::AgentActivationResolutionDisposition::TaskSelectionRequired {
+                selection: eliot_protocol::AgentActivationSelectionDirective {
+                    candidate_handles: handles.iter().map(ToString::to_string).collect(),
+                    candidate_coverage: eliot_protocol::AgentActivationCandidateCoverage::Partial,
+                    recovery_handle: "recovery-1".to_owned(),
+                },
+            }
+        };
+        let cases: [(
+            AgentBridgeActivationDenialCode,
+            &str,
+            Option<eliot_protocol::AgentActivationResolutionDisposition>,
+        ); 7] = [
             (
                 AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
                 eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+                None,
             ),
             (
                 AgentBridgeActivationDenialCode::TaskSelectionRequired,
                 eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+                Some(selection(&["task-candidate-1"])),
             ),
             (
                 AgentBridgeActivationDenialCode::ScopeSelectionRequired,
                 eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::ScopeSelectionRequired {
+                        selection: eliot_protocol::AgentActivationSelectionDirective {
+                            candidate_handles: vec!["scope-candidate-1".to_owned()],
+                            candidate_coverage:
+                                eliot_protocol::AgentActivationCandidateCoverage::Partial,
+                            recovery_handle: "recovery-scope".to_owned(),
+                        },
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::ScopeAmbiguous,
                 eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::ScopeAmbiguous {
+                        selection: eliot_protocol::AgentActivationSelectionDirective {
+                            candidate_handles: vec!["scope-a".to_owned(), "scope-b".to_owned()],
+                            candidate_coverage:
+                                eliot_protocol::AgentActivationCandidateCoverage::Complete,
+                            recovery_handle: "recovery-ambiguous".to_owned(),
+                        },
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::NotReady,
                 eliot_protocol::AGENT_BRIDGE_NOT_READY,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::NotReady {
+                        recovery_handle: "recovery-retry".to_owned(),
+                        retry: eliot_protocol::AgentActivationRetryDirective {
+                            dependency_ref: "dep-1".to_owned(),
+                            observed_dependency_revision: "rev-7".to_owned(),
+                            not_before_unix_ms: 1,
+                        },
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::StaleFence,
                 eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::StaleFence {
+                        recovery_handle: "recovery-fence".to_owned(),
+                        observed_state_fence: None,
+                    },
+                ),
             ),
             (
                 AgentBridgeActivationDenialCode::FailedInternal,
                 eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL,
+                Some(
+                    eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+                        failure_handle: "failure-1".to_owned(),
+                    },
+                ),
             ),
         ];
         let mut seen = BTreeSet::new();
-        for (code, wire) in cases {
+        let total = cases.len();
+        for (code, wire, detail) in cases {
             assert!(seen.insert(wire), "denial reason strings must be distinct");
-            assert_eq!(denial_reason_code(code), wire);
-            let resp = AgentBridgeActivationResponse::denied(&req, code).unwrap();
+            assert_eq!(code.as_str(), wire);
+            let resp = AgentBridgeActivationResponse::denied(&req, code, detail).unwrap();
             assert!(resp.validate_request(&req).is_ok());
             let frame = Frame {
                 protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
@@ -1377,16 +1743,24 @@ mod tests {
             };
             let decoded = decode_activation_response(&frame, &req, &receipt).expect("decode");
             match decoded.disposition {
-                eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
+                eliot_protocol::AgentBridgeActivationDisposition::Denied {
+                    reason_code,
+                    detail,
+                } => {
                     assert_eq!(reason_code, code);
-                    assert_eq!(denial_reason_code(reason_code), wire);
+                    assert_eq!(reason_code.as_str(), wire);
+                    assert_eq!(
+                        detail.is_some(),
+                        code != AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                        "typed denials keep their detail; the no-result denial keeps none"
+                    );
                 }
                 eliot_protocol::AgentBridgeActivationDisposition::Authenticated { .. } => {
                     panic!("denial response must not decode as authenticated");
                 }
             }
         }
-        assert_eq!(seen.len(), cases.len());
+        assert_eq!(seen.len(), total);
     }
 
     #[test]
@@ -1532,7 +1906,7 @@ mod tests {
     mod reactive_runner_tests {
         use super::super::{
             AdmissionBasis, AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId,
-            CueKind, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
+            CueOrigin, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
             HostEventEnvelope, ItemDisposition, McpForwardingPort, NormalizedCue, Profile,
             ProviderFailure, ProviderReadiness, ReactiveInjectionLedger, RiskTier, Severity,
             UseOutcome,
@@ -1632,7 +2006,7 @@ mod tests {
         fn reactive_cue(revision: &str) -> NormalizedCue {
             NormalizedCue {
                 cue_id: "cue-reactive-1".to_owned(),
-                kind: CueKind::ToolObservation,
+                kind: CueOrigin::ToolObservation,
                 source: "tool-surface-1".to_owned(),
                 source_revision: revision.to_owned(),
                 cue_digest: REACTIVE_DIGEST.to_owned(),
@@ -1856,6 +2230,48 @@ mod tests {
                     .is_err()
             );
             assert!(restored.restore_reactive_ledger(&[]).is_err());
+        }
+
+        #[test]
+        fn ledger_snapshot_pins_the_store_facing_byte_contract() {
+            // The C4 durable seam (Store owner persists these bytes verbatim):
+            // contract stamp, canonical JSON shape, and the 1 MiB bound,
+            // straight through the production export entry. Delivery
+            // semantics stay with the bridge ledger; the Store never
+            // interprets beyond the structural stamp.
+            let mut runner = reactive_runner(true);
+            runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    vec!["rel-reactive-a".to_owned()],
+                    reactive_admission(Severity::Normal, RiskTier::Low),
+                )
+                .expect("admit");
+            let bytes = runner.reactive_ledger_snapshot().expect("snapshot");
+            assert!(
+                bytes.len() <= super::reactive_injection_receipts::MAX_LEDGER_JSON_BYTES,
+                "snapshot must fit the bounded Store write"
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("snapshot is JSON");
+            assert_eq!(
+                value.get("contract").and_then(|contract| contract.as_str()),
+                Some(super::REACTIVE_INJECTION_CONTRACT),
+                "snapshot carries the delivery-record contract stamp"
+            );
+            for key in [
+                "contract",
+                "next_item_seq",
+                "next_receipt_seq",
+                "items",
+                "receipts",
+            ] {
+                assert!(
+                    value.get(key).is_some(),
+                    "snapshot shape must carry {key} for the Store reader"
+                );
+            }
         }
 
         #[test]

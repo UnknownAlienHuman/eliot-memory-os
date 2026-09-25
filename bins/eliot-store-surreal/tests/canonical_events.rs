@@ -17,9 +17,9 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, OperationId, ResourceGeneration, StateFence};
 use eliot_store_api::{
     CommitId, EventId, OperationManifestDigest, OrderingHead, OrderingScopeId, OutboxId,
-    OutboxIntent, OutboxState, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, Resubmission, RevisionHead, RevisionKey, SplitView, TransitionClass,
-    WriteReceipt, WriteReceiptStatus,
+    OutboxIntent, OutboxState, ProjectionMode, ProjectionPublicationId,
+    ProjectionPublicationRecord, ProjectionStatus, Resubmission, RevisionHead, RevisionKey,
+    SplitView, TransitionClass, WriteReceipt, WriteReceiptStatus,
 };
 use eliot_store_surreal::{
     CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
@@ -104,6 +104,13 @@ fn committed_bundle() -> CommittedCanonicalTransition {
         projection_refs: Vec::new(),
         outbox_refs: vec![outbox.outbox_id.clone()],
         operation_manifest_digest: OperationManifestDigest::new("d".repeat(64)).unwrap(),
+        // Standalone-fixture issue-#18 values (not bound to a transition):
+        // this bundle only exercises canonical event projection, never
+        // digest bindings. Shapes stay valid so `validate()` reaches the
+        // behavior under test.
+        admission_digest: "e".repeat(64),
+        mutation_plan_digest: "f".repeat(64),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -205,11 +212,7 @@ fn projection_readable_as_current_only_with_matching_fence_record() {
             .is_err()
     );
     // Mismatched source heads.
-    assert!(
-        publication
-            .check_current(&[], 5, &"c".repeat(64))
-            .is_err()
-    );
+    assert!(publication.check_current(&[], 5, &"c".repeat(64)).is_err());
     // Broken atomic data/provenance coupling.
     let mut decoupled = fenced_publication();
     decoupled.atomic_commit_ref = CommitId::new("commit-1931-other").unwrap();

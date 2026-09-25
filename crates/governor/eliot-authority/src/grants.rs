@@ -1,13 +1,33 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use eliot_contracts::StateFence;
+use eliot_influence::{
+    BoundedRevocationRequest, ClosureCompleteness, InfluenceEdgeDisposition, QualifiedInfluenceEdge,
+};
 use eliot_receipts::{AuthorityBinding, EffectClass, SessionBinding, WorkScopeBinding};
-use eliot_security_contracts::EffectCeiling;
+use eliot_security_contracts::{EffectCeiling, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::revocation_history::derive_suppressions;
 use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
+
+const REVOCATION_PAGE_EDGE_LIMIT: u64 = 256;
+const REVOCATION_PAGE_WORK_LIMIT: u64 = 513;
+
+fn map_bounded_revocation_error(error: eliot_influence::InfluenceError) -> AuthorityError {
+    AuthorityError::BoundedRevocation(error)
+}
+
+fn map_bounded_history_error(error: AuthorityError) -> RevocationHistoryError {
+    match error {
+        AuthorityError::BoundedRevocation(error) => {
+            RevocationHistoryError::BoundedRevocation(error)
+        }
+        _ => RevocationHistoryError::UnknownHistory,
+    }
+}
 
 macro_rules! text_id {
     ($name:ident, $field:literal) => {
@@ -402,6 +422,36 @@ impl EffectiveCapabilitySnapshot {
     }
 }
 
+/// One delegated member reference in a Governor-enumerated closure.
+///
+/// Identity and parent linkage only: semantic intents, opaque records, and
+/// fence contours are served by the hydration layer from canonical state, not
+/// by the pure graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureMemberRef {
+    /// Enumerated grant identity.
+    pub grant_id: GrantId,
+    /// Delegating parent identity. `None` only for the closure target when
+    /// the target is itself an authority root.
+    pub parent_grant_id: Option<GrantId>,
+}
+
+/// Owner-enumerated descendant closure of one grant at one graph revision.
+///
+/// Returned by [`GrantGraph::delegated_closure`]: the complete affected set
+/// the Kernel fences for a delegation revocation, with the revision it was
+/// read at. Survivor paths on independent authority lines are declared by
+/// the hydration layer, never inferred here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureDelegation {
+    /// Lineage domain shared by every member.
+    pub authority_root_ref: String,
+    /// Graph revision the closure was enumerated at.
+    pub revision: u64,
+    /// Closure members in parent-before-child order, target first.
+    pub members: Vec<GrantClosureMemberRef>,
+}
+
 /// `ELIOT_ARCH_OWNER`: ARCH-AUTH-01
 /// Pure grant-lineage evaluator.
 #[derive(Clone, Debug)]
@@ -556,6 +606,52 @@ impl GrantGraph {
             }
         }
         let suppressed = derive_suppressions(&graph, &closures);
+        // Fail-closed recheck: every engine-reachable in-graph descendant of
+        // an affected in-graph grant must already be suppressed. The engine
+        // traverses exactly the same-root parent links as
+        // `derive_suppressions`, so this holds by construction on complete
+        // evidence and refuses when a closure under-claims its transitive
+        // descendants. Affected references naming no grant in this graph
+        // belong to another graph's denominator and refuse nothing.
+        let suppressed_ids: BTreeSet<&str> = suppressed
+            .iter()
+            .map(|entry| entry.grant_id.as_str())
+            .collect();
+        for closure in &closures {
+            for affected_ref in &closure.affected {
+                let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
+                    continue;
+                };
+                if graph.grant(grant_id.as_str()).is_none() {
+                    continue;
+                }
+                let outcome = graph
+                    .transitive_revocation_closure(
+                        &grant_id,
+                        &evidence.state_fence,
+                        &eliot_influence::RevocationBounds::default_bounds(),
+                    )
+                    .map_err(map_bounded_history_error)?;
+                if !outcome.complete
+                    || !outcome.frontier.is_empty()
+                    || outcome.omissions.iter().any(|omission| {
+                        matches!(
+                            omission.cause,
+                            eliot_influence::OmissionCause::BoundsExhausted
+                        )
+                    })
+                {
+                    return Err(RevocationHistoryError::UnknownHistory);
+                }
+                for engine_ref in &outcome.affected_refs {
+                    if graph.grant(engine_ref.as_str()).is_some()
+                        && !suppressed_ids.contains(engine_ref.as_str())
+                    {
+                        return Err(RevocationHistoryError::UnknownHistory);
+                    }
+                }
+            }
+        }
         for entry in &suppressed {
             if let Ok(grant_id) = GrantId::new(entry.grant_id.clone()) {
                 graph.apply_restored_revocation(&grant_id);
@@ -574,6 +670,193 @@ impl GrantGraph {
             .checked_add(1)
             .ok_or(AuthorityError::InvalidField("grant_graph_revision"))?;
         Ok(())
+    }
+
+    /// Enumerates the exact descendant closure of one grant at the current
+    /// graph revision: the target plus every transitive child on the same
+    /// authority root, in parent-before-child order with the target first.
+    ///
+    /// This is the Governor-side lineage primitive behind durable closure
+    /// revocation (`#2100`): the graph owner declares the complete affected
+    /// set so the Kernel never fences from caller material or process memory
+    /// alone. Lineage that crosses roots is never followed. The traversal is
+    /// defended with a visited set, so it terminates even on a graph that
+    /// was not validated at construction. Revoked grants are still listed:
+    /// revocation status is enforcement state, not lineage shape, and the
+    /// caller decides the fence disposition.
+    ///
+    /// Alternate-path survival is not decided here: grants on independent
+    /// authority paths are separate graph entries, and the surviving-path
+    /// declaration belongs to the hydration layer that serves the full
+    /// closure evidence.
+    pub fn delegated_closure(
+        &self,
+        grant_id: &GrantId,
+    ) -> Result<GrantClosureDelegation, AuthorityError> {
+        let target = self
+            .grants
+            .get(grant_id)
+            .ok_or_else(|| AuthorityError::MissingParent(grant_id.clone()))?;
+        let authority_root_ref = target.authority_root_ref.clone();
+        let mut members = vec![GrantClosureMemberRef {
+            grant_id: target.grant_id.clone(),
+            parent_grant_id: target.parent_grant_id.clone(),
+        }];
+        let mut seen = BTreeSet::new();
+        seen.insert(target.grant_id.clone());
+        let mut frontier = vec![target.grant_id.clone()];
+        while let Some(current) = frontier.pop() {
+            // Grant-id order keeps the enumeration deterministic across
+            // restarts and owners.
+            let mut children: Vec<&CapabilityGrant> = self
+                .grants
+                .values()
+                .filter(|grant| {
+                    grant.parent_grant_id.as_ref() == Some(&current)
+                        && grant.authority_root_ref == authority_root_ref
+                })
+                .collect();
+            children.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
+            for child in children {
+                if !seen.insert(child.grant_id.clone()) {
+                    continue;
+                }
+                frontier.push(child.grant_id.clone());
+                members.push(GrantClosureMemberRef {
+                    grant_id: child.grant_id.clone(),
+                    parent_grant_id: child.parent_grant_id.clone(),
+                });
+            }
+        }
+        // Discovery order is already parent-before-child: a child is
+        // recorded only when its parent is popped. Siblings pop in reverse
+        // grant-id order from the stack, which is still deterministic across
+        // restarts and owners.
+        Ok(GrantClosureDelegation {
+            authority_root_ref,
+            revision: self.revision,
+            members,
+        })
+    }
+
+    /// Recomputes the exact transitive revocation closure of one grant
+    /// through the pure `eliot-influence` bounded revocation evaluator.
+    ///
+    /// This is a read-only recheck of a complete, current closure against
+    /// the same origin, scope, fence, and snapshot: the caller supplies the
+    /// origin grant, the recovery fence, and explicit bounds, and the engine
+    /// derives the exact affected set from live-graph delegation edges.
+    /// Historical drift is rejected earlier at `require_current` plus the
+    /// fence checks in
+    /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history);
+    /// this method evaluates the current live graph only.
+    ///
+    /// Every delegation link on the origin's authority root becomes one
+    /// qualified influence edge with
+    /// [`PermittedCurrent`](InfluenceEdgeDisposition::PermittedCurrent)
+    /// disposition: live-graph edges are current by construction. Lineage
+    /// that crosses authority roots is never followed, mirroring
+    /// [`delegated_closure`](Self::delegated_closure).
+    ///
+    /// The production recheck runs the evaluator in bounded pages and resumes
+    /// only from the exact returned continuation. Per-page limits may end a
+    /// call early, but the caller-supplied operation-global bounds, graph/fence
+    /// binding, cumulative work, and pending source-edge position remain
+    /// unchanged across every page. A global-bound refusal remains incomplete
+    /// and is never converted to a clear traversal.
+    ///
+    /// Historical grants and lineage are preserved: this method takes
+    /// `&self` and deletes nothing. The graph crate never mutates
+    /// authority; this crate calls the pure evaluator only and preserves its
+    /// typed refusal through [`AuthorityError::BoundedRevocation`].
+    pub fn transitive_revocation_closure(
+        &self,
+        origin: &GrantId,
+        fence: &StateFence,
+        bounds: &eliot_influence::RevocationBounds,
+    ) -> Result<eliot_influence::BoundedRevocationOutcome, AuthorityError> {
+        let target = self
+            .grants
+            .get(origin)
+            .ok_or_else(|| AuthorityError::MissingParent(origin.clone()))?;
+        let authority_root_ref = target.authority_root_ref.clone();
+        // `BTreeMap` iteration is grant-id ordered, so edge order is
+        // deterministic across restarts and owners.
+        let mut edges = Vec::new();
+        for grant in self.grants.values() {
+            let Some(parent_id) = grant.parent_grant_id.as_ref() else {
+                continue;
+            };
+            if grant.authority_root_ref != authority_root_ref {
+                continue;
+            }
+            edges.push(QualifiedInfluenceEdge {
+                source_ref: parent_id.as_str().to_owned(),
+                dependent_ref: grant.grant_id.as_str().to_owned(),
+                disposition: InfluenceEdgeDisposition::PermittedCurrent,
+            });
+        }
+        let request = BoundedRevocationRequest {
+            request_id: format!("transitive-revocation:{}", origin.as_str()),
+            root_ref: origin.as_str().to_owned(),
+            reason: RevocationReason::SourceRevoked,
+            state_fence: fence.clone(),
+            edges,
+            completeness: ClosureCompleteness::Complete,
+            resumed_visited: Vec::new(),
+        };
+        let page_limits = eliot_influence::BoundedRevocationPageLimits {
+            max_page_edges: bounds.max_edges.min(REVOCATION_PAGE_EDGE_LIMIT),
+            max_page_work: bounds.max_work.min(REVOCATION_PAGE_WORK_LIMIT),
+        };
+        let mut outcome = eliot_influence::revoke_bounded_page(&request, bounds, page_limits)
+            .map_err(map_bounded_revocation_error)?;
+        while !outcome.complete {
+            if outcome.omissions.iter().any(|omission| {
+                matches!(
+                    omission.cause,
+                    eliot_influence::OmissionCause::BoundsExhausted
+                )
+            }) {
+                break;
+            }
+            let continuation = outcome
+                .continuation
+                .clone()
+                .ok_or(AuthorityError::InvalidField(
+                    "transitive_revocation_closure",
+                ))?;
+            let continuation_token =
+                outcome
+                    .continuation_token()
+                    .cloned()
+                    .ok_or(AuthorityError::InvalidField(
+                        "transitive_revocation_closure",
+                    ))?;
+            let previous_work = outcome.work_spent;
+            outcome = eliot_influence::resume_bounded_revocation(
+                &request,
+                &continuation,
+                &continuation_token,
+                bounds,
+                page_limits,
+            )
+            .map_err(map_bounded_revocation_error)?;
+            if !outcome.complete
+                && outcome.work_spent == previous_work
+                && !outcome.omissions.iter().any(|omission| {
+                    matches!(
+                        omission.cause,
+                        eliot_influence::OmissionCause::BoundsExhausted
+                    )
+                })
+            {
+                return Err(AuthorityError::InvalidField(
+                    "transitive_revocation_closure",
+                ));
+            }
+        }
+        Ok(outcome)
     }
 
     pub fn snapshot(

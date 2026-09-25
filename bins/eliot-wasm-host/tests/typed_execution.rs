@@ -35,3 +35,23 @@ fn typed_rejects_legacy_component_without_promotion() -> Result<(), String> {
         Ok(_) => Err("legacy component must not execute as typed".to_owned()),
     }
 }
+
+#[test]
+fn zero_host_call_budget_passes_limit_validation() -> Result<(), String> {
+    // Issue #21: a no-host-call component declares an explicit zero
+    // budget instead of carrying a nonzero budget that implies a hidden
+    // capability. Zero must pass the limit gate (previously
+    // `LIMIT_DENIED:envelope`) and reach world selection: the legacy
+    // fixture below therefore denies as `LegacyMismatch`, never as a
+    // limit denial.
+    let artifact =
+        wat::parse_file("tests/fixtures/guest.wat").map_err(|error| error.to_string())?;
+    let digest = Sha256Digest::of_bytes(&artifact);
+    let mut limits = default_experimental_limits(digest);
+    limits.max_host_calls = 0;
+    match execute_describe_experimental(TypedWorld::ContextAdmission, &artifact, &limits) {
+        Err(TypedExecutionError::LegacyMismatch) => Ok(()),
+        Err(other) => Err(format!("zero host-call budget must pass limits: {other}")),
+        Ok(_) => Err("legacy component must not execute as typed".to_owned()),
+    }
+}

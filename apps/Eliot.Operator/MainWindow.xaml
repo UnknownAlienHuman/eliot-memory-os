@@ -26,6 +26,7 @@
             <NavigationViewItem Content="Sleep and Meta Lab" Tag="sleep_meta" />
             <NavigationViewItem Content="Agents and Routing" Tag="agents_routing" Icon="People" />
             <NavigationViewItem Content="Autonomy Runs" Tag="autonomy" Icon="Play" />
+            <NavigationViewItem Content="User Automation" Tag="user_automation" Icon="RepeatAll" />
             <NavigationViewItem Content="Approvals" Tag="approvals" Icon="Permissions" />
             <NavigationViewItem Content="Timeline, Incidents and Operations" Tag="timeline_operations" Icon="Clock" />
         </NavigationView.MenuItems>
@@ -145,6 +146,42 @@
                 </Grid>
             </Expander>
 
+            <Expander x:Name="UserAutomationPanel" Grid.Row="3" Header="Typed UserAutomation operator operation" Visibility="Collapsed">
+                <Grid Padding="0,10,0,0" ColumnSpacing="8" RowSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.1*" />
+                        <ColumnDefinition Width="1.1*" />
+                        <ColumnDefinition Width="1.1*" />
+                        <ColumnDefinition Width="1.1*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <ComboBox Grid.Column="0" Header="Closed operation" ItemsSource="{Binding UserAutomationOperations}"
+                              SelectedItem="{Binding UserAutomationOperation, Mode=TwoWay}"
+                              AutomationProperties.Name="Typed UserAutomation operation" />
+                    <TextBox Grid.Column="1" Header="Automation ID" Text="{Binding UserAutomationId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="UserAutomation canonical identity" />
+                    <TextBox Grid.Column="2" Header="Revision" Text="{Binding UserAutomationRevision, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="UserAutomation immutable revision" />
+                    <TextBox Grid.Column="3" Header="Manual nonce" Text="{Binding UserAutomationNonce, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="UserAutomation explicit manual nonce" />
+                    <Button Grid.Column="4" Content="Send typed operation" Click="ExecuteUserAutomation_OnClick"
+                            VerticalAlignment="Bottom" AutomationProperties.Name="Send typed UserAutomation operation" />
+                    <CheckBox Grid.Row="1" Grid.Column="0" Content="Include retired" IsChecked="{Binding IncludeRetired, Mode=TwoWay}"
+                              AutomationProperties.Name="Include retired UserAutomation revisions" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="4" Header="Owner-normalized revision JSON for create/edit"
+                             Text="{Binding UserAutomationRevisionJson, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
+                             AutomationProperties.Name="Owner-normalized UserAutomation revision JSON" />
+                    <TextBox Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="4" Header="Previous revision JSON for edit"
+                             Text="{Binding UserAutomationPreviousRevisionJson, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
+                             AutomationProperties.Name="Previous owner-normalized UserAutomation revision JSON" />
+                </Grid>
+            </Expander>
+
             <Grid Grid.Row="4" ColumnSpacing="14" MinHeight="300">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="2*" MinWidth="360" />
@@ -258,6 +295,12 @@
                                      TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56" />
                             <Button Content="Submit typed action" Click="ExecuteAction_OnClick"
                                     AutomationProperties.Name="Submit selected typed action through Governor" />
+                            <StackPanel x:Name="UnknownOutcomePanel" Spacing="6" Visibility="Collapsed">
+                                <TextBlock Text="Unknown outcome: a mutation may have executed. Reconciling reuses the same operation identity; it never creates a second mutation."
+                                           TextWrapping="Wrap" FontSize="12" Opacity="0.85" />
+                                <Button Content="Reconcile unknown operations" Click="ReconcileUnknown_OnClick"
+                                        AutomationProperties.Name="Reconcile unknown operator operations under the same identity" />
+                            </StackPanel>
                         </StackPanel>
                     </ScrollViewer>
                 </Border>

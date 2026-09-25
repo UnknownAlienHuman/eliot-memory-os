@@ -7,10 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+mod backup_snapshot;
 mod cutover_ownership;
 mod doctor;
 mod model;
 mod reservation_model;
+mod restore_journal;
 mod snapshot_model;
 mod status;
 mod status_projection;
@@ -20,6 +22,13 @@ mod versioned_artifact;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use backup_snapshot::{
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN,
+    MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, OrsBackupDestination, OrsBackupEntry,
+    OrsBackupFence, OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage,
+    OrsBackupRequest, OrsBackupSnapshot, OrsBackupSourceIdentity, PerEntryOutcome, RowDisposition,
+    RowFamilyDisposition, RowFamilyKind, StoredEffectClass,
+};
 pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
     CutoverRouteTable, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
@@ -32,6 +41,12 @@ pub use model::*;
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     ScopeReservationRequest, WriterReservationToken,
+};
+pub use restore_journal::{
+    JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
+    MAX_JOURNAL_STREAM_KEY_BYTES, RESTORE_JOURNAL_RECORD_SCHEMA, RESTORE_JOURNAL_SCHEMA_VERSION,
+    RestoreJournalAppendReceipt, RestoreJournalArchiveClass, RestoreJournalEntry,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
 };
 pub use snapshot_model::{OrsSnapshotReceipt, OrsSnapshotRequest};
 pub use status::{

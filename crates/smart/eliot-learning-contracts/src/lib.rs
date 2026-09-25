@@ -19,8 +19,10 @@ pub mod promotion;
 pub mod state_view;
 
 pub use activation::{
-    HarnessActivationReceiptCandidate, LifecycleStage, MetricObservation, StageDisposition,
-    StageObservation,
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, CrossTaskAdmission,
+    DeliverySection, DeliveryStatus, HarnessActivationReceiptCandidate, LifecycleStage,
+    MetricObservation, OverlayEligibility, RetrievalSection, RetrievalStatus, StageDisposition,
+    StageObservation, overlay_eligibility,
 };
 pub use assessment::{
     AssessmentDimension, CausalCeiling, DimensionAssessment, DimensionStatus,

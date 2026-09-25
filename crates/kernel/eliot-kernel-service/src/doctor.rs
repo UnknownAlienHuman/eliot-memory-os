@@ -2970,8 +2970,7 @@ mod tests {
         let manifest = health_probe_manifest(&installed_artifact_digest)
             .expect("probe manifest builds from the installed digest");
         assert_eq!(registry.manifest_digest(), manifest.digest());
-        let recipe =
-            health_probe_recipe(&installed_artifact_digest).expect("probe recipe builds");
+        let recipe = health_probe_recipe(&installed_artifact_digest).expect("probe recipe builds");
         let operation = manifest
             .resolve(HEALTH_PROBE_OPERATION_ID)
             .expect("probe operation resolves");

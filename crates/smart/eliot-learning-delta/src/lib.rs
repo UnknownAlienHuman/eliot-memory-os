@@ -11,15 +11,24 @@
 
 #![forbid(unsafe_code)]
 
+mod boundary;
 mod derive;
 mod evidence;
+mod gate;
 mod input;
 mod policy;
 mod result;
 mod retry;
+mod stored;
+
+pub use boundary::{
+    ConsequentialBoundary, is_non_consequential_tool, require_consequential, status_for_boundary,
+    status_for_tool,
+};
 
 pub use derive::derive_attempt_learning_outcome;
 pub use evidence::{EvidenceKind, EvidenceReceipt, SemanticOutcome};
+pub use gate::{AdmissionReceipt, check_delivery, delivery_allowed, select_deliverable_indices};
 pub use input::{
     AttemptEvidence, AttemptInvocationBinding, AttemptStatus, BeforeSelector, ChangeRequest,
     DependencyEvidence, DependencyRole, DependencyStatus, DerivationContext, EvaluationContext,
@@ -29,6 +38,7 @@ pub use input::{
 pub use policy::{DerivationPolicy, NoChangeWitness, RetryReason, SurfacePermission};
 pub use result::LearningDeltaError;
 pub use retry::{RetryAssessment, RetryContext, canonical_retry_fingerprint};
+pub use stored::{AttemptCloseDisposition, StoredDeltaDisposition, StoredLearningDelta};
 
 pub use eliot_learning_contracts::{
     AttemptLearningOutcome, ChangeSurface, MemberId, OwnerId, SlotId, TargetId, ValueState,

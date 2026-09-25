@@ -62,5 +62,10 @@
   "worker_result_authority": "candidate_only",
   "decision_owner": "task_controller_or_human",
   "promotion_disposition": "simulated_no_promotion",
-  "eligible_for_route_promotion": false
+  "eligible_for_route_promotion": false,
+  "cancellation_fixture_closure_fields": [
+    "expected_process_tree_closed",
+    "expected_descendants_closed"
+  ],
+  "cancellation_fixture_outcome": "expected_cancelled_confirmed"
 }

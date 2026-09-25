@@ -910,13 +910,13 @@ mod tests {
     use eliot_store::{CanonicalStore, ControlWal, DbClientSet};
     use eliot_types::{
         AgentId, ClaimCardInput, ClaimId, CognitiveProjectionReadState, CommandContext,
-        ControlWalConfig, CredentialProviderKind, CueBinding, CueKind, CueMatchMode, CueStrength,
-        EpistemicStatus, FailureRecordCommand, GovernorConfig, IdempotencyOptions, LifecycleStatus,
-        LifecycleWriteOptions, MemoryRevision, MemoryWriteEnvelope, ModuleCard, ObservedCue,
-        OperationId, ProjectId, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
-        SemanticCommand, SemanticCommandKind, SessionId, SurrealServerConfig, TaintClass, TaskId,
-        UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, Visibility, WriteId,
-        WriteStatus,
+        ControlWalConfig, CredentialProviderKind, CueBinding, CueMatchMode, CueStrength,
+        EpistemicStatus, FailureRecordCommand, GovernorConfig, IdempotencyOptions, LegacyCueKindV1,
+        LifecycleStatus, LifecycleWriteOptions, MemoryRevision, MemoryWriteEnvelope, ModuleCard,
+        ObservedCue, OperationId, ProjectId, ReadConsistencyMode, RecallL0Request, RelationInput,
+        RelationType, SemanticCommand, SemanticCommandKind, SessionId, SurrealServerConfig,
+        TaintClass, TaskId, UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, Visibility,
+        WriteId, WriteStatus,
     };
     use serde_json::{Value, json};
     use std::error::Error;
@@ -1208,7 +1208,7 @@ mod tests {
             wait_for_cue_publication(&store, injection_project_id, first_head).await?;
 
             let observed_cues = [ObservedCue {
-                kind: CueKind::FilePath,
+                kind: LegacyCueKindV1::FilePath,
                 value: injection_path.to_owned(),
             }];
             let first_firing = cue_index.fire(injection_project_id, &observed_cues).await?;
@@ -1457,7 +1457,7 @@ mod tests {
             payload: json!({
                 "source_revision": source_revision,
                 "cue_bindings": [CueBinding {
-                    cue_kind: CueKind::FilePath,
+                    cue_kind: LegacyCueKindV1::FilePath,
                     cue_value: path.to_owned(),
                     match_mode: CueMatchMode::Exact,
                     strength: CueStrength::Primary,
@@ -1486,7 +1486,7 @@ mod tests {
             failure_refs: vec!["failure:c7-03c-live-revision".to_owned()],
             source_refs: vec![format!("file:{path}")],
             cue_bindings: vec![CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: path.to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,

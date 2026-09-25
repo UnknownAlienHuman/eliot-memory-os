@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "name": "replay-identity",
+      "first_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "second_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect_outcome": "ReplayIdentity"
+    },
+    {
+      "name": "identity-conflict",
+      "first_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "second_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expect_outcome": "IdentityConflict"
+    },
+    {
+      "name": "malformed-hash-refused",
+      "first_hash": "not-a-digest",
+      "second_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect_outcome": "Refused"
+    }
+  ]
+}

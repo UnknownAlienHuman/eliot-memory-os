@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
+mod automation_state_tests;
+#[cfg(test)]
 mod epistemic_tests;
 #[cfg(test)]
 mod notification_state_tests;
@@ -22,24 +24,28 @@ use eliot_kernel_core::{
 };
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
+    AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
+    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
-    DecodedNotificationMutation, DecodedReactiveMutation, ERASURE_PARAM_OPERATION_ID,
-    ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, decode_erasure_surfaces, decode_notification_mutation,
-    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
-    genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
-    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
+    DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
+    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    bind_issue18_receipt, canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
+    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
+    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
     validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
     validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -262,6 +268,11 @@ impl MemoryStore {
         validate_transaction(ctx, &transition)?;
         // Recompute before any lookup or effect: supplied != recomputed is a
         // typed digest mismatch with no transaction and no lookup success.
+        // The carried ordering scopes must also still equal the hashed
+        // expected ordering heads: a post-admission scope edit leaves the
+        // shared digest unchanged but changes head advancement, so it fails
+        // here with the same typed mismatch.
+        verify_ordering_scope_binding(&transition, expected_ordering_heads)?;
         let view = CanonicalRequestView::from_apply(
             ctx,
             &transition,
@@ -327,6 +338,18 @@ impl MemoryStore {
         // receipt's outbox references include the appended reactive outbox
         // intents. Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_reactive_state(&mut state, &transition, &mut plan)?;
+        // Issue #1779: admitted automation legs execute here, beside the
+        // reactive legs and before the receipt is built, so the receipt's
+        // outbox references include the appended automation outbox intents.
+        // Rows, receipt, and outbox still commit atomically below.
+        dispatch_apply_automation_state(&mut state, &transition, &mut plan)?;
+        // Issue #223: admitted experience bank/feedback legs execute here,
+        // beside the automation legs and before the receipt is built, so the
+        // receipt's outbox references include the appended experience outbox
+        // intents. Rows, receipt, and outbox still commit atomically below.
+        dispatch_apply_experience_state(&mut state, &transition, &mut plan)?;
+        dispatch_apply_finish_evidence(&mut state, &transition)?;
+        dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -569,6 +592,159 @@ fn dispatch_apply_erasure(
     Ok(())
 }
 
+const FINISH_OWNER_NAMESPACE: &str = "owner";
+const FINISH_OWNER_KEY: &str = "finish";
+const CANONICAL_OWNER_NAMESPACE: &str = "owner";
+const CANONICAL_OWNER_KEY: &str = "canonical";
+
+/// Applies the Governor-produced canonical finish-evidence owner image under
+/// the same lock as the decision receipt. The memory backend mirrors the
+/// reference CAS semantics of the Surreal adapter; it never derives or
+/// validates finish evidence itself.
+fn dispatch_apply_finish_evidence(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordFinishEvidence)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let expected_revision = text_param("expected_canonical_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "expected_canonical_revision must be a decimal revision",
+        })?;
+    let snapshot_json = text_param("snapshot_json")?;
+    if snapshot_json.is_empty() {
+        return Err(StoreError::Empty {
+            field: "canonical.finish_evidence_snapshot_json",
+        });
+    }
+    if snapshot_json.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+
+    let key = RecoveryRecordKey::new(CANONICAL_OWNER_NAMESPACE, CANONICAL_OWNER_KEY)?;
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing.state_fence != transition.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if existing.revision != expected_revision {
+            return Err(StoreError::RevisionConflict);
+        }
+    } else if expected_revision != 0 {
+        return Err(StoreError::RevisionConflict);
+    }
+    let revision = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField {
+            field: "canonical.owner_revision",
+            reason: "revision overflow",
+        })?;
+    let payload = snapshot_json.as_bytes().to_vec();
+    let record = RecoveryRecord {
+        namespace: CANONICAL_OWNER_NAMESPACE.to_owned(),
+        key: CANONICAL_OWNER_KEY.to_owned(),
+        state_fence: transition.state_fence.clone(),
+        revision,
+        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
+    Ok(())
+}
+
+/// Applies the admitted Governor finish-owner mutation under the same lock as
+/// the canonical receipt. The receipt JSON is deliberately opaque here: the
+/// Governor owns its shape and semantics, while this handler only performs
+/// the fixed `owner/finish` fenced revision CAS/upsert.
+fn dispatch_apply_finish_decision(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let Some(command) = transition
+        .named_operations
+        .iter()
+        .find(|command| command.operation == NamedMutationOperation::RecordFinishDecision)
+    else {
+        return Ok(());
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let _attempt_id = text_param("attempt_id")?;
+    let expected_revision = text_param("expected_finish_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "expected_finish_revision must be a decimal revision",
+        })?;
+    let receipt_json = text_param("receipt_json")?;
+    if receipt_json.len() > MAX_RECOVERY_RECORD_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+
+    let key = RecoveryRecordKey::new(FINISH_OWNER_NAMESPACE, FINISH_OWNER_KEY)?;
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing.state_fence != transition.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if existing.revision != expected_revision {
+            return Err(StoreError::RevisionConflict);
+        }
+    } else if expected_revision != 0 {
+        return Err(StoreError::RevisionConflict);
+    }
+    let revision = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField {
+            field: "finish.owner_revision",
+            reason: "revision overflow",
+        })?;
+    let payload = receipt_json.as_bytes().to_vec();
+    let record = RecoveryRecord {
+        namespace: FINISH_OWNER_NAMESPACE.to_owned(),
+        key: FINISH_OWNER_KEY.to_owned(),
+        state_fence: transition.state_fence.clone(),
+        revision,
+        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(&payload),
+        payload,
+    };
+    record.validate()?;
+    state.recovery_records.insert(key, record);
+    Ok(())
+}
+
 /// Executes admitted notification-state legs on already-locked state
 /// (issue #1780).
 ///
@@ -748,6 +924,431 @@ fn dispatch_apply_reactive_state(
         outbox.validate()?;
         plan.outbox_records.push(outbox);
         reactive_index = reactive_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Joins one revision-row address. Collision-free by the same
+/// control-character argument as the Surreal contour: neither half may
+/// contain `\x1f` per the wire contract.
+fn automation_revision_key(automation_id: &str, revision: &str) -> String {
+    format!("{automation_id}\x1f{revision}")
+}
+
+/// Executes admitted automation legs on already-locked state
+/// (issue #1779).
+///
+/// Runs beside [`dispatch_apply_reactive_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Revision rows are immutable and create-only
+/// (divergent rewrites fail closed); the current pointer moves only
+/// through the observed revision; invocation rows are create-only by
+/// occurrence identity. Each command appends one outbox intent bound to
+/// the resulting row bytes, so rows and their outbox intents commit
+/// atomically via [`commit_transaction`]. Non-automation transitions are
+/// a no-op here.
+fn dispatch_apply_automation_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_automation_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyUserAutomationState);
+    if !has_automation_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::UserAutomation {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut automation_index = 0_usize;
+    for command in &transition.named_operations {
+        let decoded = match command.operation {
+            NamedMutationOperation::ApplyUserAutomationState => {
+                decode_automation_mutation(command.operation, &command.parameters)?
+            }
+            _ => continue,
+        };
+        let row_json = match decoded {
+            DecodedAutomationMutation::Create {
+                automation_id,
+                revision,
+                revision_json,
+                configuration_state,
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                match state.automation_revisions.get(&key) {
+                    Some(existing) if existing.revision_json != revision_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_revisions.insert(
+                            key,
+                            AutomationRevisionRow {
+                                automation_id: automation_id.clone(),
+                                revision: revision.clone(),
+                                revision_json: revision_json.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                if state.automation_currents.contains_key(&automation_id) {
+                    return Err(StoreError::IdentityConflict);
+                }
+                state.automation_currents.insert(
+                    automation_id.clone(),
+                    AutomationCurrentRow {
+                        automation_id,
+                        revision,
+                        configuration_state,
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+                serde_json::to_value(&revision_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+            DecodedAutomationMutation::Edit {
+                automation_id,
+                previous_revision,
+                revision,
+                revision_json,
+                configuration_state,
+            } => {
+                let current = state.automation_currents.get(&automation_id).ok_or(
+                    StoreError::InvalidField {
+                        field: "automation.automation_id",
+                        reason: "unknown automation",
+                    },
+                )?;
+                if current.revision != previous_revision {
+                    return Err(StoreError::IdentityConflict);
+                }
+                if current.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                let key = automation_revision_key(&automation_id, &revision);
+                match state.automation_revisions.get(&key) {
+                    Some(existing) if existing.revision_json != revision_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_revisions.insert(
+                            key,
+                            AutomationRevisionRow {
+                                automation_id: automation_id.clone(),
+                                revision: revision.clone(),
+                                revision_json: revision_json.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                state.automation_currents.insert(
+                    automation_id.clone(),
+                    AutomationCurrentRow {
+                        automation_id,
+                        revision,
+                        configuration_state,
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+                serde_json::to_value(&revision_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+            DecodedAutomationMutation::StateTransition {
+                automation_id,
+                revision,
+                configuration_state,
+                ..
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                if !state.automation_revisions.contains_key(&key) {
+                    return Err(StoreError::InvalidField {
+                        field: "automation.revision",
+                        reason: "unknown automation revision",
+                    });
+                }
+                let current = state.automation_currents.get(&automation_id).ok_or(
+                    StoreError::InvalidField {
+                        field: "automation.automation_id",
+                        reason: "unknown automation",
+                    },
+                )?;
+                if current.revision != revision {
+                    return Err(StoreError::IdentityConflict);
+                }
+                if current.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                let row_json = serde_json::to_value(&revision)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                state.automation_currents.insert(
+                    automation_id.clone(),
+                    AutomationCurrentRow {
+                        automation_id,
+                        revision,
+                        configuration_state,
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+                row_json
+            }
+            DecodedAutomationMutation::RunNow {
+                automation_id,
+                revision,
+                occurrence_id,
+                invocation_json,
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                if !state.automation_revisions.contains_key(&key) {
+                    return Err(StoreError::InvalidField {
+                        field: "automation.revision",
+                        reason: "unknown automation revision",
+                    });
+                }
+                match state.automation_invocations.get(&occurrence_id) {
+                    Some(existing) if existing.invocation_json != invocation_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_invocations.insert(
+                            occurrence_id.clone(),
+                            AutomationInvocationRow {
+                                occurrence_id,
+                                automation_id: automation_id.clone(),
+                                invocation_json: invocation_json.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                serde_json::to_value(&invocation_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+            DecodedAutomationMutation::Failure {
+                automation_id,
+                revision,
+                occurrence_id,
+                failure,
+                failure_json,
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                if !state.automation_revisions.contains_key(&key) {
+                    return Err(StoreError::InvalidField {
+                        field: "automation.revision",
+                        reason: "unknown automation revision",
+                    });
+                }
+                let failure_key = eliot_store_api::automation_failure_key(
+                    &automation_id,
+                    &revision,
+                    &failure.fingerprint,
+                );
+                match state.automation_failures.get(&failure_key) {
+                    Some(existing) if existing.failure_json != failure_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_failures.insert(
+                            failure_key.clone(),
+                            AutomationFailureRow {
+                                automation_id: automation_id.clone(),
+                                revision: revision.clone(),
+                                occurrence_id: occurrence_id.clone(),
+                                fingerprint: failure.fingerprint.clone(),
+                                failure_json: failure_json.clone(),
+                                source_operation_id: operation_key.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                state
+                    .automation_last_failure
+                    .insert(automation_id.clone(), failure_key);
+                serde_json::to_value(&failure_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+        };
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-automation-{automation_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        automation_index = automation_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Joins one experience row address. Collision-free by the same
+/// control-character argument as the automation contour: the handle may
+/// not contain `\x1f` per the wire contract, and the revision is a fixed
+/// 20-digit decimal so key order matches revision order.
+fn experience_row_key(handle: &str, revision: u64) -> String {
+    format!("{handle}\x1f{revision:020}")
+}
+
+/// Executes admitted experience bank/feedback legs on already-locked state
+/// (issue #223).
+///
+/// Runs beside [`dispatch_apply_automation_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Rows are immutable and create-only per joined
+/// `(handle, revision)` key (divergent rewrites fail closed; identical
+/// replays converge); the presented digests travel on the row for
+/// readback binding. Each command appends one outbox intent bound to the
+/// resulting row bytes, so rows and their outbox intents commit
+/// atomically via [`commit_transaction`]. Non-experience transitions are
+/// a no-op here.
+fn dispatch_apply_experience_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_experience_op = transition.named_operations.iter().any(|command| {
+        matches!(
+            command.operation,
+            NamedMutationOperation::CommitExperienceBank
+                | NamedMutationOperation::CommitAgentFeedback
+        )
+    });
+    if !has_experience_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::CaptureCandidate {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut experience_index = 0_usize;
+    for command in &transition.named_operations {
+        let decoded = match command.operation {
+            NamedMutationOperation::CommitExperienceBank
+            | NamedMutationOperation::CommitAgentFeedback => {
+                eliot_store_api::decode_experience_mutation(command.operation, &command.parameters)?
+            }
+            _ => continue,
+        };
+        let (handle, revision, record_json, record_digest, table_is_bank) = match decoded {
+            eliot_store_api::DecodedExperienceMutation::Bank {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ..
+            } => (handle, revision, record_json, record_digest, true),
+            eliot_store_api::DecodedExperienceMutation::Feedback {
+                handle,
+                revision,
+                record_json,
+                record_digest,
+                ..
+            } => (handle, revision, record_json, record_digest, false),
+        };
+        let key = experience_row_key(&handle, revision);
+        let row_json = serde_json::to_value(&record_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if table_is_bank {
+            match state.experience_bank_rows.get(&key) {
+                Some(existing) if existing.record_json != record_json => {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Some(_) => {}
+                None => {
+                    state.experience_bank_rows.insert(
+                        key,
+                        ExperienceBankRow {
+                            handle,
+                            revision,
+                            record_json: record_json.clone(),
+                            record_digest,
+                            state_fence: transition.state_fence.clone(),
+                            scope_id: transition.scope_id.to_string(),
+                            task_id: transition.task_id.clone(),
+                        },
+                    );
+                }
+            }
+        } else {
+            match state.experience_feedback_rows.get(&key) {
+                Some(existing) if existing.record_json != record_json => {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Some(_) => {}
+                None => {
+                    state.experience_feedback_rows.insert(
+                        key,
+                        ExperienceFeedbackRow {
+                            handle,
+                            revision,
+                            record_json: record_json.clone(),
+                            record_digest,
+                            state_fence: transition.state_fence.clone(),
+                            scope_id: transition.scope_id.to_string(),
+                            task_id: transition.task_id.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-experience-{experience_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        experience_index = experience_index.saturating_add(1);
     }
     Ok(())
 }
@@ -1101,6 +1702,393 @@ fn resource_snapshot_payload(
     }))
 }
 
+/// Builds the same-fence, same-scope experience range payload (issue #223).
+///
+/// Errors surface as serialization failures with the underlying message:
+/// parameters are pre-validated by the catalogue gate, so any failure here
+/// is defense in depth, never a distinct dispatch outcome. Rows project in
+/// key order (handle, then zero-padded revision) with verbatim record
+/// documents plus presented digests; rows past the bound set `truncated`
+/// with `matched_total` counting only returned records, never a guess at
+/// the remainder. Zero matches are an exact empty result, not an error.
+fn experience_range_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+    bank: bool,
+) -> Result<Value, serde_json::Error> {
+    let decoded = eliot_store_api::validate_experience_read_params(&query.parameters)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let scope_id = query
+        .scope_id
+        .clone()
+        .ok_or_else(|| serde_json::Error::custom("experience range read requires scope_id"))?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let heads: Vec<(String, u64)> = state
+        .revision_heads
+        .values()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => Some(
+            eliot_store_api::audit_cursor_parse(cursor, fence, &heads)
+                .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        ),
+    };
+    let mut records = Vec::new();
+    let mut truncated = false;
+    let mut ordinal: u64 = 0;
+    // Local row walk shared by both families: fence plus scope gating,
+    // deterministic key order, ordinal skip for continuation, and a
+    // limit-plus-probe bound with caller-visible truncation.
+    macro_rules! walk_rows {
+        ($rows:expr) => {
+            for row in $rows {
+                if row.state_fence != *fence || row.scope_id != scope_id.as_str() {
+                    continue;
+                }
+                ordinal = ordinal.saturating_add(1);
+                if start.is_some_and(|start| ordinal <= start) {
+                    continue;
+                }
+                if records.len() > limit {
+                    truncated = true;
+                    break;
+                }
+                records.push(json!({
+                    "handle": row.handle,
+                    "revision": row.revision,
+                    "record_json": row.record_json,
+                    "record_digest": row.record_digest,
+                }));
+            }
+        };
+    }
+    if bank {
+        walk_rows!(state.experience_bank_rows.values());
+    } else {
+        walk_rows!(state.experience_feedback_rows.values());
+    }
+    if records.len() > limit {
+        records.pop();
+        truncated = true;
+    }
+    let matched_total = records.len();
+    let next_cursor = if truncated {
+        Some(
+            eliot_store_api::audit_cursor_issue(
+                fence,
+                &heads,
+                start
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(matched_total).unwrap_or(u64::MAX)),
+            )
+            .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    serde_json::to_value(
+        eliot_store_api::ExperienceRangePage {
+            records,
+            matched_total,
+            truncated,
+            next_cursor,
+        }
+        .payload(fence),
+    )
+}
+
+/// Builds the same-fence audit-range payload (issue #223).
+///
+/// Projects durable `CaptureObservation` command records as envelope
+/// candidates through the shared [`audit_envelope_candidate`] filter:
+/// subjects that parse as JSON objects carrying a string `record_id`
+/// are carried verbatim; ordinary non-envelope captures are skipped
+/// (normal store content, never corruption). No scope filtering: command
+/// scopes need not match event scopes, and the coordinated consumer
+/// carries scope-free gap/control records regardless of scope, so
+/// store-level scope filtering here would silently drop records the
+/// consumer must see (F2 resolution: scope-free catalogue rows per the
+/// `GetMailbox` precedent — facade caller scope required, catalogue
+/// rows scope-free — with scope gating at the decision layer per
+/// I12-26). Fence agreement is enforced by the caller: this helper runs
+/// only after `execute_named_sync` proves the query fence equals the
+/// state fence. Reads beyond
+/// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
+/// fail closed with [`StoreError::PayloadTooLarge`] instead of
+/// truncating: a truncated audit range cannot prove journal
+/// completeness. This projects candidates only — full envelope
+/// validation and live-journal presence binding stay downstream, so a
+/// carried candidate can never become a false journal record here.
+///
+/// Continuation cursors (optional `cursor` selector): an absent cursor
+/// reads from the start and fails closed with
+/// [`StoreError::PayloadTooLarge`] past
+/// [`MAX_AUDIT_RANGE_RECORDS`](eliot_store_api::MAX_AUDIT_RANGE_RECORDS)
+/// instead of truncating; a present cursor verified by
+/// `audit_cursor_parse` against this fence and the current revision
+/// heads resumes paging past that candidate ordinal with the same bound
+/// and no overflow failure. Cross-fence, stale-heads, or malformed
+/// cursors fail closed (callers restart enumeration).
+fn audit_range_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let start: Option<u64> = match query.parameters.get("cursor").and_then(Value::as_str) {
+        None => None,
+        Some(cursor) => {
+            let heads: Vec<(String, u64)> = state
+                .revision_heads
+                .values()
+                .map(|head| (head.key.as_str().to_owned(), head.revision))
+                .collect();
+            Some(
+                eliot_store_api::audit_cursor_parse(cursor, fence, &heads)
+                    .map_err(|error| serde_json::Error::custom(error.to_string()))?,
+            )
+        }
+    };
+    let mut records = Vec::new();
+    let mut ordinal: u64 = 0;
+    for record in &state.named_operations {
+        if record.operation.operation != NamedMutationOperation::CaptureObservation {
+            continue;
+        }
+        let Some(subject) = record
+            .operation
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(candidate) = eliot_store_api::audit_envelope_candidate(subject) else {
+            continue;
+        };
+        ordinal = ordinal.saturating_add(1);
+        if start.is_some_and(|start| ordinal <= start) {
+            continue;
+        }
+        records.push(candidate);
+        if records.len() > eliot_store_api::MAX_AUDIT_RANGE_RECORDS as usize {
+            if start.is_none() {
+                return Err(serde_json::Error::custom(
+                    "audit range exceeds the bounded maximum",
+                ));
+            }
+            records.pop();
+            break;
+        }
+    }
+    serde_json::to_value(json!({ "records": records }))
+}
+
+/// Builds the same-fence user-automation read payload (issue #1779).
+///
+/// Errors surface as serialization failures with the underlying message:
+/// parameters are pre-validated by the catalogue gate, so any failure here
+/// is defense in depth, never a distinct dispatch outcome. `list` projects
+/// same-fence current pointers in automation-id order (retired excluded
+/// unless requested); `current` projects one pointer or explicit absence;
+/// `history` projects the bounded verbatim revision set; `invocations`
+/// projects the bounded verbatim invocation set; `failure` projects the
+/// last same-fence failure row or explicit absence.
+#[allow(clippy::too_many_lines)]
+fn automation_state_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let decoded = validate_automation_read_params(&query.parameters)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let limit = usize::from(decoded.max_records.max(1));
+    match decoded.query.as_str() {
+        AUTOMATION_QUERY_LIST => {
+            let mut currents = Vec::new();
+            for row in state.automation_currents.values() {
+                if row.state_fence != *fence {
+                    continue;
+                }
+                if !decoded.include_retired && row.configuration_state == AUTOMATION_STATE_RETIRED {
+                    continue;
+                }
+                if currents.len() >= limit {
+                    break;
+                }
+                currents.push(json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "configuration_state": row.configuration_state,
+                }));
+            }
+            serde_json::to_value(json!({
+                "currents": currents,
+                "revision": currents.len(),
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_CURRENT => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            let (current, revision) = match state.automation_currents.get(&id) {
+                Some(row)
+                    if row.state_fence == *fence
+                        && decoded
+                            .requested_revision
+                            .as_deref()
+                            .is_none_or(|revision| revision == row.revision) =>
+                {
+                    (
+                        json!({
+                            "automation_id": row.automation_id,
+                            "revision": row.revision,
+                            "configuration_state": row.configuration_state,
+                        }),
+                        1,
+                    )
+                }
+                _ => (Value::Null, 0),
+            };
+            serde_json::to_value(json!({
+                "current": current,
+                "revision": revision,
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_HISTORY => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            let mut revisions = Vec::new();
+            if let Some(requested_revision) = decoded.requested_revision.as_deref() {
+                if let Some(row) = state.automation_revisions.values().find(|row| {
+                    row.automation_id == id
+                        && row.revision == requested_revision
+                        && row.state_fence == *fence
+                }) {
+                    revisions.push(json!({
+                        "automation_id": row.automation_id,
+                        "revision": row.revision,
+                        "revision_json": row.revision_json,
+                    }));
+                }
+            } else {
+                for row in state.automation_revisions.values() {
+                    if row.automation_id != id || row.state_fence != *fence {
+                        continue;
+                    }
+                    if revisions.len() >= limit {
+                        break;
+                    }
+                    revisions.push(json!({
+                        "automation_id": row.automation_id,
+                        "revision": row.revision,
+                        "revision_json": row.revision_json,
+                    }));
+                }
+            }
+            serde_json::to_value(json!({
+                "revisions": revisions,
+                "revision": revisions.len(),
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_INVOCATIONS => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            automation_invocations_payload(
+                state,
+                fence,
+                &id,
+                limit,
+                decoded.requested_occurrence_id.as_deref(),
+            )
+        }
+        AUTOMATION_QUERY_FAILURE => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            automation_failure_payload(state, fence, &id)
+        }
+        _ => Err(serde_json::Error::custom("unknown automation query")),
+    }
+}
+
+/// Projects the bounded same-fence invocation set for one automation.
+fn automation_invocations_payload(
+    state: &MemoryState,
+    fence: &StateFence,
+    automation_id: &str,
+    limit: usize,
+    requested_occurrence_id: Option<&str>,
+) -> Result<Value, serde_json::Error> {
+    let mut invocations = Vec::new();
+    for row in state.automation_invocations.values() {
+        if row.automation_id != automation_id || row.state_fence != *fence {
+            continue;
+        }
+        if requested_occurrence_id.is_some_and(|occurrence_id| row.occurrence_id != occurrence_id) {
+            continue;
+        }
+        if invocations.len() >= limit {
+            break;
+        }
+        invocations.push(json!({
+            "occurrence_id": row.occurrence_id,
+            "automation_id": row.automation_id,
+            "invocation_json": row.invocation_json,
+        }));
+    }
+    serde_json::to_value(json!({
+        "invocations": invocations,
+        "revision": invocations.len(),
+        "state_fence": fence,
+    }))
+}
+
+/// Projects the last same-fence failure row for one automation, or
+/// explicit absence when no row exists under this fence.
+fn automation_failure_payload(
+    state: &MemoryState,
+    fence: &StateFence,
+    automation_id: &str,
+) -> Result<Value, serde_json::Error> {
+    let row = state
+        .automation_last_failure
+        .get(automation_id)
+        .and_then(|key| state.automation_failures.get(key))
+        .filter(|row| row.state_fence == *fence);
+    let (failure, revision) = match row {
+        Some(row) => (
+            json!({
+                "automation_id": row.automation_id,
+                "revision": row.revision,
+                "occurrence_id": row.occurrence_id,
+                "fingerprint": row.fingerprint,
+                "failure_json": row.failure_json,
+                "history_ref": eliot_store_api::automation_failure_history_ref(
+                    &row.automation_id,
+                    &row.revision,
+                    &row.fingerprint,
+                ),
+                "source_operation_id": row.source_operation_id,
+            }),
+            1,
+        ),
+        None => (Value::Null, 0),
+    };
+    serde_json::to_value(json!({
+        "failure": failure,
+        "revision": revision,
+        "state_fence": fence,
+    }))
+}
+
 fn validate_transaction(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -1178,6 +2166,17 @@ fn validate_transaction_state(
             .named_operations
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplyResourceSnapshot)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyUserAutomationState)
+        || transition.named_operations.iter().any(|command| {
+            matches!(
+                command.operation,
+                NamedMutationOperation::RecordFinishDecision
+                    | NamedMutationOperation::RecordFinishEvidence
+            )
+        })
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }
@@ -1312,6 +2311,9 @@ fn transaction_receipt(
             .map(|record| record.outbox_id.clone())
             .collect(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{:016}", plan.commit_sequence)),
@@ -1572,7 +2574,10 @@ impl MemoryStore {
     /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
     /// selectors. Issue #1941 C4 adds `GetReactiveInjectionState` with its
     /// exact `session_id` selector and `GetResourceSnapshot` with its exact
-    /// `uri` selector.
+    /// `uri` selector. Issue #1779 adds `GetUserAutomationState` with its
+    /// closed query discriminator and exact selectors. Issue #223 adds
+    /// `GetExperienceBankRange` and `GetAgentFeedbackRange` with the
+    /// `max_records` bound, scope-addressed through the request envelope.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -1585,6 +2590,10 @@ impl MemoryStore {
                 | NamedReadOperation::GetNotificationState
                 | NamedReadOperation::GetReactiveInjectionState
                 | NamedReadOperation::GetResourceSnapshot
+                | NamedReadOperation::GetUserAutomationState
+                | NamedReadOperation::GetExperienceBankRange
+                | NamedReadOperation::GetAgentFeedbackRange
+                | NamedReadOperation::GetAuditRange
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -1695,6 +2704,16 @@ impl MemoryStore {
             NamedReadOperation::GetResourceSnapshot => {
                 resource_snapshot_payload(&state, query, &fence)
             }
+            NamedReadOperation::GetUserAutomationState => {
+                automation_state_payload(&state, query, &fence)
+            }
+            NamedReadOperation::GetExperienceBankRange => {
+                experience_range_payload(&state, query, &fence, true)
+            }
+            NamedReadOperation::GetAgentFeedbackRange => {
+                experience_range_payload(&state, query, &fence, false)
+            }
+            NamedReadOperation::GetAuditRange => audit_range_payload(&state, query, &fence),
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
@@ -2433,6 +3452,7 @@ fn genesis_receipt(
     // Bind the receipt to the recomputed digest, never a blind copy.
     let recomputed = verify_genesis_canonical_hash(request)?;
     let manifest = genesis_manifest()?;
+    let issue18_transition = genesis_transition(context, request)?;
     let mut receipt = WriteReceipt {
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
@@ -2448,11 +3468,15 @@ fn genesis_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: manifest.digest,
+        admission_digest: issue18_transition.admission_digest.clone(),
+        mutation_plan_digest: issue18_transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: Vec::new(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
         envelope: None,
     };
+    bind_issue18_receipt(&issue18_transition, &mut receipt, &[]);
     receipt.envelope = Some(issue_genesis_receipt_envelope(
         context,
         request,
@@ -2512,6 +3536,91 @@ struct ResourceSnapshotRow {
     task_id: Option<String>,
 }
 
+/// One immutable experience-bank row: the verbatim Governor-admitted
+/// record document for one handle + owner revision with its presented
+/// digest, admission fence, and task-binding provenance (issue #223).
+/// Rows are create-only; divergent rewrites fail closed and identical
+/// replays converge.
+#[derive(Clone, Debug, PartialEq)]
+struct ExperienceBankRow {
+    handle: String,
+    revision: u64,
+    record_json: String,
+    record_digest: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One immutable agent-feedback row (issue #223). Same durable rule as
+/// the bank rows: verbatim document, presented digest, create-only keyed
+/// by joined handle and owner revision.
+#[derive(Clone, Debug, PartialEq)]
+struct ExperienceFeedbackRow {
+    handle: String,
+    revision: u64,
+    record_json: String,
+    record_digest: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One immutable automation revision row: the verbatim Kernel-owned
+/// revision document for one automation + revision with its admission
+/// fence and task-binding provenance (issue #1779).
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationRevisionRow {
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One current automation pointer: the revision an automation names plus
+/// the closed admission state, fence, and provenance (issue #1779).
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationCurrentRow {
+    automation_id: String,
+    revision: String,
+    configuration_state: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One automation invocation row: the verbatim invocation document for
+/// one stable occurrence identity (issue #1779).
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationInvocationRow {
+    occurrence_id: String,
+    automation_id: String,
+    invocation_json: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One immutable automation failure row keyed by
+/// `(automation_id, revision, fingerprint)` (issue #1779). Verbatim
+/// failure document plus the first-writer operation identity, driven
+/// only through the closed failure leg under the held transaction lock.
+/// Repeats of one failure class converge on the existing row.
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationFailureRow {
+    automation_id: String,
+    revision: String,
+    occurrence_id: String,
+    fingerprint: String,
+    failure_json: String,
+    source_operation_id: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct MemoryState {
     epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
@@ -2547,6 +3656,38 @@ struct MemoryState {
     /// driven only through the closed reactive legs under the held
     /// transaction lock.
     resource_snapshots: BTreeMap<String, ResourceSnapshotRow>,
+    /// Immutable automation revision rows keyed by joined
+    /// `(automation_id, revision)` (issue #1779). Verbatim Kernel-owned
+    /// revision documents, driven only through the closed automation legs
+    /// under the held transaction lock.
+    automation_revisions: BTreeMap<String, AutomationRevisionRow>,
+    /// Current automation pointers keyed by automation (issue #1779).
+    /// Compare-and-set revision plus closed admission state, driven only
+    /// through the closed automation legs under the held transaction lock.
+    automation_currents: BTreeMap<String, AutomationCurrentRow>,
+    /// Automation invocation rows keyed by occurrence (issue #1779).
+    /// Verbatim invocation documents, driven only through the closed
+    /// automation legs under the held transaction lock.
+    automation_invocations: BTreeMap<String, AutomationInvocationRow>,
+    /// Immutable automation failure rows keyed by the canonical failure
+    /// key `(automation_id, revision, fingerprint)` (issue #1779).
+    /// Verbatim failure documents with first-writer provenance, driven
+    /// only through the closed failure leg under the held transaction
+    /// lock; repeats converge on the existing row.
+    automation_failures: BTreeMap<String, AutomationFailureRow>,
+    /// Last-failure pointers keyed by automation (issue #1779): the
+    /// failure key of the most recently committed failure row. Driven
+    /// only through the closed failure leg under the held transaction
+    /// lock; latest write wins.
+    automation_last_failure: BTreeMap<String, String>,
+    /// Immutable experience-bank rows keyed by joined `(handle, revision)`
+    /// (issue #223). Verbatim Governor-admitted record documents with
+    /// presented digests, driven only through the closed experience legs
+    /// under the held transaction lock; divergent rewrites fail closed.
+    experience_bank_rows: BTreeMap<String, ExperienceBankRow>,
+    /// Immutable agent-feedback rows keyed by joined `(handle, revision)`
+    /// (issue #223). Same durable rule as the bank rows.
+    experience_feedback_rows: BTreeMap<String, ExperienceFeedbackRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -2575,6 +3716,13 @@ impl PartialEq for MemoryState {
             && self.erased_subjects == other.erased_subjects
             && self.reactive_sessions == other.reactive_sessions
             && self.resource_snapshots == other.resource_snapshots
+            && self.automation_revisions == other.automation_revisions
+            && self.automation_currents == other.automation_currents
+            && self.automation_invocations == other.automation_invocations
+            && self.automation_failures == other.automation_failures
+            && self.automation_last_failure == other.automation_last_failure
+            && self.experience_bank_rows == other.experience_bank_rows
+            && self.experience_feedback_rows == other.experience_feedback_rows
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -2603,6 +3751,13 @@ impl Default for MemoryState {
             notifications: NotificationStore::new(),
             reactive_sessions: BTreeMap::new(),
             resource_snapshots: BTreeMap::new(),
+            automation_revisions: BTreeMap::new(),
+            automation_currents: BTreeMap::new(),
+            automation_invocations: BTreeMap::new(),
+            automation_failures: BTreeMap::new(),
+            automation_last_failure: BTreeMap::new(),
+            experience_bank_rows: BTreeMap::new(),
+            experience_feedback_rows: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -2626,6 +3781,9 @@ impl MemoryState {
             && self.notifications.len() == 0
             && self.reactive_sessions.is_empty()
             && self.resource_snapshots.is_empty()
+            && self.automation_revisions.is_empty()
+            && self.automation_currents.is_empty()
+            && self.automation_invocations.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {
@@ -2980,6 +4138,11 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
             operation_manifest_digest: manifest()?.digest,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; no semantic source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![eliot_store_api::NamedMutationRequest {
                 operation: eliot_store_api::NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(String::from("subject"), json!(operation))]),
@@ -2992,6 +4155,7 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: vec![],
         };
+        eliot_store_api::bind_issue18_digests(&mut prepared)?;
         let ctx = metadata(state_fence)?;
         let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
@@ -3748,6 +4912,14 @@ mod tests {
         assert_eq!(receipt.canonical_request_hash, recomputed);
         let before = store.snapshot()?;
         // Tamper one load-bearing byte (subject) while keeping the old claim.
+        // Ordering note (issue #63 vs #18): `apply_transaction` runs the
+        // structural/plan validation before the canonical recompute, so a
+        // tamper inside `named_operations` reports the mutation-plan digest
+        // here while a tamper outside plan coverage reports the canonical
+        // digest. Both cover the tampered bytes with the same typed kind,
+        // and the issue acceptance requires exactly that kind ("fails ...
+        // with a typed digest mismatch"), never a specific digest value —
+        // so either value satisfies the contract.
         let mut tampered = exact.clone();
         tampered.named_operations[0]
             .parameters
@@ -3756,14 +4928,28 @@ mod tests {
             .apply_transaction(&ctx, tampered, &[], &[])
             .expect_err("tampered bytes must fail");
         assert!(
-            matches!(
-                &err,
-                StoreError::TransitionDigestMismatch { expected, observed }
-                    if expected == &recomputed
-                        && observed
-                            != &recomputed
-            ),
+            matches!(&err, StoreError::TransitionDigestMismatch { .. }),
             "tamper must be TRANSITION_DIGEST_MISMATCH, got {err:?}"
+        );
+        assert_eq!(before, store.snapshot()?);
+        // Canonical-only tamper (outside mutation-plan coverage): a changed
+        // request id keeps every stored plan digest valid, so the plan
+        // checks pass and the canonical recompute reports expected == the
+        // original claim. This pins the canonical leg with a digest-value
+        // assertion.
+        let mut tampered_ctx = ctx.clone();
+        tampered_ctx.request_id =
+            RequestId::new("request-tampered").map_err(StoreError::Foundation)?;
+        let ctx_err = store
+            .apply_transaction(&tampered_ctx, exact.clone(), &[], &[])
+            .expect_err("tampered context must fail");
+        assert!(
+            matches!(
+                &ctx_err,
+                StoreError::TransitionDigestMismatch { expected, observed }
+                    if expected == &recomputed && observed != &recomputed
+            ),
+            "context tamper must report the canonical digest, got {ctx_err:?}"
         );
         assert_eq!(before, store.snapshot()?);
         // Same-key-different-bytes with a correctly recomputed claim for the
@@ -3775,6 +4961,10 @@ mod tests {
         forked.named_operations[0]
             .parameters
             .insert("subject".to_owned(), json!("forked"));
+        // Rebind the plan digests for the new bytes: the fork must be fully
+        // self-consistent (plan + canonical) so the idempotency collision —
+        // not a stale plan claim — decides the outcome.
+        eliot_store_api::bind_issue18_digests(&mut forked)?;
         let forked_view = CanonicalRequestView::from_apply(&ctx, &forked, &[], &[]);
         forked.identity.canonical_request_hash = canonical_request_hash(&forked_view)?;
         // Force the idempotency-key collision while keeping the fork's own
@@ -3812,6 +5002,124 @@ mod tests {
         Ok(())
     }
 
+    /// Issue #63 A2 cross-crate golden manifest: the same neutral
+    /// single-manifest values `eliot-canonical` uses for the chain
+    /// envelope, so the manifest digest is code-derived identically.
+    fn golden_chain_manifest() -> Result<eliot_store_api::NamedOperationManifest, StoreError> {
+        eliot_store_api::NamedOperationManifest::new(
+            "governor-golden-chain-63",
+            eliot_store_api::CONTRACT_VERSION,
+            vec![TransitionClass::CaptureCandidate],
+            EffectClass::Candidate,
+            1_024,
+            1_024,
+            1_000,
+        )
+    }
+
+    /// Pinned digest of the Governor chain envelope, asserted independently
+    /// by `eliot-canonical` (see its `golden_chain_envelope` test).
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
+        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+
+    #[test]
+    fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
+    {
+        // Issue #63 A2: Governor envelope (eliot-canonical) → shared view
+        // and hash (eliot-store-api) → memory commit receipt. All three
+        // bind the pinned digest; the exact replay is byte-identical.
+        use eliot_canonical::CanonicalWriteEnvelope;
+        use eliot_store_api::{
+            EventId, NamedMutationOperation, NamedMutationRequest, OrderingHeadExpectation,
+            RevisionHeadExpectation,
+        };
+
+        fn canonical_error(error: eliot_canonical::CanonicalError) -> StoreError {
+            StoreError::Serialization(error.to_string())
+        }
+
+        let state_fence = fence();
+        let manifest = golden_chain_manifest()?;
+        let envelope = CanonicalWriteEnvelope {
+            operation_id: eliot_contracts::OperationId::new("op-golden-chain-63")
+                .map_err(StoreError::Foundation)?,
+            request: RequestMeta {
+                request_id: RequestId::new("request-golden-chain-63")
+                    .map_err(StoreError::Foundation)?,
+                session_id: None,
+                task_id: None,
+                product_id: ProductId::new("product-golden-chain")
+                    .map_err(StoreError::Foundation)?,
+                source_id: SourceId::new("source-golden-chain").map_err(StoreError::Foundation)?,
+                state_fence: state_fence.clone(),
+                clock: ClockReading {
+                    valid_time_ms: Some(1),
+                    known_time_ms: Some(1),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+            },
+            idempotency_key: "idem-golden-chain-63".to_owned(),
+            scope_id: ScopeId::new("scope-golden-chain-63")?,
+            task_id: None,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: manifest.digest.clone(),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    json!("observation-golden-chain-63"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![EventId::new("event-golden-chain-1")?],
+                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                relation_kinds: vec!["relation-golden-chain-1".to_owned()],
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: vec!["approval-golden-chain-1".to_owned()],
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("revision-golden-chain-a")?,
+                expected_revision: 1,
+                state_fence: state_fence.clone(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-golden-chain-63")?,
+                expected_sequence: 1,
+                state_fence: state_fence.clone(),
+            }],
+        };
+        // Governor side binds the pinned digest through the shared function.
+        let governor_hash = envelope.canonical_request_hash().map_err(canonical_error)?;
+        assert_eq!(governor_hash, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        let transition = envelope.prepare().map_err(canonical_error)?;
+        assert_eq!(
+            transition.identity.canonical_request_hash,
+            ISSUE_63_GOLDEN_CHAIN_DIGEST
+        );
+        // Store-api side recomputes the same digest from the transported
+        // apply values.
+        let ctx = envelope.request.clone();
+        let revision_heads = envelope.expected_revision_heads.clone();
+        let ordering_heads = envelope.expected_ordering_heads.clone();
+        let view =
+            CanonicalRequestView::from_apply(&ctx, &transition, &revision_heads, &ordering_heads);
+        assert_eq!(canonical_request_hash(&view)?, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        // Memory side commits and binds the same digest, then replays it.
+        let store = store()?;
+        store.register_manifest(manifest)?;
+        let receipt =
+            store.apply_transaction(&ctx, transition.clone(), &revision_heads, &ordering_heads)?;
+        assert_eq!(receipt.canonical_request_hash, ISSUE_63_GOLDEN_CHAIN_DIGEST);
+        let before = store.snapshot()?;
+        let replay = store.apply_transaction(&ctx, transition, &revision_heads, &ordering_heads)?;
+        assert_eq!(receipt, replay);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
     fn capture_with_subject(
         operation: &str,
         subject: &str,
@@ -3826,6 +5134,9 @@ mod tests {
         prepared.named_operations[0]
             .parameters
             .insert("subject".to_owned(), json!(subject));
+        // The plan changed after `transition()` bound the issue-#18 digests:
+        // re-derive them from the mutated plan before rebinding the hash.
+        eliot_store_api::bind_issue18_digests(&mut prepared)?;
         let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
         Ok(prepared)
@@ -3884,6 +5195,7 @@ mod tests {
             )?;
             capture.scope_id = ScopeId::new(scope)?;
             capture.ordering_scopes = vec![OrderingScopeId::new(scope)?];
+            eliot_store_api::bind_issue18_digests(&mut capture)?;
             capture.identity.canonical_request_hash = canonical_request_hash(
                 &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
             )?;
@@ -4414,6 +5726,10 @@ mod tests {
         ctx: &RequestMeta,
         transition: &mut PreparedTransition,
     ) -> Result<(), StoreError> {
+        // Re-derive every identity bound to the mutated content (issue-#18
+        // plan/admission digests, then the canonical request hash) so the
+        // negative case reaches the downstream check it targets.
+        eliot_store_api::bind_issue18_digests(transition)?;
         let view = CanonicalRequestView::from_apply(ctx, transition, &[], &[]);
         transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
         Ok(())
@@ -4511,9 +5827,7 @@ mod tests {
         ));
         assert!(
             store
-                .receipt_sync(
-                    &OperationId::new("op-erase-na").map_err(StoreError::Foundation)?
-                )?
+                .receipt_sync(&OperationId::new("op-erase-na").map_err(StoreError::Foundation)?)?
                 .is_none()
         );
         assert_eq!(store.erasure_outcomes("op-erase-na")?, None);
@@ -4527,8 +5841,7 @@ mod tests {
             "doomed-subject",
             vec!["approval-user-1".to_owned()],
         )?;
-        stale.operation_manifest_digest =
-            OperationManifestDigest::new("0".repeat(64))?;
+        stale.operation_manifest_digest = OperationManifestDigest::new("0".repeat(64))?;
         rebind_erasure_hash(&ctx, &mut stale)?;
         assert_eq!(
             store.apply_transaction(&ctx, stale, &[], &[]),
@@ -4566,8 +5879,8 @@ mod tests {
     /// identical receipt (replay of the deletion proof stays legitimate) and
     /// a non-erasure receipt stays rehydratable.
     #[test]
-    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically(
-    ) -> Result<(), StoreError> {
+    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically()
+    -> Result<(), StoreError> {
         use eliot_store_api::ERASURE_STATE_IRREVERSIBLE_CONSTRAINT;
 
         assert_eq!(
@@ -4594,10 +5907,7 @@ mod tests {
         );
         // Replay is not rehydration: the same identity resolves to the
         // identical deletion proof without duplicate destructive work.
-        assert_eq!(
-            store.apply_transaction(&ctx, staged, &[], &[])?,
-            receipt
-        );
+        assert_eq!(store.apply_transaction(&ctx, staged, &[], &[])?, receipt);
 
         // A non-erasure receipt from the same executor stays rehydratable.
         let capture = capture_with_subject("op-guard-seed", "kept-subject", &state_fence, &ctx)?;
@@ -4672,6 +5982,11 @@ mod tests {
             requested_effect_ceiling: effect,
             admission_contract_set_digest: "a".repeat(64),
             operation_manifest_digest: manifest_digest,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; no semantic source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![eliot_store_api::NamedMutationRequest {
                 operation: mutation,
                 parameters,
@@ -4684,6 +5999,7 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: vec![],
         };
+        eliot_store_api::bind_issue18_digests(&mut prepared)?;
         let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
         prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
         Ok(prepared)
@@ -4828,10 +6144,7 @@ mod tests {
             response.payload["records"].as_array().map(Vec::len),
             Some(1)
         );
-        assert_eq!(
-            response.payload["current"]["to"],
-            json!("OPEN"),
-        );
+        assert_eq!(response.payload["current"]["to"], json!("OPEN"),);
         // Unknown task is an exact empty, not an error.
         let empty = store.execute_named_sync(&cognitive_query(
             &state_fence,
@@ -4842,7 +6155,11 @@ mod tests {
                 ("max_records".to_owned(), json!("10")),
             ]),
         )?)?;
-        assert!(empty.payload["records"].as_array().is_some_and(Vec::is_empty));
+        assert!(
+            empty.payload["records"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
         // GetAttentionAndProblems returns the admitted problem record.
         let response = store.execute_named_sync(&cognitive_query(
             &state_fence,
@@ -4878,9 +6195,11 @@ mod tests {
                 ("max_records".to_owned(), json!("10")),
             ]),
         )?)?;
-        assert!(response.payload["records"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
+        assert!(
+            response.payload["records"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
         // GetCapabilityEvidenceState returns the exact skill record.
         let response = store.execute_named_sync(&cognitive_query(
             &state_fence,

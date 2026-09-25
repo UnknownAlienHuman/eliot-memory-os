@@ -76,6 +76,7 @@ fn candidate() -> ContextCandidate {
         atom_id: id("atom"),
         provider_role: provider_role(),
         source: source_snapshot(),
+        learning: None,
         representation: AtomRepresentation::Whole {
             content: "complete goal\n\twith source detail".to_owned(),
         },

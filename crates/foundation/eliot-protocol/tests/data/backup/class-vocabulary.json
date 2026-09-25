@@ -1,0 +1,22 @@
+{
+  "contract": "eliot.foundation.backup",
+  "wire_version": 1,
+  "classes": ["FULL_RECOVERY", "CANONICAL_ONLY_DEGRADED", "SCOPE_EXPORT"],
+  "transitions": {
+    "FULL_RECOVERY": ["FULL_RECOVERY"],
+    "CANONICAL_ONLY_DEGRADED": ["CANONICAL_ONLY_DEGRADED"],
+    "SCOPE_EXPORT": ["SCOPE_EXPORT"]
+  },
+  "rules": {
+    "no_silent_downgrade": true,
+    "no_silent_upgrade": true,
+    "declared_must_equal_evidenced": true,
+    "degraded_never_satisfies_full_readiness": true
+  },
+  "rejected_examples": [
+    ["FULL_RECOVERY", "CANONICAL_ONLY_DEGRADED"],
+    ["FULL_RECOVERY", "SCOPE_EXPORT"],
+    ["CANONICAL_ONLY_DEGRADED", "FULL_RECOVERY"],
+    ["SCOPE_EXPORT", "FULL_RECOVERY"]
+  ]
+}

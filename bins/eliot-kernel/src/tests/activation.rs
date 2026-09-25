@@ -77,38 +77,14 @@ fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
         AgentActivationPending {
             ticket,
             request,
-            decision: None,
             claim_lease_until_unix_ms: None,
         },
     )
 }
 
 #[cfg(windows)]
-fn activation_test_decision(ticket_id: &str) -> AgentActivationResolutionDecision {
-    AgentActivationResolutionDecision {
-        wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
-        wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
-        ticket_id: ticket_id.to_owned(),
-        ticket_sha256: "c".repeat(64),
-        state_fence: StateFence::new(
-            test_epoch(1),
-            ResourceGeneration::new(1).expect("resource generation"),
-        ),
-        principal_id: "principal-test".to_owned(),
-        session_id: "session-test".to_owned(),
-        task_id: "task-test".to_owned(),
-        work_unit_id: "work-unit-test".to_owned(),
-        work_scope_id: "scope-test".to_owned(),
-        task_revision: "task-revision-test".to_owned(),
-        plan_id: "plan-test".to_owned(),
-        plan_revision: "plan-revision-test".to_owned(),
-        decision_sha256: "d".repeat(64),
-    }
-}
-
-#[cfg(windows)]
 #[test]
-fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim() {
+fn activation_claim_is_single_admission_without_result_less_recycle() {
     let (ticket_id, entry) = activation_test_entry(2_000);
     let mut pending = AgentActivationPendingState::default();
     pending.fifo.push_back(ticket_id.clone());
@@ -117,29 +93,27 @@ fn activation_claim_lease_retries_transient_resolution_without_duplicate_claim()
     let first = pending.claim_at(1).expect("first claim");
     assert_eq!(first.ticket_id, "activation-ticket-test");
     assert!(pending.claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS).is_none());
-    let retry = pending
-        .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
-        .expect("claim after lease expiry");
-    assert_eq!(retry, first, "retry reuses the exact Kernel ticket");
+    // #66 C4/A3: a result-less ticket is never re-queued after its single
+    // admission, even after the admission mark passes. Reconsideration
+    // requires a retained typed transient result with a changed-dependency
+    // discriminator on the submit path; an unanswered ticket rests until the
+    // Kernel-owned deadline instead of looping the resolver.
+    assert!(
+        pending
+            .claim_at(AGENT_ACTIVATION_CLAIM_LEASE_MS + 1)
+            .is_none()
+    );
+    assert!(pending.claim_at(1_999).is_none());
 }
 
 #[cfg(windows)]
 #[test]
-fn activation_claim_expires_at_deadline_and_decided_ticket_is_not_reclaimed() {
-    let (ticket_id, mut entry) = activation_test_entry(2_000);
+fn activation_claim_expires_at_deadline() {
+    let (ticket_id, entry) = activation_test_entry(2_000);
     let mut pending = AgentActivationPendingState::default();
     pending.fifo.push_back(ticket_id.clone());
     pending.entries.insert(ticket_id.clone(), entry.clone());
     assert!(pending.claim_at(2_000).is_none(), "deadline is inclusive");
-
-    entry.decision = Some(activation_test_decision(&ticket_id));
-    pending.fifo.clear();
-    pending.fifo.push_back(ticket_id.clone());
-    pending.entries.insert(ticket_id, entry);
-    assert!(
-        pending.claim_at(1).is_none(),
-        "decided tickets are terminal"
-    );
 }
 
 #[cfg(windows)]
@@ -238,26 +212,6 @@ fn activation_denial_codes_map_each_non_resolved_disposition_distinctly() {
     );
 }
 
-#[cfg(windows)]
-#[test]
-fn activation_decision_replay_is_exact_and_conflicts_are_rejected() {
-    let first = activation_test_decision("activation-ticket-test");
-    assert_eq!(
-        classify_activation_decision(None, &first),
-        ActivationDecisionDisposition::Commit
-    );
-    assert_eq!(
-        classify_activation_decision(Some(&first), &first),
-        ActivationDecisionDisposition::ExactReplay
-    );
-    let mut conflicting = first.clone();
-    conflicting.plan_id = "different-plan".to_owned();
-    assert_eq!(
-        classify_activation_decision(Some(&first), &conflicting),
-        ActivationDecisionDisposition::Conflict
-    );
-}
-
 // ---------------------------------------------------------------------------
 // #203 / #1115: one canonical terminal result identity per ticket across the
 // daemon and host-request legs.
@@ -290,7 +244,6 @@ fn activation_v2_entry(ticket: &AgentActivationResolutionTicket) -> AgentActivat
     AgentActivationPending {
         ticket: ticket.clone(),
         request: template.request,
-        decision: None,
         claim_lease_until_unix_ms: None,
     }
 }

@@ -1,6 +1,8 @@
 schema = "eliot.dependency-policy.v1"
 issue = 1229
-updated_at = "2026-09-13"
+updated_at = "2026-09-23"
+# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
+exceptions = []
 
 [scanner]
 tool = "cargo-deny"
@@ -29,15 +31,115 @@ require_hashes = true
 [ecosystems.node]
 contract = "integrations/opencode/plugin-bridge-contract.json"
 manifest = "integrations/opencode/opencode.json"
+package_root = "integrations"
 
 [external_executables.surrealdb]
-name = "surrealdb"
-version = "2.2.1"
+name = "surreal.exe"
+version = "3.1.4"
 license = "BSL-1.1"
 consumer = "crates/storage/eliot-store-surreal"
 trust_model = "local-loopback-service-only"
 removal_boundary = "pluggable-storage-facade"
 owner = "crates/storage/eliot-store-surreal"
+sha256 = "13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1"
+catalog = "docs/release/SURREALDB_WINDOWS_X64.lock.json"
+observed_path = "C:/Tools/SurrealDB/surreal.exe"
+version_args = ["version"]
+release_source = "https://github.com/surrealdb/surrealdb/releases/tag/v3.1.4"
+release_asset = "https://github.com/surrealdb/surrealdb/releases/download/v3.1.4/surreal-v3.1.4.windows-amd64.exe"
+source_tag = "v3.1.4"
+advisory_package = "surrealdb"
+advisory_ecosystem = "crates.io"
+advisory_scope = "rust-crate"
+distributed_binary_applicability = "unestablished"
+advisory_source = "https://api.osv.dev/v1/query"
+advisory_query = '{"package":{"name":"surrealdb","ecosystem":"crates.io"},"version":"3.1.4"}'
+advisory_checked_at = "2026-09-23T03:21:38Z"
+advisory_digest = "ca3ee13e6d878ee2613ea4adb337648ff4819f99c4d1bdd654222e59e17f0a30"
+advisory_response_digest = "ca3ee13e6d878ee2613ea4adb337648ff4819f99c4d1bdd654222e59e17f0a30"
+advisory_query_sha256 = "08a71d32c9f3e8a31c35c6e6b82d8cc2201b271aa3ec7779e04796fb07e7611c"
+advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.1.4/osv-query.json"
+advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.1.4/osv-response.json"
+advisory_status = "findings"
+advisory_findings = [
+    "GHSA-848m-r628-vrxw",
+    "GHSA-cc8f-fcx3-gpjr",
+    "GHSA-h4h3-3rfj-x6fq",
+    "GHSA-h5rg-8p7f-47g2",
+    "GHSA-hv6h-hc26-q48p",
+    "GHSA-jv2j-mqmw-xvv5",
+]
+
+[external_executables.surrealdb.distributed_binary_evidence]
+status = "source-and-advisory-verified"
+build_status = "not_executed"
+source_repository = "https://github.com/surrealdb/surrealdb"
+source_tag = "v3.1.4"
+source_commit = "c9e039542e85c3853f26219198df1ae64291edda"
+build_target = "x86_64-pc-windows-msvc"
+build_features = ["default", "storage-tikv", "jwks", "ml"]
+build_command = "cargo build --no-default-features --features default --features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc"
+source_paths = [
+    "surrealdb/server/src/ntw/api.rs",
+    "surrealdb/core/src/idx/ft/analyzer/mapper.rs",
+    "surrealdb/core/src/exec/planner/select/mod.rs",
+    "surrealdb/core/src/iam/jwks.rs",
+    "surrealdb/core/src/doc/field.rs",
+    "surrealdb/core/src/syn/parser/expression.rs",
+]
+source_archive_path = ".eliot/dependency-policy/surrealdb/v3.1.4/surrealdb-v3.1.4.tar.gz"
+source_archive_sha256 = "88d748727ce85ed713dd632ed71bb716bbbe56f2af1031542d78f3196853b6b5"
+source_tag_ref_path = ".eliot/dependency-policy/surrealdb/v3.1.4/github-tag-v3.1.4.json"
+advisory_fix_versions = { "GHSA-848m-r628-vrxw" = "3.2.0", "GHSA-cc8f-fcx3-gpjr" = "3.1.5", "GHSA-h4h3-3rfj-x6fq" = "3.1.5", "GHSA-h5rg-8p7f-47g2" = "3.1.5", "GHSA-hv6h-hc26-q48p" = "3.1.5", "GHSA-jv2j-mqmw-xvv5" = "3.1.5" }
+advisory_conditions = { "GHSA-848m-r628-vrxw" = "authenticated non-root caller invokes a custom API outside its authenticated namespace or database scope", "GHSA-cc8f-fcx3-gpjr" = "EDITOR or OWNER mapper filter reads a process-readable file when SURREAL_FILE_ALLOWLIST is empty", "GHSA-h4h3-3rfj-x6fq" = "record user orders by an indexed field hidden by field-level SELECT permission", "GHSA-h5rg-8p7f-47g2" = "database-level OWNER JWKS access follows a redirect to a blocked network target", "GHSA-hv6h-hc26-q48p" = "record user reaches a field-hidden record through graph or reference traversal", "GHSA-jv2j-mqmw-xvv5" = "authenticated query user submits a deep operator chain that exceeds safe expression depth" }
+advisory_source_paths = { "GHSA-848m-r628-vrxw" = ["surrealdb/server/src/ntw/api.rs"], "GHSA-cc8f-fcx3-gpjr" = ["surrealdb/core/src/idx/ft/analyzer/mapper.rs"], "GHSA-h4h3-3rfj-x6fq" = ["surrealdb/core/src/exec/planner/select/mod.rs"], "GHSA-h5rg-8p7f-47g2" = ["surrealdb/core/src/iam/jwks.rs"], "GHSA-hv6h-hc26-q48p" = ["surrealdb/core/src/doc/field.rs", "surrealdb/core/src/exec/planner/select/mod.rs"], "GHSA-jv2j-mqmw-xvv5" = ["surrealdb/core/src/syn/parser/expression.rs"] }
+advisory_features = { "GHSA-848m-r628-vrxw" = ["default"], "GHSA-cc8f-fcx3-gpjr" = ["default"], "GHSA-h4h3-3rfj-x6fq" = ["default"], "GHSA-h5rg-8p7f-47g2" = ["default", "jwks"], "GHSA-hv6h-hc26-q48p" = ["default"], "GHSA-jv2j-mqmw-xvv5" = ["default"] }
+
+[external_executables.surrealdb.patched_candidate]
+status = "project_local_artifact_required"
+name = "surreal.exe"
+version = "3.2.0"
+architecture = "windows-x64"
+pe_machine = "8664"
+sha256 = "9382a851a54df09aaf39c74c0b010a14b09f2565651f620e83c21dc1f1bca8d3"
+release_source = "https://github.com/surrealdb/surrealdb/releases/tag/v3.2.0"
+release_asset = "https://github.com/surrealdb/surrealdb/releases/download/v3.2.0/surreal-v3.2.0.windows-amd64.exe"
+source_tag = "v3.2.0"
+source_commit = "5bebfcdcfa9166131618f768dfe0c0e6fb486f4f"
+build_target = "x86_64-pc-windows-msvc"
+build_features = ["default", "storage-tikv", "jwks", "ml"]
+build_command = "cargo build --no-default-features --features default --features storage-tikv,jwks,ml --locked --target x86_64-pc-windows-msvc"
+provisioning = "project_local_provisioner"
+installation_approval = "not-issued"
+artifact_path = ".eliot/dependency-policy/surrealdb/v3.2.0/surreal-v3.2.0.windows-amd64.exe"
+artifact_size = 114430464
+source_archive_path = ".eliot/dependency-policy/surrealdb/v3.2.0/surrealdb-v3.2.0.tar.gz"
+source_archive_sha256 = "669f077b43c8a2910a2e0091d2cf2f4082e3279d4f6d2d3fbba0e5e30a0f15f6"
+source_paths = [
+    "surrealdb/server/src/ntw/api.rs",
+    "surrealdb/core/src/idx/ft/analyzer/mapper.rs",
+    "surrealdb/core/src/exec/planner/select/mod.rs",
+    "surrealdb/core/src/iam/jwks.rs",
+    "surrealdb/core/src/doc/field.rs",
+    "surrealdb/core/src/syn/parser/expression.rs",
+]
+source_tag_ref_path = ".eliot/dependency-policy/surrealdb/v3.2.0/github-tag-v3.2.0.json"
+release_metadata_path = ".eliot/dependency-policy/surrealdb/v3.2.0/github-release-v3.2.0.json"
+advisory_query_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-query.json"
+advisory_response_path = ".eliot/dependency-policy/surrealdb/v3.2.0/osv-response.json"
+advisory_package = "surrealdb"
+advisory_ecosystem = "crates.io"
+advisory_scope = "rust-crate"
+advisory_max_age_hours = 24
+
+[direct_dependencies.aes-gcm]
+ecosystem = "rust"
+consumer = "eliot-backup"
+owner = "crates/storage/eliot-backup"
+reason = "vetted AES-256-GCM for portable backup envelope open and re-seal (#1873)"
+features = ["aes", "alloc", "zeroize"]
+public_exposure = "none (sealed bytes and digests only; no key or plaintext types cross the API)"
+removal_plan = "installation-bound DPAPI path remains; portable restore degrades to refused"
 
 [direct_dependencies.anyhow]
 ecosystem = "rust"
@@ -93,6 +195,24 @@ features = ["sink"]
 public_exposure = "internal async conduits"
 removal_plan = "hand-rolled poll loop"
 
+[direct_dependencies.getrandom]
+ecosystem = "rust"
+consumer = "eliot-backup"
+owner = "crates/storage/eliot-backup"
+reason = "OS randomness for portable envelope nonces (#1873)"
+features = []
+public_exposure = "none"
+removal_plan = "installation-bound DPAPI path remains; portable sealing refused without nonces"
+
+[direct_dependencies.zeroize]
+ecosystem = "rust"
+consumer = "eliot-backup"
+owner = "crates/storage/eliot-backup"
+reason = "vetted RAII zeroization for portable key material and plaintext (#1873)"
+features = []
+public_exposure = "zeroizing key and plaintext memory wrappers only"
+removal_plan = "standardized secret-memory owner"
+
 [direct_dependencies.wasmtime]
 ecosystem = "rust"
 consumer = "eliot-wasm-runtime"
@@ -101,6 +221,18 @@ reason = "sandboxed WebAssembly component execution"
 features = ["component-model", "cranelift", "runtime", "std"]
 public_exposure = "sandboxed execution facade"
 removal_plan = "alternative WASM engine"
+
+[direct_dependencies.wasmparser]
+ecosystem = "rust"
+consumer = "crates/smart/eliot-context-compiler-wasm, crates/smart/eliot-cue-activation-wasm, crates/smart/eliot-dreamer-curation-wasm, crates/smart/eliot-dreamer-cycle-wasm, crates/smart/eliot-dreamer-orientation-wasm, crates/smart/eliot-dreamer-research-wasm, crates/smart/eliot-memory-curation-screen-wasm"
+owner = "crates/smart"
+reason = "WASM core and component binary parsing for descriptor import validation"
+version = "0.256.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60bd825ffedc6cba8a642924ba7ae424afbc47811cffbcb7b92031ec24e59b4c"
+features = []
+public_exposure = "internal descriptor validation only"
+removal_plan = "prevalidated descriptor decoder"
 
 [direct_dependencies.wat]
 ecosystem = "rust"
@@ -300,14 +432,57 @@ version = "4.25.1"
 public_exposure = "scripts only"
 removal_plan = "manual json validation"
 
-[direct_dependencies.pyyaml]
-ecosystem = "python"
-consumer = "scripts verification"
-owner = "scripts"
-reason = "YAML parsing for GitHub workflow and config verification"
-version = "6.0.3"
-public_exposure = "scripts only"
-removal_plan = "custom YAML parser"
+[[workspace_dependency_dispositions]]
+consumer = "eliot-wasm-host"
+dependency = "eliot-contracts"
+dependency_kind = "dependencies"
+target = "all"
+owner = "bins/eliot-wasm-host"
+reason = "owner-permit issuance context for P03 parent drive"
+features = ["default"]
+public_exposure = "none"
+removal_plan = "Remove when P03 parent-drive epoch parsing and owner-fence construction no longer require eliot-contracts."
 
-# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
-exceptions = []
+[[workspace_dependency_dispositions]]
+consumer = "eliot-wasm-host"
+dependency = "eliot-platform"
+dependency_kind = "dependencies"
+target = "all"
+owner = "bins/eliot-wasm-host"
+reason = "owner-permit issuance context for P03 parent drive"
+features = ["default"]
+public_exposure = "none"
+removal_plan = "Remove when P03 parent-drive validation no longer carries the owner-observed ClockObservation."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-kernel-core"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Restore and publish the canonical owner closure through Kernel hydration and closure contracts."
+features = ["default"]
+public_exposure = "Public owner-closure provider methods use Kernel grant, introduction, and restore contract types."
+removal_plan = "Remove when owner-closure hydration no longer consumes Kernel closure restore types and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-ors"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Validate and construct opaque operational-record inputs and grant/introduction activation values for owner-closure hydration."
+features = ["default"]
+public_exposure = "Opaque ORS activation values flow through owner-closure restore payloads; secret bytes are not exposed."
+removal_plan = "Remove when owner-closure hydration no longer encodes ORS grant/introduction activation records and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-governor"
+dependency = "eliot-platform"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/governor/eliot-governor"
+reason = "Pass SecretReference handles to owner-closure admission while keeping secret bytes outside the provider."
+features = ["default"]
+public_exposure = "SecretReference is a public admission parameter; secret bytes are not exposed."
+removal_plan = "Remove when owner-closure admission no longer consumes eliot_platform::SecretReference and the manifest edge is deleted."

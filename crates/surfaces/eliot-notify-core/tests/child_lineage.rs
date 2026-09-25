@@ -13,16 +13,14 @@
 
 use eliot_notify_core::{
     AdmissionRequest, DeliveryEffect, DeliveryRoute, Recipient, RecipientRole,
-    SignedWatchdogFallbackEnvelope, WATCHDOG_SIGNATURE_DOMAIN,
-    watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
-    watchdog_signature_payload,
+    SignedWatchdogFallbackEnvelope, WATCHDOG_SIGNATURE_DOMAIN, watchdog_notification_id,
+    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
 };
 use eliot_platform::PlatformHandle;
 use serde_json::{Value, json};
 
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
-const BODY_HEX: &str =
-    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BODY_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn fence_json() -> Value {
     json!({

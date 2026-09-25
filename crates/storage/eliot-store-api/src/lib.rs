@@ -30,16 +30,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod backup_io;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
+pub mod experience_store;
 mod notification_state;
 mod payload_authority;
 mod reactive_state;
 mod request_hash;
 mod store_failure;
+mod user_automation_state;
 mod wire;
 pub mod write_admission;
+
+pub use backup_io::{
+    ALL_BACKUP_IO_CAPABILITIES, BACKUP_IO_CAPABILITY_COHERENT_SNAPSHOT,
+    BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_CAPABILITY_OPERATION_RECONCILIATION,
+    BACKUP_IO_CAPABILITY_PURGE_VALIDATION, BACKUP_IO_CAPABILITY_REBUILD_VALIDATION,
+    BACKUP_IO_CAPABILITY_REFERENCE_VALIDATION, BACKUP_IO_CONTRACT_NAME,
+    BACKUP_IO_RESTORE_SCHEMA_V1, BACKUP_IO_SNAPSHOT_SCHEMA_V1, BackupIoCapability,
+    BackupOperationReconciliation, BlobResidency, BlobResidencyDomain, CanonicalRestoreBatch,
+    CanonicalSnapshotPort, DestinationClass, EventInterval, IsolatedDestination,
+    IsolatedRestorePort, IsolationEvidence, MAX_DENOMINATOR_REFERENCES, MAX_PROOF_HANDLES,
+    MAX_RESTORE_MEMBERS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS,
+    MAX_SNAPSHOT_PAGES, ReconciliationOutcome, RestoreConflictKind, RestoreValidationReceipt,
+    SnapshotBeginRequest, SnapshotBounds, SnapshotCompleteness, SnapshotCursor,
+    SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
+    SnapshotPage, SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
+    is_backup_io_capability, reconcile_same_operation,
+};
 
 pub use dreamer_job::{
     DREAMER_JOB_LEDGER_SCHEMA, DreamerJobExpectedState, DreamerJobLedgerEvent,
@@ -66,9 +86,10 @@ pub use notification_state::{
 };
 
 pub use payload_authority::{
-    CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
-    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
-    number_token_would_narrow, reject_control_parameter_name,
+    CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, HISTORICAL_TRUNCATION_SIGNATURE,
+    HistoricalRecordDisposition, HistoricalRecordProvenance, MAX_EXACT_JSON_BYTES,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, dispose_historical_record,
+    json_shape_name, number_token_would_narrow, reject_control_parameter_name,
 };
 
 pub use reactive_state::{
@@ -88,9 +109,37 @@ pub use reactive_state::{
     validate_resource_uri, validate_sha256_hex,
 };
 
+pub use user_automation_state::{
+    AUTOMATION_OPERATION_CREATE, AUTOMATION_OPERATION_EDIT, AUTOMATION_OPERATION_FAILURE,
+    AUTOMATION_OPERATION_PAUSE, AUTOMATION_OPERATION_REMOVE, AUTOMATION_OPERATION_RESUME,
+    AUTOMATION_OPERATION_RUN_NOW, AUTOMATION_PAGE_CURRENT, AUTOMATION_PAGE_CURRENTS,
+    AUTOMATION_PAGE_FAILURE, AUTOMATION_PAGE_INVOCATIONS, AUTOMATION_PAGE_REVISION,
+    AUTOMATION_PAGE_REVISIONS, AUTOMATION_PAGE_STATE_FENCE, AUTOMATION_PARAM_AUTOMATION_ID,
+    AUTOMATION_PARAM_CONFIGURATION_STATE, AUTOMATION_PARAM_FAILURE_JSON,
+    AUTOMATION_PARAM_INCLUDE_RETIRED, AUTOMATION_PARAM_INVOCATION_JSON,
+    AUTOMATION_PARAM_MAX_RECORDS, AUTOMATION_PARAM_OCCURRENCE_ID, AUTOMATION_PARAM_OPERATION,
+    AUTOMATION_PARAM_PREVIOUS_REVISION, AUTOMATION_PARAM_QUERY, AUTOMATION_PARAM_REVISION,
+    AUTOMATION_PARAM_REVISION_JSON, AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE,
+    AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST,
+    AUTOMATION_STATE_ACTIVE, AUTOMATION_STATE_BLOCKED_CONFIG, AUTOMATION_STATE_PAUSED,
+    AUTOMATION_STATE_RETIRED, AutomationContractError, AutomationFailureDocument,
+    DecodedAutomationMutation, DecodedAutomationRead, MAX_AUTOMATION_DOC_BYTES,
+    MAX_AUTOMATION_ID_BYTES, MAX_AUTOMATION_PAGE_RECORDS, MAX_AUTOMATION_REVISION_ID_BYTES,
+    USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
+    USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params, automation_edit_params,
+    automation_failure_history_ref, automation_failure_key, automation_failure_params,
+    automation_invocation_read_request, automation_mutation_request, automation_read_request,
+    automation_revision_read_request, automation_run_now_params,
+    automation_state_transition_params, decode_automation_mutation, is_configuration_state_wire,
+    parse_automation_failure_document, validate_automation_doc,
+    validate_automation_failure_document, validate_automation_mutation_params,
+    validate_automation_read_params,
+};
+
 pub use request_hash::{
-    CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, canonical_request_bytes, canonical_request_hash,
-    verify_canonical_request_hash,
+    CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, admission_digest_hex, canonical_request_bytes,
+    canonical_request_hash, mutation_plan_digest_hex, verify_admission_digest,
+    verify_canonical_request_hash, verify_mutation_plan_digest, verify_ordering_scope_binding,
 };
 
 pub use store_failure::{
@@ -113,10 +162,12 @@ pub use wire::{
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
-    CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest, ReadinessReceipt,
-    ReadinessStatus, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
-    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
-    request_frame, request_frame_with_payload_authority, response_frame,
+    CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest,
+    ReadinessReceipt, ReadinessStatus, StoreBackupOperation, StoreBackupRequest,
+    StoreBackupResponse, StoreBackupStatus, StoreBackupStatusOutcome, StoreRequest, StoreResponse,
+    StoreWireError, decode_request_frame, decode_request_frame_with_authority,
+    decode_response_frame, dreamer_job_capability, request_frame,
+    request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;
@@ -130,6 +181,23 @@ pub use erasure_admission::{
     encode_erasure_surfaces,
 };
 
+pub use experience_store::{
+    AUDIT_PARAM_CURSOR, DecodedExperienceMutation, DecodedExperienceRead,
+    EXPERIENCE_BANK_MUTATION_NAME, EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_MUTATION_NAME,
+    EXPERIENCE_FEEDBACK_READ_NAME, EXPERIENCE_PAGE_MATCHED_TOTAL, EXPERIENCE_PAGE_NEXT_CURSOR,
+    EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE, EXPERIENCE_PAGE_TRUNCATED,
+    EXPERIENCE_PARAM_FENCE_DIGEST, EXPERIENCE_PARAM_IDEMPOTENCY_KEY, EXPERIENCE_PARAM_MAX_RECORDS,
+    EXPERIENCE_PARAM_RECORD_DIGEST, EXPERIENCE_PARAM_RECORD_JSON, EXPERIENCE_PARAM_RECORD_REVISION,
+    EXPERIENCE_PARAM_SCOPE_DIGEST, EXPERIENCE_STORE_SCHEMA_V1, ExperienceContractError,
+    ExperienceRangePage, MAX_EXPERIENCE_HANDLE_BYTES, MAX_EXPERIENCE_IDEMPOTENCY_BYTES,
+    MAX_EXPERIENCE_PAGE_RECORDS, MAX_EXPERIENCE_RECORD_JSON_BYTES, audit_cursor_issue,
+    audit_cursor_parse, audit_envelope_candidate, audit_heads_digest, decode_experience_mutation,
+    experience_bank_commit_params, experience_bank_mutation_request, experience_bank_read_request,
+    experience_feedback_commit_params, experience_feedback_mutation_request,
+    experience_feedback_read_request, validate_experience_mutation_params,
+    validate_experience_read_params,
+};
+
 pub use write_admission::{
     MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservedScopeBinding,
     ReservedWriteRequest, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
@@ -138,17 +206,17 @@ pub use write_admission::{
 
 pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
-    MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES,
-    READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE,
-    SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations, generated_operation_manifests,
-    operation_manifest_set_digest,
+    MAX_AUDIT_RANGE_RECORDS, MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE,
+    OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE,
+    SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 
 pub use operation_parameters::{
     ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
     named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
     named_read_operation_name, parameter_schema_digest, project_parameter_schema,
-    validate_typed_read_parameters,
+    validate_typed_read_parameters, verify_declaration_holds_no_payload_encoding,
 };
 
 pub use revocation_history::{
@@ -578,6 +646,36 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Validates bound semantic source revisions (issue #18).
+///
+/// Every entry renders one bound head as `key@revision`: a non-blank,
+/// control-free key, the `@` separator, and a non-zero decimal revision.
+/// Entries must be unique. An empty list is valid and is exactly what
+/// fence-scoped erasure transitions and frozen fixtures record.
+fn validate_semantic_source_revisions(entries: &[String]) -> Result<(), StoreError> {
+    const FIELD: &str = "semantic_source_revisions";
+    const REASON: &str = "must render bound heads as key@revision";
+    unique(entries.iter().cloned(), FIELD)?;
+    for entry in entries {
+        let (key, revision) = entry.split_once('@').ok_or(StoreError::InvalidField {
+            field: FIELD,
+            reason: REASON,
+        })?;
+        validate_text(key, FIELD)?;
+        let revision: u64 = revision.parse().map_err(|_| StoreError::InvalidField {
+            field: FIELD,
+            reason: REASON,
+        })?;
+        if revision == 0 {
+            return Err(StoreError::InvalidField {
+                field: FIELD,
+                reason: REASON,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn unique<T: Ord>(
     values: impl IntoIterator<Item = T>,
     field: &'static str,
@@ -648,6 +746,20 @@ pub enum TransitionClass {
     /// closed reactive typed parameters. The ceiling is the maximum
     /// store-allowed reversible effect; existing class maxima are unchanged.
     ReactiveState,
+    /// Canonical user-automation revision + admission-state persistence
+    /// (issue #1779).
+    ///
+    /// Store-owned durable rows for operator automations: immutable
+    /// revision rows (opaque Kernel-owned documents, create-only),
+    /// a compare-and-set current pointer per automation carrying the
+    /// closed admission state, and create-only invocation rows keyed by
+    /// stable occurrence identity. Applied only through the named
+    /// automation transaction carrying the closed automation typed
+    /// parameters. Lineage validity stays Kernel-owned; the store
+    /// arbitrates keys, pointers, and immutability. The ceiling is the
+    /// maximum store-allowed reversible effect; existing class maxima are
+    /// unchanged.
+    UserAutomation,
 }
 
 impl TransitionClass {
@@ -660,7 +772,8 @@ impl TransitionClass {
             | Self::RecoverySchema
             | Self::Erasure
             | Self::NotificationState
-            | Self::ReactiveState => EffectClass::ReversibleMutation,
+            | Self::ReactiveState
+            | Self::UserAutomation => EffectClass::ReversibleMutation,
         }
     }
 }
@@ -719,6 +832,18 @@ pub enum NamedReadOperation {
     GetReactiveInjectionState,
     /// Canonical resource-snapshot read (issue #1941 C4).
     GetResourceSnapshot,
+    /// Canonical user-automation read (issue #1779).
+    GetUserAutomationState,
+    /// Canonical experience-bank range read (issue #223).
+    ///
+    /// Durable same-scope bank-record rows with owner revisions, driven
+    /// only through the closed experience legs under the held transaction
+    /// lock. The read projects verbatim record documents; digest
+    /// re-proof stays Governor-owned at the read edge.
+    GetExperienceBankRange,
+    /// Canonical agent-feedback range read (issue #223). Same durable
+    /// rule as the bank range read.
+    GetAgentFeedbackRange,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -732,6 +857,14 @@ pub enum NamedMutationOperation {
     UpdateTaskState,
     ApplyLifecyclePolicy,
     ReconcileRecovery,
+    /// Persists the Governor-owned canonical finish receipt through the
+    /// existing `RecoverySchema` transition. The store treats the receipt as
+    /// opaque bytes and only arbitrates the `owner/finish` revision.
+    RecordFinishDecision,
+    /// Persists the Governor-produced canonical finish-evidence owner image
+    /// through the same fenced `RecoverySchema` transition. The store treats
+    /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
+    RecordFinishEvidence,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -774,6 +907,29 @@ pub enum NamedMutationOperation {
     /// digest over the decoded bytes and refuses URI rewrites; it never
     /// mints identity or resolves handles.
     ApplyResourceSnapshot,
+    /// Canonical user-automation transaction (issue #1779).
+    ///
+    /// Durable operator-automation persistence only: the prepared
+    /// transition must carry [`TransitionClass::UserAutomation`], the
+    /// declared automation effect ceiling, and the closed automation typed
+    /// parameters (operation discriminator, identities, opaque revision /
+    /// invocation documents, closed admission state). The store bridge
+    /// persists documents verbatim and arbitrates keys and pointers; it
+    /// never derives lineage, transitions, or invocation semantics.
+    ApplyUserAutomationState,
+    /// Canonical experience-bank commit (issue #223).
+    ///
+    /// Durable bank-record persistence only: the prepared transition must
+    /// carry [`TransitionClass::CaptureCandidate`], the declared
+    /// candidate-only effect ceiling, and the closed experience typed
+    /// parameters (verbatim record document, presented digests, owner
+    /// revision, idempotency key). The store bridge persists the document
+    /// verbatim, arbitrates handle/revision keys with convergent replay,
+    /// and never derives lineage, support, or influence.
+    CommitExperienceBank,
+    /// Canonical agent-feedback commit (issue #223). Same durable rule
+    /// as the bank commit leg.
+    CommitAgentFeedback,
 }
 
 impl NamedMutationOperation {
@@ -784,13 +940,18 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
-            Self::ReconcileRecovery | Self::RecordAuthorityRevocation => {
-                TransitionClass::RecoverySchema
-            }
+            Self::ReconcileRecovery
+            | Self::RecordFinishDecision
+            | Self::RecordFinishEvidence
+            | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
             Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
                 TransitionClass::ReactiveState
+            }
+            Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
+            Self::CommitExperienceBank | Self::CommitAgentFeedback => {
+                TransitionClass::CaptureCandidate
             }
         }
     }
@@ -1393,6 +1554,28 @@ pub struct PreparedTransition {
     pub requested_effect_ceiling: EffectClass,
     pub admission_contract_set_digest: String,
     pub operation_manifest_digest: OperationManifestDigest,
+    /// I05-06 step-12 admission-DECISION digest (lowercase hex SHA-256).
+    ///
+    /// This binds the admission DECISION, never the contract-set input
+    /// alone: its documented byte layout is owned by
+    /// [`admission_digest_hex`]. It is distinct from
+    /// `admission_contract_set_digest`, which carries the admitted
+    /// contract-set input digest.
+    pub admission_digest: String,
+    /// I05-06 `mutation_plan_hash` (lowercase hex SHA-256).
+    ///
+    /// This binds the exact ordered [`NamedMutationRequest`] plan via
+    /// [`mutation_plan_digest_hex`]. It is distinct from
+    /// `operation_manifest_digest`, which carries the authorizing catalogue
+    /// manifest (or set) digest.
+    pub mutation_plan_digest: String,
+    /// Bound semantic source revisions rendered as `key@revision` heads.
+    ///
+    /// The envelope path renders these from the admitted
+    /// `expected_revision_heads` via [`render_semantic_source_revisions`];
+    /// fence-scoped erasure transitions and frozen fixtures record `[]`
+    /// explicitly.
+    pub semantic_source_revisions: Vec<String>,
     pub named_operations: Vec<NamedMutationRequest>,
     pub event_projection_relation_intents: EventProjectionRelationIntents,
     pub security: SecurityContext,
@@ -1463,6 +1646,24 @@ impl PreparedTransition {
                 return Err(StoreError::TransitionClassExceeded);
             }
         }
+        // Issue #18: the bound decision/plan digests are recomputed from the
+        // carried content and compared; any divergence (including a
+        // malformed claimant) fails with the typed digest mismatch, never
+        // with a silent default. These arms run after the structural checks
+        // above so a more specific shape refusal keeps its error.
+        verify_mutation_plan_digest(self)?;
+        verify_admission_digest(self)?;
+        validate_semantic_source_revisions(&self.semantic_source_revisions)?;
+        // Fence-scoped erasure binds no semantic source: the deletion
+        // admits no revision lineage and records `[]` explicitly.
+        if self.transition_class == TransitionClass::Erasure
+            && !self.semantic_source_revisions.is_empty()
+        {
+            return Err(StoreError::InvalidField {
+                field: "semantic_source_revisions",
+                reason: "erasure records no semantic source revisions",
+            });
+        }
         self.security.validate(&self.state_fence)
     }
 
@@ -1503,6 +1704,93 @@ impl PreparedTransition {
     }
 }
 
+/// Computes the expected I05-06 step-12 admission-DECISION digest for one
+/// prepared transition (issue #18).
+///
+/// Pure derivation over the carried decision inputs; the checking path is
+/// [`verify_admission_digest`] via [`PreparedTransition::validate`], and
+/// the producing path is [`bind_issue18_digests`].
+pub fn expected_admission_digest(transition: &PreparedTransition) -> Result<String, StoreError> {
+    admission_digest_hex(transition)
+}
+
+/// Computes the expected I05-06 `mutation_plan_hash` for one prepared
+/// transition (issue #18).
+///
+/// Pure derivation over the exact ordered plan; the checking path is
+/// [`verify_mutation_plan_digest`] via [`PreparedTransition::validate`],
+/// and the producing path is [`bind_issue18_digests`].
+pub fn expected_mutation_plan_digest(
+    transition: &PreparedTransition,
+) -> Result<String, StoreError> {
+    mutation_plan_digest_hex(&transition.named_operations)
+}
+
+/// Renders bound semantic source revisions as `key@revision` heads
+/// (issue #18).
+///
+/// The envelope path renders the admitted `expected_revision_heads` through
+/// this function when binding a receipt (see [`bind_issue18_receipt`]); the
+/// rendered entries are checked by [`PreparedTransition::validate`] and by
+/// [`WriteReceipt::validate`]. Fence-scoped erasure and frozen fixtures
+/// render no heads and record `[]` explicitly.
+#[must_use]
+pub fn render_semantic_source_revisions(heads: &[RevisionHeadExpectation]) -> Vec<String> {
+    heads
+        .iter()
+        .map(|head| {
+            let key = head.key.as_str();
+            let revision = head.expected_revision;
+            format!("{key}@{revision}")
+        })
+        .collect()
+}
+
+/// Binds the derived issue-#18 digests onto a prepared transition
+/// (issue #18 W2/W3/A1/A2/A3).
+///
+/// Computes [`expected_mutation_plan_digest`] and
+/// [`expected_admission_digest`] from the carried content and stores them;
+/// digests are always derived here, never supplied by the caller.
+/// `semantic_source_revisions` is left untouched: the envelope path sets it
+/// via [`render_semantic_source_revisions`], while fence-scoped erasure and
+/// frozen fixtures keep the explicit `[]` they were constructed with.
+/// Called by every in-crate transition builder
+/// ([`genesis_transition`], [`erasure_admission::admit_erasure_transition`])
+/// before validation.
+pub fn bind_issue18_digests(transition: &mut PreparedTransition) -> Result<(), StoreError> {
+    let mutation_plan_digest = expected_mutation_plan_digest(transition)?;
+    let admission_digest = expected_admission_digest(transition)?;
+    transition.mutation_plan_digest = mutation_plan_digest;
+    transition.admission_digest = admission_digest;
+    Ok(())
+}
+
+/// Binds the issue-#18 receipt fields from the admitted transition and the
+/// admitted expected heads (issue #18).
+///
+/// Copies the transition's `admission_digest` and `mutation_plan_digest`
+/// exactly and renders `semantic_source_revisions` from
+/// `expected_revision_heads` via [`render_semantic_source_revisions`].
+/// Equality of these three bindings between receipt and transition is then
+/// enforced by the receipt-issuing path
+/// ([`issue_store_receipt_envelope`]); the genesis path additionally
+/// recomputes this binding with empty heads (see
+/// `check_genesis_receipt_bindings`).
+pub fn bind_issue18_receipt(
+    transition: &PreparedTransition,
+    receipt: &mut WriteReceipt,
+    expected_revision_heads: &[RevisionHeadExpectation],
+) {
+    receipt
+        .admission_digest
+        .clone_from(&transition.admission_digest);
+    receipt
+        .mutation_plan_digest
+        .clone_from(&transition.mutation_plan_digest);
+    receipt.semantic_source_revisions = render_semantic_source_revisions(expected_revision_heads);
+}
+
 /// Builds the one provider-independent manifest admitted for Store genesis.
 /// The digest is derived from the complete manifest shape and is shared by
 /// every adapter; no provider name or zero digest is accepted as a substitute.
@@ -1527,7 +1815,7 @@ pub fn genesis_transition(
 ) -> Result<PreparedTransition, StoreError> {
     request.validate_for_context(context)?;
     let manifest = genesis_manifest()?;
-    let transition = PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: request.operation_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
@@ -1541,6 +1829,12 @@ pub fn genesis_transition(
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: manifest.digest.as_str().to_owned(),
         operation_manifest_digest: manifest.digest.clone(),
+        // The genesis decision/plan digests are derived, never defaulted:
+        // the empty plan still binds its canonical bytes. Genesis binds no
+        // semantic source and records `[]` explicitly.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: Vec::new(),
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
@@ -1550,6 +1844,7 @@ pub fn genesis_transition(
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
     };
+    bind_issue18_digests(&mut transition)?;
     transition.validate_against_manifest(&manifest)?;
     Ok(transition)
 }
@@ -1753,6 +2048,18 @@ pub struct WriteReceipt {
     pub projection_refs: Vec<ProjectionPublicationId>,
     pub outbox_refs: Vec<OutboxId>,
     pub operation_manifest_digest: OperationManifestDigest,
+    /// Admission-DECISION digest copied exactly from the admitted
+    /// transition (issue #18); equality is enforced by the
+    /// receipt-issuing path.
+    pub admission_digest: String,
+    /// Mutation-plan digest copied exactly from the admitted transition
+    /// (issue #18); equality is enforced by the receipt-issuing path.
+    pub mutation_plan_digest: String,
+    /// Bound semantic source revisions rendered as `key@revision` heads
+    /// (issue #18). The envelope path renders the admitted
+    /// `expected_revision_heads`; fence-scoped erasure and frozen fixtures
+    /// record `[]` explicitly.
+    pub semantic_source_revisions: Vec<String>,
     pub error_code: Option<ErrorCode>,
     pub resubmission: Resubmission,
     pub committed_at: Option<String>,
@@ -1764,6 +2071,13 @@ impl WriteReceipt {
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.idempotency_key, "idempotency_key")?;
         validate_digest(&self.canonical_request_hash, "canonical_request_hash")?;
+        // Issue #18: the bound receipt bindings keep their digest shapes
+        // and the `key@revision` rendering; equality with the admitted
+        // transition is enforced by the receipt-issuing path, not here,
+        // because the receipt carries no plan content to recompute from.
+        validate_digest(&self.admission_digest, "admission_digest")?;
+        validate_digest(&self.mutation_plan_digest, "mutation_plan_digest")?;
+        validate_semantic_source_revisions(&self.semantic_source_revisions)?;
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
@@ -1949,6 +2263,7 @@ pub fn issue_genesis_receipt_envelope(
 ) -> Result<ReceiptEnvelope, StoreError> {
     let transition = genesis_transition(context, request)?;
     validate_genesis_receipt_shape(receipt)?;
+    check_genesis_receipt_bindings(&transition, receipt)?;
     receipt.validate()?;
     issue_store_receipt_envelope(context, &transition, receipt, commit_sequence)
 }
@@ -1962,8 +2277,32 @@ pub fn validate_genesis_receipt_envelope(
 ) -> Result<(), StoreError> {
     let transition = genesis_transition(context, request)?;
     validate_genesis_receipt_shape(receipt)?;
+    check_genesis_receipt_bindings(&transition, receipt)?;
     receipt.validate()?;
     validate_store_receipt_envelope(context, &transition, receipt)
+}
+
+/// Recomputes the expected issue-#18 receipt bindings for the genesis path
+/// and rejects divergence (issue #18).
+///
+/// Genesis binds no semantic source: the expected binding is recomputed via
+/// [`bind_issue18_receipt`] with empty heads, so a receipt carrying a
+/// substituted decision/plan digest or any source revision fails here with
+/// [`StoreError::InvalidReceipt`]. This is the production caller that keeps
+/// [`bind_issue18_receipt`] reachable from the receipt-issuing path.
+fn check_genesis_receipt_bindings(
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+) -> Result<(), StoreError> {
+    let mut rebound = receipt.clone();
+    bind_issue18_receipt(transition, &mut rebound, &[]);
+    if rebound.admission_digest != receipt.admission_digest
+        || rebound.mutation_plan_digest != receipt.mutation_plan_digest
+        || rebound.semantic_source_revisions != receipt.semantic_source_revisions
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok(())
 }
 
 fn validate_genesis_receipt_shape(receipt: &WriteReceipt) -> Result<(), StoreError> {
@@ -2007,6 +2346,9 @@ fn validate_receipt_inputs(
         && receipt.canonical_request_hash == transition.identity.canonical_request_hash
         && receipt.transition_class == transition.transition_class
         && receipt.operation_manifest_digest == transition.operation_manifest_digest
+        && receipt.admission_digest == transition.admission_digest
+        && receipt.mutation_plan_digest == transition.mutation_plan_digest
+        && receipt.semantic_source_revisions == transition.semantic_source_revisions
         && receipt.status == WriteReceiptStatus::Committed
         && receipt.commit_id.is_some()
         && receipt.committed_at.as_deref() == Some(expected_committed_at.as_str())
@@ -2122,6 +2464,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::Erasure => "store.apply.erasure",
         TransitionClass::NotificationState => "store.apply.notification_state",
         TransitionClass::ReactiveState => "store.apply.reactive_state",
+        TransitionClass::UserAutomation => "store.apply.user_automation",
     }
 }
 
@@ -2724,6 +3067,9 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
+            admission_digest: "a".repeat(64),
+            mutation_plan_digest: "b".repeat(64),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![
                 NamedMutationRequest {
                     operation: NamedMutationOperation::CaptureObservation,
@@ -2984,12 +3330,18 @@ mod tests {
             emitted_event_ids: Vec::new(),
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
-            operation_manifest_digest: transition.operation_manifest_digest,
+            operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Frozen genesis fixture: no semantic source, recorded `[]`
+            // explicitly through the production receipt binder.
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some(format!("commit-sequence-{commit_sequence:016}")),
             envelope: None,
         };
+        bind_issue18_receipt(&transition, &mut receipt, &[]);
         receipt.envelope = Some(issue_genesis_receipt_envelope(
             context,
             request,
@@ -3061,6 +3413,116 @@ mod tests {
             first.ordering_scopes[0].as_str(),
             GENESIS_RECEIPT_ORDERING_SCOPE
         );
+        Ok(())
+    }
+
+    #[test]
+    fn issue18_transition_bindings_recompute_and_compare() -> Result<(), StoreError> {
+        let context = genesis_context()?;
+        let request = genesis_request()?;
+        let transition = genesis_transition(&context, &request)?;
+        // Derived, never defaulted: the carried digests equal a fresh
+        // recompute, and the empty plan still binds its canonical bytes.
+        assert_eq!(
+            transition.mutation_plan_digest,
+            expected_mutation_plan_digest(&transition)?
+        );
+        assert_eq!(
+            transition.admission_digest,
+            expected_admission_digest(&transition)?
+        );
+        assert_ne!(
+            transition.admission_digest,
+            transition.admission_contract_set_digest
+        );
+
+        let mut tampered_plan = transition.clone();
+        tampered_plan.mutation_plan_digest = "0".repeat(64);
+        assert!(matches!(
+            tampered_plan.validate(),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
+        let mut tampered_admission = transition.clone();
+        tampered_admission.admission_digest = "1".repeat(64);
+        assert!(matches!(
+            tampered_admission.validate(),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
+
+        let mut malformed = transition.clone();
+        malformed
+            .semantic_source_revisions
+            .push("no-separator".to_owned());
+        assert!(matches!(
+            malformed.validate(),
+            Err(StoreError::InvalidField {
+                field: "semantic_source_revisions",
+                ..
+            })
+        ));
+        assert_eq!(
+            render_semantic_source_revisions(&[]),
+            Vec::<String>::new(),
+            "frozen fixtures record no source revisions explicitly"
+        );
+
+        // Fence-scoped erasure binds no semantic source.
+        let erasure_request = ErasureAdmissionRequest {
+            identity: OperationIdentity {
+                operation_id: id("op-erasure-18")?,
+                idempotency_key: "retry-erasure-18".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            scope_id: ScopeId::new("scope-erasure-18")?,
+            ordering_scope: OrderingScopeId::new("scope-erasure-18")?,
+            state_fence: fence(),
+            subject: "subject-18".to_owned(),
+            surfaces: vec!["Index".to_owned()],
+            reason: "user requested deletion".to_owned(),
+            requester: "user:alice".to_owned(),
+            approval_refs: vec!["approval-18".to_owned()],
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-erasure-18")?,
+            security: SecurityContext::default(),
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![],
+                projection_kinds: vec![],
+                relation_kinds: vec![],
+            },
+        };
+        let mut erasure = admit_erasure_transition(&erasure_request)?;
+        assert!(erasure.semantic_source_revisions.is_empty());
+        assert!(erasure.validate().is_ok());
+        erasure
+            .semantic_source_revisions
+            .push("scope-erasure-18@1".to_owned());
+        assert_eq!(
+            erasure.validate(),
+            Err(StoreError::InvalidField {
+                field: "semantic_source_revisions",
+                reason: "erasure records no semantic source revisions",
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn issue18_genesis_receipt_binding_is_enforced() -> Result<(), StoreError> {
+        let context = genesis_context()?;
+        let request = genesis_request()?;
+        let receipt = genesis_receipt(&context, &request, 1)?;
+        assert!(receipt.semantic_source_revisions.is_empty());
+        validate_genesis_receipt_envelope(&context, &request, &receipt)?;
+
+        let mut substituted = receipt.clone();
+        substituted.mutation_plan_digest = "2".repeat(64);
+        assert!(validate_genesis_receipt_envelope(&context, &request, &substituted).is_err());
+
+        let mut sourced = receipt;
+        sourced
+            .semantic_source_revisions
+            .push("scope:one@1".to_owned());
+        assert!(validate_genesis_receipt_envelope(&context, &request, &sourced).is_err());
         Ok(())
     }
 
@@ -3234,6 +3696,9 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest")?,
+            admission_digest: "a".repeat(64),
+            mutation_plan_digest: "b".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

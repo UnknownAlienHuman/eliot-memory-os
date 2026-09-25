@@ -1,0 +1,32 @@
+{
+  "handle": {
+    "consistency_point": "cp-975-1",
+    "snapshot_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "operation_id": "op-975-begin-1",
+    "idempotency_key": "idem-975-begin-1"
+  },
+  "cursor": {
+    "handle_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "page_index": 1,
+    "cumulative_members": 2,
+    "cumulative_bytes": 384
+  },
+  "members": [
+    {
+      "member_id": "member-975-2",
+      "member_type": "REFERENCE",
+      "content_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "residency": {
+        "domain": "CONTENT_BLOB",
+        "residency_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "byte_count": 256
+      },
+      "reference_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "cumulative_bytes": 384,
+  "cumulative_work": 9,
+  "is_last": true,
+  "predecessor_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+  "next_cursor": null
+}

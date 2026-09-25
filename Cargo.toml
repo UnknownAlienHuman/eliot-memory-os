@@ -23,6 +23,7 @@ members = [
   "crates/foundation/eliot-contracts",
   "crates/foundation/eliot-evaluation-contracts",
   "crates/foundation/eliot-evidence",
+  "crates/foundation/eliot-memory-projection-contracts",
   "crates/foundation/eliot-observation-contracts",
   "crates/foundation/eliot-protocol",
   "crates/foundation/eliot-receipts",
@@ -105,6 +106,7 @@ members = [
   "crates/meta/eliot-runtime-status",
   "crates/security/eliot-erasure",
   "crates/security/eliot-influence",
+  "crates/smart/eliot-cognitive-quality",  # agent_order 80
   "crates/smart/eliot-context",
   "crates/smart/eliot-cues",
   "crates/smart/eliot-dreamer-core",
@@ -177,6 +179,14 @@ members = [
   "crates/smart/eliot-learning-overlay",  # agent_order 35
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
   "crates/meta/eliot-self-quality",  # agent_order 38
+  "crates/smart/eliot-understanding-assessment",  # agent_order 85
+  "crates/governor/eliot-memory-projection-provider",  # agent_order 46
+  "crates/smart/eliot-experience-projection",  # agent_order 48
+  "crates/smart/eliot-experience-provider",  # agent_order 51
+  "crates/smart/eliot-dreamer-self-query",  # agent_order 49
+  "crates/smart/eliot-epistemic-context-provider",  # agent_order 50
+  "crates/smart/eliot-memory-quality",  # agent_order 76
+  "crates/smart/eliot-dreamer-memory-revision",  # agent_order 79
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -275,6 +285,7 @@ eliot-runtime = { path = "crates/kernel/eliot-runtime", version = "0.1.0" }
 eliot-native-worker-core = { path = "crates/modules/eliot-native-worker-core", version = "0.1.0" }
 eliot-wasm-runtime = { path = "crates/modules/eliot-wasm-runtime", version = "0.1.0" }
 eliot-source-assurance = { path = "crates/security/eliot-source-assurance", version = "0.1.0" }
+eliot-influence = { path = "crates/security/eliot-influence", version = "0.1.0" }
 eliot-host-service = { path = "crates/kernel/eliot-host-service", version = "0.1.0" }
 eliot-installation = { path = "crates/kernel/eliot-installation", version = "0.1.0" }
 eliot-kernel-service = { path = "crates/kernel/eliot-kernel-service", version = "0.1.0" }
@@ -294,7 +305,10 @@ eliot-task = { path = "crates/governor/eliot-task", version = "0.1.0" }
 eliot-testd-core = { path = "crates/instrument/eliot-testd-core", version = "0.1.0" }
 eliot-doctor-core = { path = "crates/meta/eliot-doctor-core", version = "0.1.0" }
 eliot-runtime-status = { path = "crates/meta/eliot-runtime-status", version = "0.1.0" }
+eliot-cognitive-quality = { path = "crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-context = { path = "crates/smart/eliot-context", version = "0.1.0" }
+eliot-epistemic-contracts = { path = "crates/smart/eliot-epistemic-contracts", version = "0.1.0" }
+eliot-learning-contracts = { path = "crates/smart/eliot-learning-contracts", version = "0.1.0" }
 eliot-watchdog-core = { path = "crates/supervision/eliot-watchdog-core", version = "0.1.0" }
 eliot-research-exchange = { path = "crates/research/eliot-research-exchange", version = "0.1.0" }
 eliot-research-exchange-api = { path = "crates/research/eliot-research-exchange-api", version = "0.1.0" }
@@ -304,6 +318,12 @@ eliot-learning-delta = { path = "crates/smart/eliot-learning-delta", version = "
 eliot-learning-overlay = { path = "crates/smart/eliot-learning-overlay", version = "0.1.0" }
 eliot-learning-activation-assessment = { path = "crates/meta/eliot-learning-activation-assessment", version = "0.1.0" }
 eliot-self-quality = { path = "crates/meta/eliot-self-quality", version = "0.1.0" }
+eliot-context-contracts = { path = "crates/smart/eliot-context-contracts", version = "0.1.0" }
+eliot-dreamer-contracts = { path = "crates/smart/eliot-dreamer-contracts", version = "0.1.0" }
+eliot-understanding-assessment = { path = "crates/smart/eliot-understanding-assessment", version = "0.1.0" }
+eliot-experience-projection = { path = "crates/smart/eliot-experience-projection", version = "0.1.0" }
+eliot-dreamer-self-query = { path = "crates/smart/eliot-dreamer-self-query", version = "0.1.0" }
+eliot-epistemic-context-provider = { path = "crates/smart/eliot-epistemic-context-provider", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 wasmtime = { version = "=47.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wat = "=1.256.0"

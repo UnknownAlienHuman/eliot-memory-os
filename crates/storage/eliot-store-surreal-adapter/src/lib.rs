@@ -16,6 +16,8 @@
 #![forbid(unsafe_code)]
 
 mod apply;
+pub mod backup_restore;
+mod backup_snapshot;
 mod client;
 mod config;
 mod dreamer_job;
@@ -30,6 +32,15 @@ mod write_scheduler;
 use std::fmt;
 use std::num::NonZeroUsize;
 
+pub use crate::client::session_pool::{PoolAdmission, PoolOccupancy, SessionRole};
+pub use backup_restore::{
+    MAX_ADMISSION_AGE_MS, MAX_RESTORE_BATCH_MEMBERS, MAX_RESTORE_BYTES, MAX_RESTORE_DURATION_MS,
+    RESTORE_CAPABILITY, RESTORE_SCHEMA_V1, RestoreDenominator, RestoreLedger,
+    SUPPORTED_RESTORE_OPERATIONS, active_store_identity, is_supported_restore_operation,
+    is_suppressed_by_current_purge, new_destination_identity, redact_store_error,
+    shared_restore_ledger, validate_isolated_destination, validate_reference_closure,
+    validate_restore_batch,
+};
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
     PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
@@ -37,13 +48,14 @@ pub use config::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalStoreClient, CanonicalValidationSnapshot, ExactJsonBytes,
-    GENESIS_MANIFEST_NAME, NamedOperationManifest, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest,
+    CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
+    CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
+    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
@@ -307,7 +319,10 @@ impl SurrealStoreAdapter {
     #[must_use]
     pub fn reserved_write_capability(&self) -> Option<&'static str> {
         let slot = self.execution.lock().ok()?;
-        if slot.as_ref().is_some_and(|execution| execution.is_concurrent()) {
+        if slot
+            .as_ref()
+            .is_some_and(|execution| execution.is_concurrent())
+        {
             Some(CAPABILITY_RESERVED_WRITE)
         } else {
             None
@@ -317,6 +332,56 @@ impl SurrealStoreAdapter {
     /// Returns the installed execution generation, if any.
     pub(crate) fn execution_handle(&self) -> Option<std::sync::Arc<WriteExecution>> {
         self.execution.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Live session-pool occupancy snapshot (issue #2030, 994/14 follow-up
+    /// binding).
+    ///
+    /// Read-only point observation across the read, normal-write, and
+    /// protected health/admin lanes; totals are the fixed construction
+    /// bounds. Observing never checks anything out and never waits.
+    /// `None` while the transport is not connected.
+    #[must_use]
+    pub fn pool_occupancy(&self) -> Option<PoolOccupancy> {
+        let transport = self.client.get()?.as_ref().ok()?;
+        Some(transport.session_pool().occupancy())
+    }
+
+    /// Non-blocking pool admission verdict for one role (issue #2030, 994/14
+    /// follow-up binding).
+    ///
+    /// Callers that must shed load instead of queueing behind a lane use
+    /// this entrypoint; a saturated verdict never borrows capacity from
+    /// another role. `None` while the transport is not connected.
+    #[must_use]
+    pub fn pool_admission(&self, role: SessionRole) -> Option<PoolAdmission> {
+        let transport = self.client.get()?.as_ref().ok()?;
+        Some(transport.session_pool().admission(role))
+    }
+
+    /// Point execution-capacity snapshot of the installed generation (issue
+    /// #2030, 994/14 follow-up binding). `None` when no execution generation
+    /// is installed. Read-only; see [`WriteExecution::capacity`].
+    #[must_use]
+    pub fn execution_capacity(&self) -> Option<ExecutionCapacity> {
+        Some(self.execution_handle()?.capacity())
+    }
+
+    /// Point scheduler occupancy snapshot of the installed generation (issue
+    /// #2030, 994/14 follow-up binding). `None` when no execution generation
+    /// is installed. Read-only; see [`WriteExecution::scheduler_occupancy`].
+    #[must_use]
+    pub fn scheduler_occupancy(&self) -> Option<SchedulerOccupancy> {
+        Some(self.execution_handle()?.scheduler_occupancy())
+    }
+
+    /// Non-blocking scheduler admission verdict of the installed generation
+    /// (issue #2030, 994/14 follow-up binding). `None` when no execution
+    /// generation is installed. Read-only; see
+    /// [`WriteExecution::scheduler_admission`].
+    #[must_use]
+    pub fn scheduler_admission(&self) -> Option<SchedulerAdmission> {
+        Some(self.execution_handle()?.scheduler_admission())
     }
 
     /// Installs one execution generation; refuses when one is present.
@@ -451,13 +516,16 @@ impl SurrealStoreAdapter {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, AdapterError> {
-        apply::apply_prepared(
+        // Boxed: the inner future holds the multi-kilobyte canonical
+        // `PreparedTransition` across provider awaits, exceeding the default
+        // future-size lint.
+        Box::pin(apply::apply_prepared(
             self,
             ctx,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        )
+        ))
         .await
     }
 
@@ -477,14 +545,17 @@ impl SurrealStoreAdapter {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         authorities: &[Option<ExactJsonBytes>],
     ) -> Result<WriteReceipt, AdapterError> {
-        apply::apply_prepared_with_authority(
+        // Boxed: the inner future holds the multi-kilobyte canonical
+        // `PreparedTransition` across provider awaits, exceeding the default
+        // future-size lint.
+        Box::pin(apply::apply_prepared_with_authority(
             self,
             ctx,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             authorities,
-        )
+        ))
         .await
     }
 
@@ -536,13 +607,16 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
-        apply::apply_prepared(
+        // Boxed: the inner future holds the multi-kilobyte canonical
+        // `PreparedTransition` across provider awaits, exceeding the default
+        // future-size lint.
+        Box::pin(apply::apply_prepared(
             self,
             ctx,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
-        )
+        ))
         .await
         .map_err(AdapterError::into_store_error)
     }
@@ -637,6 +711,38 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         Box::pin(dreamer_job::dreamer_job(self, ctx, request))
             .await
             .map_err(AdapterError::into_store_error)
+    }
+}
+
+/// Coherent bounded snapshot capture over the `SurrealDB` bridge (issue #951).
+///
+/// Read-only delegation to [`crate::backup_snapshot`]: each method binds,
+/// pages, or closes one owner-issued consistency point without acquiring
+/// `write_lock`, issuing DDL, or performing restore.
+impl CanonicalSnapshotPort for SurrealStoreAdapter {
+    async fn begin_snapshot(
+        &self,
+        ctx: &RequestMeta,
+        request: SnapshotBeginRequest,
+    ) -> Result<SnapshotHandle, StoreError> {
+        crate::backup_snapshot::begin_snapshot(self, ctx, request).await
+    }
+
+    async fn read_snapshot_page(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+        cursor: SnapshotCursor,
+    ) -> Result<SnapshotPage, StoreError> {
+        crate::backup_snapshot::read_snapshot_page(self, ctx, handle, cursor).await
+    }
+
+    async fn end_snapshot(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+    ) -> Result<SnapshotEndReceipt, StoreError> {
+        crate::backup_snapshot::end_snapshot(self, ctx, handle).await
     }
 }
 

@@ -9,6 +9,8 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::surreal_automation::{AutomationWrites, automation_write_statements};
+use super::surreal_experience::{ExperienceWrites, experience_write_statements};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
@@ -83,6 +85,11 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "notification_revision_conflict",
     "reactive_session_conflict",
     "reactive_snapshot_conflict",
+    "automation_revision_conflict",
+    "automation_current_conflict",
+    "automation_invocation_conflict",
+    "experience_bank_conflict",
+    "experience_feedback_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: stale
@@ -93,6 +100,10 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "revision_head_create_conflict",
     "ordering_head_cas_conflict",
     "ordering_head_create_conflict",
+    "finish_owner_cas_conflict",
+    "finish_owner_create_conflict",
+    "canonical_owner_cas_conflict",
+    "canonical_owner_create_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -197,6 +208,8 @@ pub(super) async fn write_transaction(
     lane: TxLane,
     notifications: &[super::surreal_notification::SurrealNotificationWrite],
     reactive: &ReactiveWrites,
+    automation: &AutomationWrites,
+    experience: &ExperienceWrites,
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -210,6 +223,8 @@ pub(super) async fn write_transaction(
         current_orderings,
         notifications,
         reactive,
+        automation,
+        experience,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -269,6 +284,8 @@ fn build_apply_statements(
     current_orderings: &[OrderingHead],
     notifications: &[super::surreal_notification::SurrealNotificationWrite],
     reactive: &ReactiveWrites,
+    automation: &AutomationWrites,
+    experience: &ExperienceWrites,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -483,6 +500,14 @@ fn build_apply_statements(
 
     append_reactive_statements(&mut sql, &mut bindings, reactive)?;
 
+    append_automation_statements(&mut sql, &mut bindings, automation)?;
+
+    // #223 experience writes and #325 finish owner snapshots commit atomically
+    // with the canonical receipt.
+    append_experience_statements(&mut sql, &mut bindings, experience)?;
+    append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
         "receipt_table".to_owned(),
@@ -522,6 +547,203 @@ fn build_apply_statements(
     Ok((sql, bindings))
 }
 
+/// Appends the Governor-produced canonical finish-evidence owner image.
+///
+/// The adapter keeps the snapshot opaque and only performs the fixed
+/// `owner/canonical` fenced revision CAS. Governor has already validated and
+/// derived the evidence from its task, observation, coordination, and plan
+/// owners before this statement is assembled.
+fn append_finish_evidence_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordFinishEvidence
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let expected_revision = text_param("expected_canonical_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_canonical_revision must be a decimal revision",
+            })
+        })?;
+    let snapshot_json = text_param("snapshot_json")?;
+    if snapshot_json.is_empty() {
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "canonical.finish_evidence_snapshot_json",
+        }));
+    }
+    if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    let canonical_key = eliot_store_api::RecoveryRecordKey::new("owner", "canonical")
+        .map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&canonical_key)?;
+    let payload = snapshot_json.as_bytes();
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(canonical_key.namespace));
+    record.insert("key".to_owned(), json!(canonical_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert(
+        "revision".to_owned(),
+        json!(expected_revision.checked_add(1).ok_or_else(|| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "canonical.owner_revision",
+                reason: "revision overflow",
+            })
+        })?),
+    );
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::OWNER_SNAPSHOT_SCHEMA),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(payload)),
+    );
+
+    sql.push_str(schema::TX_CANONICAL_OWNER);
+    bindings.insert(
+        "canonical_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("canonical_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "canonical_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "canonical_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert("canonical_owner_record".to_owned(), Value::Object(record));
+    Ok(())
+}
+
+/// Appends the single Governor-owned finish persistence leg, when present.
+///
+/// The adapter does not decode or derive a finish decision.  It binds the
+/// admitted receipt bytes verbatim to the fixed `owner/finish` recovery row
+/// and lets the provider arbitrate the exact fence and outer revision inside
+/// the same canonical transaction as the receipt.  The Governor remains the
+/// owner of all finish semantics and evidence.
+fn append_finish_owner_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let Some(command) = transition.named_operations.iter().find(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::RecordFinishDecision
+    }) else {
+        return Ok(());
+    };
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let attempt_id = text_param("attempt_id")?;
+    let expected_revision = text_param("expected_finish_revision")?
+        .parse::<u64>()
+        .map_err(|_| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_finish_revision must be a decimal revision",
+            })
+        })?;
+    let receipt_json = text_param("receipt_json")?;
+    if receipt_json.is_empty() {
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "finish.receipt_json",
+        }));
+    }
+    if receipt_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+
+    let finish_key =
+        eliot_store_api::RecoveryRecordKey::new("owner", "finish").map_err(AdapterError::Store)?;
+    let owner_id = recovery_owner_id(&finish_key)?;
+    let payload = receipt_json.as_bytes();
+    let mut record = Map::new();
+    record.insert("namespace".to_owned(), json!(finish_key.namespace));
+    record.insert("key".to_owned(), json!(finish_key.key));
+    record.insert("state_fence".to_owned(), json!(&transition.state_fence));
+    record.insert(
+        "revision".to_owned(),
+        json!(expected_revision.checked_add(1).ok_or_else(|| {
+            AdapterError::Store(StoreError::InvalidField {
+                field: "finish.owner_revision",
+                reason: "revision overflow",
+            })
+        })?),
+    );
+    record.insert(
+        "schema".to_owned(),
+        json!(eliot_store_api::OWNER_SNAPSHOT_SCHEMA),
+    );
+    record.insert("payload".to_owned(), json!(payload));
+    record.insert(
+        "value_digest".to_owned(),
+        json!(eliot_store_api::sha256_hex(payload)),
+    );
+
+    sql.push_str(schema::TX_FINISH_OWNER);
+    bindings.insert(
+        "finish_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("finish_owner_id".to_owned(), json!(owner_id));
+    bindings.insert(
+        "finish_expected_state_fence".to_owned(),
+        json!(&transition.state_fence),
+    );
+    bindings.insert(
+        "finish_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert("finish_owner_record".to_owned(), Value::Object(record));
+    // Keep the attempt identity bound in the assembled transaction even
+    // though the storage layer treats the receipt payload as opaque.  This
+    // prevents a future caller from silently dropping the required parameter
+    // while preserving Governor ownership of its interpretation.
+    bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+fn recovery_owner_id(key: &eliot_store_api::RecoveryRecordKey) -> Result<String, AdapterError> {
+    let bytes = eliot_store_api::canonical_json_bytes(key)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    Ok(eliot_store_api::sha256_hex(&bytes))
+}
+
 /// Appends canonical notification record writes (issue #1780).
 ///
 /// One compare-and-set per computed write, assembled from the pre-transaction
@@ -548,6 +770,52 @@ fn append_notification_statements(
     Ok(())
 }
 
+/// Appends canonical automation row writes (issue #1779).
+///
+/// Same atomicity contract as the sibling fragments: revision
+/// create-or-converge, pointer compare-and-set, and invocation
+/// create-or-converge rows commit in the same transaction as the receipt
+/// and outbox rows. Binding collisions fail closed instead of silently
+/// overwriting a canonical binding.
+fn append_automation_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    automation: &AutomationWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = automation_write_statements(automation);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "automation binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends canonical experience bank/feedback row writes (issue #223).
+///
+/// Same atomicity contract as the automation fragment: create-or-converge
+/// rows commit in the same transaction as the receipt and outbox rows.
+/// Binding collisions fail closed instead of silently overwriting a
+/// canonical binding.
+fn append_experience_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    experience: &ExperienceWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = experience_write_statements(experience);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "experience binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
 /// Appends canonical reactive row writes (issue #1941 C4).
 ///
 /// Same atomicity contract as the notification fragment above: session
@@ -1180,7 +1448,7 @@ mod authority_binding_tests {
                 EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage");
             let epoch =
                 EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
-            eliot_store_api::PreparedTransition {
+            let mut transition = eliot_store_api::PreparedTransition {
                 identity: OperationIdentity {
                     operation_id: eliot_store_api::OperationId::new("op-evidence-bind")
                         .expect("operation"),
@@ -1196,6 +1464,11 @@ mod authority_binding_tests {
                 admission_contract_set_digest: "b".repeat(64),
                 operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                     .expect("manifest"),
+                // Issue-#18 digests are derived, never defaulted; no semantic
+                // source is bound here (`[]`).
+                admission_digest: String::new(),
+                mutation_plan_digest: String::new(),
+                semantic_source_revisions: Vec::new(),
                 named_operations: vec![NamedMutationRequest {
                     operation: NamedMutationOperation::CaptureObservation,
                     parameters: BTreeMap::from([("subject".to_owned(), json!("evidence-alpha"))]),
@@ -1207,7 +1480,9 @@ mod authority_binding_tests {
                 },
                 security: SecurityContext::default(),
                 required_proof_and_approval_refs: Vec::new(),
-            }
+            };
+            eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+            transition
         }
 
         // Real planner output — never a canned row — binds subject, full
@@ -1291,7 +1566,7 @@ mod allocation_classification_tests {
     fn transition(operation: &str) -> eliot_store_api::PreparedTransition {
         use serde_json::json;
         use std::collections::BTreeMap;
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: eliot_store_api::OperationId::new(operation).expect("operation"),
                 idempotency_key: format!("idem-{operation}"),
@@ -1306,6 +1581,11 @@ mod allocation_classification_tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(operation))]),
@@ -1317,7 +1597,9 @@ mod allocation_classification_tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn context() -> eliot_store_api::RequestMeta {
@@ -1512,6 +1794,8 @@ mod allocation_classification_tests {
             &current_orderings,
             &[],
             &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+            &ExperienceWrites::default(),
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -1559,6 +1843,8 @@ mod allocation_classification_tests {
             &[],
             &[],
             &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+            &ExperienceWrites::default(),
         )
         .expect("create path assembles");
         assert!(
@@ -1584,6 +1870,8 @@ mod allocation_classification_tests {
             &[],
             &[],
             &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+            &ExperienceWrites::default(),
         )
         .expect("genesis assembles");
         assert!(
@@ -1613,6 +1901,8 @@ mod allocation_classification_tests {
             &[],
             &[],
             &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+            &ExperienceWrites::default(),
         )
         .expect("statements assemble");
         assert_eq!(

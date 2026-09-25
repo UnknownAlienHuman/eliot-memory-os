@@ -11,7 +11,10 @@ use eliot_instrument_api::{
     EvidenceCoverage, EvidenceFreshness, InstrumentContractError, InstrumentKind, RawEvidence,
     VerificationOutcome, VerificationRun as CurrentVerificationRun,
 };
-use eliot_instrument_nextest::{NEXTEST_INSTRUMENT, parse_jsonl};
+use eliot_instrument_nextest::{
+    NEXTEST_INSTRUMENT, NEXTEST_STDERR_CONTENT_TYPE, NEXTEST_STDOUT_CONTENT_TYPE, NextestTestEvent,
+    NextestTestStatus, catalog_test_id, parse_jsonl, parse_test_events,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -704,12 +707,35 @@ pub fn evaluate_current(
                 artifact: item.artifact_id.to_string(),
             });
         }
-        stream.extend_from_slice(&item.bytes);
+        // nextest's machine-readable dialect is stdout. Stderr is retained
+        // for forensic lineage but is never concatenated into the JSONL
+        // parser input; doing so turns ordinary diagnostics into malformed
+        // test events and can hide a split stdout line boundary.
+        if item.content_type == NEXTEST_STDOUT_CONTENT_TYPE
+            || item.content_type == "application/json"
+        {
+            stream.extend_from_slice(&item.bytes);
+        } else if item.content_type == NEXTEST_STDERR_CONTENT_TYPE {
+            continue;
+        }
     }
     let report = parse_jsonl(&stream).map_err(|error| VerifierError::UnparsableReport {
         reason: error.to_string(),
     })?;
-    let (passed_names, completed_names) = completed_test_names(&stream);
+    let events = parse_test_events(&stream).map_err(|error| VerifierError::UnparsableReport {
+        reason: error.to_string(),
+    })?;
+    let mut passed_names = BTreeSet::new();
+    let mut completed_names = BTreeSet::new();
+    for event in events {
+        let NextestTestEvent::Completed { name, status } = event else {
+            continue;
+        };
+        completed_names.insert(catalog_test_id(&name).to_owned());
+        if status == NextestTestStatus::Pass {
+            passed_names.insert(catalog_test_id(&name).to_owned());
+        }
+    }
     let has_missing = required_test_ids.difference(&passed_names).next().is_some();
     let observed_required = required_test_ids
         .intersection(&completed_names)
@@ -800,55 +826,6 @@ pub fn evaluate_current(
             detail: format!("constructed run rejected: {error}"),
         })?;
     Ok(run)
-}
-
-/// Projects completed and passed test names from one canonical nextest JSONL
-/// stream.
-///
-/// This follows the registered adapter event shape (`type == "test"` with
-/// `started`/`completed` events and `PASS`/`pass` completion status) without
-/// replacing the authoritative [`parse_jsonl`] counters: callers must parse
-/// first, so malformed, duplicate, or unsupported events already failed
-/// closed before names are read here.
-fn completed_test_names(bytes: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut passed = BTreeSet::new();
-    let mut completed = BTreeSet::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        let is_test = value
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| kind == "test");
-        if !is_test {
-            continue;
-        }
-        let name = value
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let event = value
-            .get("event")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let Some(name) = name else { continue };
-        if !matches!(event, "completed" | "COMPLETED") {
-            continue;
-        }
-        completed.insert(name.clone());
-        let status = value
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if matches!(status, "PASS" | "pass") {
-            passed.insert(name);
-        }
-    }
-    (passed, completed)
 }
 
 /// Bounds freshness to capture clocks inside the admitted run window.

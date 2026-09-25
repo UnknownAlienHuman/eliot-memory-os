@@ -100,12 +100,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
-    KernelService, KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimReceipt,
-    NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
+    KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
+    NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
     advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
     handle_testd_admission_attempt, reconcile_testd_admission,
@@ -114,8 +114,16 @@ use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
     NativeWorkerClaimRecord, OperationIdentity,
 };
-use eliot_process::OperationId;
+use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
+use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
+use eliot_testd_core::{
+    JobState as TestdJobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
+    KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy, TESTD_PRODUCTIVE_PROFILE,
+    TargetRoots, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
+    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
+    testd_profile_binding, verification_receipt_sha256,
+};
 use serde::{Deserialize, Serialize};
 
 /// Protected Dreamer dispatch-launch material and launch lineage (T12-09).
@@ -140,8 +148,8 @@ use super::runtime_identity::stable_owner_principal_digest;
 use super::{
     ActionLeaseRef, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
     ImageId, JobId, KernelComposition, ProcessExecutionAdmissionRequest, ProcessExecutionError,
-    ProcessIntent, ProcessOwnerBinding, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
-    SessionId,
+    ProcessIntent, ProcessOwnerBinding, ProcessStartReceipt, ProcessTreeId, RequestIdentity,
+    ResourceLimits, SessionId,
 };
 
 /// One-shot worker kind served by the dispatch-launch contour.
@@ -318,6 +326,10 @@ pub struct DispatchGrant {
     pub idempotency_key: String,
     /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
     pub expires_at: u64,
+    /// Kernel-selected `TestD` owner database carried in the protected dispatch
+    /// file. Other worker grants omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testd_owner_store_path: Option<String>,
 }
 
 impl DispatchGrant {
@@ -332,6 +344,15 @@ impl DispatchGrant {
             &self.grant_digest,
             "grant digest must be a lowercase SHA-256 digest",
         )?;
+        if self
+            .testd_owner_store_path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty() || !Path::new(path).is_absolute())
+        {
+            return Err(DispatchLaunchError::InvalidMaterial(
+                "TestD owner store path must be a non-blank absolute path".to_owned(),
+            ));
+        }
         if self.fence_generation == 0 {
             return Err(DispatchLaunchError::InvalidMaterial(
                 "grant fence generation must be non-zero".to_owned(),
@@ -371,6 +392,7 @@ fn dispatch_grant_for(
     authority_epoch: &EpochId,
     generation: Generation,
     admitted_at_unix_nanos: u64,
+    testd_owner_store_path: Option<&Path>,
 ) -> Result<DispatchGrant, DispatchLaunchError> {
     require_digest(
         identity_digest,
@@ -409,6 +431,12 @@ fn dispatch_grant_for(
     material.push_str(&idempotency_key);
     material.push('|');
     material.push_str(&expires_at.to_string());
+    let testd_owner_store_path =
+        testd_owner_store_path.map(|path| path.to_string_lossy().into_owned());
+    if let Some(path) = testd_owner_store_path.as_deref() {
+        material.push_str("|testd-owner-store|");
+        material.push_str(path);
+    }
     let grant_digest = super::sha256_hex(material.as_bytes());
     let grant = DispatchGrant {
         grant_digest,
@@ -417,6 +445,7 @@ fn dispatch_grant_for(
         fence_nonce,
         idempotency_key,
         expires_at,
+        testd_owner_store_path,
     };
     // Prove the material satisfies the exact broker constructors before it
     // is ever written: the child will call these same entries.
@@ -657,6 +686,9 @@ struct LaunchRecord {
     request_digest: String,
     effect_digest: Option<String>,
     material_path: Option<PathBuf>,
+    /// Owner state captured from the durable `TestD` row before productive
+    /// dispatch and rechecked at authenticated terminal completion.
+    testd_owner_binding: Option<TestdLaunchOwnerBinding>,
     nonce: String,
     operation_id: String,
     phase: LaunchPhase,
@@ -670,6 +702,19 @@ struct LaunchRecord {
     /// Retained original native-worker claim request for binding checks;
     /// always `None` for Doctor/Testd.
     native_request: Option<NativeWorkerClaimRequest>,
+}
+
+/// Immutable `TestD` owner projection retained at Kernel dispatch time. The
+/// process identity is the `TestD` owner's projection of the consumed
+/// `ProcessRequest`; the invocation digest and verifier binding bind the exact
+/// admitted plan through terminal publication.
+#[derive(Clone, Debug)]
+struct TestdLaunchOwnerBinding {
+    source_root: PathBuf,
+    owner_store_path: PathBuf,
+    process: ProcessAdmission,
+    invocation_sha256: String,
+    verifier_dispatch: Option<TestdVerifierDispatchBinding>,
 }
 
 /// Retained launch records. The durable attempt/effect ledger stays the
@@ -1077,6 +1122,539 @@ pub(crate) fn admit_testd_attempt(
     let session = AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str())
         .map_err(gate_error)?;
     handle_testd_admission_attempt(service, &session, request, now_unix_nanos).map_err(gate_error)
+}
+
+/// Returns the single Kernel-selected durable `TestD` owner database path.
+/// Job/project references are never used as filesystem paths.
+pub(crate) fn testd_owner_store_path(work_root: &Path) -> PathBuf {
+    work_root.join(".eliot").join("testd-state.redb")
+}
+
+/// Reuses the current composed `TestD` principal and live Kernel fence for
+/// owner-side submit, readback, and receipt acknowledgement operations.
+pub(crate) fn bind_testd_owner_session(
+    service: &KernelService,
+) -> Result<AuthenticatedTestdSession, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("testd front door"))?;
+    AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str()).map_err(gate_error)
+}
+
+/// Creates one durable productive `TestD` job through the authenticated Kernel
+/// owner. The caller supplies Governor-resolved `WorkScope` and a tool
+/// observation; Kernel rehydrates `RequestIdentity` from the frame, chooses
+/// job/build/store paths, rereads tool bytes, issues the process request, and
+/// commits the identity and job together before any dispatcher can see it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single owner pipeline: validate, bind, issue, commit"
+)]
+pub(crate) async fn submit_testd_owner_job(
+    kernel: &KernelComposition,
+    identity: &RequestIdentity,
+    request: &TestdOwnerSubmitRequest,
+    now_unix_ms: u64,
+) -> Result<TestdOwnerSubmitResponse, DispatchLaunchError> {
+    request
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    identity
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if now_unix_ms == 0
+        || identity.request.metadata != request.submission.invocation.request
+        || identity.request.state_fence != request.submission.invocation.request.state_fence
+        || identity.request.metadata.task_id.is_none()
+        || identity
+            .request
+            .state_fence
+            .task_revision
+            .as_ref()
+            .is_none_or(|revision| revision.value() == 0)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "TestD owner submission does not match the authenticated task identity".to_owned(),
+        ));
+    }
+
+    let (authenticated, process_gateway) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        let authenticated = bind_testd_owner_session(&service)?;
+        let process_gateway = kernel
+            .process_gateway
+            .clone()
+            .ok_or(DispatchLaunchError::ExecutorUnavailable)?;
+        (authenticated, process_gateway)
+    };
+    let generation = Generation::new(authenticated.generation())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if !authenticated
+        .authority_epoch()
+        .is_same_authority(&identity.request.state_fence.authority_epoch)
+        || generation.get() != identity.request.state_fence.resource_generation.value()
+    {
+        return Err(DispatchLaunchError::Gate(
+            "authenticated TestD identity is outside the live Kernel fence".to_owned(),
+        ));
+    }
+
+    let source_input = Path::new(&request.submission.source_root);
+    if !source_input.is_absolute() {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "Governor WorkScope source root must be absolute".to_owned(),
+        ));
+    }
+    let source_root = std::fs::canonicalize(source_input)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if source_root != source_input || !source_root.is_dir() {
+        return Err(DispatchLaunchError::Gate(
+            "Governor WorkScope source root is not a canonical existing directory".to_owned(),
+        ));
+    }
+    let work_root = std::fs::canonicalize(&kernel.work_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if !work_root.is_dir() {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel work root is not an existing directory".to_owned(),
+        ));
+    }
+
+    let operation_id = request.submission.invocation.request.request_id.as_str();
+    let job_digest = sha256_hex(operation_id.as_bytes());
+    let job_id = format!("testd-{job_digest}");
+    let state_dir = work_root.join(".eliot");
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&state_dir).ok().as_deref() != Some(state_dir.as_path()) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel TestD state directory is not canonical".to_owned(),
+        ));
+    }
+    let contour_root = state_dir.join("testd-execution");
+    std::fs::create_dir_all(&contour_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&contour_root).ok().as_deref() != Some(contour_root.as_path()) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel TestD execution contour is not canonical".to_owned(),
+        ));
+    }
+    let target_root = contour_root.join(&job_digest);
+    std::fs::create_dir_all(&target_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&target_root).ok().as_deref() != Some(target_root.as_path()) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel TestD target root is not canonical".to_owned(),
+        ));
+    }
+    let target_roots = TargetRoots::new(
+        contour_root.to_string_lossy().into_owned(),
+        source_root.to_string_lossy().into_owned(),
+        target_root.to_string_lossy().into_owned(),
+        target_root.to_string_lossy().into_owned(),
+    )
+    .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let environment = request
+        .process_tool
+        .validate_for_roots(&target_roots.target_root, &target_roots.cache_root)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+
+    let profile = testd_profile_binding(
+        TESTD_PRODUCTIVE_PROFILE,
+        &request.process_tool.observation.nextest_sha256,
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let process_tree_id = ProcessTreeId::new(format!("testd-tree-{}", &job_digest[..32]))
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let process_session_id = SessionId::new(format!("testd-session-{}", &job_digest[..32]))
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let intent = ProcessIntent::new(
+        OperationId::new(operation_id)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        process_tree_id,
+        JobId::new(job_id.clone()).map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        ImageId::new("testd-profile-cargo-nextest")
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        process_session_id,
+        generation,
+        request.process_tool.observation.nextest_path.clone(),
+        request.process_tool.observation.nextest_sha256.clone(),
+        profile.fixed_argv.clone(),
+        source_root.to_string_lossy().into_owned(),
+        environment,
+        ResourceLimits::new(
+            profile.wall_timeout_ms,
+            profile.cpu_time_ms,
+            profile.memory_bytes,
+            profile.stdout_bytes,
+            profile.stderr_bytes,
+            profile.max_descendants,
+        )
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let fence = FencingToken::new(
+        authenticated.authority_epoch().clone(),
+        generation,
+        format!("testd-owner-fence-{}", &job_digest[..32]),
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let process_admission = ProcessExecutionAdmissionRequest::new(
+        TESTD_MODULE_ID,
+        intent,
+        ActionLeaseRef::new(format!("testd-owner-lease-{}", &job_digest[..32]))
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        fence,
+        now_unix_ms.saturating_add(profile.wall_timeout_ms),
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let process_owner = launch_owner_binding(
+        DispatchedWorkerKind::Testd,
+        authenticated.authority_epoch(),
+        generation,
+    )?;
+    let process = process_gateway
+        .issue_testd_process_request(&process_owner, process_admission)
+        .await
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let process_request = KernelProcessAdmissionRequest {
+        job_id: job_id.clone(),
+        project_id: request.submission.project_id.clone(),
+        invocation: request.submission.invocation.clone(),
+        source_root: target_roots.source_root.clone(),
+        target_root: target_roots.target_root.clone(),
+        cache_root: target_roots.cache_root.clone(),
+    };
+    let provider = KernelIssuedProcessProvider::new(
+        process,
+        target_roots.allowed_contour_root.clone(),
+        format!("testd-owner-{}", request.request_digest),
+    );
+    let permit = issue_process_admission(&provider, &process_request)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let submission = TestdVerifierJobSubmission {
+        job_id,
+        project_id: request.submission.project_id.clone(),
+        invocation: request.submission.invocation.clone(),
+        target_roots,
+        priority: 0,
+    };
+    submission
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+
+    let owner_path = testd_owner_store_path(&work_root);
+    let owner_parent = owner_path.parent().ok_or_else(|| {
+        DispatchLaunchError::Gate("Kernel TestD owner path has no parent".to_owned())
+    })?;
+    std::fs::create_dir_all(owner_parent)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let store = TestdStore::open(&owner_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .submit_productive_verifier(submission, identity.clone(), permit, now_unix_ms)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    Ok(TestdOwnerSubmitResponse {
+        job_id: job.job_id,
+        operation_id: job.process.operation_id,
+        authority_epoch: job.process.authority_epoch,
+        generation: job.process.generation,
+        payload_digest: job.payload_digest,
+    })
+}
+
+struct KernelIssuedProcessProvider {
+    process: Mutex<Option<ProcessRequest>>,
+    contour_root: String,
+    grant_id: String,
+}
+
+impl KernelIssuedProcessProvider {
+    fn new(process: ProcessRequest, contour_root: String, grant_id: String) -> Self {
+        Self {
+            process: Mutex::new(Some(process)),
+            contour_root,
+            grant_id,
+        }
+    }
+}
+
+impl KernelProcessAdmissionProvider for KernelIssuedProcessProvider {
+    fn admit(
+        &self,
+        request: &KernelProcessAdmissionRequest,
+    ) -> Result<KernelProcessAdmissionEvidence, eliot_testd_core::TestdError> {
+        let process = self
+            .process
+            .lock()
+            .map_err(|_| eliot_testd_core::TestdError::InvalidBinding)?
+            .take()
+            .ok_or(eliot_testd_core::TestdError::InvalidBinding)?;
+        if process.job_id().as_str() != request.job_id
+            || process.operation_id().as_str() != request.invocation.request.request_id.as_str()
+            || process.working_directory() != request.source_root
+            || process.environment().non_secret().get("CARGO_TARGET_DIR")
+                != Some(&request.target_root)
+            || process.environment().non_secret().get("CARGO_HOME") != Some(&request.cache_root)
+        {
+            return Err(eliot_testd_core::TestdError::InvalidBinding);
+        }
+        Ok(KernelProcessAdmissionEvidence {
+            process,
+            contour_root: self.contour_root.clone(),
+            grant_id: self.grant_id.clone(),
+        })
+    }
+}
+
+/// Captures the durable `TestD` process identity and, for a productive profile,
+/// verifier-plan binding before the Kernel writes dispatch material. This
+/// binds terminal publication to the same owner row the worker was admitted
+/// from.
+fn capture_testd_launch_owner_binding(
+    work_root: &Path,
+    source_root: &Path,
+    admission: &TestdAdmission,
+    authority_epoch: &EpochId,
+    generation: u64,
+) -> Result<TestdLaunchOwnerBinding, DispatchLaunchError> {
+    let owner_path = testd_owner_store_path(work_root);
+    if !owner_path.is_file() {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD owner file is absent before dispatch".to_owned(),
+        ));
+    }
+    let owner_store_path = std::fs::canonicalize(&owner_path)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let store = TestdStore::open(&owner_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .get(&admission.job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("durable TestD job is absent before dispatch".to_owned())
+        })?;
+    let process = &job.process;
+    if job.job_id != admission.job_id
+        || process.job_id != admission.job_id
+        || process.operation_id != admission.operation_id
+        || process.generation != generation
+        || !process.authority_epoch.is_same_authority(authority_epoch)
+        || job.invocation.profile != admission.profile
+        || job.target_roots.source_root != source_root.to_string_lossy().as_ref()
+        || job.state != TestdJobState::Queued
+        || job.attempts != 0
+        || job.lease.is_some()
+    {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD owner row does not match the live admitted launch".to_owned(),
+        ));
+    }
+    require_digest(
+        &process.invocation_digest,
+        "durable TestD process invocation digest must be lowercase SHA-256",
+    )?;
+    let invocation_bytes = canonical_json_bytes(&job.invocation)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let invocation_sha256 = sha256_hex(&invocation_bytes);
+    let verifier_dispatch = job.verifier_dispatch.clone();
+    if admission.profile == TESTD_PRODUCTIVE_PROFILE {
+        let binding = verifier_dispatch.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no persisted verifier-plan binding".to_owned(),
+            )
+        })?;
+        binding
+            .validate_for_job(&job)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    } else if verifier_dispatch.is_some() {
+        return Err(DispatchLaunchError::Gate(
+            "non-productive TestD launch carries a verifier-plan binding".to_owned(),
+        ));
+    }
+    Ok(TestdLaunchOwnerBinding {
+        source_root: source_root.to_path_buf(),
+        owner_store_path,
+        process: job.process,
+        invocation_sha256,
+        verifier_dispatch,
+    })
+}
+
+/// Rehydrates a `TestD` terminal completion against the retained Kernel launch,
+/// the current authenticated `TestD` session, and the durable `TestD` owner row.
+/// The transport request never supplies a task, operation, plan, or verdict.
+pub(crate) fn read_testd_terminal_completion(
+    service: &KernelService,
+    request: &super::testd_terminal_completion_route::Request,
+) -> Result<super::testd_terminal_completion_route::Response, DispatchLaunchError> {
+    request
+        .validate()
+        .map_err(DispatchLaunchError::InvalidMaterial)?;
+    if !matches!(
+        service.state(),
+        KernelServiceState::Ready | KernelServiceState::Degraded
+    ) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel is outside the TestD terminal-completion admission state".to_owned(),
+        ));
+    }
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("testd front door"))?;
+    let authenticated_session =
+        AuthenticatedTestdSession::bind(service, contour.principal_owner.as_str())
+            .map_err(gate_error)?;
+    let retained = {
+        let launches = launches_table(contour)?;
+        launches.by_identity.get(&request.job_id).cloned()
+    }
+    .ok_or_else(|| DispatchLaunchError::Gate("TestD launch owner is absent".to_owned()))?;
+    if retained.kind != DispatchedWorkerKind::Testd
+        || retained.identity != request.job_id
+        || !matches!(
+            retained.phase,
+            LaunchPhase::Launched | LaunchPhase::Reconciled
+        )
+        || retained.testd_admission.as_ref().is_none_or(|admission| {
+            admission.job_id != request.job_id
+                || admission.admission_digest != retained.admission_digest
+                || admission.request_digest != retained.request_digest
+        })
+    {
+        return Err(DispatchLaunchError::Gate(
+            "terminal request does not bind the retained TestD launch".to_owned(),
+        ));
+    }
+    let admission = retained.testd_admission.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("retained TestD admission is absent".to_owned())
+    })?;
+    let owner_binding = retained.testd_owner_binding.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("retained TestD owner binding is absent".to_owned())
+    })?;
+    admission
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if authenticated_session.generation() == 0
+        || authenticated_session.generation() != owner_binding.process.generation
+        || !authenticated_session
+            .authority_epoch()
+            .is_same_authority(&owner_binding.process.authority_epoch)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "retained TestD launch is outside the live Kernel fence".to_owned(),
+        ));
+    }
+    if admission.profile != TESTD_PRODUCTIVE_PROFILE {
+        return Err(DispatchLaunchError::Gate(
+            "terminal verifier completion requires the admitted productive profile".to_owned(),
+        ));
+    }
+    let source_root = &owner_binding.source_root;
+    if std::fs::canonicalize(source_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        != *source_root
+    {
+        return Err(DispatchLaunchError::Gate(
+            "TestD source root changed after launch admission".to_owned(),
+        ));
+    }
+    let owner_path = &owner_binding.owner_store_path;
+    if !owner_path.is_file() {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD owner file is absent".to_owned(),
+        ));
+    }
+    let store = TestdStore::open(owner_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .get(&request.job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .ok_or_else(|| DispatchLaunchError::Gate("durable TestD job is absent".to_owned()))?;
+    let binding = job.verifier_dispatch.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("pre-dispatch verifier owner binding is absent".to_owned())
+    })?;
+    binding
+        .validate_for_job(&job)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let invocation_bytes = canonical_json_bytes(&job.invocation)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let invocation_digest = sha256_hex(&invocation_bytes);
+    if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+        || binding.operation_id != job.process.operation_id.as_str()
+        || owner_binding.verifier_dispatch.as_ref() != Some(binding)
+        || job.process != owner_binding.process
+        || invocation_digest != owner_binding.invocation_sha256
+        || job.job_id != admission.job_id
+        || job.process.job_id != admission.job_id
+        || job.process.operation_id != admission.operation_id
+        || job.target_roots.source_root.as_str() != source_root.to_string_lossy().as_ref()
+        || job.lease.is_some()
+        || !matches!(
+            job.state,
+            TestdJobState::Succeeded | TestdJobState::Failed | TestdJobState::Cancelled
+        )
+    {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD job is not the admitted terminal verifier".to_owned(),
+        ));
+    }
+    let verification = job.verification_receipt.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("durable TestD finish receipt is absent".to_owned())
+    })?;
+    let actual_receipt_digest = verification_receipt_sha256(verification)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if actual_receipt_digest != request.receipt_sha256 {
+        return Err(DispatchLaunchError::Gate(
+            "terminal request does not bind the exact TestD finish receipt".to_owned(),
+        ));
+    }
+    let publication = job.terminal_publication.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("durable TestD terminal handoff is absent".to_owned())
+    })?;
+    if publication.receipt_sha256 != request.receipt_sha256 {
+        return Err(DispatchLaunchError::Gate(
+            "durable terminal handoff binds a different finish receipt".to_owned(),
+        ));
+    }
+    if let Some(receipt_json) = &publication.committed_receipt_json {
+        let receipt: WriteReceipt = serde_json::from_str(receipt_json)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        receipt
+            .validate()
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        let expected_operation = format!("{}/verifier-execution", binding.operation_id);
+        let expected_idempotency = format!(
+            "{}:verifier-execution",
+            binding.request_identity.idempotency_key
+        );
+        if receipt.status != WriteReceiptStatus::Committed
+            || receipt.operation_id.as_str() != expected_operation
+            || receipt.idempotency_key != expected_idempotency
+            || receipt.state_fence != binding.request_identity.request.state_fence
+        {
+            return Err(DispatchLaunchError::Gate(
+                "stored terminal acknowledgement is not the exact committed Governor receipt"
+                    .to_owned(),
+            ));
+        }
+        return Ok(
+            super::testd_terminal_completion_route::Response::Committed {
+                job_id: request.job_id.clone(),
+                receipt_sha256: request.receipt_sha256.clone(),
+                request_digest: request.request_digest.clone(),
+                receipt: Box::new(receipt),
+            },
+        );
+    }
+    Ok(super::testd_terminal_completion_route::Response::Pending {
+        job_id: request.job_id.clone(),
+        receipt_sha256: request.receipt_sha256.clone(),
+        request_digest: request.request_digest.clone(),
+    })
 }
 
 /// Mints the I7.5/I15.2 launch nonce for one admitted identity.
@@ -1714,6 +2292,7 @@ pub fn prepare_doctor_launch(
                 request_digest: material.attempt.request_digest.clone(),
                 effect_digest: admission.effect_digest.clone(),
                 material_path: None,
+                testd_owner_binding: None,
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
@@ -1737,6 +2316,7 @@ pub fn prepare_doctor_launch(
         &authority_epoch,
         generation,
         admission.admitted_at_unix_nanos,
+        None,
     )?;
     let bytes = doctor_material_bytes(
         material.attempt,
@@ -2141,6 +2721,7 @@ pub async fn launch_admitted_doctor_attempt(
                     request_digest,
                     effect_digest: ready.admission.effect_digest.clone(),
                     material_path: Some(material_path),
+                    testd_owner_binding: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
@@ -2166,6 +2747,7 @@ pub async fn launch_admitted_doctor_attempt(
                     request_digest,
                     effect_digest: ready.admission.effect_digest.clone(),
                     material_path: Some(material_path),
+                    testd_owner_binding: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
@@ -2399,6 +2981,11 @@ fn retain_launch(
                 existing.request_digest.clone_from(&record.request_digest);
                 existing.effect_digest.clone_from(&record.effect_digest);
                 existing.material_path.clone_from(&record.material_path);
+                if record.testd_owner_binding.is_some() {
+                    existing
+                        .testd_owner_binding
+                        .clone_from(&record.testd_owner_binding);
+                }
                 existing.testd_admission.clone_from(&record.testd_admission);
                 existing.native_receipt.clone_from(&record.native_receipt);
                 existing.native_request.clone_from(&record.native_request);
@@ -2578,7 +3165,7 @@ pub enum TestdLaunchSkip {
 /// A prepared testd launch: admitted and nonce-bound, ready to spawn.
 pub enum PreparedTestdLaunch {
     /// Ready to spawn through the admitted executor.
-    Ready(ReadyTestdLaunch),
+    Ready(Box<ReadyTestdLaunch>),
     /// An exact resubmit under one job identity: carries the RETAINED
     /// original admission (original admitted-at time and digest), never
     /// the just-recomputed one.
@@ -2620,6 +3207,9 @@ pub struct ReadyTestdLaunch {
     pub authority_epoch: EpochId,
     /// Live activation generation bound at admission.
     pub generation: Generation,
+    /// Durable `TestD` process and verifier-plan identity captured before
+    /// dispatch and retained through terminal publication.
+    owner_binding: TestdLaunchOwnerBinding,
 }
 
 /// Outcome of one testd admit-then-launch call.
@@ -2704,6 +3294,16 @@ pub fn prepare_testd_launch(
             "dispatch child working directory must be non-blank".to_owned(),
         ));
     }
+    let testd_source_root = std::fs::canonicalize(material.working_directory).map_err(|error| {
+        DispatchLaunchError::InvalidMaterial(format!(
+            "testd source root cannot be canonicalized: {error}"
+        ))
+    })?;
+    if !testd_source_root.is_dir() {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "testd source root is not a directory".to_owned(),
+        ));
+    }
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("testd front door"))?;
@@ -2712,12 +3312,16 @@ pub fn prepare_testd_launch(
             .service
             .lock()
             .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
-        let response = admit_testd_attempt(&service, material.request, now_unix_nanos)?;
-        let epoch = service.authority_epoch();
-        let generation = service
-            .activation_receipt()
-            .map_or(0, |receipt| receipt.generation.value());
-        (epoch, generation, response)
+        let session = AuthenticatedTestdSession::bind(&service, contour.principal_owner.as_str())
+            .map_err(gate_error)?;
+        let response =
+            handle_testd_admission_attempt(&service, &session, material.request, now_unix_nanos)
+                .map_err(gate_error)?;
+        (
+            session.authority_epoch().clone(),
+            session.generation(),
+            response,
+        )
     };
     if generation == 0 {
         return Err(DispatchLaunchError::Gate(
@@ -2737,6 +3341,13 @@ pub fn prepare_testd_launch(
     require_digest(
         &admission.request_digest,
         "admission request digest must be a lowercase SHA-256 digest",
+    )?;
+    let owner_binding = capture_testd_launch_owner_binding(
+        &kernel.work_root,
+        &testd_source_root,
+        &admission,
+        &authority_epoch,
+        generation,
     )?;
     let nonce = mint_dispatch_nonce(
         DispatchedWorkerKind::Testd,
@@ -2783,6 +3394,7 @@ pub fn prepare_testd_launch(
                 request_digest: admission.request_digest.clone(),
                 effect_digest: None,
                 material_path: None,
+                testd_owner_binding: Some(owner_binding.clone()),
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
@@ -2815,6 +3427,7 @@ pub fn prepare_testd_launch(
         &authority_epoch,
         generation,
         admission.admitted_at_unix_nanos,
+        Some(&owner_binding.owner_store_path),
     )
     .inspect_err(|_| {
         release_launch(contour, &admission.job_id);
@@ -2844,17 +3457,18 @@ pub fn prepare_testd_launch(
     {
         record.material_path = Some(material_path.clone());
     }
-    Ok(PreparedTestdLaunch::Ready(ReadyTestdLaunch {
+    Ok(PreparedTestdLaunch::Ready(Box::new(ReadyTestdLaunch {
         admission,
         nonce,
         operation_id,
         executable: material.executable.to_path_buf(),
         executable_sha256: material.executable_sha256.to_owned(),
-        working_directory: material.working_directory.to_path_buf(),
+        working_directory: testd_source_root,
         material_path,
         authority_epoch,
         generation,
-    }))
+        owner_binding,
+    })))
 }
 
 /// Spawns one prepared testd launch through the admitted process gateway.
@@ -2938,6 +3552,7 @@ pub async fn launch_admitted_testd_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_owner_binding: Some(ready.owner_binding.clone()),
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
@@ -2963,6 +3578,7 @@ pub async fn launch_admitted_testd_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_owner_binding: Some(ready.owner_binding.clone()),
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
@@ -3382,6 +3998,7 @@ pub fn prepare_native_worker_launch(
                 request_digest: material.request.request_digest.clone(),
                 effect_digest: None,
                 material_path: None,
+                testd_owner_binding: None,
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
@@ -3404,6 +4021,7 @@ pub fn prepare_native_worker_launch(
         &authority_epoch,
         generation,
         admitted_at_nanos,
+        None,
     )
     .inspect_err(|_| {
         release_launch(contour, &receipt.claim_id);
@@ -3541,6 +4159,7 @@ pub async fn launch_admitted_native_worker_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_owner_binding: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
@@ -3573,6 +4192,7 @@ pub async fn launch_admitted_native_worker_attempt(
                     request_digest,
                     effect_digest: None,
                     material_path: Some(material_path),
+                    testd_owner_binding: None,
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
@@ -3963,6 +4583,7 @@ pub fn prepare_dreamer_launch(
         &authority_epoch,
         generation,
         now_unix_nanos,
+        None,
     )
     .map_err(dreamer_launch_error)?;
     // Single-flight reservation under the original job identity: a
@@ -4233,12 +4854,20 @@ mod tests {
 
     use super::*;
     use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use eliot_ipc::TransportError;
     use eliot_ipc::{PeerIdentity, Session};
+    use eliot_kernel_core::{
+        CURRENT_IMPLEMENTATION_SOURCE_DIGEST, CURRENT_NORMATIVE_PAIR_KEY,
+        HANDSHAKE_ENVELOPE_VERSION, HealthDimensionKind, KernelRuntimeHealthEvidence,
+        StateMigrationClass, expected_seal_tag,
+    };
     use eliot_kernel_service::{
         KernelActivationPermit, KernelControlCommand, KernelReadyReceipt, KernelServiceState,
         TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION, TestdAdmissionResponse,
     };
-    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+    use eliot_runtime_contracts::{
+        GenerationCutoverState, HealthDimension, HealthVector, ServiceProcessState,
+    };
     use std::num::NonZeroU64;
 
     use crate::KernelConfig;
@@ -4441,6 +5070,7 @@ mod tests {
     ) -> TestdAdmissionEnvelope {
         TestdAdmissionEnvelope {
             job_id: job_id.to_owned(),
+            profile: "cargo-test".to_owned(),
             operation_id: operation.map(str::to_owned),
             cancellation: false,
             fence: FencingToken::new(
@@ -4634,6 +5264,20 @@ mod tests {
         match &frame.payload {
             eliot_protocol::ProtocolPayload::Json(value) => value.clone(),
             _ => panic!("dispatch reply must carry a JSON payload"),
+        }
+    }
+
+    fn health_heartbeat(session: &Session) -> eliot_protocol::Frame {
+        eliot_protocol::Frame {
+            protocol_version: session.protocol_version,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: session.connection_id.clone(),
+            request_id: None,
+            kind: eliot_protocol::FrameKind::Heartbeat,
+            message_type: eliot_protocol::MessageType::Health,
+            request_identity: None,
+            payload: eliot_protocol::ProtocolPayload::Json(serde_json::json!({"probe": true})),
+            trace_context: BTreeMap::new(),
         }
     }
 
@@ -6036,7 +6680,9 @@ mod tests {
     }
 
     /// The heartbeat reply carries the composed advertisement flag through
-    /// the closed dispatch gateway.
+    /// the closed dispatch gateway and projects the complete authenticated
+    /// I1.10/I1.12 carrier. This is intentionally decoded through the shared
+    /// consumer type so a field omitted or rebound by the producer fails here.
     #[test]
     fn heartbeat_reports_composed_advertisement_flag() {
         // The contour cell may already be composed by the lifecycle test
@@ -6045,17 +6691,7 @@ mod tests {
         let root = temp_root("heartbeat");
         let kernel = ready_kernel(&root);
         let session = worker_session(&kernel, DispatchedWorkerKind::Testd.module_id());
-        let heartbeat = eliot_protocol::Frame {
-            protocol_version: session.protocol_version,
-            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
-            connection_id: session.connection_id.clone(),
-            request_id: None,
-            kind: eliot_protocol::FrameKind::Heartbeat,
-            message_type: eliot_protocol::MessageType::Health,
-            request_identity: None,
-            payload: eliot_protocol::ProtocolPayload::Json(serde_json::json!({"probe": true})),
-            trace_context: BTreeMap::new(),
-        };
+        let heartbeat = health_heartbeat(&session);
         let expected = doctor_repair_advertised();
         let action = kernel
             .dispatch_frame(&session, &heartbeat)
@@ -6063,6 +6699,9 @@ mod tests {
         match action {
             crate::KernelFrameAction::Reply(frame) => {
                 let payload = reply_payload(&frame);
+                let evidence: KernelRuntimeHealthEvidence =
+                    serde_json::from_value(payload.clone()).expect("canonical health carrier");
+                evidence.validate().expect("producer carrier validates");
                 assert_eq!(
                     payload.get("status").and_then(serde_json::Value::as_str),
                     Some("OPEN")
@@ -6074,9 +6713,127 @@ mod tests {
                     Some(expected),
                     "heartbeat must echo the live composed advertisement"
                 );
+                assert_eq!(evidence.status, "OPEN");
+                assert_eq!(evidence.authority_epoch, session.authority_epoch);
+                assert_eq!(
+                    evidence.module_generation,
+                    session.module_generation.generation
+                );
+
+                let compatibility = evidence.compatibility_evidence();
+                assert_eq!(compatibility.envelope_version(), HANDSHAKE_ENVELOPE_VERSION);
+                assert_eq!(compatibility.protocol_version(), 1);
+                assert_eq!(compatibility.canonical_format_version(), 1);
+                assert_eq!(
+                    compatibility.module_generation(),
+                    session.module_generation.generation
+                );
+                assert_eq!(compatibility.authority_epoch(), &session.authority_epoch);
+                assert_eq!(
+                    compatibility.migration_class(),
+                    StateMigrationClass::NoMigration
+                );
+                assert_eq!(
+                    compatibility.architecture_source_digest(),
+                    eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST
+                );
+                assert_eq!(evidence.normative_pair_key, CURRENT_NORMATIVE_PAIR_KEY);
+                assert_eq!(
+                    evidence.implementation_source_digest,
+                    CURRENT_IMPLEMENTATION_SOURCE_DIGEST
+                );
+                assert_eq!(
+                    expected_seal_tag(compatibility.architecture_source_digest()),
+                    compatibility.seal_tag()
+                );
+
+                let process = evidence.process_health();
+                assert_eq!(process.process_state(), ServiceProcessState::Ready);
+                assert_eq!(process.generation_state(), session.module_generation.state);
+                assert_eq!(process.cutover_state(), GenerationCutoverState::Preparing);
+                assert!(!process.generation_is_active());
+                assert!(!process.cutover_is_complete());
+                let health = process.health();
+                assert_eq!(health.canonical, HealthVector::healthy());
+                for kind in [
+                    HealthDimensionKind::Liveness,
+                    HealthDimensionKind::Readiness,
+                    HealthDimensionKind::Freshness,
+                    HealthDimensionKind::Compatibility,
+                    HealthDimensionKind::Integrity,
+                    HealthDimensionKind::Capacity,
+                ] {
+                    assert_eq!(health.dimension(kind), HealthDimension::Healthy);
+                }
+                assert!(matches!(
+                    health.dimension(HealthDimensionKind::SupervisionCoverage),
+                    HealthDimension::Healthy | HealthDimension::Unknown
+                ));
+                assert_eq!(evidence.capability_readiness().len(), 1);
+                let readiness = &evidence.capability_readiness()[0];
+                assert_eq!(readiness.capability(), "worker.execute");
+                assert_eq!(
+                    readiness.required_dimensions(),
+                    &[
+                        HealthDimensionKind::Liveness,
+                        HealthDimensionKind::Readiness,
+                        HealthDimensionKind::Compatibility,
+                        HealthDimensionKind::Integrity,
+                        HealthDimensionKind::Capacity,
+                        HealthDimensionKind::SupervisionCoverage,
+                    ]
+                );
+                assert_eq!(
+                    process.capability_is_current(readiness),
+                    matches!(health.supervision_coverage, HealthDimension::Healthy)
+                );
             }
             _ => panic!("heartbeat must reply"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same authenticated heartbeat route fences every stale binding
+    /// before it can project health: a stale resource generation, a changed
+    /// state-fence epoch, and a foreign Authority Epoch are all rejected by
+    /// the live Kernel policy join. These cases use the real ready composition
+    /// and mutate only the presented session snapshot.
+    #[test]
+    fn heartbeat_refuses_stale_generation_state_fence_and_authority_epoch() {
+        let root = temp_root("heartbeat-fences");
+        let kernel = ready_kernel(&root);
+        let session = worker_session(&kernel, DispatchedWorkerKind::Testd.module_id());
+        let heartbeat = health_heartbeat(&session);
+
+        let mut stale_generation = session.clone();
+        stale_generation.module_generation.generation =
+            ResourceGeneration::new(2).expect("stale generation");
+        assert!(matches!(
+            kernel.dispatch_frame(&stale_generation, &heartbeat),
+            Err(TransportError::SessionFenced)
+        ));
+
+        let mut mismatched_fence = session.clone();
+        mismatched_fence
+            .module_generation
+            .state_fence
+            .authority_epoch = test_epoch(2);
+        assert!(matches!(
+            kernel.dispatch_frame(&mismatched_fence, &heartbeat),
+            Err(TransportError::SessionFenced)
+        ));
+
+        let mut foreign_epoch = session.clone();
+        foreign_epoch.authority_epoch = EpochId::new(
+            EpochLineageId::new("660e8400-e29b-41d4-a716-446655440000").expect("foreign lineage"),
+            NonZeroU64::new(1).expect("foreign sequence"),
+        )
+        .expect("foreign epoch");
+        assert!(matches!(
+            kernel.dispatch_frame(&foreign_epoch, &heartbeat),
+            Err(TransportError::SessionFenced)
+        ));
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6197,6 +6954,7 @@ mod tests {
             &epoch,
             Generation::new(7).expect("generation"),
             1_750_000_000_000_000_000,
+            None,
         )
         .expect("grant");
         let bytes = doctor_material_bytes(
@@ -6365,6 +7123,7 @@ mod tests {
                 &epoch,
                 Generation::new(7).expect("generation"),
                 now_nanos,
+                None,
             )
             .expect("grant");
             doctor_material_bytes(

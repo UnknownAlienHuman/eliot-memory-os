@@ -11,6 +11,13 @@ use crate::model::{
     drain_transition, epoch_transition_is_direct_child_of, kernel_transition,
     store_rebind_transition, wake_transition,
 };
+use crate::reactive_context::{
+    ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
+    ReactiveContextPrepareRequest, ReactiveContextPrepareResult, ReactiveContextPreparedEnqueue,
+    ReactiveContextQueueError, ReactiveContextQueuePort, ReactiveContextQueueQuery,
+    ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome, ReactiveContextReconcileRequest,
+    ReactiveContextRecord, ReactiveContextTransition, ReactiveContextTransitionReceipt,
+};
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
 pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
@@ -116,7 +123,7 @@ pub fn record_checksum(record: &HostStateRecord) -> Result<String, JournalError>
     Ok(checksum(&json(record)?))
 }
 
-fn transaction_id(
+pub(crate) fn journal_transaction_id(
     record: &HostStateRecord,
     record_checksum: &str,
 ) -> Result<PlatformHandle, JournalError> {
@@ -342,6 +349,9 @@ fn apply(
                 state.drain = None;
                 state.drain_commit = None;
                 state.wakes.clear();
+                if let Some(queue) = state.reactive_context.as_mut() {
+                    queue.advance_generation()?;
+                }
                 state.clean_marker = None;
             }
             state.activation = Some(next.clone());
@@ -493,6 +503,30 @@ fn apply(
             }
             state.clean_marker = None;
         }
+        HostStateRecord::WakeCancellationBatch(next) => {
+            // Validate every compare-and-swap member against the same locked
+            // snapshot before replacing any WakeRecord.  A stale later
+            // target therefore cannot leave an earlier target applied.
+            let mut indexes = Vec::with_capacity(next.entries.len());
+            for entry in &next.entries {
+                let index = state
+                    .wakes
+                    .iter()
+                    .position(|item| item.wake_id == entry.wake.wake_id)
+                    .ok_or(JournalError::StaleFence)?;
+                let current_checksum =
+                    record_checksum(&HostStateRecord::Wake(state.wakes[index].clone()))?;
+                if current_checksum != entry.expected_record_checksum.as_str() {
+                    return Err(JournalError::StaleFence);
+                }
+                wake_transition(Some(&state.wakes[index]), &entry.wake)?;
+                indexes.push(index);
+            }
+            for (index, entry) in indexes.into_iter().zip(&next.entries) {
+                state.wakes[index] = entry.wake.clone();
+            }
+            state.clean_marker = None;
+        }
         HostStateRecord::Observation(next) => {
             state.observations.push(next.clone());
             state.clean_marker = None;
@@ -525,6 +559,10 @@ fn apply(
             }
             state.clean_marker = None;
         }
+        HostStateRecord::ReactiveContext(next) => {
+            crate::reactive_context::apply_record(&mut state.reactive_context, next, sequence)?;
+            state.clean_marker = None;
+        }
         HostStateRecord::CleanMarker(next) => {
             let genesis_without_runtime_contour = state
                 .activation
@@ -541,6 +579,10 @@ fn apply(
                 && state.observations.is_empty()
                 && state.readiness_observations.is_empty()
                 && state.store_rebinds.is_empty();
+            let reactive_context_clean = state
+                .reactive_context
+                .as_ref()
+                .is_none_or(crate::ReactiveContextQueueState::clean_for_drain);
             if next.manifest.schema_version != JOURNAL_VERSION
                 || next.manifest.last_sequence != state.sequence
                 || next.manifest.last_checksum.as_str()
@@ -548,6 +590,7 @@ fn apply(
                 || (state.activation.as_ref().map(|value| value.state)
                     != Some(crate::ActivationState::StoppedClean)
                     && !genesis_without_runtime_contour)
+                || !reactive_context_clean
             {
                 return Err(JournalError::Invalid(
                     "clean marker does not cover a cleanly stopped journal".into(),
@@ -926,11 +969,125 @@ impl<B: JournalBackend> HostStateJournal<B> {
         self.append_inner(HostStateRecord::ReadinessObservation(observation))
     }
 
+    pub fn prepare_reactive_context(
+        &self,
+        request: ReactiveContextPrepareRequest,
+    ) -> Result<ReactiveContextPrepareResult, ReactiveContextQueueError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReactiveContextQueueError::Journal(JournalError::Synchronization))?;
+        crate::reactive_context::prepare(state.reactive_context.as_ref(), request)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn commit_reactive_context(
+        &self,
+        prepared: ReactiveContextPreparedEnqueue,
+    ) -> Result<ReactiveContextEnqueueReceipt, ReactiveContextQueueError> {
+        if !matches!(
+            &prepared.record.action,
+            ReactiveContextJournalAction::Enqueue(_)
+        ) {
+            return Err(ReactiveContextQueueError::Invalid(
+                "prepared enqueue token does not contain an enqueue action".into(),
+            ));
+        }
+        let host_record = HostStateRecord::ReactiveContext(prepared.record.clone());
+        let checksum = record_checksum(&host_record)?;
+        if checksum != prepared.record_checksum {
+            return Err(ReactiveContextQueueError::IdentityConflict);
+        }
+        let transaction_id = journal_transaction_id(&host_record, &checksum)?;
+        if transaction_id != prepared.transaction_id {
+            return Err(ReactiveContextQueueError::IdentityConflict);
+        }
+        let journal = self.append(host_record)?;
+        let state = self.snapshot()?;
+        let entry = state
+            .reactive_context
+            .as_ref()
+            .and_then(|queue| queue.committed_entry(&prepared.record.operation))
+            .ok_or(ReactiveContextQueueError::NotFound)?;
+        Ok(ReactiveContextEnqueueReceipt { journal, entry })
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn compare_and_transition(
+        &self,
+        transition: ReactiveContextTransition,
+    ) -> Result<ReactiveContextTransitionReceipt, ReactiveContextQueueError> {
+        let record = ReactiveContextRecord {
+            schema_version: crate::REACTIVE_CONTEXT_QUEUE_SCHEMA_VERSION,
+            fence: transition.fence.clone(),
+            operation: transition.mutation.clone(),
+            expected_queue_revision: transition.expected_queue_revision,
+            action: ReactiveContextJournalAction::Transition(transition.clone()),
+        };
+        let journal = self.append(HostStateRecord::ReactiveContext(record))?;
+        let state = self.snapshot()?;
+        let entry = state
+            .reactive_context
+            .as_ref()
+            .and_then(|queue| queue.committed_entry(&transition.target))
+            .ok_or(ReactiveContextQueueError::NotFound)?;
+        Ok(ReactiveContextTransitionReceipt { journal, entry })
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn load_reactive_context_queue(
+        &self,
+        query: ReactiveContextQueueQuery,
+    ) -> Result<ReactiveContextQueueSnapshot, ReactiveContextQueueError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReactiveContextQueueError::Journal(JournalError::Synchronization))?;
+        let queue = state.reactive_context.clone().unwrap_or_default();
+        crate::reactive_context::snapshot(&queue, &query)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn query_reactive_context_operation(
+        &self,
+        query: ReactiveContextOperationQuery,
+    ) -> Result<crate::ReactiveContextQueueEntry, ReactiveContextQueueError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReactiveContextQueueError::Journal(JournalError::Synchronization))?;
+        state
+            .reactive_context
+            .as_ref()
+            .and_then(|queue| queue.committed_entry(&query.operation))
+            .ok_or(ReactiveContextQueueError::NotFound)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn reconcile_reactive_context(
+        &self,
+        request: ReactiveContextReconcileRequest,
+    ) -> Result<ReactiveContextReconcileOutcome, ReactiveContextQueueError> {
+        let (outcome, committed_operation) =
+            self.reconcile_with_descriptor(&request.transaction_id)?;
+        if matches!(outcome, ReconcileOutcome::Committed)
+            && committed_operation.as_ref() != Some(&request.operation)
+        {
+            return Err(ReactiveContextQueueError::IdentityConflict);
+        }
+        let state = self.snapshot()?;
+        let entry = state
+            .reactive_context
+            .as_ref()
+            .and_then(|queue| queue.committed_entry(&request.operation));
+        crate::reactive_context::map_reconcile(outcome, entry)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn append_inner(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
         record.validate_live_admission()?;
         let record_checksum = record_checksum(&record)?;
-        let transaction_id = transaction_id(&record, &record_checksum)?;
+        let transaction_id = journal_transaction_id(&record, &record_checksum)?;
         let mut state = self
             .state
             .lock()
@@ -1013,6 +1170,13 @@ impl<B: JournalBackend> HostStateJournal<B> {
         &self,
         transaction_id: &PlatformHandle,
     ) -> Result<ReconcileOutcome, JournalError> {
+        Ok(self.reconcile_with_descriptor(transaction_id)?.0)
+    }
+
+    pub(crate) fn reconcile_with_descriptor(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<(ReconcileOutcome, Option<IdempotencyIdentity>), JournalError> {
         let mut state = self
             .state
             .lock()
@@ -1032,14 +1196,15 @@ impl<B: JournalBackend> HostStateJournal<B> {
                 let image = backend.load().map_err(map_backend_error)?;
                 let recovered = state_for_host(&image, &state.host)?;
                 validate_committed_append(&committed, &recovered)?;
+                let operation = committed.operation.clone();
                 *state = recovered;
-                Ok(ReconcileOutcome::Committed)
+                Ok((ReconcileOutcome::Committed, Some(operation)))
             }
             BackendReconcileState::Prepared => {
                 validate_prepared_descriptor(&mut *backend, transaction_id, &state.host)?;
-                Ok(ReconcileOutcome::StillUnknown)
+                Ok((ReconcileOutcome::StillUnknown, None))
             }
-            BackendReconcileState::Absent => Ok(ReconcileOutcome::NotCommitted),
+            BackendReconcileState::Absent => Ok((ReconcileOutcome::NotCommitted, None)),
         }
     }
 
@@ -1068,6 +1233,50 @@ impl<B: JournalBackend> HostStateJournal<B> {
             .lock()
             .unwrap_or_else(|_| unreachable!())
             .sequence = sequence;
+    }
+}
+
+impl<B: JournalBackend> ReactiveContextQueuePort for HostStateJournal<B> {
+    fn prepare_or_replay(
+        &self,
+        request: ReactiveContextPrepareRequest,
+    ) -> Result<ReactiveContextPrepareResult, ReactiveContextQueueError> {
+        self.prepare_reactive_context(request)
+    }
+
+    fn commit_enqueued(
+        &self,
+        prepared: ReactiveContextPreparedEnqueue,
+    ) -> Result<ReactiveContextEnqueueReceipt, ReactiveContextQueueError> {
+        self.commit_reactive_context(prepared)
+    }
+
+    fn compare_and_transition(
+        &self,
+        transition: ReactiveContextTransition,
+    ) -> Result<ReactiveContextTransitionReceipt, ReactiveContextQueueError> {
+        Self::compare_and_transition(self, transition)
+    }
+
+    fn load_attempt_queue(
+        &self,
+        query: ReactiveContextQueueQuery,
+    ) -> Result<ReactiveContextQueueSnapshot, ReactiveContextQueueError> {
+        self.load_reactive_context_queue(query)
+    }
+
+    fn query_operation(
+        &self,
+        query: ReactiveContextOperationQuery,
+    ) -> Result<crate::ReactiveContextQueueEntry, ReactiveContextQueueError> {
+        self.query_reactive_context_operation(query)
+    }
+
+    fn reconcile_operation(
+        &self,
+        request: ReactiveContextReconcileRequest,
+    ) -> Result<ReactiveContextReconcileOutcome, ReactiveContextQueueError> {
+        self.reconcile_reactive_context(request)
     }
 }
 

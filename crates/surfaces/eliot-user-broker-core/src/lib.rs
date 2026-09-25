@@ -484,6 +484,126 @@ pub struct LaunchReceipt {
     pub disposition: LaunchDisposition,
 }
 
+/// Stable, credential-free projection of the real [`LaunchReceipt`] for the
+/// authenticated Operator launch boundary.  The private [`OperationPermit`]
+/// is deliberately excluded: it remains inside [`UserBroker`] and cannot be
+/// manufactured by a UI, CLI, or wire decoder.
+pub const OPERATOR_LAUNCH_RECEIPT_WIRE_ID: &str = "eliot.user-broker.operator-launch-receipt";
+pub const OPERATOR_LAUNCH_RECEIPT_WIRE_VERSION: u16 = 1;
+pub const OPERATOR_LAUNCH_RESTART_WIRE_ID: &str = "eliot.user-broker.operator-restart-receipt";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorLaunchReceipt {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub operation_id: OperationId,
+    pub request_digest: String,
+    pub registration_digest: String,
+    pub user_broker_epoch: u64,
+    pub fence_id: String,
+    pub process_receipt: ProcessStartReceipt,
+    pub proof_ceiling: ProofCeiling,
+    pub lineage_verified: bool,
+    pub disposition: LaunchDisposition,
+}
+
+impl OperatorLaunchReceipt {
+    /// Projects the exact owner result without exposing its private permit.
+    pub fn from_launch(receipt: &LaunchReceipt) -> Self {
+        Self {
+            wire_id: OPERATOR_LAUNCH_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: OPERATOR_LAUNCH_RECEIPT_WIRE_VERSION,
+            operation_id: receipt.operation_id.clone(),
+            request_digest: receipt.request_digest.clone(),
+            registration_digest: receipt.registration_digest.clone(),
+            user_broker_epoch: receipt.user_broker_epoch,
+            fence_id: receipt.fence_id.clone(),
+            process_receipt: receipt.process_receipt.clone(),
+            proof_ceiling: receipt.proof_ceiling,
+            lineage_verified: receipt.lineage_verified,
+            disposition: receipt.disposition,
+        }
+    }
+
+    /// Validates the wire projection as an owner-bound terminal receipt.
+    /// Arbitrary non-empty JSON cannot satisfy this contract.
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        if OperationId::new(self.operation_id.as_str().to_owned()).is_err() {
+            return Err(BrokerError::InvalidField("operator_operation_id"));
+        }
+        if self.wire_id != OPERATOR_LAUNCH_RECEIPT_WIRE_ID
+            || self.wire_version != OPERATOR_LAUNCH_RECEIPT_WIRE_VERSION
+        {
+            return Err(BrokerError::InvalidField("operator_launch_receipt_wire"));
+        }
+        hex_digest(&self.request_digest, "operator_request_digest")?;
+        hex_digest(&self.registration_digest, "operator_registration_digest")?;
+        text(&self.fence_id, "operator_fence_id")?;
+        if self.user_broker_epoch == 0 || !self.lineage_verified {
+            return Err(BrokerError::InvalidField("operator_launch_receipt_binding"));
+        }
+        if self.proof_ceiling != ProofCeiling::Observation
+            || self.disposition != LaunchDisposition::Active
+        {
+            return Err(BrokerError::InvalidField(
+                "operator_launch_receipt_disposition",
+            ));
+        }
+        self.process_receipt
+            .validate()
+            .map_err(|error| BrokerError::Provider(format!("process receipt: {error}")))?;
+        if self.process_receipt.operation_id() != &self.operation_id {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl LaunchReceipt {
+    /// Returns the only public launch projection admitted on the Operator
+    /// boundary.  The private operation permit never crosses this method.
+    pub fn operator_receipt(&self) -> OperatorLaunchReceipt {
+        OperatorLaunchReceipt::from_launch(self)
+    }
+}
+
+/// Exact owner binding returned when the serving generation/session has been
+/// invalidated before a new Operator launch can be admitted.  This is a
+/// typed restart disposition, not a free-form error object or a continuity
+/// token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorLaunchRestartReceipt {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub operation_id: OperationId,
+    pub registration_digest: String,
+    pub user_broker_epoch: u64,
+    pub fence_id: String,
+}
+
+impl OperatorLaunchRestartReceipt {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        if OperationId::new(self.operation_id.as_str().to_owned()).is_err() {
+            return Err(BrokerError::InvalidField("operator_operation_id"));
+        }
+        if self.wire_id != OPERATOR_LAUNCH_RESTART_WIRE_ID
+            || self.wire_version != OPERATOR_LAUNCH_RECEIPT_WIRE_VERSION
+        {
+            return Err(BrokerError::InvalidField("operator_restart_receipt_wire"));
+        }
+        hex_digest(&self.registration_digest, "operator_registration_digest")?;
+        text(&self.fence_id, "operator_fence_id")?;
+        if self.user_broker_epoch == 0 {
+            return Err(BrokerError::InvalidField(
+                "operator_restart_receipt_binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LaunchDisposition {

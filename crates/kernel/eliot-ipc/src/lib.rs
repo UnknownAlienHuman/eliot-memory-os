@@ -2653,12 +2653,12 @@ mod windows_transport {
         // Exact `4 + length` with overflow check: fail closed before any
         // body-sized allocation so no attacker-controlled length reaches
         // `with_capacity`/`resize` unchecked.
-        let total = 4_usize.checked_add(length).ok_or(
-            TransportError::Protocol(ProtocolError::OversizeFrame {
+        let total = 4_usize.checked_add(length).ok_or(TransportError::Protocol(
+            ProtocolError::OversizeFrame {
                 actual: usize::MAX,
                 maximum: limits.max_frame_bytes,
-            }),
-        )?;
+            },
+        ))?;
         let mut wire = Vec::with_capacity(total);
         wire.extend_from_slice(&prefix);
         wire.resize(total, 0);

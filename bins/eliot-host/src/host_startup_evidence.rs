@@ -548,6 +548,8 @@ mod tests {
             testd_artifact_digest: hex_handle("c"),
             native_worker_executable_path: path("eliot-native-worker.exe"),
             native_worker_artifact_digest: hex_handle("d"),
+            wasm_host_executable_path: path("eliot-wasm-host.exe"),
+            wasm_host_artifact_digest: hex_handle("f"),
             descriptor_digest: hex_handle("0"),
         }
         .with_computed_digest()
@@ -570,6 +572,7 @@ mod tests {
             doctor_artifact_digest: hex_handle("b"),
             testd_artifact_digest: hex_handle("c"),
             native_worker_artifact_digest: hex_handle("d"),
+            wasm_host_artifact_digest: hex_handle("f"),
             kernel_executable_path: handle(dir.join("eliot-kernel.exe").to_string_lossy().as_ref()),
             store_bridge_executable_path: handle(
                 dir.join("eliot-store-surreal.exe")
@@ -586,6 +589,9 @@ mod tests {
                 dir.join("eliot-native-worker.exe")
                     .to_string_lossy()
                     .as_ref(),
+            ),
+            wasm_host_executable_path: handle(
+                dir.join("eliot-wasm-host.exe").to_string_lossy().as_ref(),
             ),
             config_path: handle(dir.join("generation.json").to_string_lossy().as_ref()),
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],

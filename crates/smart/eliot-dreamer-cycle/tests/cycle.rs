@@ -2108,18 +2108,40 @@ fn no_progress_streak_exhaustion_with_in_flight_operation_emits_reconciliation()
     busy_max_streak.no_progress_streak = eliot_dreamer_cycle::MAX_NO_PROGRESS;
     busy_max_streak.seal().unwrap();
 
-    let event = eliot_dreamer_cycle::DurableEvent::RestartObserved(eliot_dreamer_cycle::RestartEvidence {
-        fence: busy_max_streak.fence.clone(),
-        revision: busy_max_streak.revision,
-    });
+    let event =
+        eliot_dreamer_cycle::DurableEvent::RestartObserved(eliot_dreamer_cycle::RestartEvidence {
+            fence: busy_max_streak.fence.clone(),
+            revision: busy_max_streak.revision,
+        });
     let result = step_durable_job(&busy_max_streak, &event).unwrap();
-    assert_eq!(result.next_state.phase, eliot_dreamer_cycle::DurablePhase::Reconciling);
-    assert_eq!(result.disposition, eliot_dreamer_cycle::DurableDisposition::ReconciliationRequired);
     assert_eq!(
-        result.next_state.current_operation.as_ref().map(|o| &o.operation_id),
-        busy_max_streak.current_operation.as_ref().map(|o| &o.operation_id)
+        result.next_state.phase,
+        eliot_dreamer_cycle::DurablePhase::Reconciling
+    );
+    assert_eq!(
+        result.disposition,
+        eliot_dreamer_cycle::DurableDisposition::ReconciliationRequired
+    );
+    assert_eq!(
+        result
+            .next_state
+            .current_operation
+            .as_ref()
+            .map(|o| &o.operation_id),
+        busy_max_streak
+            .current_operation
+            .as_ref()
+            .map(|o| &o.operation_id)
     );
     assert_eq!(result.commands.len(), 1);
-    assert!(matches!(result.commands[0], eliot_dreamer_cycle::DurableCommand::ReconcileOperation(_)));
-    assert!(!result.commands.iter().any(|c| matches!(c, eliot_dreamer_cycle::DurableCommand::EscalateBlocked(_))));
+    assert!(matches!(
+        result.commands[0],
+        eliot_dreamer_cycle::DurableCommand::ReconcileOperation(_)
+    ));
+    assert!(
+        !result
+            .commands
+            .iter()
+            .any(|c| matches!(c, eliot_dreamer_cycle::DurableCommand::EscalateBlocked(_)))
+    );
 }

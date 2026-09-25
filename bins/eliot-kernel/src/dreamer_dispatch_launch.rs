@@ -954,6 +954,7 @@ mod dreamer_dispatch_launch_tests {
             fence_nonce: format!("dreamer-launch-fence-{short}"),
             idempotency_key: format!("dreamer-launch-lease-{short}"),
             expires_at: 1_750_000_060_000,
+            testd_owner_store_path: None,
         }
     }
 

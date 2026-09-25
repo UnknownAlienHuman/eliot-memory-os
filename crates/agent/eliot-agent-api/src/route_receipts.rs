@@ -67,6 +67,98 @@ pub const MAX_SAFE_ERROR_CHARS: usize = 2048;
 /// explicit versioned legacy decoder.
 pub const LEGACY_CANDIDATE_SCHEMA_V5: &str = "eliot-agent-api/v5:CapabilityRouteDecision";
 
+/// Case-insensitive secret/credential markers that must never enter a public
+/// receipt field. The list is intentionally narrow: each marker names a
+/// credential or secret transport (`bearer` tokens, private keys, API keys,
+/// passwords, cookies, authorization headers) rather than ordinary
+/// operational vocabulary, so redaction never fires on plain provider
+/// status text such as `provider rejected request`.
+const FORBIDDEN_PUBLIC_ERROR_MARKERS: &[&str] = &[
+    "bearer",
+    "-----begin",
+    "private_key",
+    "privatekey",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "passwd",
+    "password",
+    "secret",
+    "set-cookie",
+    "authorization:",
+    "token=",
+];
+
+/// Placeholder recorded when an adapter error message carries nothing
+/// publishable after sanitization.
+const REDACTED_PUBLIC_ERROR: &str = "redacted-provider-error";
+
+/// Replaces one case-insensitive occurrence scan of `marker` inside `text`
+/// with `[redacted]`, preserving all other bytes verbatim.
+fn redact_marker(text: &str, marker: &str) -> String {
+    let text_lower = text.to_lowercase();
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut rest_lower = text_lower.as_str();
+    while let Some(index) = rest_lower.find(marker) {
+        // `marker` is ASCII, so the byte index is a char boundary in both
+        // the original and the lowercased view.
+        redacted.push_str(&rest[..index]);
+        redacted.push_str("[redacted]");
+        rest = &rest[index + marker.len()..];
+        rest_lower = &rest_lower[index + marker.len()..];
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// Sanitizes one adapter-supplied public error message at the adapter
+/// boundary (issue #369 W20/A21). Credential/secret markers are redacted,
+/// control characters are removed, and the result is truncated to
+/// [`MAX_SAFE_ERROR_CHARS`] on a char boundary. Infallible by construction:
+/// an empty or fully-redacted input yields [`REDACTED_PUBLIC_ERROR`], never
+/// an empty string, so the output always satisfies
+/// [`validate_safe_public_error`].
+#[must_use]
+pub fn sanitize_adapter_error(raw: &str) -> String {
+    let mut sanitized = raw.to_owned();
+    for marker in FORBIDDEN_PUBLIC_ERROR_MARKERS {
+        sanitized = redact_marker(&sanitized, marker);
+    }
+    let sanitized: String = sanitized
+        .chars()
+        .filter(|char| !char.is_control())
+        .collect();
+    let mut truncated = String::new();
+    for char in sanitized.chars().take(MAX_SAFE_ERROR_CHARS) {
+        truncated.push(char);
+    }
+    let truncated = truncated.trim().to_owned();
+    if truncated.is_empty() {
+        return REDACTED_PUBLIC_ERROR.to_owned();
+    }
+    truncated
+}
+
+/// Validates an adapter-sanitized public error message: bounded length, no
+/// blank/control content, and no residual secret/credential marker. Adapters
+/// record [`sanitize_adapter_error`] output here; direct constructors must do
+/// the same, since validation rejects any message that still carries a
+/// forbidden marker with [`ContractError::ForbiddenContent`].
+pub fn validate_safe_public_error(message: &str) -> Result<(), ContractError> {
+    validate_bounded_text(message, "safe_public_error", MAX_SAFE_ERROR_CHARS)?;
+    let message_lower = message.to_lowercase();
+    if FORBIDDEN_PUBLIC_ERROR_MARKERS
+        .iter()
+        .any(|marker| message_lower.contains(marker))
+    {
+        return Err(ContractError::ForbiddenContent {
+            field: "safe_public_error",
+        });
+    }
+    Ok(())
+}
+
 /// Rejects blank, whitespace-only, control-bearing, or over-long opaque text.
 fn validate_bounded_text(
     value: &str,
@@ -538,7 +630,12 @@ pub struct PhysicalRouteObservationReceipt {
     /// [`route_divergence_fields`] of the two fingerprints.
     pub diverged_fields: Vec<String>,
     pub execution_outcome: ExecutionOutcome,
-    /// Exact admitted request commitment.
+    /// Exact admitted request commitment: the bound
+    /// [`ProviderExecutionBinding::start_request_sha256`] preserved verbatim
+    /// (see [`bound_request_digest`](Self::bound_request_digest)). Adapters
+    /// never substitute a zero placeholder or a re-derived wire hash;
+    /// [`validate_against`](Self::validate_against) rejects any other value,
+    /// so two different start requests can never report the same commitment.
     pub request_digest: LowercaseSha256,
     pub translation_digest: Option<LowercaseSha256>,
     /// Immutable digest-bound raw-evidence linkage: a reference is valid
@@ -584,6 +681,20 @@ impl PhysicalRouteObservationReceipt {
     /// the result in `self_digest` before publishing.
     pub fn compute_digest(&self) -> Result<LowercaseSha256, serde_json::Error> {
         typed_digest(compute_self_digest_hex(self)?)
+    }
+
+    /// Preserves the bound start-request commitment as the observation's
+    /// `request_digest`. The request domain is the exact launch request
+    /// pinned by [`ProviderExecutionBinding::start_request_sha256`]: the
+    /// value is carried over verbatim, never re-hashed, never defaulted.
+    /// A binding whose commitment is malformed fails closed here, before
+    /// any receipt is minted.
+    pub fn bound_request_digest(
+        binding: &ProviderExecutionBinding,
+    ) -> Result<LowercaseSha256, ContractError> {
+        binding.validate_internal()?;
+        typed_digest(binding.start_request_sha256.clone())
+            .map_err(|_| ContractError::BindingMismatch)
     }
 
     /// The usable proof ceiling of any physical observation. Divergence,
@@ -643,7 +754,7 @@ impl PhysicalRouteObservationReceipt {
             validate_bounded_text(reference, "raw_evidence_ref", MAX_TEXT_REF_CHARS)?;
         }
         if let Some(message) = &self.safe_public_error {
-            validate_bounded_text(message, "safe_public_error", MAX_SAFE_ERROR_CHARS)?;
+            validate_safe_public_error(message)?;
         }
         if let Some(reference) = &self.restricted_raw_error_ref {
             validate_bounded_text(reference, "restricted_raw_error_ref", MAX_TEXT_REF_CHARS)?;
@@ -735,7 +846,10 @@ impl PhysicalRouteObservationReceipt {
     /// execution binding: exact attempt/lease/fence/generation agreement,
     /// exact embedded-binding agreement (a same-session observation for the
     /// wrong execution unit fails closed), exact admitted-digest linkage,
-    /// and requested-route agreement with the admitted selected route.
+    /// exact bound start-request commitment (`request_digest` must equal the
+    /// binding's `start_request_sha256`: a substituted valid-form digest or
+    /// a zero placeholder fails here, not at a later intake), and
+    /// requested-route agreement with the admitted selected route.
     /// Capability claims are never validated from the requested side.
     pub fn validate_against(
         &self,
@@ -746,6 +860,9 @@ impl PhysicalRouteObservationReceipt {
         admission.validate()?;
         binding.validate_internal()?;
         if self.binding != *binding {
+            return Err(ContractError::BindingMismatch);
+        }
+        if self.request_digest.as_str() != binding.start_request_sha256 {
             return Err(ContractError::BindingMismatch);
         }
         if self.attempt_id != admission.attempt_id || self.attempt_id != binding.attempt_id {

@@ -16,10 +16,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod experience;
+pub use experience::*;
+mod failure_observation;
+pub use failure_observation::*;
 mod record_family_v2;
 pub use record_family_v2::*;
 mod source_handles;
 pub use source_handles::*;
+mod continuity;
+pub use continuity::*;
 
 /// Stable wire name for this C0-11 contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.observation-contracts";
@@ -871,6 +877,7 @@ pub fn contract_identity() -> Result<ContractIdentity, ObservationError> {
             "event": schemars::schema_for!(ObservationEventCore),
             "record": schemars::schema_for!(ObservationRecordEnvelope),
             "coverage": schemars::schema_for!(CoverageAssessment),
+            "continuity": schemars::schema_for!(ContinuityObservation),
         }),
     )
     .map_err(ObservationError::from)

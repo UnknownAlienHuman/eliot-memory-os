@@ -21,13 +21,23 @@ runtime_bundle = "eliotd"
 agent_order = 17
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-context-contracts = { path = "../eliot-context-contracts" }
-eliot-receipts = { path = "../../foundation/eliot-receipts" }
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
+eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+eliot-reactive-context-plan = { path = "../eliot-reactive-context-plan", version = "0.1.0" }
+serde = { workspace = true }
+
+# Host-only owner evidence: the wasm32 guest contour must never see Governor
+# state or the governed registries. Target-gating keeps the guest dependency
+# closure to portable contracts/mechanics while native host callers keep full
+# permit gates.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
+eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
 
 [dev-dependencies]
-eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }
 
 [lints]
 workspace = true

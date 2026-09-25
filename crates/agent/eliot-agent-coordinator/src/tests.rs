@@ -30,12 +30,13 @@ use crate::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
     CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
     CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
-    OutcomeReconciliationId, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
-    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
-    ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
-    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
-    SubmissionId, UnknownOutcomeResolution, WorkClass, WorkerId,
+    OutcomeReconciliationId, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
+    ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
+    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeResolution, WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -175,8 +176,8 @@ fn admitted_capability_for(
     minimum_sequence: u64,
 ) -> TestResult<AdmittedProviderCapability> {
     let live_epoch = test_epoch(TEST_LINEAGE_A, live_sequence);
-    Ok(AdmittedProviderCapability::new(
-        identity,
+    let _ = live_epoch;
+    let presented = PresentedClaimMaterial::new(
         "claim-t9-05-1".to_owned(),
         "attempt-t9-05-1".to_owned(),
         "op-t9-05-1".to_owned(),
@@ -184,13 +185,24 @@ fn admitted_capability_for(
         sha256_hex(b"executable-material-t9-05-1"),
         route_revision.to_owned(),
         capacity_revision.to_owned(),
+        1,
+        fence(),
+    )?;
+    let currentness = OwnerCurrentness::new(
         ProviderCapabilityExpectation {
             current_route_revision: current_route_revision.to_owned(),
             current_capacity_revision: current_capacity_revision.to_owned(),
             live_authority_epoch: test_epoch(TEST_LINEAGE_A, expectation_sequence),
             revoked,
         },
-        live_epoch,
+        fence(),
+        "session-test-binding".to_owned(),
+    )?;
+    Ok(AdmittedProviderCapability::new(
+        identity,
+        presented,
+        currentness,
+        None,
         minimum_sequence,
     )?)
 }
@@ -1300,7 +1312,7 @@ fn descendant_closure_matches_runtime_before_parent_complete_candidate() -> Test
     )?;
     let accepted = coordinator.submit_result(parent_context, parent_result)?;
     assert_eq!(
-        accepted.proof_ceiling,
+        accepted.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     Ok(())
@@ -1677,16 +1689,16 @@ fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> T
     let result = result_submission("case-17", &lane, ResultDisposition::CandidateSucceeded)?;
     let receipt = coordinator.submit_result(context, result)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     assert_eq!(
-        receipt.provider_disposition,
+        receipt.provider_disposition(),
         ResultDisposition::CandidateSucceeded
     );
     // Coordinator never produces a finish-level proof.
     assert_ne!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::ScopedVerification
     );
     // Serialized receipt is candidate-only.
@@ -1790,7 +1802,7 @@ fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> Tes
     replay.submission_id = first_id.clone();
     replay.result.actual_route = first_route.clone();
     let replayed = coordinator.submit_result(context.clone(), replay)?;
-    assert_eq!(replayed.submission_id, first_id);
+    assert_eq!(replayed.submission_id(), &first_id);
     // Same identity with different bytes (different disposition) is a conflict.
     let mut conflict = result_submission("case-19", &lane, ResultDisposition::Partial)?;
     conflict.submission_id = first_id.clone();
@@ -1910,7 +1922,7 @@ fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_
     )?;
     let receipt = coordinator.submit_result(parent_context, parent_result)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     // Even with two levels of CANDIDATE_SUCCEEDED, no task finish is derived.
@@ -2199,6 +2211,60 @@ fn binding_duplicate_unit_reuse_conflicts_across_attempts() -> TestResult {
 }
 
 #[test]
+fn binding_distinct_unit_on_distinct_attempt_binds_independently() -> TestResult {
+    // Positive side of the #361 declared attempt rule: a new turn on a new
+    // attempt binds successfully while the first attempt keeps its own unit.
+    // (The negative side — same live unit on two attempts — is
+    // `binding_duplicate_unit_reuse_conflicts_across_attempts`.)
+    let proofs = [
+        "proof-admission-bind-e",
+        "proof-bind-bind-e-0",
+        "proof-bind-bind-e-1",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-e",
+        &[
+            bind_lane_spec("work-bind-e-0", "reader-bind-e-0", "a"),
+            bind_lane_spec("work-bind-e-1", "reader-bind-e-1", "b"),
+        ],
+        None,
+    )?;
+    let first = admitted.admitted_lanes[0].clone();
+    let second = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(ExecutionContext::from(&admitted), first.attempt_id.clone())?;
+    coordinator.start_attempt(ExecutionContext::from(&admitted), second.attempt_id.clone())?;
+    let events_before = coordinator.events().len();
+    let first_bound = coordinator.bind_provider_execution(
+        ExecutionContext::from(&admitted),
+        binding_submission("bind-e-0", &first, "unit-e0", "shared")?,
+    )?;
+    let second_bound = coordinator.bind_provider_execution(
+        ExecutionContext::from(&admitted),
+        binding_submission("bind-e-1", &second, "unit-e1", "shared")?,
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 2);
+    assert_eq!(first_bound.execution_unit.unit_id, "turn-unit-e0");
+    assert_eq!(second_bound.execution_unit.unit_id, "turn-unit-e1");
+    assert_eq!(
+        coordinator
+            .attempt(&first.attempt_id)
+            .unwrap_or_else(|| panic!("first attempt must exist"))
+            .provider_binding,
+        Some(first_bound)
+    );
+    assert_eq!(
+        coordinator
+            .attempt(&second.attempt_id)
+            .unwrap_or_else(|| panic!("second attempt must exist"))
+            .provider_binding,
+        Some(second_bound)
+    );
+    Ok(())
+}
+
+#[test]
 fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> TestResult {
     let proofs = ["proof-admission-bind-d", "proof-bind-bind-d"];
     let mut coordinator = coordinator(config(4, 4), &proofs)?;
@@ -2392,15 +2458,15 @@ fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
     submission.result.actual_route = diverged_observation(&lane, &binding, &observed)?;
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     assert_eq!(
-        receipt.actual_route.route_state,
+        receipt.actual_route().route_state,
         RouteObservationState::Diverged
     );
     assert_eq!(
-        receipt.actual_route.observed_route.as_ref(),
+        receipt.actual_route().observed_route.as_ref(),
         Some(&observed)
     );
     Ok(())
@@ -2435,14 +2501,14 @@ fn unobserved_observation_is_retained_with_capped_ceiling() -> TestResult {
     submission.result.unknown_reason = Some("provider outcome unresolved".to_owned());
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     assert_eq!(
-        receipt.actual_route.route_state,
+        receipt.actual_route().route_state,
         RouteObservationState::Unobserved
     );
-    assert_eq!(receipt.actual_route.observed_route, None);
+    assert_eq!(receipt.actual_route().observed_route, None);
     Ok(())
 }
 
@@ -2619,7 +2685,7 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     let happy = result_submission("s5a-0", &first, ResultDisposition::Partial)?;
     let receipt = restored.submit_result(context.clone(), happy)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     // Forged digest: same attempt/binding/route but a zero digest instead of
@@ -3573,7 +3639,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     submission.result.actual_route = matched_observation(&lane, &stored)?;
     let intake = restored.submit_result(context.clone(), submission)?;
     assert_eq!(
-        intake.proof_ceiling,
+        intake.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     let mut again = result_submission("e2e-observe-again", &lane, ResultDisposition::Partial)?;
@@ -3613,7 +3679,7 @@ fn production_verifier_admits_binds_and_accepts_result() -> TestResult {
     submission.result.actual_route = matched_observation(&lane, &binding)?;
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
-        receipt.proof_ceiling,
+        receipt.proof_ceiling(),
         eliot_receipts::ProofCeiling::CandidateArtifact
     );
     Ok(())
@@ -4177,7 +4243,10 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
     let mut valid_json = serde_json::to_value(classified_request("wcx", "swarm")?)?;
     valid_json["work_class"] = serde_json::json!("proton");
     let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(valid_json);
-    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    let message = decoded
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
     assert!(
         message.contains("unknown work class: proton"),
         "decode must reject unknown class, got {message:?}"
@@ -4210,7 +4279,10 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
     );
     // No silent default: a missing `work_class` field fails decode.
     let mut missing_json = serde_json::to_value(classified_request("wcmiss", "swarm")?)?;
-    missing_json.as_object_mut().ok_or("request must be an object")?.remove("work_class");
+    missing_json
+        .as_object_mut()
+        .ok_or("request must be an object")?
+        .remove("work_class");
     assert!(serde_json::from_value::<StaffingPlanRequest>(missing_json).is_err());
     Ok(())
 }

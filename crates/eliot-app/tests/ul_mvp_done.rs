@@ -3,8 +3,8 @@ mod support;
 
 use eliot_engine::{GitMiningService, ModuleCardService};
 use eliot_types::{
-    AgentId, ClaimId, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength,
-    InjectionReceipt, LifecycleStatus, MaterialPacketFrame, MemoryInfluenceTrace, ModuleCard,
+    AgentId, ClaimId, CommandContext, CueBinding, CueMatchMode, CueStrength, InjectionReceipt,
+    LegacyCueKindV1, LifecycleStatus, MaterialPacketFrame, MemoryInfluenceTrace, ModuleCard,
     ObservabilityKind, PredictionRecord, PredictionResolution, ProjectCharter, ProjectId,
     RelationType, SemanticCommand, SubsystemCapsule, SystemMap, TaintClass, TaskId, Visibility,
     WriteId, compile_packet_input_schema,
@@ -806,7 +806,7 @@ fn failure_command(project_id: ProjectId, fingerprint: &str) -> SemanticCommand 
         summary: "network session repeatedly drops".to_owned(),
         payload: json!({
             "cue_bindings": [CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: "src/net/session.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,

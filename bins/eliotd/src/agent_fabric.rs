@@ -26,10 +26,13 @@ use std::sync::Arc;
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
-    AdmissionId, AgentCoordinator, CandidateId, CoordinatorConfig, CoordinatorError,
-    CoordinatorSnapshot, PlanGap, StaffingPlanCandidate, StaffingPlanRequest, WorkClass,
+    AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
+    CoordinatorError, CoordinatorSnapshot, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
+    ProviderBindingSnapshot, ProviderIdentity, ProviderSelectionHealth, StaffingPlanCandidate,
+    StaffingPlanRequest, WorkClass,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
+use eliot_kernel_service::ProviderCapabilityExpectation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -92,6 +95,121 @@ pub fn daemon_coordinator_config() -> Result<CoordinatorConfig, FabricError> {
         capacity_identity: FABRIC_CAPACITY_IDENTITY.to_owned(),
         capacity_revision,
     })
+}
+
+/// Authenticated Kernel claim material for one verified provider binding
+/// (issue #1108, W4/A1/A2).
+///
+/// Two halves, resolved by the daemon composition per construction, per
+/// restore, and per daemon operation resolution — never cached across live
+/// fence changes:
+///
+/// - presented: the claim material as claimed by the operation at hand
+///   (admission receipt refs, lane claim presentation), including the
+///   operation fence and the claimed worker generation;
+/// - owner: the currentness the daemon observed over its authenticated
+///   Kernel session — the Governor currentness it holds
+///   ([`ProviderCapabilityExpectation`]), the live fence it freshly
+///   re-queried ([`DaemonKernelClient::kernel_fence`](crate::DaemonKernelClient::kernel_fence)),
+///   and the Kernel-issued session binding it presented under
+///   ([`OwnerSessionFacts::session_binding`](crate::OwnerSessionFacts::session_binding),
+///   blank before the validated handshake, which fails closed).
+///
+/// M2 (#22): the supplier is Kernel over the authenticated front-door
+/// session plus ORS operation records bound to the exact attempt; no new
+/// signing or token service. Digest equality between the presented binding
+/// digests and the durable ORS row is enforced Kernel-side per effecting
+/// operation through the authenticated capability wire operation; the
+/// capability construction below enforces presented-versus-owner coherence
+/// (revisions, epoch, generation), and the sealed receipt from that wire
+/// operation is the per-operation owner proof the executor applies before
+/// touching the coordinator.
+///
+/// Evidence only, never authority: only [`AdmittedProviderCapability::new`]
+/// plus [`AgentCoordinator::new_with_admitted_provider`] admit effects, and
+/// every proof re-runs the T9-04 pure Kernel verifier. Carries no secret
+/// material (identities, digests, revisions, fences, epoch, sequence only).
+/// Catalogue, quota, and liveness observations (issue #265) ride only in
+/// `health`: selection/health input, never admission.
+#[derive(Clone, Debug)]
+pub struct VerifiedProviderMaterial {
+    /// Provider identity the binding must match exactly.
+    pub identity: ProviderIdentity,
+    /// Durable claim identity as claimed by the operation at hand.
+    pub claim_id: String,
+    /// Attempt identity as claimed by the operation at hand.
+    pub attempt_id: String,
+    /// Exact external-effect operation identity as claimed by the operation
+    /// at hand.
+    pub operation_id: String,
+    /// Presented claim binding digest (lowercase SHA-256).
+    pub binding_digest: String,
+    /// Presented executable binding digest (lowercase SHA-256).
+    pub executable_digest: String,
+    /// Presented route revision from the operation at hand.
+    pub route_revision: String,
+    /// Presented capacity revision from the operation at hand.
+    pub capacity_revision: String,
+    /// Claimed worker generation from the operation presentation (nonzero).
+    pub worker_generation: u64,
+    /// Operation fence from the operation at hand.
+    pub presented_fence: StateFence,
+    /// Current Governor/Kernel expectation observed by the daemon.
+    pub expectation: ProviderCapabilityExpectation,
+    /// Live fence freshly re-queried by the daemon over its session.
+    pub live_fence: StateFence,
+    /// Kernel-issued session binding the daemon presented under.
+    pub session_binding: String,
+    /// Issue #265 selection/health observation, if any. Input only: never
+    /// read by the verifier, never mints admission.
+    pub health: Option<ProviderSelectionHealth>,
+    /// Minimum replayed event sequence for restore.
+    pub minimum_event_sequence: u64,
+}
+
+/// Builds the sealed admission capability from authenticated Kernel claim
+/// material (issue #1108, production composition caller for W4/A1/A2).
+///
+/// Wiring plus coherence: forwards the daemon-resolved
+/// [`VerifiedProviderMaterial`] halves into the presented/owner capability
+/// boundary, which fails closed on any presented-versus-owner disagreement
+/// (route/capacity revision, authority epoch, resource generation) or owner
+/// rejection (revoked, malformed, stale). The caller must supply a freshly
+/// re-queried live fence and the validated session binding per call: a
+/// blank binding (no live session) or a stale fence fails here, never at
+/// first effect. Currency is re-checked on every coordinator `verify` call,
+/// never cached.
+///
+/// # Errors
+///
+/// Returns the coordinator owner rejection unchanged (shape, coherence, or
+/// stale/revoked binding).
+pub fn build_admitted_provider_capability(
+    material: VerifiedProviderMaterial,
+) -> Result<AdmittedProviderCapability, FabricError> {
+    let presented = PresentedClaimMaterial::new(
+        material.claim_id,
+        material.attempt_id,
+        material.operation_id,
+        material.binding_digest,
+        material.executable_digest,
+        material.route_revision,
+        material.capacity_revision,
+        material.worker_generation,
+        material.presented_fence,
+    )?;
+    let currentness = OwnerCurrentness::new(
+        material.expectation,
+        material.live_fence,
+        material.session_binding,
+    )?;
+    Ok(AdmittedProviderCapability::new(
+        material.identity,
+        presented,
+        currentness,
+        material.health,
+        material.minimum_event_sequence,
+    )?)
 }
 
 /// Plans one candidate through the real coordinator owner.
@@ -444,6 +562,16 @@ pub enum FabricError {
     /// operation.
     #[error("fabric terminal cancellation: {0}")]
     TerminalCancellation(String),
+    /// The snapshot carries a verified provider binding but no fresh owner
+    /// material was supplied. Restore stays blocked: re-resolve live
+    /// evidence through [`AgentFabric::restore_verified`]. A serialized
+    /// `Verified` label alone never restores effecting readiness, and
+    /// missing/stale/revoked evidence never downgrades silently to a
+    /// plan-only restore masquerading as recovery.
+    #[error(
+        "fabric restore blocked: snapshot holds a verified provider binding; supply fresh owner material through restore_verified"
+    )]
+    ProviderEvidenceRequired,
 }
 
 /// B-MOD model registry seam (#694). The fabric resolves routes only through
@@ -629,6 +757,50 @@ impl AgentFabric {
             initialized: true,
         };
         fabric.record("coordinator_constructed", "coordinator");
+        Ok(fabric)
+    }
+
+    /// Constructs the one coordinator on a sealed admitted provider
+    /// capability (issue #1108, production composition caller for A1/A2).
+    ///
+    /// The `capability` must be built via
+    /// [`build_admitted_provider_capability`] from claim material the daemon
+    /// resolved over its authenticated Kernel session plus ORS operation
+    /// records bound to the exact attempt (M2). The coordinator performs no
+    /// I/O and launches nothing; stale, revoked, foreign, or conflicting
+    /// evidence fails closed through the T9-04 pure verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the config is invalid, or the
+    /// coordinator owner rejection (e.g. stale capacity binding) unchanged.
+    pub fn new_with_admitted_provider(
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        config
+            .validate()
+            .map_err(|error| FabricError::Contract(format!("coordinator config: {error}")))?;
+        let coordinator = AgentCoordinator::new_with_admitted_provider(config.clone(), capability)?;
+        let mut fabric = Self {
+            config,
+            coordinator,
+            ports,
+            ledger: Vec::new(),
+            definitions: BTreeMap::new(),
+            definition_bytes: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            admissions: BTreeMap::new(),
+            admission_by_definition: BTreeMap::new(),
+            activations: BTreeMap::new(),
+            intents: BTreeMap::new(),
+            intent_by_operation: BTreeMap::new(),
+            attempt_states: BTreeMap::new(),
+            cancellations: BTreeMap::new(),
+            initialized: true,
+        };
+        fabric.record("coordinator_constructed_verified", "coordinator");
         Ok(fabric)
     }
 
@@ -1389,10 +1561,18 @@ impl AgentFabric {
     /// unresolved reservations stay unresolved and no second coordinator is
     /// created.
     ///
+    /// A snapshot carrying a verified provider binding is rejected here
+    /// with [`FabricError::ProviderEvidenceRequired`]: without freshly
+    /// resolved owner material the restore stays blocked instead of
+    /// silently resuming as plan-only. Re-resolve live evidence through
+    /// [`AgentFabric::restore_verified`], or construct an explicitly fresh
+    /// plan-only fabric through [`AgentFabric::new`].
+    ///
     /// # Errors
     ///
-    /// Returns the coordinator owner restore rejection or a stale-config
-    /// conflict.
+    /// Returns [`FabricError::ProviderEvidenceRequired`] when the snapshot
+    /// holds a verified provider binding, the coordinator owner restore
+    /// rejection, or a stale-config conflict.
     pub fn restore(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
@@ -1402,6 +1582,12 @@ impl AgentFabric {
             return Err(FabricError::IdentityConflict(
                 "restore config does not match the snapshotted coordinator config".to_owned(),
             ));
+        }
+        if matches!(
+            snapshot.coordinator_snapshot.provider_binding,
+            ProviderBindingSnapshot::Verified { .. }
+        ) {
+            return Err(FabricError::ProviderEvidenceRequired);
         }
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -1451,6 +1637,104 @@ impl AgentFabric {
         };
         fabric.record("fabric_restored", "fabric");
         Ok(fabric)
+    }
+
+    /// Restores the fabric on a freshly supplied admitted provider
+    /// capability (issue #1108, verified restore for A8).
+    ///
+    /// The daemon re-queries Kernel and passes a fresh `capability`; the
+    /// snapshot's stored binding must equal the live binding and every
+    /// replayed event re-verifies through the T9-04 pure verifier, so a
+    /// serialized `Verified` label alone never restores authority and
+    /// missing/stale/revoked evidence stays plan-only/blocked instead of
+    /// silently resuming effecting operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coordinator owner restore rejection, a stale-config
+    /// conflict, or a stale/revoked binding rejection unchanged.
+    pub fn restore_with_admitted_provider(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        if snapshot.coordinator_snapshot.config != config {
+            return Err(FabricError::IdentityConflict(
+                "restore config does not match the snapshotted coordinator config".to_owned(),
+            ));
+        }
+        let coordinator = AgentCoordinator::restore_with_admitted_provider(
+            snapshot.coordinator_snapshot.clone(),
+            config.clone(),
+            capability,
+        )?;
+        let mut definition_bytes = BTreeMap::new();
+        for (key, definition) in &snapshot.definitions {
+            definition_bytes.insert(key.clone(), definition.definition_digest.clone());
+        }
+        let mut admission_by_definition = BTreeMap::new();
+        for (admission_key, admission) in &snapshot.admissions {
+            admission_by_definition.insert(
+                admission.definition_id.as_str().to_owned(),
+                admission_key.clone(),
+            );
+        }
+        let mut intent_by_operation = BTreeMap::new();
+        for (dispatch_id, intent) in &snapshot.intents {
+            intent_by_operation.insert(
+                dispatch_id.clone(),
+                format!(
+                    "{}/{}",
+                    intent.admission_id.as_str(),
+                    intent.attempt_id.as_str()
+                ),
+            );
+        }
+        let mut fabric = Self {
+            config,
+            coordinator,
+            ports,
+            ledger: snapshot.ledger.clone(),
+            definitions: snapshot.definitions,
+            definition_bytes,
+            reservations: snapshot.reservations,
+            admissions: snapshot.admissions,
+            admission_by_definition,
+            activations: snapshot.activations,
+            intents: snapshot.intents,
+            intent_by_operation,
+            attempt_states: snapshot.attempt_states,
+            cancellations: snapshot.cancellations,
+            initialized: true,
+        };
+        fabric.record("fabric_restored_verified", "fabric");
+        Ok(fabric)
+    }
+
+    /// Restores the fabric on freshly resolved owner material in one call
+    /// (issue #1108, verified restore for A8).
+    ///
+    /// Builds a fresh capability from `material` — the daemon's per-restore
+    /// resolution over its authenticated session (fresh live fence, current
+    /// Governor expectation, validated session binding) — then restores
+    /// through [`AgentFabric::restore_with_admitted_provider`]. Callers pass
+    /// freshly resolved material on every restore: a stored capability is
+    /// never reused across restarts, so missing/stale/revoked evidence stays
+    /// plan-only/blocked instead of silently resuming effecting operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns the capability construction rejection, the coordinator owner
+    /// restore rejection, or a stale-config conflict unchanged.
+    pub fn restore_verified(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+    ) -> Result<Self, FabricError> {
+        let capability = build_admitted_provider_capability(material)?;
+        Self::restore_with_admitted_provider(snapshot, config, ports, capability)
     }
 }
 

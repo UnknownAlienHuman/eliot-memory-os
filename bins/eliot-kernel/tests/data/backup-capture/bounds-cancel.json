@@ -1,0 +1,26 @@
+{
+  "backup_id": "capture-959-bounds",
+  "class": "full_recovery",
+  "source_adapter": "kernel-capture-959",
+  "schema_generation": "schema-959",
+  "scope_id": null,
+  "store_generation": "store-959",
+  "lineage": "550e8400-e29b-41d4-a716-446655440000",
+  "capture_times_match": true,
+  "cursors": {
+    "receipt": 1,
+    "event": 2,
+    "outbox": 0
+  },
+  "pending_ops": ["op-pending-959-1"],
+  "budgets": {
+    "max_events": 1,
+    "max_bytes": 64,
+    "max_blobs": 0,
+    "max_artifacts": 1
+  },
+  "cancel_requested": true,
+  "control_reserve_preserved": true,
+  "drift": "none",
+  "expected_state": "cancelled"
+}

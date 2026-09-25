@@ -32,24 +32,38 @@
 pub mod authority;
 pub mod authority_controller;
 mod authority_snapshot;
+pub mod durable_owner_bootstrap;
 pub mod error;
+pub mod governor_closure_source;
 pub mod grant_activation_port;
+pub mod introduction_lifecycle;
 pub mod module;
+pub mod user_automation;
 
 pub use authority::{
     AuthorityGrant, AuthorityGrantRequest, AuthorityReceipt, KernelAuthority, KernelAuthorityKey,
 };
 pub use authority_controller::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec,
-    ProcessDispatchAuthorityController, ProcessExecutionReplayBegin, ProcessExecutionReplayRecord,
-    ProcessExecutionReplayState, ProcessExecutionReplayStore, SealedAuthoritySnapshot,
-    process_admission_digest,
+    KernelAuthorityReplaySnapshot, ProcessDispatchAuthorityController, ProcessExecutionReplayBegin,
+    ProcessExecutionReplayRecord, ProcessExecutionReplayState, ProcessExecutionReplayStore,
+    SealedAuthoritySnapshot, process_admission_digest,
 };
+pub use durable_owner_bootstrap::{BoundCanonicalOwner, bind_canonical_owner, owner_bundle_digest};
 pub use error::{KernelError, KernelResult};
+pub use governor_closure_source::{
+    GovernorClosureRestore, GovernorClosureSource, GovernorClosureSourceHandle,
+};
 pub use grant_activation_port::{
-    CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantRevocationIntent,
-    IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
-    ROOT_GRANT_HYDRATION_FIELDS, RootGrantHydration, RootGrantHydrationSource,
+    CommittedReceipt, GRANT_CLOSURE_ENUMERATION_FIELDS, GrantActivationIntent, GrantActivationPort,
+    GrantClosureActivationIntent, GrantClosureEnumeration, GrantClosureMember, GrantClosureReceipt,
+    GrantClosureRevocationIntent, GrantClosureSurvivor, GrantRevocationIntent, IntentDisposition,
+    IntroductionActivationIntent, IntroductionRevocationIntent, ROOT_GRANT_HYDRATION_FIELDS,
+    RootGrantHydration, RootGrantHydrationSource, verify_grant_seal, verify_introduction_seal,
+};
+pub use introduction_lifecycle::{
+    INTRODUCTION_HYDRATION_FIELDS, IntroductionHydration, introduction_fence_input,
+    introduction_fence_record_id,
 };
 pub use module::compatibility_handshake::{
     AcceptedCompatibilityEvidence, CompatibilityEnvelope, CompatibilityMismatch,
@@ -74,6 +88,28 @@ pub use module::process_health::{
     CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
 };
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
+pub use module::runtime_health::{
+    CURRENT_ARCHITECTURE_SOURCE_DIGEST, CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+    CURRENT_NORMATIVE_PAIR_KEY, KernelRuntimeHealthEvidence,
+};
+pub use user_automation::{
+    AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,
+    AutomationFailureNotificationProjection, AutomationOccurrenceIdentity, AutomationRecipient,
+    AutomationRecipientRole, AutomationReconciliationReference, AutomationResourceCeiling,
+    AutomationTaskBinding, AutomationTaskKind, AutomationWorkClass, AutomationWorkScope,
+    DstFoldPolicy, DstGapPolicy, NormalizedSchedule, OverlapPolicy, ProviderFingerprint,
+    ProviderFingerprintPolicy, RecursionPolicy, RouteCostPolicy, ScheduleKind,
+    USER_AUTOMATION_CONTRACT_NAME, USER_AUTOMATION_CONTRACT_VERSION,
+    USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION, USER_AUTOMATION_PREFLIGHT_EFFECT_CEILING,
+    USER_AUTOMATION_PREFLIGHT_OPERATION, USER_AUTOMATION_PREFLIGHT_SELECTOR, USER_AUTOMATION_SCOPE,
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationError,
+    UserAutomationExecutionMode, UserAutomationFailureProjection, UserAutomationFailureReason,
+    UserAutomationInvocation, UserAutomationOperation, UserAutomationOperatorIntent,
+    UserAutomationPreflightContext, UserAutomationPreflightDecision,
+    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationQuery,
+    UserAutomationQueryKind, UserAutomationRevision, UserAutomationTrigger,
+    UserAutomationTriggerOrigin, user_automation_contract_identity,
+};
 
 /// Result of releasing a pre-effect process-start replay reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

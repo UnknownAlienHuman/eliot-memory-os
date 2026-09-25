@@ -1,0 +1,21 @@
+{
+  "description": "Closed per-owner accepted backup method tables (issue #962). The Kernel drives each owner only through its exact table; anything else refuses pre-effect.",
+  "host_owner": {
+    "peer": "host-backup-owner",
+    "accepted_methods": [
+      "PREPARE_ISOLATED_RESTORE",
+      "ADMIT_CUTOVER",
+      "RESTORE_STATUS",
+      "RECONCILE_RESTORE"
+    ]
+  },
+  "watchdog_owner": {
+    "peer": "watchdog-backup-owner",
+    "accepted_methods": [
+      "READ_SNAPSHOT_PAGE",
+      "VERIFY_ARCHIVE",
+      "RESTORE_STATUS",
+      "RECONCILE_RESTORE"
+    ]
+  }
+}

@@ -17,6 +17,7 @@ use std::time::Duration;
 use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
+use eliot_kernel_core::user_automation::UserAutomationInvocation;
 use eliot_ors::{RedbRecoveryStore, ReservationRecord, WriterReservationToken};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_store_api::{
@@ -34,7 +35,11 @@ use crate::store_write_reservation::{
     mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
 };
-use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
+use crate::{
+    CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
+    StoreClientFault, StoreClientFaultHarness, UserAutomationOwnerLookup,
+    UserAutomationOwnerSnapshot,
+};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
@@ -558,6 +563,19 @@ impl KernelStoreGateway {
         Ok(lease)
     }
 
+    /// Arms the production fault hook on the bound store client (issue #2030
+    /// follow-up binding for 994/11-12).
+    ///
+    /// Read-through delegation only: no dispatch, admission, or reservation
+    /// behavior changes. Harness-gated like `arm_fault` itself — only `test`
+    /// or `--features test-support` builds can construct the token, so
+    /// production callers cannot arm faults. The 994 follow-up cases arm the
+    /// hook on the proven kernel route, then drive `apply_reserved` through
+    /// the existing owner-bound path.
+    pub fn arm_store_fault(&self, harness: &StoreClientFaultHarness, fault: StoreClientFault) {
+        self.store.arm_fault(harness, fault);
+    }
+
     /// Cancels one reserved write before possible submission (issue #992).
     ///
     /// Cancellation is protected-control work (I14.3): it holds one
@@ -765,6 +783,61 @@ impl KernelStoreGateway {
             request,
         )
         .await
+    }
+
+    /// Reads and authenticates the current UserAutomation owner material through
+    /// the active generation-routed Store contour. The UserAutomation adapter
+    /// constructs and projects the closed named reads; this gateway remains the
+    /// only production path that performs their Store IO.
+    pub async fn read_user_automation_owner(
+        &self,
+        lookup: &UserAutomationOwnerLookup,
+    ) -> Result<UserAutomationOwnerSnapshot, String> {
+        let (current_request, history_request) = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::owner_read_requests(lookup)
+        .map_err(|error| error.to_string())?;
+        let current_response = self.execute_named(current_request.clone()).await?;
+        let history_response = self.execute_named(history_request.clone()).await?;
+        let current_after_response = self.execute_named(current_request.clone()).await?;
+        CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_owner_snapshot(
+            lookup,
+            &current_request,
+            current_response,
+            &history_request,
+            history_response,
+            &current_request,
+            current_after_response,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Reads one owner-issued invocation by its exact occurrence identity
+    /// through the active generation route. The bounded invocation page is
+    /// never used for production provenance recovery.
+    pub async fn read_user_automation_invocation(
+        &self,
+        state_fence: &StateFence,
+        automation_id: &str,
+        occurrence_id: &str,
+    ) -> Result<UserAutomationInvocation, String> {
+        state_fence.validate().map_err(|error| error.to_string())?;
+        let request = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::invocation_read_request(
+            automation_id.to_owned(),
+            occurrence_id.to_owned(),
+            state_fence.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let response = self.execute_named(request.clone()).await?;
+        CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_invocation(
+            automation_id,
+            occurrence_id,
+            &request,
+            response,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel
@@ -1130,8 +1203,8 @@ mod tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            ScopeId, SecurityContext, TransitionClass, canonical_request_hash,
-            operation_manifest_set_digest,
+            ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
+            canonical_request_hash, operation_manifest_set_digest,
         };
 
         const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1168,6 +1241,11 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: set_digest,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; no semantic source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1183,6 +1261,7 @@ mod tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        bind_issue18_digests(&mut transition).unwrap_or_else(|_| unreachable!());
         transition.identity.canonical_request_hash = canonical_request_hash(
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
@@ -2049,7 +2128,7 @@ mod live_surreal_evidence_pack_e2e {
     ) -> PreparedTransition {
         let entries = generated_operation_manifests().expect("operation catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
-        PreparedTransition {
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new(format!("op-t11-live-{tag}"))
                     .expect("operation identity"),
@@ -2064,6 +2143,11 @@ mod live_surreal_evidence_pack_e2e {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: set_digest.as_str().to_owned(),
             operation_manifest_digest: set_digest,
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
@@ -2075,7 +2159,9 @@ mod live_surreal_evidence_pack_e2e {
             },
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     fn verification_intent() -> QueryIntent {

@@ -1,0 +1,8 @@
+{
+  "_comment": "949/restore-transaction frozen fixture inventory. Exact relative paths (repository-rooted) of the finite fixture set. Frozen before coding; the test file asserts this inventory.",
+  "fixtures": [
+    "crates/storage/eliot-backup/tests/data/restore-transaction/paths.json",
+    "crates/storage/eliot-backup/tests/data/restore-transaction/manifest.json",
+    "crates/storage/eliot-backup/tests/data/restore-transaction/vectors.json"
+  ]
+}

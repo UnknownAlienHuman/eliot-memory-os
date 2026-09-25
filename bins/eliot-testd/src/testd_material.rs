@@ -134,6 +134,9 @@ pub struct DispatchGrant {
     pub idempotency_key: String,
     /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
     pub expires_at: u64,
+    /// Kernel-selected `TestD` owner database protected by the grant digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testd_owner_store_path: Option<String>,
 }
 
 /// Bins-local mirror of the kernel `TestdAdmissionAttemptRequest` (exact
@@ -208,6 +211,8 @@ pub struct TestdMaterialAdmission {
     /// fields. The per-host installed artifact digest binds later at Drive
     /// time through the intent's `executable_sha256`.
     pub profile_binding_digest: String,
+    /// Exact non-secret environment bindings carried by the Kernel receipt.
+    pub environment: Vec<(String, String)>,
     /// Whether the job was admitted cancelled; cancelled admissions never
     /// stage execution work.
     pub cancelled: bool,
@@ -249,6 +254,8 @@ pub struct ValidatedTestdMaterial {
     pub profile: String,
     /// Canonical definition digest over the static admitted profile fields.
     pub profile_binding_digest: String,
+    /// Exact non-secret environment bindings admitted for this profile.
+    pub environment: Vec<(String, String)>,
     /// Canonical digest of the exact admitted request envelope.
     pub request_digest: String,
     /// Canonical digest of the admission receipt.
@@ -266,6 +273,9 @@ pub struct ValidatedTestdMaterial {
     /// Validated Kernel-issued launch grant; the dispatch authority
     /// consumes exactly this value at issuance time.
     pub grant: DispatchGrant,
+    /// Canonical `TestD` database owned by Kernel `work_root` and bound into the
+    /// grant digest; never inferred from `source_root` or process cwd.
+    pub owner_store_path: PathBuf,
     /// Rebuilt fence from the validated grant (broker constructors).
     pub fence: FencingToken,
     /// Whether the job was admitted cancelled; cancelled admissions never
@@ -436,11 +446,31 @@ fn validate_material(
     validate_admission(&file.admission, &file.request)?;
     validate_session_binding(&file)?;
     let (fence, _lease) = validate_grant(&file.grant, &file.admission, now_unix_ms)?;
+    let owner_store_path = file
+        .grant
+        .testd_owner_store_path
+        .as_deref()
+        .ok_or_else(|| {
+            TestdMaterialError::Contract(
+                "TestD dispatch grant is missing its owner store path".to_owned(),
+            )
+        })?;
+    let owner_store_path = Path::new(owner_store_path);
+    if !owner_store_path.is_absolute()
+        || !owner_store_path.is_file()
+        || std::fs::canonicalize(owner_store_path).ok().as_deref() != Some(owner_store_path)
+    {
+        return Err(TestdMaterialError::Contract(
+            "TestD owner store path is not a canonical existing file".to_owned(),
+        ));
+    }
+    let owner_store_path = owner_store_path.to_path_buf();
     Ok(ValidatedTestdMaterial {
         job_id: file.request.job_id,
         operation_id: file.admission.operation_id.clone(),
         profile: file.admission.profile.clone(),
         profile_binding_digest: file.admission.profile_binding_digest.clone(),
+        environment: file.admission.environment.clone(),
         request_digest: file.admission.request_digest,
         admission_digest: file.admission.admission_digest,
         epoch: file.epoch,
@@ -448,6 +478,7 @@ fn validate_material(
         nonce: file.nonce,
         grant_digest: file.grant.grant_digest.clone(),
         grant: file.grant,
+        owner_store_path,
         fence,
         cancelled: file.admission.cancelled,
     })
@@ -503,20 +534,34 @@ fn validate_admission(
     // Admitted profile record: exactly one profile is admitted, and its
     // definition digest must equal the closed registry digest. A
     // substituted profile or widened binding fails here, before any drive.
-    if admission.profile != eliot_testd_core::TESTD_ADMITTED_PROFILE {
+    if !eliot_testd_core::is_admitted_testd_profile(&admission.profile) {
         return Err(TestdMaterialError::Contract(
-            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
+            "testd admits only registered probe or productive nextest profiles".to_owned(),
         ));
     }
     validate_wire_digest(
         &admission.profile_binding_digest,
         "testd_material.profile_binding_digest",
     )?;
-    let expected_binding = eliot_testd_core::testd_definition_digest()
-        .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
+    let expected_binding =
+        eliot_testd_core::testd_definition_digest_for_profile(&admission.profile)
+            .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
     if admission.profile_binding_digest != expected_binding {
         return Err(TestdMaterialError::Contract(
             "testd_material.profile_binding_digest mismatch".to_owned(),
+        ));
+    }
+    let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if admission.environment != expected_environment {
+        return Err(TestdMaterialError::Contract(
+            "testd_material.environment does not match the registered profile".to_owned(),
         ));
     }
     if admission.job_id != request.job_id {
@@ -657,6 +702,10 @@ fn recomputed_grant_digest(
     material.push_str(&grant.idempotency_key);
     material.push('|');
     material.push_str(&grant.expires_at.to_string());
+    if let Some(path) = grant.testd_owner_store_path.as_deref() {
+        material.push_str("|testd-owner-store|");
+        material.push_str(path);
+    }
     Ok(sha256_hex(material.as_bytes()))
 }
 
@@ -704,6 +753,7 @@ impl TestdMaterialAdmission {
             operation_id: &'a str,
             profile: &'a str,
             profile_binding_digest: &'a str,
+            environment: &'a [(String, String)],
             cancelled: bool,
             admitted_at_unix_nanos: u64,
         }
@@ -715,6 +765,7 @@ impl TestdMaterialAdmission {
             operation_id: &self.operation_id,
             profile: &self.profile,
             profile_binding_digest: &self.profile_binding_digest,
+            environment: &self.environment,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
         };

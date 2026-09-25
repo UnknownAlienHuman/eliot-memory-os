@@ -13,6 +13,7 @@ mod error;
 mod journal;
 mod legacy;
 mod model;
+mod reactive_context;
 mod redb_journal;
 mod redb_store;
 mod scm_operation_store;
@@ -44,7 +45,20 @@ pub use model::{
     NonceState, OneTimeNonceState, PriorKernelDisposition, PriorKernelSource,
     ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
     RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState,
-    WakeDisposition, WakeRecord, host_owner_epoch_digest,
+    WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition, WakeRecord,
+    host_owner_epoch_digest,
+};
+pub use reactive_context::{
+    DEFAULT_REACTIVE_CONTEXT_MAX_ATTEMPT_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_BYTES,
+    DEFAULT_REACTIVE_CONTEXT_MAX_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_PAGE_ITEMS,
+    MAX_REACTIVE_CONTEXT_REASON_BYTES, REACTIVE_CONTEXT_QUEUE_SCHEMA_VERSION,
+    ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
+    ReactiveContextPrepareRequest, ReactiveContextPrepareResult, ReactiveContextPreparedEnqueue,
+    ReactiveContextQueueCursor, ReactiveContextQueueEntry, ReactiveContextQueueError,
+    ReactiveContextQueueLimits, ReactiveContextQueuePort, ReactiveContextQueueQuery,
+    ReactiveContextQueueSnapshot, ReactiveContextQueueState, ReactiveContextReconcileOutcome,
+    ReactiveContextReconcileRequest, ReactiveContextRecord, ReactiveContextStreamCursor,
+    ReactiveContextTransition, ReactiveContextTransitionEvidence, ReactiveContextTransitionReceipt,
 };
 pub use redb_journal::{RedbJournalBackend, RedbJournalInspection};
 pub use redb_store::{

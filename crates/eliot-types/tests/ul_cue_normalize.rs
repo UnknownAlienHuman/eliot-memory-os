@@ -1,6 +1,6 @@
 use eliot_types::{
     AgentCandidateSubmitInput, BlobRef, CUE_BINDING_PAGE_SCHEMA_VERSION_V1,
-    CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding, CueKind, CueMatchMode, CueStrength,
+    CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding, CueMatchMode, CueStrength, LegacyCueKindV1,
     ObserveInput, agent_candidate_input_schema, command_pattern, cue_binding_page_id,
     error_signature, normalize_binding, normalize_binding_pages, normalize_path,
     normalize_query_tokens, observe_input_schema, path_matches_boundary,
@@ -125,7 +125,7 @@ fn t03_candidate_schema_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         provenance_refs: vec!["task:03".to_owned()],
         freshness_rule: "recheck after store layout changes".to_owned(),
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::FilePath,
+            cue_kind: LegacyCueKindV1::FilePath,
             cue_value: "crates/eliot-store/src/lib.rs".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

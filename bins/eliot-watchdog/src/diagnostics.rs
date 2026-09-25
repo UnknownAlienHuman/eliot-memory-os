@@ -48,8 +48,7 @@ static SUBSCRIBER_INSTALLED: OnceLock<bool> = OnceLock::new();
 /// panics, takes a recovery action, or logs recursively.
 pub fn install_subscriber() {
     let _ = SUBSCRIBER_INSTALLED.get_or_init(|| {
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -72,7 +71,10 @@ pub(crate) const DIAGNOSTIC_IDENTITY_MAX_CHARS: usize = 128;
 /// The input is already secret-free (the registration nonce never enters
 /// `SpoolError` or the start-failure detail); truncation only bounds bytes.
 #[must_use]
-#[allow(dead_code, reason = "port of #738 truncation helper; wiring blocked on root-lock preparation")]
+#[allow(
+    dead_code,
+    reason = "port of #738 truncation helper; wiring blocked on root-lock preparation"
+)]
 pub(crate) fn truncate_diagnostic_detail(value: &str) -> String {
     truncate_chars(value, DIAGNOSTIC_DETAIL_MAX_CHARS)
 }
@@ -80,12 +82,18 @@ pub(crate) fn truncate_diagnostic_detail(value: &str) -> String {
 /// Truncates an installation identity echo to
 /// [`DIAGNOSTIC_IDENTITY_MAX_CHARS`] characters (port of #738).
 #[must_use]
-#[allow(dead_code, reason = "port of #738 truncation helper; wiring blocked on root-lock preparation")]
+#[allow(
+    dead_code,
+    reason = "port of #738 truncation helper; wiring blocked on root-lock preparation"
+)]
 pub(crate) fn truncate_diagnostic_identity(value: &str) -> String {
     truncate_chars(value, DIAGNOSTIC_IDENTITY_MAX_CHARS)
 }
 
-#[allow(dead_code, reason = "port of #738 truncation helper; wiring blocked on root-lock preparation")]
+#[allow(
+    dead_code,
+    reason = "port of #738 truncation helper; wiring blocked on root-lock preparation"
+)]
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() > max_chars {
         value.chars().take(max_chars).collect()
@@ -117,7 +125,10 @@ pub(crate) const fn host_observation_diagnostic(state: HostObservationState) -> 
 /// data); only the variant class is returned. `InvalidLease` (unavailable or
 /// invalid) stays distinct from `LeaseStale` (stale) and `LeaseFenced`.
 #[must_use]
-#[allow(dead_code, reason = "port of #738 observation helper; wiring blocked on root-lock preparation")]
+#[allow(
+    dead_code,
+    reason = "port of #738 observation helper; wiring blocked on root-lock preparation"
+)]
 pub(crate) const fn spool_error_observation(error: &SpoolError) -> &'static str {
     match error {
         SpoolError::Io(_) => "spool_io",

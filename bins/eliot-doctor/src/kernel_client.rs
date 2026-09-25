@@ -2609,8 +2609,7 @@ mod tests {
         now: OffsetDateTime,
     ) -> Result<(ClosedRepairRequest, RepairRecipeManifest), String> {
         let artifact = digest(0xc1);
-        let manifest =
-            health_probe_manifest(&artifact).map_err(|error| error.to_string())?;
+        let manifest = health_probe_manifest(&artifact).map_err(|error| error.to_string())?;
         let recipe = health_probe_recipe(&artifact).map_err(|error| error.to_string())?;
         let operation = manifest
             .resolve(HEALTH_PROBE_OPERATION_ID)
@@ -2725,11 +2724,18 @@ mod tests {
         }
         assert_eq!(validated.generation, validated.request.fence.generation);
         assert_eq!(validated.attempt.attempt_id, ATTEMPT_ID);
-        let admission =
-            honest_health_admission(&validated.request, &validated.manifest, ATTEMPT_ID, EFFECT_SEQ, &validated.epoch, now)?;
+        let admission = honest_health_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        )?;
         let expected_effect = admission.effect_digest.clone();
         let mut transport = FakeTransport::admitting(admission);
-        let authority = Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
+        let authority =
+            Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
         let executor = Arc::new(AuthorityBackedExecutor::new(Arc::clone(&authority)));
         let outcome = drive_validated_dispatched_attempt(
             &mut transport,
@@ -2743,8 +2749,14 @@ mod tests {
         )
         .await
         .map_err(|error| error.to_string())?;
-        if !matches!(outcome.disposition, DoctorDisposition::RepairedPendingVerification { .. }) {
-            return Err(format!("expected pending verification, got {:?}", outcome.disposition));
+        if !matches!(
+            outcome.disposition,
+            DoctorDisposition::RepairedPendingVerification { .. }
+        ) {
+            return Err(format!(
+                "expected pending verification, got {:?}",
+                outcome.disposition
+            ));
         }
         if outcome.exit_code() != EXIT_PENDING_VERIFICATION {
             return Err(format!("expected exit 10, got {}", outcome.exit_code()));
@@ -2761,8 +2773,14 @@ mod tests {
         if executor.lock().starts != 1 {
             return Err("expected exactly one effect dispatch".to_owned());
         }
-        let replay_admission =
-            honest_health_admission(&validated.request, &validated.manifest, ATTEMPT_ID, EFFECT_SEQ, &validated.epoch, now)?;
+        let replay_admission = honest_health_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        )?;
         if replay_admission.effect_digest != expected_effect {
             return Err("exact replay must return the same admission".to_owned());
         }
@@ -2779,7 +2797,7 @@ mod tests {
         )
         .await
         {
-            Err(error) if error.exit_code() == EXIT_KERNEL_ADMISSION_REQUIRED => {},
+            Err(error) if error.exit_code() == EXIT_KERNEL_ADMISSION_REQUIRED => {}
             Err(error) => return Err(format!("replay must deny with exit 78, got {error}")),
             Ok(_) => return Err("exact replay must not dispatch a second effect".to_owned()),
         }
@@ -2810,10 +2828,17 @@ mod tests {
             .ok_or_else(|| "valid health material must present".to_owned())?;
         let mut mutated = validated.clone();
         mutated.request.approval = Some("forged-approval".to_owned());
-        let admission =
-            honest_health_admission(&validated.request, &validated.manifest, ATTEMPT_ID, EFFECT_SEQ, &validated.epoch, now)?;
+        let admission = honest_health_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        )?;
         let mut transport = FakeTransport::admitting(admission);
-        let authority = Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
+        let authority =
+            Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
         let executor = Arc::new(AuthorityBackedExecutor::new(Arc::clone(&authority)));
         match drive_validated_dispatched_attempt(
             &mut transport,
@@ -2827,8 +2852,12 @@ mod tests {
         )
         .await
         {
-            Err(AdapterError::Admission(DoctorError::IdentityMismatch)) => {},
-            Err(error) => return Err(format!("changed approval must deny IdentityMismatch, got {error}")),
+            Err(AdapterError::Admission(DoctorError::IdentityMismatch)) => {}
+            Err(error) => {
+                return Err(format!(
+                    "changed approval must deny IdentityMismatch, got {error}"
+                ));
+            }
             Ok(_) => return Err("changed approval must deny without effect".to_owned()),
         }
         if transport.submits != 0 {
@@ -2841,7 +2870,7 @@ mod tests {
         foreign.epoch = foreign_epoch();
         let foreign_path = write_dispatched_temp(&foreign, "health-probe-foreign")?;
         match read_dispatched_material_from(&foreign_path, &epoch) {
-            Err(DispatchedMaterialError::StaleEpoch { .. }) => {},
+            Err(DispatchedMaterialError::StaleEpoch { .. }) => {}
             Err(error) => {
                 remove_dispatched_temp(&foreign_path);
                 return Err(format!("foreign lineage must deny StaleEpoch, got {error}"));
@@ -2876,7 +2905,10 @@ mod tests {
         let envelope = test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ);
         let mut losing = FakeTransport::losing_reply();
         match losing.submit_repair_attempt(&envelope) {
-            Err(DoctorIpcError::UnknownOutcome { attempt_id, request_digest }) => {
+            Err(DoctorIpcError::UnknownOutcome {
+                attempt_id,
+                request_digest,
+            }) => {
                 if attempt_id != ATTEMPT_ID || request_digest != envelope.request_digest {
                     return Err("lost reply must carry the original submit identity".to_owned());
                 }
@@ -2893,14 +2925,27 @@ mod tests {
             process: test_process_request(),
             epoch: epoch.clone(),
         };
-        match drive_admitted_attempt(&mut losing, Arc::clone(&executor), Arc::new(EvidenceCollector::new()), presented, now).await
+        match drive_admitted_attempt(
+            &mut losing,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            presented,
+            now,
+        )
+        .await
         {
-            Err(AdapterError::KernelClient(_)) => {},
-            Err(error) => return Err(format!("lost reply stays a typed transport failure, got {error}")),
+            Err(AdapterError::KernelClient(_)) => {}
+            Err(error) => {
+                return Err(format!(
+                    "lost reply stays a typed transport failure, got {error}"
+                ));
+            }
             Ok(_) => return Err("lost submit reply fails closed without effect".to_owned()),
         }
         if losing.submits != 1 || executor.lock().starts != 0 {
-            return Err("lost reply means exactly one submit and zero effect dispatches".to_owned());
+            return Err(
+                "lost reply means exactly one submit and zero effect dispatches".to_owned(),
+            );
         }
         let mut transport = FakeTransport::admitting(admission);
         let executor = Arc::new(FakeExecutor::new(FakeMode::UnknownOnStart));
@@ -2912,11 +2957,19 @@ mod tests {
             process: test_process_request(),
             epoch,
         };
-        let outcome = drive_admitted_attempt(&mut transport, Arc::clone(&executor), Arc::new(EvidenceCollector::new()), presented, now)
-            .await
-            .map_err(|error| error.to_string())?;
+        let outcome = drive_admitted_attempt(
+            &mut transport,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            presented,
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let reconciliation_key = match &outcome.disposition {
-            DoctorDisposition::UnknownEffectOutcome { reconciliation_key, .. } => reconciliation_key.clone(),
+            DoctorDisposition::UnknownEffectOutcome {
+                reconciliation_key, ..
+            } => reconciliation_key.clone(),
             other => return Err(format!("expected unknown outcome, got {other:?}")),
         };
         if outcome.exit_code() != EXIT_UNKNOWN_EFFECT_OUTCOME {
@@ -2925,8 +2978,11 @@ mod tests {
         if Some(reconciliation_key.as_str()) != expected_effect.as_deref() {
             return Err("reconciliation key names the original effect identity".to_owned());
         }
-        let operation = manifest.resolve(HEALTH_PROBE_OPERATION_ID).map_err(|error| error.to_string())?;
-        let adapter = AutomaticSafeAdapter::bind(Arc::clone(&executor), operation).map_err(|error| error.to_string())?;
+        let operation = manifest
+            .resolve(HEALTH_PROBE_OPERATION_ID)
+            .map_err(|error| error.to_string())?;
+        let adapter = AutomaticSafeAdapter::bind(Arc::clone(&executor), operation)
+            .map_err(|error| error.to_string())?;
         let reconciled = adapter
             .reconcile_admitted_unknown(ReconcileInputs {
                 request: &request,
@@ -2939,8 +2995,14 @@ mod tests {
             })
             .await
             .map_err(|error| error.to_string())?;
-        if !matches!(reconciled.disposition, DoctorDisposition::Reconciling { .. }) {
-            return Err(format!("expected reconciling, got {:?}", reconciled.disposition));
+        if !matches!(
+            reconciled.disposition,
+            DoctorDisposition::Reconciling { .. }
+        ) {
+            return Err(format!(
+                "expected reconciling, got {:?}",
+                reconciled.disposition
+            ));
         }
         if reconciled.exit_code() != EXIT_RECONCILING {
             return Err(format!("expected exit 14, got {}", reconciled.exit_code()));
@@ -2961,7 +3023,9 @@ mod tests {
             .await
         {
             Err(AdapterError::ReconciliationKeyMismatch) => Ok(()),
-            Err(error) => Err(format!("wrong key must deny ReconciliationKeyMismatch, got {error}")),
+            Err(error) => Err(format!(
+                "wrong key must deny ReconciliationKeyMismatch, got {error}"
+            )),
             Ok(_) => Err("wrong reconciliation key must deny without effect".to_owned()),
         }
     }

@@ -75,7 +75,11 @@ fn production_dependency_selects_package(
                 .get("dependencies")
                 .and_then(toml::Value::as_table)
             {
-                scan_table(table, &format!("target.{target}.dependencies"), &mut matches);
+                scan_table(
+                    table,
+                    &format!("target.{target}.dependencies"),
+                    &mut matches,
+                );
             }
         }
     }

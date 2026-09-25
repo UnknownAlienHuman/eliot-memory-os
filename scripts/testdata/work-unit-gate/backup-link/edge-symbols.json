@@ -1,0 +1,84 @@
+{
+  "edges": [
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-backup",
+      "imported_public_symbol": "BackupBundle",
+      "symbol_file": "crates/storage/eliot-backup/src/lib.rs",
+      "symbol_line": 608,
+      "consumer_file": "bins/eliot-kernel/src/backup_restore.rs"
+    },
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-ipc",
+      "imported_public_symbol": "TransportError",
+      "symbol_file": "crates/kernel/eliot-ipc/src/lib.rs",
+      "symbol_line": 392,
+      "consumer_file": "bins/eliot-kernel/src/agent_bridge.rs"
+    },
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-protocol",
+      "imported_public_symbol": "Frame",
+      "symbol_file": "crates/foundation/eliot-protocol/src/lib.rs",
+      "symbol_line": 551,
+      "consumer_file": "bins/eliot-kernel/src/agent_bridge.rs"
+    },
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-store-api",
+      "imported_public_symbol": "WriteReceipt",
+      "symbol_file": "crates/storage/eliot-store-api/src/lib.rs",
+      "symbol_line": 1868,
+      "consumer_file": "bins/eliot-kernel/src/backup_restore.rs"
+    },
+    {
+      "package": "eliot-host-control-endpoint",
+      "dependency": "eliot-host-service",
+      "imported_public_symbol": "response_matches_request",
+      "symbol_file": "crates/kernel/eliot-host-service/src/runtime_control.rs",
+      "symbol_line": 912,
+      "consumer_file": "crates/kernel/eliot-host-control-endpoint/src/lib.rs"
+    },
+    {
+      "package": "eliot-host-control-endpoint",
+      "dependency": "eliot-ipc",
+      "imported_public_symbol": "NamedPipeServer",
+      "symbol_file": "crates/kernel/eliot-ipc/src/lib.rs",
+      "symbol_line": 2056,
+      "consumer_file": "crates/kernel/eliot-host-control-endpoint/src/lib.rs"
+    },
+    {
+      "package": "eliot-host-service",
+      "dependency": "eliot-protocol",
+      "imported_public_symbol": "EventEnvelope",
+      "symbol_file": "crates/foundation/eliot-protocol/src/lib.rs",
+      "symbol_line": 648,
+      "consumer_file": "crates/kernel/eliot-host-service/src/reactive_context_delivery.rs"
+    },
+    {
+      "package": "eliot-backup",
+      "dependency": "eliot-blob-api",
+      "imported_public_symbol": "BlobLocator",
+      "symbol_file": "crates/storage/eliot-blob-api/src/lib.rs",
+      "symbol_line": 281,
+      "consumer_file": "crates/storage/eliot-backup/src/lib.rs"
+    },
+    {
+      "package": "eliot-backup",
+      "dependency": "eliot-store-api",
+      "imported_public_symbol": "WriteReceipt",
+      "symbol_file": "crates/storage/eliot-store-api/src/lib.rs",
+      "symbol_line": 1868,
+      "consumer_file": "crates/storage/eliot-backup/src/restore_runner.rs"
+    },
+    {
+      "package": "eliot-blob",
+      "dependency": "eliot-blob-api",
+      "imported_public_symbol": "BlobLocator",
+      "symbol_file": "crates/storage/eliot-blob-api/src/lib.rs",
+      "symbol_line": 281,
+      "consumer_file": "crates/storage/eliot-blob/src/lib.rs"
+    }
+  ]
+}

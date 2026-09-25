@@ -348,7 +348,7 @@ fn transition_for_with(
         requested_effect_ceiling,
         "992 fixture class and ceiling agree through the production mapping"
     );
-    PreparedTransition {
+    let mut transition = PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new(operation_id).unwrap(),
             idempotency_key,
@@ -365,6 +365,11 @@ fn transition_for_with(
         requested_effect_ceiling,
         admission_contract_set_digest: fixture.admission_contract_set_digest.clone(),
         operation_manifest_digest: OperationManifestDigest::new(manifest).unwrap(),
+        // Issue-#18 digests are derived below via `bind_issue18_digests`,
+        // never defaulted; this fixture leg binds no semantic source (`[]`).
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: Vec::new(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([(
@@ -379,7 +384,9 @@ fn transition_for_with(
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    eliot_store_api::bind_issue18_digests(&mut transition).unwrap();
+    transition
 }
 
 /// Seals the canonical request hash over the exact values about to be bound,
@@ -831,6 +838,11 @@ fn receipt_with_envelope(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // Issue-#18 bindings are copied exactly from the admitted
+        // transition, never defaulted.
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
         error_code,
         resubmission: Resubmission::None,
         committed_at,
@@ -3654,6 +3666,12 @@ fn startup_receipt(
         projection_refs: Vec::new(),
         outbox_refs: Vec::new(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        // Issue-#18 bindings are copied exactly from the admitted
+        // transition, never defaulted; equality is enforced by the
+        // receipt-issuing path below.
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
         error_code: None,
         resubmission: Resubmission::None,
         committed_at: Some("commit-sequence-0000000000000001".to_owned()),

@@ -124,6 +124,7 @@ impl RegistryFixture {
             "eliot-doctor.exe",
             "eliot-testd.exe",
             "eliot-native-worker.exe",
+            "eliot-wasm-host.exe",
         ] {
             let destination = artifact_root.join(name);
             std::fs::copy(&source, &destination).unwrap_or_else(|error| {
@@ -585,9 +586,11 @@ impl RegistryFixture {
         let doctor_path = self.artifact_root.join("eliot-doctor.exe");
         let testd_path = self.artifact_root.join("eliot-testd.exe");
         let native_worker_path = self.artifact_root.join("eliot-native-worker.exe");
+        let wasm_host_path = self.artifact_root.join("eliot-wasm-host.exe");
         let doctor_digest = Self::artifact_digest(&doctor_path);
         let testd_digest = Self::artifact_digest(&testd_path);
         let native_worker_digest = Self::artifact_digest(&native_worker_path);
+        let wasm_host_digest = Self::artifact_digest(&wasm_host_path);
         let config_handle = path_handle(&config_path);
         let mut runtime_launch = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
@@ -660,9 +663,11 @@ impl RegistryFixture {
             doctor_artifact_digest: handle(doctor_digest),
             testd_artifact_digest: handle(testd_digest),
             native_worker_artifact_digest: handle(native_worker_digest),
+            wasm_host_artifact_digest: handle(wasm_host_digest),
             doctor_executable_path: path_handle(&doctor_path),
             testd_executable_path: path_handle(&testd_path),
             native_worker_executable_path: path_handle(&native_worker_path),
+            wasm_host_executable_path: path_handle(&wasm_host_path),
             descriptor_digest: handle(Self::digest(22)),
         };
         runtime_launch.kernel_arguments = vec![
@@ -704,6 +709,7 @@ impl RegistryFixture {
             doctor_artifact_digest: runtime_launch.doctor_artifact_digest.clone(),
             testd_artifact_digest: runtime_launch.testd_artifact_digest.clone(),
             native_worker_artifact_digest: runtime_launch.native_worker_artifact_digest.clone(),
+            wasm_host_artifact_digest: runtime_launch.wasm_host_artifact_digest.clone(),
             kernel_executable_path: path_handle(&kernel_path),
             store_bridge_executable_path: runtime_launch.store_bridge_executable_path.clone(),
             canonical_store_executable_path: runtime_launch.canonical_store_executable_path.clone(),
@@ -711,6 +717,7 @@ impl RegistryFixture {
             doctor_executable_path: runtime_launch.doctor_executable_path.clone(),
             testd_executable_path: runtime_launch.testd_executable_path.clone(),
             native_worker_executable_path: runtime_launch.native_worker_executable_path.clone(),
+            wasm_host_executable_path: runtime_launch.wasm_host_executable_path.clone(),
             config_path: config_handle,
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],
@@ -817,12 +824,8 @@ impl RegistryFixture {
     /// way Phase-A source-bundle materialization digests role bytes before
     /// binding them into the launch descriptor.
     fn artifact_digest(path: &Path) -> String {
-        let bytes = std::fs::read(path).unwrap_or_else(|error| {
-            panic!(
-                "read fixture artifact {}: {error}",
-                path.display()
-            )
-        });
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("read fixture artifact {}: {error}", path.display()));
         sha256_hex(&bytes)
     }
 

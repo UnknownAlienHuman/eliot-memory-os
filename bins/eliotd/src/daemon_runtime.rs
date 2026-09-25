@@ -24,6 +24,17 @@ use eliot_protocol::{
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile,
 };
+use eliot_runtime_contracts::DaemonProgressChannel;
+use eliot_store_api::{StoreHealth, StoreHealthStatus};
+use eliotd::startup_capability_bindings::{
+    DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
+    StartupCapabilityBindings,
+};
+use eliotd::testd_terminal_completion::{
+    TestdOwnerDrainOutcome, ack_testd_owner_terminal_completion,
+    bind_testd_owner_verifier_dispatch, emit_testd_owner_drain_skip,
+    query_testd_owner_pending_dispatches, query_testd_owner_terminal_evidence,
+};
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
     LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
@@ -31,6 +42,14 @@ use eliotd::{
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
+
+/// Shared daemon composition handle for the run loop. The loop holds no
+/// long-lived borrow: every flight future locks briefly (readers) or for
+/// one bounded drain (the TestD owner finish driver, the only writer), so
+/// health, shutdown, and concurrent readers stay pollable. A poisoned row
+/// never fails the daemon closed; transport failures do, mirroring the
+/// local-read poller.
+type SharedComposition = Arc<tokio::sync::Mutex<DaemonComposition>>;
 
 const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -245,30 +264,46 @@ pub(super) fn run() -> Result<(), String> {
         Some(authority_activation),
     )
     .map_err(|error| error.to_string())?;
-    // AUD-C02-B: the single place holding both the concrete client and the
-    // composition. Push the already-validated Kernel-issued owner session
-    // facts (if a handshake validated them) into the composition via the one
-    // setter. No new thread, no new handshake, no storing the client; without
-    // facts the composition keeps the empty (unadmitted) board behaviour.
-    if let Some(facts) = kernel.owner_session_facts() {
-        composition.note_owner_session_binding(facts);
-    }
-    // T12-06: gated Dreamer intake registration at the same attach site. The
-    // readiness-gated accessor plus the fence-bound route-context check prove
-    // the intake wiring before readiness is reported; no thread, no transport,
-    // no start() contour or run-loop change.
-    attach_dreamer_intake(&composition, &kernel)?;
-    // T12-07: gated Dreamer model-call registration at the same attach site. The
-    // readiness-gated accessor plus the fence-bound model route-context check prove
-    // the model wiring before readiness is reported; no thread, no transport, no
-    // provider credentials, no start() contour or run-loop change.
-    attach_dreamer_model(&composition)?;
-    // #872: gated agent-fabric registration at the same attach site. The
-    // readiness-gated descriptor proves the admitted ingress reaches the
-    // durable swarm-control composition before readiness is reported; no
-    // thread, no transport, no start() contour or run-loop change.
-    attach_agent_fabric(&composition)?;
-    kernel.report_ready().map_err(|error| error.to_string())?;
+    // #18 item A: bind the seven declared startup capabilities and record one
+    // explicit disposition for each. The returned ledger — not control flow —
+    // decides whether this generation may report Governor readiness.
+    let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // Issue #88, wave 3: the ready answer carries the once-per-generation
+    // supervision bundle. The per-tick producer below cites it verbatim; the
+    // Kernel re-verifies every echoed field on each submit.
+    //
+    // #18 item A: `report_ready` sends the Kernel `daemon_ready` operation, so
+    // reaching it on an unbound composition would claim a Governor readiness
+    // the daemon does not have. It is reached only when the ledger proves every
+    // declared capability bound. When one is unbound there is no
+    // `daemon_ready` answer, so no supervision bundle exists: its lineage and
+    // lease head are Kernel-authored and are never invented here. The daemon
+    // stays alive, observable, and running, and renews no supervision progress
+    // until a later generation binds every capability.
+    let supervision_progress = if bindings.is_complete() {
+        let ready_supervision = kernel.report_ready().map_err(|error| error.to_string())?;
+        let session_facts = kernel.owner_session_facts().ok_or_else(|| {
+            "daemon has no validated Kernel session binding for supervision progress".to_owned()
+        })?;
+        Some(
+            eliotd::SupervisionProgressProducer::new(eliotd::SupervisionProducerDeps {
+                daemon_artifact_id: format!("eliotd-exe:{}", launch.executable_sha256),
+                daemon_config_digest: launch.config_sha256.clone(),
+                launch_nonce: launch.launch_nonce.clone(),
+                process_pid: std::process::id(),
+                transport_session_evidence: session_facts.session_binding().to_owned(),
+                transport_connection_evidence: session_facts.connection_id().to_owned(),
+                ready: ready_supervision,
+            })
+            .map_err(|error| format!("daemon supervision producer: {error}"))?,
+        )
+    } else {
+        None
+    };
+    // The local-read poller below drives Skill pairs through the composition
+    // inside its flight future: share it here so the future owns its handle.
+    // All pre-loop exclusive uses are complete; shutdown unwraps below.
+    let composition = Arc::new(composition);
     // I1.11 steps 8/9 (issue #1967): publish Governor startup evidence on
     // the authenticated daemon channel for the Kernel consumer. The producer
     // evaluates live retained records only — transport binding, admitted and
@@ -288,17 +323,60 @@ pub(super) fn run() -> Result<(), String> {
     let _startup_span = tracing::info_span!("eliotd.daemon_start").entered();
     // I1.11 step 9: restricted skills in the retained capability model become
     // visible degradation on the readiness record (the publish above already
-    // warned with the partition). A cold/fully-holding model reports ready.
-    let _ = eliotd::diagnostics::emit_daemon_readiness(true, capability_summary.has_restrictions());
-    let status = composition.status();
+    // warned with the partition).
+    //
+    // #18 item A: the reported readiness is the composition's computed
+    // readiness ANDed with the declared binding ledger, never a literal. An
+    // unbound capability therefore withholds readiness and reports visible
+    // degradation while the process keeps running.
+    let composition_status = composition.status();
+    let ready = composition_status.ready && bindings.is_complete();
+    let degraded = composition_status.degraded
+        || !bindings.is_complete()
+        || capability_summary.has_restrictions();
+    // The composition's own health ladder is preserved: a stopped or stale
+    // composition still reports exactly that, and an unbound capability reads
+    // as degraded instead of healthy.
+    let health = if ready
+        || composition_status.health == "stopped"
+        || composition_status.health == "stale"
+    {
+        composition_status.health.clone()
+    } else {
+        "degraded".to_owned()
+    };
+    let status = DaemonStatus {
+        ready,
+        degraded,
+        health,
+        ..composition_status
+    };
+    let _ = eliotd::diagnostics::emit_daemon_readiness(ready, degraded);
     write_json(&ready_message(&status))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), &composition));
-    let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
+    // The run loop is the only writer of the composition (TestD owner
+    // finish drain); readers lock briefly per step. Wrap here: every
+    // pre-loop exclusive use above is complete.
+    let composition = SharedComposition::new(tokio::sync::Mutex::new(
+        Arc::try_unwrap(composition)
+            .map_err(|_| "daemon composition shared before run loop".to_owned())?,
+    ));
+    let loop_result = runtime.block_on(run_loop(
+        Arc::clone(&kernel),
+        Arc::clone(&composition),
+        supervision_progress,
+    ));
+    // The loop dropped its handle on return, so this unwrap is deterministic;
+    // the error arm documents the invariant instead of panicking on it.
+    let shutdown_result = Arc::try_unwrap(composition)
+        .map_err(|_| "daemon composition still shared at shutdown".to_owned())?
+        .into_inner()
+        .shutdown()
+        .map_err(|error| error.to_string());
     // #740: shutdown disposition record. The terminal-failure reports below
     // keep their exact existing behavior; this only names the disposition.
     let final_result = match (loop_result, shutdown_result) {
@@ -355,6 +433,139 @@ pub(super) fn run() -> Result<(), String> {
     final_result
 }
 
+/// Binds the seven declared startup capabilities and records one explicit
+/// disposition for each (#18 item A).
+///
+/// This is the single place holding both the concrete Kernel client and the
+/// composition, and it runs the seven startup attach sites in declaration
+/// order. Each site yields either the exact admitted identity/descriptor it
+/// produced — retained by the returned ledger for the lifetime of the process
+/// — or the exact reason it did not bind. No attach propagates with `?`: an
+/// unbound capability keeps the daemon alive and observable while withholding
+/// readiness, so a degraded optional surface can never remove the process.
+fn bind_declared_startup_capabilities(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &mut DaemonComposition,
+) -> StartupCapabilityBindings {
+    // AUD-C02-B: the single place holding both the concrete client and the
+    // composition. Push the already-validated Kernel-issued owner session
+    // facts (if a handshake validated them) into the composition via the one
+    // setter. No new thread, no new handshake, no storing the client; without
+    // facts the composition keeps the empty (unadmitted) board behaviour and
+    // the capability records why it did not bind.
+    let owner_session_binding = match kernel.owner_session_facts() {
+        Some(facts) => {
+            let retained = RetainedStartupBinding::OwnerSession {
+                session_binding: facts.session_binding().to_owned(),
+                connection_id: facts.connection_id().to_owned(),
+            };
+            composition.note_owner_session_binding(facts);
+            Ok(retained)
+        }
+        None => Err("Kernel handshake validated no owner session binding".to_owned()),
+    };
+    // #1780: attach canonical notification records where the concrete
+    // client and the composition meet (same site as the owner-session
+    // facts above). A cold/unbound read degrades to the empty inbox with
+    // an error record exactly like the skill-tool-source path below: it
+    // emits diagnostics and the daemon continues, never failing readiness
+    // for an unreadable inbox.
+    let notification_snapshot =
+        match eliotd::notification_board_attach::attach_notification_snapshot(kernel, composition) {
+            eliotd::notification_board_attach::NotificationBoardAttach::Ready(records) => {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.notification_snapshot_attached",
+                    record_count = records.len(),
+                );
+                Ok(RetainedStartupBinding::NotificationSnapshot {
+                    record_count: records.len(),
+                })
+            }
+            eliotd::notification_board_attach::NotificationBoardAttach::Unavailable { reason } => {
+                Err(reason)
+            }
+        };
+    // T12-06: gated Dreamer intake registration at the same attach site. The
+    // readiness-gated accessor plus the fence-bound route-context check prove
+    // the intake wiring before readiness is reported; no thread, no transport,
+    // no start() contour or run-loop change. The admitted route context is
+    // retained by the ledger instead of being dropped here.
+    let dreamer_intake = attach_dreamer_intake(composition, kernel);
+    // T12-07: gated Dreamer model-call registration at the same attach site. The
+    // readiness-gated accessor plus the fence-bound model route-context check prove
+    // the model wiring before readiness is reported; no thread, no transport, no
+    // provider credentials, no start() contour or run-loop change.
+    let dreamer_model = attach_dreamer_model(composition);
+    // #872: gated agent-fabric registration at the same attach site. The
+    // readiness-gated descriptor proves the admitted ingress reaches the
+    // durable swarm-control composition before readiness is reported; no
+    // thread, no transport, no start() contour or run-loop change. The
+    // admitted descriptor is retained by the ledger.
+    let agent_fabric = attach_agent_fabric(composition);
+    // #1882: the two declared Skill-path capabilities, in declaration order.
+    let (skill_tool_source, skill_tool_basis) = bind_skill_path_capabilities(composition);
+    // The retained ledger is the only readiness input for the declared
+    // capabilities: it cannot be constructed without a disposition for each of
+    // the seven, and the whole record (bound identity or unbound reason) is
+    // emitted once so the retained evidence is observable, not dropped.
+    record_startup_bindings(
+        owner_session_binding,
+        notification_snapshot,
+        dreamer_intake,
+        dreamer_model,
+        agent_fabric,
+        skill_tool_source,
+        skill_tool_basis,
+    )
+}
+
+/// Binds the two declared Skill-path capabilities (#1882), in declaration
+/// order: the canonical tool source, then the installed-Skill tool-basis
+/// reconciliation against the live canonical tool view.
+///
+/// The tool-source proof builds the production canonical registry through the
+/// Governor hook and pins the admitted definition version with no skill inputs
+/// consumed and nothing delivered (I1.5 starts only admitted capabilities).
+/// Reconciliation binds the reconciliation path into the startup sequence and
+/// proves the live hook edge executes in the production binary; a fresh startup
+/// catalogue is empty, so it marks nothing today, and once installs land it
+/// marks entries whose tools left the canonical set so a restart never revives
+/// a generally-delivered display for a removed tool. Skill delivery stays
+/// optional (A2.3): a failure in either degrades only the skill path. No
+/// thread, no transport, no `start()` contour or run-loop change.
+fn bind_skill_path_capabilities(
+    composition: &DaemonComposition,
+) -> (
+    Result<RetainedStartupBinding, String>,
+    Result<RetainedStartupBinding, String>,
+) {
+    let skill_tool_source = attach_skill_tool_source().map(|admitted| {
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.skill_tool_source_attached",
+            admitted_definition_version = %admitted,
+        );
+        RetainedStartupBinding::SkillToolSource {
+            admitted_definition_version: admitted,
+        }
+    });
+    let skill_tool_basis = match composition.skill_reconcile_tool_basis() {
+        Ok(marked) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.skill_tool_basis_reconciled",
+                marked_stale = marked,
+            );
+            Ok(RetainedStartupBinding::SkillToolBasis {
+                marked_stale: marked,
+            })
+        }
+        Err(reason) => Err(reason.to_string()),
+    };
+    (skill_tool_source, skill_tool_basis)
+}
+
 /// Attaches the T12-06 Governor Dreamer intake registration (gated, no lifecycle change).
 ///
 /// Post-`start` attach-style check at the single site holding both the concrete client and the
@@ -362,17 +573,22 @@ pub(super) fn run() -> Result<(), String> {
 /// the readiness-gated accessor and validates the fence-bound route context. Fails closed
 /// before `report_ready` when the Governor is not ready or the admitted fence cannot bind a
 /// context. No thread, no transport, no `start()` contour or run-loop change.
+///
+/// #18 item A: the returned `Err` is the exact reason the capability did not bind; it is
+/// recorded in the startup binding ledger and emitted as an `ErrorRecord` instead of
+/// propagating, so an unbound intake withholds readiness rather than removing the process.
+/// On success the admitted route context itself is the retained evidence.
 fn attach_dreamer_intake(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
-) -> Result<(), String> {
+) -> Result<RetainedStartupBinding, String> {
     let adapter = composition
         .dreamer_admission(kernel)
         .map_err(|error| error.to_string())?;
-    let _context = adapter
+    let context = adapter
         .dreamer_route_context()
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(RetainedStartupBinding::DreamerIntakeRoute(context))
 }
 
 /// Attaches the T12-07 governed Dreamer model-call registration (gated, no lifecycle change).
@@ -383,14 +599,17 @@ fn attach_dreamer_intake(
 /// before `report_ready` when the Governor is not ready or the admitted fence cannot bind
 /// a context. No thread, no transport, no provider execution or credentials, no `start()`
 /// contour or run-loop change.
-fn attach_dreamer_model(composition: &DaemonComposition) -> Result<(), String> {
+///
+/// #18 item A: the admitted model route context is the retained evidence; a failure records
+/// the exact reason instead of propagating.
+fn attach_dreamer_model(composition: &DaemonComposition) -> Result<RetainedStartupBinding, String> {
     let adapter = composition
         .dreamer_model()
         .map_err(|error| error.to_string())?;
-    let _context = adapter
+    let context = adapter
         .model_route_context()
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(RetainedStartupBinding::DreamerModelRoute(context))
 }
 
 /// Attaches the #872 durable agent-fabric registration (gated, no lifecycle change).
@@ -404,7 +623,10 @@ fn attach_dreamer_model(composition: &DaemonComposition) -> Result<(), String> {
 /// `start()` contour or run-loop change: the single `AgentCoordinator` is
 /// constructed per admitted operation through the fabric composition, and the
 /// run loop dispatches only post-activation provider-neutral intents.
-fn attach_agent_fabric(composition: &DaemonComposition) -> Result<(), String> {
+///
+/// #18 item A: the admitted descriptor is returned as the retained evidence, and a failure
+/// records the exact reason instead of propagating.
+fn attach_agent_fabric(composition: &DaemonComposition) -> Result<RetainedStartupBinding, String> {
     // #740: #872 attach span over the existing control path. The admitted
     // ingress reaching the durable fabric is recorded with the descriptor
     // identities before readiness is reported.
@@ -420,7 +642,95 @@ fn attach_agent_fabric(composition: &DaemonComposition) -> Result<(), String> {
         descriptor.generation,
         descriptor.authority_epoch,
     );
-    Ok(())
+    Ok(RetainedStartupBinding::AgentFabric(descriptor))
+}
+
+/// Records the seven declared startup binding dispositions and emits them once.
+///
+/// #18 item A: this is the single place the declared denominator becomes durable
+/// in-process state. Every capability keeps either its exact admitted
+/// identity/descriptor or the exact reason it did not bind; an unbound
+/// capability is reported as an `ErrorRecord` at its own owning code and
+/// withholds readiness, but never propagates and never removes the process. The
+/// whole ledger is emitted so the retained evidence is observable.
+fn record_startup_bindings(
+    owner_session_binding: Result<RetainedStartupBinding, String>,
+    notification_snapshot: Result<RetainedStartupBinding, String>,
+    dreamer_intake: Result<RetainedStartupBinding, String>,
+    dreamer_model: Result<RetainedStartupBinding, String>,
+    agent_fabric: Result<RetainedStartupBinding, String>,
+    skill_tool_source: Result<RetainedStartupBinding, String>,
+    skill_tool_basis: Result<RetainedStartupBinding, String>,
+) -> StartupCapabilityBindings {
+    fn disposition(
+        capability: DeclaredStartupCapability,
+        outcome: Result<RetainedStartupBinding, String>,
+    ) -> StartupBindingDisposition {
+        match outcome {
+            Ok(retained) => StartupBindingDisposition::Bound(Box::new(retained)),
+            Err(reason) => {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    capability.as_str(),
+                    &reason,
+                )
+                .emit();
+                StartupBindingDisposition::Unbound(reason)
+            }
+        }
+    }
+    let bindings = StartupCapabilityBindings::new(
+        disposition(
+            DeclaredStartupCapability::OwnerSessionBinding,
+            owner_session_binding,
+        ),
+        disposition(
+            DeclaredStartupCapability::NotificationSnapshot,
+            notification_snapshot,
+        ),
+        disposition(DeclaredStartupCapability::DreamerIntake, dreamer_intake),
+        disposition(DeclaredStartupCapability::DreamerModel, dreamer_model),
+        disposition(DeclaredStartupCapability::AgentFabric, agent_fabric),
+        disposition(
+            DeclaredStartupCapability::SkillToolSource,
+            skill_tool_source,
+        ),
+        disposition(DeclaredStartupCapability::SkillToolBasis, skill_tool_basis),
+    );
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.startup_capability_bindings",
+        complete = bindings.is_complete(),
+        unbound = bindings
+            .unbound_reasons()
+            .iter()
+            .map(|(capability, _)| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        bindings = %bindings.report(),
+    );
+    bindings
+}
+
+/// Proves the live canonical tool-source path before readiness (issue #1882,
+/// no lifecycle change).
+///
+/// Post-`start` attach-style check needing no composition handle: builds the
+/// production canonical tool source through the Governor hook
+/// (`eliot_governor::canonical_skill_tool_source`) and pins the admitted
+/// definition version the Skill delivery driver runs under. I1.5 starts only
+/// capabilities an admitted request requires, so nothing is installed,
+/// issued, or displayed here — this only proves the real tools-owner edge
+/// executes in the production binary and records which definition version
+/// the skill path is bound to. Skill delivery stays an optional capability
+/// (A2.3): a hook failure emits an error record and degrades only the skill
+/// path, never daemon readiness. No thread, no transport, no `start()`
+/// contour or run-loop change.
+fn attach_skill_tool_source() -> Result<String, String> {
+    let _span = tracing::info_span!("eliotd.skill_tool_source_attach").entered();
+    eliot_governor::canonical_skill_tool_source()
+        .map(|(_, admitted)| admitted)
+        .map_err(|error| format!("skill tool source unavailable: {error}"))
 }
 
 fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {
@@ -525,7 +835,8 @@ impl LoopCadence {
 
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
-    composition: &DaemonComposition,
+    composition: SharedComposition,
+    mut supervision_progress: Option<eliotd::SupervisionProgressProducer>,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -537,25 +848,39 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // #2100: O1 owner-feed trigger state. The runtime retains one trigger
+    // across passes so an unchanged provider performs no IO, while a
+    // revision advance or a recovery re-presentation republishes through the
+    // full read->publish->readback exchange. Degradation never fails the
+    // loop: pending grants stay pending until a later pass binds them.
+    let mut owner_feed = eliotd::OwnerFeedTrigger::new();
+    // Sole owner of TestD owner drain state (issue #325). The same tick
+    // drives it independently of the other flights: one bounded drain step
+    // binds pending verifier dispatches, publishes terminal verifier facts,
+    // submits finish candidates, and acknowledges terminals, all through
+    // the Kernel owner routes.
+    let mut testd_owner_flight = TestdOwnerFlight::Idle;
+    // Recovery re-presentation at loop start: rebind the Kernel P-07 owner
+    // from live Governor state before any activation work is claimed. No
+    // drain can be outstanding this early, so nothing settles it first.
+    sync_owner_feed(&kernel, &composition, &mut owner_feed).await;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
                 let exit = drain_activation_on_shutdown(&mut flight).await?;
                 drain_local_read_on_shutdown(&mut local_read_flight).await?;
+                drain_testd_owner_on_shutdown(&mut testd_owner_flight).await?;
                 return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
-                // The local-read poller rides the same tick under its own
-                // gate: it must start even while an activation is in flight,
-                // so its gate is checked before the activation early-continue.
-                maybe_start_local_read_poll(&kernel, &mut local_read_flight);
-                if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
-                    flight = ActivationFlight::InFlight(ActivationFlightState {
-                        future: start_activation_claim(&kernel),
-                        retained: None,
-                    });
-                }
+                start_tick_work(
+                    &kernel,
+                    &composition,
+                    &mut local_read_flight,
+                    &mut testd_owner_flight,
+                    &mut flight,
+                );
             }
             completion = async {
                 match &mut flight {
@@ -571,29 +896,22 @@ async fn run_loop(
                             Err(error) => return Err(error),
                             Ok(claim) => claim,
                         };
-                        // Issue #202 (owner decision ii), validate-first: an
-                        // invalid ticket constructs the terminal artifact with
-                        // no Governor read, then idles the flight and
-                        // continues the loop. No typed-result submit, no
-                        // reconcile of typed results, no retry of the rejected
-                        // revision.
-                        let ticket = match claim {
-                            ActivationClaim::Empty => {
+                        // Issue #202 (owner decision ii), validate-first.
+                        let ticket = match settle_activation_claim(claim, &mut supervision_progress)? {
+                            ActivationClaimStep::Idle => {
                                 flight = ActivationFlight::Idle;
                                 continue;
                             }
-                            ActivationClaim::Invalid {
-                                ticket_bytes,
-                                reason,
-                            } => {
-                                settle_invalid_claim(ticket_bytes, &reason)?;
-                                flight = ActivationFlight::Idle;
-                                continue;
-                            }
-                            ActivationClaim::Valid(ticket) => *ticket,
+                            ActivationClaimStep::Valid(ticket) => *ticket,
                         };
-                        let now = unix_ms(SystemTime::now())?;
-                        match start_valid_claim_step(&kernel, composition, ticket, now)? {
+                        let state = start_claimed_activation_step(
+                            &kernel,
+                            &composition,
+                            &mut testd_owner_flight,
+                            ticket,
+                        )
+                        .await?;
+                        match state {
                             Some(state) => {
                                 flight = ActivationFlight::InFlight(state);
                             }
@@ -604,6 +922,7 @@ async fn run_loop(
                     }
                     ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
                         Ok(()) => {
+                            note_supervision_applied(supervision_progress.as_mut());
                             flight = ActivationFlight::Idle;
                         }
                         Err(ActivationDispatchError::Hard(error)) => return Err(error),
@@ -616,13 +935,228 @@ async fn run_loop(
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
                 settle_local_read_completion(local_read_completion, &mut local_read_flight)?;
             }
+            testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
+                settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
+            }
             _ = cadence.health_heartbeat.tick() => {
-                KernelTransitionPort::health(&*kernel)
-                    .await
-                    .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+                run_health_heartbeat_tick(
+                    &kernel,
+                    &composition,
+                    &mut owner_feed,
+                    &mut supervision_progress,
+                    &mut testd_owner_flight,
+                    &flight,
+                )
+                .await?;
             }
         }
     }
+}
+
+/// What one completed activation claim resolves to before the loop acts.
+///
+/// The ticket is boxed so the idle arm stays a zero-sized value: a claim that
+/// resolves to nothing must not carry the ticket's size.
+#[derive(Debug)]
+enum ActivationClaimStep {
+    /// Nothing further runs this pass: the flight idles and the loop resumes.
+    Idle,
+    /// A valid admitted ticket that may start its dispatch step.
+    Valid(Box<AgentActivationResolutionTicket>),
+}
+
+/// Resolves one completed activation claim, validate-first (issue #202, owner
+/// decision ii).
+///
+/// An empty claim and an invalid ticket both idle the flight and continue the
+/// loop with no Governor read, no typed-result submit, no reconcile of typed
+/// results, and no retry of the rejected revision; an invalid ticket
+/// constructs its terminal artifact from the claimed bytes alone. A valid
+/// ticket notes the Claim channel and is handed to the dispatch step.
+fn settle_activation_claim(
+    claim: ActivationClaim,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+) -> Result<ActivationClaimStep, String> {
+    match claim {
+        ActivationClaim::Empty => Ok(ActivationClaimStep::Idle),
+        ActivationClaim::Invalid {
+            ticket_bytes,
+            reason,
+        } => {
+            settle_invalid_claim(ticket_bytes, &reason)?;
+            Ok(ActivationClaimStep::Idle)
+        }
+        ActivationClaim::Valid(ticket) => {
+            note_supervision_claim(supervision_progress.as_mut());
+            Ok(ActivationClaimStep::Valid(Box::new(*ticket)))
+        }
+    }
+}
+
+/// Starts the tick-driven work for one shared-cadence tick.
+///
+/// The local-read poller and the TestD owner drain each ride the same tick
+/// under their own gate: both must start even while an activation is in
+/// flight, so their gates are checked before the activation early-continue.
+/// The activation claim itself still starts only when its flight is idle.
+fn start_tick_work(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    local_read_flight: &mut LocalReadFlight,
+    testd_owner_flight: &mut TestdOwnerFlight,
+    flight: &mut ActivationFlight,
+) {
+    maybe_start_local_read_poll(kernel, composition, local_read_flight);
+    maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
+    if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
+        *flight = ActivationFlight::InFlight(ActivationFlightState {
+            future: start_activation_claim(kernel),
+            retained: None,
+        });
+    }
+}
+
+/// Notes one claimed activation on the supervision Claim channel when a
+/// supervision lineage exists.
+///
+/// #18 item A: a generation whose declared capabilities did not all bind was
+/// never reported ready, so the Kernel issued no `daemon_ready` bundle and
+/// there is no lineage or lease head to advance. Absence of the producer is an
+/// explicit not-ready state, not a silent drop: the readiness record already
+/// reported the withholding.
+fn note_supervision_claim(producer: Option<&mut eliotd::SupervisionProgressProducer>) {
+    if let Some(producer) = producer {
+        producer.note_claim();
+    }
+}
+
+/// Notes one Kernel-accepted dispatch on the supervision Dispatch/Apply
+/// channels when a supervision lineage exists. Mirrors
+/// [`note_supervision_claim`].
+fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressProducer>) {
+    if let Some(producer) = producer {
+        producer.note_kernel_applied();
+    }
+}
+
+/// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
+/// health poll stays evidence-only, then the same tick submits supervision
+/// progress built from observed work. The poll's Store dimension is reused as
+/// the observation's `store_dependency` evidence, never as renewal authority.
+///
+/// #18 item A: the health poll runs unconditionally, so liveness stays observed
+/// even for a generation that never reported ready; only the progress renewal
+/// is absent, because the Kernel authored no supervision lineage for it.
+async fn run_health_heartbeat_tick(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    owner_feed: &mut eliotd::OwnerFeedTrigger,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    testd_owner_flight: &mut TestdOwnerFlight,
+    flight: &ActivationFlight,
+) -> Result<(), String> {
+    let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
+        .await
+        .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+    if let Some(producer) = supervision_progress.as_mut() {
+        submit_supervision_heartbeat(
+            kernel,
+            producer,
+            &health,
+            matches!(flight, ActivationFlight::InFlight(_)),
+        )
+        .await?;
+    }
+    // #2100: revision-advance trigger for the Kernel P-07 owner feed.
+    // Unchanged providers perform no IO here; an advanced provider
+    // republishes with readback proof.
+    //
+    // Item B: settle the outstanding TestD drain first, so the owner feed does
+    // not wait on the composition lock while the drain holds it across a
+    // Governor-owned canonical exchange.
+    settle_testd_owner_before_lock(testd_owner_flight).await?;
+    sync_owner_feed(kernel, composition, owner_feed).await;
+    Ok(())
+}
+
+/// Submits per-tick supervision progress from observed work (Implements #88,
+/// wave 3).
+///
+/// One observation per due channel goes out in fixed channel order, adopting
+/// the Kernel answer after each submit so later channels cite the fresh head.
+/// A transport failure retries once with the byte-identical request (exact
+/// replay is idempotent, never a second renewal); typed refusals converge
+/// locally without retry. A refused or failed tick fails the daemon closed
+/// exactly like the health poll it rides with.
+async fn submit_supervision_heartbeat(
+    kernel: &Arc<DaemonKernelClient>,
+    producer: &mut eliotd::SupervisionProgressProducer,
+    health: &StoreHealth,
+    activation_in_flight: bool,
+) -> Result<(), String> {
+    // #740: heartbeat span. Outcomes and refusal codes are named; lease
+    // material, cursors, and digests never enter the sink.
+    let _span = tracing::info_span!("eliotd.supervision_heartbeat").entered();
+    let inputs = eliotd::SupervisionTickInputs {
+        store_ready: health.status == StoreHealthStatus::Ready,
+        activation_in_flight,
+    };
+    let store_dimension = eliotd::store_dependency_dimension(health.status);
+    for channel in [
+        DaemonProgressChannel::Claim,
+        DaemonProgressChannel::Dispatch,
+        DaemonProgressChannel::Apply,
+    ] {
+        if !producer.submit_due(channel) {
+            continue;
+        }
+        let request = producer.build_observation(channel, &inputs, store_dimension)?;
+        let answer = match kernel.submit_supervision_progress(&request).await {
+            Ok(answer) => answer,
+            Err(first_error) => {
+                kernel
+                    .submit_supervision_progress(&request)
+                    .await
+                    .map_err(|error| {
+                        format!("Kernel supervision progress submit: {first_error}; retry: {error}")
+                    })?
+            }
+        };
+        producer.adopt_answer(&answer)?;
+        if let Some(outcome) = answer.outcome {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.supervision_heartbeat_decided",
+                outcome = outcome.as_str(),
+            );
+        } else if let Some(code) = answer.refusal_code.as_deref() {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.supervision_heartbeat_refused",
+                code = code,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Settles one claimed activation ticket into the next dispatch step or an
+/// idle flight.
+///
+/// Item B: the outstanding TestD drain is settled *before* this function takes
+/// the composition lock, so the loop never queues behind — and never blocks — a
+/// guarded Kernel exchange inside the drain. The clock is read first, exactly
+/// as before, so an invalid wall clock still fails closed before any lock.
+async fn start_claimed_activation_step(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    testd_owner_flight: &mut TestdOwnerFlight,
+    ticket: AgentActivationResolutionTicket,
+) -> Result<Option<ActivationFlightState>, String> {
+    let now = unix_ms(SystemTime::now())?;
+    settle_testd_owner_before_lock(testd_owner_flight).await?;
+    let guard = composition.lock().await;
+    start_valid_claim_step(kernel, &guard, ticket, now)
 }
 
 /// Starts the dispatch step for one validated ticket, or idles on
@@ -737,24 +1271,65 @@ async fn drain_activation_on_shutdown(
     }
 }
 
+/// Runs one O1 owner-feed synchronization pass (issue #2100) and records
+/// its outcome.
+///
+/// A proven publish emits the bound revision for diagnostics; an unchanged
+/// provider stays silent; a degraded pass emits an error record and the loop
+/// continues, retrying on a later tick. The feed never gates readiness and
+/// never fails the daemon: an unbound Kernel owner only leaves grants
+/// pending, exactly like an absent P-07 port.
+async fn sync_owner_feed(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    trigger: &mut eliotd::OwnerFeedTrigger,
+) {
+    let guard = composition.lock().await;
+    match eliotd::maintain_owner_feed(&guard, kernel, trigger).await {
+        Ok(Some(revision)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.owner_feed_published",
+                revision = revision,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "owner-feed",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
+}
+
 /// Starts one local-read poll step for the outbound-only poller (Implements
 /// #18): claim one queued admitted `eliot.query` pair, forward it through
 /// the Kernel `local_read` leg, and submit its result body. At most one pair
 /// per tick; a null claim backs off until the next tick.
 fn start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
-    Box::pin(async move { LocalReadCompletion::Settled(run_local_read_poll(&kernel_clone).await) })
+    Box::pin(async move {
+        LocalReadCompletion::Settled(run_local_read_poll(&kernel_clone, composition).await)
+    })
 }
 
 /// Starts the local-read poll step when its flight is idle. Checked before
 /// the activation gate on every tick so the poller stays live while an
 /// activation is in flight.
-fn maybe_start_local_read_poll(kernel: &Arc<DaemonKernelClient>, flight: &mut LocalReadFlight) {
+fn maybe_start_local_read_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut LocalReadFlight,
+) {
     if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
         *flight = LocalReadFlight::InFlight(LocalReadFlightState {
-            future: start_local_read_poll(kernel),
+            future: start_local_read_poll(kernel, Arc::clone(composition)),
         });
     }
 }
@@ -795,7 +1370,10 @@ fn settle_local_read_completion(
 /// the daemon closed — a claimed pair that cannot forward or submit is never
 /// silently discarded. A stale capability is never retried: the step settles
 /// and the next tick claims the current generation anew.
-async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPollOutcome, String> {
+async fn run_local_read_poll(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<LocalReadPollOutcome, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
     let _span = tracing::info_span!("eliotd.local_read_poll").entered();
@@ -806,6 +1384,24 @@ async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPol
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
+    let guard = composition.lock().await;
+    // #1882: Skill pairs serve locally through the composition Skill driver
+    // instead of forwarding on the Kernel `local_read` leg (which serves
+    // store reads only). Recognition is the shared Skill tool predicate over
+    // the pair's tool name; anything else keeps the existing forward path
+    // byte-identical. The served result body submits through the same
+    // idempotent leg below, so claimed skill pairs settle exactly like
+    // forwarded ones.
+    if eliotd::skill_dispatch::is_skill_tool(&tool) {
+        let body =
+            eliotd::skill_dispatch::serve_skill_pair(&guard, kernel, &envelope, &tool, &attempt)
+                .await;
+        return match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
+            LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+            LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+        };
+    }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
@@ -855,6 +1451,251 @@ async fn drain_local_read_on_shutdown(flight: &mut LocalReadFlight) -> Result<Ru
     };
     match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
         Ok(LocalReadCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
+    }
+}
+
+/// Completion of one in-flight TestD owner drain step. Bind, terminal
+/// publish, finish submit, and ack share one flight branch so health and
+/// shutdown stay pollable while the bounded step is outstanding; the step
+/// handles at most one bounded poll per queue per tick.
+enum TestdOwnerCompletion {
+    Settled(Result<TestdOwnerDrainOutcome, String>),
+}
+
+struct TestdOwnerFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>>,
+}
+
+/// Sole owner of TestD owner drain state in `run_loop`, mirroring
+/// [`LocalReadFlight`]. `Idle` means no drain work is outstanding;
+/// `InFlight` holds the one pending drain step. No second owner and no
+/// second concurrent drain step exist.
+enum TestdOwnerFlight {
+    Idle,
+    InFlight(TestdOwnerFlightState),
+}
+
+/// Pure tick gate: the TestD owner timer starts work only when the flight
+/// is idle. The in-flight step is polled in its own `select!` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestdOwnerTickDecision {
+    StartDrain,
+    SkipInFlight,
+}
+
+fn decide_testd_owner_tick(flight: &TestdOwnerFlight) -> TestdOwnerTickDecision {
+    match flight {
+        TestdOwnerFlight::Idle => TestdOwnerTickDecision::StartDrain,
+        TestdOwnerFlight::InFlight(_) => TestdOwnerTickDecision::SkipInFlight,
+    }
+}
+
+/// Starts one TestD owner drain step for the finish cadence (issue #325):
+/// bind pending verifier dispatches, publish terminal verifier facts,
+/// submit finish candidates, and acknowledge terminals, all through the
+/// Kernel owner routes. At most one bounded step per tick; an empty poll
+/// backs off until the next tick.
+fn start_testd_owner_drain(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        // Boxed: the phase-split drain future exceeds the inline bound, and
+        // keeping it on the stack would push this flight future past the
+        // large-future threshold. Same future, same step.
+        TestdOwnerCompletion::Settled(
+            Box::pin(run_testd_owner_drain(&kernel_clone, composition)).await,
+        )
+    })
+}
+
+/// Starts the TestD owner drain step when its flight is idle. Checked on
+/// every tick alongside the other pollers so terminal evidence publishes
+/// while activations are in flight.
+fn maybe_start_testd_owner_drain(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut TestdOwnerFlight,
+) {
+    if decide_testd_owner_tick(flight) == TestdOwnerTickDecision::StartDrain {
+        *flight = TestdOwnerFlight::InFlight(TestdOwnerFlightState {
+            future: start_testd_owner_drain(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+/// Polls the one in-flight TestD owner drain step, pending forever while
+/// idle so health and shutdown stay pollable with no step outstanding.
+async fn next_testd_owner_completion(flight: &mut TestdOwnerFlight) -> TestdOwnerCompletion {
+    match flight {
+        TestdOwnerFlight::Idle => std::future::pending::<TestdOwnerCompletion>().await,
+        TestdOwnerFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed TestD owner drain step back to idle. A drained
+/// step idles until the next tick; only a step failure fails the daemon
+/// closed — a poisoned row that cannot drain is recorded as a diagnostic
+/// and skipped inside the step, never silently discarded and never fatal.
+fn settle_testd_owner_completion(
+    completion: TestdOwnerCompletion,
+    flight: &mut TestdOwnerFlight,
+) -> Result<(), String> {
+    match completion {
+        TestdOwnerCompletion::Settled(Ok(_)) => {
+            *flight = TestdOwnerFlight::Idle;
+            Ok(())
+        }
+        TestdOwnerCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Settles an outstanding TestD owner drain step before this task takes the
+/// composition lock for itself (#18 item B).
+///
+/// The drain is the one flight that legitimately holds the composition guard
+/// across a Kernel exchange: publishing a verifier-execution fact and deriving
+/// its finish decision are `&mut GovernorComposition` operations on the single
+/// Governor owner, reachable only through this guard, and moving them out would
+/// require a second handle to that owner. Every other Kernel exchange in the
+/// step therefore runs with no guard at all (see
+/// [`run_testd_owner_drain`]), and this function makes the ordering total for
+/// the arms the loop itself drives: the loop settles the drain first and then
+/// takes the lock, so neither side can queue behind the other. The local-read
+/// poller takes the same lock inside its own flight; that is a pre-existing
+/// path outside this issue and is not made to wait here. No new work is started
+/// and no state machine is duplicated — the flight stays the single owner of
+/// drain state.
+async fn settle_testd_owner_before_lock(flight: &mut TestdOwnerFlight) -> Result<(), String> {
+    if let TestdOwnerFlight::Idle = flight {
+        return Ok(());
+    }
+    let completion = next_testd_owner_completion(flight).await;
+    settle_testd_owner_completion(completion, flight)
+}
+
+/// Runs one TestD owner drain step through the production finish caller.
+///
+/// #18 item B: the bounded step is split into phases so the composition guard
+/// is never held across a Kernel exchange except for the two Governor-owned
+/// canonical legs that structurally require the single Governor owner:
+///
+/// ```text
+/// (a) guard held   — read the composition readiness gate (no exchange);
+/// (b) no guard     — both bounded owner polls;
+/// (c) guard held   — plan the exact owner bind payload for one pending
+///                    dispatch (a pure read of the retained owners);
+/// (d) no guard     — the owner bind leg;
+/// (e) guard held   — publish the verifier-execution fact and derive its finish
+///                    decision for one terminal row (the irreducible
+///                    `&mut GovernorComposition` legs);
+/// (f) no guard     — the owner terminal ack leg.
+/// ```
+///
+/// Before this change the guard was held across the whole step: both polls plus
+/// three Kernel exchanges per row, so one bounded step stalled every other task
+/// waiting on the same lock. Semantics are unchanged: one bounded step per
+/// tick, at most one outstanding drain, exact replay rather than duplication,
+/// a poisoned row recorded as a diagnostic and skipped, and only a transport
+/// failure of a poll failing the daemon closed.
+async fn run_testd_owner_drain(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<TestdOwnerDrainOutcome, String> {
+    // #740-style receipt span over the bind/publish/submit/ack drain step.
+    // Row counts are named; digests and payload bytes never are.
+    let _span = tracing::info_span!("eliotd.testd_owner_drain").entered();
+    if !testd_owner_drain_admitted(&composition).await {
+        return Err(
+            "TestD owner drain: TestD owner drain needs a Ready Governor composition".to_owned(),
+        );
+    }
+    let mut outcome = TestdOwnerDrainOutcome::default();
+    // (b) no guard: the first bounded owner poll.
+    let pending = query_testd_owner_pending_dispatches(kernel)
+        .await
+        .map_err(|error| format!("TestD owner drain: {error}"))?;
+    for entry in &pending {
+        // (c) guard held: plan the exact bind payload, then release it.
+        let planned = {
+            let guard = composition.lock().await;
+            guard.plan_testd_verifier_dispatch_binding(entry)
+        };
+        let bound = match planned {
+            Ok(binding) => {
+                // (d) no guard: the owner bind leg.
+                bind_testd_owner_verifier_dispatch(kernel, &entry.job.job_id, binding).await
+            }
+            Err(error) => Err(error),
+        };
+        match bound {
+            Ok(()) => outcome.dispatch_bindings_persisted += 1,
+            Err(error) => {
+                outcome.rows_skipped += 1;
+                emit_testd_owner_drain_skip(&entry.job.job_id, &error);
+            }
+        }
+    }
+    // (b) no guard: the second bounded owner poll.
+    let terminals = query_testd_owner_terminal_evidence(kernel)
+        .await
+        .map_err(|error| format!("TestD owner drain: {error}"))?;
+    for evidence in &terminals {
+        // (e) guard held: the two Governor-owned canonical legs for this row.
+        let committed = {
+            let mut guard = composition.lock().await;
+            Box::pin(guard.commit_testd_terminal_owner_fact(evidence)).await
+        };
+        match committed {
+            Ok(receipt) => {
+                // (f) no guard: the owner terminal ack leg.
+                match ack_testd_owner_terminal_completion(kernel, &evidence.job.job_id, receipt)
+                    .await
+                {
+                    Ok(()) => {
+                        outcome.terminals_drained += 1;
+                        outcome.finish_decisions_persisted += 1;
+                        outcome.terminals_acked += 1;
+                    }
+                    Err(error) => {
+                        outcome.rows_skipped += 1;
+                        emit_testd_owner_drain_skip(&evidence.job.job_id, &error);
+                    }
+                }
+            }
+            Err(error) => {
+                outcome.rows_skipped += 1;
+                emit_testd_owner_drain_skip(&evidence.job.job_id, &error);
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Reads the composition readiness gate the drain requires, holding the guard
+/// only for that synchronous read.
+async fn testd_owner_drain_admitted(composition: &SharedComposition) -> bool {
+    let guard = composition.lock().await;
+    guard.readiness() == eliot_governor::CompositionReadiness::Ready
+}
+
+/// Bounded shutdown drain for one in-flight TestD owner step. Never starts
+/// new work: an in-flight step runs to its bounded end (its rows are
+/// idempotent owner-side, so a repeated poll replays rather than
+/// duplicates), while an already-persisted decision exact-replays on the
+/// next submit — so the drain always settles as plain `Shutdown`, never
+/// unknown.
+async fn drain_testd_owner_on_shutdown(
+    flight: &mut TestdOwnerFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, TestdOwnerFlight::Idle);
+    let TestdOwnerFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(TestdOwnerCompletion::Settled(Err(error))) => Err(error),
         _ => Ok(RunLoopExit::Shutdown),
     }
 }
@@ -1784,6 +2625,16 @@ mod tests {
             .expect("one second before Unix epoch must be representable");
         let error = unix_ms(observed).expect_err("pre-epoch clock must fail closed");
         assert!(error.contains("precedes Unix epoch"));
+    }
+
+    #[test]
+    fn skill_tool_source_attach_proves_the_live_registry_edge() {
+        // Real tools owner through the Governor hook, executed in the
+        // production binary target: the attach pins a non-blank admitted
+        // definition version with no skill inputs consumed and nothing
+        // delivered.
+        let admitted = attach_skill_tool_source().expect("live canonical tool source must attach");
+        assert!(!admitted.trim().is_empty());
     }
 
     #[test]

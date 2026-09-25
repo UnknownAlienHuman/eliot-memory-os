@@ -572,18 +572,25 @@ impl RestoreTarget for FileRestoreTarget {
 /// Obligation states mirror the established convention: performed validations
 /// carry this runner's observed refs; ORS suspension is `Satisfied` exactly
 /// when the archive carries an ORS snapshot; unknown reconciliation stays
-/// `Unknown`; broker invalidation stays an explicit `MissingCapability` for
-/// the `#960`/`#961` owner.
+/// `Unknown`; runtime/session/lease/route/broker invalidation stays an
+/// explicit `MissingCapability` for the `#960`/`#961` owner (the file runner
+/// never mints exact-owner invalidation receipts).
 /// Builds the runner-observed obligation set.
 ///
 /// Performed validations carry this runner's observed refs; ORS suspension is
 /// `Satisfied` exactly when the archive carries an ORS snapshot; unknown
-/// reconciliation stays `Unknown`; broker invalidation stays an explicit
-/// `MissingCapability` for the `#960`/`#961` owner.
+/// reconciliation stays `Unknown`; runtime/session/lease/route/broker
+/// invalidation stays an explicit `MissingCapability` for the `#960`/`#961`
+/// owner.
 fn runner_obligations(bundle: &BackupBundle) -> super::RestoreObligations {
-    use super::{RestoreObligationState, RestoreObligations};
+    use super::{RestoreObligationState, RestoreObligations, RestoreOwnerObligation};
     let satisfied = |owner_id: &str| {
         FileRestoreTarget::build_obligation(owner_id, RestoreObligationState::Satisfied)
+    };
+    let missing = |owner_id: &str, reason: &str| RestoreOwnerObligation {
+        owner_id: owner_id.to_owned(),
+        evidence_ref: reason.to_owned(),
+        state: RestoreObligationState::MissingCapability,
     };
     RestoreObligations {
         purge: satisfied("purge-owner"),
@@ -604,10 +611,22 @@ fn runner_obligations(bundle: &BackupBundle) -> super::RestoreObligations {
         ),
         watchdog_signals: satisfied("watchdog-owner"),
         external_source_revalidation: satisfied("external-source-owner"),
-        runtime_invalidation: satisfied("runtime-owner"),
-        session_invalidation: satisfied("session-owner"),
-        lease_invalidation: satisfied("lease-owner"),
-        route_invalidation: satisfied("route-owner"),
+        runtime_invalidation: missing(
+            "runtime-owner",
+            "file-runner cannot invalidate runtime authority; requires runtime owner #960/#961",
+        ),
+        session_invalidation: missing(
+            "session-owner",
+            "file-runner cannot invalidate sessions; requires runtime owner #960/#961",
+        ),
+        lease_invalidation: missing(
+            "lease-owner",
+            "file-runner cannot invalidate launch leases; requires runtime owner #960/#961",
+        ),
+        route_invalidation: missing(
+            "route-owner",
+            "file-runner cannot invalidate route continuations; requires runtime owner #960/#961",
+        ),
         user_broker_invalidation: FileRestoreTarget::build_obligation(
             "user-broker-owner",
             RestoreObligationState::MissingCapability,

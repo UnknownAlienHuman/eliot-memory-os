@@ -6,11 +6,12 @@ use eliot_engine::{
 };
 use eliot_types::{
     AgentId, CapsuleBuild, CommandContext, ConceptKind, ConceptNode, CoverageClass, CueBinding,
-    CueKind, CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LifecycleStatus,
-    ModuleCard, ObservabilityKind, PredictionExpectation, PredictionRecord, PredictionResolution,
-    ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind, RelationInput, RelationType,
-    SemanticCommand, SessionId, SubsystemCapsule, SystemMap, TaintClass, TaskId, UlArtifact,
-    UlArtifactBatchRecordCommand, VerificationResult, Visibility, WriteId, ul_token_estimate,
+    CueMatchMode, CueStrength, DependencyManifest, InjectionReceipt, LegacyCueKindV1,
+    LifecycleStatus, ModuleCard, ObservabilityKind, PredictionExpectation, PredictionRecord,
+    PredictionResolution, ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind,
+    RelationInput, RelationType, SemanticCommand, SessionId, SubsystemCapsule, SystemMap,
+    TaintClass, TaskId, UlArtifact, UlArtifactBatchRecordCommand, VerificationResult, Visibility,
+    WriteId, ul_token_estimate,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -685,7 +686,7 @@ fn concept(project_id: ProjectId, id: &str, name: &str, boundary: &str) -> Conce
 
 fn cue(value: &str) -> Vec<CueBinding> {
     vec![CueBinding {
-        cue_kind: CueKind::Subsystem,
+        cue_kind: LegacyCueKindV1::Subsystem,
         cue_value: value.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength: CueStrength::Primary,

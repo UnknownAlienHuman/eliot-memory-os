@@ -24,7 +24,8 @@ pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
 use eliot_skill::{
-    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+    ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
@@ -33,6 +34,19 @@ mod resources;
 pub use resources::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
+};
+mod skill_transport;
+pub use skill_transport::{
+    MAX_CARRY_BYTES, MAX_INTAKE_BYTES, SKILL_DISPLAY_TOOL, SKILL_INJECT_TOOL,
+    SKILL_TRANSPORT_CONTRACT_ID, SKILL_TRANSPORT_VERSION, SkillAckPayload, SkillDisplayPayload,
+    SkillIntakePayload, SkillResultEnvelope, SkillResultOutcome, SkillToolKind,
+    SkillTransportError, skill_tool_kind,
+};
+mod route_tokens;
+pub use route_tokens::{
+    MAX_MEASUREMENT_WIRE_BYTES, RouteTokenObservation, RouteTokenizer,
+    TOKEN_MEASUREMENT_CONTRACT_ID, TOKEN_MEASUREMENT_VERSION, TokenMeasurementPayload,
+    UnmeasuredReason, produce_route_token_observation,
 };
 mod terminal_inputs;
 pub use terminal_inputs::{
@@ -484,11 +498,213 @@ impl ActivationGrant {
     }
 }
 
+/// I7.20 agent-facing activation disposition registry (closed control layer).
+///
+/// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, agent-facing
+/// failure control has two layers: `AgentResponseDisposition` (small closed
+/// control enum) and `reason_code` (open versioned registry). Bridges switch
+/// on the stable disposition and MAY specialize known reason codes.
+pub const ACTIVATION_DISPOSITION_INVALID_REQUEST: &str = "INVALID_REQUEST";
+/// I7.20 stale/conflict disposition: retry requires a new ticket, the stale
+/// fence fails closed; the bridge never auto-selects a candidate.
+pub const ACTIVATION_DISPOSITION_STALE_OR_CONFLICT: &str = "STALE_OR_CONFLICT";
+/// I7.20 unavailable/capacity disposition: fail-closed with a failure capsule.
+pub const ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
+/// I7.20 terminal failure disposition: fail-closed with a failure capsule.
+pub const ACTIVATION_DISPOSITION_FAILED: &str = "FAILED";
+
+/// I7.20 directive kind for candidate recovery: present candidates only, the
+/// agent (never the bridge) selects; no auto-selection.
+pub const ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY: &str = "candidate-recovery-no-auto-selection";
+/// I7.20 directive kind for stale/conflict: the retry requires a new ticket.
+pub const ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET: &str = "retry-requires-new-ticket";
+/// I7.20 directive kind for stale fences: fail closed, never reuse authority.
+pub const ACTIVATION_DIRECTIVE_FENCE_CLOSED: &str = "stale-fence-fail-closed";
+/// I7.20 directive kind for failures: carry the typed failure capsule.
+pub const ACTIVATION_DIRECTIVE_FAILURE_CAPSULE: &str = "failure-capsule";
+
+/// I7.20 agent-facing denial report: disposition + catalogue `reason_code` +
+/// directive plus the exact owner-issued denial detail.
+///
+/// Every non-success response includes the disposition, the exact
+/// `reason_code`, the applicable Recovery or Conflict Directive, and the same
+/// operation identity when one exists. The bridge surfaces the report
+/// read-only and fails closed; it never auto-selects among candidates and
+/// never collapses distinct candidate sets, retry bounds, or failure handles
+/// into one static string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivationDenialReport {
+    reason_code: &'static str,
+    disposition: &'static str,
+    directive_kind: &'static str,
+    operation: String,
+    detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
+}
+
+impl ActivationDenialReport {
+    /// Seals one denial report. All legs are required; silence and generic
+    /// internal-error prose are not normal control behavior. The `detail`
+    /// carries the exact owner-issued typed disposition and is `None` only
+    /// for the Kernel-owned no-result refusal, which has no daemon
+    /// disposition to project. A malformed leg fails as a provider contract
+    /// rejection: the legs arrive from the trusted provider projection, so a
+    /// blank leg means the provider violated its contract.
+    pub fn new(
+        reason_code: &'static str,
+        disposition: &'static str,
+        directive_kind: &'static str,
+        operation: String,
+        detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
+    ) -> Result<Self, ProviderFailure> {
+        validate_text(reason_code, "activation_denial.reason_code").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial reason must be non-blank",
+            )
+        })?;
+        validate_text(disposition, "activation_denial.disposition").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial disposition must be non-blank",
+            )
+        })?;
+        validate_text(directive_kind, "activation_denial.directive_kind").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial directive must be non-blank",
+            )
+        })?;
+        validate_text(&operation, "activation_denial.operation").map_err(|_| {
+            ProviderFailure::new(
+                "eliot-agent-bridge-core",
+                "activation denial operation must be non-blank",
+            )
+        })?;
+        Ok(Self {
+            reason_code,
+            disposition,
+            directive_kind,
+            operation,
+            detail,
+        })
+    }
+
+    /// Catalogue `reason_code` from the I7.20 reason registry (open layer);
+    /// legacy transport codes arrive already projected to their catalogue
+    /// alias and unknown future codes pass through verbatim.
+    pub const fn reason_code(&self) -> &'static str {
+        self.reason_code
+    }
+
+    /// Closed I7.20 control disposition the bridge switches on.
+    pub const fn disposition(&self) -> &'static str {
+        self.disposition
+    }
+
+    /// Applicable Recovery or Conflict Directive kind; never auto-selected.
+    pub const fn directive_kind(&self) -> &'static str {
+        self.directive_kind
+    }
+
+    /// Operation identity (the exact demand) this denial answers.
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    /// Exact owner-issued denial detail; `None` only for the Kernel-owned
+    /// no-result refusal.
+    pub const fn detail(&self) -> Option<&eliot_protocol::AgentActivationResolutionDisposition> {
+        self.detail.as_ref()
+    }
+
+    /// Renders the exact agent-facing denial detail: disposition, catalogue
+    /// reason, directive, operation correlation, and the differing
+    /// owner-issued payload (candidate handles plus coverage plus recovery
+    /// handle; retry dependency plus observed revision plus earliest-retry
+    /// bound; observed fence plus recovery handle; or failure handle).
+    /// Two denials with different candidate sets, retry bounds, or failure
+    /// handles render differently; nothing here is reconstructed from reason
+    /// text.
+    pub fn agent_detail(&self) -> String {
+        let payload = match &self.detail {
+            None => "no-typed-result".to_owned(),
+            Some(
+                eliot_protocol::AgentActivationResolutionDisposition::TaskSelectionRequired {
+                    selection,
+                }
+                | eliot_protocol::AgentActivationResolutionDisposition::ScopeSelectionRequired {
+                    selection,
+                }
+                | eliot_protocol::AgentActivationResolutionDisposition::ScopeAmbiguous { selection },
+            ) => {
+                let candidates = serde_json::to_string(&selection.candidate_handles)
+                    .unwrap_or_else(|_| "[]".to_owned());
+                format!(
+                    "candidates={} coverage={:?} recovery={}",
+                    candidates, selection.candidate_coverage, selection.recovery_handle
+                )
+            }
+            Some(eliot_protocol::AgentActivationResolutionDisposition::NotReady {
+                recovery_handle,
+                retry,
+            }) => format!(
+                "recovery={} dependency={} observed_revision={} not_before_unix_ms={}",
+                recovery_handle,
+                retry.dependency_ref,
+                retry.observed_dependency_revision,
+                retry.not_before_unix_ms
+            ),
+            Some(eliot_protocol::AgentActivationResolutionDisposition::StaleFence {
+                recovery_handle,
+                observed_state_fence,
+            }) => match observed_state_fence {
+                Some(fence) => format!("recovery={recovery_handle} observed_fence={fence:?}"),
+                None => format!("recovery={recovery_handle} observed_fence=none"),
+            },
+            Some(eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+                failure_handle,
+            }) => format!("failure={failure_handle}"),
+            Some(eliot_protocol::AgentActivationResolutionDisposition::Resolved { .. }) => {
+                "invalid-resolved-in-denial".to_owned()
+            }
+        };
+        format!(
+            "activation denied: disposition={} reason={} directive={} operation={} {}",
+            self.disposition, self.reason_code, self.directive_kind, self.operation, payload
+        )
+    }
+}
+
+impl fmt::Display for ActivationDenialReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.agent_detail())
+    }
+}
+
 /// Trusted activation-port disposition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActivationPortOutcome {
     Authenticated(ActivationPortResult),
-    Denied { reason_code: &'static str },
+    /// I7.20 detailed denial carrying the disposition, the catalogue
+    /// `reason_code`, and the directive triple plus the exact owner-issued
+    /// denial detail. Fails closed via [`BridgeError::ActivationDenied`];
+    /// the extra legs travel to the agent-facing projection instead of being
+    /// discarded at the port.
+    Denied(ActivationDenialReport),
+    /// No valid terminal result arrived before the ticket deadline. Distinct
+    /// from every typed negative: the Kernel may still hold or expire the
+    /// ticket on its own leg, but this port observed the deadline pass with
+    /// no terminal result.
+    DeadlineExceeded {
+        operation: String,
+        deadline_unix_ms: u64,
+    },
+    /// The transport exchange ended with no terminal result while the ticket
+    /// deadline had not passed, so the outcome is unknown rather than denied:
+    /// never one of the known negatives, never a success, and never authority.
+    UnknownOutcome {
+        operation: String,
+    },
 }
 
 /// Injected demand-start boundary. The host owner, not A-16, owns process
@@ -916,9 +1132,20 @@ impl AgentBridgeCore {
         let activation = host.activate(&request)?;
         let grant = match activation {
             ActivationPortOutcome::Authenticated(result) => ActivationGrant::seal(result)?,
-            ActivationPortOutcome::Denied { reason_code } => {
-                validate_text(reason_code, "activation_denial.reason_code")?;
-                return Err(BridgeError::ActivationDenied(reason_code));
+            ActivationPortOutcome::Denied(report) => {
+                return Err(BridgeError::ActivationDenied(report));
+            }
+            ActivationPortOutcome::DeadlineExceeded {
+                operation,
+                deadline_unix_ms,
+            } => {
+                return Err(BridgeError::ActivationDeadlineExceeded {
+                    operation,
+                    deadline_unix_ms,
+                });
+            }
+            ActivationPortOutcome::UnknownOutcome { operation } => {
+                return Err(BridgeError::ActivationUnknownOutcome { operation });
             }
         };
         if let Some(current) = &self.active {
@@ -1698,6 +1925,19 @@ pub trait SkillLifecyclePort {
         ctx: &'a RequestMetadata,
         request: ProposeSkillRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+
+    /// Binds one receiver ack to its exact Hotset receipt and displays the
+    /// activated Skill at the admitted fence. The bridge carries the inert
+    /// receipt/ack pair and returns only the typed display; tool-authority
+    /// checks (admitted version, tool basis, provisional ceiling) stay with
+    /// the Governor owner behind the port.
+    fn display_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>>;
 }
 
 impl AgentBridgeCore {
@@ -1743,6 +1983,30 @@ impl AgentBridgeCore {
             .validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         Ok(candidate)
+    }
+
+    /// Binds one receiver ack to its exact Hotset receipt and displays the
+    /// activated Skill at the exact attached fence.
+    pub async fn display_skill_activation(
+        &mut self,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+    ) -> Result<ActivatedSkillDisplay, BridgeError> {
+        receipt.validate()?;
+        ack.validate()?;
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let display = self
+            .skill_port()?
+            .display_skill(ctx, skill_id.to_owned(), receipt, ack)
+            .await?;
+        display
+            .validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        Ok(display)
     }
 
     /// Fails closed unless the caller fence covers the exact attached
@@ -1820,6 +2084,38 @@ impl AgentBridgeCore {
         ))
     }
 
+    /// Projects one tool result into its delivery receipt from a live
+    /// measurement wire payload: the adapter's attested count passes through
+    /// byte-bound verification by [`produce_route_token_observation`] —
+    /// versioned wire, admission-linked matched route, exact delivered
+    /// bytes — before it may enter the receipt, unaltered. A missing
+    /// payload means the route supports no measurement and withholds with
+    /// [`BridgeError::UnmeasuredTokens`], as do unlinked, diverged,
+    /// unobserved, or misbound payloads; the bridge never estimates the
+    /// count. Delivery completeness stays the owner's observed state, as
+    /// with [`Self::project_tool_result`].
+    pub fn project_produced_tool_result(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        payload: Option<&TokenMeasurementPayload>,
+        admission: &eliot_agent_api::AdmittedRouteReceipt,
+        binding: &eliot_agent_api::ProviderExecutionBinding,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.require_attached()?;
+        let payload = payload.ok_or(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::NoObservation,
+        })?;
+        let produced = produce_route_token_observation(result_bytes, payload, admission, binding)?;
+        Ok(ToolResultReceipt::project(
+            result_bytes,
+            source_handle,
+            produced.tokens(),
+            delivery,
+        ))
+    }
+
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. The registry is cleared on every new attach, so this
     /// count describes only the live attach.
@@ -1860,8 +2156,19 @@ pub enum BridgeError {
     Provider(#[from] ProviderFailure),
     #[error("bridge is not attached")]
     NotAttached,
-    #[error("activation denied by the trusted host provider: {0}")]
-    ActivationDenied(&'static str),
+    #[error("activation denied: {0}")]
+    ActivationDenied(ActivationDenialReport),
+    #[error(
+        "activation observed no terminal result before deadline {deadline_unix_ms} for operation {operation}"
+    )]
+    ActivationDeadlineExceeded {
+        operation: String,
+        deadline_unix_ms: u64,
+    },
+    #[error(
+        "activation outcome unknown for operation {operation}: no terminal result, deadline not reached"
+    )]
+    ActivationUnknownOutcome { operation: String },
     #[error("stale session, generation, or state fence")]
     StaleAuthority,
     #[error("EXTERNAL_ATTACH_RECONCILIATION_REQUIRED")]
@@ -1892,6 +2199,8 @@ pub enum BridgeError {
     ResourceTooLarge { bytes: usize, capacity: usize },
     #[error("incomplete tool-result delivery {delivery:?} cannot satisfy complete evidence")]
     IncompleteDelivery { delivery: DeliveryStatus },
+    #[error("tool-result token cost is unmeasured: {reason}")]
+    UnmeasuredTokens { reason: UnmeasuredReason },
     #[error(transparent)]
     Skill(#[from] SkillError),
 }

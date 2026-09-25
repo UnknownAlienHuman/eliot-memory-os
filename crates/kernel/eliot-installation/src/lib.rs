@@ -44,14 +44,14 @@ use eliot_platform_windows::{
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
     ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
-    ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStartOutcome,
-    ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
-    SupervisionAuthorityKeyStoreRequest, UserOwnedPathLease, WindowsInstallerRootPrimitive,
-    WindowsInstallerSecretProvider, WindowsPlatform, WindowsStoreCredentialTargetGenerator,
-    WindowsSupervisionAuthorityKeyStore, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
-    protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
+    ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
+    ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
+    StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
+    UserOwnedPathLease, WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider,
+    WindowsPlatform, WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
+    current_user_local_app_data_root, fresh_service_registration_nonce,
+    observe_running_eliot_host_process, protected_program_data_root,
+    require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
 use eliot_platform_windows::{
@@ -150,9 +150,10 @@ pub use approved_generation_registry::{
     phase_b_digest_state, phase_b_scm_selector,
 };
 use approved_generation_registry::{
-    ActiveVerifiedReceiptBinding, PendingActivationTerminal, PendingActivationTerminalDisposition,
-    activation_terminal_digest, candidate_manifest_digest, phase_b_scm_digest,
-    registry_projection_identity, validate_phase_b_scm_digest,
+    ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
+    PendingActivationTerminalDisposition, activation_abort_receipt_digest,
+    activation_projection_intent_digest, activation_terminal_digest, candidate_manifest_digest,
+    phase_b_scm_digest, registry_projection_identity, validate_phase_b_scm_digest,
 };
 #[cfg(test)]
 use approved_generation_registry::{
@@ -300,17 +301,21 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// Version 22 separates filesystem and Credential Manager create dispositions
 /// and requires the keyed non-secret credential creation proof. Version 23
 /// adds the optional, digest-bound agent-bridge source materialization plan.
+/// Version 24 binds the SCM grant OWNER|GROUP proof from the same live handle
+/// into the durable registration receipt and its canonical marker digest.
 /// Older wires cannot be interpreted as this effect set.
 /// Older wires require explicit migration and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(23, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(24, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
 /// Registry wire version 12 binds the provisioned supervision authority into
 /// pending Phase-B receipts and committed/rebound live bindings. Version 15
 /// binds each Watchdog approval to the exact installer-read SCM control grant.
+/// Version 16 carries the complete OWNER|GROUP|DACL proof in every durable
+/// service-control grant receipt.
 /// Older projections are never defaulted into current authority.
-pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(15, 0, 0);
+pub const INSTALLATION_REGISTRY_WIRE_VERSION: ContractVersion = ContractVersion::new(16, 0, 0);
 
 /// Bounded wall-clock window in which one committed SCM start intent must
 /// converge to a stable `Running` readback.  The coordinator accepts an
@@ -950,6 +955,8 @@ pub struct CandidateManifest {
     pub testd_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved native worker image.
     pub native_worker_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved WASM-host image.
+    pub wasm_host_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
     pub kernel_executable_path: PlatformHandle,
     /// Canonical installation-approved eliot-store-surreal bridge path.
@@ -964,6 +971,8 @@ pub struct CandidateManifest {
     pub testd_executable_path: PlatformHandle,
     /// Canonical installation-approved native worker executable path.
     pub native_worker_executable_path: PlatformHandle,
+    /// Canonical installation-approved WASM-host executable path.
+    pub wasm_host_executable_path: PlatformHandle,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
@@ -986,7 +995,7 @@ pub struct CandidateManifest {
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
-    /// canonical generation and exact ordered twelve-file Phase-A facts. It is not a
+    /// canonical generation and exact ordered thirteen-file Phase-A facts. It is not a
     /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
@@ -1168,12 +1177,16 @@ pub struct RuntimeLaunchDescriptor {
     pub testd_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved native worker image.
     pub native_worker_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved WASM-host image.
+    pub wasm_host_artifact_digest: PlatformHandle,
     /// Explicit installation-approved Doctor executable path.
     pub doctor_executable_path: PlatformHandle,
     /// Explicit installation-approved Testd executable path.
     pub testd_executable_path: PlatformHandle,
     /// Explicit installation-approved native worker executable path.
     pub native_worker_executable_path: PlatformHandle,
+    /// Explicit installation-approved WASM-host executable path.
+    pub wasm_host_executable_path: PlatformHandle,
     /// SHA-256 of the descriptor fields excluding this digest.
     pub descriptor_digest: PlatformHandle,
 }
@@ -1576,6 +1589,23 @@ impl RuntimeLaunchDescriptor {
         Ok((&self.host_executable_path, &self.host_artifact_digest))
     }
 
+    /// Returns the exact approved WASM-host executable path and content digest.
+    ///
+    /// This is the binding B1's Kernel-grant lane feeds to the installed
+    /// binary resolver before staging the reaped P03 child: the descriptor
+    /// self-digest and all path/digest invariants are checked before the
+    /// caller receives it, and the P03 executor re-hashes the file under
+    /// its deny-write lease at launch.
+    pub fn wasm_host_artifact_binding(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.wasm_host_executable_path,
+            &self.wasm_host_artifact_digest,
+        ))
+    }
+
     /// Returns the three dispatch child image digests from the launch
     /// descriptor: Doctor, Testd, and native worker. Validated exactly like
     /// `kernel_artifact_digest`; never defaulted.
@@ -1644,9 +1674,11 @@ impl RuntimeLaunchDescriptor {
             doctor_artifact_digest: &'a PlatformHandle,
             testd_artifact_digest: &'a PlatformHandle,
             native_worker_artifact_digest: &'a PlatformHandle,
+            wasm_host_artifact_digest: &'a PlatformHandle,
             doctor_executable_path: &'a PlatformHandle,
             testd_executable_path: &'a PlatformHandle,
             native_worker_executable_path: &'a PlatformHandle,
+            wasm_host_executable_path: &'a PlatformHandle,
         }
         serde_json::to_vec(&Unsigned {
             profile: self.profile,
@@ -1687,9 +1719,11 @@ impl RuntimeLaunchDescriptor {
             doctor_artifact_digest: &self.doctor_artifact_digest,
             testd_artifact_digest: &self.testd_artifact_digest,
             native_worker_artifact_digest: &self.native_worker_artifact_digest,
+            wasm_host_artifact_digest: &self.wasm_host_artifact_digest,
             doctor_executable_path: &self.doctor_executable_path,
             testd_executable_path: &self.testd_executable_path,
             native_worker_executable_path: &self.native_worker_executable_path,
+            wasm_host_executable_path: &self.wasm_host_executable_path,
         })
         .map_err(|error| InstallationError::InvalidField {
             field: "manifest.runtime_launch".to_owned(),
@@ -1934,9 +1968,25 @@ impl RuntimeLaunchDescriptor {
             &self.native_worker_artifact_digest,
             "runtime_launch.native_worker_artifact_digest",
         )?;
+        approved_path(
+            &self.wasm_host_executable_path,
+            "runtime_launch.wasm_host_executable_path",
+        )?;
+        approved_filename(
+            &self.wasm_host_executable_path,
+            "eliot-wasm-host.exe",
+            "runtime_launch.wasm_host_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.wasm_host_artifact_digest,
+            "runtime_launch.wasm_host_artifact_digest",
+        )?;
         if self.doctor_executable_path == self.testd_executable_path
             || self.doctor_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.wasm_host_executable_path
             || self.testd_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.wasm_host_executable_path
+            || self.native_worker_executable_path == self.wasm_host_executable_path
             || self.doctor_executable_path == self.host_executable_path
             || self.doctor_executable_path == self.watchdog_executable_path
             || self.doctor_executable_path == self.store_bridge_executable_path
@@ -1952,6 +2002,11 @@ impl RuntimeLaunchDescriptor {
             || self.native_worker_executable_path == self.store_bridge_executable_path
             || self.native_worker_executable_path == self.canonical_store_executable_path
             || self.native_worker_executable_path == self.eliotd_executable_path
+            || self.wasm_host_executable_path == self.host_executable_path
+            || self.wasm_host_executable_path == self.watchdog_executable_path
+            || self.wasm_host_executable_path == self.store_bridge_executable_path
+            || self.wasm_host_executable_path == self.canonical_store_executable_path
+            || self.wasm_host_executable_path == self.eliotd_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "runtime_launch.named_artifact_paths".to_owned(),
@@ -2010,6 +2065,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.native_worker_executable_path,
                 "runtime_launch.native_worker_executable_path",
+            ),
+            (
+                &self.wasm_host_executable_path,
+                "runtime_launch.wasm_host_executable_path",
             ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
             (
@@ -2088,6 +2147,10 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.native_worker_executable_path,
                 "runtime_launch.native_worker_executable_path",
+            ),
+            (
+                &self.wasm_host_executable_path,
+                "runtime_launch.wasm_host_executable_path",
             ),
         ] {
             self.runtime_state_roots
@@ -2174,6 +2237,10 @@ impl CandidateManifest {
         sha256_handle(
             &self.native_worker_artifact_digest,
             "manifest.native_worker_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.wasm_host_artifact_digest,
+            "manifest.wasm_host_artifact_digest",
         )?;
         approved_path(
             &self.kernel_executable_path,
@@ -2262,27 +2329,49 @@ impl CandidateManifest {
                 &self.native_worker_executable_path,
                 "manifest.native_worker_executable_path",
             )?;
+        approved_path(
+            &self.wasm_host_executable_path,
+            "manifest.wasm_host_executable_path",
+        )?;
+        approved_filename(
+            &self.wasm_host_executable_path,
+            "eliot-wasm-host.exe",
+            "manifest.wasm_host_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.wasm_host_executable_path,
+                "manifest.wasm_host_executable_path",
+            )?;
         if self.kernel_executable_path == self.store_bridge_executable_path
             || self.kernel_executable_path == self.canonical_store_executable_path
             || self.kernel_executable_path == self.host_executable_path
             || self.kernel_executable_path == self.doctor_executable_path
             || self.kernel_executable_path == self.testd_executable_path
             || self.kernel_executable_path == self.native_worker_executable_path
+            || self.kernel_executable_path == self.wasm_host_executable_path
             || self.store_bridge_executable_path == self.canonical_store_executable_path
             || self.store_bridge_executable_path == self.host_executable_path
             || self.store_bridge_executable_path == self.doctor_executable_path
             || self.store_bridge_executable_path == self.testd_executable_path
             || self.store_bridge_executable_path == self.native_worker_executable_path
+            || self.store_bridge_executable_path == self.wasm_host_executable_path
             || self.canonical_store_executable_path == self.host_executable_path
             || self.canonical_store_executable_path == self.doctor_executable_path
             || self.canonical_store_executable_path == self.testd_executable_path
             || self.canonical_store_executable_path == self.native_worker_executable_path
+            || self.canonical_store_executable_path == self.wasm_host_executable_path
             || self.host_executable_path == self.doctor_executable_path
             || self.host_executable_path == self.testd_executable_path
             || self.host_executable_path == self.native_worker_executable_path
+            || self.host_executable_path == self.wasm_host_executable_path
             || self.doctor_executable_path == self.testd_executable_path
             || self.doctor_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.wasm_host_executable_path
             || self.testd_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.wasm_host_executable_path
+            || self.native_worker_executable_path == self.wasm_host_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2331,6 +2420,7 @@ impl CandidateManifest {
             || self.runtime_launch.eliotd_executable_path == self.doctor_executable_path
             || self.runtime_launch.eliotd_executable_path == self.testd_executable_path
             || self.runtime_launch.eliotd_executable_path == self.native_worker_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.wasm_host_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2340,6 +2430,7 @@ impl CandidateManifest {
         if self.runtime_launch.doctor_executable_path == self.config_path
             || self.runtime_launch.testd_executable_path == self.config_path
             || self.runtime_launch.native_worker_executable_path == self.config_path
+            || self.runtime_launch.wasm_host_executable_path == self.config_path
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.dispatch_executable_path".to_owned(),
@@ -2404,6 +2495,11 @@ impl CandidateManifest {
             &self.native_worker_executable_path,
             "manifest.native_worker_executable_path",
         )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.wasm_host_executable_path,
+            "manifest.wasm_host_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -2427,6 +2523,8 @@ impl CandidateManifest {
                 != self.native_worker_executable_path
             || self.runtime_launch.native_worker_artifact_digest
                 != self.native_worker_artifact_digest
+            || self.runtime_launch.wasm_host_executable_path != self.wasm_host_executable_path
+            || self.runtime_launch.wasm_host_artifact_digest != self.wasm_host_artifact_digest
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.artifact_bindings".to_owned(),
@@ -4383,8 +4481,8 @@ impl WindowsInstallationEffectPort {
     ) -> Result<InstallationEffectObservation, PortError> {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
-        match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent { proof } => {
+        match platform.inspect_service_registration_runtime_with_control_grant(&registration) {
+            ServiceRegistrationRuntimeReadback::Absent { proof } => {
                 if std::fs::symlink_metadata(service_marker_path(request)).is_ok() {
                     return Ok(root_mismatch("service-marker-before-intent"));
                 }
@@ -4396,7 +4494,7 @@ impl WindowsInstallationEffectPort {
                     &spec,
                 )
             }
-            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+            ServiceRegistrationRuntimeReadback::Matching { control_grant, .. } => {
                 let digest = registration.expected_configuration_digest();
                 let control_grant = control_grant
                     .as_ref()
@@ -4412,7 +4510,7 @@ impl WindowsInstallationEffectPort {
                 if matches!(
                     &request.plan,
                     InstallerEffectPlan::RegisterService {
-                        role: InstallerServiceRole::Host,
+                        role: InstallerServiceRole::Host | InstallerServiceRole::Watchdog,
                         ..
                     }
                 ) && control_grant.is_none()
@@ -4438,8 +4536,10 @@ impl WindowsInstallationEffectPort {
                     ),
                 }
             }
-            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -4450,15 +4550,17 @@ impl WindowsInstallationEffectPort {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
         let digest = registration.expected_configuration_digest();
-        match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent { proof } => service_absent_from_live_inspection(
-                request,
-                &registration,
-                &proof,
-                &self.primitive,
-                &spec,
-            ),
-            ServiceRegistrationInspection::Matching { control_grant, .. } => {
+        match platform.inspect_service_registration_runtime_with_control_grant(&registration) {
+            ServiceRegistrationRuntimeReadback::Absent { proof } => {
+                service_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    &proof,
+                    &self.primitive,
+                    &spec,
+                )
+            }
+            ServiceRegistrationRuntimeReadback::Matching { control_grant, .. } => {
                 let control_grant = control_grant
                     .as_ref()
                     .map(InstallerServiceControlGrantReceipt::from_readback)
@@ -4471,7 +4573,7 @@ impl WindowsInstallationEffectPort {
                 if matches!(
                     &request.plan,
                     InstallerEffectPlan::RegisterService {
-                        role: InstallerServiceRole::Host,
+                        role: InstallerServiceRole::Host | InstallerServiceRole::Watchdog,
                         ..
                     }
                 ) && control_grant.is_none()
@@ -4524,8 +4626,10 @@ impl WindowsInstallationEffectPort {
                     control_grant,
                 )
             }
-            ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeReadback::Mismatched => Ok(root_mismatch("service-config")),
+            ServiceRegistrationRuntimeReadback::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -5750,7 +5854,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         };
         // s38 (#1345): Host and Watchdog creations both require the
-        // installer-policy DACL proof before the ownership marker may be
+        // installer-policy OWNER|GROUP|DACL proof before the ownership marker may be
         // minted. Older platform builds never return a Host grant, so Host
         // creation honestly stays `Unknown` until the platform generalizes
         // the grant install/read (WRITER-A); it can never be reported
@@ -6387,7 +6491,9 @@ fn root_mismatch(reason: &str) -> InstallationEffectObservation {
     }
 }
 
-const SERVICE_MARKER_VERSION: u32 = 2;
+// The path namespace stays stable so an older marker is observed and rejected
+// during reconciliation instead of being bypassed by a new marker path.
+const SERVICE_MARKER_VERSION: u32 = 3;
 const SERVICE_MARKER_LIMIT: u64 = 16 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -6520,7 +6626,7 @@ fn service_marker_read(
 /// The proof must bind this exact validated registration; a proof for any
 /// other name or configuration digest is a provider/readback substitution and
 /// fails closed. Evidence binds the effect, plan, observed service identity,
-/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v2
+/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v3
 /// binding. The precondition is cloned unchanged so an admitted snapshot is
 /// preserved verbatim.
 fn service_absent_observation(
@@ -6638,7 +6744,7 @@ fn service_matching_observation(
         .map_or("none", PlatformHandle::as_str);
     let evidence = PlatformHandle::new(sha256_hex(
         format!(
-            "service-matching-v2\0{}\0{}\0{}\0{}\0{}",
+            "service-matching-v3\0{}\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             request.plan_digest.as_str(),
             configuration_digest,
@@ -6650,7 +6756,7 @@ fn service_matching_observation(
     .map_err(|_| PortError::InvalidRequestMetadata)?;
     let postcondition_digest = PlatformHandle::new(sha256_hex(
         format!(
-            "service-postcondition-v2\0{}\0{}\0{}\0{}",
+            "service-postcondition-v3\0{}\0{}\0{}\0{}",
             request.effect_id.as_str(),
             configuration_digest,
             marker_digest.as_str(),
@@ -6976,6 +7082,10 @@ pub fn registry_projection_pending_ref(
     .map_err(|error| platform_error(&error))
 }
 
+/// Durable pending reference persisted when a bounded service start passes
+/// its convergence deadline without acknowledgement.
+pub(crate) const SERVICE_START_TIMEOUT_PENDING_REF: &str = "timeout:service-start-convergence";
+
 /// Coordinates one durable installation transaction without owning platform mechanics.
 pub(crate) struct InstallationCoordinator<P, S> {
     port: P,
@@ -7282,7 +7392,7 @@ where
                 return self.persist_unknown(
                     transaction,
                     index,
-                    PlatformHandle::new("timeout:service-start-convergence")
+                    PlatformHandle::new(SERVICE_START_TIMEOUT_PENDING_REF)
                         .map_err(|error| platform_error(&error))?,
                 );
             }
@@ -8969,6 +9079,88 @@ where
         })
     }
 
+    /// Recovery-only readback reconciliation for a first-install service-start
+    /// timeout, called before the Host registry abort in
+    /// `rollback_with_activation_owner`.
+    ///
+    /// `Activating` with the exact pending suffix needs no reconciliation and
+    /// yields no indexes.  `RollbackRequired` with the retained intent yields
+    /// the unsettled start indexes only after an authoritative port readback
+    /// observes every one of them `Absent`; the reset to `Pending` itself
+    /// happens later inside the single intent-clearing CAS, so a failed
+    /// readback persists nothing and keeps the intent.  Any present service,
+    /// any residual unknown, or any contour outside the timeout shape refuses
+    /// with recovery/forward-repair rather than quarantining or dropping the
+    /// intent.  This never executes an effect: reconciliation is read-only.
+    pub(crate) fn reconcile_timeout_starts_for_owner_rollback(
+        &mut self,
+        transaction: &InstallationTransaction,
+    ) -> Result<Vec<usize>, InstallationError> {
+        transaction.validate()?;
+        if transaction.activation_projection_intent().is_none() {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage(),
+                to: InstallationStage::RolledBack,
+            });
+        }
+        if transaction.stage() == InstallationStage::Activating {
+            return Ok(Vec::new());
+        }
+        let candidates = transaction.recoverable_timeout_start_indexes()?;
+        for index in &candidates {
+            let attempt = match &transaction.effect_progress[*index].state {
+                InstallationEffectProgressState::IntentCommitted { attempt, .. } => *attempt,
+                InstallationEffectProgressState::Unknown { .. } => 1,
+                _ => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            };
+            let request = effect_request(
+                transaction,
+                *index,
+                attempt,
+                InstallationEffectAction::Rollback,
+                None,
+            )?;
+            let observed = match self.port.reconcile(&request) {
+                PortOutcome::Known(observed) => {
+                    observed.validate()?;
+                    observed.validate_for_effect(&transaction.installer_effects[*index])?;
+                    observed
+                }
+                other => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation stays unknown for effect {}: {}",
+                        transaction.effect_progress[*index].effect_id.as_str(),
+                        port_pending(other).as_str(),
+                    )));
+                }
+            };
+            match observed {
+                InstallationEffectObservation::Absent {
+                    service_runtime_lineage: None,
+                    ..
+                } => {}
+                InstallationEffectObservation::Absent { .. } => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation observed a runtime lineage for effect {}",
+                        transaction.effect_progress[*index].effect_id.as_str(),
+                    )));
+                }
+                InstallationEffectObservation::Matching { .. } => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation observed a present service for effect {}; forward repair is required",
+                        transaction.effect_progress[*index].effect_id.as_str(),
+                    )));
+                }
+                InstallationEffectObservation::Mismatch { .. } => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     fn persist_quarantined(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -9171,6 +9363,146 @@ where
 }
 
 impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
+    /// Rolls back a first-install activation intent only after the Host-owned
+    /// registry has durably acknowledged the exact `ABORTED` terminal.
+    ///
+    /// The ordinary `rollback` seam deliberately continues to reject a
+    /// transaction carrying an activation intent.  Production recovery callers
+    /// must supply the already-open Host owner capability and registry through
+    /// this explicit owner-aware seam; no caller-supplied approval fields are
+    /// accepted.
+    ///
+    /// Two pre-no-return first-install contours are admitted.  `Activating`
+    /// with the exact pending service-start/credential/Phase-B suffix needs no
+    /// reconciliation.  `RollbackRequired` is admitted only for the
+    /// service-start timeout contour the bounded-start drive persists, and only
+    /// after an authoritative readback proves every unsettled service start
+    /// `Absent`; a present service, a residual unknown, an observed runtime
+    /// lineage, or an applied credential/Phase-B effect keeps the intent and
+    /// refuses for forward repair.  Past the no-return boundary, after a
+    /// committed activation, or on a non-first install, the existing refusal is
+    /// unchanged and is decided before any readback.
+    ///
+    /// The intent is cleared only after the exact owner acknowledgement, inside
+    /// the single transaction-store `compare_and_save`.  A CAS conflict, a
+    /// mismatched pending projection, a missing Host owner, or an unknown
+    /// provider result leaves the intent durable and returns an error.  The
+    /// cleared transaction then re-enters the ordinary exact-effect rollback
+    /// loop, so only `CreatedByTransaction` identities are removed.
+    pub fn rollback_with_activation_owner(
+        &mut self,
+        registry: &RedbInstallationRegistry,
+        host: &HostOwnerEpochCapability,
+        transaction_id: &PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let Some(intent) = transaction.activation_projection_intent().cloned() else {
+            return self.inner.rollback(transaction_id);
+        };
+        // Past the no-return boundary, after a committed activation, or on any
+        // upgrade of a previously working install, this seam keeps the existing
+        // refusal: no readback, no registry mutation, no intent retirement.
+        // These guards therefore precede the recovery-only reconciliation
+        // below so a post-boundary transaction cannot reach it at all.
+        if transaction.no_return_boundary.is_some() || transaction.active_verified_receipt.is_some()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "activation rollback is refused after the no-return or committed-activation boundary"
+                    .to_owned(),
+            ));
+        }
+        if transaction.current_active_manifest.is_some() || transaction.last_known_good.is_some() {
+            return Err(InstallationError::IncompleteObservation(
+                "activation-intent rollback is restricted to a first installation".to_owned(),
+            ));
+        }
+        // Only the two pre-no-return contours reach the registry.  Recovery-only
+        // reconciliation for the service-start timeout contour: `Activating`
+        // needs none, while a timeout-persisted `RollbackRequired` must prove
+        // every unsettled start `Absent` through an authoritative readback
+        // before the owner abort below.  Any other stage refuses here; any
+        // present service or residual unknown refuses with the intent kept.
+        // The ordinary `rollback` seam is unchanged and still rejects an
+        // intent outright.
+        if transaction.stage() != InstallationStage::Activating
+            && transaction.stage() != InstallationStage::RollbackRequired
+        {
+            return Err(InstallationError::IllegalTransition {
+                from: transaction.stage(),
+                to: InstallationStage::RolledBack,
+            });
+        }
+        let reconciled_absent = self
+            .inner
+            .reconcile_timeout_starts_for_owner_rollback(&transaction)?;
+        // This is the pre-no-return contour: service starts, credential, and
+        // Phase-B effects are still pending and carry no runtime receipt.  The
+        // `Activating` shape is re-checked here before touching the registry;
+        // the timeout shape was already proven by the reconciliation above and
+        // is re-proven inside the intent-clearing CAS below.
+        if transaction.stage() == InstallationStage::Activating {
+            transaction.require_signed_pending_activation_effects()?;
+        }
+        let approval = intent.derive_verified_approval(&transaction)?;
+        let manifest_digest = candidate_manifest_digest(&transaction.candidate_manifest)?;
+        let activation_intent_digest = activation_projection_intent_digest(&intent)?;
+        let expected_transaction = TransactionVersion::of(&transaction)?;
+        let abort_evidence = match registry.read_exact_aborted_activation_ack(
+            host,
+            transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest.generation,
+            &manifest_digest,
+            &approval,
+            &activation_intent_digest,
+        )? {
+            Some(evidence) => evidence,
+            None => {
+                let pending_revision = registry.read_exact_pending_activation_revision(
+                    host,
+                    transaction_id,
+                    &transaction.installer_plan_digest,
+                    &approval,
+                    &activation_intent_digest,
+                )?;
+                registry.abort_pending_activation_exact(
+                    host,
+                    pending_revision,
+                    &approval,
+                    &activation_intent_digest,
+                )?;
+                registry
+                    .read_exact_aborted_activation_ack(
+                        host,
+                        transaction_id,
+                        &transaction.installer_plan_digest,
+                        &transaction.candidate_manifest.generation,
+                        &manifest_digest,
+                        &approval,
+                        &activation_intent_digest,
+                    )?
+                    .ok_or_else(|| {
+                        InstallationError::IncompleteObservation(
+                            "Host abort returned without the exact durable ABORTED terminal"
+                                .to_owned(),
+                        )
+                    })?
+            }
+        };
+        let mut cleared = transaction;
+        cleared.prepare_pre_no_return_rollback(abort_evidence, &reconciled_absent)?;
+        <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
+            self.inner.store_mut(),
+            expected_transaction,
+            &cleared,
+        )?;
+        self.inner.rollback(transaction_id)
+    }
     /// Projects bootstrap only after the transaction CAS has retained the
     /// activation projection intent.  The registry remains a projection and
     /// cannot become the first durable owner of this handoff.

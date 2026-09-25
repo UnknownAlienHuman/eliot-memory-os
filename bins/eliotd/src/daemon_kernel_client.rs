@@ -14,16 +14,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionResult, AgentActivationResultAck,
-    AgentActivationResultReconcile, AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
     RequestIdentity, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
-use eliot_store_api::{NamedReadRequest, NamedReadResponse};
+use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
+use eliot_testd_core::{
+    TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
+};
+use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -76,6 +81,23 @@ pub struct OwnerSessionFacts {
     pub(crate) launch_nonce: String,
     pub(crate) artifact_digest: String,
     pub(crate) protected_snapshot_digest: String,
+}
+
+impl OwnerSessionFacts {
+    /// Returns the validated `sid=..;session=..` binding string: the daemon's
+    /// transport-session evidence for supervision progress (identity refs
+    /// only, never a secret).
+    #[must_use]
+    pub fn session_binding(&self) -> &str {
+        &self.session_binding
+    }
+
+    /// Returns the local connection correlation id: diagnostic transport
+    /// evidence only, never renewal identity.
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
 }
 
 #[cfg(windows)]
@@ -250,23 +272,6 @@ impl DaemonKernelClient {
         let ticket_bytes = serde_json::to_vec(&ticket)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         Ok(super::classify_claimed_ticket_value(&ticket_bytes))
-    }
-
-    #[cfg(windows)]
-    pub async fn submit_agent_activation_decision(
-        &self,
-        decision: &AgentActivationResolutionDecision,
-    ) -> Result<(), super::DaemonError> {
-        decision
-            .validate()
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        self.transact_async(
-            "agent_activation_submit",
-            serde_json::json!({ "decision": decision }),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     #[cfg(windows)]
@@ -448,7 +453,7 @@ impl DaemonKernelClient {
         }
     }
 
-    pub fn report_ready(&self) -> Result<(), super::DaemonError> {
+    pub fn report_ready(&self) -> Result<super::DaemonReadySupervision, super::DaemonError> {
         // #740: readiness span, distinct from the handshake span above.
         let _span = tracing::info_span!("eliotd.daemon_readiness").entered();
         #[cfg(windows)]
@@ -457,10 +462,14 @@ impl DaemonKernelClient {
                 .enable_all()
                 .build()
                 .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-            runtime
+            let value = runtime
                 .block_on(self.report_ready_with_pre_admission_retry())
-                .map(|_| ())
-                .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+            // Issue #88, wave 3: the Kernel answers `daemon_ready` with the
+            // once-per-generation supervision bundle (authority lineage plus
+            // the exact current lease head). The per-tick producer cites this
+            // bundle verbatim; a missing bundle fails readiness closed.
+            super::parse_daemon_ready_supervision(&value).map_err(super::DaemonError::Kernel)
         }
         #[cfg(not(windows))]
         {
@@ -468,6 +477,32 @@ impl DaemonKernelClient {
                 KernelClientError::Unsupported.to_string(),
             ))
         }
+    }
+
+    /// Submits one per-tick supervision-progress renewal request on the
+    /// authenticated daemon channel (Implements #88, wave 3).
+    ///
+    /// The request carries only daemon-observed evidence plus the last
+    /// Kernel-answered predecessor; the Kernel decides renewal and always
+    /// answers with its exact durable head so the producer converges after
+    /// renewals on any path. Typed refusals arrive as parsed answers, never
+    /// as transport errors; only delivery/contract failures error here.
+    #[cfg(windows)]
+    pub async fn submit_supervision_progress(
+        &self,
+        request: &eliot_runtime_contracts::DaemonSupervisionRenewalRequest,
+    ) -> Result<super::SupervisionProgressAnswer, super::DaemonError> {
+        request
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                super::DAEMON_SUPERVISION_PROGRESS_OPERATION,
+                super::progress_submit_payload(request),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        super::parse_progress_answer(&value).map_err(super::DaemonError::Kernel)
     }
 
     pub fn report_degraded(&self, reason: impl Into<String>) -> Result<(), super::DaemonError> {
@@ -1065,6 +1100,304 @@ impl DaemonKernelClient {
             request_counter: Arc::clone(&self.request_counter),
             validated_session_binding: Mutex::new(self.validated_session_binding()),
         })
+    }
+}
+
+/// Authenticated `TestD` owner operation names served by the Kernel owner
+/// (`bins/eliot-kernel/src/testd_terminal_completion_route.rs`). The daemon
+/// mirrors the exact wire strings; the Kernel remains the route and fence
+/// authority and validates every payload shape, version, and digest.
+pub(super) const TESTD_OWNER_PENDING_DISPATCHES_OPERATION: &str =
+    "eliot.kernel.testd-owner-pending-dispatches";
+pub(super) const TESTD_OWNER_BIND_DISPATCH_OPERATION: &str =
+    "eliot.kernel.testd-owner-bind-dispatch";
+pub(super) const TESTD_OWNER_PENDING_TERMINALS_OPERATION: &str =
+    "eliot.kernel.testd-owner-pending-terminals";
+pub(super) const TESTD_OWNER_ACK_TERMINAL_OPERATION: &str = "eliot.kernel.testd-owner-ack-terminal";
+pub(super) const TESTD_OWNER_WIRE_VERSION: u16 = 1;
+/// Bound for one owner poll. Matches the Kernel owner limit exactly; a wider
+/// poll is refused before any transport is touched.
+pub(super) const TESTD_OWNER_POLL_LIMIT: u16 = 8;
+
+/// Daemon mirror of the Kernel pending-dispatch poll request. The Kernel
+/// owns validation; this mirror only constructs well-formed wire bytes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerPendingDispatchesRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub limit: u16,
+}
+
+/// Daemon mirror of the Kernel pending-terminal poll request.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerPendingTerminalsRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub limit: u16,
+}
+
+/// Daemon mirror of the Kernel bind-dispatch request. The digest binds the
+/// wire, job, and canonical binding bytes exactly as the Kernel recomputes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerBindDispatchRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub job_id: String,
+    pub binding: TestdVerifierDispatchBinding,
+    pub request_digest: String,
+}
+
+/// Daemon mirror of the Kernel ack-terminal request. The digest binds the
+/// wire, job, and canonical receipt bytes exactly as the Kernel recomputes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerAckTerminalRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub job_id: String,
+    pub receipt: WriteReceipt,
+    pub request_digest: String,
+}
+
+/// Daemon mirror of the Kernel pending-dispatch poll response.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerPendingDispatchesResponse {
+    pub pending: Vec<TestdPendingVerifierDispatch>,
+}
+
+/// Daemon mirror of the Kernel bind-dispatch response.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerBindDispatchResponse {
+    pub job_id: String,
+    pub binding_sha256: String,
+}
+
+/// Daemon mirror of the Kernel pending-terminal poll response.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerPendingTerminalsResponse {
+    pub evidence: Vec<TestdTerminalCompletionEvidence>,
+}
+
+/// Daemon mirror of the Kernel ack-terminal response.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TestdOwnerAckTerminalResponse {
+    pub job_id: String,
+    pub receipt: WriteReceipt,
+}
+
+fn testd_owner_limit(limit: u16) -> Result<u16, KernelPortError> {
+    if limit == 0 || limit > 64 {
+        return Err(KernelPortError::Contract(
+            "TestD owner poll limit must be between one and 64".to_owned(),
+        ));
+    }
+    Ok(limit)
+}
+
+fn testd_owner_job_id(job_id: &str) -> Result<(), KernelPortError> {
+    if job_id.trim().is_empty() || job_id.chars().any(char::is_control) {
+        return Err(KernelPortError::Contract(
+            "TestD owner job id must be non-blank and control-free".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn testd_owner_binding_sha256(
+    binding: &TestdVerifierDispatchBinding,
+) -> Result<String, KernelPortError> {
+    let bytes = canonical_json_bytes(binding)
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn testd_owner_receipt_sha256(receipt: &WriteReceipt) -> Result<String, KernelPortError> {
+    let bytes = canonical_json_bytes(receipt)
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn testd_owner_bind_request_digest(
+    job_id: &str,
+    binding_sha256: &str,
+) -> Result<String, KernelPortError> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        wire_id: &'a str,
+        wire_version: u16,
+        job_id: &'a str,
+        binding_sha256: &'a str,
+    }
+    let bytes = canonical_json_bytes(&Canonical {
+        wire_id: TESTD_OWNER_BIND_DISPATCH_OPERATION,
+        wire_version: TESTD_OWNER_WIRE_VERSION,
+        job_id,
+        binding_sha256,
+    })
+    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn testd_owner_ack_request_digest(
+    job_id: &str,
+    receipt_sha256: &str,
+) -> Result<String, KernelPortError> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        wire_id: &'a str,
+        wire_version: u16,
+        job_id: &'a str,
+        receipt_sha256: &'a str,
+    }
+    let bytes = canonical_json_bytes(&Canonical {
+        wire_id: TESTD_OWNER_ACK_TERMINAL_OPERATION,
+        wire_version: TESTD_OWNER_WIRE_VERSION,
+        job_id,
+        receipt_sha256,
+    })
+    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+impl DaemonKernelClient {
+    /// Polls the Kernel-owned pending verifier dispatches. The response
+    /// carries the full durable job plus the exact admitted frame identity;
+    /// the daemon computes the canonical plan binding from its Governor
+    /// read and persists it through the bind leg below.
+    ///
+    /// Kernel remains the route and fence authority; this method performs
+    /// no admission decision and never opens the `TestD` database.
+    pub(super) async fn query_testd_pending_dispatches_async(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<TestdPendingVerifierDispatch>, KernelPortError> {
+        let limit = testd_owner_limit(limit)?;
+        let request = TestdOwnerPendingDispatchesRequest {
+            wire_id: TESTD_OWNER_PENDING_DISPATCHES_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_WIRE_VERSION,
+            limit,
+        };
+        let value = self
+            .transact_async(
+                TESTD_OWNER_PENDING_DISPATCHES_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_owner_pending_dispatches")?;
+        let response: TestdOwnerPendingDispatchesResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(response.pending)
+    }
+
+    /// Persists one daemon-computed verifier-dispatch binding through the
+    /// Kernel owner. The binding must reuse the exact admitted identity the
+    /// Kernel retained at job admission; anything else fails closed
+    /// owner-side as a binding conflict.
+    pub(super) async fn acknowledge_testd_verifier_dispatch_async(
+        &self,
+        job_id: &str,
+        binding: TestdVerifierDispatchBinding,
+    ) -> Result<String, KernelPortError> {
+        testd_owner_job_id(job_id)?;
+        let binding_sha256 = testd_owner_binding_sha256(&binding)?;
+        let request_digest = testd_owner_bind_request_digest(job_id, &binding_sha256)?;
+        let request = TestdOwnerBindDispatchRequest {
+            wire_id: TESTD_OWNER_BIND_DISPATCH_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_WIRE_VERSION,
+            job_id: job_id.to_owned(),
+            binding,
+            request_digest,
+        };
+        let value = self
+            .transact_async(
+                TESTD_OWNER_BIND_DISPATCH_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_owner_bind_dispatch")?;
+        let response: TestdOwnerBindDispatchResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if response.job_id != job_id || response.binding_sha256 != binding_sha256 {
+            return Err(KernelPortError::Contract(
+                "Kernel bind-dispatch response does not bind the requested job and binding"
+                    .to_owned(),
+            ));
+        }
+        Ok(response.binding_sha256)
+    }
+
+    /// Polls the Kernel-owned pending terminal evidence. Each entry is a
+    /// complete identity-joined productive terminal row still missing its
+    /// canonical `WriteReceipt`; worker exit alone never qualifies.
+    pub(super) async fn query_testd_terminal_evidence_async(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<TestdTerminalCompletionEvidence>, KernelPortError> {
+        let limit = testd_owner_limit(limit)?;
+        let request = TestdOwnerPendingTerminalsRequest {
+            wire_id: TESTD_OWNER_PENDING_TERMINALS_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_WIRE_VERSION,
+            limit,
+        };
+        let value = self
+            .transact_async(
+                TESTD_OWNER_PENDING_TERMINALS_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_owner_pending_terminals")?;
+        let response: TestdOwnerPendingTerminalsResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(response.evidence)
+    }
+
+    /// Records one committed canonical `WriteReceipt` through the Kernel
+    /// owner. The receipt must be the exact canonical bytes advertised by
+    /// the terminal publication; anything else fails closed owner-side.
+    pub(super) async fn acknowledge_testd_terminal_completion_async(
+        &self,
+        job_id: &str,
+        receipt: WriteReceipt,
+    ) -> Result<WriteReceipt, KernelPortError> {
+        testd_owner_job_id(job_id)?;
+        receipt
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let receipt_sha256 = testd_owner_receipt_sha256(&receipt)?;
+        let request_digest = testd_owner_ack_request_digest(job_id, &receipt_sha256)?;
+        let request = TestdOwnerAckTerminalRequest {
+            wire_id: TESTD_OWNER_ACK_TERMINAL_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_WIRE_VERSION,
+            job_id: job_id.to_owned(),
+            receipt,
+            request_digest,
+        };
+        let value = self
+            .transact_async(
+                TESTD_OWNER_ACK_TERMINAL_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_owner_ack_terminal")?;
+        let response: TestdOwnerAckTerminalResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if response.job_id != job_id {
+            return Err(KernelPortError::Contract(
+                "Kernel ack-terminal response does not bind the requested job".to_owned(),
+            ));
+        }
+        Ok(response.receipt)
     }
 }
 

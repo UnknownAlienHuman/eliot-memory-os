@@ -11,6 +11,10 @@
     reason = "windows-only helpers are live on Windows; allow for cross-platform check"
 )]
 
+/// Backup configuration evidence projection (B-BACKUP-HOST-PREP #958).
+pub mod backup_config_projection;
+/// Host-owned isolated backup destination preparation (B-BACKUP-HOST-PREP #958).
+pub mod backup_preparation;
 mod credential_control;
 #[cfg(windows)]
 mod host_activation_durable;
@@ -29,6 +33,8 @@ mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
 mod launch_options;
+#[cfg(windows)]
+mod reactive_context_delivery;
 mod scm_launch;
 mod store_kernel_launch_sequence;
 /// Host Windows Event Log sink seam (F-LOG-HOST-0, #889): thin bounded
@@ -117,6 +123,10 @@ impl Drop for HostTerminalGuard<'_> {
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
     HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+    HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
+    UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
+    process_user_automation_execution_queue, reject_unbound_user_automation_execution,
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
 pub use eliot_host_service::runtime_control::{
@@ -138,6 +148,10 @@ use launch_descriptor_validation::{
 };
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
+#[cfg(windows)]
+pub use reactive_context_delivery::{
+    HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError,
+};
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
     classify_host_scm_inspection, validate_host_scm_bootstrap,
@@ -159,6 +173,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
+#[cfg(windows)]
+use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
     EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
@@ -186,6 +202,7 @@ use eliot_installation::{
 };
 #[cfg(windows)]
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 #[cfg(all(test, windows))]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
@@ -216,8 +233,8 @@ use eliot_platform_windows::{
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, HostOwnerLease, HostOwnerLeaseError,
     HostOwnerLeaseReleaseError, ProtectedRootLease, ServiceAccount, ServiceRegistrationRequest,
-    ServiceRegistrationRuntimeInspection, ServiceStartMode, TerminatedJobChild, WindowsPlatform,
-    fresh_kernel_activation_nonce,
+    ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStopOutcome, TerminatedJobChild,
+    WindowsPlatform, fresh_kernel_activation_nonce,
 };
 #[cfg(windows)]
 use eliot_process::DispatchAuthorityId;
@@ -340,14 +357,23 @@ use phase_b_previous_authority::{
 
 #[cfg(windows)]
 mod phase_b_materialization;
+#[cfg(all(windows, test))]
+use phase_b_materialization::phase_b_template_path;
 #[cfg(windows)]
 use phase_b_materialization::{
     agent_bridge_admission_descriptor, open_agent_bridge_final_lease, phase_b_bytes_digest,
     phase_b_lease_bytes, phase_b_lease_identity, phase_b_materialize_file_with_rollback,
     phase_b_remove_rollback_backup, phase_b_restore_or_remove, phase_b_template_bytes,
 };
-#[cfg(all(windows, test))]
-use phase_b_materialization::{phase_b_materialize_file, phase_b_template_path};
+
+mod notify_fallback_setup;
+pub use notify_fallback_setup::{
+    NotifyFallbackRegistration, NotifyFallbackSetup, NotifyFallbackSetupInputs,
+    PublishedNotifyDeclaration, publish_notify_fallback_declaration, register_notify_fallback,
+    setup_notify_fallback_per_user,
+};
+#[cfg(windows)]
+pub(crate) use phase_b_materialization::phase_b_materialize_file;
 
 #[cfg(windows)]
 mod phase_b_previous_projection;
@@ -390,15 +416,16 @@ mod kernel_activation_driver;
 use kernel_activation_driver::DurableKernelActivationDriver;
 
 #[cfg(windows)]
-mod kernel_front_door_client;
-#[cfg(windows)]
 mod host_startup_evidence;
+#[cfg(windows)]
+mod kernel_front_door_client;
 #[cfg(all(windows, test))]
 use kernel_front_door_client::kernel_front_door_acl_mode;
 #[cfg(windows)]
 use kernel_front_door_client::{
-    activation_response_or_reconcile, connect_authenticated_kernel_front_door,
-    kernel_control_request, validate_authenticated_kernel_peer,
+    HostKernelUserAutomationOwner, activation_response_or_reconcile,
+    connect_authenticated_kernel_front_door, kernel_control_request,
+    validate_authenticated_kernel_peer,
 };
 
 #[cfg(all(windows, test))]
@@ -505,7 +532,7 @@ fn validate_probe_response(
     request: &KernelControlRequest,
     activation: &KernelActivationReceipt,
     response: &KernelControlResponse,
-) -> Result<KernelReadyReceipt, HostError> {
+) -> Result<(KernelReadyReceipt, KernelRuntimeHealthEvidence), HostError> {
     request
         .validate()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -526,6 +553,27 @@ fn validate_probe_response(
     let ready = response.receipt.clone().ok_or_else(|| {
         HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
     })?;
+    let runtime_health = response.runtime_health.clone().ok_or_else(|| {
+        HostError::ProcessContour(
+            "Kernel did not return the canonical runtime-health carrier".to_owned(),
+        )
+    })?;
+    runtime_health
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let process_health = runtime_health.process_health();
+    if !runtime_health
+        .authority_epoch()
+        .is_same_authority(&request.candidate.kernel_epoch)
+        || runtime_health.module_generation() != activation.generation
+        || process_health.process_id() != ready.process.process_id.as_str()
+        || process_health.process_state() != ready.process.state
+        || process_health.health().canonical != ready.health
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel runtime-health carrier is foreign to the exact readiness contour".to_owned(),
+        ));
+    }
     let supervision = response.supervision_lease.as_ref().ok_or_else(|| {
         HostError::ProcessContour(
             "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
@@ -552,7 +600,7 @@ fn validate_probe_response(
     ready
         .validate_for_probe(request, activation)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    Ok(ready)
+    Ok((ready, runtime_health))
 }
 
 #[cfg(windows)]
@@ -560,6 +608,7 @@ struct AuthenticatedKernelReadiness {
     request: KernelControlRequest,
     response: KernelControlResponse,
     ready: KernelReadyReceipt,
+    runtime_health: KernelRuntimeHealthEvidence,
     supervision_lease: eliot_ors::SupervisionLeaseSnapshot,
     store_fence: PlatformHandle,
     peer_evidence: PlatformHandle,
@@ -1799,21 +1848,13 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let response = decode_control_response_frame(&response)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            if response.message_id != probe_request.message_id
-                || response.request_digest != probe_request.payload_digest
-                || response.error.is_some()
-                || response.state != KernelServiceState::Ready
-            {
-                return Err(HostError::ProcessContour(
-                    "Kernel ProbeReady response binding failed".to_owned(),
-                ));
-            }
-            let ready = response.receipt.ok_or_else(|| {
-                HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
-            })?;
-            ready
-                .validate_for_probe(&probe_request, &activation_receipt)
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            // Startup uses the same canonical carrier gate as every later
+            // readiness probe. A ready receipt alone cannot authorize the
+            // activation: the owner-produced health/compatibility evidence
+            // must bind to this exact request, generation, epoch, process,
+            // and health vector before Host commits Active.
+            let (ready, _runtime_health) =
+                validate_probe_response(&probe_request, &activation_receipt, &response)?;
             Ok((activation_receipt, ready))
         });
         let (activation_receipt, ready) = match ready {
@@ -2741,7 +2782,7 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let response = decode_control_response_frame(&frame)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let ready = validate_probe_response(&request, activation, &response)?;
+            let (ready, runtime_health) = validate_probe_response(&request, activation, &response)?;
             let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
                 HostError::ProcessContour(
                     "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
@@ -2758,6 +2799,7 @@ impl HostJobBranches {
                 request,
                 response,
                 ready,
+                runtime_health,
                 supervision_lease,
                 store_fence,
                 peer_evidence,
@@ -2998,6 +3040,27 @@ impl HostJobBranches {
             }
             None => Ok(BranchLiveness::Dead),
         }
+    }
+
+    /// Proves the process contour is still before any no-return/service
+    /// boundary for a first-install abort. Unknown Job observations and any
+    /// retained launch/recovery object fail closed; callers must preserve the
+    /// durable pending carrier in those cases.
+    pub(crate) fn pre_no_return_abort_liveness(&self) -> Result<(), String> {
+        let kernel = Self::branch_state(self.kernel.as_ref())?;
+        let store = Self::branch_state(self.store.as_ref())?;
+        if !matches!(kernel, BranchLiveness::Dead)
+            || !matches!(store, BranchLiveness::Dead)
+            || self.has_recorded_contour()
+            || self.launch.is_some()
+            || self.kernel_candidate.is_some()
+            || self.kernel_activation_receipt.is_some()
+        {
+            return Err(
+                "Host Job contour has live, unknown, or retained service progress".to_owned(),
+            );
+        }
+        Ok(())
     }
 
     fn liveness_only(&self) -> HostBranchDisposition {
@@ -3424,16 +3487,16 @@ fn epoch_contract_error(error: &EpochContractError) -> JournalError {
 
 #[cfg(windows)]
 mod watchdog_service_start;
-#[cfg(all(test, windows))]
-use watchdog_service_start::{
-    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
-    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
-};
 #[cfg(windows)]
 use watchdog_service_start::{
     InstalledWatchdogControl, InstalledWatchdogRuntimeInspection,
     approved_service_registration_request, select_watchdog_approval_for_inspection,
     start_installed_watchdog, verify_watchdog_scm_running,
+};
+#[cfg(all(test, windows))]
+use watchdog_service_start::{
+    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
+    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
 };
 
 fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
@@ -3539,8 +3602,7 @@ fn record_fence(
 mod journal_append;
 #[cfg(windows)]
 use journal_append::{
-    append_authenticated_kernel_readiness_with_heartbeat,
-    append_store_rebind_terminal,
+    append_authenticated_kernel_readiness_with_heartbeat, append_store_rebind_terminal,
     persist_store_rebind_disposition,
 };
 // The pre-transport append stays covered by journal tests through the
@@ -3611,6 +3673,18 @@ use store_recovery_evidence::{
     read_store_recovery_termination_evidence,
 };
 
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct WatchdogStartRecoveryCarrier {
+    registration: ServiceRegistrationRequest,
+    platform_root: PathBuf,
+    heartbeat_state_root: PathBuf,
+    issued_descriptor: watchdog_heartbeat::HeartbeatTransportDescriptor,
+    initial_stopped_without_process: bool,
+    descriptor_published: bool,
+    start_may_have_issued: bool,
+}
+
 /// Host-owned lifecycle state and installation activation registry.
 #[allow(
     clippy::struct_excessive_bools,
@@ -3660,9 +3734,13 @@ pub struct HostComposition {
     #[cfg(windows)]
     phase_b: Option<HostPhaseBMaterialization>,
     #[cfg(windows)]
+    watchdog_start_recovery: Option<WatchdogStartRecoveryCarrier>,
+    #[cfg(windows)]
     runtime_restarts: std::collections::HashMap<String, HostKernelRestartReceipt>,
     #[cfg(windows)]
     runtime_control_queue: HostRuntimeControlQueue,
+    #[cfg(windows)]
+    user_automation_execution_queue: HostUserAutomationExecutionQueue,
     #[cfg(windows)]
     store_recovery_startup_fence: StoreRecoveryStartupFence,
     active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind,
@@ -3918,6 +3996,183 @@ impl HostComposition {
         open_registry_store_at(&self.registry_host_root)
     }
 
+    /// Prepares one isolated backup destination through registry-committed
+    /// owner evidence (B-BACKUP-HOST-PREP #958).
+    ///
+    /// Binds the delegation sink to live composition authority: the
+    /// presented caller passes the
+    /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth)
+    /// owner gate (held lease covers the launch installation, presented
+    /// source equals it), and the destination is prepared from inspected
+    /// owner evidence through the caller-supplied journal sink. The sink
+    /// returns alongside the destination so the caller can reconcile,
+    /// cancel, or clean up the same operation later. Durable production
+    /// journal binding awaits the Host-state owner's preparation record
+    /// variant; until then the sink stays a port. Caller-channel
+    /// authentication beyond this installation binding stays parameterized
+    /// pending role-bound control contracts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
+    /// when the caller gate, lease/installation binding, owner evidence,
+    /// admission, or journal persistence fails closed.
+    pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>(
+        &self,
+        journal: J,
+        caller: &crate::backup_preparation::BackupCallerAuth,
+        request: &crate::backup_preparation::PresentedPreparationRequest,
+    ) -> Result<
+        (
+            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::PreparedDestination,
+        ),
+        crate::backup_preparation::PreparationError,
+    > {
+        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence};
+        caller.authenticate_for_owner(
+            &self.owner_lease,
+            self.launch_options.installation(),
+            &request.source_installation_id,
+        )?;
+        let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
+        let mut sink = DelegatedPreparation::new(journal);
+        let prepared = sink.prepare(&evidence, request)?;
+        Ok((sink, prepared))
+    }
+
+    /// Accepted backup dispatch table (#954 envelope/method bridge, #962).
+    ///
+    /// Each entry is `(operation, owner path marker, needs_cutover_admission)`:
+    /// `PREPARE_ISOLATED_RESTORE` resolves through the #958 owner preparation
+    /// chain (see [`HostComposition::backup_dispatch_prepare`], which calls
+    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare));
+    /// `ADMIT_CUTOVER` resolves through the #961 owner cutover chain
+    /// (`crate::backup_cutover::execute_cutover`) exclusively under a separate
+    /// cutover admission. No algorithm is reimplemented here. Registration
+    /// runs [`HostComposition::validate_backup_dispatch_prepare_routing`]
+    /// over the table so the routing cannot rot unwired.
+    pub fn register_backup_dispatch() -> [(
+        eliot_protocol::backup::BackupOperationKind,
+        &'static str,
+        bool,
+    ); 2] {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        let dispatch = [
+            (
+                BackupOp::PrepareIsolatedRestore,
+                "crate::backup_preparation::DelegatedPreparation::prepare",
+                false,
+            ),
+            (
+                BackupOp::AdmitCutover,
+                "crate::backup_cutover::execute_cutover",
+                true,
+            ),
+        ];
+        // Pin the preparation routing validation into registration;
+        // wiring-only, no backup operation runs here.
+        Self::validate_backup_dispatch_prepare_routing(dispatch);
+        dispatch
+    }
+
+    /// Validates the accepted backup dispatch routing shared by
+    /// registration and preparation (#962).
+    ///
+    /// Wiring-only pin: the closed two-entry table carries the preparation
+    /// path without cutover admission and the cutover path with it, while
+    /// rehearsal completion resolves to no entry so rehearsal can never
+    /// route to cutover. [`HostComposition::register_backup_dispatch`]
+    /// invokes this validation, and so does
+    /// [`HostComposition::backup_dispatch_prepare`] before delegating to
+    /// [`HostComposition::prepare_backup_destination`]; no backup operation
+    /// runs here.
+    fn validate_backup_dispatch_prepare_routing(
+        dispatch: [(
+            eliot_protocol::backup::BackupOperationKind,
+            &'static str,
+            bool,
+        ); 2],
+    ) {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        // Length is pinned by the `[T; 2]` type; pin the routing contents.
+        let [
+            (prepare_op, prepare_marker, prepare_admission),
+            (cutover_op, cutover_marker, cutover_admission),
+        ] = dispatch;
+        debug_assert_eq!(prepare_op, BackupOp::PrepareIsolatedRestore);
+        debug_assert!(!prepare_marker.is_empty());
+        debug_assert!(!prepare_admission);
+        debug_assert_eq!(cutover_op, BackupOp::AdmitCutover);
+        debug_assert!(!cutover_marker.is_empty());
+        debug_assert!(cutover_admission);
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::PrepareIsolatedRestore),
+            Some(false)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::AdmitCutover),
+            Some(true)
+        );
+        debug_assert_eq!(
+            Self::backup_dispatch_needs_cutover_admission(BackupOp::CompleteRehearsal),
+            None
+        );
+    }
+
+    /// Reports whether one backup operation needs a separate cutover
+    /// admission on the dispatch table (#962).
+    ///
+    /// Returns `Some(false)` for the preparation path, `Some(true)` for the
+    /// cutover path, and `None` for operations with no dispatch entry.
+    /// Rehearsal guard: `COMPLETE_REHEARSAL` returns `None`, so a rehearsal
+    /// completion can never resolve cutover.
+    pub fn backup_dispatch_needs_cutover_admission(
+        operation: eliot_protocol::backup::BackupOperationKind,
+    ) -> Option<bool> {
+        use eliot_protocol::backup::BackupOperationKind as BackupOp;
+        match operation {
+            BackupOp::PrepareIsolatedRestore => Some(false),
+            BackupOp::AdmitCutover => Some(true),
+            // `CompleteRehearsal` and every other operation share this arm:
+            // rehearsal completion has no dispatch entry, so it can never
+            // resolve cutover.
+            _ => None,
+        }
+    }
+
+    /// Dispatches one accepted preparation through the existing owner chain
+    /// (#962). This delegates to
+    /// [`HostComposition::prepare_backup_destination`], which authenticates
+    /// the caller, inspects owner evidence, and runs
+    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare);
+    /// the production caller chain is preserved and no algorithm is
+    /// reimplemented here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
+    /// when the caller gate, lease/installation binding, owner evidence,
+    /// admission, or journal persistence fails closed.
+    pub fn backup_dispatch_prepare<J: crate::backup_preparation::PreparationJournal>(
+        &self,
+        journal: J,
+        caller: &crate::backup_preparation::BackupCallerAuth,
+        request: &crate::backup_preparation::PresentedPreparationRequest,
+    ) -> Result<
+        (
+            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::PreparedDestination,
+        ),
+        crate::backup_preparation::PreparationError,
+    > {
+        // Route through the shared dispatch validation before delegating:
+        // preparation must resolve without cutover admission, cutover with
+        // it, and rehearsal completion to no entry.
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
+        self.prepare_backup_destination(journal, caller, request)
+    }
+
     /// Opens the durable Host contour for one installation identity and
     /// advances its persisted epoch before any process admission.
     ///
@@ -3934,6 +4189,10 @@ impl HostComposition {
         // guard. Missing evidence suppresses `admitted`, never a new branch.
         host_lifecycle_observe_requested("host.open requested");
         let mut host_terminal = HostTerminalGuard::armed("host-open-failed");
+        // Backup dispatch wiring (#962): pin the accepted preparation /
+        // cutover routing into the production startup path so it cannot rot
+        // unwired. Wiring-only: no backup operation runs here.
+        Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
         if launch_options.installation().as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }
@@ -4068,9 +4327,15 @@ impl HostComposition {
             #[cfg(windows)]
             phase_b: None,
             #[cfg(windows)]
+            watchdog_start_recovery: None,
+            #[cfg(windows)]
             runtime_restarts: durable_restarts,
             #[cfg(windows)]
             runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            #[cfg(windows)]
+            user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
             #[cfg(windows)]
@@ -4812,8 +5077,9 @@ impl HostComposition {
         let _guard = capability
             .live_guard()
             .map_err(|e| HostError::Platform(e.to_string()))?;
-        let control = HostRuntimeControl::new_with_capability(
+        let control = HostRuntimeControl::new_with_capability_and_user_automation(
             std::sync::Arc::clone(&self.runtime_control_queue),
+            std::sync::Arc::clone(&self.user_automation_execution_queue),
             &capability,
         )
         .map_err(HostError::Platform)?;
@@ -4823,9 +5089,126 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn user_automation_owner(&self) -> Result<HostKernelUserAutomationOwner, HostError> {
+        let candidate = self.jobs.kernel_candidate.clone().ok_or_else(|| {
+            HostError::ProcessContour(
+                "UserAutomation owner has no retained Kernel candidate".to_owned(),
+            )
+        })?;
+        let activation = self.jobs.kernel_activation_receipt.clone().ok_or_else(|| {
+            HostError::ProcessContour(
+                "UserAutomation owner has no Kernel activation receipt".to_owned(),
+            )
+        })?;
+        let kernel_process = self.jobs.kernel_process().cloned().ok_or_else(|| {
+            HostError::ProcessContour(
+                "UserAutomation owner has no retained live Kernel process".to_owned(),
+            )
+        })?;
+        self.jobs.validate_running_kernel_candidate(&candidate)?;
+        HostKernelUserAutomationOwner::new(candidate, activation, kernel_process)
+    }
+
+    /// Drains the authenticated `UserAutomation` queue through the retained
+    /// Kernel front-door owner and the canonical Host journal Wake owner.
+    ///
+    /// The queue carries the channel evidence selected by the authenticated
+    /// runtime-control transport. An endpoint is therefore composed per
+    /// request from that exact binding; a request can never borrow another
+    /// request's connection identity or fence. The Durable Job adapter calls
+    /// the Kernel's authenticated Dreamer route, which in turn calls the
+    /// retained canonical Store gateway. Wake cancellation remains a direct
+    /// operation of the sole Host journal owner.
+    #[cfg(windows)]
+    pub fn process_user_automation_requests(
+        &self,
+        queue: &HostUserAutomationExecutionQueue,
+    ) -> Result<usize, HostError> {
+        let queue_empty = queue
+            .lock()
+            .map_err(|_| {
+                HostError::ProcessContour("UserAutomation owner queue lock is poisoned".to_owned())
+            })?
+            .is_empty();
+        if queue_empty {
+            return Ok(0);
+        }
+        host_lifecycle_observe_scm("host.user-automation owner requested");
+        let (kernel_owner, unavailable_reason) = match self.user_automation_owner() {
+            Ok(owner) => (Some(owner), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        runtime.block_on(async {
+            let mut processed = 0;
+            while let Some(envelope) = pop_user_automation_execution(queue) {
+                let request = envelope.request().clone();
+                let session = envelope.session().clone();
+                let response =
+                    if let Some(owner) = kernel_owner.as_ref() {
+                        match owner.owner_binding() {
+                            Ok(owner_binding) if session.owner() == &owner_binding => {
+                                let endpoint =
+                                    UserAutomationHostExecutionEndpoint::new_with_owner_binding(
+                                        owner_binding,
+                                        HostDurableJobAdapter::new(owner),
+                                        HostWakeIntentAdapter::new(&self.journal),
+                                    );
+                                match endpoint {
+                                    Ok(endpoint) => {
+                                        Box::pin(endpoint.execute_authenticated_response(
+                                            request.clone(),
+                                            session,
+                                        ))
+                                        .await
+                                    }
+                                    Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                        &request, error,
+                                    ),
+                                }
+                            }
+                            Ok(_) => UserAutomationHostExecutionResponse::failed_for(
+                                &request,
+                                UserAutomationRuntimeError::IdentityConflict,
+                            ),
+                            Err(error) => UserAutomationHostExecutionResponse::failed_for(
+                                &request,
+                                UserAutomationRuntimeError::Unavailable(error.to_string()),
+                            ),
+                        }
+                    } else {
+                        UserAutomationHostExecutionResponse::failed_for(
+                            &request,
+                            UserAutomationRuntimeError::Unavailable(
+                                unavailable_reason
+                                    .as_deref()
+                                    .unwrap_or("UserAutomation Kernel owner is unavailable")
+                                    .to_owned(),
+                            ),
+                        )
+                    };
+                let _ = envelope.respond(response);
+                processed += 1;
+            }
+            Ok::<usize, HostError>(processed)
+        })
+    }
+
+    #[cfg(windows)]
     #[allow(missing_docs)]
     pub fn runtime_control_queue(&self) -> HostRuntimeControlQueue {
         std::sync::Arc::clone(&self.runtime_control_queue)
+    }
+
+    /// Returns the bounded `UserAutomation` owner queue admitted by the
+    /// authenticated runtime-control endpoint.
+    #[cfg(windows)]
+    pub fn user_automation_execution_queue(&self) -> HostUserAutomationExecutionQueue {
+        std::sync::Arc::clone(&self.user_automation_execution_queue)
     }
 
     #[cfg(windows)]
@@ -5310,6 +5693,7 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn start_watchdog(
+        &mut self,
         phase_b: &HostPhaseBMaterialization,
         scm_launch: &RuntimeLaunchDescriptor,
         approval: &InstallerServiceRegistrationApproval,
@@ -5374,6 +5758,16 @@ impl HostComposition {
             &launch.watchdog_executable_path,
         )?;
         debug_assert_eq!(registration.binary_path(), image.as_path());
+        if self.watchdog_start_recovery.is_some() {
+            return Err(HostError::RecoveryRequired(
+                "a prior Watchdog start still has an unreconciled recovery carrier".to_owned(),
+            ));
+        }
+        let initial_stopped_without_process = matches!(
+            platform.inspect_service_registration_runtime(&registration),
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+                if observation.is_stopped() && observation.process().is_none()
+        );
         // Transport1750 step 1: mint the per-instance heartbeat rendezvous
         // (ACL-restricted pipe plus 256-bit challenge) and publish it
         // through the trusted contour the Watchdog already reads (the
@@ -5390,7 +5784,24 @@ impl HostComposition {
             heartbeat_bootstrap.installation_id(),
             heartbeat_bootstrap.transaction_plan_generation(),
         )?;
+        self.watchdog_start_recovery = Some(WatchdogStartRecoveryCarrier {
+            registration: registration.clone(),
+            platform_root: PathBuf::from(launch.kernel_work_root.as_str()),
+            heartbeat_state_root: heartbeat_state_root.to_path_buf(),
+            issued_descriptor: heartbeat_issued.clone(),
+            initial_stopped_without_process,
+            // Publishing is an externally visible atomic replacement. Mark
+            // it as potentially complete before dispatch so a response-loss
+            // error cannot make abort infer that the file is absent.
+            descriptor_published: true,
+            start_may_have_issued: false,
+        });
         heartbeat_issued.publish(heartbeat_state_root)?;
+        if let Some(carrier) = self.watchdog_start_recovery.as_mut() {
+            // StartServiceW may have crossed its provider boundary even when
+            // the helper returns an error or an unknown convergence result.
+            carrier.start_may_have_issued = true;
+        }
         start_installed_watchdog(&mut platform, &registration, context)?;
         // Transport1750 step 2: bind the rendezvous to the SCM-verified
         // incarnation now Running. Admission and the writer both pin this
@@ -5404,12 +5815,7 @@ impl HostComposition {
                 state,
                 wait_hint_ms,
                 process,
-            } => verify_watchdog_scm_running(
-                &registration,
-                state,
-                wait_hint_ms,
-                process.as_ref(),
-            )?,
+            } => verify_watchdog_scm_running(&registration, state, wait_hint_ms, process.as_ref())?,
             _ => {
                 return Err(HostError::RecoveryRequired(
                     "Watchdog is not Running for heartbeat incarnation bind".to_owned(),
@@ -5423,6 +5829,203 @@ impl HostComposition {
             scm.process.start_time_100ns,
         )?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn watchdog_start_inputs_for_manifest(
+        &self,
+        manifest: &CandidateManifest,
+    ) -> Result<Option<(ServiceRegistrationRequest, PathBuf, PathBuf)>, HostError> {
+        let Some(approval) = select_watchdog_approval_for_inspection(&self.registry, manifest)?
+        else {
+            return Ok(None);
+        };
+        let launch = &manifest.runtime_launch;
+        let registration = approved_service_registration_request(
+            launch,
+            &approval,
+            InstallerServiceRole::Watchdog,
+            &launch.watchdog_executable_path,
+        )?;
+        Ok(Some((
+            registration,
+            PathBuf::from(launch.kernel_work_root.as_str()),
+            PathBuf::from(launch.runtime_state_roots.host_state_root.as_str()),
+        )))
+    }
+
+    #[cfg(windows)]
+    fn pending_watchdog_start_inputs(
+        &self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<Option<(ServiceRegistrationRequest, PathBuf, PathBuf)>, HostError> {
+        self.watchdog_start_inputs_for_manifest(&pending.manifest)
+    }
+
+    #[cfg(windows)]
+    fn reconcile_watchdog_start_bound(
+        &mut self,
+        registration: ServiceRegistrationRequest,
+        platform_root: PathBuf,
+        heartbeat_state_root: PathBuf,
+    ) -> Result<(), HostError> {
+        let carrier = self.watchdog_start_recovery.clone();
+        if let Some(carrier) = carrier.as_ref() {
+            if carrier.registration != registration
+                || !windows_paths_equal(&carrier.platform_root, &platform_root)
+                || !windows_paths_equal(&carrier.heartbeat_state_root, &heartbeat_state_root)
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog recovery carrier is not bound to the pending launch".to_owned(),
+                ));
+            }
+            if !carrier.initial_stopped_without_process {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog start was not admitted from an exact stopped/no-process state"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let platform = WindowsPlatform::new(platform_root)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut stopped_process = None;
+        match platform.inspect_service_registration_runtime(&registration) {
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+                if observation.is_stopped() && observation.process().is_none() => {}
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+                if observation.is_running() =>
+            {
+                let Some(carrier) = carrier.as_ref() else {
+                    return Err(HostError::RecoveryRequired(
+                        "Watchdog is Running without an operation-bound start carrier".to_owned(),
+                    ));
+                };
+                if !carrier.descriptor_published || !carrier.start_may_have_issued {
+                    return Err(HostError::RecoveryRequired(
+                        "Running Watchdog lacks the complete operation-bound start carrier"
+                            .to_owned(),
+                    ));
+                }
+                let process = observation.process().ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "Watchdog Running state has no handle-bound process identity".to_owned(),
+                    )
+                })?;
+                let current_descriptor =
+                    watchdog_heartbeat::HeartbeatTransportDescriptor::load(&heartbeat_state_root)?
+                        .ok_or_else(|| {
+                            HostError::RecoveryRequired(
+                                "Running Watchdog has no heartbeat descriptor for rollback binding"
+                                    .to_owned(),
+                            )
+                        })?;
+                if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
+                    || current_descriptor.host_challenge_nonce
+                        != carrier.issued_descriptor.host_challenge_nonce
+                    || current_descriptor.service_instance_guid
+                        != carrier.issued_descriptor.service_instance_guid
+                    || current_descriptor.installation_id
+                        != carrier.issued_descriptor.installation_id
+                    || current_descriptor.transaction_plan_generation
+                        != carrier.issued_descriptor.transaction_plan_generation
+                    || current_descriptor.watchdog_incarnation_pid != process.process_id
+                    || current_descriptor.watchdog_incarnation_start_100ns
+                        != process.start_time_100ns
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Running Watchdog is not the exact heartbeat-bound start peer".to_owned(),
+                    ));
+                }
+                let runtime_identity_digest =
+                    observation.runtime_identity_digest().ok_or_else(|| {
+                        HostError::RecoveryRequired(
+                            "Running Watchdog has no runtime identity digest".to_owned(),
+                        )
+                    })?;
+                let stop_request = carrier
+                    .registration
+                    .clone()
+                    .with_expected_runtime_identity_digest(runtime_identity_digest)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                match platform
+                    .stop_service_registration(&stop_request)
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+                {
+                    ServiceStopOutcome::Stopped { .. }
+                    | ServiceStopOutcome::AlreadyStopped { .. } => {
+                        stopped_process = Some((process.process_id, process.start_time_100ns));
+                    }
+                    ServiceStopOutcome::AlreadyStopping { .. }
+                    | ServiceStopOutcome::EffectUnknown => {
+                        return Err(HostError::RecoveryRequired(
+                            "Watchdog stop outcome is not durably known".to_owned(),
+                        ));
+                    }
+                }
+            }
+            ServiceRegistrationRuntimeInspection::Matching { observation } => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "Watchdog SCM state {:?} is not a safe abort boundary",
+                    observation.state()
+                )));
+            }
+            ServiceRegistrationRuntimeInspection::Absent => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog registration is absent during start rollback".to_owned(),
+                ));
+            }
+            ServiceRegistrationRuntimeInspection::Mismatched
+            | ServiceRegistrationRuntimeInspection::Unknown { .. } => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog registration cannot be authoritatively reconciled".to_owned(),
+                ));
+            }
+        }
+
+        if stopped_process.is_some() {
+            match platform.inspect_service_registration_runtime(&registration) {
+                ServiceRegistrationRuntimeInspection::Matching { observation }
+                    if observation.is_stopped() && observation.process().is_none() => {}
+                _ => {
+                    return Err(HostError::RecoveryRequired(
+                        "Watchdog stop lacks exact stopped/no-process readback".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(carrier) = carrier.as_ref() {
+            watchdog_heartbeat::remove_start_artifacts_exact(
+                &heartbeat_state_root,
+                &carrier.issued_descriptor,
+                stopped_process,
+            )?;
+            self.watchdog_start_recovery = None;
+        } else {
+            watchdog_heartbeat::require_no_start_artifacts(&heartbeat_state_root)?;
+        }
+        Ok(())
+    }
+
+    /// Reconciles every Watchdog effect before the first-install registry
+    /// abort.  A service stop is admitted only when this Host's carrier proves
+    /// that the approved registration was initially stopped, the current SCM
+    /// process is the exact bound heartbeat peer, and the stop primitive
+    /// confirms the post-call state.  Restarted Hosts have no operation-bound
+    /// carrier and therefore accept only an exact stopped SCM service with no
+    /// heartbeat artifacts; all other states remain recovery-required.
+    #[cfg(windows)]
+    pub(crate) fn reconcile_watchdog_start_for_abort(
+        &mut self,
+        pending: &eliot_installation::PendingActivation,
+    ) -> Result<(), HostError> {
+        let Some((registration, platform_root, heartbeat_state_root)) =
+            self.pending_watchdog_start_inputs(pending)?
+        else {
+            return Ok(());
+        };
+        self.reconcile_watchdog_start_bound(registration, platform_root, heartbeat_state_root)
     }
 
     #[cfg(windows)]
@@ -5713,30 +6316,40 @@ impl HostComposition {
             .push(phase_b_activation_binding(&phase_b)?);
         self.append_record(HostStateRecord::Activation(next))?;
         if let Some(watchdog_approval) = watchdog_approval.as_ref() {
-            Self::start_watchdog(
+            if let Err(error) = self.start_watchdog(
                 &phase_b,
                 &manifest.runtime_launch,
                 watchdog_approval,
                 lifecycle_context(&self.host, "watchdog-start")?,
-            )?;
+            ) {
+                return self.cleanup_launched_contour(error);
+            }
         }
-        let (kernel_artifact, approved_store_artifact) = manifest
+        let (kernel_artifact, approved_store_artifact) = match manifest
             .host_child_artifact_digests()
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return self.cleanup_launched_contour(HostError::ProcessContour(error.to_string()));
+            }
+        };
         if approved_store_artifact != store_artifact {
-            return Err(HostError::ProcessContour(
+            return self.cleanup_launched_contour(HostError::ProcessContour(
                 "Store bridge artifact digest is not the approved manifest digest".to_owned(),
             ));
         }
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
-        let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
+        let (prior_kernel, kernel_generation, kernel_authority_epoch) = match self
             .next_kernel_activation_context(
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
                 None,
-            )?;
-        self.jobs.start_approved(
+            ) {
+            Ok(value) => value,
+            Err(error) => return self.cleanup_launched_contour(error),
+        };
+        if let Err(error) = self.jobs.start_approved(
             kernel_executable,
             store_executable,
             &manifest.generation,
@@ -5749,7 +6362,9 @@ impl HostComposition {
             store_artifact,
             &self.host,
             &phase_b.launch,
-        )?;
+        ) {
+            return self.cleanup_launched_contour(error);
+        }
         let agent_bridge_admission = match (phase_b.agent_bridge(), phase_b.final_agent_bridge()) {
             (Some(_prepared), None) => Err(HostError::RecoveryRequired(
                 "Agent Bridge admission requires the final provider binding".to_owned(),
@@ -5797,6 +6412,10 @@ impl HostComposition {
         if let Err(error) = self.persist_process_observations(&manifest.generation) {
             self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
         } else {
+            // The full contour is now Active and the start carrier no longer
+            // guards a pending first-install abort. Any earlier failure kept
+            // it intact for exact SCM/heartbeat reconciliation.
+            self.watchdog_start_recovery = None;
             // F-LOG-HOST-1: started only; readiness needs its own proof.
             host_lifecycle_observe_requested("host.start-manifest started");
             Ok(())
@@ -6513,8 +7132,9 @@ impl HostComposition {
             InstallerServiceRole::Watchdog,
             &scm_launch.watchdog_executable_path,
         )?;
-        let mut platform = WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
-            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let mut platform =
+            WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
+                .map_err(|error| HostError::Platform(error.to_string()))?;
         let scm = match platform.inspect_registration_runtime(&registration) {
             InstalledWatchdogRuntimeInspection::Matching {
                 state,
@@ -6772,18 +7392,35 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn reconcile_watchdog_start_for_cleanup(&mut self) -> Result<(), HostError> {
+        let Some((registration, platform_root, heartbeat_state_root)) =
+            self.watchdog_start_recovery.as_ref().map(|carrier| {
+                (
+                    carrier.registration.clone(),
+                    carrier.platform_root.clone(),
+                    carrier.heartbeat_state_root.clone(),
+                )
+            })
+        else {
+            return Ok(());
+        };
+        self.reconcile_watchdog_start_bound(registration, platform_root, heartbeat_state_root)
+    }
+
+    #[cfg(windows)]
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
         // F-LOG-HOST-1: cleanup phase only; outer owns the terminal.
         host_lifecycle_observe_drain("host.cleanup-launched requested");
+        let watchdog = self.reconcile_watchdog_start_for_cleanup();
         let store = self.jobs.terminate_store();
         let kernel = self.jobs.terminate_kernel();
-        match (kernel, store) {
-            (Ok(()), Ok(())) => {
+        match (watchdog, kernel, store) {
+            (Ok(()), Ok(()), Ok(())) => {
                 self.jobs.clear_recorded_contour();
                 Err(error)
             }
-            (kernel, store) => Err(HostError::RecoveryRequired(format!(
-                "persistence failed ({error}); launched contour cleanup requires recovery: kernel={kernel:?}, store={store:?}"
+            (watchdog, kernel, store) => Err(HostError::RecoveryRequired(format!(
+                "persistence failed ({error}); launched contour cleanup requires recovery: watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
             ))),
         }
     }

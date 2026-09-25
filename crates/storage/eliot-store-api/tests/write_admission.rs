@@ -38,10 +38,11 @@ use eliot_store_api::{
     NamedReadRequest, NamedReadResponse, OperationIdentity, OperationManifestDigest,
     OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecoveryRecord, RequestMeta,
     ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
-    ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreHealthStatus, StoreRecoveryRequest, StoreRequest, TransitionClass,
-    WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding, sha256_hex,
+    ScopeId, ScopeRevisionView, SecurityContext, StoreBackupOperation, StoreBackupRequest,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
+    StoreRequest, TransitionClass, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
+    WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
+    bind_issue18_digests, render_semantic_source_revisions, sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -64,7 +65,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransition {
-    eliot_store_api::PreparedTransition {
+    let mut transition = eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("op-admit-1").unwrap(),
             idempotency_key: "idem-admit-1".to_owned(),
@@ -81,6 +82,12 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
         operation_manifest_digest: OperationManifestDigest::new("manifest-admit-1").unwrap(),
+        // Derived bindings, never placeholders. The envelope path renders
+        // the admitted expected heads; every request built on this
+        // transition below carries exactly `revision_heads()`.
+        admission_digest: String::new(),
+        mutation_plan_digest: String::new(),
+        semantic_source_revisions: render_semantic_source_revisions(&revision_heads()),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
             parameters: BTreeMap::from([("subject".to_owned(), json!("observation-admit-1"))]),
@@ -92,7 +99,9 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
         },
         security: SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
-    }
+    };
+    bind_issue18_digests(&mut transition).unwrap();
+    transition
 }
 
 fn transition() -> eliot_store_api::PreparedTransition {
@@ -303,11 +312,25 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "7265472a978bd13efd07fed9487cb1667fc0e43142709ed5dde33a13cc89b038"
+        "3d9dd652702e2df81373b4c180299229a519da0b2a491550ccb1bf7171c1e0ea"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "746d87f6c80bfbe72063173cb56608940bf148bb57dd43cb95ea7a670eeab7f2"
+        "3d6eb8c4fac7952e74d71565a158c633c426384cbe0ef5a692d6d945d33707f3"
+    );
+    // Issue #18: the frozen transition carries derived (never defaulted)
+    // decision/plan digests plus the rendered source revisions.
+    assert_eq!(
+        from_fixture.transition.admission_digest,
+        "85c55439e5ab7cab499f106a2cfad50fe9a7dd0c3d6796b15278963bb02ff7e4"
+    );
+    assert_eq!(
+        from_fixture.transition.mutation_plan_digest,
+        "f67bc87634ad01aa2ccbdcd3bb8546e379fed288e3886193c42942c648cbbae2"
+    );
+    assert_eq!(
+        from_fixture.transition.semantic_source_revisions,
+        vec!["rev-admit-1@3".to_owned()]
     );
     assert_eq!(from_fixture.admission.scopes.len(), 1);
     assert_eq!(
@@ -763,6 +786,29 @@ fn dreamer_wire_request() -> StoreRequest {
     }
 }
 
+/// Minimal backup wire request (issue #975).
+///
+/// The `Status` operation carries no fenced payload beyond the context, so
+/// it is the smallest shape that still proves the closed `Backup` variant,
+/// its fixed `op` tag, and its declared-but-unadvertised capability. The
+/// envelope identity matches the status operation, satisfying the #975
+/// envelope/payload coherence rule.
+fn backup_wire_request() -> StoreRequest {
+    StoreRequest::Backup {
+        request: StoreBackupRequest {
+            context: context(),
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-admit-backup-1").unwrap(),
+                idempotency_key: "idem-admit-backup-1".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            operation: StoreBackupOperation::Status {
+                operation_id: OperationId::new("op-admit-backup-1").unwrap(),
+            },
+        },
+    }
+}
+
 /// Fixed `op` tag for one wire variant.
 ///
 /// Exhaustive on purpose: adding a `StoreRequest` variant breaks this match
@@ -776,6 +822,7 @@ fn store_request_op_tag(request: &StoreRequest) -> &'static str {
         StoreRequest::Named { .. } => "named",
         StoreRequest::Apply { .. } => "apply",
         StoreRequest::ReservedWrite { .. } => "reserved_write",
+        StoreRequest::Backup { .. } => "backup",
         StoreRequest::Recovery { .. } => "recovery",
         StoreRequest::InitializeGenesis { .. } => "initialize_genesis",
         StoreRequest::Receipt { .. } => "receipt",
@@ -804,10 +851,11 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
     // Closed wire-variant catalogue: every exported `StoreRequest` variant
     // encodes under its fixed `op` tag, round-trips, and validates. Slice
-    // #991 adds exactly one variant (`reserved_write`), covered in the
-    // catalogue below; the legacy eleven keep their exact tags, encodings,
-    // and advertised capabilities unchanged, while the reserved-write
-    // capability stays declared-but-unadvertised (proven in the loop and
+    // #991 adds exactly one variant (`reserved_write`) and slice #975 adds
+    // exactly one variant (`backup`), covered in the catalogue below; the
+    // legacy eleven keep their exact tags, encodings, and advertised
+    // capabilities unchanged, while the reserved-write and backup
+    // capabilities stay declared-but-unadvertised (proven in the loop and
     // again explicitly below).
     let catalogue = vec![
         StoreRequest::Health,
@@ -830,6 +878,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         StoreRequest::ReservedWrite {
             request: valid_request(),
         },
+        backup_wire_request(),
     ];
     let mut tags = Vec::new();
     for variant in &catalogue {
@@ -842,14 +891,16 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         let decoded: StoreRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(&decoded, variant);
         assert!(decoded.validate().is_ok());
-        if store_request_op_tag(variant) == "reserved_write" {
-            assert_eq!(
-                decoded.capability(),
+        if matches!(store_request_op_tag(variant), "reserved_write" | "backup") {
+            let expected = if store_request_op_tag(variant) == "reserved_write" {
                 eliot_store_api::CAPABILITY_RESERVED_WRITE
-            );
+            } else {
+                eliot_store_api::CAPABILITY_STORE_BACKUP
+            };
+            assert_eq!(decoded.capability(), expected);
             assert!(
                 !CAPABILITIES.contains(&decoded.capability()),
-                "the reserved-write capability is declared but stays unadvertised"
+                "the reserved-write/backup capability is declared but stays unadvertised"
             );
         } else {
             assert!(
@@ -863,6 +914,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         tags,
         vec![
             "apply",
+            "backup",
             "dreamer_job",
             "health",
             "initialize_genesis",
@@ -875,7 +927,7 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
             "revision_heads",
             "validation_snapshot",
         ],
-        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant"
+        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant and the single #975 backup variant"
     );
     // Reserved-write evidence selects no wire operation by itself: the bare
     // projection carries no `op` tag while every `StoreRequest` encoding
@@ -1041,6 +1093,12 @@ impl StubClient {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-stub").unwrap(),
+            // Frozen probe fixture: format-valid shapes and `[]` source
+            // revisions; equality with a transition is enforced by the
+            // receipt-issuing path, not here.
+            admission_digest: "d".repeat(64),
+            mutation_plan_digest: "c".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: Some(ErrorCode::Conflict),
             resubmission: Resubmission::None,
             committed_at: None,

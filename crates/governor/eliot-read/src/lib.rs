@@ -1153,6 +1153,8 @@ fn requires_scope(operation: NamedReadOperation) -> bool {
             | NamedReadOperation::GetConformanceState
             | NamedReadOperation::GetMailbox
             | NamedReadOperation::GetAuditRange
+            | NamedReadOperation::GetExperienceBankRange
+            | NamedReadOperation::GetAgentFeedbackRange
     )
 }
 
@@ -1169,12 +1171,16 @@ fn operation_matches_intent(operation: NamedReadOperation, mode: QueryMode) -> b
             NamedReadOperation::GetEvidencePack
                 | NamedReadOperation::GetAuditRange
                 | NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetExperienceBankRange
+                | NamedReadOperation::GetAgentFeedbackRange
         ),
         QueryMode::Provenance => matches!(
             operation,
             NamedReadOperation::GetEvidencePack
                 | NamedReadOperation::GetAuditRange
                 | NamedReadOperation::ResolveWriteReceipt
+                | NamedReadOperation::GetExperienceBankRange
+                | NamedReadOperation::GetAgentFeedbackRange
         ),
         QueryMode::Navigation => matches!(
             operation,

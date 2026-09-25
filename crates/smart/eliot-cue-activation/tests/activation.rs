@@ -681,16 +681,18 @@ fn broader_mode_requires_explicit_profile_rule() {
         vec![projection(cue.clone(), "path", "target-a", 40)],
         Vec::new(),
     );
-    let exact_only = profile(0, vec![exact_rule(CueKind::FilePath, 900)], Vec::new(), None);
+    let exact_only = profile(
+        0,
+        vec![exact_rule(CueKind::FilePath, 900)],
+        Vec::new(),
+        None,
+    );
     let gated = evaluate_activation(
         &candidate,
         &request(&candidate, vec![cue.clone()], 0),
         &exact_only,
     );
-    assert!(matches!(
-        gated,
-        Err(ActivationError::Unsupported)
-    ));
+    assert!(matches!(gated, Err(ActivationError::Unsupported)));
     let with_prefix = profile(
         0,
         vec![
@@ -998,18 +1000,16 @@ fn duplicate_exact_row_keeps_single_lineage() {
         Vec::new(),
     );
     let mut sibling = base.clone();
-    sibling.observed.observed_cue_id =
-        ObservedCueId::new("observed-dup-2".to_string()).unwrap();
+    sibling.observed.observed_cue_id = ObservedCueId::new("observed-dup-2".to_string()).unwrap();
     let p = profile(0, vec![exact_rule(CueKind::Symbol, 900)], Vec::new(), None);
-    let evaluation = evaluate_activation(
-        &candidate,
-        &request(&candidate, vec![base, sibling], 0),
-        &p,
-    )
-    .unwrap();
+    let evaluation =
+        evaluate_activation(&candidate, &request(&candidate, vec![base, sibling], 0), &p).unwrap();
     assert_eq!(evaluation.result.direct.len(), 1);
     assert_eq!(
-        evaluation.result.direct[0].matched_key.comparison_key_id.as_str(),
+        evaluation.result.direct[0]
+            .matched_key
+            .comparison_key_id
+            .as_str(),
         "key-dup-1"
     );
     assert_eq!(evaluation.result.direct[0].target.as_str(), "target-a");
@@ -1056,12 +1056,8 @@ fn only_valid_direct_targets_seed_spreading() {
         vec![RelationRule::new(RelationKind::Supports, 1000)],
         Some("registry-1".into()),
     );
-    let evaluation = evaluate_activation(
-        &candidate,
-        &request(&candidate, vec![seed_cue], 2),
-        &p,
-    )
-    .unwrap();
+    let evaluation =
+        evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 2), &p).unwrap();
     assert_eq!(evaluation.result.direct.len(), 1);
     assert_eq!(evaluation.result.direct[0].target.as_str(), "a");
     assert!(evaluation.result.derived.is_empty());
@@ -1149,19 +1145,19 @@ fn valid_one_hop_activation_uses_direct_seed_path() {
         vec![RelationRule::new(RelationKind::Supports, 1000)],
         Some("registry-1".into()),
     );
-    let evaluation = evaluate_activation(
-        &candidate,
-        &request(&candidate, vec![seed_cue], 2),
-        &p,
-    )
-    .unwrap();
+    let evaluation =
+        evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 2), &p).unwrap();
     assert_eq!(evaluation.result.derived.len(), 1);
     let derived = &evaluation.result.derived[0];
     assert_eq!(derived.target.as_str(), "b");
     assert_eq!(derived.direct_seed.as_str(), "a");
     assert_eq!(derived.depth, 1);
     assert_eq!(
-        derived.path.iter().map(RelationEdgeId::as_str).collect::<Vec<_>>(),
+        derived
+            .path
+            .iter()
+            .map(RelationEdgeId::as_str)
+            .collect::<Vec<_>>(),
         vec!["edge-1"]
     );
     assert_eq!(derived.strength, ActivationStrength(1000));
@@ -1227,7 +1223,11 @@ fn bounded_multihop_activation_chains_scores() {
     assert_eq!(by_target("b").depth, 1);
     assert_eq!(by_target("c").depth, 2);
     assert_eq!(
-        by_target("c").path.iter().map(RelationEdgeId::as_str).collect::<Vec<_>>(),
+        by_target("c")
+            .path
+            .iter()
+            .map(RelationEdgeId::as_str)
+            .collect::<Vec<_>>(),
         vec!["edge-1", "edge-2"]
     );
 }
@@ -1264,12 +1264,8 @@ fn prohibited_direction_is_not_traversed() {
         vec![RelationRule::new(RelationKind::Supports, 1000)],
         Some("registry-1".into()),
     );
-    let evaluation = evaluate_activation(
-        &candidate,
-        &request(&candidate, vec![seed_cue], 2),
-        &p,
-    )
-    .unwrap();
+    let evaluation =
+        evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 2), &p).unwrap();
     assert_eq!(evaluation.result.direct.len(), 1);
     assert!(evaluation.result.derived.is_empty());
     assert!(matches!(
@@ -1350,8 +1346,12 @@ fn cycle_terminates_deterministically() {
         vec![RelationRule::new(RelationKind::Supports, 1000)],
         Some("registry-1".into()),
     );
-    let first = evaluate_activation(&candidate, &request(&candidate, vec![seed_cue.clone()], 4), &p)
-        .unwrap();
+    let first = evaluate_activation(
+        &candidate,
+        &request(&candidate, vec![seed_cue.clone()], 4),
+        &p,
+    )
+    .unwrap();
     let second =
         evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 4), &p).unwrap();
     assert_eq!(first.result, second.result);
@@ -1381,12 +1381,8 @@ fn self_loop_terminates_without_inflation() {
         vec![RelationRule::new(RelationKind::Supports, 1000)],
         Some("registry-1".into()),
     );
-    let evaluation = evaluate_activation(
-        &candidate,
-        &request(&candidate, vec![seed_cue], 2),
-        &p,
-    )
-    .unwrap();
+    let evaluation =
+        evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 2), &p).unwrap();
     assert_eq!(evaluation.result.direct.len(), 1);
     assert_eq!(
         evaluation.result.direct[0].strength,
@@ -1427,12 +1423,8 @@ fn duplicate_paths_cannot_inflate_popularity() {
         vec![RelationRule::new(RelationKind::Supports, 500)],
         Some("registry-1".into()),
     );
-    let evaluation = evaluate_activation(
-        &candidate,
-        &request(&candidate, vec![seed_cue], 1),
-        &p,
-    )
-    .unwrap();
+    let evaluation =
+        evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 1), &p).unwrap();
     assert_eq!(evaluation.result.derived.len(), 1);
     assert_eq!(evaluation.result.derived[0].target.as_str(), "b");
     assert_eq!(
@@ -1527,7 +1519,11 @@ fn depth_boundary_records_frontier() {
         )
     };
     let candidate = build(
-        vec![mk("a", "a", "seed", 90), mk("b", "b", "b", 91), mk("c", "c", "c", 92)],
+        vec![
+            mk("a", "a", "seed", 90),
+            mk("b", "b", "b", 91),
+            mk("c", "c", "c", 92),
+        ],
         vec![edge(1, "a", "b"), edge(2, "b", "c")],
     );
     let p = profile(
@@ -1552,8 +1548,20 @@ fn depth_boundary_records_frontier() {
         if *bound_hit == eliot_cue_contracts::BoundKind::Depth
             && frontier.iter().any(|id| id.as_str() == "edge-2")
     ));
-    assert!(evaluation.result.derived.iter().any(|item| item.target.as_str() == "b"));
-    assert!(!evaluation.result.derived.iter().any(|item| item.target.as_str() == "c"));
+    assert!(
+        evaluation
+            .result
+            .derived
+            .iter()
+            .any(|item| item.target.as_str() == "b")
+    );
+    assert!(
+        !evaluation
+            .result
+            .derived
+            .iter()
+            .any(|item| item.target.as_str() == "c")
+    );
 }
 
 // WORK_UNIT_CASE: 600/27
@@ -1651,7 +1659,9 @@ fn visited_node_boundary_is_explicit() {
     req.bounds = limited;
     assert!(matches!(
         evaluate_activation(&candidate, &req, &p),
-        Err(ActivationError::Limit { field: "activation.max_nodes" })
+        Err(ActivationError::Limit {
+            field: "activation.max_nodes"
+        })
     ));
 }
 
@@ -1674,7 +1684,11 @@ fn path_length_boundary_is_explicit() {
         )
     };
     let candidate = build(
-        vec![mk("a", "a", "seed", 90), mk("b", "b", "b", 91), mk("c", "c", "c", 92)],
+        vec![
+            mk("a", "a", "seed", 90),
+            mk("b", "b", "b", 91),
+            mk("c", "c", "c", 92),
+        ],
         vec![edge(1, "a", "b"), edge(2, "b", "c")],
     );
     let mut limited = bounds(2);
@@ -1696,7 +1710,9 @@ fn path_length_boundary_is_explicit() {
     req.bounds = limited;
     assert!(matches!(
         evaluate_activation(&candidate, &req, &p),
-        Err(ActivationError::Limit { field: "activation.max_path_len" })
+        Err(ActivationError::Limit {
+            field: "activation.max_path_len"
+        })
     ));
 }
 
@@ -1741,10 +1757,16 @@ fn result_count_boundaries_are_explicit() {
     direct_req.bounds = direct_limited;
     assert!(matches!(
         evaluate_activation(&candidate, &direct_req, &direct_profile),
-        Err(ActivationError::Limit { field: "activation.max_direct" })
+        Err(ActivationError::Limit {
+            field: "activation.max_direct"
+        })
     ));
     let spread = build(
-        vec![mk("a", "a", "seed", 90), mk("b", "b", "b", 91), mk("c", "c", "c", 92)],
+        vec![
+            mk("a", "a", "seed", 90),
+            mk("b", "b", "b", 91),
+            mk("c", "c", "c", 92),
+        ],
         vec![edge(1, "a", "b"), edge(2, "a", "c")],
     );
     let mut derived_limited = bounds(1);
@@ -1766,7 +1788,9 @@ fn result_count_boundaries_are_explicit() {
     derived_req.bounds = derived_limited;
     assert!(matches!(
         evaluate_activation(&spread, &derived_req, &derived_profile),
-        Err(ActivationError::Limit { field: "activation.max_derived" })
+        Err(ActivationError::Limit {
+            field: "activation.max_derived"
+        })
     ));
 }
 
@@ -1788,7 +1812,10 @@ fn trace_and_output_boundaries_are_explicit() {
             seed + 10,
         )
     };
-    let candidate = build(vec![mk("a", "a", "seed", 90), mk("b", "b", "other", 91)], Vec::new());
+    let candidate = build(
+        vec![mk("a", "a", "seed", 90), mk("b", "b", "other", 91)],
+        Vec::new(),
+    );
     let mut trace_limited = bounds(0);
     trace_limited.max_trace_steps = 1;
     let trace_profile = ActivationProfile::seal(
@@ -1808,14 +1835,12 @@ fn trace_and_output_boundaries_are_explicit() {
     trace_req.bounds = trace_limited;
     assert!(matches!(
         evaluate_activation(&candidate, &trace_req, &trace_profile),
-        Err(ActivationError::Limit { field: "activation.trace" })
+        Err(ActivationError::Limit {
+            field: "activation.trace"
+        })
     ));
     let solo = build(vec![mk("a", "a", "seed", 90)], Vec::new());
-    let mut output_req = request(
-        &solo,
-        vec![solo.admitted_bindings[0].normalized.clone()],
-        0,
-    );
+    let mut output_req = request(&solo, vec![solo.admitted_bindings[0].normalized.clone()], 0);
     output_req.bounds.max_output_bytes = 1;
     let output_profile = ActivationProfile::seal(
         "activation-v1".into(),
@@ -1881,7 +1906,11 @@ fn direct_complete_with_derived_partial() {
         )
     };
     let candidate = build(
-        vec![mk("a", "a", "seed", 90), mk("b", "b", "b", 91), mk("c", "c", "c", 92)],
+        vec![
+            mk("a", "a", "seed", 90),
+            mk("b", "b", "b", 91),
+            mk("c", "c", "c", 92),
+        ],
         vec![edge(1, "a", "b"), edge(2, "b", "c")],
     );
     let p = profile(
@@ -1916,13 +1945,27 @@ fn completeness_taxonomy_stays_distinct() {
         frontier: vec![edge_id.clone()],
         bound_hit: BoundKind::Depth,
     };
-    let partial = Completeness::Partial { frontier: vec![edge_id.clone()] };
-    let blocked = Completeness::Blocked { reason: "policy".to_string() };
-    let unavailable = Completeness::Unavailable { reason: "missing".to_string() };
-    let unknown = Completeness::Unknown { reason: "unknown".to_string() };
-    let source_unavailable = Completeness::SourceUnavailable { reason: "io".to_string() };
-    let no_direct = Completeness::NoDirectMatch { reason: "empty".to_string() };
-    let stale = Completeness::Stale { snapshot_fence: fence() };
+    let partial = Completeness::Partial {
+        frontier: vec![edge_id.clone()],
+    };
+    let blocked = Completeness::Blocked {
+        reason: "policy".to_string(),
+    };
+    let unavailable = Completeness::Unavailable {
+        reason: "missing".to_string(),
+    };
+    let unknown = Completeness::Unknown {
+        reason: "unknown".to_string(),
+    };
+    let source_unavailable = Completeness::SourceUnavailable {
+        reason: "io".to_string(),
+    };
+    let no_direct = Completeness::NoDirectMatch {
+        reason: "empty".to_string(),
+    };
+    let stale = Completeness::Stale {
+        snapshot_fence: fence(),
+    };
     assert_ne!(complete, truncated);
     assert_ne!(truncated, partial);
     assert_ne!(blocked, unavailable);
@@ -1953,7 +1996,11 @@ fn every_bound_carries_frontier_evidence() {
         )
     };
     let chain = build(
-        vec![mk("a", "a", "seed", 90), mk("b", "b", "b", 91), mk("c", "c", "c", 92)],
+        vec![
+            mk("a", "a", "seed", 90),
+            mk("b", "b", "b", 91),
+            mk("c", "c", "c", 92),
+        ],
         vec![edge(1, "a", "b"), edge(2, "b", "c")],
     );
     let depth_profile = profile(
@@ -1973,7 +2020,10 @@ fn every_bound_carries_frontier_evidence() {
     )
     .unwrap();
     match &depth_eval.result.completeness {
-        eliot_cue_contracts::Completeness::Truncated { frontier, bound_hit } => {
+        eliot_cue_contracts::Completeness::Truncated {
+            frontier,
+            bound_hit,
+        } => {
             assert_eq!(*bound_hit, eliot_cue_contracts::BoundKind::Depth);
             assert!(!frontier.is_empty());
             assert!(frontier.iter().any(|id| id.as_str() == "edge-2"));
@@ -2000,15 +2050,14 @@ fn every_bound_carries_frontier_evidence() {
         Some("registry-1".into()),
     )
     .unwrap();
-    let mut fan_req = request(
-        &fan,
-        vec![fan.admitted_bindings[0].normalized.clone()],
-        2,
-    );
+    let mut fan_req = request(&fan, vec![fan.admitted_bindings[0].normalized.clone()], 2);
     fan_req.bounds = fan_bounds;
     let fan_eval = evaluate_activation(&fan, &fan_req, &fan_profile).unwrap();
     match &fan_eval.result.completeness {
-        eliot_cue_contracts::Completeness::Truncated { frontier, bound_hit } => {
+        eliot_cue_contracts::Completeness::Truncated {
+            frontier,
+            bound_hit,
+        } => {
             assert_eq!(*bound_hit, eliot_cue_contracts::BoundKind::Fanout);
             assert!(!frontier.is_empty());
         }
@@ -2114,8 +2163,8 @@ fn evaluator_is_pure_with_no_delivery_side_effects() {
     );
     let before = candidate.clone();
     let p = profile(0, vec![exact_rule(CueKind::Symbol, 900)], Vec::new(), None);
-    let first = evaluate_activation(&candidate, &request(&candidate, vec![cue.clone()], 0), &p)
-        .unwrap();
+    let first =
+        evaluate_activation(&candidate, &request(&candidate, vec![cue.clone()], 0), &p).unwrap();
     let second = evaluate_activation(&candidate, &request(&candidate, vec![cue], 0), &p).unwrap();
     assert_eq!(candidate, before);
     assert_eq!(candidate.build_digest, before.build_digest);
@@ -2143,7 +2192,11 @@ fn derived_results_follow_bounded_exact_seed_paths() {
         )
     };
     let candidate = build(
-        vec![mk("a", "a", "seed", 90), mk("b", "b", "b", 91), mk("c", "c", "c", 92)],
+        vec![
+            mk("a", "a", "seed", 90),
+            mk("b", "b", "b", 91),
+            mk("c", "c", "c", 92),
+        ],
         vec![edge(1, "a", "b"), edge(2, "b", "c")],
     );
     let p = profile(

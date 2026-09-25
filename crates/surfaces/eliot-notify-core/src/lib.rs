@@ -8,6 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+mod user_automation;
+
+pub use user_automation::{
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
+    UserAutomationFailureNotification, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationNotificationProjection, UserAutomationPreflightDecision,
+    UserAutomationPreflightError, UserAutomationPreflightProjection,
+    UserAutomationPreflightReceipt, UserAutomationTrigger, preflight_user_automation,
+};
+
 use std::fmt::Write as _;
 
 use eliot_contracts::{RequestMetadata, StateFence};
@@ -50,6 +60,85 @@ pub const WATCHDOG_SIGNATURE_DOMAIN: &str = "ELIOT/X-01/WATCHDOG-FALLBACK/V1";
 /// Fixed product/source identities for the autonomous X-01 route.
 pub const WATCHDOG_PRODUCT_ID: &str = "eliot-notify-watchdog";
 pub const WATCHDOG_SOURCE_ID: &str = "eliot-watchdog";
+
+/// Maximum accepted age of a signed Watchdog fallback envelope at verify time.
+///
+/// Three default Watchdog ticks per `FRESHNESS_TICK_MULTIPLE = 3`
+/// (`bins/eliot-host/src/watchdog_heartbeat.rs:44,49-50`: "six-second
+/// freshness bound (three default ticks)" with the default 2 s tick from
+/// `watchdog_config.rs:26`; deadline projection: "a projection older than
+/// this without a fresh admitted heartbeat is unresponsive, never current
+/// coverage"). The tight window is correct because I11.6 lines 13-14 promise
+/// persistence, not toast: "no immediate desktop toast is promised; Event
+/// Log/spool persist the obligation" — stale evidence must not toast while
+/// the persisted obligation remains regardless.
+pub const WATCHDOG_FALLBACK_FRESHNESS_MS: u64 = 6_000;
+
+/// Maximum accepted future skew of a signed Watchdog fallback envelope.
+///
+/// The spool owner stamps `created_at_ms` from its own clock and enforces
+/// the window with its own clock at acknowledgement time
+/// (`bins/eliot-watchdog/src/watchdog_spool.rs:68-69`), so minter and
+/// verifier share the host clock; the spool `EXPORT_BATCH_TTL_MS = 60_000`
+/// (`:72`) bounds the same-clock operation horizon.
+pub const WATCHDOG_FALLBACK_CLOCK_SKEW_MS: u64 = 60_000;
+
+/// Maximum accepted canonical-JSON size of a signed Watchdog fallback envelope.
+///
+/// The I11.6 fallback envelope contains only the fixed five-field set —
+/// "incident class, installation identity, timestamp, evidence digest and
+/// `eliot recovery status` instruction. It contains no secrets, project
+/// content or large evidence and grants no repair authority." (I11.6 line
+/// 17) — with the transport-local `INSTALLATION_ID_LIMIT = 128` bound
+/// ("Transport-local bound for the installation identity echo",
+/// `watchdog_heartbeat.rs:38`). The cap is ~2.5x the worst-case maximal
+/// canonical encoding (~800 B) of that fixed set with `incident_class` <= 64,
+/// `installation_identity`/`key_id` <= 128, `evidence_digest` exactly 64 hex, the
+/// fixed unit enum, and exact algorithm/domain constants plus 128-hex
+/// signature; a unit test below measures a maximal envelope against it.
+pub const WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES: usize = 2048;
+
+/// Validates the freshness of a signed Watchdog fallback envelope timestamp.
+///
+/// Rejects negative timestamps, envelopes older than
+/// [`WATCHDOG_FALLBACK_FRESHNESS_MS`], and envelopes more than
+/// [`WATCHDOG_FALLBACK_CLOCK_SKEW_MS`] in the future. Uses only
+/// checked/saturating conversions so no input can panic.
+///
+/// # Errors
+/// Returns [`NotifyError::InvalidEnvelope`] when the timestamp is stale,
+/// too far in the future, or negative.
+pub fn validate_fallback_freshness(timestamp_ms: i64, now_ms: u64) -> Result<(), NotifyError> {
+    if timestamp_ms < 0 {
+        return Err(NotifyError::InvalidEnvelope("timestamp_ms"));
+    }
+    let timestamp =
+        u64::try_from(timestamp_ms).map_err(|_| NotifyError::InvalidEnvelope("timestamp_ms"))?;
+    if timestamp <= now_ms {
+        let age = now_ms.saturating_sub(timestamp);
+        if age > WATCHDOG_FALLBACK_FRESHNESS_MS {
+            return Err(NotifyError::InvalidEnvelope("timestamp_ms"));
+        }
+    } else {
+        let future = timestamp.saturating_sub(now_ms);
+        if future > WATCHDOG_FALLBACK_CLOCK_SKEW_MS {
+            return Err(NotifyError::InvalidEnvelope("timestamp_ms"));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the canonical-JSON size of a signed Watchdog fallback envelope.
+///
+/// # Errors
+/// Returns [`NotifyError::InvalidEnvelope`] when the byte length exceeds
+/// [`WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES`].
+pub fn validate_fallback_envelope_size(canonical_bytes: &[u8]) -> Result<(), NotifyError> {
+    if canonical_bytes.len() > WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES {
+        return Err(NotifyError::InvalidEnvelope("envelope_size"));
+    }
+    Ok(())
+}
 
 /// Domain separator for the I11.12 failure-notification identity.
 pub const USER_AUTOMATION_FAILURE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-FAILURE/V1";
@@ -3680,5 +3769,136 @@ mod tests {
                 "user_automation_failure.identity"
             ))
         );
+    }
+
+    #[test]
+    fn user_automation_failure_request_binds_owner_identity_to_existing_envelope() {
+        let (mut notification, _) = normal_input("request-user-automation-producer");
+        notification.user_automation_failure = Some(
+            UserAutomationFailureIdentity::new(
+                "caller-supplied-automation",
+                "caller-supplied-revision",
+                "caller-supplied-fingerprint",
+            )
+            .expect("caller annotation fixture"),
+        );
+        let bound = UserAutomationFailureRequest {
+            automation_id: "automation-1".to_owned(),
+            automation_revision: "revision-7".to_owned(),
+            failure_fingerprint: "failure-fingerprint-a".to_owned(),
+            notification,
+        }
+        .into_notification_envelope()
+        .expect("owner identity binds");
+        let identity = bound
+            .user_automation_failure
+            .as_ref()
+            .expect("automation annotation");
+        assert_eq!(identity.automation_revision.automation_id, "automation-1");
+        assert_eq!(identity.automation_revision.revision, "revision-7");
+        assert_eq!(
+            identity.failure_fingerprint.fingerprint,
+            "failure-fingerprint-a"
+        );
+        assert_eq!(
+            bound.canonical.notification_id,
+            identity.notification_id().unwrap()
+        );
+        assert_eq!(bound.canonical.dedup_key, identity.dedup_key().unwrap());
+        assert_eq!(bound.validate_shape(), Ok(()));
+    }
+
+    #[test]
+    fn user_automation_failure_request_rejects_blank_owner_identity_reference() {
+        let (notification, _) = normal_input("request-user-automation-invalid");
+        let result = UserAutomationFailureRequest {
+            automation_id: " ".to_owned(),
+            automation_revision: "revision-7".to_owned(),
+            failure_fingerprint: "failure-fingerprint-a".to_owned(),
+            notification,
+        }
+        .into_notification_envelope();
+        assert_eq!(
+            result,
+            Err(NotifyError::InvalidEnvelope(
+                "user_automation_failure.automation_id"
+            ))
+        );
+    }
+
+    #[test]
+    fn fallback_freshness_accepts_fresh_and_at_bound_envelopes() {
+        let now = 100_000_u64;
+        assert_eq!(validate_fallback_freshness(now as i64, now), Ok(()));
+        assert_eq!(validate_fallback_freshness(now as i64 - 1_000, now), Ok(()));
+        assert_eq!(
+            validate_fallback_freshness(now as i64 - WATCHDOG_FALLBACK_FRESHNESS_MS as i64, now),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fallback_freshness_rejects_stale_future_and_negative_timestamps() {
+        let now = 100_000_u64;
+        assert_eq!(
+            validate_fallback_freshness(
+                now as i64 - WATCHDOG_FALLBACK_FRESHNESS_MS as i64 - 1,
+                now
+            ),
+            Err(NotifyError::InvalidEnvelope("timestamp_ms"))
+        );
+        assert_eq!(
+            validate_fallback_freshness((now + WATCHDOG_FALLBACK_CLOCK_SKEW_MS) as i64, now),
+            Ok(())
+        );
+        assert_eq!(
+            validate_fallback_freshness((now + WATCHDOG_FALLBACK_CLOCK_SKEW_MS + 1) as i64, now),
+            Err(NotifyError::InvalidEnvelope("timestamp_ms"))
+        );
+        assert_eq!(
+            validate_fallback_freshness(-1, now),
+            Err(NotifyError::InvalidEnvelope("timestamp_ms"))
+        );
+        assert_eq!(
+            validate_fallback_freshness(i64::MIN, now),
+            Err(NotifyError::InvalidEnvelope("timestamp_ms"))
+        );
+    }
+
+    #[test]
+    fn fallback_envelope_size_accepts_cap_and_rejects_overflow() {
+        assert_eq!(
+            validate_fallback_envelope_size(&vec![0u8; WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_fallback_envelope_size(&vec![0u8; WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES + 1]),
+            Err(NotifyError::InvalidEnvelope("envelope_size"))
+        );
+    }
+
+    #[test]
+    fn maximal_fallback_envelope_measures_within_size_cap() {
+        let signed = SignedWatchdogFallbackEnvelope {
+            envelope: WatchdogFallbackEnvelope {
+                incident_class: PlatformHandle::new("A".repeat(64)).unwrap(),
+                installation_identity: PlatformHandle::new("B".repeat(128)).unwrap(),
+                timestamp_ms: i64::MIN,
+                evidence_digest: "ab".repeat(32),
+                recovery_instruction: RecoveryInstruction::EliotRecoveryStatus,
+            },
+            algorithm: WATCHDOG_SIGNATURE_ALGORITHM.to_owned(),
+            key_id: PlatformHandle::new("C".repeat(128)).unwrap(),
+            domain: WATCHDOG_SIGNATURE_DOMAIN.to_owned(),
+            signature: "cd".repeat(64),
+        };
+        let bytes = eliot_receipts::canonical_json_bytes(&signed).unwrap();
+        assert!(
+            bytes.len() <= WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES,
+            "maximal envelope {} bytes exceeds cap {}",
+            bytes.len(),
+            WATCHDOG_FALLBACK_ENVELOPE_MAX_BYTES
+        );
+        assert_eq!(validate_fallback_envelope_size(&bytes), Ok(()));
     }
 }

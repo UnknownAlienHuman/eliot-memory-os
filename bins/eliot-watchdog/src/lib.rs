@@ -56,6 +56,7 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod backup_control;
 mod diagnostics;
 mod heartbeat_transport;
 mod host_identity_observation;
@@ -67,6 +68,8 @@ mod supervision_lease_load;
 mod watchdog_admission;
 mod watchdog_composition;
 mod watchdog_config;
+pub mod watchdog_fallback_composition;
+mod watchdog_fallback_envelope;
 mod watchdog_publication_readback;
 mod watchdog_spool;
 
@@ -84,14 +87,20 @@ use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
 };
-pub(crate) use watchdog_spool::{
-    SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
+pub use watchdog_spool::export_driver::{
+    WatchdogEntryView, WatchdogExportSink, export_once, watchdog_entry_views, watchog_entry_views,
 };
 pub use watchdog_spool::{
-    SpoolAppendOutcome, WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload,
+    CaptureFenceParams, SpoolAppendOutcome, SpoolCoverageDenominator, SpoolFenceEntryKind,
+    SpoolImportReplayDisposition, SpoolImportReplayLedger, SpoolMarkerDetail, SpoolObservedDigest,
+    SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits, WatchdogSpoolEntry,
+    WatchdogSpoolExportLimits, WatchdogSpoolFence, WatchdogSpoolHeader, WatchdogSpoolPayload,
+    WatchdogSpoolSnapshotPage, acceptance_allowed, capture_fence, check_page_continuation,
+    read_page, reconcile_restore, validate_isolated_destination, validate_restore_chain,
+    verify_page_digest,
 };
-pub use watchdog_spool::export_driver::{
-    WatchdogEntryView, WatchdogExportSink, export_once, watchog_entry_views, watchdog_entry_views,
+pub(crate) use watchdog_spool::{
+    SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
 };
 
 #[cfg(test)]
@@ -110,8 +119,8 @@ impl WatchdogSpool {
 
 #[cfg(test)]
 pub(crate) use watchdog_spool::{
-    SPOOL_HIGH_WATER_KEY, SPOOL_HIGH_WATER_TABLE, SPOOL_SCHEMA_VERSION, SPOOL_TABLE,
-    WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header,
+    SPOOL_HIGH_WATER_KEY, SPOOL_HIGH_WATER_TABLE, SPOOL_SCHEMA_VERSION, SPOOL_TABLE, encode_entry,
+    encode_high_water, validate_header,
 };
 
 #[cfg(test)]
@@ -123,6 +132,13 @@ pub(crate) use service_registration_projection::{
     read_approved_service_registration, validate_bound_service_registrations,
 };
 
+pub use backup_control::{
+    AcceptedWatchdogBackupMethod, BackupControlHandle, accepted_watchdog_backup_methods,
+    register_backup_control, start_backup_control, stop_backup_control,
+};
+pub use heartbeat_transport::{
+    FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
+};
 #[cfg(test)]
 use runtime_manifest_selection::manifest_matches_bootstrap;
 use runtime_manifest_selection::{read_registry_for_bootstrap, select_runtime_manifest};
@@ -141,10 +157,13 @@ pub use self_admission::{
 };
 use watchdog_admission::validate_runtime_binding;
 pub use watchdog_admission::{FileWatchdogAdmission, WatchdogRuntimeBinding};
-pub use watchdog_composition::{WatchdogAuthorityState, WatchdogComposition, WatchdogReadiness};
+pub use watchdog_composition::{
+    WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
+};
 pub use watchdog_config::WatchdogConfig;
-pub use heartbeat_transport::{
-    FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
+pub use watchdog_fallback_envelope::{
+    WatchdogFallbackMintError, WatchdogFallbackMintInputs, mint_watchdog_fallback_envelope,
+    publish_watchdog_fallback_envelope,
 };
 
 /// Canonical public admission template shared with Host/runtime-status.
@@ -1338,9 +1357,11 @@ mod tests {
             "doctor_artifact_digest": "b".repeat(64),
             "testd_artifact_digest": "c".repeat(64),
             "native_worker_artifact_digest": "e".repeat(64),
+            "wasm_host_artifact_digest": "f".repeat(64),
             "doctor_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-doctor.exe",
             "testd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-testd.exe",
             "native_worker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-native-worker.exe",
+            "wasm_host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-wasm-host.exe",
             "descriptor_digest": "9".repeat(64)
         });
         serde_json::from_value(serde_json::json!({
@@ -1353,6 +1374,7 @@ mod tests {
             "doctor_artifact_digest": "b".repeat(64),
             "testd_artifact_digest": "c".repeat(64),
             "native_worker_artifact_digest": "e".repeat(64),
+            "wasm_host_artifact_digest": "f".repeat(64),
             "kernel_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-kernel.exe",
             "store_bridge_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-store-surreal.exe",
             "canonical_store_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\surreal.exe",
@@ -1360,6 +1382,7 @@ mod tests {
             "doctor_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-doctor.exe",
             "testd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-testd.exe",
             "native_worker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-native-worker.exe",
+            "wasm_host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-wasm-host.exe",
             "config_path": r"C:\ProgramData\Eliot\packages\generation-7\store.json",
             "dependency_closure_refs": ["evidence-dependencies"],
             "license_refs": ["evidence-licenses"],
@@ -1961,8 +1984,8 @@ mod tests {
         assert!(monitor.canonical_identity().is_some());
     }
 
-    mod self_admission_and_gap;
     mod s08w_recovery_containment;
+    mod self_admission_and_gap;
 
     fn heartbeat(sequence: u64) -> WatchdogSpoolEntry {
         WatchdogSpoolEntry {

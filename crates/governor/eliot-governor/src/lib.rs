@@ -39,6 +39,8 @@ mod composition;
 mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
+mod experience_commit;
+mod finish_attempt;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -49,15 +51,24 @@ pub use cue_composition::{
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
+pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
+pub use finish_attempt::{FinishAttemptError, GovernorFinishAttempt};
 mod controlboard_projection;
+mod learning_admission;
+mod learning_delta_integration;
 mod observation_reconciliation;
 mod operator_reconciliation;
+mod owner_closure_feed;
+mod owner_closure_provider;
 mod owner_projection_refresh;
+mod reactive_admission;
+mod scope_identity_admission;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
 mod task_lifecycle;
+mod wasm_resolution;
 
 pub use activation_outcome::*;
 pub use canonical_projections::{
@@ -78,17 +89,50 @@ pub use controlboard_projection::{
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
-pub use eliot_canonical::CanonicalWriteEnvelope;
+pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
+pub use eliot_finish::FinishDecisionReceipt;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
+pub use learning_admission::{
+    LEARNING_ADMISSION_CONTRACT, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
+    LearningAdmissionError, LearningAdmissionPermit, VerifiedLearningAdmission,
+    issue_learning_admission, issue_learning_ticket, verify_learning_admission,
+    verify_learning_ticket,
+};
+pub use learning_delta_integration::{
+    AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
+    delta_delivery_allowed, derive_delta_at_boundary, emit_activation_receipt_at_attempt_close,
+    issue_delta_admission, retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
+};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
-pub use skill_lifecycle::GovernorSkillLifecycle;
+pub use owner_closure_feed::{OwnerPublishPort, publish_owner_feed, synchronize_owner_feed};
+pub use owner_closure_provider::{
+    GrantAdmissionParams, IntroductionAdmissionParams, OWNER_HYDRATION_SNAPSHOT_SCHEMA,
+    OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider, PreservedAdmission,
+};
+pub use reactive_admission::{
+    AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
+    assess_reactive_risk, bind_atom_risk,
+};
+pub use scope_identity_admission::{
+    BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
+    HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
+    PrivacyProfile, ProposalSource, RegisteredInstanceEvidence, ResolutionAuthentication,
+    ResolutionOutcome, ResolutionRequest, ResolutionTier, ResumedTaskEvidence, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint, ScopeRelocationOrAttachReceipt,
+    ScopeResolution, SessionTaskClaim, TaskScopeCheck, TaskScopeOutcome, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
+    WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity, check_at_trigger,
+    check_task_observation, derive_observed_resources, identity_legs, issue_resolution_receipt,
+    produce_attach_receipt, rebind_with_receipt, require_fresh_matched_binding,
+};
+pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
 pub use swarm_plan_attachment_ownership::{
     AttachmentOwnershipDomain, AttachmentOwnershipScope, OwnershipOutcome,
@@ -98,6 +142,10 @@ pub use swarm_plan_attachment_service::{
     CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
 };
 pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
+pub use wasm_resolution::{
+    CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
+    GovernorWasmAdmission, PromotionExpectations,
+};
 
 use std::collections::BTreeMap;
 

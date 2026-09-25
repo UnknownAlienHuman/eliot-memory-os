@@ -1,7 +1,7 @@
 use crate::EngineError;
 use eliot_types::{
-    CoChangeEdge, CueBinding, CueKind, CueMatchMode, CueStrength, DependencyManifest,
-    FileDependency, HotspotScore, ModuleCard, ProjectId, normalize_bindings, ul_token_estimate,
+    CoChangeEdge, CueBinding, CueMatchMode, CueStrength, DependencyManifest, FileDependency,
+    HotspotScore, LegacyCueKindV1, ModuleCard, ProjectId, normalize_bindings, ul_token_estimate,
 };
 use serde_json::json;
 use std::cmp::Ordering;
@@ -369,7 +369,7 @@ fn first_path_segment(path: &str) -> String {
 
 fn file_binding(path: &str, strength: CueStrength) -> CueBinding {
     CueBinding {
-        cue_kind: CueKind::FilePath,
+        cue_kind: LegacyCueKindV1::FilePath,
         cue_value: path.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength,
@@ -384,7 +384,7 @@ pub fn failure_bindings_by_path(
     let mut failures = BTreeMap::<String, BTreeSet<String>>::new();
     for source in sources.iter().filter(|source| source.negative_memory) {
         for binding in &source.cue_bindings {
-            if binding.cue_kind == CueKind::FilePath {
+            if binding.cue_kind == LegacyCueKindV1::FilePath {
                 failures
                     .entry(binding.cue_value.clone())
                     .or_default()

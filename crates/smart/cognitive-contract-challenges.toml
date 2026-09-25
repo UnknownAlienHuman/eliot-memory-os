@@ -169,13 +169,13 @@ evidence_execution_status = "NOT_EXECUTED"
 
 [[challenge]]
 id = "CC-W9-REV12-HANDOFF"
-status = "OPEN_PROVIDER_CONFORMANCE"
+status = "CLOSED_FREEZE_DELIVERED"
 required_owner = "Wave 1 projection contract owner"
 needed_by = ["eliot-memory-quality", "eliot-dreamer-memory-revision", "eliot-cognitive-quality", "eliot-understanding-assessment"]
 depends_on = ["cognitive-rev12-contract-schema-freeze.toml"]
-missing_contract = "Handoff for #223: file cognitive-rev12-contract-schema-freeze.toml is absent repo-wide at base 03b04bc5 (rg exit 1, dual-glob zero); downstream Rust implementation, package Module Proof, real provider-consumer Edge Proof, and named Product Pulses for the four W9 crates stay NOT_EXECUTED until that freeze or equivalent versioned upstream projection types exist. This absence does not block the STATIC_FIELD_CONTRACT_ONLY freeze itself."
+missing_contract = "Handoff for #223 delivered: crates/smart/cognitive-rev12-contract-schema-freeze.toml freeze_id cognitive-rev12-contract-schema-freeze-2026-09-22-r6 delivered via #2403/#2407 (was absent repo-wide at base 03b04bc5, rg exit 1, dual-glob zero). Remaining per-crate Module Proof, real provider-consumer Edge Proof, and named Product Pulses for the four W9 crates stay TEST-PHASE / NOT_EXECUTED; this closure claims STATIC_CONTRACT_REGISTRATION_ONLY freeze delivery, not implementation/edge/pulse proof."
 forbidden_workaround = "implementing W9 Rust types from prose, inventing upstream denominators, or treating this static freeze as implementation/edge/pulse proof"
-resolution_evidence = ["cognitive-rev12-contract-schema-freeze.toml or equivalent versioned upstream projection freeze", "producer fixtures", "W9 Module Proof per crate", "real provider-consumer Edge proof per edge", "named W9 Product Pulse execution"]
+resolution_evidence = ["crates/smart/cognitive-rev12-contract-schema-freeze.toml freeze_id cognitive-rev12-contract-schema-freeze-2026-09-22-r6 delivered via #2403/#2407", "producer fixtures in freeze", "W9 Module Proof per crate stays TEST-PHASE (not claimed)", "real provider-consumer Edge proof per edge stays TEST-PHASE (not claimed)", "named W9 Product Pulse execution stays TEST-PHASE (not claimed)"]
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"

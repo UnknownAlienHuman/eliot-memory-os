@@ -18,20 +18,25 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
-    RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
+    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
+    CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
+    IsolationEvidence, NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId,
+    OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
+    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
     WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
-    verify_canonical_request_hash,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::{HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY};
 
+#[path = "store_backup_client.rs"]
+mod store_backup_client;
 #[path = "store_exchange.rs"]
 mod store_exchange;
 
@@ -457,8 +462,12 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         // exact values about to be sent (context + transition + expected
         // heads) and reject divergence before the Apply frame is built. The
         // view borrows these references — not re-forwarded copies — so a
-        // mutation after admission fails here with the typed mismatch.
+        // mutation after admission fails here with the typed mismatch. The
+        // carried ordering scopes must also still equal the hashed expected
+        // ordering heads: a post-admission scope edit leaves the shared
+        // digest unchanged but changes head advancement.
         {
+            verify_ordering_scope_binding(&transition, &expected_ordering_heads)?;
             let view = CanonicalRequestView::from_apply(
                 ctx,
                 &transition,
@@ -888,6 +897,113 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             StoreResponse::Health { record } => Ok(record),
             _ => Err(StoreError::InvalidReceipt),
         }
+    }
+}
+
+impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
+    /// Opens one bounded coherent snapshot capture (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue, which sends once through the existing
+    /// bounded `execute_raw` machinery. Consumed by #959/#960 orchestration.
+    pub async fn backup_begin(
+        &self,
+        ctx: &RequestMeta,
+        request: SnapshotBeginRequest,
+    ) -> Result<SnapshotHandle, StoreError> {
+        self.backup_begin_inner(ctx, request).await
+    }
+
+    /// Reads one bounded page of an open capture (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_page(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+        cursor: SnapshotCursor,
+    ) -> Result<SnapshotPage, StoreError> {
+        self.backup_page_inner(ctx, handle, cursor).await
+    }
+
+    /// Closes one capture with its owner-issued end receipt (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_end(
+        &self,
+        ctx: &RequestMeta,
+        handle: SnapshotHandle,
+    ) -> Result<SnapshotEndReceipt, StoreError> {
+        self.backup_end_inner(ctx, handle).await
+    }
+
+    /// Prepares one isolated restore destination (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_prepare_destination(
+        &self,
+        ctx: &RequestMeta,
+        destination: IsolatedDestination,
+    ) -> Result<IsolationEvidence, StoreError> {
+        self.backup_prepare_destination_inner(ctx, destination)
+            .await
+    }
+
+    /// Restores one bounded canonical batch into its isolated destination
+    /// (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_restore_batch(
+        &self,
+        ctx: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreError> {
+        self.backup_restore_batch_inner(ctx, batch).await
+    }
+
+    /// Validates one canonical restore batch without applying it (issue
+    /// #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    /// Returns the wire `Validation` outcome type
+    /// (`RestoreValidationReceipt`; wire.rs is authority).
+    pub async fn backup_validate(
+        &self,
+        ctx: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreError> {
+        self.backup_validate_inner(ctx, batch).await
+    }
+
+    /// Observes the status of one backup operation (issue #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_status(
+        &self,
+        ctx: &RequestMeta,
+        operation_id: OperationId,
+    ) -> Result<StoreBackupStatus, StoreError> {
+        self.backup_status_inner(ctx, operation_id).await
+    }
+
+    /// Reconciles one uncertain backup mutation by exact identity (issue
+    /// #975).
+    ///
+    /// Exact public backup-port delegation: no logic here, forwards to the
+    /// `store_backup_client` glue. Consumed by #959/#960 orchestration.
+    pub async fn backup_reconcile(
+        &self,
+        ctx: &RequestMeta,
+        first: OperationIdentity,
+        second: OperationIdentity,
+    ) -> Result<BackupOperationReconciliation, StoreError> {
+        self.backup_reconcile_inner(ctx, first, second).await
     }
 }
 
@@ -1385,11 +1501,17 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Issue-#18 bindings are copied exactly from the canonical
+            // genesis transition; genesis binds no semantic source.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: eliot_store_api::Resubmission::None,
             committed_at: Some(format!("commit-sequence-{0:016}", 1)),
             envelope: None,
         };
+        eliot_store_api::bind_issue18_receipt(&transition, &mut receipt, &[]);
         assert_eq!(context.state_fence, transition.state_fence);
         assert_eq!(context.state_fence, receipt.state_fence);
         assert_eq!(receipt.operation_id, transition.identity.operation_id);
@@ -1428,6 +1550,16 @@ mod tests {
         Vec<OrderingHeadExpectation>,
     ) {
         let context = context_for(fence, "apply-request-1", "source");
+        let revision_heads = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("scope:one").expect("key"),
+            expected_revision: 1,
+            state_fence: fence.clone(),
+        }];
+        let ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-authority").expect("ordering"),
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }];
         let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("apply-op-1").expect("operation id"),
@@ -1443,6 +1575,15 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; the admitted expected heads render here via
+            // `render_semantic_source_revisions`, mirroring the Governor
+            // envelope path.
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(
+                &revision_heads,
+            ),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1458,16 +1599,7 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
-        let revision_heads = vec![RevisionHeadExpectation {
-            key: RevisionKey::new("scope:one").expect("key"),
-            expected_revision: 1,
-            state_fence: fence.clone(),
-        }];
-        let ordering_heads = vec![OrderingHeadExpectation {
-            scope: OrderingScopeId::new("scope-authority").expect("ordering"),
-            expected_sequence: 1,
-            state_fence: fence.clone(),
-        }];
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
         let view = CanonicalRequestView::from_apply(
             &context,
             &transition,
@@ -1496,6 +1628,12 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Issue-#18 bindings are copied exactly from the admitted
+            // transition, never defaulted; equality is enforced by the
+            // receipt-issuing path.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -2058,7 +2196,17 @@ mod tests {
 
     fn reserved_request(fence: &StateFence) -> ReservedWriteRequest {
         let context = context_for(fence, "reserved-request-1", "source-991-k");
-        let transition = PreparedTransition {
+        let expected_revision_heads = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("rev-991-k1").expect("key"),
+            expected_revision: 3,
+            state_fence: fence.clone(),
+        }];
+        let expected_ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-991-k1").expect("ordering"),
+            expected_sequence: 6,
+            state_fence: fence.clone(),
+        }];
+        let mut transition = PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-991-k1").expect("operation id"),
                 idempotency_key: "idem-991-k1".to_owned(),
@@ -2073,6 +2221,15 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; the admitted expected heads render here via
+            // `render_semantic_source_revisions`, mirroring the Governor
+            // envelope path.
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: eliot_store_api::render_semantic_source_revisions(
+                &expected_revision_heads,
+            ),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-k1"))]),
@@ -2085,6 +2242,7 @@ mod tests {
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
         let admission = WriteAdmissionProjection::bind(
             &transition,
             WriteAdmissionParams {
@@ -2117,16 +2275,8 @@ mod tests {
             context,
             transition,
             admission,
-            expected_revision_heads: vec![RevisionHeadExpectation {
-                key: RevisionKey::new("rev-991-k1").expect("key"),
-                expected_revision: 3,
-                state_fence: fence.clone(),
-            }],
-            expected_ordering_heads: vec![OrderingHeadExpectation {
-                scope: OrderingScopeId::new("scope-991-k1").expect("ordering"),
-                expected_sequence: 6,
-                state_fence: fence.clone(),
-            }],
+            expected_revision_heads,
+            expected_ordering_heads,
         };
         request.validate().expect("reserved request validates");
         request
@@ -2154,6 +2304,12 @@ mod tests {
             projection_refs: Vec::new(),
             outbox_refs: Vec::new(),
             operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            // Issue-#18 bindings are copied exactly from the admitted
+            // transition, never defaulted; equality is enforced by the
+            // receipt-issuing path.
+            admission_digest: transition.admission_digest.clone(),
+            mutation_plan_digest: transition.mutation_plan_digest.clone(),
+            semantic_source_revisions: transition.semantic_source_revisions.clone(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

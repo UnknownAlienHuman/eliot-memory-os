@@ -27,15 +27,29 @@ impl EvalVerdictService {
             .case_results
             .iter()
             .all(|result| result.status == EvalCaseStatus::Passed);
+        let has_inconclusive_case = run
+            .case_results
+            .iter()
+            .any(|result| result.status == EvalCaseStatus::NotYetImplemented);
         let failure_clusters = Self::failure_clusters(run);
         let status = match run.status {
             EvalRunStatus::Completed if all_passed => EvalVerdictStatus::Pass,
             EvalRunStatus::BlockedInvalidDataset
             | EvalRunStatus::BlockedMutationAttempt
             | EvalRunStatus::BlockedUnsafeProfile => EvalVerdictStatus::Blocked,
+            EvalRunStatus::Completed | EvalRunStatus::Failed if has_inconclusive_case => {
+                EvalVerdictStatus::Inconclusive
+            }
             EvalRunStatus::Completed | EvalRunStatus::Failed => EvalVerdictStatus::Fail,
             _ => EvalVerdictStatus::Inconclusive,
         };
+        let mut reasons = vec!["eval verdict is report-only and grants no authority".to_owned()];
+        if has_inconclusive_case {
+            reasons.push(
+                "at least one case is NotYetImplemented; an inconclusive integrity result cannot produce a PASS verdict"
+                    .to_owned(),
+            );
+        }
         EvalVerdict {
             eval_verdict_id: EvalVerdictId::new_v7(),
             eval_run_id: run.eval_run_id,
@@ -49,7 +63,7 @@ impl EvalVerdictService {
             mutates_policy: false,
             mutates_action_permissions: false,
             mutates_completion_state: false,
-            reasons: vec!["eval verdict is report-only and grants no authority".to_owned()],
+            reasons,
             created_at: OffsetDateTime::now_utc(),
         }
     }

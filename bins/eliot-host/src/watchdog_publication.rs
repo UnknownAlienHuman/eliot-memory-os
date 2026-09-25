@@ -25,10 +25,7 @@ const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 #[cfg(windows)]
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 #[cfg(windows)]
-pub(super) fn write_watchdog_publication_child(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), HostError> {
+pub(super) fn write_watchdog_publication_child(path: &Path, bytes: &[u8]) -> Result<(), HostError> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,

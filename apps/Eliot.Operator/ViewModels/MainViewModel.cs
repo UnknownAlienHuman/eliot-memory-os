@@ -34,6 +34,7 @@ public static class OperatorPageCatalog
         new("sleep_meta", "Sleep and Meta Lab", "Replay, holdout, baseline/candidate comparison and promotion evidence.", true),
         new("agents_routing", "Agents and Routing", "Hosts, capability envelopes, leases, contours and route decisions.", true),
         new("autonomy", "Autonomy Runs", "Bounded contracts, budgets, assignments, tripwires and completion proof.", true),
+        new("user_automation", "User Automation", "Authenticated create, inspect and lifecycle operations over canonical UserAutomation revisions.", false),
         new("approvals", "Approvals", "Exact action hash, risk, write set, verifier, rollback and decision receipts.", true),
         new("timeline_operations", "Timeline, Incidents and Operations", "Transitions, receipts, incidents, recovery, backups and logs.", true),
     ];
@@ -42,12 +43,16 @@ public static class OperatorPageCatalog
 public sealed class MainViewModel : INotifyPropertyChanged
 {
     private readonly IGovernorClient _client;
+    private readonly OperatorPendingOperationJournal? _pendingJournal;
     private OperatorTaskContext? _taskContext;
     private CancellationTokenSource? _requestCancellation;
     private OperatorPageDefinition _currentPage = OperatorPageCatalog.All[0];
     private OperatorRecordView? _selectedRecord;
     private OperatorActionView? _selectedAction;
     private SavedFilterViewModel? _selectedSavedFilter;
+    private readonly List<OperatorPendingOperation> _pendingOperations = [];
+    private string? _lastRuntimeId;
+    private string? _lastAuthGeneration;
     private bool _isBusy;
     private string _projectId = string.Empty;
     private string _taskId = string.Empty;
@@ -60,6 +65,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _queryParametersText = "{}";
     private string _resultMode = "human";
     private string _candidateDisposition = "promote";
+    private string _userAutomationId = string.Empty;
+    private string _userAutomationRevision = string.Empty;
+    private string _userAutomationNonce = string.Empty;
+    private string _userAutomationRevisionJson = "{}";
+    private string _userAutomationPreviousRevisionJson = "{}";
+    private string _userAutomationOperation = "list";
+    private bool _includeRetired;
     private string? _graphSelectedRef;
     private int _graphDepth = 1;
     private string _resultPayloadText = string.Empty;
@@ -68,10 +80,37 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _statusTitle = "Disconnected";
     private string _statusMessage = "Waiting for the active ELIOT runtime.";
     private OperatorBannerSeverity _statusSeverity = OperatorBannerSeverity.Informational;
+    private bool _pendingJournalUnavailable;
 
-    public MainViewModel(IGovernorClient client)
+    public MainViewModel(
+        IGovernorClient client,
+        OperatorPendingOperationJournal? pendingJournal = null)
     {
         _client = client;
+        _pendingJournal = pendingJournal;
+        if (_pendingJournal is not null)
+        {
+            try
+            {
+                _pendingOperations.AddRange(_pendingJournal.LoadForRecovery());
+                if (_pendingOperations.Count > 0)
+                {
+                    _statusTitle = "Reconciliation required";
+                    _statusMessage = $"{_pendingOperations.Count} operator operation(s) survived a restart and require same-operation reconciliation.";
+                    _statusSeverity = OperatorBannerSeverity.Warning;
+                }
+            }
+            catch (OperatorPendingOperationJournalException error)
+            {
+                // Do not overwrite or discard an unreadable journal. The UI
+                // remains available for reads, but no new mutation can be
+                // sent until the owner-local recovery artifact is readable.
+                _pendingJournalUnavailable = true;
+                _statusTitle = "Recovery journal unavailable";
+                _statusMessage = error.Message;
+                _statusSeverity = OperatorBannerSeverity.Error;
+            }
+        }
         foreach (var page in OperatorPageCatalog.All)
         {
             PaletteSuggestions.Add($"Go: {page.Title}");
@@ -84,10 +123,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public ObservableCollection<OperatorRecordView> Records { get; } = [];
     public ObservableCollection<SavedFilterViewModel> SavedFilters { get; } = [];
     public ObservableCollection<string> PaletteSuggestions { get; } = [];
+    /// Retained operations awaiting a terminal receipt. Unknown-outcome
+    /// entries reconcile under the same identity; they are never resubmitted
+    /// as new mutations.
+    public IReadOnlyList<OperatorPendingOperation> PendingOperations => _pendingOperations.AsReadOnly();
+    public bool HasUnknownOperations =>
+        _pendingOperations.Any(operation => operation.Phase == OperatorOperationPhase.UnknownReconciling);
     public IReadOnlyList<string> QueryOperations { get; } =
         ["current_state", "recall_preview", "exact_evidence", "relationship_slice", "trace_replay", "health_report"];
     public IReadOnlyList<string> ResultModes { get; } = ["human", "json", "graph"];
     public IReadOnlyList<string> CandidateDispositions { get; } = ["promote", "reject", "demote", "archive"];
+    public IReadOnlyList<string> UserAutomationOperations => UserAutomationContract.OperationKinds;
 
     public OperatorPageDefinition CurrentPage
     {
@@ -100,6 +146,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 OnPropertyChanged(nameof(SectionDescription));
                 OnPropertyChanged(nameof(IsGraphPage));
                 OnPropertyChanged(nameof(IsQueryPage));
+                OnPropertyChanged(nameof(IsUserAutomationPage));
             }
         }
     }
@@ -108,6 +155,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string SectionDescription => CurrentPage.Description;
     public bool IsQueryPage => CurrentPage.Tag == "query_lab";
     public bool IsGraphPage => CurrentPage.Tag == "causal_provenance" || (IsQueryPage && ResultMode == "graph");
+    public bool IsUserAutomationPage => CurrentPage.Tag == "user_automation";
     public bool IsBusy { get => _isBusy; private set => Set(ref _isBusy, value); }
     public string ProjectId { get => _projectId; set => Set(ref _projectId, value.Trim()); }
     public string TaskId { get => _taskId; set => Set(ref _taskId, value.Trim()); }
@@ -127,6 +175,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
     public string CandidateDisposition { get => _candidateDisposition; set => Set(ref _candidateDisposition, value); }
+    public string UserAutomationId { get => _userAutomationId; set => Set(ref _userAutomationId, value.Trim()); }
+    public string UserAutomationRevision { get => _userAutomationRevision; set => Set(ref _userAutomationRevision, value.Trim()); }
+    public string UserAutomationNonce { get => _userAutomationNonce; set => Set(ref _userAutomationNonce, value.Trim()); }
+    public string UserAutomationRevisionJson { get => _userAutomationRevisionJson; set => Set(ref _userAutomationRevisionJson, value); }
+    public string UserAutomationPreviousRevisionJson { get => _userAutomationPreviousRevisionJson; set => Set(ref _userAutomationPreviousRevisionJson, value); }
+    public string UserAutomationOperation { get => _userAutomationOperation; set => Set(ref _userAutomationOperation, value); }
+    public bool IncludeRetired { get => _includeRetired; set => Set(ref _includeRetired, value); }
     public int GraphDepth { get => _graphDepth; set => Set(ref _graphDepth, Math.Clamp(value, 1, 3)); }
     public string ResultPayloadText { get => _resultPayloadText; private set => Set(ref _resultPayloadText, value); }
     public string ResultSummary { get => _resultSummary; private set => Set(ref _resultSummary, value); }
@@ -264,7 +319,43 @@ public sealed class MainViewModel : INotifyPropertyChanged
             task,
             ActionInput.Trim(),
             CandidateDisposition);
-        await ExecuteCommandAsync(command, task, SelectedAction.Command);
+        // One identity per user action: the typed envelope mints the
+        // operation id once and the exact bytes are retained until a terminal
+        // receipt. A retry of this action reconciles the same identity.
+        var envelope = OperatorIntentEnvelope.Create(
+            task.ProjectId,
+            task.TaskId,
+            task.Revision,
+            JsonSerializer.SerializeToElement(command));
+        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
+    }
+
+    /// Reconciles every pending unknown-outcome operation under its retained
+    /// identity. No second logical mutation is ever minted here.
+    public async Task ReconcilePendingAsync()
+    {
+        var unknown = _pendingOperations
+            .Where(operation => operation.Phase == OperatorOperationPhase.UnknownReconciling)
+            .ToList();
+        if (unknown.Count == 0)
+        {
+            SetBanner("Nothing to reconcile", "No operation is waiting for unknown-outcome reconciliation.", OperatorBannerSeverity.Informational);
+            return;
+        }
+        foreach (var pending in unknown)
+        {
+            // Resend the retained operation: same identity, same expected
+            // revision, same command bytes. No new identity is minted here.
+            using var document = JsonDocument.Parse(pending.EnvelopeJson);
+            var reconciling = new OperatorIntentEnvelope(
+                document.RootElement.GetProperty("project_id").GetString()!,
+                document.RootElement.GetProperty("task_id").GetString()!,
+                document.RootElement.GetProperty("expected_revision").GetUInt64(),
+                pending.OperationId,
+                document.RootElement.GetProperty("command").Clone());
+            reconciling.Validate();
+            await SubmitIntentAsync(reconciling, pending.CommandName, isReconcile: true);
+        }
     }
 
     public async Task RunCommandAsync(string command)
@@ -283,7 +374,84 @@ public sealed class MainViewModel : INotifyPropertyChanged
             "start_run" or "resume_run" => new { command, autonomy_run_id = runId },
             _ => throw new InvalidOperationException($"Unsupported operator run command: {command}")
         };
-        await ExecuteCommandAsync(payload, task, command);
+        // One identity per user action, retained for reconciliation.
+        var envelope = OperatorIntentEnvelope.Create(
+            task.ProjectId,
+            task.TaskId,
+            task.Revision,
+            JsonSerializer.SerializeToElement(payload));
+        await SubmitIntentAsync(envelope, command, isReconcile: false);
+    }
+
+    /// Sends one closed UserAutomation operator operation through the existing
+    /// authenticated Governor client. The UI never supplies identity, fence,
+    /// schedule authority, provider credentials, or Store receipt fields.
+    public async Task RunUserAutomationAsync()
+    {
+        IsBusy = true;
+        NotifyCounts();
+        try
+        {
+            var operation = BuildUserAutomationOperation();
+            var result = await _client.UserAutomationAsync(
+                operation,
+                _requestCancellation?.Token ?? CancellationToken.None);
+            ResultPayloadText = result.GetRawText();
+            ResultSummary = $"UserAutomation {UserAutomationOperation} response received from the authenticated Governor route.";
+            SetBanner(
+                "UserAutomation response received",
+                $"The typed {UserAutomationOperation} operation was sent with one client idempotency key; the owner response is shown below.",
+                OperatorBannerSeverity.Success);
+        }
+        catch (Exception error)
+        {
+            SetBanner("UserAutomation command failed", error.Message, OperatorBannerSeverity.Error);
+        }
+        finally
+        {
+            IsBusy = false;
+            NotifyCounts();
+        }
+    }
+
+    private UserAutomationOperation BuildUserAutomationOperation() => UserAutomationOperation switch
+    {
+        "create" => new UserAutomationCreateOperation(ParseRevision(UserAutomationRevisionJson)),
+        "list" => new UserAutomationListOperation(IncludeRetired),
+        "status" => new UserAutomationStatusOperation(RequiredUserAutomationId()),
+        "history" => new UserAutomationHistoryOperation(RequiredUserAutomationId()),
+        "pause" => new UserAutomationPauseOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
+        "resume" => new UserAutomationResumeOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
+        "edit" => new UserAutomationEditOperation(
+            ParseRevision(UserAutomationPreviousRevisionJson),
+            ParseRevision(UserAutomationRevisionJson)),
+        "run_now" => new UserAutomationRunNowOperation(
+            RequiredUserAutomationId(),
+            RequiredUserAutomationRevision(),
+            UserAutomationNonce),
+        "remove" => new UserAutomationRemoveOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
+        "inspect_last_failure" => new UserAutomationInspectLastFailureOperation(RequiredUserAutomationId()),
+        _ => throw new InvalidOperationException("UserAutomation operation is not in the closed operation catalogue.")
+    };
+
+    private string RequiredUserAutomationId()
+    {
+        UserAutomationContract.RequireText(UserAutomationId, "automation_id");
+        return UserAutomationId;
+    }
+
+    private string RequiredUserAutomationRevision()
+    {
+        UserAutomationContract.RequireText(UserAutomationRevision, "automation_revision");
+        return UserAutomationRevision;
+    }
+
+    private static UserAutomationRevision ParseRevision(string value)
+    {
+        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value)
+            ?? throw new InvalidOperationException("owner-normalized UserAutomation revision JSON is required.");
+        revision.Validate();
+        return revision;
     }
 
     private async Task LoadPageAsync(bool append)
@@ -323,7 +491,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 && page.TaskRevision is not null
                     ? new OperatorTaskContext(page.ProjectId, page.TaskId, page.TaskRevision.Value)
                     : null;
-            if (!append)
+            // Generation/revision/fence changes invalidate all dependent UI
+            // state before use: cached rows, cursors, and selections are
+            // rebuildable projections, never authority.
+            var rotated = InvalidateOnRotation(page);
+            if (!append || rotated)
             {
                 Records.Clear();
                 SelectedRecord = null;
@@ -336,7 +508,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
             ResultSummary = $"Showing {Records.Count} of {totalQualifier}{page.TotalMatching}; page generated {page.GeneratedAt.LocalDateTime:g}.";
             SetBanner(
                 "Connected",
-                $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
+                rotated
+                    ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
+                    : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
                 OperatorBannerSeverity.Success);
         }
         catch (OperationCanceledException)
@@ -354,49 +528,312 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private async Task ExecuteCommandAsync(object command, OperatorTaskContext task, string action)
+    /// Sends one typed intent: first send mints nothing (the envelope already
+    /// carries the per-action identity); reconciliation resends the retained
+    /// identity. Unknown transport outcomes retain the pending operation for
+    /// exact reconciliation instead of a second mutation.
+    private async Task SubmitIntentAsync(OperatorIntentEnvelope envelope, string action, bool isReconcile)
     {
         IsBusy = true;
         NotifyCounts();
+        if (!isReconcile && _pendingJournalUnavailable)
+        {
+            SetBanner(
+                "Command not sent",
+                "The user-local pending-operation journal is unavailable; recover it before sending another mutation.",
+                OperatorBannerSeverity.Error);
+            IsBusy = false;
+            NotifyCounts();
+            return;
+        }
+
+        var pending = new OperatorPendingOperation(
+            envelope.OperationId,
+            JsonSerializer.Serialize(envelope),
+            envelope.ExpectedRevision,
+            action,
+            OperatorOperationPhase.Submitted,
+            DateTimeOffset.UtcNow);
+        if (!isReconcile)
+        {
+            _pendingOperations.Add(pending);
+            if (!TryPersistPendingState())
+            {
+                _pendingOperations.RemoveAll(operation => operation.OperationId == pending.OperationId);
+                RefreshPendingState();
+                SetBanner(
+                    "Command not sent",
+                    "The pending operation could not be durably journaled; no owner request was sent.",
+                    OperatorBannerSeverity.Error);
+                IsBusy = false;
+                NotifyCounts();
+                return;
+            }
+            RefreshPendingState();
+        }
         try
         {
-            var receipt = await _client.CommandAsync(new
+            var requestEnvelope = isReconcile
+                ? ParseRetainedEnvelope(pending.EnvelopeJson)
+                : JsonSerializer.SerializeToElement(envelope);
+            JsonElement receipt = isReconcile
+                ? await _client.ReconcileAsync(
+                    requestEnvelope,
+                    _requestCancellation?.Token ?? CancellationToken.None)
+                : await _client.CommandAsync(
+                    requestEnvelope,
+                    _requestCancellation?.Token ?? CancellationToken.None);
+            bool accepted;
+            bool executed;
+            string outcome;
+            string? receiptId;
+            try
             {
-                project_id = task.ProjectId,
-                task_id = task.TaskId,
-                expected_revision = task.Revision,
-                idempotency_key = Guid.NewGuid().ToString("N"),
-                command
-            }, _requestCancellation?.Token ?? CancellationToken.None);
-            var accepted = receipt.GetProperty("accepted").GetBoolean();
-            var executed = receipt.GetProperty("executed").GetBoolean();
-            var outcome = receipt.GetProperty("outcome").GetString() ?? "unknown";
-            var receiptId = receipt.TryGetProperty("canonical_receipt", out var canonicalReceipt)
-                && canonicalReceipt.ValueKind == JsonValueKind.Object
-                && canonicalReceipt.TryGetProperty("receipt_id", out var canonicalReceiptId)
-                    ? canonicalReceiptId.GetString()
-                    : null;
+                var parsed = ReadCommandReceipt(receipt, pending);
+                accepted = parsed.Accepted;
+                executed = parsed.Executed;
+                outcome = parsed.Outcome;
+                receiptId = parsed.ReceiptId;
+            }
+            catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException or JsonException)
+            {
+                // The owner answered but the receipt shape proves nothing:
+                // retain the same identity for reconciliation.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+                RefreshPendingState();
+                SetBanner(
+                    "Unknown outcome — reconcile, do not resubmit",
+                    $"{action}: {pending.OperationId} returned an unreadable receipt; use Reconcile before any retry.",
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
             if (accepted && executed && receiptId is null)
             {
-                throw new InvalidOperationException("Governor accepted a durable mutation without a canonical receipt.");
+                // The owner claims a durable mutation but proves nothing:
+                // retain the same identity for reconciliation, never resubmit.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+                RefreshPendingState();
+                SetBanner(
+                    "Unknown outcome — reconcile, do not resubmit",
+                    $"{action}: {pending.OperationId} was accepted without a canonical receipt; use Reconcile before any retry.",
+                    OperatorBannerSeverity.Warning);
+                return;
             }
+            if (accepted && executed)
+            {
+                if (!RemovePending(pending.OperationId))
+                {
+                    RefreshPendingState();
+                    SetBanner(
+                        "Receipt received — recovery retained",
+                        $"{action}: the owner returned a receipt, but the local journal could not be compacted; reconcile the retained operation after recovery.",
+                        OperatorBannerSeverity.Warning);
+                    return;
+                }
+            }
+            else if (!accepted)
+            {
+                if (!RemovePending(pending.OperationId))
+                {
+                    RefreshPendingState();
+                    SetBanner(
+                        "Rejection received — recovery retained",
+                        $"{action}: the owner rejected the command, but the local journal could not be compacted; retain the exact operation for reconciliation.",
+                        OperatorBannerSeverity.Warning);
+                    return;
+                }
+            }
+            else
+            {
+                // An accepted-but-not-yet-executed response is still an
+                // owner-pending effect. Keep it durable and make the UI
+                // reconcile the same identity rather than treating the
+                // provisional answer as a terminal success.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            }
+            RefreshPendingState();
             if (executed) await RefreshAsync();
+            var bannerTitle = accepted && !executed
+                ? "Command accepted — reconcile pending owner work"
+                : accepted
+                    ? "Command accepted"
+                    : "Command rejected";
+            var bannerSeverity = accepted && !executed
+                ? OperatorBannerSeverity.Warning
+                : accepted
+                    ? OperatorBannerSeverity.Success
+                    : OperatorBannerSeverity.Warning;
             SetBanner(
-                accepted ? "Command accepted" : "Command rejected",
+                bannerTitle,
                 receiptId is null
                     ? $"{action}: {outcome}; no durable mutation executed."
                     : $"{action}: {outcome}; canonical receipt {receiptId}.",
-                accepted ? OperatorBannerSeverity.Success : OperatorBannerSeverity.Warning);
+                bannerSeverity);
+        }
+        catch (OperatorUnknownOutcomeException unknown)
+        {
+            // Possibly executed: retain the same identity for reconciliation.
+            // First sends update the entry added above in place; reconciliations
+            // leave the retained entry untouched.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Unknown outcome — reconcile, do not resubmit",
+                $"{action}: {unknown.OperationId} may have executed; use Reconcile before any retry.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperatorRestartRequiredException restart)
+        {
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Restart required",
+                $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
+                OperatorBannerSeverity.Warning);
+        }
+        catch (OperationCanceledException)
+        {
+            // Transport cancelled: the effect may still have committed, so the
+            // same identity stays reconciliable instead of a terminal cancel.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner("Command cancelled", "The nonblocking Governor request was cancelled; a possibly committed effect stays reconciliable under the same operation identity.", OperatorBannerSeverity.Informational);
         }
         catch (Exception error)
         {
-            SetBanner("Command failed", error.Message, OperatorBannerSeverity.Error);
+            // A local, reconnect, handshake, or decode failure does not prove
+            // that the original owner request was never committed. This also
+            // covers reconciliation attempts: a fresh handshake refusal cannot
+            // compact the older operation. Only the exact owner-bound receipt
+            // branches above may remove a retained operation.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Command outcome unproven — recovery retained",
+                $"{action}: {error.Message}; use Reconcile before any retry.",
+                OperatorBannerSeverity.Warning);
         }
         finally
         {
             IsBusy = false;
             NotifyCounts();
         }
+    }
+
+    private static (bool Accepted, bool Executed, string Outcome, string? ReceiptId) ReadCommandReceipt(
+        JsonElement receipt,
+        OperatorPendingOperation pending)
+    {
+        if (receipt.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("operator command receipt must be one JSON object");
+        }
+
+        if (!receipt.TryGetProperty("operation_id", out var operationId)
+            || operationId.ValueKind != JsonValueKind.String
+            || !string.Equals(operationId.GetString(), pending.OperationId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("operator command receipt is bound to a different operation");
+        }
+
+        if (!receipt.TryGetProperty("expected_revision", out var expectedRevision)
+            || expectedRevision.ValueKind != JsonValueKind.Number
+            || !expectedRevision.TryGetUInt64(out var receiptExpectedRevision)
+            || receiptExpectedRevision != pending.ExpectedRevision)
+        {
+            throw new InvalidOperationException("operator command receipt is bound to a different expected revision");
+        }
+
+        if (!receipt.TryGetProperty("revision", out var revision)
+            || revision.ValueKind != JsonValueKind.Number
+            || !revision.TryGetUInt64(out var receiptRevision)
+            || receiptRevision != pending.ExpectedRevision)
+        {
+            throw new InvalidOperationException("operator command receipt has an unbound task revision");
+        }
+
+        if (!receipt.TryGetProperty("accepted", out var acceptedValue)
+            || (acceptedValue.ValueKind != JsonValueKind.True && acceptedValue.ValueKind != JsonValueKind.False)
+            || !receipt.TryGetProperty("executed", out var executedValue)
+            || (executedValue.ValueKind != JsonValueKind.True && executedValue.ValueKind != JsonValueKind.False))
+        {
+            throw new InvalidOperationException("operator command receipt has no typed terminal disposition");
+        }
+
+        if (!receipt.TryGetProperty("outcome", out var outcomeValue)
+            || outcomeValue.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(outcomeValue.GetString())
+            || string.Equals(outcomeValue.GetString(), "unknown", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("operator command receipt has no proven outcome");
+        }
+
+        var accepted = acceptedValue.GetBoolean();
+        var executed = executedValue.GetBoolean();
+        string? receiptId = null;
+        if (receipt.TryGetProperty("canonical_receipt", out var canonicalReceipt)
+            && canonicalReceipt.ValueKind == JsonValueKind.Object
+            && canonicalReceipt.TryGetProperty("receipt_id", out var canonicalReceiptId)
+            && canonicalReceiptId.ValueKind == JsonValueKind.String)
+        {
+            receiptId = canonicalReceiptId.GetString();
+            if (string.IsNullOrWhiteSpace(receiptId)) receiptId = null;
+        }
+
+        if (executed != (receiptId is not null) || (executed && !accepted))
+        {
+            throw new InvalidOperationException("operator command receipt has an inconsistent canonical disposition");
+        }
+
+        return (accepted, executed, outcomeValue.GetString()!, receiptId);
+    }
+
+    private bool ReplacePending(string operationId, OperatorOperationPhase phase)
+    {
+        var index = _pendingOperations.FindIndex(operation => operation.OperationId == operationId);
+        if (index < 0) return true;
+        var original = _pendingOperations[index];
+        _pendingOperations[index] = original.WithPhase(phase);
+        if (TryPersistPendingState()) return true;
+        _pendingOperations[index] = original;
+        return false;
+    }
+
+    private bool RemovePending(string operationId)
+    {
+        var retained = _pendingOperations.ToArray();
+        _pendingOperations.RemoveAll(operation => operation.OperationId == operationId);
+        if (TryPersistPendingState()) return true;
+        _pendingOperations.Clear();
+        _pendingOperations.AddRange(retained);
+        return false;
+    }
+
+    private bool TryPersistPendingState()
+    {
+        if (_pendingJournal is null) return true;
+        try
+        {
+            _pendingJournal.Save(_pendingOperations);
+            return true;
+        }
+        catch (OperatorPendingOperationJournalException)
+        {
+            _pendingJournalUnavailable = true;
+            return false;
+        }
+    }
+
+    private static JsonElement ParseRetainedEnvelope(string envelopeJson)
+    {
+        using var document = JsonDocument.Parse(envelopeJson);
+        return document.RootElement.Clone();
+    }
+
+    private void RefreshPendingState()
+    {
+        OnPropertyChanged(nameof(PendingOperations));
+        OnPropertyChanged(nameof(HasUnknownOperations));
     }
 
     private static object BuildCommand(
@@ -437,6 +874,23 @@ public sealed class MainViewModel : INotifyPropertyChanged
             throw new InvalidOperationException("Typed Operator parameters must be one JSON object.");
         }
         return document.RootElement.Clone();
+    }
+
+    /// Tracks the runtime/auth-generation binding of the last applied page.
+    /// Returns true when the binding rotated: the caller must discard cached
+    /// rows, cursors, and selections before use. Pending unknown-outcome
+    /// operations are retained under their own identities for reconciliation.
+    private bool InvalidateOnRotation(OperatorProjectionPage page)
+    {
+        var rotated = _lastRuntimeId is not null
+            && (_lastRuntimeId != page.RuntimeId || _lastAuthGeneration != page.AuthGeneration);
+        _lastRuntimeId = page.RuntimeId;
+        _lastAuthGeneration = page.AuthGeneration;
+        if (rotated)
+        {
+            _nextCursor = null;
+        }
+        return rotated;
     }
 
     private void ValidateScope()

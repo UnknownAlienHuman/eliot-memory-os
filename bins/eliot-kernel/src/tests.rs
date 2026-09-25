@@ -14,16 +14,19 @@
 //! boundary via `super::*`. It is an ordinary module kept under 10k LOC.
 use super::*;
 use eliot_contracts::ContractVersion;
-use eliot_kernel_core::{KernelError, KernelResult, SealedAuthoritySnapshot};
+use eliot_kernel_core::{
+    KernelAuthorityReplaySnapshot, KernelError, KernelResult, SealedAuthoritySnapshot,
+};
 use eliot_ors::{
     EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, RecoveryPayload,
     StateFenceSnapshot,
 };
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_process::{
-    ActionLeaseRef, DispatchPermitAuthority, DispatchPermitReplaySnapshot, EnvironmentInheritance,
-    EnvironmentProjection, FencingToken, ImageId, JobId, OperationId, PermitIssuance,
-    ProcessTreeId, ResourceLimits, SessionId,
+    ActionLeaseRef, DispatchPermitAuthority, EnvironmentInheritance, EnvironmentProjection,
+    FencingToken, ImageId, JobId, OperationId, OriginChallengeRequest, OriginControlOperation,
+    OriginControlPresentation, PermitIssuance, PhysicalProcessBinding, ProcessTreeId,
+    ResourceLimits, SessionId,
 };
 use eliot_runtime_contracts::{
     DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_NAME, DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_VERSION,
@@ -1091,7 +1094,8 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
     assert!(matches!(
         denial.disposition,
         AgentBridgeActivationDisposition::Denied {
-            reason_code: AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+            reason_code: AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            detail: None,
         }
     ));
     assert!(
@@ -1120,7 +1124,7 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
     assert_eq!(
         stdout,
         concat!(
-            r#"{"status":"error","code":"BRIDGE_REQUEST_REJECTED","detail":"activation denied by the trusted host provider: SEMANTIC_RESOLUTION_UNAVAILABLE"}"#,
+            r#"{"status":"error","code":"ACTIVATION_FAILED","detail":"activation denied: disposition=FAILED reason=UNKNOWN_OUTCOME directive=retry-requires-new-ticket operation=r13-denied-os-demand no-typed-result"}"#,
             "\n"
         )
     );
@@ -1532,9 +1536,11 @@ fn live_receipt_manifest(
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         doctor_executable_path: path("eliot-doctor.exe"),
         testd_executable_path: path("eliot-testd.exe"),
         native_worker_executable_path: path("eliot-native-worker.exe"),
+        wasm_host_executable_path: path("eliot-wasm-host.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch
@@ -1553,6 +1559,7 @@ fn live_receipt_manifest(
         doctor_artifact_digest: handle("b".repeat(64)),
         testd_artifact_digest: handle("c".repeat(64)),
         native_worker_artifact_digest: handle("d".repeat(64)),
+        wasm_host_artifact_digest: handle("f".repeat(64)),
         kernel_executable_path,
         store_bridge_executable_path,
         canonical_store_executable_path,
@@ -1560,6 +1567,7 @@ fn live_receipt_manifest(
         doctor_executable_path: path("eliot-doctor.exe"),
         testd_executable_path: path("eliot-testd.exe"),
         native_worker_executable_path: path("eliot-native-worker.exe"),
+        wasm_host_executable_path: path("eliot-wasm-host.exe"),
         config_path: store_config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure".to_owned())],
         license_refs: vec![handle("evidence:licenses".to_owned())],
@@ -1828,6 +1836,12 @@ fn running_daemon_retains_only_the_same_authenticated_ready_publication_operatio
         recovery_fenced: false,
         supervision: None,
         live_ready: None,
+        #[cfg(windows)]
+        supervision_progress: DaemonSupervisionProgressState::unbound(),
+        #[cfg(windows)]
+        last_progress_observation: None,
+        #[cfg(windows)]
+        supervision_expired: false,
     };
     state
         .bind_live_receipt_publication_operation(&exact)
@@ -2092,6 +2106,12 @@ fn receipt_publication_race_is_retryable_only_for_exact_bound_client() {
         recovery_fenced: false,
         supervision: None,
         live_ready: None,
+        #[cfg(windows)]
+        supervision_progress: DaemonSupervisionProgressState::unbound(),
+        #[cfg(windows)]
+        last_progress_observation: None,
+        #[cfg(windows)]
+        supervision_expired: false,
     };
     assert!(matches!(
         KernelComposition::published_daemon_receipt(&state),
@@ -2231,7 +2251,7 @@ struct JsonSnapshotCodec;
 impl DispatchSnapshotCodec for JsonSnapshotCodec {
     fn seal(
         &self,
-        snapshot: &DispatchPermitReplaySnapshot,
+        snapshot: &KernelAuthorityReplaySnapshot,
         _binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<SealedAuthoritySnapshot> {
         let ciphertext = serde_json::to_vec(snapshot)
@@ -2245,7 +2265,7 @@ impl DispatchSnapshotCodec for JsonSnapshotCodec {
         &self,
         payload: &RecoveryPayload,
         _binding: &AuthoritySnapshotBinding,
-    ) -> KernelResult<DispatchPermitReplaySnapshot> {
+    ) -> KernelResult<KernelAuthorityReplaySnapshot> {
         let RecoveryPayload::Encrypted { ciphertext, .. } = payload else {
             return Err(KernelError::RecoveryUnavailable(
                 "authority fixture payload is not encrypted".to_owned(),
@@ -2276,6 +2296,52 @@ fn authority_binding(authority_id: &DispatchAuthorityId) -> AuthoritySnapshotBin
         None,
     )
     .expect("authority binding")
+}
+
+fn origin_authority_binding(
+    authority_id: &DispatchAuthorityId,
+) -> (AuthoritySnapshotBinding, eliot_contracts::StateFence) {
+    let fence = eliot_contracts::StateFence::new(
+        test_epoch(1),
+        ResourceGeneration::new(3).expect("generation"),
+    );
+    let epoch = EpochLineage {
+        current: EpochIdentity {
+            lineage_id: OpaqueLabel::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            epoch: 1,
+        },
+        predecessor: None,
+    };
+    let state_fence = StateFenceSnapshot::capture(&fence, 1).expect("state fence");
+    let binding = AuthoritySnapshotBinding::new(
+        authority_id.clone(),
+        OperationIdentity::new(authority_id.as_str()).expect("record id"),
+        epoch,
+        state_fence,
+        1,
+        None,
+    )
+    .expect("origin authority binding");
+    (binding, fence)
+}
+
+fn origin_test_request(fence: eliot_contracts::StateFence) -> OriginChallengeRequest {
+    OriginChallengeRequest::new(
+        PhysicalProcessBinding::new(
+            4242,
+            133_081_756_927_500_000,
+            "C:\\svc\\worker.exe",
+            "executor-job-1",
+        )
+        .expect("physical identity"),
+        "installation-7",
+        "a".repeat(64),
+        Generation::new(3).expect("generation"),
+        fence,
+        OriginControlOperation::Kill,
+        "origin-recovery-nonce",
+    )
+    .expect("origin request")
 }
 
 fn seed_intent() -> ProcessIntent {
@@ -3197,6 +3263,63 @@ fn process_authority_first_issue_is_versioned_and_stale_controller_fails_closed(
     drop(restarted);
     drop(stale);
     drop(winner);
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn process_authority_origin_replay_survives_ors_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-origin-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let ors_path = root.join("kernel-ors.redb");
+    let authority_id = DispatchAuthorityId::new("kernel-origin-recovery").expect("authority");
+    let (binding, fence) = origin_authority_binding(&authority_id);
+    let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(JsonSnapshotCodec);
+    let store = Arc::new(RedbRecoveryStore::open(&ors_path).expect("real ORS store"));
+    let authority_store: Arc<dyn OperationalRecoveryStore> = store.clone();
+    let key = || KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("dispatch key");
+
+    let mut controller = ProcessDispatchAuthorityController::activate_and_persist_initial(
+        authority_id.clone(),
+        key(),
+        Arc::clone(&authority_store),
+        Arc::clone(&codec),
+        &binding,
+    )
+    .expect("initial authority snapshot");
+    let request = origin_test_request(fence);
+    let challenge = controller
+        .issue_origin_challenge(&request, 1_700_000_000_000, 1_700_000_060_000, &binding)
+        .expect("origin challenge issue");
+    let presentation =
+        OriginControlPresentation::new(request, challenge).expect("origin presentation");
+    drop(controller);
+
+    let mut recovered = ProcessDispatchAuthorityController::restore(
+        authority_id,
+        key(),
+        authority_store,
+        codec,
+        &binding,
+    )
+    .expect("authority restart recovery");
+    let grant = recovered
+        .decide_origin_control(&presentation, 1_700_000_030_000, &binding)
+        .expect("recovered origin decision");
+    assert_eq!(grant.operation(), OriginControlOperation::Kill);
+    assert!(matches!(
+        recovered.decide_origin_control(&presentation, 1_700_000_030_000, &binding),
+        Err(KernelError::DependencyUnavailable(_))
+    ));
+
+    drop(recovered);
     drop(store);
     let _ = std::fs::remove_dir_all(root);
 }

@@ -19,12 +19,16 @@ use crate::controlboard_projection::{
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
+use crate::owner_closure_feed::{OwnerPublishPort, synchronize_owner_feed};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::scope_identity_admission::{
+    ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
+};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
-    Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
-    ServiceObservation,
+    FinishAttemptError, Governor, GovernorConfig, GovernorFinishAttempt, GovernorState,
+    QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
     GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
@@ -32,15 +36,30 @@ use eliot_authority::{
     IntroductionStatus, P07AuthorityPort, P07PortError,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
-use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
+use eliot_canonical::{
+    AcceptanceCoverage, CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
+};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
-    EpochId, OperationId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
-    sha256_hex,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
+    ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
-use eliot_finish::{FinishDecisionReceipt, FinishService};
+use eliot_diagnostic::{
+    CONTRACT_NAME as DIAGNOSTIC_CONTRACT, DiagnosticClassifier, DiagnosticEvent, DiagnosticInput,
+    DiagnosticSeverity, DiagnosticStatus,
+};
+use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
+use eliot_finish::{DescendantClosure, FinishDecisionReceipt, FinishService};
+use eliot_instrument_api::{
+    EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus, InstrumentInvocation,
+    InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource, VerificationOutcome,
+    VerificationRun,
+};
+use eliot_instrument_nextest::{
+    NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
+};
 use eliot_maintenance::{
     MaintenanceController, MaintenanceError, MaintenanceJob, MaintenanceStateStore,
 };
@@ -49,14 +68,31 @@ use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
+use eliot_security_contracts::PrivacyClass;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, ScopeRevisionView,
-    StoreHealth, WriteReceipt,
+    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    ScopeRevisionView, StoreHealth, WriteReceipt,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskState};
-use eliot_workscope::{WorkScopeBindingOwner, WorkScopeBindingSnapshot};
+use eliot_testd_core::{
+    JobState, RawArtifactStream, ReceiptBinding, TestJob, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
+};
+use eliot_workscope::{
+    AuthorityBasis, BootstrapScanner, GenerationEvidence, GoverningSourceAdmission,
+    GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, IdentityLegOutcome,
+    MaterialAdmission, MaterialReadinessInputs, ObservedScopeResources, PrivacyProfile,
+    RequestedEffect, ResolutionAuthentication, ResolutionRequest, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeRelocationOrAttachReceipt,
+    ScopeResolution, SourceAdmissionRequest, TaskBindingInput, TaskBindingState,
+    TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet, WorkScopeDescriptor,
+    WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger, admit_initial_binding,
+    check_at_trigger, evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
+    rebind_with_receipt,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -783,6 +819,11 @@ pub struct CanonicalPlanBinding {
     pub plan_revision: String,
     pub task_id: TaskId,
     pub work_scope_id: String,
+    /// Verifier request contract selected by this canonical plan. Older
+    /// plans may omit it, but the verifier fact producer refuses such a plan
+    /// because profile/config/scope/artifact currentness cannot be proved.
+    #[serde(default)]
+    pub verifier: Option<CanonicalVerifierPlanBinding>,
 }
 
 impl CanonicalPlanBinding {
@@ -798,6 +839,7 @@ impl CanonicalPlanBinding {
             plan_revision: plan_revision.into(),
             task_id,
             work_scope_id: work_scope_id.into(),
+            verifier: None,
         };
         binding.validate()?;
         Ok(binding)
@@ -822,8 +864,1366 @@ impl CanonicalPlanBinding {
                 "canonical work scope id is blank or contains control characters".to_owned(),
             ));
         }
+        if let Some(verifier) = &self.verifier {
+            verifier.validate()?;
+        }
         Ok(())
     }
+}
+
+/// Verifier request identity selected by the canonical plan.
+///
+/// This is the owner-side expectation used to join a TestD invocation to the
+/// exact verifier configuration. A terminal binding alone is insufficient:
+/// its planned configuration hash and contract revision are intentionally
+/// consumer-validated here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierPlanBinding {
+    pub planned: eliot_evaluation_contracts::PlannedVerifierRef,
+    /// Registered instrument which performs the admitted verifier run.
+    pub instrument: ContractId,
+    /// Instrument kind admitted by the productive evaluator.
+    pub kind: InstrumentKind,
+    pub profile: String,
+    /// Exact target carried by the admitted invocation.
+    pub target: String,
+    /// Exact instrument-level arguments carried by the admitted invocation.
+    pub arguments: Vec<String>,
+    pub declared_scope: String,
+    pub input_artifacts: Vec<ArtifactId>,
+    /// Required test ids selected by the canonical plan owner.
+    pub required_test_ids: BTreeSet<String>,
+    /// Full `TaskContract` acceptance denominator bound by the canonical plan
+    /// owner (issue #325 P1, I7.9).
+    ///
+    /// The finish path enumerates exactly this set before joining executed
+    /// verifier evidence. The selected `required_test_ids` inventory alone is
+    /// never the acceptance denominator: an obligation omitted from the test
+    /// list must still surface as an uncovered acceptance row rather than
+    /// vanishing from the gate.
+    pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Explicit join from each acceptance item to the nextest test ids that
+    /// establish it (issue #325 P1).
+    ///
+    /// Many-to-many mappings are supported without equating test ids with
+    /// acceptance ids. An item with no entry is unmapped and the verifier
+    /// path reports it uncovered; an entry with an empty test set declares a
+    /// non-test obligation that executed verifier runs alone cannot satisfy.
+    /// Neither form ever shrinks the task denominator to the selected test
+    /// list.
+    pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
+    /// Registered evaluator identity and version used for this plan.
+    pub evaluator: ContractId,
+    pub evaluator_version: ContractVersion,
+}
+
+impl CanonicalVerifierPlanBinding {
+    fn validate(&self) -> Result<(), CompositionError> {
+        for (field, value) in [
+            ("verifier_id", self.planned.verifier_id.as_str()),
+            ("instrument", self.instrument.as_str()),
+            ("profile", self.profile.as_str()),
+            ("target", self.target.as_str()),
+            ("declared_scope", self.declared_scope.as_str()),
+            ("evaluator", self.evaluator.as_str()),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(CompositionError::Recovery(format!(
+                    "canonical verifier plan {field} is blank or contains control characters"
+                )));
+            }
+        }
+        self.planned
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.planned.scope != self.declared_scope {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan scope differs from declared scope".to_owned(),
+            ));
+        }
+        if self.kind != InstrumentKind::Test {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan must bind the TEST instrument kind".to_owned(),
+            ));
+        }
+        if self.instrument.as_str() != eliot_instrument_nextest::NEXTEST_INSTRUMENT {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan must bind the registered nextest instrument".to_owned(),
+            ));
+        }
+        if self.evaluator.as_str() != eliot_verifier::CONTRACT_NAME
+            || self.planned.verifier_id != self.evaluator
+            || self.evaluator_version
+                != ContractVersion::new(
+                    eliot_verifier::CONTRACT_VERSION.0,
+                    eliot_verifier::CONTRACT_VERSION.1,
+                    eliot_verifier::CONTRACT_VERSION.2,
+                )
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan is not bound to the current evaluator contract".to_owned(),
+            ));
+        }
+        if self
+            .arguments
+            .iter()
+            .any(|argument| argument.trim().is_empty() || argument.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan contains an invalid argument".to_owned(),
+            ));
+        }
+        if self.required_test_ids.is_empty()
+            || self
+                .required_test_ids
+                .iter()
+                .any(|test_id| test_id.trim().is_empty() || test_id.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no required test ids".to_owned(),
+            ));
+        }
+        // I7.9 / issue #325 P1: the plan must bind the full TaskContract
+        // acceptance denominator, not just the selected test inventory. An
+        // empty denominator would let the finish path shrink the task to the
+        // test list, so admission fails closed here.
+        self.validate_acceptance_denominator()?;
+        if self.input_artifacts.is_empty()
+            || self
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.as_str().trim().is_empty())
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no exact input artifact binding".to_owned(),
+            ));
+        }
+        let config_hash = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &self.instrument,
+            kind: self.kind,
+            profile: &self.profile,
+            target: &self.target,
+            arguments: &self.arguments,
+            declared_scope: &self.declared_scope,
+            input_artifacts: &self.input_artifacts,
+            required_test_ids: &self.required_test_ids,
+            required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            acceptance_verifier_map: &self.acceptance_verifier_map,
+            evaluator: &self.evaluator,
+            evaluator_version: self.evaluator_version,
+        })?;
+        if self.planned.verifier_config_hash != config_hash {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan config hash does not bind its invocation shape".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates the plan-bound `TaskContract` acceptance denominator and its
+    /// explicit join to the selected test inventory (issue #325 P1, I7.9).
+    fn validate_acceptance_denominator(&self) -> Result<(), CompositionError> {
+        if self.required_acceptance_item_ids.is_empty()
+            || self
+                .required_acceptance_item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no required acceptance item ids".to_owned(),
+            ));
+        }
+        for (item_id, test_ids) in &self.acceptance_verifier_map {
+            if !self.required_acceptance_item_ids.contains(item_id) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier plan maps an unknown acceptance item".to_owned(),
+                ));
+            }
+            if item_id.trim().is_empty() || item_id.chars().any(char::is_control) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier plan has an invalid acceptance item id".to_owned(),
+                ));
+            }
+            for test_id in test_ids {
+                if test_id.trim().is_empty()
+                    || test_id.chars().any(char::is_control)
+                    || !self.required_test_ids.contains(test_id)
+                {
+                    return Err(CompositionError::Recovery(
+                        "canonical verifier plan maps an acceptance item outside its required test set"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Observed immutable invocation/evaluator identity recovered from the durable
+/// TestD job. This is kept separate from `PlannedVerifierRef`: a terminal
+/// binding may carry the plan as an expectation, but this record is populated
+/// from the actual admitted invocation and evaluated run.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierInvocationBinding {
+    pub instrument: ContractId,
+    pub kind: InstrumentKind,
+    pub profile: String,
+    pub target: String,
+    pub arguments: Vec<String>,
+    pub declared_scope: String,
+    pub input_artifacts: Vec<ArtifactId>,
+    pub required_test_ids: BTreeSet<String>,
+    /// `TaskContract` acceptance denominator observed with the admitted
+    /// invocation; copied from the canonical plan so a persisted fact keeps
+    /// the exact denominator its acceptance join used.
+    pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Acceptance-to-test join observed with the admitted invocation; copied
+    /// from the canonical plan for the same reason.
+    pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
+    pub evaluator: ContractId,
+    pub evaluator_version: ContractVersion,
+    pub config_hash: String,
+}
+
+impl CanonicalVerifierInvocationBinding {
+    fn from_invocation(
+        invocation: &InstrumentInvocation,
+        plan: &CanonicalVerifierPlanBinding,
+    ) -> Result<Self, CompositionError> {
+        invocation.validate().map_err(|error| {
+            verifier_fact_error(format!("TestD invocation validation failed: {error}"))
+        })?;
+        let config_hash = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &invocation.instrument,
+            kind: invocation.kind,
+            profile: &invocation.profile,
+            target: &invocation.target,
+            arguments: &invocation.arguments,
+            declared_scope: &invocation.declared_scope,
+            input_artifacts: &invocation.input_artifacts,
+            required_test_ids: &plan.required_test_ids,
+            required_acceptance_item_ids: &plan.required_acceptance_item_ids,
+            acceptance_verifier_map: &plan.acceptance_verifier_map,
+            evaluator: &plan.evaluator,
+            evaluator_version: plan.evaluator_version,
+        })?;
+        Ok(Self {
+            instrument: invocation.instrument.clone(),
+            kind: invocation.kind,
+            profile: invocation.profile.clone(),
+            target: invocation.target.clone(),
+            arguments: invocation.arguments.clone(),
+            declared_scope: invocation.declared_scope.clone(),
+            input_artifacts: invocation.input_artifacts.clone(),
+            required_test_ids: plan.required_test_ids.clone(),
+            required_acceptance_item_ids: plan.required_acceptance_item_ids.clone(),
+            acceptance_verifier_map: plan.acceptance_verifier_map.clone(),
+            evaluator: plan.evaluator.clone(),
+            evaluator_version: plan.evaluator_version,
+            config_hash,
+        })
+    }
+
+    fn validate(&self) -> Result<(), CompositionError> {
+        if self.kind != InstrumentKind::Test
+            || self.instrument.as_str() != eliot_instrument_nextest::NEXTEST_INSTRUMENT
+            || self.evaluator.as_str() != eliot_verifier::CONTRACT_NAME
+            || self.profile.trim().is_empty()
+            || self.target.trim().is_empty()
+            || self.declared_scope.trim().is_empty()
+            || self.input_artifacts.is_empty()
+            || self.required_test_ids.is_empty()
+            || self.required_acceptance_item_ids.is_empty()
+            || self.config_hash.len() != 64
+            || self
+                .config_hash
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(verifier_fact_error(
+                "observed verifier invocation binding is incomplete or wrong-kind",
+            ));
+        }
+        if self
+            .arguments
+            .iter()
+            .any(|argument| argument.trim().is_empty() || argument.chars().any(char::is_control))
+            || self
+                .required_test_ids
+                .iter()
+                .any(|test_id| test_id.trim().is_empty() || test_id.chars().any(char::is_control))
+            || self
+                .required_acceptance_item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+            || self.acceptance_verifier_map.keys().any(|item_id| {
+                item_id.trim().is_empty()
+                    || item_id.chars().any(char::is_control)
+                    || !self.required_acceptance_item_ids.contains(item_id)
+            })
+            || self
+                .acceptance_verifier_map
+                .values()
+                .flat_map(BTreeSet::iter)
+                .any(|test_id| {
+                    test_id.trim().is_empty()
+                        || test_id.chars().any(char::is_control)
+                        || !self.required_test_ids.contains(test_id)
+                })
+        {
+            return Err(verifier_fact_error(
+                "observed verifier invocation binding has invalid text",
+            ));
+        }
+        let recomputed = verifier_invocation_config_digest(&VerifierInvocationConfig {
+            instrument: &self.instrument,
+            kind: self.kind,
+            profile: &self.profile,
+            target: &self.target,
+            arguments: &self.arguments,
+            declared_scope: &self.declared_scope,
+            input_artifacts: &self.input_artifacts,
+            required_test_ids: &self.required_test_ids,
+            required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            acceptance_verifier_map: &self.acceptance_verifier_map,
+            evaluator: &self.evaluator,
+            evaluator_version: self.evaluator_version,
+        })?;
+        if recomputed != self.config_hash {
+            return Err(verifier_fact_error(
+                "observed verifier invocation config hash is not exact",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact verifier invocation shape bound by the canonical plan owner into
+/// `verifier_config_hash`.
+///
+/// Issue #325 P1: the `TaskContract` acceptance denominator and its explicit
+/// test join are part of the hashed shape, so a stale hash can never attest
+/// a substituted denominator.
+struct VerifierInvocationConfig<'a> {
+    instrument: &'a ContractId,
+    kind: InstrumentKind,
+    profile: &'a str,
+    target: &'a str,
+    arguments: &'a [String],
+    declared_scope: &'a str,
+    input_artifacts: &'a [ArtifactId],
+    required_test_ids: &'a BTreeSet<String>,
+    required_acceptance_item_ids: &'a BTreeSet<String>,
+    acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
+    evaluator: &'a ContractId,
+    evaluator_version: ContractVersion,
+}
+
+fn verifier_invocation_config_digest(
+    config: &VerifierInvocationConfig<'_>,
+) -> Result<String, CompositionError> {
+    #[derive(Serialize)]
+    struct Config<'a> {
+        instrument: &'a ContractId,
+        kind: InstrumentKind,
+        profile: &'a str,
+        target: &'a str,
+        arguments: &'a [String],
+        declared_scope: &'a str,
+        input_artifacts: &'a [ArtifactId],
+        required_test_ids: &'a BTreeSet<String>,
+        required_acceptance_item_ids: &'a BTreeSet<String>,
+        acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
+        evaluator: &'a ContractId,
+        evaluator_version: ContractVersion,
+    }
+    let bytes = canonical_json_bytes(&Config {
+        instrument: config.instrument,
+        kind: config.kind,
+        profile: config.profile,
+        target: config.target,
+        arguments: config.arguments,
+        declared_scope: config.declared_scope,
+        input_artifacts: config.input_artifacts,
+        required_test_ids: config.required_test_ids,
+        required_acceptance_item_ids: config.required_acceptance_item_ids,
+        acceptance_verifier_map: config.acceptance_verifier_map,
+        evaluator: config.evaluator,
+        evaluator_version: config.evaluator_version,
+    })
+    .map_err(|error| {
+        CompositionError::Recovery(format!("verifier config canonicalization failed: {error}"))
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Exact raw artifact identity carried by a durable TestD verifier receipt.
+///
+/// The bytes remain owned by TestD's durable receipt.  Canonical state keeps
+/// the immutable handle, digest, and capture shape needed to prove that a
+/// terminal verifier run used the same artifact lineage after rehydration.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierRawArtifactBinding {
+    pub handle: String,
+    pub content_type: String,
+    pub length: u64,
+    pub sha256: String,
+    pub truncated: bool,
+}
+
+/// Exact TestD receipt identity retained by the canonical verifier fact.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierReceiptBinding {
+    pub job_id: String,
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub generation: u64,
+    pub authority_epoch: EpochId,
+    pub invocation_id: String,
+    pub invocation_digest: String,
+    pub execution: ExecutionStatus,
+    pub receipt_sha256: String,
+    pub allowed_contour_root: String,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
+}
+
+impl CanonicalVerifierReceiptBinding {
+    fn from_binding(
+        binding: &ReceiptBinding,
+        execution: ExecutionStatus,
+        receipt_sha256: String,
+    ) -> Self {
+        Self {
+            job_id: binding.job_id.clone(),
+            operation_id: binding.operation_id.clone(),
+            process_tree_id: binding.process_tree_id.clone(),
+            generation: binding.generation,
+            authority_epoch: binding.authority_epoch.clone(),
+            invocation_id: binding.invocation_id.clone(),
+            invocation_digest: binding.invocation_digest.clone(),
+            execution,
+            receipt_sha256,
+            allowed_contour_root: binding.allowed_contour_root.clone(),
+            source_root: binding.source_root.clone(),
+            target_root: binding.target_root.clone(),
+            cache_root: binding.cache_root.clone(),
+        }
+    }
+}
+
+/// Immutable source identity captured by the TestD owner around execution.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierSourceObservation {
+    pub repository_root: String,
+    pub branch: String,
+    pub commit: String,
+    pub dirty_state_sha256: String,
+}
+
+impl CanonicalVerifierSourceObservation {
+    fn from_testd(observation: &TestdSourceObservation) -> Self {
+        Self {
+            repository_root: observation.repository_root.clone(),
+            branch: observation.branch.clone(),
+            commit: observation.commit.clone(),
+            dirty_state_sha256: observation.dirty_state_sha256.clone(),
+        }
+    }
+
+    fn validate(&self, expected_root: &str) -> Result<(), CompositionError> {
+        let commit_valid = matches!(self.commit.len(), 40 | 64)
+            && self
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let dirty_digest_valid = self.dirty_state_sha256.len() == 64
+            && self
+                .dirty_state_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if self.repository_root != expected_root
+            || !std::path::Path::new(&self.repository_root).is_absolute()
+            || std::path::Path::new(&self.repository_root)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || self.repository_root.chars().any(char::is_control)
+            || self.branch.trim().is_empty()
+            || self.branch.chars().any(char::is_control)
+            || !commit_valid
+            || !dirty_digest_valid
+        {
+            return Err(verifier_fact_error(
+                "persisted source observation is malformed or outside the admitted repository",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Before/after source identity retained with the canonical verifier fact.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierSourceObservationRange {
+    pub before: CanonicalVerifierSourceObservation,
+    pub after: CanonicalVerifierSourceObservation,
+}
+
+impl CanonicalVerifierSourceObservationRange {
+    fn from_testd(range: &TestdSourceObservationRange) -> Self {
+        Self {
+            before: CanonicalVerifierSourceObservation::from_testd(&range.before),
+            after: CanonicalVerifierSourceObservation::from_testd(&range.after),
+        }
+    }
+
+    fn validate(&self, expected_root: &str) -> Result<(), CompositionError> {
+        self.before.validate(expected_root)?;
+        self.after.validate(expected_root)?;
+        if self.before.repository_root != self.after.repository_root {
+            return Err(verifier_fact_error(
+                "source observation changed repository roots during verification",
+            ));
+        }
+        Ok(())
+    }
+
+    fn unchanged(&self) -> bool {
+        self.before == self.after
+    }
+}
+
+/// One physical TestD effect bound to the task and verifier run.
+///
+/// This is a retained execution receipt reference, not an assertion that the
+/// effect is closed.  Descendant/effect closure remains a later canonical
+/// owner phase.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierEffectBinding {
+    pub task_id: String,
+    pub job_id: String,
+    pub operation_id: String,
+    pub process_tree_id: String,
+    pub state_fence: StateFence,
+    pub execution: ExecutionStatus,
+    pub receipt_sha256: String,
+}
+
+impl CanonicalVerifierEffectBinding {
+    fn validate(
+        &self,
+        expected_task_id: &str,
+        expected_fence: &StateFence,
+    ) -> Result<(), CompositionError> {
+        if self.task_id != expected_task_id
+            || self.state_fence != *expected_fence
+            || self.job_id.trim().is_empty()
+            || self.operation_id.trim().is_empty()
+            || self.process_tree_id.trim().is_empty()
+            || self.job_id.chars().any(char::is_control)
+            || self.operation_id.chars().any(char::is_control)
+            || self.process_tree_id.chars().any(char::is_control)
+            || self.receipt_sha256.len() != 64
+            || self
+                .receipt_sha256
+                .bytes()
+                .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier effect binding is not task/fence bound".to_owned(),
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !self.execution.is_terminal() {
+            return Err(CompositionError::Recovery(
+                "canonical verifier effect binding is not terminal".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Canonical fact produced from a terminal TestD job and its persisted
+/// verifier receipt.
+///
+/// The fact retains failed, stale, partial, and otherwise non-certifying
+/// verifier runs for readback.  [`Self::certifies_completion`] is deliberately
+/// derived from the bound execution/evaluation axes and never from a caller
+/// label or task command.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierExecutionFact {
+    pub task_id: String,
+    pub task_revision: u64,
+    pub plan: CanonicalPlanBinding,
+    pub state_fence: StateFence,
+    pub job_id: String,
+    pub job_state: String,
+    pub receipt: CanonicalVerifierReceiptBinding,
+    /// Real branch, commit, and dirty-state observations retained by TestD.
+    #[serde(default)]
+    pub source_observation: Option<CanonicalVerifierSourceObservationRange>,
+    pub verification_run: VerificationRun,
+    /// Observed invocation/evaluator identity recovered from the TestD job.
+    /// This is the non-tautological config/currentness join.
+    pub invocation: CanonicalVerifierInvocationBinding,
+    pub terminal_binding: TerminalVerifierBinding,
+    pub input_artifact_bindings: Vec<ArtifactId>,
+    pub raw_artifact_bindings: Vec<CanonicalVerifierRawArtifactBinding>,
+    pub effect_reference_bindings: Vec<CanonicalVerifierEffectBinding>,
+}
+
+impl CanonicalVerifierExecutionFact {
+    /// Builds a fact only from a terminal, durably receipt-bound TestD job.
+    ///
+    /// `receipt` must equal the full receipt retained by TestD after the
+    /// worker/verifier transition.  The terminal binding and run are checked
+    /// against the same invocation, fence, outcome, and artifact lineage.
+    pub fn from_testd(
+        task_id: &TaskId,
+        task_revision: u64,
+        plan: &CanonicalPlanBinding,
+        state_fence: &StateFence,
+        job: &TestJob,
+        receipt: &VerificationReceipt,
+        run: VerificationRun,
+    ) -> Result<Self, CompositionError> {
+        check_testd_receipt_terminal(job, receipt)?;
+        let receipt_binding = receipt.binding();
+        if job.receipt.as_ref() != Some(&receipt_binding)
+            || job.verification_receipt.as_ref() != Some(receipt)
+        {
+            return Err(verifier_fact_error(
+                "TestD verifier receipt is not the durably retained job receipt",
+            ));
+        }
+        check_testd_receipt_fence(job, receipt, state_fence)?;
+        let verifier_plan = admitted_testd_verifier_plan(plan, task_id, task_revision, job)?;
+        let invocation = matched_testd_invocation(&job.invocation, verifier_plan)?;
+        let terminal_binding =
+            checked_testd_terminal_binding(&run, state_fence, job, receipt, verifier_plan)?;
+
+        check_testd_artifact_lineage(receipt, &run, &terminal_binding)?;
+
+        let receipt_sha256 =
+            eliot_testd_core::verification_receipt_sha256(receipt).map_err(|error| {
+                verifier_fact_error(format!("TestD receipt digest failed: {error}"))
+            })?;
+        let canonical_receipt = CanonicalVerifierReceiptBinding::from_binding(
+            &receipt_binding,
+            receipt.execution,
+            receipt_sha256.clone(),
+        );
+        let fact = Self {
+            task_id: task_id.as_str().to_owned(),
+            task_revision,
+            plan: plan.clone(),
+            state_fence: state_fence.clone(),
+            job_id: job.job_id.clone(),
+            job_state: canonical_job_state(job.state).to_owned(),
+            receipt: canonical_receipt,
+            source_observation: receipt
+                .source_observation
+                .as_ref()
+                .map(CanonicalVerifierSourceObservationRange::from_testd),
+            verification_run: run,
+            invocation,
+            terminal_binding,
+            input_artifact_bindings: job.invocation.input_artifacts.clone(),
+            raw_artifact_bindings: receipt
+                .raw_artifacts
+                .iter()
+                .map(|artifact| CanonicalVerifierRawArtifactBinding {
+                    handle: artifact.handle.clone(),
+                    content_type: artifact.content_type.clone(),
+                    length: artifact.length,
+                    sha256: artifact.sha256.clone(),
+                    truncated: artifact.truncated,
+                })
+                .collect(),
+            effect_reference_bindings: vec![CanonicalVerifierEffectBinding {
+                task_id: task_id.as_str().to_owned(),
+                job_id: receipt.job_id.clone(),
+                operation_id: receipt.operation_id.clone(),
+                process_tree_id: receipt.process_tree_id.clone(),
+                state_fence: state_fence.clone(),
+                execution: receipt.execution,
+                receipt_sha256,
+            }],
+        };
+        fact.validate(state_fence)?;
+        Ok(fact)
+    }
+
+    /// Validates the persisted fact without consulting a caller or provider.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
+        let verifier_plan = checked_fact_identity_and_plan(self, expected_fence)?;
+        check_fact_invocation_matches_plan(self, verifier_plan)?;
+        check_fact_run_and_receipt(self, expected_fence, verifier_plan)?;
+        check_fact_artifact_lineage(self)?;
+        check_fact_terminal_effect_join(self, expected_fence)?;
+        Ok(())
+    }
+
+    /// Whether the bound execution/evaluation is eligible to certify finish.
+    #[must_use]
+    pub fn certifies_completion(&self) -> bool {
+        let fresh = matches!(
+            self.verification_run.freshness,
+            EvidenceFreshness::ExactCandidate
+                | EvidenceFreshness::ExactCommit
+                | EvidenceFreshness::ExactQuiescedWorktree
+        );
+        self.job_state == "succeeded"
+            && self.receipt.execution == ExecutionStatus::Succeeded
+            && self.verification_run.execution == ExecutionStatus::Succeeded
+            && self.verification_run.outcome == VerificationOutcome::Pass
+            && self.verification_run.coverage == EvidenceCoverage::CompleteForScope
+            && self.verification_run.finished_at.is_some()
+            && fresh
+            && self
+                .source_observation
+                .as_ref()
+                .is_some_and(CanonicalVerifierSourceObservationRange::unchanged)
+            && !self.raw_artifact_bindings.is_empty()
+            && !self.verification_run.raw_evidence.is_empty()
+            && !self.verification_run.evidence.is_empty()
+            && self.verification_run.evidence.iter().all(|evidence| {
+                matches!(
+                    evidence.freshness,
+                    EvidenceFreshness::ExactCandidate
+                        | EvidenceFreshness::ExactCommit
+                        | EvidenceFreshness::ExactQuiescedWorktree
+                ) && evidence.coverage == EvidenceCoverage::CompleteForScope
+            })
+            && self
+                .raw_artifact_bindings
+                .iter()
+                .all(|artifact| !artifact.truncated)
+    }
+}
+
+/// Rejects a receipt that fails owner validation or a non-terminal job.
+fn check_testd_receipt_terminal(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+) -> Result<(), CompositionError> {
+    receipt.validate(job).map_err(|error| {
+        verifier_fact_error(format!("TestD receipt validation failed: {error}"))
+    })?;
+    if !job.state.is_terminal() {
+        return Err(verifier_fact_error(
+            "TestD verifier fact requires a terminal job",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a receipt that does not bind the current canonical fence.
+fn check_testd_receipt_fence(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    state_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    if job.execution != Some(receipt.execution)
+        || job.invocation.request.state_fence != *state_fence
+        || receipt.authority_epoch != state_fence.authority_epoch
+        || receipt.generation != state_fence.resource_generation.value()
+    {
+        return Err(verifier_fact_error(
+            "TestD receipt does not bind to the current canonical fence",
+        ));
+    }
+    Ok(())
+}
+
+/// Admits the canonical verifier plan for one task revision and binds the
+/// `TestD` request to it. Returns the borrowed verifier plan binding.
+fn admitted_testd_verifier_plan<'a>(
+    plan: &'a CanonicalPlanBinding,
+    task_id: &TaskId,
+    task_revision: u64,
+    job: &TestJob,
+) -> Result<&'a CanonicalVerifierPlanBinding, CompositionError> {
+    if plan.task_id != *task_id || task_revision == 0 {
+        return Err(verifier_fact_error(
+            "verifier fact task or plan binding is invalid",
+        ));
+    }
+    plan.validate()?;
+    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+        verifier_fact_error("canonical plan has no verifier profile/config/scope/artifact binding")
+    })?;
+    if job.invocation.request.task_id.as_ref() != Some(task_id) {
+        return Err(verifier_fact_error(
+            "TestD verifier request is not bound to the canonical plan",
+        ));
+    }
+    Ok(verifier_plan)
+}
+
+/// Whether the observed invocation equals the exact canonical plan request,
+/// including the plan-bound `TaskContract` acceptance denominator and its
+/// explicit test join (issue #325 P1, I7.9).
+fn verifier_invocation_matches_plan(
+    invocation: &CanonicalVerifierInvocationBinding,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> bool {
+    invocation.instrument == verifier_plan.instrument
+        && invocation.kind == verifier_plan.kind
+        && invocation.profile == verifier_plan.profile
+        && invocation.target == verifier_plan.target
+        && invocation.arguments == verifier_plan.arguments
+        && invocation.declared_scope == verifier_plan.declared_scope
+        && invocation.input_artifacts == verifier_plan.input_artifacts
+        && invocation.required_test_ids == verifier_plan.required_test_ids
+        && invocation.required_acceptance_item_ids == verifier_plan.required_acceptance_item_ids
+        && invocation.acceptance_verifier_map == verifier_plan.acceptance_verifier_map
+        && invocation.evaluator == verifier_plan.evaluator
+        && invocation.evaluator_version == verifier_plan.evaluator_version
+        && invocation.config_hash == verifier_plan.planned.verifier_config_hash
+}
+
+/// Rebuilds the observed invocation binding and requires it to equal the
+/// exact canonical plan request.
+fn matched_testd_invocation(
+    job_invocation: &InstrumentInvocation,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<CanonicalVerifierInvocationBinding, CompositionError> {
+    let invocation =
+        CanonicalVerifierInvocationBinding::from_invocation(job_invocation, verifier_plan)?;
+    if !verifier_invocation_matches_plan(&invocation, verifier_plan) {
+        return Err(verifier_fact_error(
+            "observed TestD invocation is not the exact canonical plan request",
+        ));
+    }
+    Ok(invocation)
+}
+
+/// Validates the terminal execution outcome and builds its canonical binding.
+fn checked_testd_terminal_binding(
+    run: &VerificationRun,
+    state_fence: &StateFence,
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<TerminalVerifierBinding, CompositionError> {
+    run.validate().map_err(|error| {
+        verifier_fact_error(format!("VerificationRun validation failed: {error}"))
+    })?;
+    if !run.execution.is_terminal()
+        || run.state_fence != *state_fence
+        || run.invocation_id.as_str() != job.invocation.request.request_id.as_str()
+        || run.invocation_id.as_str() != receipt.invocation_id
+        || run.execution != receipt.execution
+    {
+        return Err(verifier_fact_error(
+            "VerificationRun is not the terminal TestD execution outcome",
+        ));
+    }
+    let evidence_refs: Vec<_> = run
+        .raw_evidence
+        .iter()
+        .cloned()
+        .chain(
+            run.evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.clone()),
+        )
+        .collect();
+    let terminal_binding = TerminalVerifierBinding {
+        planned: verifier_plan.planned.clone(),
+        evidence: VerifierEvidenceRef {
+            run_id: run.run_id.clone(),
+            verifier_id: run.verifier.clone(),
+            scope: run.scope.clone(),
+            execution: run.execution,
+            outcome: run.outcome,
+            proof_ceiling: verifier_plan.planned.proof_ceiling,
+            evidence_refs,
+        },
+    };
+    terminal_binding.validate().map_err(|error| {
+        verifier_fact_error(format!("terminal verifier binding invalid: {error}"))
+    })?;
+    if terminal_binding.evidence.run_id != run.run_id
+        || terminal_binding.evidence.verifier_id != run.verifier
+        || terminal_binding.evidence.scope != run.scope
+        || terminal_binding.evidence.execution != run.execution
+        || terminal_binding.evidence.outcome != run.outcome
+    {
+        return Err(verifier_fact_error(
+            "terminal verifier binding does not match the executed run",
+        ));
+    }
+    if terminal_binding.planned.verifier_id != verifier_plan.planned.verifier_id
+        || terminal_binding.planned.scope != verifier_plan.declared_scope
+        || terminal_binding.planned.verifier_config_hash
+            != verifier_plan.planned.verifier_config_hash
+        || terminal_binding.planned.contract_revision != verifier_plan.planned.contract_revision
+        || run.verifier != verifier_plan.evaluator
+        || run.scope != job.invocation.declared_scope
+    {
+        return Err(verifier_fact_error(
+            "terminal verifier configuration is not the canonical requested profile/revision",
+        ));
+    }
+    Ok(terminal_binding)
+}
+
+/// Requires the run's raw and normalized evidence to stay inside the `TestD`
+/// receipt lineage bound by the terminal binding.
+fn check_testd_artifact_lineage(
+    receipt: &VerificationReceipt,
+    run: &VerificationRun,
+    terminal_binding: &TerminalVerifierBinding,
+) -> Result<(), CompositionError> {
+    let raw_handles: BTreeSet<String> = receipt
+        .raw_artifacts
+        .iter()
+        .map(|artifact| artifact.handle.clone())
+        .collect();
+    let run_raw_handles: BTreeSet<String> =
+        run.raw_evidence.iter().map(ToString::to_string).collect();
+    if !run_raw_handles.is_subset(&raw_handles) {
+        return Err(verifier_fact_error(
+            "VerificationRun raw evidence is outside the TestD receipt",
+        ));
+    }
+    for evidence in &run.evidence {
+        if !raw_handles.contains(evidence.raw_artifact_id.as_str()) {
+            return Err(verifier_fact_error(
+                "normalized verifier evidence is outside the TestD receipt",
+            ));
+        }
+    }
+    let run_artifacts: BTreeSet<String> = run
+        .raw_evidence
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            run.evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.to_string()),
+        )
+        .collect();
+    if terminal_binding
+        .evidence
+        .evidence_refs
+        .iter()
+        .any(|reference| !run_artifacts.contains(reference.as_str()))
+    {
+        return Err(verifier_fact_error(
+            "terminal verifier evidence references an unbound artifact",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates fact identity, fence, plan admission, and the observed
+/// invocation shape. Returns the borrowed verifier plan binding.
+fn checked_fact_identity_and_plan<'a>(
+    fact: &'a CanonicalVerifierExecutionFact,
+    expected_fence: &StateFence,
+) -> Result<&'a CanonicalVerifierPlanBinding, CompositionError> {
+    if &fact.state_fence != expected_fence
+        || fact.task_id.trim().is_empty()
+        || fact.task_id.chars().any(char::is_control)
+        || fact.job_id.trim().is_empty()
+        || fact.job_id.chars().any(char::is_control)
+        || fact.task_revision == 0
+    {
+        return Err(verifier_fact_error(
+            "canonical verifier fact has an invalid task, job, or fence",
+        ));
+    }
+    fact.state_fence
+        .validate()
+        .map_err(|error| verifier_fact_error(error.to_string()))?;
+    fact.plan.validate()?;
+    if fact.plan.task_id.as_str() != fact.task_id {
+        return Err(verifier_fact_error(
+            "canonical verifier fact plan is task-mismatched",
+        ));
+    }
+    let verifier_plan = fact.plan.verifier.as_ref().ok_or_else(|| {
+        verifier_fact_error("persisted verifier fact has no canonical verifier plan binding")
+    })?;
+    fact.invocation.validate()?;
+    Ok(verifier_plan)
+}
+
+/// Requires the persisted invocation to equal the canonical plan config,
+/// including the acceptance denominator and test join (issue #325 P1, I7.9).
+fn check_fact_invocation_matches_plan(
+    fact: &CanonicalVerifierExecutionFact,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<(), CompositionError> {
+    if !verifier_invocation_matches_plan(&fact.invocation, verifier_plan) {
+        return Err(verifier_fact_error(
+            "persisted verifier invocation does not match canonical plan config",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates input artifacts, the terminal run, its binding, and the exact
+/// `TestD` receipt/source join.
+fn check_fact_run_and_receipt(
+    fact: &CanonicalVerifierExecutionFact,
+    expected_fence: &StateFence,
+    verifier_plan: &CanonicalVerifierPlanBinding,
+) -> Result<(), CompositionError> {
+    if fact.input_artifact_bindings.is_empty()
+        || fact.input_artifact_bindings != verifier_plan.input_artifacts
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier input artifacts are not the canonical plan artifacts",
+        ));
+    }
+    fact.verification_run.validate().map_err(|error| {
+        verifier_fact_error(format!("persisted VerificationRun is invalid: {error}"))
+    })?;
+    if !fact.verification_run.execution.is_terminal()
+        || fact.verification_run.state_fence != *expected_fence
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier run is not terminal or is stale",
+        ));
+    }
+    fact.terminal_binding.validate().map_err(|error| {
+        verifier_fact_error(format!("persisted terminal binding is invalid: {error}"))
+    })?;
+    if fact.terminal_binding.evidence.run_id != fact.verification_run.run_id
+        || fact.terminal_binding.evidence.verifier_id != fact.verification_run.verifier
+        || fact.terminal_binding.evidence.scope != fact.verification_run.scope
+        || fact.terminal_binding.evidence.execution != fact.verification_run.execution
+        || fact.terminal_binding.evidence.outcome != fact.verification_run.outcome
+    {
+        return Err(verifier_fact_error(
+            "persisted terminal binding does not match the run",
+        ));
+    }
+    validate_canonical_receipt_binding(&fact.receipt, &fact.state_fence)?;
+    match &fact.source_observation {
+        Some(observation) => observation.validate(&fact.receipt.source_root)?,
+        None if fact.receipt.execution == ExecutionStatus::Succeeded => {
+            return Err(verifier_fact_error(
+                "successful verifier fact lacks an observed source identity",
+            ));
+        }
+        None => {}
+    }
+    if fact.receipt.job_id != fact.job_id
+        || fact.receipt.invocation_id != fact.verification_run.invocation_id.as_str()
+        || fact.receipt.execution != fact.verification_run.execution
+    {
+        return Err(verifier_fact_error(
+            "persisted receipt binding does not match the run",
+        ));
+    }
+    if fact.verification_run.verifier != verifier_plan.evaluator
+        || fact.verification_run.scope != fact.invocation.declared_scope
+        || fact.verification_run.invocation_id.as_str() != fact.receipt.invocation_id
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier run is not bound to the admitted evaluator invocation",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates raw artifact bindings and the exact artifact lineage join.
+fn check_fact_artifact_lineage(
+    fact: &CanonicalVerifierExecutionFact,
+) -> Result<(), CompositionError> {
+    let mut handles = BTreeSet::new();
+    for artifact in &fact.raw_artifact_bindings {
+        if artifact.handle.trim().is_empty()
+            || artifact.content_type.trim().is_empty()
+            || artifact.handle.chars().any(char::is_control)
+            || artifact.content_type.chars().any(char::is_control)
+            || artifact.sha256.len() != 64
+            || artifact
+                .sha256
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || !handles.insert(artifact.handle.clone())
+        {
+            return Err(verifier_fact_error(
+                "persisted verifier artifact binding is invalid or duplicated",
+            ));
+        }
+    }
+    let run_artifacts: BTreeSet<String> = fact
+        .verification_run
+        .raw_evidence
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            fact.verification_run
+                .evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.to_string()),
+        )
+        .collect();
+    if fact
+        .verification_run
+        .raw_evidence
+        .iter()
+        .any(|reference| !handles.contains(reference.as_str()))
+        || fact
+            .verification_run
+            .evidence
+            .iter()
+            .any(|evidence| !handles.contains(evidence.raw_artifact_id.as_str()))
+        || fact
+            .terminal_binding
+            .evidence
+            .evidence_refs
+            .iter()
+            .any(|reference| !run_artifacts.contains(reference.as_str()))
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier artifact lineage is not exact",
+        ));
+    }
+    for evidence in &fact.verification_run.evidence {
+        let Some(raw_handles) = evidence.value.get("raw_artifact_handles") else {
+            continue;
+        };
+        let raw_handles = raw_handles.as_array().ok_or_else(|| {
+            verifier_fact_error("normalized evidence raw_artifact_handles is not an array")
+        })?;
+        let mut seen_raw_handles = BTreeSet::new();
+        for raw_handle in raw_handles {
+            let raw_handle = raw_handle.as_str().ok_or_else(|| {
+                verifier_fact_error(
+                    "normalized evidence raw_artifact_handles contains a non-string value",
+                )
+            })?;
+            if !handles.contains(raw_handle) || !seen_raw_handles.insert(raw_handle) {
+                return Err(verifier_fact_error(
+                    "normalized evidence names an unbound or duplicate raw artifact",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Requires a terminal job state and the exact single `TestD` effect receipt
+/// join.
+fn check_fact_terminal_effect_join(
+    fact: &CanonicalVerifierExecutionFact,
+    expected_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    if !matches!(
+        fact.job_state.as_str(),
+        "succeeded" | "failed" | "cancelled" | "quarantined"
+    ) {
+        return Err(verifier_fact_error(
+            "persisted verifier fact does not identify a terminal TestD job",
+        ));
+    }
+    if fact.effect_reference_bindings.len() != 1
+        || fact.effect_reference_bindings.iter().any(|effect| {
+            effect.validate(&fact.task_id, expected_fence).is_err()
+                || effect.receipt_sha256 != fact.receipt.receipt_sha256
+                || effect.job_id != fact.receipt.job_id
+                || effect.operation_id != fact.receipt.operation_id
+                || effect.process_tree_id != fact.receipt.process_tree_id
+                || effect.execution != fact.receipt.execution
+        })
+    {
+        return Err(verifier_fact_error(
+            "persisted verifier fact does not join its exact TestD effect receipt",
+        ));
+    }
+    Ok(())
+}
+
+/// Rebuilds acceptance dispositions from the terminal verifier evidence
+/// joined against the current canonical owner plan. Persisted `satisfied`
+/// flags are never an independent source of acceptance truth.
+///
+/// I7.9 / issue #325 P1: the denominator is rehydrated from the current
+/// canonical owner plan (`plan`, read by the caller from the canonical owner
+/// at the exact task/fence/revision), never from the selected
+/// `required_test_ids` inventory and never from the fact-embedded plan clone
+/// alone: a fact whose plan drifted from the current owner plan fails closed
+/// here. Every required acceptance item is enumerated before any verifier
+/// evidence is joined; unmapped items stay uncovered and can never yield
+/// `VERIFIED_COMPLETE` downstream.
+pub(crate) fn acceptance_coverage_from_verifier_fact(
+    plan: &CanonicalPlanBinding,
+    fact: &CanonicalVerifierExecutionFact,
+) -> Result<Vec<AcceptanceCoverage>, CompositionError> {
+    if fact.plan != *plan {
+        return Err(verifier_fact_error(
+            "canonical verifier fact plan drifted from the current canonical owner plan",
+        ));
+    }
+    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+        verifier_fact_error("canonical finish plan has no verifier item bindings")
+    })?;
+    let run_ref = fact.verification_run.run_id.to_string();
+    let run_is_current = matches!(
+        fact.verification_run.freshness,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    );
+    let mut acceptance = Vec::with_capacity(verifier_plan.required_acceptance_item_ids.len());
+    for item_id in &verifier_plan.required_acceptance_item_ids {
+        // Explicit acceptance-to-test join owned by the canonical plan. A
+        // missing entry is an unmapped obligation; an empty test set declares
+        // a non-test obligation that executed verifier runs alone cannot
+        // satisfy. Neither form shrinks the denominator to the test list.
+        let mapped = verifier_plan
+            .acceptance_verifier_map
+            .get(item_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut evidence_refs = BTreeSet::new();
+        let mut mapped_events = 0_usize;
+        let mut all_mapped_observed = true;
+        let mut all_pass = true;
+        for test_id in &mapped {
+            let test_events = fact
+                .verification_run
+                .evidence
+                .iter()
+                .filter(|event| {
+                    event
+                        .value
+                        .get("nextest_test_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(test_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if test_events.is_empty() {
+                all_mapped_observed = false;
+            }
+            for event in test_events {
+                mapped_events += 1;
+                evidence_refs.insert(event.evidence_id.to_string());
+                evidence_refs.insert(event.raw_artifact_id.to_string());
+                if let Some(handles) = event
+                    .value
+                    .get("raw_artifact_handles")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    evidence_refs.extend(
+                        handles
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+                if event
+                    .value
+                    .get("nextest_status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("PASS")
+                {
+                    all_pass = false;
+                }
+            }
+        }
+        if mapped_events == 0 {
+            // Keep the negative item disposition tied to the actual raw run
+            // artifacts inspected; never mint a placeholder item receipt.
+            evidence_refs.extend(
+                fact.verification_run
+                    .raw_evidence
+                    .iter()
+                    .map(ToString::to_string),
+            );
+        }
+        // An item is satisfied only for a current run where every bound test
+        // executed and every bound execution passed. Failed, stale,
+        // not-executed, simulated (non-productive, hence non-certifying and
+        // stale-marked upstream), unmapped, and non-test obligations stay
+        // uncovered here and fail closed in `derive_finish_decision`.
+        let satisfied = run_is_current && !mapped.is_empty() && all_mapped_observed && all_pass;
+        let verifier_run_refs = if mapped_events == 0 {
+            Vec::new()
+        } else {
+            vec![run_ref.clone()]
+        };
+        // Only an explicit empty mapping declares a non-test obligation that
+        // does not require a verifier run. A missing mapping stays a
+        // verifier gap so absent coverage fails closed downstream.
+        let requires_verifier = !matches!(
+            verifier_plan.acceptance_verifier_map.get(item_id),
+            Some(tests) if tests.is_empty()
+        );
+        acceptance.push(AcceptanceCoverage {
+            item_id: item_id.clone(),
+            satisfied,
+            evidence_refs: evidence_refs.into_iter().collect(),
+            verifier_run_refs,
+            requires_verifier,
+        });
+    }
+    Ok(acceptance)
+}
+
+fn verifier_fact_error(reason: impl Into<String>) -> CompositionError {
+    CompositionError::Recovery(format!(
+        "canonical verifier execution fact: {}",
+        reason.into()
+    ))
+}
+
+fn canonical_job_state(state: JobState) -> &'static str {
+    match state {
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+        JobState::Quarantined => "quarantined",
+        JobState::Queued | JobState::Running | JobState::RetryWait => "non_terminal",
+    }
+}
+
+fn validate_canonical_receipt_binding(
+    binding: &CanonicalVerifierReceiptBinding,
+    expected_fence: &StateFence,
+) -> Result<(), CompositionError> {
+    let text_fields = [
+        (&binding.job_id, "job_id"),
+        (&binding.operation_id, "operation_id"),
+        (&binding.process_tree_id, "process_tree_id"),
+        (&binding.invocation_id, "invocation_id"),
+        (&binding.invocation_digest, "invocation_digest"),
+        (&binding.allowed_contour_root, "allowed_contour_root"),
+        (&binding.source_root, "source_root"),
+        (&binding.target_root, "target_root"),
+        (&binding.cache_root, "cache_root"),
+    ];
+    if text_fields
+        .iter()
+        .any(|(value, _)| value.trim().is_empty() || value.chars().any(char::is_control))
+        || binding.generation != expected_fence.resource_generation.value()
+        || binding.authority_epoch != expected_fence.authority_epoch
+        || !binding.execution.is_terminal()
+    {
+        return Err(verifier_fact_error(
+            "persisted TestD receipt identity is stale or malformed",
+        ));
+    }
+    Ok(())
 }
 
 /// Persisted current-plan authority for one exact Governor fence.
@@ -833,6 +2233,160 @@ pub struct CanonicalAdmissionSnapshot {
     pub state_fence: StateFence,
     pub owner_revision: u64,
     pub current_plan: Option<CanonicalPlanBinding>,
+    /// Last terminal verifier execution fact admitted for this exact task,
+    /// plan, artifact lineage, and fence.
+    #[serde(default)]
+    pub verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
+    /// Canonical evidence required to evaluate a finish candidate.  The
+    /// candidate draft never supplies this record; it is rehydrated with the
+    /// current canonical owner image and must carry the same fence as it.
+    #[serde(default)]
+    pub finish_evidence: Option<CanonicalFinishEvidence>,
+}
+
+/// Canonical owner evidence consumed by the Governor finish path.
+///
+/// This is deliberately a projection owned by the canonical owner, rather
+/// than a second finish machine.  `FinishService` derives the decision from
+/// this record; the Store only persists the resulting receipt projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalFinishEvidence {
+    /// Fence at which the evidence was observed.
+    pub state_fence: StateFence,
+    /// Acceptance, artifact, verifier, and effect evidence from canonical
+    /// state.  It is never accepted from the finish caller.
+    pub evidence: FinishEvidence,
+    /// Exact effect receipts joined to the terminal verifier owner fact.
+    pub effect_reference_bindings: Vec<CanonicalVerifierEffectBinding>,
+    /// Closure observation for admitted descendants and external effects.
+    pub descendant_closure: DescendantClosure,
+    /// Authority owner reference for finish evaluation.
+    pub finish_authority_ref: String,
+    /// Optional explicit authority for a closing lifecycle action.
+    pub closure_authority_ref: Option<String>,
+}
+
+impl CanonicalFinishEvidence {
+    /// Validates the evidence against one active canonical fence.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), CompositionError> {
+        if &self.state_fence != expected_fence {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence has a stale state fence".to_owned(),
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.evidence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.evidence.task_id.trim().is_empty()
+            || self.evidence.task_id.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence task identity is invalid".to_owned(),
+            ));
+        }
+        if self.finish_authority_ref.trim().is_empty()
+            || self.finish_authority_ref.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish authority reference is invalid".to_owned(),
+            ));
+        }
+        if let Some(reference) = &self.closure_authority_ref
+            && (reference.trim().is_empty() || reference.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical closure authority reference is invalid".to_owned(),
+            ));
+        }
+        if self.effect_reference_bindings.is_empty()
+            || self.effect_reference_bindings.iter().any(|effect| {
+                effect
+                    .validate(&self.evidence.task_id, expected_fence)
+                    .is_err()
+            })
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence has no valid owner-bound effect receipt".to_owned(),
+            ));
+        }
+        match &self.descendant_closure {
+            DescendantClosure::Complete { receipt_ref }
+                if !self.evidence.artifact_refs.contains(receipt_ref) =>
+            {
+                return Err(CompositionError::Recovery(
+                    "complete descendant closure is missing its owner receipt artifact".to_owned(),
+                ));
+            }
+            DescendantClosure::Incomplete { unresolved_refs }
+                if unresolved_refs
+                    .iter()
+                    .any(|reference| !self.evidence.unresolved_effect_refs.contains(reference)) =>
+            {
+                return Err(CompositionError::Recovery(
+                    "descendant closure is not joined to unresolved effect dispositions".to_owned(),
+                ));
+            }
+            DescendantClosure::Unknown { reason_ref }
+                if !self.evidence.unresolved_effect_refs.contains(reason_ref)
+                    && !self.evidence.artifact_refs.contains(reason_ref) =>
+            {
+                return Err(CompositionError::Recovery(
+                    "unknown descendant closure has no canonical owner reference".to_owned(),
+                ));
+            }
+            DescendantClosure::Complete { .. }
+            | DescendantClosure::Incomplete { .. }
+            | DescendantClosure::Unknown { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn validate_owner_joins(
+        &self,
+        plan: &CanonicalPlanBinding,
+        fact: &CanonicalVerifierExecutionFact,
+    ) -> Result<(), CompositionError> {
+        if self.evidence.task_id != fact.task_id
+            || self.evidence.current_task_revision != fact.task_revision
+            || plan != &fact.plan
+            || plan.task_id.as_str() != self.evidence.task_id
+            || self.effect_reference_bindings != fact.effect_reference_bindings
+        {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence does not join the current plan, task, or verifier effect owner"
+                    .to_owned(),
+            ));
+        }
+        let run_ref = fact.verification_run.run_id.to_string();
+        if self.evidence.executed_verifier_run_refs != [run_ref.clone()] {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence does not name its exact executed verifier run"
+                    .to_owned(),
+            ));
+        }
+        let expected_stale = if fact.certifies_completion() {
+            Vec::new()
+        } else {
+            vec![run_ref]
+        };
+        if self.evidence.stale_verifier_run_refs != expected_stale {
+            return Err(CompositionError::Recovery(
+                "canonical verifier execution/outcome disposition is not joined to finish evidence"
+                    .to_owned(),
+            ));
+        }
+        if self.evidence.acceptance != acceptance_coverage_from_verifier_fact(plan, fact)? {
+            return Err(CompositionError::Recovery(
+                "canonical per-item acceptance dispositions differ from verifier evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CanonicalAdmissionSnapshot {
@@ -846,6 +2400,8 @@ impl CanonicalAdmissionSnapshot {
             state_fence,
             owner_revision,
             current_plan,
+            verifier_execution_fact: None,
+            finish_evidence: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -864,6 +2420,33 @@ impl CanonicalAdmissionSnapshot {
         if let Some(current_plan) = &self.current_plan {
             current_plan.validate()?;
         }
+        if let Some(fact) = &self.verifier_execution_fact {
+            fact.validate(&self.state_fence)?;
+            let current_plan = self.current_plan.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical verifier fact has no current plan owner".to_owned(),
+                )
+            })?;
+            if current_plan != &fact.plan || current_plan.task_id.as_str() != fact.task_id {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier fact does not match the current plan".to_owned(),
+                ));
+            }
+        }
+        if let Some(finish_evidence) = &self.finish_evidence {
+            finish_evidence.validate(&self.state_fence)?;
+            let current_plan = self.current_plan.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical finish evidence has no current plan owner".to_owned(),
+                )
+            })?;
+            let fact = self.verifier_execution_fact.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical finish evidence has no verifier execution owner".to_owned(),
+                )
+            })?;
+            finish_evidence.validate_owner_joins(current_plan, fact)?;
+        }
         Ok(())
     }
 }
@@ -874,6 +2457,10 @@ struct CanonicalAdmissionSnapshotWire {
     state_fence: StateFence,
     owner_revision: u64,
     current_plan: Option<CanonicalPlanBinding>,
+    #[serde(default)]
+    verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
+    #[serde(default)]
+    finish_evidence: Option<CanonicalFinishEvidence>,
 }
 
 impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
@@ -882,7 +2469,16 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = CanonicalAdmissionSnapshotWire::deserialize(deserializer)?;
-        Self::new(wire.state_fence, wire.owner_revision, wire.current_plan)
+        let snapshot = Self {
+            state_fence: wire.state_fence,
+            owner_revision: wire.owner_revision,
+            current_plan: wire.current_plan,
+            verifier_execution_fact: wire.verifier_execution_fact,
+            finish_evidence: wire.finish_evidence,
+        };
+        snapshot
+            .validate()
+            .map(|()| snapshot)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -1039,6 +2635,134 @@ impl CanonicalAdmissionOwner {
                 "canonical current plan is absent; semantic activation is unavailable".to_owned(),
             )
         })
+    }
+
+    /// Returns the durable canonical owner revision used by a finish-evidence
+    /// compare-and-set.
+    #[must_use]
+    pub const fn owner_revision(&self) -> u64 {
+        self.snapshot.owner_revision
+    }
+
+    /// Builds the next canonical owner image after a verifier has completed
+    /// and its durable TestD row has been rehydrated. The fact is retained
+    /// even when its execution/outcome is non-certifying; finish evaluation
+    /// must see the real failed, stale, partial, or unknown run rather than a
+    /// caller assertion or a missing-value default.
+    pub fn prepare_verifier_execution_fact(
+        &self,
+        fact: CanonicalVerifierExecutionFact,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        fact.validate(&self.state_fence)?;
+        if let Some(plan) = &self.snapshot.current_plan
+            && (plan.task_id.as_str() != fact.task_id
+                || plan.plan_id != fact.plan.plan_id
+                || plan.plan_revision != fact.plan.plan_revision)
+        {
+            return Err(CompositionError::Recovery(
+                "verifier execution fact does not match the current canonical plan".to_owned(),
+            ));
+        }
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            verifier_execution_fact: Some(fact),
+            finish_evidence: self.snapshot.finish_evidence.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Reads the exact verifier execution fact retained by the canonical
+    /// owner at the active fence. Absence is a recovery gap, never an empty
+    /// verifier result.
+    pub fn read_verifier_execution_fact(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier fact read used a stale state fence".to_owned(),
+            ));
+        }
+        let fact = self
+            .snapshot
+            .verifier_execution_fact
+            .clone()
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical verifier execution fact is absent; completion proof is unavailable"
+                        .to_owned(),
+                )
+            })?;
+        fact.validate(state_fence)?;
+        Ok(fact)
+    }
+
+    /// Builds the next canonical admission owner image after a Governor-owned
+    /// finish-evidence derivation.  This is a pure owner transition payload;
+    /// persistence is performed only by the Kernel transition port.
+    pub fn prepare_finish_evidence(
+        &self,
+        evidence: CanonicalFinishEvidence,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        evidence.validate(&self.state_fence)?;
+        if let Some(plan) = &self.snapshot.current_plan
+            && plan.task_id.as_str() != evidence.evidence.task_id
+        {
+            return Err(CompositionError::Recovery(
+                "finish evidence task does not match the current canonical plan".to_owned(),
+            ));
+        }
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            finish_evidence: Some(evidence),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Reads the canonical finish evidence at the exact active fence.
+    ///
+    /// The result is owner state recovered from the Kernel named read.  A
+    /// missing record is a plan gap, never an empty evidence default, because
+    /// the finish service must not derive proof from the caller draft.
+    pub fn read_finish_evidence(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalFinishEvidence, CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence || self.scope.state_fence != *state_fence {
+            return Err(CompositionError::Recovery(
+                "canonical finish evidence read used a stale state fence".to_owned(),
+            ));
+        }
+        let evidence = self.snapshot.finish_evidence.clone().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical finish evidence owner is absent; completion proof is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        evidence.validate(state_fence)?;
+        Ok(evidence)
     }
 }
 
@@ -1579,6 +3303,13 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let canonical_snapshot: CanonicalAdmissionSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Canonical)?;
+        let canonical_read_revision = recovery.owner_read(RecoveryOwner::Canonical)?.revision;
+        if canonical_snapshot.owner_revision != canonical_read_revision {
+            return Err(CompositionError::Recovery(
+                "canonical snapshot revision does not match its Kernel named-read revision"
+                    .to_owned(),
+            ));
+        }
         let canonical = CanonicalAdmissionOwner::new(
             state_fence.clone(),
             recovery.canonical_scope.clone(),
@@ -1653,6 +3384,338 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+}
+
+fn testd_finished_clock(job: &TestJob) -> ClockReading {
+    let finished_at_ms = job.updated_at_ms.min(i64::MAX as u64) as i64;
+    ClockReading {
+        valid_time_ms: Some(finished_at_ms),
+        known_time_ms: Some(finished_at_ms),
+        transaction_sequence: None,
+        monotonic_ns: None,
+    }
+}
+
+/// Converts the durable TestD bytes into the standard raw-evidence contract.
+/// TestD's storage digest is length-domain-separated; the verifier receives a
+/// fresh standard digest over the exact retained bytes, so no handle or
+/// process-exit label can substitute for the captured stream.
+fn testd_raw_evidence(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+) -> Result<Vec<RawEvidence>, CompositionError> {
+    receipt.validate(job).map_err(|error| {
+        CompositionError::Recovery(format!("TestD receipt validation failed: {error}"))
+    })?;
+    let mut artifacts = receipt.raw_artifacts.clone();
+    artifacts.sort_by(|left, right| {
+        left.capture_sequence
+            .cmp(&right.capture_sequence)
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    artifacts
+        .into_iter()
+        .map(|artifact| {
+            let artifact_id = ArtifactId::new(artifact.handle.clone()).map_err(|error| {
+                CompositionError::Recovery(format!("raw verifier artifact id is invalid: {error}"))
+            })?;
+            let sha256 = sha256_hex(&artifact.bytes);
+            let content_type = match artifact.stream {
+                RawArtifactStream::Stdout => {
+                    eliot_instrument_nextest::NEXTEST_STDOUT_CONTENT_TYPE.to_owned()
+                }
+                RawArtifactStream::Stderr => {
+                    eliot_instrument_nextest::NEXTEST_STDERR_CONTENT_TYPE.to_owned()
+                }
+                RawArtifactStream::Unknown => artifact.content_type.clone(),
+            };
+            let raw = RawEvidence {
+                artifact_id,
+                invocation_id: job.invocation.request.request_id.clone(),
+                source: RawEvidenceSource::Process,
+                content_type,
+                bytes: artifact.bytes,
+                sha256,
+                captured_at: artifact.captured_at,
+                truncated: artifact.truncated,
+            };
+            raw.validate().map_err(|error| {
+                CompositionError::Recovery(format!("raw verifier artifact is invalid: {error}"))
+            })?;
+            Ok(raw)
+        })
+        .collect()
+}
+
+/// Runs the registered diagnostic normalizer over every completed nextest
+/// event. The evaluator owns outcome/coverage; this projection only attaches
+/// canonical event identity and keeps each normalized item linked to the
+/// exact raw stream which produced it.
+fn normalize_nextest_run(
+    run: &mut VerificationRun,
+    job: &TestJob,
+    plan: &CanonicalVerifierPlanBinding,
+    receipt: &VerificationReceipt,
+    raw: &[RawEvidence],
+    observed_at: ClockReading,
+) -> Result<(), CompositionError> {
+    if raw.is_empty() {
+        return Err(CompositionError::Recovery(
+            "nextest normalization has no raw artifact".to_owned(),
+        ));
+    }
+    let Some(source_observation) = receipt.source_observation.as_ref() else {
+        run.freshness = EvidenceFreshness::Unknown;
+        run.coverage = EvidenceCoverage::PartialForScope;
+        return Ok(());
+    };
+    source_observation.validate().map_err(|error| {
+        CompositionError::Recovery(format!("source observation invalid: {error}"))
+    })?;
+    if source_observation.before.repository_root != job.target_roots.source_root
+        || source_observation.after.repository_root != job.target_roots.source_root
+    {
+        return Err(CompositionError::Recovery(
+            "source observation is outside the admitted TestD repository".to_owned(),
+        ));
+    }
+    if !source_observation.unchanged() {
+        run.freshness = EvidenceFreshness::Unknown;
+        run.coverage = EvidenceCoverage::PartialForScope;
+    }
+    let source_before = &source_observation.before;
+    let tool = receipt.tool_observation.as_ref().ok_or_else(|| {
+        CompositionError::Recovery(
+            "productive TestD receipt has no owner-observed tool identity".to_owned(),
+        )
+    })?;
+    tool.validate().map_err(|error| {
+        CompositionError::Recovery(format!("tool observation invalid: {error}"))
+    })?;
+    let stdout = raw
+        .iter()
+        .filter(|evidence| {
+            evidence.content_type == eliot_instrument_nextest::NEXTEST_STDOUT_CONTENT_TYPE
+                || evidence.content_type == "application/json"
+        })
+        .collect::<Vec<_>>();
+    if stdout.is_empty() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer has no stdout event stream".to_owned(),
+        ));
+    }
+    let mut stream = Vec::new();
+    let mut spans = Vec::new();
+    for evidence in stdout {
+        let start = stream.len();
+        stream.extend_from_slice(&evidence.bytes);
+        spans.push((start, stream.len(), evidence.artifact_id.clone()));
+    }
+    let events = parse_test_events(&stream).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered nextest normalizer rejected the joined stdout stream: {error}"
+        ))
+    })?;
+    let mut normalized = Vec::new();
+    let classifier = DiagnosticClassifier::default();
+    let mut line_start = 0usize;
+    let mut line_events = Vec::new();
+    for line_end in stream
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .chain((!stream.is_empty() && !stream.ends_with(b"\n")).then_some(stream.len()))
+    {
+        if line_end < line_start {
+            continue;
+        }
+        let line = &stream[line_start..line_end];
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            line_events.extend(parse_test_events(line).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "registered nextest normalizer could not map joined event: {error}"
+                ))
+            })?);
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    if line_events.len() != events.len() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer lost an event while joining stdout chunks".to_owned(),
+        ));
+    }
+    let mut line_start = 0usize;
+    let mut event_index = 0usize;
+    for line_end in stream
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        .chain((!stream.is_empty() && !stream.ends_with(b"\n")).then_some(stream.len()))
+    {
+        let line = &stream[line_start..line_end];
+        if !line.iter().all(u8::is_ascii_whitespace) {
+            let line_event_count = parse_test_events(line)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?
+                .len();
+            let handles = spans
+                .iter()
+                .filter(|(start, end, _)| *start < line_end && *end > line_start)
+                .map(|(_, _, artifact_id)| artifact_id.clone())
+                .collect::<Vec<_>>();
+            if handles.is_empty() && line_event_count != 0 {
+                return Err(CompositionError::Recovery(
+                    "nextest event has no raw artifact lineage".to_owned(),
+                ));
+            }
+            for _ in 0..line_event_count {
+                let event = &line_events[event_index];
+                event_index += 1;
+                let NextestTestEvent::Completed { name, status } = event else {
+                    continue;
+                };
+                let status_label = nextest_status_label(*status);
+                let severity = match status {
+                    NextestTestStatus::Pass => DiagnosticSeverity::Information,
+                    NextestTestStatus::Fail
+                    | NextestTestStatus::Timeout
+                    | NextestTestStatus::Leak
+                    | NextestTestStatus::Cancelled => DiagnosticSeverity::Error,
+                    NextestTestStatus::Skip => DiagnosticSeverity::Warning,
+                };
+                let raw_observation_ref = handles.first().cloned().ok_or_else(|| {
+                    CompositionError::Recovery("nextest event has no raw artifact".to_owned())
+                })?;
+                let diagnostic = DiagnosticEvent::from_input(DiagnosticInput {
+                    project_id: job.invocation.request.product_id.to_string(),
+                    task_id: job
+                        .invocation
+                        .request
+                        .task_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                    tool_id: job.invocation.instrument.to_string(),
+                    tool_version: tool.nextest_identity(),
+                    config_hash: plan.planned.verifier_config_hash.clone(),
+                    branch: source_before.branch.clone(),
+                    commit: source_before.commit.clone(),
+                    dirty_state_hash: source_before.dirty_state_sha256.clone(),
+                    file_path: job.invocation.target.clone(),
+                    range: None,
+                    severity,
+                    rule_id: format!("nextest.test.{}", status_label.to_ascii_lowercase()),
+                    message: format!("nextest test {name} completed with status {status_label}"),
+                    raw_observation_ref: raw_observation_ref.clone(),
+                    observed_at,
+                    status: if matches!(*status, NextestTestStatus::Pass) {
+                        DiagnosticStatus::Resolved
+                    } else {
+                        DiagnosticStatus::Active
+                    },
+                })
+                .map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "registered diagnostic normalizer rejected nextest event: {error}"
+                    ))
+                })?;
+                let diagnostic = classifier.admit(diagnostic).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "registered diagnostic normalizer rejected nextest event: {error}"
+                    ))
+                })?;
+                let evidence_id = ArtifactId::new(format!("nextest-evidence-{}", sha256_hex(line)))
+                    .map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "normalized evidence id is invalid: {error}"
+                        ))
+                    })?;
+                let mut value = serde_json::to_value(&diagnostic).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "normalized diagnostic serialization failed: {error}"
+                    ))
+                })?;
+                value["raw_artifact_handles"] = serde_json::json!(handles);
+                // Preserve the typed nextest item identity and outcome in the
+                // normalized owner evidence. FinishAttempt joins these exact
+                // fields to the canonical required-test set; diagnostic prose
+                // and run-level status are not item-level acceptance proof.
+                value["nextest_test_id"] = serde_json::json!(catalog_test_id(name));
+                value["nextest_status"] = serde_json::json!(status_label);
+                normalized.push(NormalizedEvidence {
+                    evidence_id,
+                    raw_artifact_id: raw_observation_ref,
+                    normalizer: ContractId::new(DIAGNOSTIC_CONTRACT).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "diagnostic contract id is invalid: {error}"
+                        ))
+                    })?,
+                    kind: "nextest.test".to_owned(),
+                    summary: format!("nextest test {name} completed with status {status_label}"),
+                    value,
+                    axes: EvidenceAxes::observed(),
+                    freshness: run.freshness,
+                    coverage: if plan.required_test_ids.contains(catalog_test_id(name)) {
+                        run.coverage
+                    } else {
+                        EvidenceCoverage::PartialForScope
+                    },
+                });
+            }
+        }
+        line_start = line_end.saturating_add(1);
+    }
+    if event_index != line_events.len() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer did not consume every parsed event".to_owned(),
+        ));
+    }
+    if normalized.is_empty() {
+        return Err(CompositionError::Recovery(
+            "registered nextest normalizer produced no completed test evidence".to_owned(),
+        ));
+    }
+    run.evidence = normalized;
+    run.validate().map_err(|error| {
+        CompositionError::Recovery(format!("normalized VerificationRun is invalid: {error}"))
+    })
+}
+
+const fn nextest_status_label(status: NextestTestStatus) -> &'static str {
+    match status {
+        NextestTestStatus::Pass => "PASS",
+        NextestTestStatus::Fail => "FAIL",
+        NextestTestStatus::Skip => "SKIP",
+        NextestTestStatus::Timeout => "TIMEOUT",
+        NextestTestStatus::Leak => "LEAK",
+        NextestTestStatus::Cancelled => "CANCELLED",
+    }
+}
+
+pub(crate) fn evaluate_testd_verification_current(
+    job: &TestJob,
+    receipt: &VerificationReceipt,
+    plan: &CanonicalVerifierPlanBinding,
+) -> Result<VerificationRun, CompositionError> {
+    if job.invocation.profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        return Err(CompositionError::Recovery(
+            "current verifier evaluation requires the productive nextest profile".to_owned(),
+        ));
+    }
+    let raw = testd_raw_evidence(job, receipt)?;
+    let finished_at = testd_finished_clock(job);
+    let mut run = eliot_verifier::evaluate_current(
+        &job.invocation,
+        &raw,
+        &plan.required_test_ids,
+        job.invocation.request.clock,
+        finished_at,
+    )
+    .map_err(|error| {
+        CompositionError::Recovery(format!(
+            "registered nextest evaluator rejected durable TestD evidence: {error}"
+        ))
+    })?;
+    normalize_nextest_run(&mut run, job, plan, receipt, &raw, finished_at)?;
+    Ok(run)
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
@@ -1731,6 +3794,94 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Rehydrates one verifier execution fact from the current Governor task,
+    /// plan, and the current durable TestD owner row. The caller supplies only
+    /// the durable job identity; it cannot pass a held `TestJob` image or a
+    /// verifier verdict. The store read, task/plan join, persisted receipt,
+    /// execution run, artifact lineage, and canonical fence are checked by
+    /// the one fact constructor.
+    pub fn rehydrate_testd_verifier_execution_fact(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<CanonicalVerifierExecutionFact, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let task = self.owners.task.task(task_id).ok_or_else(|| {
+            CompositionError::Recovery(format!("canonical task {} is absent", task_id.as_str()))
+        })?;
+        if task.task_id != *task_id || task.revision != task_revision || task.state_fence != fence {
+            return Err(CompositionError::Recovery(
+                "canonical task owner is stale for verifier rehydration".to_owned(),
+            ));
+        }
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
+        if plan.task_id != *task_id {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan is task-mismatched".to_owned(),
+            ));
+        }
+        let job = testd
+            .get(job_id)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("TestD owner read failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                CompositionError::Recovery(format!("durable TestD job {job_id} is absent"))
+            })?;
+        let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical plan has no verifier profile/config/scope/artifact binding".to_owned(),
+            )
+        })?;
+        let receipt = job.verification_receipt.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "durable TestD job has no full verification receipt".to_owned(),
+            )
+        })?;
+        let run = evaluate_testd_verification_current(&job, receipt, verifier_plan)?;
+        CanonicalVerifierExecutionFact::from_testd(
+            task_id,
+            task_revision,
+            &plan,
+            &fence,
+            &job,
+            receipt,
+            run,
+        )
+    }
+
+    /// Prepares the canonical owner image for a TestD verifier fact. The
+    /// returned snapshot is committed only through the existing canonical
+    /// transition/CAS path; no public setter can install a caller assertion.
+    pub fn prepare_testd_verifier_execution_fact(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<CanonicalAdmissionSnapshot, CompositionError> {
+        let fact =
+            self.rehydrate_testd_verifier_execution_fact(task_id, task_revision, job_id, testd)?;
+        self.owners.canonical.prepare_verifier_execution_fact(fact)
+    }
+
+    /// Reads the canonical verifier plan only from this ready composition's
+    /// retained owner and the exact admitted state fence.
+    pub fn read_current_plan(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<CanonicalPlanBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.owners.canonical.read_current_plan(state_fence)
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
@@ -1847,6 +3998,100 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Borrows the single Governor FinishAttempt adapter.
+    ///
+    /// The adapter rehydrates the current task and canonical finish-evidence
+    /// sources at the retained fence. The composition's production method
+    /// publishes the Governor-derived `owner/canonical` evidence CAS and
+    /// refreshes its readback before the adapter evaluates the existing
+    /// [`FinishService`]. It never consumes provider result state as proof.
+    #[must_use]
+    pub fn finish_attempt_service(&self) -> GovernorFinishAttempt<'_, P> {
+        let finish_revision = self
+            .recovery
+            .owner_reads
+            .iter()
+            .find(|read| read.owner == RecoveryOwner::Finish)
+            .map_or(0, |read| read.revision);
+        GovernorFinishAttempt::new(
+            &self.owners,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            finish_revision,
+        )
+    }
+
+    /// Publishes the current durable `TestD` verifier execution fact through
+    /// the same canonical owner CAS used by `FinishEvidence`. The caller gives
+    /// only the job identity; `TestD` currentness and the full receipt/run are
+    /// re-read inside the Governor service before the write.
+    pub async fn publish_testd_verifier_execution_fact(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &TaskId,
+        task_revision: u64,
+        job_id: &str,
+        testd: &TestdStore,
+    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .publish_testd_verifier_execution_fact(
+                identity,
+                operation_id,
+                task_id,
+                task_revision,
+                job_id,
+                testd,
+            )
+            .await
+    }
+
+    /// Publishes the verifier-execution owner from complete identity-joined
+    /// terminal evidence supplied by the Kernel owner route. The daemon-side
+    /// entry: no `TestdStore` handle crosses the daemon boundary.
+    pub async fn publish_testd_verifier_execution_fact_from_evidence(
+        &self,
+        evidence: &TestdTerminalCompletionEvidence,
+    ) -> Result<Option<WriteReceipt>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service()
+            .publish_testd_verifier_execution_fact_from_evidence(evidence)
+            .await
+    }
+
+    /// Runs the production `FinishAttempt` path and returns only after the
+    /// canonical receipt has committed. Publication is performed by the
+    /// daemon composition through `refresh_from_kernel`, using the same
+    /// committed-receipt boundary as the other daemon callers.
+    pub async fn finish_attempt(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: OperationId,
+        draft: FinishAttemptDraft,
+    ) -> Result<FinishDecisionReceipt, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        {
+            let service = self.finish_attempt_service();
+            service
+                .publish_finish_evidence(identity, &operation_id, &draft)
+                .await?;
+        }
+        self.refresh_from_kernel()
+            .map_err(FinishAttemptError::Composition)?;
+        let receipt = {
+            let service = self.finish_attempt_service();
+            service.submit(identity, operation_id, draft).await?
+        };
+        Ok(receipt)
+    }
+
     /// Borrows the single observation/verified-repair reconciliation owner as
     /// a canonical [`GovernorObservationReconciliation`] adapter.
     ///
@@ -1887,6 +4132,543 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Runs the `ScopeBindingGuard` at one mandatory trigger against the live
+    /// retained `WorkScope` binding (issue #1787, `CanonicalWrite` trigger
+    /// wiring).
+    ///
+    /// Reads the live [`WorkScopeBindingOwner`] at the retained fence and
+    /// evaluates [`check_at_trigger`] with the caller-supplied observation:
+    /// mechanical truth enters only through `observed`, never from retained
+    /// fields. Without governing-source closure only the identity legs run, so
+    /// a mismatching observation withholds or quarantines exactly as with a
+    /// receipt while an identity-clear observation withholds pending source
+    /// closure instead of allowing. Fails closed when no binding is retained
+    /// or the owner read disagrees with the fence.
+    pub fn check_work_scope_at_trigger(
+        &self,
+        observed: &ScopeBinding,
+        trigger: GuardTrigger,
+    ) -> Result<TriggerReport, CompositionError> {
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; guard revalidation is unavailable".to_owned(),
+            )
+        })?;
+        let fence = self.snapshot.state_fence();
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(check_at_trigger(&snapshot.binding, observed, None, trigger))
+    }
+
+    /// Admits one trigger-gated operation against live `WorkScope` authority
+    /// (issue #1787, admission wiring).
+    ///
+    /// Joins the live owner read, the retained resource descriptor, and the
+    /// owner-issued resolution receipt through [`admit_at_trigger`]. Authority
+    /// comes from the live owner read and the retained descriptor, never from
+    /// receipt fields alone. Fails closed when no binding is retained.
+    pub fn admit_work_scope_at_trigger(
+        &self,
+        descriptor: &WorkScopeDescriptor,
+        receipt: &WorkScopeResolutionReceipt,
+        observed_generation: &GenerationEvidence,
+        fence: &StateFence,
+        trigger: GuardTrigger,
+    ) -> Result<TriggerAdmission, CompositionError> {
+        let Some(owner) = self.owners.work_scope.as_ref() else {
+            return Err(CompositionError::Recovery(
+                "WorkScope binding is unbound; trigger admission is unavailable".to_owned(),
+            ));
+        };
+        admit_at_trigger(
+            owner,
+            descriptor,
+            receipt,
+            observed_generation,
+            fence,
+            trigger,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits an authorized relocation/attach receipt as the new expected
+    /// `WorkScope` binding (issue #1787, rebind wiring).
+    ///
+    /// Validates the receipt through [`rebind_with_receipt`] and requires the
+    /// derived binding to be identity-clear against the caller-supplied live
+    /// observation: a rebind that disagrees with what is actually observed
+    /// fails instead of installing a stale binding. The returned binding is
+    /// the expected binding for the next owner snapshot; persisting it as the
+    /// current owner snapshot belongs to the recovery/bootstrap path that
+    /// owns owner writes.
+    pub fn rebind_work_scope_with_receipt(
+        receipt: &ScopeRelocationOrAttachReceipt,
+        expected_scope_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        fence: &StateFence,
+        observed: &ScopeBinding,
+    ) -> Result<ScopeBinding, CompositionError> {
+        let binding = rebind_with_receipt(
+            receipt,
+            expected_scope_ref,
+            privacy_class,
+            governing_source_generation,
+            fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if eliot_workscope::identity_legs(&binding, observed) != IdentityLegOutcome::IdentityClear {
+            return Err(CompositionError::Recovery(
+                "rebound WorkScope binding disagrees with the live observation".to_owned(),
+            ));
+        }
+        Ok(binding)
+    }
+
+    /// Runs one scope-identity resolution request through the evidence-first
+    /// order (issue #1787, resolver production caller).
+    ///
+    /// Entry for attach callers: the request carries session/task authority
+    /// references, binding tokens, resumed-task evidence, host handles,
+    /// registered instances or relocation receipts, lineage evidence, or a
+    /// manifest boundary, plus supporting-only evidence that can withhold a
+    /// unique outcome but never select. The first tier with usable evidence
+    /// decides; ambiguity preserves the candidate set instead of selecting.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn resolve_scope_identity(
+        request: &ResolutionRequest,
+    ) -> Result<ScopeResolution, CompositionError> {
+        WorkScopeResolver::resolve(request)
+            .map(|outcome| outcome.resolution)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Resolves scanner-derived inputs through the evidence-first resolver
+    /// (issue #1787, scanner-seam production caller).
+    ///
+    /// Runs [`BootstrapScanner::resolve_with_scan`] for an attach caller:
+    /// discovery evidence populates only the host-handles, lineage, and
+    /// manifest-boundary tiers, so resolution can distinguish candidates but
+    /// never authenticates a scope; owner issuance stays separate.
+    pub fn resolve_scope_identity_from_scan(
+        inputs: &ScannerResolverInputs,
+        candidates: &WorkScopeCandidateSet,
+    ) -> Result<ScopeResolution, CompositionError> {
+        BootstrapScanner::resolve_with_scan(inputs, candidates)
+            .map(|outcome| outcome.resolution)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Issues a durable resolution receipt from the live owner binding (issue
+    /// #1787, issuance production caller).
+    ///
+    /// Issuance reads `owner` at `fence` and requires the retained binding to
+    /// match `descriptor` with a `MATCHED` guard receipt; `Authenticated`
+    /// issuance additionally requires the supplied source closure to
+    /// re-validate. The receipt proves owner issuance; its fields alone do not.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "issuance joins every durable receipt field in one owner-checked entry"
+    )]
+    pub fn issue_scope_resolution_receipt(
+        &self,
+        receipt_ref: &str,
+        proposal_ref: &str,
+        descriptor: &WorkScopeDescriptor,
+        owner: &WorkScopeBindingOwner,
+        fence: &StateFence,
+        authentication: ResolutionAuthentication,
+        supporting_evidence: Vec<IdentityEvidence>,
+        rejected_candidate_refs: Vec<String>,
+        unresolved_candidate_refs: Vec<String>,
+        authority_ref: &str,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+    ) -> Result<WorkScopeResolutionReceipt, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        issue_resolution_receipt(
+            receipt_ref,
+            proposal_ref,
+            descriptor,
+            owner,
+            fence,
+            authentication,
+            supporting_evidence,
+            rejected_candidate_refs,
+            unresolved_candidate_refs,
+            authority_ref,
+            source_closure,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Enforces the scope binding guard at one trigger (issue #1787, guard
+    /// admission-chain production caller).
+    ///
+    /// Reads the retained binding at the retained fence, evaluates `observed`
+    /// at `trigger` with the caller-retained source closure, and returns the
+    /// current snapshot only when the verdict is `Allow` (full `MATCHED`
+    /// receipt). Any other verdict fails closed with the trigger and
+    /// disposition; the retained binding, task state, and project memory are
+    /// untouched.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn require_scope_guard_for_observed(
+        &self,
+        observed: &ScopeBinding,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+        trigger: GuardTrigger,
+    ) -> Result<WorkScopeBindingSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; scope-guarded work is unavailable".to_owned(),
+            )
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let report = check_at_trigger(&snapshot.binding, observed, source_closure, trigger);
+        match report.verdict {
+            GuardVerdict::Allow => Ok(snapshot),
+            GuardVerdict::Withhold | GuardVerdict::Quarantine => {
+                Err(guard_recovery_error(&report, "scope guard withheld"))
+            }
+        }
+    }
+
+    /// Admits an authorized relocation/attach receipt as the new expected
+    /// `WorkScope` binding (issue #1787, rebind production caller).
+    ///
+    /// The receipt must name the retained scope and match the retained fence;
+    /// the new binding carries the observed workspace-instance identity and
+    /// generation, and admission additionally requires a fresh `MATCHED`
+    /// source-closure check for that instance. Afterwards the same operation
+    /// is admitted only with the observed identity and fence. The prior
+    /// identity stays preserved inside the receipt. The returned owner is not
+    /// retained here: persist it with
+    /// [`Self::install_admitted_work_scope_owner`], which enforces
+    /// generation-aligned installation at the same fence.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn admit_scope_relocation(
+        &self,
+        receipt: &ScopeRelocationOrAttachReceipt,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        owner_revision: u64,
+    ) -> Result<WorkScopeBindingOwner, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; relocation has no retained scope".to_owned(),
+            )
+        })?;
+        let retained = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let relocated = rebind_with_receipt(
+            receipt,
+            &retained.binding.scope.scope_ref,
+            privacy_class,
+            governing_source_generation,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let fresh = ScopeBindingGuard.check(&relocated, &relocated, sources, privacy);
+        if fresh.disposition != ScopeBindingDisposition::Matched {
+            return Err(CompositionError::Recovery(
+                "relocation source closure is not matched for the observed instance".to_owned(),
+            ));
+        }
+        let snapshot = WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, fresh)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        WorkScopeBindingOwner::new(snapshot)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits an observed workspace instance as an attach to the retained scope
+    /// (issue #1787, attach production caller).
+    ///
+    /// This is the owning thin caller for the attach trigger path: `observed`
+    /// is the live mechanical observation already derived from workspace facts
+    /// (the daemon trigger ingress observes the explicit root and derives at
+    /// the admission fence generation; the CLI scope-observe ingress derives
+    /// the same shape as evidence). The entry produces the owner-issued attach
+    /// receipt from that observation, the retained descriptor and owner, and
+    /// the explicit authorization reference, then admits it through
+    /// [`Self::admit_scope_relocation`], which rebinds with the receipt and
+    /// requires a fresh `MATCHED` source-closure check for the observed
+    /// instance. Both the receipt and the admitted owner return, so the caller
+    /// retains the authorization evidence alongside the new binding; persist
+    /// the owner with [`Self::install_admitted_work_scope_owner`]. The prior
+    /// identity stays preserved inside the receipt; the retained binding, task
+    /// state, and project memory are untouched on any failure.
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "attach admission joins the live observation, retained records, authorization, and source closure in one entry"
+    )]
+    pub fn admit_observed_scope_attach(
+        &self,
+        receipt_ref: &str,
+        observed: &ObservedScopeResources,
+        descriptor: &WorkScopeDescriptor,
+        authorizing_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        owner_revision: u64,
+    ) -> Result<(ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "WorkScope binding is unbound; attach has no retained scope".to_owned(),
+            )
+        })?;
+        let receipt = produce_attach_receipt(
+            receipt_ref,
+            descriptor,
+            owner,
+            observed,
+            authorizing_ref,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let bound = self.admit_scope_relocation(
+            &receipt,
+            privacy_class,
+            governing_source_generation,
+            sources,
+            privacy,
+            owner_revision,
+        )?;
+        Ok((receipt, bound))
+    }
+
+    /// Admits the initial binding for a newly resolved scope (issue #1787,
+    /// bootstrap-constructor production caller).
+    ///
+    /// Used when no retained owner exists yet: the bootstrap caller supplies
+    /// the described scope, the binding it actually read, the current
+    /// observation, and the source closure that authenticates it. Admission
+    /// mints the owner only after descriptor agreement, clear identity legs,
+    /// and a fresh `MATCHED` guard check at the retained fence. Persist the
+    /// minted owner with [`Self::install_admitted_work_scope_owner`].
+    ///
+    /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    pub fn admit_initial_scope_binding(
+        &self,
+        descriptor: &WorkScopeDescriptor,
+        owner_revision: u64,
+        binding: &ScopeBinding,
+        observed: &ScopeBinding,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+    ) -> Result<WorkScopeBindingOwner, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        admit_initial_binding(
+            descriptor,
+            owner_revision,
+            &fence,
+            binding,
+            observed,
+            sources,
+            privacy,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Persists an admitted `WorkScope` owner as the retained binding
+    /// (issue #1787, rebind/attach persistence).
+    ///
+    /// Installs the owner minted by [`Self::admit_scope_relocation`],
+    /// [`Self::admit_observed_scope_attach`], or
+    /// [`Self::admit_initial_scope_binding`] only when it is readable at the
+    /// retained fence, its guard receipt is freshly `MATCHED` and agrees with
+    /// the binding on every identity field, and the binding generation equals
+    /// the fence generation, so the same operation is admitted afterwards
+    /// only with that instance identity and generation fence. Anything else
+    /// fails without touching the retained binding.
+    pub fn install_admitted_work_scope_owner(
+        &mut self,
+        owner: WorkScopeBindingOwner,
+    ) -> Result<WorkScopeBindingSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ensure_snapshot_fresh(&snapshot, "install admitted WorkScope owner")?;
+        if snapshot.binding.scope.generation != fence.resource_generation.value() {
+            return Err(CompositionError::Recovery(
+                "admitted WorkScope binding generation disagrees with the installation fence"
+                    .to_owned(),
+            ));
+        }
+        self.owners.work_scope = Some(owner);
+        Ok(snapshot)
+    }
+
+    /// Guards one scope-sensitive canonical write with the `ScopeBindingGuard`
+    /// (issue #1787, `CanonicalWrite` trigger production caller).
+    ///
+    /// When a `WorkScope` binding is retained, the write's own scope claim is
+    /// tested against it through [`check_at_trigger`] at
+    /// [`GuardTrigger::CanonicalWrite`]: the observed binding carries the
+    /// write-claimed scope reference over the retained instance, root,
+    /// generation, privacy, and source-generation facts, so the guard can
+    /// prove a scope mismatch without ever minting authority from the claim.
+    /// A quarantined or non-identity-clear report fails the write before any
+    /// canonical commit; an identity-clear observation proceeds because the
+    /// guard proved no mismatch (source-closure enforcement lives at
+    /// issuance and admission, where sources exist). With no retained binding
+    /// there is nothing to revalidate and the write proceeds unchanged, so
+    /// pre-bootstrap genesis writes keep working.
+    pub fn check_canonical_write_work_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Option<TriggerReport>, CompositionError> {
+        let Some(owner) = self.owners.work_scope.as_ref() else {
+            return Ok(None);
+        };
+        let fence = self.snapshot.state_fence();
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let mut observed_scope = snapshot.binding.scope.clone();
+        scope_id.clone_into(&mut observed_scope.scope_ref);
+        let observed = ScopeBinding {
+            scope: observed_scope,
+            privacy_class: snapshot.binding.privacy_class,
+            governing_source_generation: snapshot.binding.governing_source_generation,
+        };
+        let report = check_at_trigger(
+            &snapshot.binding,
+            &observed,
+            None,
+            GuardTrigger::CanonicalWrite,
+        );
+        if report.verdict == GuardVerdict::Quarantine
+            || report.identity != IdentityLegOutcome::IdentityClear
+        {
+            // Issue #1787: the mismatch carries its withholding proof instead
+            // of a bare error — trigger, identity legs, verdict, and the
+            // expected/observed instance pair — while the retained binding,
+            // task state, and project memory stay preserved. No source closure
+            // exists on this edge, so no receipt is minted here; source
+            // closure is enforced at issuance and admission.
+            return Err(CompositionError::Recovery(format!(
+                "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard withheld at trigger {:?} (identity {:?}, verdict {:?}; expected instance {} observed instance {}); retained binding preserved, write withheld",
+                snapshot.binding.scope.scope_ref,
+                report.trigger,
+                report.identity,
+                report.verdict,
+                snapshot.binding.scope.instance_ref,
+                observed.scope.instance_ref,
+            )));
+        }
+        Ok(Some(report))
+    }
+
+    /// Admits governing sources for one scope generation (issue #1791,
+    /// governing-source admission production caller).
+    ///
+    /// Owning thin entry for daemon/scanner ingress: runs
+    /// [`eliot_workscope::admit_governing_sources`] over the caller-built
+    /// request (candidates from authenticated receipts or discovery leases,
+    /// applicable authority claims, proven bindings/contracts, declared
+    /// precedences), then enforces the admission fence before returning: an
+    /// expired admission and an admitted record without authority fail closed
+    /// here instead of reaching readiness. The returned admission is the
+    /// caller input for cold-start compilation of that scope generation.
+    pub fn admit_governing_sources_for_scope(
+        request: SourceAdmissionRequest,
+        now: u64,
+    ) -> Result<GoverningSourceAdmission, CompositionError> {
+        let admission = eliot_workscope::admit_governing_sources(request)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        admission
+            .require_live(now)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        admission
+            .require_admitted_authority()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(admission)
+    }
+
+    /// Builds the `TASK_SELECTION_REQUIRED` intake shape for one scope
+    /// (issue #1791, task-selection production caller).
+    ///
+    /// Owning thin entry for the activation path: when no current task
+    /// exists, the daemon answers with the minimal valid intake shape (goal,
+    /// acceptance, owner, scope plus a complete example) and the bounded
+    /// exploratory offer from [`eliot_workscope::task_selection_required`],
+    /// so the emitted selection directive always has a backing intake shape.
+    pub fn task_selection_intake_shape(
+        scope_ref: &str,
+    ) -> Result<TaskSelectionRequired, CompositionError> {
+        eliot_workscope::task_selection_required(scope_ref)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Promotes one task-intake candidate through its owner/delegation path
+    /// (issue #1791, intake-promotion production caller).
+    ///
+    /// Owning thin entry for task ingress: runs
+    /// [`eliot_workscope::TaskIntakeCandidate::promote`] with the existing
+    /// task binding the delegation names (`parent`, read from live governor
+    /// task state), so a `Current` binding input only ever arises from the
+    /// required owner or a proven delegation, never from direct construction.
+    pub fn promote_task_intake(
+        candidate: &TaskIntakeCandidate,
+        basis: &AuthorityBasis,
+        parent: &TaskBindingState,
+        task_revision: u64,
+    ) -> Result<TaskBindingInput, CompositionError> {
+        candidate
+            .promote(basis, parent, task_revision)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Admits one bounded exploratory binding without task authority
+    /// (issue #1791, exploratory-admission production caller).
+    ///
+    /// Owning thin entry for orientation ingress: runs
+    /// [`eliot_workscope::TaskIntakeCandidate::admit_exploratory`], whose
+    /// read-only binding can never authorize scope-sensitive Material
+    /// effects.
+    pub fn admit_exploratory_task_intake(
+        candidate: &TaskIntakeCandidate,
+    ) -> Result<TaskBindingInput, CompositionError> {
+        candidate
+            .admit_exploratory()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
     /// Applies one Canonical-admitted transition through the sole retained
     /// Kernel port under the exact admitted request identity. Callers cannot
     /// provide a second client or bypass Canonical admission with an
@@ -1900,10 +4682,202 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
+        // Issue #1787: a task-bound canonical write is scope-sensitive work and
+        // requires the retained binding to be freshly `MATCHED` at the request
+        // fence. The retained guard receipt must agree with the binding on
+        // every identity field and the write must address the bound scope; any
+        // drift fails the write before any canonical commit, without selecting
+        // another candidate or transferring task state or project memory.
+        // Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+        if envelope.task_id.is_some() {
+            let scope = require_fresh_matched_binding(
+                self.owners.work_scope.as_ref(),
+                &envelope.request.state_fence,
+                "canonical write work scope is not freshly matched",
+            )?;
+            if scope.binding.scope.scope_ref != envelope.scope_id.as_str() {
+                return Err(CompositionError::Recovery(
+                    "canonical write addresses a different WorkScope than the bound scope"
+                        .to_owned(),
+                ));
+            }
+        }
         self.owners
             .canonical
             .commit(self.kernel.as_ref(), identity, envelope)
             .await
+    }
+
+    /// Admits one scope-sensitive effect under material readiness
+    /// (issue #1789, readiness-gate production caller).
+    ///
+    /// Evaluates [`evaluate_material_request`] for `effect` over the presented
+    /// readiness facts. The effect class matters: only
+    /// [`RequestedEffect::CanonicalWrite`] and
+    /// [`RequestedEffect::MaterialEffect`] need `READY_MATERIAL`
+    /// ([`RequestedEffect::requires_material_readiness`]); the read-only
+    /// orientation family is admitted in any orientable lifecycle once
+    /// currency holds, so the exploratory-versus-mutation distinction is
+    /// evaluated per effect, never hardcoded. Currency is judged against the
+    /// retained Kernel fence, never a caller-presented fence: the evaluated
+    /// inputs carry the presented receipt, descriptor, coverage, guard
+    /// receipt, lease, and tick with the live fence substituted, so a stale
+    /// receipt fails even when it agrees with its own fence (re-evaluation
+    /// on fence change is owned here, not delegated to the presenter).
+    ///
+    /// An admission is then bound to the retained authenticated instance:
+    /// the presented receipt must name exactly the live `WorkScope` binding
+    /// read at the retained fence. Without a retained binding there is no
+    /// authenticated instance to bind, so the write fails closed. A denial
+    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
+    /// the typed directive token; nothing is committed on any failure.
+    pub fn check_material_readiness_for_effect(
+        &self,
+        effect: RequestedEffect,
+        readiness: &MaterialReadinessInputs<'_>,
+    ) -> Result<MaterialAdmission, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let live_fence = self.kernel_snapshot().state_fence().clone();
+        let effective = MaterialReadinessInputs {
+            fence: &live_fence,
+            ..*readiness
+        };
+        let admission = evaluate_material_request(&effective, effect).map_err(|error| {
+            CompositionError::Recovery(format!("material readiness inputs are malformed: {error}"))
+        })?;
+        if matches!(admission, MaterialAdmission::Admitted { .. }) {
+            let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "WorkScope binding is unbound; material readiness cannot bind an authenticated instance"
+                        .to_owned(),
+                )
+            })?;
+            let snapshot = owner
+                .read_current(&live_fence)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if snapshot.binding.scope != readiness.receipt.scope {
+                return Err(CompositionError::Recovery(format!(
+                    "material readiness receipt addresses scope {} while WorkScope is bound to {}",
+                    readiness.receipt.scope.scope_ref, snapshot.binding.scope.scope_ref,
+                )));
+            }
+        }
+        Ok(admission)
+    }
+
+    /// Admits one scope-sensitive canonical write under material readiness
+    /// (issue #1789, readiness-gate production caller).
+    ///
+    /// Evaluates [`Self::check_material_readiness_for_effect`] for
+    /// [`RequestedEffect::CanonicalWrite`] over the presented readiness
+    /// facts. Currency is judged against the retained Kernel fence, never a
+    /// caller-presented fence: the evaluated inputs carry the presented
+    /// receipt, descriptor, coverage, guard receipt, lease, and tick with
+    /// the live fence substituted, so a stale receipt fails even when it
+    /// agrees with its own fence (re-evaluation on fence change is owned
+    /// here, not delegated to the presenter).
+    ///
+    /// An admission is then bound to the retained authenticated instance:
+    /// the presented receipt must name exactly the live `WorkScope` binding
+    /// read at the retained fence. Without a retained binding there is no
+    /// authenticated instance to bind, so the write fails closed. A denial
+    /// or a malformed bundle fails as [`CompositionError::Recovery`] carrying
+    /// the typed directive token; nothing is committed on any failure.
+    pub fn check_material_readiness_for_write(
+        &self,
+        readiness: &MaterialReadinessInputs<'_>,
+    ) -> Result<MaterialAdmission, CompositionError> {
+        self.check_material_readiness_for_effect(RequestedEffect::CanonicalWrite, readiness)
+    }
+
+    /// Applies one Canonical-admitted transition only after material
+    /// readiness admits the write (issue #1789, canonical-write production
+    /// path).
+    ///
+    /// Runs [`Self::check_material_readiness_for_write`] and commits through
+    /// the existing [`Self::commit_canonical`] path only when the admission
+    /// is `Admitted`. A typed denial (`TASK_SELECTION_REQUIRED`,
+    /// `AMBIGUOUS_RESULT`, `GOVERNING_CONTEXT_REQUIRED`,
+    /// `READINESS_REEVALUATION_REQUIRED`) fails the write before any
+    /// canonical commit: nothing is launched on a denial. The daemon
+    /// canonical-write edge calls this method instead of `commit_canonical`
+    /// directly; safe-capture experience commits keep using `commit_canonical`
+    /// because the contract permits safe capture before `READY_MATERIAL`.
+    pub async fn commit_canonical_with_readiness(
+        &self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        readiness: &MaterialReadinessInputs<'_>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        match self.check_material_readiness_for_write(readiness)? {
+            MaterialAdmission::Admitted { .. } => self.commit_canonical(identity, envelope).await,
+            MaterialAdmission::Denied {
+                directive,
+                missing_inputs,
+                ..
+            } => Err(CompositionError::Recovery(format!(
+                "material readiness denies canonical write: {}; missing: {}",
+                directive.kind_str(),
+                missing_inputs.join(",")
+            ))),
+        }
+    }
+
+    /// Checks the task, session, and `WorkScope` owners backing a native
+    /// worker executable binding: `task_revision` must equal the task owner
+    /// revision at the retained fence, `session_id` must name a session at
+    /// that fence on the retained authority with `route_ref` equal to its
+    /// admitted `model_route`, and the bound `WorkScope` must equal
+    /// `work_scope_id` with a freshly `MATCHED` guard receipt (Issue #1787:
+    /// a stale or drifted guard receipt cannot back a native executable
+    /// binding; rebind or revalidate first). Any drift fails closed as
+    /// `Recovery` without selecting another candidate or transferring task
+    /// state or project memory.
+    fn check_native_binding_identity(
+        &self,
+        fence: &StateFence,
+        task_id: &str,
+        task_revision: u64,
+        session_id: &str,
+        route_ref: &str,
+        work_scope_id: &str,
+    ) -> Result<(), CompositionError> {
+        let task_key = TaskId::new(task_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = self.owners.task.task(&task_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding task has no owner record".to_owned())
+        })?;
+        if task.revision != task_revision || task.state_fence != *fence {
+            return Err(CompositionError::Recovery(
+                "native binding task revision is stale or foreign".to_owned(),
+            ));
+        }
+        let session_key = SessionId::new(session_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let session = self.owners.session.session(&session_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding session has no owner record".to_owned())
+        })?;
+        if session.state_fence != *fence
+            || session.authority_epoch != fence.authority_epoch
+            || session.model_route != route_ref
+        {
+            return Err(CompositionError::Recovery(
+                "native binding session/route is stale or foreign".to_owned(),
+            ));
+        }
+        let scope = require_fresh_matched_binding(
+            self.owners.work_scope.as_ref(),
+            fence,
+            "native binding work scope is not freshly matched",
+        )?;
+        if scope.binding.scope.scope_ref != work_scope_id {
+            return Err(CompositionError::Recovery(
+                "native binding work scope does not match the bound WorkScope".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Publishes one versioned Governor-owned executable binding projection
@@ -1999,43 +4973,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .to_owned(),
             ));
         }
-        let task_key = TaskId::new(task_id.to_owned())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let task = self.owners.task.task(&task_key).ok_or_else(|| {
-            CompositionError::Recovery("native binding task has no owner record".to_owned())
-        })?;
-        if task.revision != task_revision || task.state_fence != fence {
-            return Err(CompositionError::Recovery(
-                "native binding task revision is stale or foreign".to_owned(),
-            ));
-        }
-        let session_key = SessionId::new(session_id.to_owned())
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let session = self.owners.session.session(&session_key).ok_or_else(|| {
-            CompositionError::Recovery("native binding session has no owner record".to_owned())
-        })?;
-        if session.state_fence != fence
-            || session.authority_epoch != authority_epoch
-            || session.model_route != route_ref
-        {
-            return Err(CompositionError::Recovery(
-                "native binding session/route is stale or foreign".to_owned(),
-            ));
-        }
-        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::Recovery(
-                "native binding WorkScope is unbound; semantic activation is unavailable"
-                    .to_owned(),
-            )
-        })?;
-        let scope = scope_owner
-            .read_current(&fence)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if scope.binding.scope.scope_ref != work_scope_id {
-            return Err(CompositionError::Recovery(
-                "native binding work scope does not match the bound WorkScope".to_owned(),
-            ));
-        }
+        self.check_native_binding_identity(
+            &fence,
+            task_id,
+            task_revision,
+            session_id,
+            route_ref,
+            work_scope_id,
+        )?;
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
@@ -2567,6 +5512,72 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         retained.note_unknown_outcome(snapshot_id)
     }
 
+    /// Restores the authority owner with live revocation-history evidence
+    /// (`#2100` owner-closure join).
+    ///
+    /// Builds the closed `GetAuthorityRevocationHistory` read for one exact
+    /// origin, executes it through the canonical read client (the Kernel
+    /// serves its durable fence state on the `store_named` route), decodes
+    /// the reply against the expected fence, and restores the authority
+    /// owner with that evidence. A transport failure, a fence disagreement,
+    /// an absent history, or a stale/invalid view refuses before any owner
+    /// state is installed: unavailable history is never absence of
+    /// revocation.
+    pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
+        reads: &R,
+        snapshot: &AuthorityOwnerSnapshot,
+        state_fence: &StateFence,
+        origin_ref: &str,
+        max_records: u32,
+    ) -> Result<AuthorityRestoreOutcome, CompositionError> {
+        let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
+        let response = reads
+            .execute_named(request)
+            .await
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let evidence = decode_revocation_history_evidence(&response, state_fence)?;
+        AuthorityOwner::from_snapshot_with_revocation_history(
+            snapshot,
+            state_fence,
+            Some(&evidence),
+        )
+    }
+
+    /// Synchronizes the Kernel P-07 owner from live Governor state after
+    /// a revision advance (`#2100` owner-closure feed call).
+    ///
+    /// Binds the feed to the live composition snapshot and fence at call
+    /// time — never caller-supplied — and runs the full
+    /// read→decode→restore→publish→readback exchange through
+    /// [`synchronize_owner_feed`]. The owning daemon runtime calls this
+    /// on provider-revision advance and on recovery; a stale trigger
+    /// refuses before any publish, and no owner state installs until
+    /// the Kernel readback proves the exact published bytes.
+    pub async fn synchronize_kernel_owner<
+        R: CanonicalReadClient + ?Sized,
+        K: OwnerPublishPort + ?Sized,
+    >(
+        &self,
+        reads: &R,
+        kernel: &K,
+        origin_ref: &str,
+        max_records: u32,
+        expected_revision: u64,
+    ) -> Result<u64, CompositionError> {
+        let snapshot = self.owners.authority.snapshot()?;
+        let state_fence = self.snapshot.state_fence();
+        synchronize_owner_feed(
+            reads,
+            kernel,
+            snapshot,
+            &state_fence,
+            origin_ref,
+            max_records,
+            expected_revision,
+        )
+        .await
+    }
+
     /// Reads one coherent semantic activation from all required owner records.
     ///
     /// No semantic identity is accepted from the caller: coordination first
@@ -2656,6 +5667,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let scope = scope_owner
             .read_current(&state_fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        // Issue #1787: activation cannot proceed on a stale or drifted guard
+        // receipt; a generation change requires a fresh `MATCHED` receipt.
+        ensure_snapshot_fresh(&scope, "activation work scope is not freshly matched")?;
         let plan = self.owners.canonical.read_current_plan(&state_fence)?;
         if plan.task_id != task_id || plan.work_scope_id != scope.binding.scope.scope_ref {
             return Err(CompositionError::Recovery(
@@ -2694,7 +5708,70 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         match self.read_unique_agent_activation(now) {
             Ok(snapshot) => GovernorActivationOutcome::Resolved(snapshot),
-            Err(error) => classify_activation_error(&error, now),
+            Err(error) => {
+                // #66 A2: an ambiguity finding must name the actual competing
+                // bindings. The unique-read error discards them, so re-read
+                // the live selection here instead of manufacturing handles.
+                let message = error.to_string();
+                if message.contains("AmbiguousActiveBinding")
+                    || message.contains("multiple active work bindings")
+                {
+                    return self.scope_ambiguous_outcome_from_selection(now);
+                }
+                classify_activation_error(&error, now)
+            }
+        }
+    }
+
+    /// Builds the `ScopeAmbiguous` outcome from the exact active-work
+    /// selection (#66 A2).
+    ///
+    /// Each candidate handle names one actual competing work binding
+    /// (`scope:candidate:{work_item_id}`), sorted and deduplicated, bounded by
+    /// `eliot_protocol::MAX_AGENT_ACTIVATION_CANDIDATES` (a truncated
+    /// denominator reports `Partial` coverage instead of claiming `Complete`).
+    /// When the selection cannot supply at least two distinct candidates (a
+    /// lost race between the two reads), the finding is an internal failure
+    /// for this ticket: never a manufactured placeholder pair and never
+    /// downgraded to task selection.
+    fn scope_ambiguous_outcome_from_selection(&self, now: u64) -> GovernorActivationOutcome {
+        let state_fence = self.snapshot.state_fence();
+        let selection = self.owners.coordination.read_active_work_lease_selection(
+            now,
+            state_fence.authority_epoch.clone(),
+            &state_fence,
+        );
+        let Ok(eliot_coordination::ActiveWorkLeaseSelection::Ambiguous { projections }) = selection
+        else {
+            return GovernorActivationOutcome::FailedInternal {
+                failure_handle: "governor.ambiguity-selection-unreadable:recovery".to_owned(),
+            };
+        };
+        let mut handles: Vec<String> = projections
+            .iter()
+            .map(|projection| format!("scope:candidate:{}", projection.work_item.work_item_id))
+            .collect();
+        handles.sort();
+        handles.dedup();
+        let complete = handles.len() <= eliot_protocol::MAX_AGENT_ACTIVATION_CANDIDATES;
+        if !complete {
+            handles.truncate(eliot_protocol::MAX_AGENT_ACTIVATION_CANDIDATES);
+        }
+        if handles.len() < 2 {
+            return GovernorActivationOutcome::FailedInternal {
+                failure_handle: "governor.ambiguity-selection-unreadable:recovery".to_owned(),
+            };
+        }
+        GovernorActivationOutcome::ScopeAmbiguous {
+            selection: GovernorSelectionDirective::new(
+                handles,
+                if complete {
+                    GovernorCandidateCoverage::Complete
+                } else {
+                    GovernorCandidateCoverage::Partial
+                },
+                "governor.scope-ambiguous:recovery",
+            ),
         }
     }
 
@@ -2886,18 +5963,18 @@ fn classify_activation_error(error: &CompositionError, now: u64) -> GovernorActi
             ),
         };
     }
+    // #66 A2: ambiguity without a live selection read carries no candidate
+    // identities, so the string classifier cannot name them. Such an error
+    // reaching this pure function means the selection denominator was lost
+    // between reads; it is an internal failure, never a manufactured
+    // placeholder pair and never task selection. The production resolver
+    // (`resolve_activation_outcome`) names the actual competing bindings from
+    // the live selection before this classifier is consulted.
     if message.contains("AmbiguousActiveBinding")
         || message.contains("multiple active work bindings")
     {
-        return GovernorActivationOutcome::ScopeAmbiguous {
-            selection: GovernorSelectionDirective::new(
-                vec![
-                    "scope:candidate:a".to_owned(),
-                    "scope:candidate:b".to_owned(),
-                ],
-                GovernorCandidateCoverage::Complete,
-                "governor.scope-ambiguous:recovery",
-            ),
+        return GovernorActivationOutcome::FailedInternal {
+            failure_handle: format!("governor.internal:{message}"),
         };
     }
     if message.contains("WorkScope binding is unbound")
@@ -3176,6 +6253,12 @@ mod tests {
                     projection_refs: Vec::new(),
                     outbox_refs: Vec::new(),
                     operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    // Issue-#18 bindings are copied exactly from the admitted
+                    // transition, never defaulted; equality is enforced by
+                    // the receipt-issuing path below.
+                    admission_digest: transition.admission_digest.clone(),
+                    mutation_plan_digest: transition.mutation_plan_digest.clone(),
+                    semantic_source_revisions: transition.semantic_source_revisions.clone(),
                     error_code: None,
                     resubmission: Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),
@@ -3418,6 +6501,8 @@ mod tests {
                 state_fence: state_fence.clone(),
                 owner_revision: 1,
                 current_plan: None,
+                verifier_execution_fact: None,
+                finish_evidence: None,
             }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
                 next_sequence: 1,
@@ -3529,7 +6614,10 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-1").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
+                verifier: None,
             }),
+            verifier_execution_fact: None,
+            finish_evidence: None,
         }
     }
 
@@ -3775,9 +6863,13 @@ mod tests {
     fn policy_owner_recovers_with_fence_revision_digest_correlation() {
         let observed = snapshot();
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-        let composition =
-            GovernorComposition::new(Arc::new(fake_kernel(observed.clone())), None, &expected, QueueLimits::default())
-                .expect("composition");
+        let composition = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
         let policy = composition.owners().policy.as_ref().expect("policy owner");
         assert_eq!(policy.state_fence(), &observed.state_fence());
         assert_eq!(policy.revision(), 1);
@@ -4418,7 +7510,10 @@ mod tests {
                 plan_revision: "1".to_owned(),
                 task_id: TaskId::new("task-other").expect("task id"),
                 work_scope_id: "scope:work".to_owned(),
+                verifier: None,
             }),
+            verifier_execution_fact: None,
+            finish_evidence: None,
         };
         mismatched_plan.validate().expect("plan shape");
         let mut mismatch = activation_fake(&observed);
@@ -4805,6 +7900,13 @@ mod tests {
             outbox_refs: Vec::new(),
             operation_manifest_digest: OperationManifestDigest::new("manifest")
                 .expect("manifest digest"),
+            // Standalone-fixture issue-#18 values (not bound to a
+            // transition): this seed only exercises refresh/head
+            // rejection, never digest bindings. Shapes stay valid so
+            // `validate()` reaches the behavior under test.
+            admission_digest: "e".repeat(64),
+            mutation_plan_digest: "f".repeat(64),
+            semantic_source_revisions: Vec::new(),
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),
@@ -4967,6 +8069,281 @@ mod tests {
             GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
                 .expect("composition");
         (kernel, composition)
+    }
+
+    /// Owned material-readiness facts for the issue #1789 gate tests.
+    ///
+    /// Every identity names the retained activation `WorkScope` binding
+    /// (`scope:work` / `instance:work` / `lineage:work`, generation 1), so
+    /// the Governor instance anchor passes and the gate verdict decides.
+    struct MaterialReadinessBundle {
+        receipt: eliot_workscope::OnboardingReadinessReceipt,
+        descriptor: eliot_workscope::WorkScopeDescriptor,
+        coverage: eliot_workscope::GoverningCoverage,
+        guard: eliot_workscope::ScopeBindingGuardReceipt,
+        lease: eliot_workscope::OnboardingLease,
+    }
+
+    impl MaterialReadinessBundle {
+        fn inputs<'a>(
+            &'a self,
+            fence: &'a StateFence,
+        ) -> eliot_workscope::MaterialReadinessInputs<'a> {
+            eliot_workscope::MaterialReadinessInputs {
+                receipt: &self.receipt,
+                descriptor: &self.descriptor,
+                coverage: &self.coverage,
+                guard_receipt: &self.guard,
+                lease: &self.lease,
+                fence,
+                now: 1,
+            }
+        }
+    }
+
+    fn readiness_scope() -> eliot_workscope::ScopeIdentity {
+        eliot_workscope::ScopeIdentity {
+            scope_ref: "scope:work".to_owned(),
+            kind: eliot_workscope::ScopeKind::GitRepo,
+            lineage_ref: Some("lineage:work".to_owned()),
+            instance_ref: "instance:work".to_owned(),
+            root_identity: "root:work".to_owned(),
+            generation: 1,
+        }
+    }
+
+    fn readiness_lineage() -> eliot_workscope::RepositoryLineageIdentity {
+        eliot_workscope::RepositoryLineageIdentity {
+            lineage_ref: "lineage:work".to_owned(),
+            object_store_ref: "store:work".to_owned(),
+            initial_history_ref: "history:work".to_owned(),
+            normalized_remote_ref: None,
+            manifest_identity_ref: None,
+        }
+    }
+
+    fn readiness_instance() -> eliot_workscope::WorkspaceInstanceIdentity {
+        eliot_workscope::WorkspaceInstanceIdentity {
+            instance_ref: "instance:work".to_owned(),
+            root_identity: "root:work".to_owned(),
+            vcs_identity_ref: None,
+            generation: 1,
+        }
+    }
+
+    fn readiness_lease() -> eliot_workscope::OnboardingLease {
+        eliot_workscope::OnboardingLease {
+            lease_ref: "onboarding:work".to_owned(),
+            lineage_candidate_ref: "lineage:work".to_owned(),
+            workspace_instance_candidate_ref: "instance:work".to_owned(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+            governing_source_generation: 1,
+            compiler_epoch: 1,
+            state: eliot_workscope::OnboardingLeaseState::Compiling,
+            deadline: 10,
+        }
+    }
+
+    fn readiness_privacy() -> eliot_workscope::PrivacyProfile {
+        eliot_workscope::PrivacyProfile {
+            admitted_classes: vec![eliot_security_contracts::PrivacyClass::Internal],
+        }
+    }
+
+    fn readiness_assurance(fence: &StateFence) -> eliot_security_contracts::SourceAssurance {
+        serde_json::from_value(serde_json::json!({
+            "source_ref": "architecture",
+            "provenance_ref": "artifact:architecture",
+            "integrity": "VERIFIED",
+            "freshness": "CURRENT",
+            "competence": "DOMAIN_VERIFIED",
+            "independence": "INDEPENDENT",
+            "privacy_class": serde_json::to_value(eliot_security_contracts::PrivacyClass::Internal)
+                .expect("privacy class"),
+            "instruction_taint": "CLEARED",
+            "allowed_epistemic_use": ["OBSERVATION"],
+            "allowed_effects": ["READ_ONLY"],
+            "required_verifier": null,
+            "quarantine": "NONE",
+            "state_fence": fence,
+        }))
+        .expect("source assurance fixture")
+    }
+
+    fn readiness_sources(fence: &StateFence) -> eliot_workscope::GoverningSourceSet {
+        eliot_workscope::GoverningSourceSet::new(
+            "scope:work".to_owned(),
+            1,
+            vec![eliot_workscope::GoverningSource {
+                source_ref: "architecture".to_owned(),
+                role: eliot_workscope::GoverningSourceRole::Architecture,
+                assurance: readiness_assurance(fence),
+                applicable_generation: 1,
+                status: eliot_workscope::SourceStatus::Admitted,
+                domains: Vec::new(),
+                digest: "a".repeat(64),
+                authority_basis: None,
+            }],
+            Vec::new(),
+        )
+        .expect("source fixture")
+    }
+
+    fn readiness_descriptor(fence: &StateFence) -> eliot_workscope::WorkScopeDescriptor {
+        eliot_workscope::WorkScopeDescriptor {
+            scope_ref: "scope:work".to_owned(),
+            descriptor_revision: 1,
+            kind: eliot_workscope::ScopeKind::GitRepo,
+            display_name: "work".to_owned(),
+            lineage: Some(readiness_lineage()),
+            instances: vec![readiness_instance()],
+            owner_refs: vec!["owner:test".to_owned()],
+            canonical_resource_refs: Vec::new(),
+            root_identities: vec!["root:work".to_owned()],
+            external_resource_refs: Vec::new(),
+            truth_surface_refs: vec!["truth:work".to_owned()],
+            verifier_refs: vec!["verifier:work".to_owned()],
+            privacy: readiness_privacy(),
+            authority_profile_ref: Some("authority:test".to_owned()),
+            execution_identity: eliot_workscope::ResourceExecutionIdentity::Service,
+            generation: eliot_workscope::GenerationEvidence {
+                branch_ref: None,
+                commit_ref: None,
+                dirty_summary_ref: None,
+                task_revision: None,
+                resource_generation: ResourceGeneration::genesis(),
+            },
+            state_fence: fence.clone(),
+            available_capabilities: Vec::new(),
+            missing_capabilities: Vec::new(),
+            lifecycle: eliot_workscope::ScopeLifecycle::Active,
+        }
+    }
+
+    fn readiness_bundle(
+        fence: &StateFence,
+        task: eliot_workscope::TaskBindingInput,
+    ) -> MaterialReadinessBundle {
+        let scope = readiness_scope();
+        let instance = readiness_instance();
+        let lineage = readiness_lineage();
+        let candidate = eliot_workscope::WorkScopeCandidate {
+            scope: scope.clone(),
+            descriptor_revision: 1,
+            lineage: Some(lineage.clone()),
+            instance: instance.clone(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+        };
+        let sources = readiness_sources(fence);
+        let privacy = readiness_privacy();
+        let binding = eliot_workscope::ScopeBinding {
+            scope: scope.clone(),
+            privacy_class: eliot_security_contracts::PrivacyClass::Internal,
+            governing_source_generation: 1,
+        };
+        let guard =
+            eliot_workscope::ScopeBindingGuard.check(&binding, &binding, &sources, &privacy);
+        let lease = readiness_lease();
+        let receipt = eliot_workscope::ColdStartController
+            .compile(
+                "receipt:work",
+                &lease,
+                "principal:test",
+                "session:test",
+                &scope,
+                &instance,
+                Some(&lineage),
+                &candidate,
+                &sources,
+                fence,
+                "governance:test",
+                vec!["integration:evidence:one".to_owned()],
+                "route:test",
+                "serializer:test",
+                "serializer-version:test",
+                "serializer-options:test",
+                "tokenizer:test",
+                "tokenizer-version:test",
+                "tokenizer-hash:test",
+                "projection:test",
+                1,
+                &privacy,
+                task,
+                1,
+            )
+            .expect("readiness receipt");
+        MaterialReadinessBundle {
+            receipt,
+            descriptor: readiness_descriptor(fence),
+            coverage: eliot_workscope::GoverningCoverage::AdmittedSources(sources),
+            guard,
+            lease,
+        }
+    }
+
+    fn readiness_composition() -> (Arc<FakeKernel>, GovernorComposition<FakeKernel>) {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(activation_fake(&observed));
+        let composition =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("composition");
+        (kernel, composition)
+    }
+
+    #[test]
+    fn canonical_write_without_task_is_denied_before_commit() {
+        let (kernel, composition) = readiness_composition();
+        let fence = composition.kernel_snapshot().state_fence().clone();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-1789-no-task",
+        );
+        let bundle = readiness_bundle(&fence, eliot_workscope::TaskBindingInput::NoTask);
+        let denied = block_on(composition.commit_canonical_with_readiness(
+            &identity,
+            envelope,
+            &bundle.inputs(&fence),
+        ));
+        assert!(
+            matches!(denied, Err(CompositionError::Recovery(ref message)) if message.contains("TASK_SELECTION_REQUIRED")),
+            "no-task write was not denied with TASK_SELECTION_REQUIRED: {denied:?}"
+        );
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 0);
+        assert!(kernel.committed.lock().expect("committed lock").is_empty());
+    }
+
+    #[test]
+    fn canonical_write_with_full_grounding_commits() {
+        let (kernel, composition) = readiness_composition();
+        let fence = composition.kernel_snapshot().state_fence().clone();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-1789-grounded",
+        );
+        let bundle = readiness_bundle(
+            &fence,
+            eliot_workscope::TaskBindingInput::Current {
+                task_ref: "task:one".to_owned(),
+                task_revision: 1,
+                acceptance_digest: "digest:acceptance:one".to_owned(),
+            },
+        );
+        let receipt = block_on(composition.commit_canonical_with_readiness(
+            &identity,
+            envelope,
+            &bundle.inputs(&fence),
+        ))
+        .expect("grounded write commits");
+        assert_eq!(receipt.operation_id.as_str(), "op-1789-grounded");
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 1);
     }
 
     #[test]
@@ -5499,8 +8876,7 @@ mod tests {
         // `PreparedTransition` via `commit_canonical` correlated by
         // `operation_id` / `canonical_request_hash` / `state_fence`.
         let observed = snapshot();
-        let expected =
-            KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
             None,

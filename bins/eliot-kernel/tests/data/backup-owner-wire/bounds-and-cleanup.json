@@ -1,0 +1,10 @@
+{
+  "description": "Bounds, malformed-payload, duplicate, and cleanup expectations (issue #962). Bounded typed payloads only; shutdown releases every resource with zero pending effects.",
+  "max_payload_bytes": 262144,
+  "oversize_bytes": 262145,
+  "malformed_payload": "not-json{{{",
+  "non_object_payload": "[1, 2, 3]",
+  "duplicate_effect_allowed": false,
+  "shutdown": { "pipe_closed": true, "pending_effects": 0, "replay_view_evicted": true },
+  "supervision": { "ops_quantum_per_round": 1, "priority_preserved": true }
+}

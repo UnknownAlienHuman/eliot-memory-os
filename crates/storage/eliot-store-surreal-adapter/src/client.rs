@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+mod backup_restore;
 mod json_codec;
 #[cfg(all(test, windows))]
 mod payload_tests;
@@ -18,6 +19,18 @@ mod provider_owner;
 mod rpc_parse;
 mod session;
 pub(crate) mod session_pool;
+/// Fixed isolated-restore operation registration (issue #952).
+///
+/// The closed restore vocabulary lives in [`backup_restore`]; restore
+/// operations are writes, so they are never pool reads. This re-export is the
+/// sole registration point: every fixed restore statement is an adapter-owned
+/// `&'static str` with bound parameters only, and caller text can never become
+/// a statement, table, connection, or credential override.
+pub(crate) use backup_restore::{
+    RESTORE_OPERATION_APPLY, RESTORE_OPERATION_PREPARE, RESTORE_OPERATION_RECONCILE,
+    RESTORE_OPERATION_VALIDATE, fixed_restore_statement, restore_capability,
+    validate_restore_operation,
+};
 pub(crate) use provider_owner::ProviderOwner;
 use session::RpcSession;
 use session_pool::{SessionPool, SessionRole};
@@ -262,9 +275,9 @@ impl RpcTransport {
     }
 
     /// Returns the fixed bounded session set under this transport's provider
-    /// generation. Test/diagnostic evidence until the scheduler (#988) and
-    /// runtime (#993) children consume it for role dispatch.
-    #[cfg(test)]
+    /// generation. Production observation entrypoint for the #2030
+    /// occupancy/admission queries (994/14 follow-up binding); read-only
+    /// snapshots never check anything out.
     pub(crate) fn session_pool(&self) -> &SessionPool {
         &self.pool
     }
@@ -329,14 +342,15 @@ impl RpcTransport {
 ///
 /// Closed allowlist (S-CONC-CLIENTS, issue #987): exactly the pure-read
 /// operations the adapter's production paths issue today — the canonical
-/// head/schema preflight reads (`read.*`) and the receipt/outbox readback
-/// (`recovery.snapshot`). Writes (`migration.apply`, canonical
+/// head/schema preflight reads (`read.*`), the receipt/outbox readback
+/// (`recovery.snapshot`), and the coherent snapshot point/page/end reads
+/// (`snapshot.*`, issue #951). Writes (`migration.apply`, canonical
 /// transactions), health probes, Dreamer rows (`dreamer.read_row`), test
 /// operations, and any unlisted operation stay on the facade session by
-/// default. A newly introduced or typoed `read.*`/`recovery.*` name is NOT
-/// admitted by naming convention: extending this mapping is the runtime
-/// integration's (#993) explicit decision, recorded here as a new entry, not
-/// a silent local widening.
+/// default. A newly introduced or typoed `read.*`/`recovery.*`/`snapshot.*`
+/// name is NOT admitted by naming convention: extending this mapping is the
+/// runtime integration's (#993) explicit decision, recorded here as a new
+/// entry, not a silent local widening.
 const POOL_READ_OPERATIONS: &[&str] = &[
     "read.all_ordering_heads",
     "read.all_revision_heads",
@@ -355,6 +369,9 @@ const POOL_READ_OPERATIONS: &[&str] = &[
     "read.schema_meta",
     "read.validation_snapshot",
     "recovery.snapshot",
+    crate::backup_snapshot::SNAPSHOT_BEGIN_OPERATION,
+    crate::backup_snapshot::SNAPSHOT_END_OPERATION,
+    crate::backup_snapshot::SNAPSHOT_PAGE_OPERATION,
 ];
 
 fn is_pool_read_operation(operation: &str) -> bool {
@@ -622,6 +639,9 @@ mod tests {
                 "read.schema_meta",
                 "read.validation_snapshot",
                 "recovery.snapshot",
+                "snapshot.begin",
+                "snapshot.end",
+                "snapshot.page",
             ]
         );
         for operation in admitted {
@@ -631,8 +651,8 @@ mod tests {
             );
         }
         // Writes, probes, Dreamer rows, test labels, and any unlisted name
-        // — including typoed or future `read.*`/`recovery.*` names — stay on
-        // the facade session until explicitly admitted above.
+        // — including typoed or future `read.*`/`recovery.*`/`snapshot.*`
+        // names — stay on the facade session until explicitly admitted above.
         for refused in [
             "migration.apply",
             "transaction.apply",

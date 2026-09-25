@@ -17,9 +17,10 @@
 use super::{
     AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
-    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, ContractId,
-    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
-    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBuildError,
+    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, BoundCanonicalOwner,
+    ContractId, DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId,
+    DispatchSnapshotCodec, GenerationRoute, GenerationRouter, GovernorClosureRestore, HealthVector,
+    IpcImplementation, KernelBackupCapture, KernelBackupRestore, KernelBuildError,
     KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
     KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
     ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
@@ -27,12 +28,18 @@ use super::{
     ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
     ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
     Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
-    UserOwnedPathLease, UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform,
-    is_lower_sha256, sha256_hex, sha256_json, unix_ms,
+    USER_AUTOMATION_KERNEL_CAPABILITY, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsDispatchSnapshotCodec, WindowsPlatform, bind_canonical_owner, is_lower_sha256,
+    owner_bundle_digest, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
 #[cfg(windows)]
+use super::{
+    DaemonSupervisionProgressState, SupervisionLeaseAuthorityConfig, dispatch_key,
+    load_agent_bridge_declaration, observed_session_principal_binding,
+};
+#[cfg(not(windows))]
 use super::{
     SupervisionLeaseAuthorityConfig, dispatch_key, load_agent_bridge_declaration,
     observed_session_principal_binding,
@@ -50,6 +57,38 @@ use std::time::Duration;
 use crate::kernel_diagnostics::{
     EntrypointStage, observe_entrypoint, observe_entrypoint_with_detail, observe_terminal_error,
 };
+
+/// Exact-owner backup channel clients (issue #962, Writer-D).
+///
+/// Declared here (rather than in `lib.rs`) so the client-injection turn
+/// touches only this composition file: production assembly binds the actual
+/// Host/Watchdog owner clients over the canonical pipes, with no new pipe
+/// family, no Host/Watchdog implementation dependency, and no behavior
+/// change to any other composition path.
+#[path = "backup_owner_clients.rs"]
+#[allow(
+    dead_code,
+    reason = "owner-channel surface is exercised per-method across production assembly and the wire test; a single surface-level allow keeps the private-module declaration warning-clean"
+)]
+mod backup_owner_clients;
+pub use backup_owner_clients::{
+    HostBackupOwnerClient, OwnerClientError, WatchdogBackupOwnerClient,
+};
+
+impl KernelComposition {
+    /// Returns a production Host backup owner client bound to the exact
+    /// canonical Host pipe. Fails closed when the canonical binding is
+    /// unavailable; never substitutes a default.
+    pub fn host_backup_owner_client() -> Result<HostBackupOwnerClient, OwnerClientError> {
+        HostBackupOwnerClient::production()
+    }
+
+    /// Returns a production Watchdog backup owner client bound to the exact
+    /// canonical Watchdog pipe. Fails closed; never substitutes a default.
+    pub fn watchdog_backup_owner_client() -> Result<WatchdogBackupOwnerClient, OwnerClientError> {
+        WatchdogBackupOwnerClient::production()
+    }
+}
 
 /// Maps one build failure to its stable owner-typed diagnostic code.
 ///
@@ -292,6 +331,172 @@ impl KernelComposition {
         );
         Self::assemble_with_process_authority(config, authority_config, ors, platform)
             .map_err(&terminal)
+    }
+
+    /// Binds the canonical Governor closure owner to the P-07 port (`#2100`).
+    ///
+    /// The Governor feed publishes the restore bundle plus the exact
+    /// expected graph revision; this method binds the port through the
+    /// canonical bootstrap against the retained ORS handle and retains the
+    /// binding. A zero or disagreeing revision, an empty admitted root set,
+    /// or a stale presentation against the durable watermark fails closed
+    /// without installing any owner. Binding requires no retained owner:
+    /// rotation goes through refresh or recover, never a silent
+    /// replacement. Returns the bound revision.
+    pub fn bind_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.p07_owner_bind_started",
+        );
+        if self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .is_some()
+        {
+            return Err(KernelBuildError::Service(
+                "P-07 owner bind requires no retained owner".to_owned(),
+            ));
+        }
+        let digest = owner_bundle_digest(&restore)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let store: Arc<dyn OperationalRecoveryStore> =
+            Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
+        let bound = bind_canonical_owner(restore, expected_revision, store)
+            .inspect_err(|_| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.p07_owner_bind_failed",
+                );
+            })
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let revision = bound.bound_revision();
+        self.p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .replace(bound);
+        self.p07_owner_digest
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .replace(digest);
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.p07_owner_bound",
+        );
+        Ok(revision)
+    }
+
+    /// Refreshes the retained P-07 owner from newer durable Governor state.
+    ///
+    /// The expected revision must not move backwards; the admitted state
+    /// swaps atomically and the durable per-root watermark advances with
+    /// the swap. Refuses when no owner is bound — bind first. A
+    /// same-revision presentation carrying different bytes refuses as well:
+    /// the digest agreement below proves rotation, not silent replacement.
+    pub fn refresh_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        let store: Arc<dyn OperationalRecoveryStore> =
+            Arc::clone(&self.p07_ors) as Arc<dyn OperationalRecoveryStore>;
+        let mut guard = self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?;
+        let Some(bound) = guard.as_mut() else {
+            return Err(KernelBuildError::Service(
+                "P-07 owner refresh requires a bound owner".to_owned(),
+            ));
+        };
+        let digest = owner_bundle_digest(&restore)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        self.check_owner_digest_agreement(expected_revision, &digest)?;
+        bound
+            .refresh(restore, expected_revision, &store)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let revision = bound.bound_revision();
+        self.p07_owner_digest
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .replace(digest);
+        Ok(revision)
+    }
+
+    /// Rebinds the P-07 owner after a restart: binds when no owner is
+    /// retained, refreshes when one is. Restart rehydration never invents
+    /// owner state — the Governor feed re-presents the bundle and the same
+    /// exact-revision gates apply as at bind time.
+    pub fn recover_p07_owner(
+        &self,
+        restore: GovernorClosureRestore,
+        expected_revision: u64,
+    ) -> Result<u64, KernelBuildError> {
+        let bound = self
+            .p07_owner
+            .lock()
+            .map_err(|_| KernelBuildError::Service("P-07 owner lock poisoned".to_owned()))?
+            .is_some();
+        if bound {
+            self.refresh_p07_owner(restore, expected_revision)
+        } else {
+            self.bind_p07_owner(restore, expected_revision)
+        }
+    }
+
+    /// Returns the bound P-07 owner revision, if an owner is retained.
+    #[must_use]
+    pub fn p07_owner_revision(&self) -> Option<u64> {
+        self.p07_owner
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(BoundCanonicalOwner::bound_revision))
+    }
+
+    /// Returns the owner readback triple for reconcile queries: whether an
+    /// owner is bound, its exact revision, and the canonical digest of the
+    /// bound bundle bytes. The Governor feed compares all three against
+    /// what it served before claiming a publish committed.
+    #[must_use]
+    pub fn p07_owner_readback(&self) -> (bool, Option<u64>, Option<String>) {
+        let owner = self.p07_owner.lock().ok();
+        let digest = self.p07_owner_digest.lock().ok();
+        match (owner, digest) {
+            (Some(owner), Some(digest)) => {
+                let record = owner.as_ref().map(BoundCanonicalOwner::bound_revision);
+                let proof = digest.as_ref().cloned();
+                (record.is_some(), record, proof)
+            }
+            _ => (false, None, None),
+        }
+    }
+
+    /// Refuses a same-revision presentation carrying different bytes.
+    ///
+    /// Rotation is proven by revision advance or exact-digest equality;
+    /// a matching revision with a disagreeing digest is a conflicting
+    /// presentation, never a silent replacement. Unbound compositions
+    /// have nothing to disagree with and pass through to bind.
+    fn check_owner_digest_agreement(
+        &self,
+        expected_revision: u64,
+        digest: &str,
+    ) -> Result<(), KernelBuildError> {
+        let (bound, revision, retained) = self.p07_owner_readback();
+        if bound && revision == Some(expected_revision) && retained.as_deref() != Some(digest) {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.p07_owner_digest_conflict",
+            );
+            return Err(KernelBuildError::Core(
+                "same-revision owner bundle digest disagreement".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn assemble_with_process_authority(
@@ -721,6 +926,8 @@ impl KernelComposition {
         let daemon_launch = config.daemon_launch.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
         let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
+        let wasm_host_executable_path = config.wasm_host_executable_path.clone();
+        let wasm_host_artifact_sha256 = config.wasm_host_artifact_sha256.clone();
         let doctor_artifact_sha256 = config.doctor_artifact_sha256.clone();
         let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
         let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
@@ -790,6 +997,7 @@ impl KernelComposition {
             (&doctor_artifact_sha256, "Doctor"),
             (&testd_artifact_sha256, "Testd"),
             (&native_worker_artifact_sha256, "native worker"),
+            (&wasm_host_artifact_sha256, "WASM host"),
         ] {
             if let Some(digest) = digest
                 && !is_lower_sha256(digest)
@@ -948,7 +1156,17 @@ impl KernelComposition {
                 || format!("kernel-{}", std::process::id()),
                 |launch| launch.launch_nonce.as_str().to_owned(),
             ),
-            allowed_capabilities: vec!["daemon".to_owned()],
+            // The regular daemon session and the dedicated Host
+            // UserAutomation session share the authenticated front-door
+            // policy, but the latter is admitted through its own binder and
+            // can only project this exact capability.  Keeping the capability
+            // in the server-owned policy prevents the special binder from
+            // bypassing live policy while retaining the least-privilege
+            // Submit-only check in `front_door_session`/`dreamer_job_dispatch`.
+            allowed_capabilities: vec![
+                "daemon".to_owned(),
+                USER_AUTOMATION_KERNEL_CAPABILITY.to_owned(),
+            ],
             allowed_privacy_classes: vec!["PUBLIC".to_owned()],
             allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
             session_principal_binding,
@@ -1081,6 +1299,28 @@ impl KernelComposition {
                 })?
                 .note_blob_degraded();
         }
+        // Issue #960: hold the Kernel-owned production restore adapter on
+        // the composition. The adapter binds the work root only; the durable
+        // journal is injected per execution by production composition (#962),
+        // so no second database is opened here and unrelated Kernel work is
+        // unaffected while no restore executes.
+        let backup_restore = KernelBackupRestore::bind(work_root.clone());
+        // Issue #962 (Writer-D): bind the exact-owner backup channel
+        // clients in production assembly. Both constructors bind the
+        // actual canonical pipes and fail closed on any fake or
+        // mismatched binding, so a missing binding is never replaced by
+        // a default. The marker records the injection for diagnostics;
+        // no other composition behavior changes.
+        HostBackupOwnerClient::production()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        WatchdogBackupOwnerClient::production()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        backup_owner_clients::mark_owner_clients_bound();
+        // Issue #959: hold the Kernel-owned cross-owner backup capture
+        // coordinator on the composition. It binds the work root only;
+        // captures consume already-accepted owner evidence per execution,
+        // so no live owner channel is opened here.
+        let backup_capture = KernelBackupCapture::bind(work_root.clone());
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1090,6 +1330,9 @@ impl KernelComposition {
         );
         observe_entrypoint(EntrypointStage::Composition);
         Ok(Self {
+            p07_owner: Mutex::new(None),
+            p07_owner_digest: Mutex::new(None),
+            p07_ors: Arc::clone(&ors),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
             runtime,
@@ -1107,6 +1350,8 @@ impl KernelComposition {
             eliotd_receipt_binding,
             kernel_artifact_sha256,
             eliotd_descriptor_artifact_sha256,
+            wasm_host_executable_path,
+            wasm_host_artifact_sha256,
             daemon_runtime: Mutex::new(DaemonRuntimeState {
                 status: DaemonRuntimeStatus::NotLaunched,
                 receipt: None,
@@ -1115,6 +1360,12 @@ impl KernelComposition {
                 supervision: None,
                 #[cfg(windows)]
                 live_ready: None,
+                #[cfg(windows)]
+                supervision_progress: DaemonSupervisionProgressState::unbound(),
+                #[cfg(windows)]
+                last_progress_observation: None,
+                #[cfg(windows)]
+                supervision_expired: false,
             }),
             daemon_status_changed: tokio::sync::Notify::new(),
             #[cfg(windows)]
@@ -1128,12 +1379,16 @@ impl KernelComposition {
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
             blob_store: Mutex::new(blob_store),
+            backup_restore,
+            backup_capture,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
             supervision_lease_authority: supervision_lease_authority.map(Arc::new),
             #[cfg(windows)]
             agent_bridge_profile: Mutex::new(None),
+            #[cfg(windows)]
+            agent_bridge_transition: std::sync::RwLock::new(()),
             #[cfg(windows)]
             agent_bridge_admission,
             #[cfg(windows)]

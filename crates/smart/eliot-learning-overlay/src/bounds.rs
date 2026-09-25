@@ -95,6 +95,7 @@ pub(crate) fn preflight(input: &OverlayComposeInput<'_>) -> Result<(), OverlayEr
         "discriminator",
     )?;
     budget.text(input.overlay_id.as_str(), "overlay_id")?;
+    bound_frozen(input.frozen, &mut budget)?;
     bound_recipe(input.recipe, &mut budget)?;
     bound_view(input.view, &mut budget)?;
     for delta in input.deltas {
@@ -145,6 +146,28 @@ pub(crate) fn preflight(input: &OverlayComposeInput<'_>) -> Result<(), OverlayEr
         return Err(OverlayError::Bound {
             field: "output.bytes",
         });
+    }
+    Ok(())
+}
+
+fn bound_frozen(frozen: &crate::FrozenPreEvaluation, b: &mut Budget) -> Result<(), OverlayError> {
+    for (value, field) in [
+        (&frozen.intended_mechanism, "frozen.intended_mechanism"),
+        (&frozen.prediction, "frozen.prediction"),
+        (&frozen.expected_observable, "frozen.expected_observable"),
+        (&frozen.possible_regressions, "frozen.possible_regressions"),
+        (&frozen.confounders, "frozen.confounders"),
+        (
+            &frozen.preserved_success_constraint,
+            "frozen.preserved_success_constraint",
+        ),
+        (
+            &frozen.next_discriminator_text,
+            "frozen.next_discriminator_text",
+        ),
+        (&frozen.rollback_condition, "frozen.rollback_condition"),
+    ] {
+        b.text(value, field)?;
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 use eliot_types::{
-    CueKind, ObservedCue, ProjectId, SessionId, TaskId, command_pattern, error_signature,
+    LegacyCueKindV1, ObservedCue, ProjectId, SessionId, TaskId, command_pattern, error_signature,
     normalize_observed_path, normalize_symbol, path_cue_tokens,
 };
 use serde_json::Value;
@@ -335,7 +335,7 @@ fn extract_cues(
                     .unwrap_or_default();
                 push_cue(
                     observed,
-                    CueKind::ErrorSignature,
+                    LegacyCueKindV1::ErrorSignature,
                     error_signature(tool_name, rule_id, message, path, None),
                 );
             }
@@ -350,7 +350,11 @@ fn extract_cues(
                     .filter_map(Value::as_str)
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
-                push_cue(observed, CueKind::CommandPattern, command_pattern(&argv));
+                push_cue(
+                    observed,
+                    LegacyCueKindV1::CommandPattern,
+                    command_pattern(&argv),
+                );
             }
             for child in values {
                 extract_cues(tool_name, key, child, observed);
@@ -359,26 +363,34 @@ fn extract_cues(
         Value::String(raw) if raw.len() <= MAX_TOUCHED_STRING_BYTES => {
             let field = key.unwrap_or_default();
             if is_path_key(field) && (field != "resource_ref" || looks_like_path(raw)) {
-                push_cue(observed, CueKind::FilePath, normalize_observed_path(raw));
+                push_cue(
+                    observed,
+                    LegacyCueKindV1::FilePath,
+                    normalize_observed_path(raw),
+                );
             } else if is_symbol_key(field) {
-                push_cue(observed, CueKind::Symbol, normalize_symbol(raw));
+                push_cue(observed, LegacyCueKindV1::Symbol, normalize_symbol(raw));
             } else if is_command_key(field) {
                 let argv = raw
                     .split_whitespace()
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>();
-                push_cue(observed, CueKind::CommandPattern, command_pattern(&argv));
+                push_cue(
+                    observed,
+                    LegacyCueKindV1::CommandPattern,
+                    command_pattern(&argv),
+                );
             } else if is_signature_key(field) {
                 let signature = if raw.starts_with("sig:") {
                     raw.to_owned()
                 } else {
                     error_signature(tool_name, field, raw, "", None)
                 };
-                push_cue(observed, CueKind::ErrorSignature, signature);
+                push_cue(observed, LegacyCueKindV1::ErrorSignature, signature);
             }
             if has_source_extension(raw) {
                 for path in path_cue_tokens(raw) {
-                    push_cue(observed, CueKind::FilePath, path);
+                    push_cue(observed, LegacyCueKindV1::FilePath, path);
                 }
             }
         }
@@ -386,7 +398,7 @@ fn extract_cues(
     }
 }
 
-fn push_cue(observed: &mut Vec<ObservedCue>, kind: CueKind, value: String) {
+fn push_cue(observed: &mut Vec<ObservedCue>, kind: LegacyCueKindV1, value: String) {
     if !value.is_empty() {
         observed.push(ObservedCue { kind, value });
     }

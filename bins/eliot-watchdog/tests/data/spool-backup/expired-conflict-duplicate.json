@@ -1,0 +1,13 @@
+{
+  "schema": "watchdog_spool_backup_member_dispositions.v1",
+  "description": "955/T7 expired/missing/duplicate/conflicting members fail explicitly; never known-empty. No payload bytes.",
+  "installation": "installation-7",
+  "watchdog_generation": 9,
+  "cases": [
+    { "case": "expired_member", "record_id": "rec-0090", "expected_disposition": "incomplete" },
+    { "case": "missing_member", "record_id": "rec-0091", "expected_disposition": "incomplete" },
+    { "case": "duplicate_member", "record_id": "rec-0092", "expected_disposition": "corrupt" },
+    { "case": "conflicting_member", "record_id": "rec-0093", "expected_disposition": "corrupt" },
+    { "case": "changed_header", "record_id": "header", "expected_disposition": "corrupt" }
+  ]
+}

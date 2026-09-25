@@ -89,17 +89,32 @@ pub const TESTD_MAX_ENVELOPE_BYTES: usize = 65_536;
 /// Maximum changed-dimension entries admitted in one testd conflict report.
 pub const TESTD_CONFLICT_MAX_FIELDS: usize = 32;
 
-/// The single admitted testd profile in this slice.
+/// The harmless testd profile in this slice.
 ///
 /// Mirrors `TESTD_ADMITTED_PROFILE` in `eliot-testd-core` (canonical
 /// owner; this crate carries no `eliot-testd-core` dependency, so the
 /// value is mirrored, not imported). In this slice the `cargo-test`
 /// profile executes the bounded `cargo --version` tool probe.
 pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
+/// Productive nextest profile mirrored from `eliot-testd-core`.
+pub const TESTD_PRODUCTIVE_PROFILE: &str = "cargo-nextest";
 /// Relative program for the admitted probe, mirrored from `eliot-testd-core`.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Relative executable for the productive nextest profile.
+pub const TESTD_PRODUCTIVE_PROFILE_PROGRAM: &str = "cargo-nextest";
 /// Fixed argv for the admitted probe, mirrored from `eliot-testd-core`.
 pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
+/// Fixed productive nextest argv, including the pinned libtest JSON format.
+pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] = &[
+    "run",
+    "--message-format",
+    "libtest-json-plus",
+    "--message-format-version",
+    "0.1",
+];
+/// Exact non-secret environment required by the experimental reporter.
+pub const TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT: &[(&str, &str)] =
+    &[("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")];
 /// Bounded wall timeout for the probe in milliseconds, mirrored.
 pub const TESTD_PROFILE_WALL_TIMEOUT_MS: u64 = 15_000;
 /// Bounded CPU ceiling for the probe in milliseconds, mirrored.
@@ -112,6 +127,18 @@ pub const TESTD_PROFILE_STDOUT_BYTES: u64 = 64 * 1024;
 pub const TESTD_PROFILE_STDERR_BYTES: u64 = 64 * 1024;
 /// Bounded descendant ceiling for the probe, mirrored.
 pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
+/// Independent productive nextest wall timeout in milliseconds.
+pub const TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
+/// Independent productive nextest CPU ceiling in milliseconds.
+pub const TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS: u64 = 10 * 60 * 1_000;
+/// Independent productive nextest memory ceiling in bytes.
+pub const TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Independent productive nextest stdout bound in bytes.
+pub const TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Independent productive nextest stderr bound in bytes.
+pub const TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
+/// Independent productive nextest descendant ceiling.
+pub const TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS: u32 = 32;
 
 /// Computes the canonical definition digest over the static admitted
 /// profile fields.
@@ -123,11 +150,11 @@ pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
 /// values must agree. Excludes the per-host installed artifact digest,
 /// which binds later at Drive time through the intent's
 /// `executable_sha256`, so this value is stable across hosts.
-fn testd_profile_definition_digest() -> Result<String, KernelServiceError> {
+fn testd_profile_definition_digest(profile: &str) -> Result<String, KernelServiceError> {
     #[derive(Serialize)]
     struct Canonical<'a> {
         cpu_time_ms: Option<u64>,
-        env_allowlist: &'a [String],
+        env_allowlist: &'a [(String, String)],
         fixed_argv: &'a [String],
         max_descendants: u32,
         memory_bytes: Option<u64>,
@@ -137,19 +164,61 @@ fn testd_profile_definition_digest() -> Result<String, KernelServiceError> {
         stdout_bytes: u64,
         wall_timeout_ms: u64,
     }
-    let empty: Vec<String> = Vec::new();
-    let argv: Vec<String> = TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+    let empty: Vec<(String, String)> = Vec::new();
+    let (argv_source, limits) = if profile == TESTD_ADMITTED_PROFILE {
+        (
+            TESTD_PROFILE_ARGV,
+            (
+                TESTD_PROFILE_WALL_TIMEOUT_MS,
+                Some(TESTD_PROFILE_CPU_TIME_MS),
+                Some(TESTD_PROFILE_MEMORY_BYTES),
+                TESTD_PROFILE_STDOUT_BYTES,
+                TESTD_PROFILE_STDERR_BYTES,
+                TESTD_PROFILE_MAX_DESCENDANTS,
+            ),
+        )
+    } else if profile == TESTD_PRODUCTIVE_PROFILE {
+        (
+            TESTD_PRODUCTIVE_PROFILE_ARGV,
+            (
+                TESTD_PRODUCTIVE_PROFILE_WALL_TIMEOUT_MS,
+                Some(TESTD_PRODUCTIVE_PROFILE_CPU_TIME_MS),
+                Some(TESTD_PRODUCTIVE_PROFILE_MEMORY_BYTES),
+                TESTD_PRODUCTIVE_PROFILE_STDOUT_BYTES,
+                TESTD_PRODUCTIVE_PROFILE_STDERR_BYTES,
+                TESTD_PRODUCTIVE_PROFILE_MAX_DESCENDANTS,
+            ),
+        )
+    } else {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_admission.profile",
+            reason: "unknown testd profile",
+        });
+    };
+    let argv: Vec<String> = argv_source.iter().map(ToString::to_string).collect();
+    let environment = if profile == TESTD_PRODUCTIVE_PROFILE {
+        TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        empty
+    };
     let canonical = Canonical {
-        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
-        env_allowlist: &empty,
+        cpu_time_ms: limits.1,
+        env_allowlist: &environment,
         fixed_argv: &argv,
-        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
-        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
-        profile: TESTD_ADMITTED_PROFILE,
-        program_path: TESTD_PROFILE_PROGRAM,
-        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
-        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
-        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+        max_descendants: limits.5,
+        memory_bytes: limits.2,
+        profile,
+        program_path: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
+        } else {
+            TESTD_PROFILE_PROGRAM
+        },
+        stderr_bytes: limits.4,
+        stdout_bytes: limits.3,
+        wall_timeout_ms: limits.0,
     };
     canonical_json_bytes(&canonical)
         .map(|bytes| sha256_hex(&bytes))
@@ -270,6 +339,10 @@ impl TestdAdmissionContext {
 pub struct TestdAdmissionEnvelope {
     /// Testd job identity this admission binds.
     pub job_id: String,
+    /// Closed profile selected before dispatch; it is part of the envelope
+    /// identity so the Kernel digest cannot silently downgrade productive
+    /// nextest to the harmless probe.
+    pub profile: String,
     /// Single admitted operation, when the envelope carries execution work.
     /// `None` marks the observation-only path, which binds no process
     /// identity and needs no Kernel admission.
@@ -411,14 +484,16 @@ pub struct TestdAdmission {
     /// Admitted operation. Cancelled admissions carry the presented
     /// operation but bind no process identity.
     pub operation_id: String,
-    /// Admitted testd profile. Exactly one profile is admitted in this
-    /// slice (`TESTD_ADMITTED_PROFILE`); anything else is refused.
+    /// Admitted testd profile selected by the closed envelope.
     pub profile: String,
     /// Canonical definition digest over the static admitted profile
     /// fields (relative program, fixed argv, environment allowlist,
     /// timeout/output caps). The per-host installed artifact digest binds
     /// later at Drive time through the intent's `executable_sha256`.
     pub profile_binding_digest: String,
+    /// Exact environment bindings admitted with the profile. These bytes
+    /// travel in protected dispatch material and are rechecked by the child.
+    pub environment: Vec<(String, String)>,
     /// Whether the job was admitted cancelled; cancelled admissions never
     /// stage execution work.
     pub cancelled: bool,
@@ -443,6 +518,7 @@ impl TestdAdmission {
             operation_id: &'a str,
             profile: &'a str,
             profile_binding_digest: &'a str,
+            environment: &'a [(String, String)],
             cancelled: bool,
             admitted_at_unix_nanos: u64,
         }
@@ -454,6 +530,7 @@ impl TestdAdmission {
             operation_id: &self.operation_id,
             profile: &self.profile,
             profile_binding_digest: &self.profile_binding_digest,
+            environment: &self.environment,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
         };
@@ -485,10 +562,13 @@ impl TestdAdmission {
         ] {
             validate_wire_text(text, field)?;
         }
-        if self.profile != TESTD_ADMITTED_PROFILE {
+        if !matches!(
+            self.profile.as_str(),
+            TESTD_ADMITTED_PROFILE | TESTD_PRODUCTIVE_PROFILE
+        ) {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.profile",
-                reason: "testd admits only the closed cargo-test tool-probe profile",
+                reason: "testd admits only the closed probe or productive nextest profile",
             });
         }
         for (digest, field) in [
@@ -501,10 +581,24 @@ impl TestdAdmission {
         ] {
             validate_wire_digest(digest, field)?;
         }
-        if self.profile_binding_digest != testd_profile_definition_digest()? {
+        if self.profile_binding_digest != testd_profile_definition_digest(&self.profile)? {
             return Err(KernelServiceError::InvalidField {
                 field: "testd_admission.profile_binding_digest",
                 reason: "profile binding digest mismatch",
+            });
+        }
+        let expected_environment = if self.profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if self.environment != expected_environment {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.environment",
+                reason: "environment does not match the registered profile",
             });
         }
         if self.admitted_at_unix_nanos == 0 {
@@ -874,6 +968,7 @@ fn testd_job_conflict(
 /// taking executable authority from the caller.
 fn build_testd_admission(
     request: &TestdAdmissionAttemptRequest,
+    profile: &str,
     operation_id: &str,
     cancelled: bool,
     admitted_at_unix_nanos: u64,
@@ -884,8 +979,16 @@ fn build_testd_admission(
         job_id: request.job_id.clone(),
         request_digest: request.request_digest.clone(),
         operation_id: operation_id.to_owned(),
-        profile: TESTD_ADMITTED_PROFILE.to_owned(),
-        profile_binding_digest: testd_profile_definition_digest()?,
+        profile: profile.to_owned(),
+        profile_binding_digest: testd_profile_definition_digest(profile)?,
+        environment: if profile == TESTD_PRODUCTIVE_PROFILE {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        } else {
+            Vec::new()
+        },
         cancelled,
         admitted_at_unix_nanos,
         admission_digest: String::new(),
@@ -972,6 +1075,7 @@ pub fn handle_testd_admission_attempt(
     }
     let admission = build_testd_admission(
         request,
+        &envelope.profile,
         &operation_id,
         envelope.cancellation,
         now_unix_nanos,
@@ -1065,7 +1169,7 @@ pub fn reconcile_testd_admission(
     if admission.profile != TESTD_ADMITTED_PROFILE {
         return Ok(false);
     }
-    if admission.profile_binding_digest != testd_profile_definition_digest()? {
+    if admission.profile_binding_digest != testd_profile_definition_digest(&admission.profile)? {
         return Ok(false);
     }
     let Some(operation_id) = envelope.operation_id.as_deref() else {
@@ -1083,6 +1187,7 @@ pub fn reconcile_testd_admission(
     }
     let recomputed = build_testd_admission(
         request,
+        &admission.profile,
         operation_id,
         envelope.cancellation,
         admission.admitted_at_unix_nanos,

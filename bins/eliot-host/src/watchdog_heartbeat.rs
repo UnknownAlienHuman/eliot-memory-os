@@ -55,8 +55,7 @@ const TICK_MAX_MS: u64 = 3_600_000;
 /// Already-bound conflict detail shared by the bind error and the heal-path
 /// matcher, so the start path recognizes exactly this conflict and nothing
 /// else. The literal is the whole contract: keep it unchanged.
-const ALREADY_BOUND_CONFLICT: &str =
-    "heartbeat descriptor is already bound to another incarnation";
+const ALREADY_BOUND_CONFLICT: &str = "heartbeat descriptor is already bound to another incarnation";
 /// Lock-file name beside the transport descriptor. The descriptor file
 /// itself cannot carry the mutex (readers open it lock-free and renames
 /// replace it), so one stable sibling file owns the critical section for
@@ -188,9 +187,7 @@ impl HeartbeatTransportDescriptor {
                 "heartbeat descriptor pipe name does not carry its instance guid".to_owned(),
             ));
         }
-        if (self.watchdog_incarnation_pid == 0)
-            != (self.watchdog_incarnation_start_100ns == 0)
-        {
+        if (self.watchdog_incarnation_pid == 0) != (self.watchdog_incarnation_start_100ns == 0) {
             return Err(HostError::Platform(
                 "heartbeat descriptor incarnation is half-bound".to_owned(),
             ));
@@ -638,9 +635,8 @@ impl TransportDescriptorLock {
             drop(file);
             Self::repair_lock_file(lock_path)?;
             let file = Self::open_lock_file(lock_path)?;
-            eliot_windows_ipc::verify_file_owner_and_dacl(lock_path).map_err(|error| {
-                format!("lock contour is not intact after repair: {error}")
-            })?;
+            eliot_windows_ipc::verify_file_owner_and_dacl(lock_path)
+                .map_err(|error| format!("lock contour is not intact after repair: {error}"))?;
             return Self::take_exclusive(file);
         }
         Self::take_exclusive(file)
@@ -699,12 +695,61 @@ impl Drop for TransportDescriptorLock {
     }
 }
 
+/// Lists the exact staging names this transport publisher can create. A
+/// process id is part of the name so a crash can leave one behind; every
+/// matching entry is recovery evidence. The caller never removes these
+/// entries because the name alone does not prove that this process owns the
+/// bytes in them.
+fn transport_staging_artifacts(path: &Path) -> Result<Vec<PathBuf>, HostError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| HostError::Platform("heartbeat descriptor path has no parent".to_owned()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HostError::Platform("heartbeat descriptor path has no UTF-8 file name".to_owned())
+        })?;
+    let prefix = format!("{file_name}.tmp-");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "heartbeat transport staging directory cannot be inspected: {error}"
+            )));
+        }
+    };
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat transport staging directory changed during inspection: {error}"
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !pid.is_empty()
+            && pid.bytes().all(|byte| byte.is_ascii_digit())
+            && pid.parse::<u32>().ok().is_some_and(|pid| pid != 0)
+        {
+            artifacts.push(entry.path());
+        }
+    }
+    Ok(artifacts)
+}
+
 /// Atomically stages descriptor bytes beside the target and renames over
 /// it, so the rendezvous is never absent or half-written. The staging
 /// file is contour-enforced before the rename (the DACL travels with the
 /// file object), the target contour is verified after, and callers prove
-/// the result with a verified reload. A stale staging file from a crashed
-/// attempt is removed first and on failure, never reused.
+/// the result with a verified reload. A crash-stale canonical staging file
+/// is retained as recovery evidence and makes the next publish fail closed.
 ///
 /// # Errors
 ///
@@ -719,15 +764,16 @@ fn atomic_replace_transport_file(path: &Path, bytes: &[u8]) -> Result<(), HostEr
     let file_name = path.file_name().ok_or_else(|| {
         HostError::Platform("heartbeat descriptor path has no file name".to_owned())
     })?;
+    if let Some(staging) = transport_staging_artifacts(path)?.first() {
+        return Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport staging artifact is retained: {}",
+            staging.display()
+        )));
+    }
     let mut staging_name = file_name.to_owned();
     staging_name.push(format!(".tmp-{}", std::process::id()));
     let staging = path.with_file_name(staging_name);
-    match std::fs::remove_file(&staging) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(HostError::Platform(error.to_string())),
-    }
-    let staged = (|| -> Result<(), HostError> {
+    (|| -> Result<(), HostError> {
         write_watchdog_publication_child(&staging, bytes)?;
         eliot_windows_ipc::restrict_file_to_current_user_and_system(&staging).map_err(|error| {
             HostError::RecoveryRequired(format!(
@@ -740,11 +786,7 @@ fn atomic_replace_transport_file(path: &Path, bytes: &[u8]) -> Result<(), HostEr
             ))
         })?;
         verify_transport_file(path)
-    })();
-    if staged.is_err() {
-        let _ = std::fs::remove_file(&staging);
-    }
-    staged
+    })()
 }
 
 /// Returns true only for the exact already-bound conflict, so the heal
@@ -763,7 +805,9 @@ fn is_already_bound_conflict(error: &HostError) -> bool {
 /// longer matches the fresh challenge). Pre-fix files predate the
 /// contour, and this None is exactly their upgrade path: rotation, never
 /// silent retention.
-fn try_load_prior_descriptor(path: &Path) -> Result<Option<HeartbeatTransportDescriptor>, HostError> {
+fn try_load_prior_descriptor(
+    path: &Path,
+) -> Result<Option<HeartbeatTransportDescriptor>, HostError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -831,7 +875,9 @@ fn prior_incarnation_live(prior: &HeartbeatTransportDescriptor) -> bool {
 /// here: a digest alone is never integrity.
 fn restrict_and_verify_transport_file(path: &Path) -> Result<(), HostError> {
     eliot_windows_ipc::restrict_file_to_current_user_and_system(path).map_err(|error| {
-        HostError::RecoveryRequired(format!("heartbeat transport file DACL enforcement failed: {error}"))
+        HostError::RecoveryRequired(format!(
+            "heartbeat transport file DACL enforcement failed: {error}"
+        ))
     })?;
     verify_transport_file(path)
 }
@@ -840,7 +886,9 @@ fn restrict_and_verify_transport_file(path: &Path) -> Result<(), HostError> {
 /// Write paths enforce first; this is the read-side half.
 fn verify_transport_file(path: &Path) -> Result<(), HostError> {
     eliot_windows_ipc::verify_file_owner_and_dacl(path).map_err(|error| {
-        HostError::RecoveryRequired(format!("heartbeat transport file contour is not intact: {error}"))
+        HostError::RecoveryRequired(format!(
+            "heartbeat transport file contour is not intact: {error}"
+        ))
     })
 }
 
@@ -1122,13 +1170,17 @@ pub(crate) fn derive_heartbeat_observation(
     let freshness_window = Duration::from_millis(
         wire.tick_interval_ms
             .checked_mul(FRESHNESS_TICK_MULTIPLE)
-            .ok_or_else(|| HostError::RecoveryRequired("heartbeat freshness window overflows".to_owned()))?,
+            .ok_or_else(|| {
+                HostError::RecoveryRequired("heartbeat freshness window overflows".to_owned())
+            })?,
     );
     let freshness_deadline_wall_ms = receive_wall_ms
         .checked_add(freshness_window.as_millis().try_into().map_err(|_| {
             HostError::RecoveryRequired("heartbeat freshness window overflows".to_owned())
         })?)
-        .ok_or_else(|| HostError::RecoveryRequired("heartbeat freshness deadline overflows".to_owned()))?;
+        .ok_or_else(|| {
+            HostError::RecoveryRequired("heartbeat freshness deadline overflows".to_owned())
+        })?;
     // CONTINUOUS is a Host-sensor claim, never a writer claim: every binding
     // below must hold, otherwise the read is a fresh heartbeat with PARTIAL
     // coverage (still admittable, proving no continuity).
@@ -1223,8 +1275,7 @@ fn continuous_chain_intact(
     {
         return false;
     }
-    if previous.kernel_epoch != wire.kernel_epoch
-        || previous.watchdog_epoch != wire.watchdog_epoch
+    if previous.kernel_epoch != wire.kernel_epoch || previous.watchdog_epoch != wire.watchdog_epoch
     {
         return false;
     }
@@ -1243,10 +1294,7 @@ fn continuous_chain_intact(
     if monotonic_ms < previous.host_receive_monotonic_ms {
         return false;
     }
-    let window_ms: u64 = freshness_window
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
+    let window_ms: u64 = freshness_window.as_millis().try_into().unwrap_or(u64::MAX);
     monotonic_ms - previous.host_receive_monotonic_ms <= window_ms
 }
 impl HostObservedWatchdogHeartbeat {
@@ -1346,6 +1394,229 @@ pub(crate) fn load_prior_heartbeat_observation(
     Some(persisted)
 }
 
+/// Loads the persisted observation without the admission path's intentional
+/// corruption-to-`None` downgrade.  Start rollback must distinguish an
+/// absent Host artifact from an unreadable or substituted one: the latter is
+/// an unknown peer outcome and therefore keeps the pending recovery carrier.
+fn load_persisted_heartbeat_observation_strict(
+    host_state_root: &Path,
+) -> Result<Option<PersistedHeartbeatObservation>, HostError> {
+    let path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(HostError::RecoveryRequired(error.to_string())),
+    };
+    if bytes.len() as u64 > TRANSPORT_FILE_LIMIT {
+        return Err(HostError::RecoveryRequired(
+            "heartbeat observation exceeds its bounded size".to_owned(),
+        ));
+    }
+    let persisted: PersistedHeartbeatObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if persisted.schema != HOST_HEARTBEAT_OBSERVATION_SCHEMA {
+        return Err(HostError::RecoveryRequired(
+            "heartbeat observation schema is unsupported".to_owned(),
+        ));
+    }
+    let canonical = HeartbeatObservationCanonical {
+        schema: persisted.schema.as_str(),
+        pipe_name: persisted.pipe_name.as_str(),
+        service_instance_guid: persisted.service_instance_guid.as_str(),
+        kernel_epoch: persisted.kernel_epoch,
+        watchdog_epoch: persisted.watchdog_epoch,
+        tick_interval_ms: persisted.tick_interval_ms,
+        watchdog_readiness_sequence: persisted.watchdog_readiness_sequence,
+        watchdog_incarnation_pid: persisted.watchdog_incarnation_pid,
+        watchdog_incarnation_start_100ns: persisted.watchdog_incarnation_start_100ns,
+        handshake_count: persisted.handshake_count,
+        host_boot_id: persisted.host_boot_id,
+        host_receive_monotonic_ms: persisted.host_receive_monotonic_ms,
+        host_receive_wall_ms: persisted.host_receive_wall_ms,
+        coverage: persisted.coverage.as_str(),
+    };
+    if sha256_json(&canonical).map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        != persisted.observation_digest
+    {
+        return Err(HostError::RecoveryRequired(
+            "heartbeat observation digest does not match its canonical bytes".to_owned(),
+        ));
+    }
+    verify_transport_file(&path)?;
+    Ok(Some(persisted))
+}
+
+fn same_heartbeat_instance(
+    current: &HeartbeatTransportDescriptor,
+    issued: &HeartbeatTransportDescriptor,
+) -> bool {
+    current.pipe_name == issued.pipe_name
+        && current.host_challenge_nonce == issued.host_challenge_nonce
+        && current.service_instance_guid == issued.service_instance_guid
+        && current.installation_id == issued.installation_id
+        && current.transaction_plan_generation == issued.transaction_plan_generation
+}
+
+fn require_heartbeat_peer_stopped(pid: u32, start_100ns: u64) -> Result<(), HostError> {
+    let alive = eliot_windows_ipc::process_is_alive(pid)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if !alive {
+        return Ok(());
+    }
+    let current_start = eliot_windows_ipc::process_creation_ticks(pid)
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if current_start == start_100ns {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog heartbeat peer is still live".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Removes only the exact heartbeat artifacts issued for one Host start.
+///
+/// The caller must first reconcile the approved SCM registration and, when a
+/// bound incarnation existed, prove that its PID/start-time peer is stopped.
+/// This function holds the descriptor lock across both artifact checks and
+/// removals.  Missing files are clean; malformed, substituted, or changed
+/// files are recovery-required and are never deleted.
+pub(crate) fn remove_start_artifacts_exact(
+    host_state_root: &Path,
+    issued: &HeartbeatTransportDescriptor,
+    expected_process: Option<(u32, u64)>,
+) -> Result<(), HostError> {
+    let _lock = TransportDescriptorLock::acquire(host_state_root)?;
+    let descriptor_path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+    if let Some(staging) = transport_staging_artifacts(&descriptor_path)?.first() {
+        return Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport staging artifact remains: {}",
+            staging.display()
+        )));
+    }
+    let current = HeartbeatTransportDescriptor::load(host_state_root)?;
+    let observation_path = host_state_root.join(HOST_HEARTBEAT_OBSERVATION_FILE_NAME);
+    let observation = load_persisted_heartbeat_observation_strict(host_state_root)?;
+
+    // Validate the complete owned set before deleting either artifact.  The
+    // descriptor is the durable recovery anchor; a malformed or substituted
+    // observation must therefore leave it intact for recovery rather than
+    // turning the later validation error into evidence loss.
+    if let Some(current) = current.as_ref() {
+        if !same_heartbeat_instance(current, issued) {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat descriptor belongs to another start incarnation".to_owned(),
+            ));
+        }
+        match expected_process {
+            Some((pid, start_100ns))
+                if current.watchdog_incarnation_pid == pid
+                    && current.watchdog_incarnation_start_100ns == start_100ns =>
+            {
+                require_heartbeat_peer_stopped(pid, start_100ns)?;
+            }
+            Some(_) => {
+                return Err(HostError::RecoveryRequired(
+                    "heartbeat descriptor peer identity changed during rollback".to_owned(),
+                ));
+            }
+            None if current.is_bound() => {
+                return Err(HostError::RecoveryRequired(
+                    "heartbeat descriptor is bound before rollback peer admission".to_owned(),
+                ));
+            }
+            None => {}
+        }
+    }
+
+    if let Some(observation) = observation.as_ref() {
+        if observation.pipe_name != issued.pipe_name
+            || observation.service_instance_guid != issued.service_instance_guid
+        {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat observation belongs to another start incarnation".to_owned(),
+            ));
+        }
+        let Some((pid, start_100ns)) = expected_process else {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat observation has no exact stopped peer binding".to_owned(),
+            ));
+        };
+        if observation.watchdog_incarnation_pid != pid
+            || observation.watchdog_incarnation_start_100ns != start_100ns
+        {
+            return Err(HostError::RecoveryRequired(
+                "heartbeat observation peer identity changed during rollback".to_owned(),
+            ));
+        }
+        require_heartbeat_peer_stopped(pid, start_100ns)?;
+    }
+
+    // Remove the audit observation first and the descriptor last.  If the
+    // second OS delete is uncertain, the descriptor remains as a durable,
+    // operation-bound recovery anchor and the caller retains its recovery
+    // carrier because this function returns an error.
+    if observation.is_some() {
+        std::fs::remove_file(&observation_path).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat observation removal outcome is unknown; durable recovery remains required: {error}"
+            ))
+        })?;
+    }
+    if current.is_some() {
+        std::fs::remove_file(&descriptor_path).map_err(|error| {
+            HostError::RecoveryRequired(format!(
+                "heartbeat descriptor removal outcome is unknown; durable recovery remains required: {error}"
+            ))
+        })?;
+    }
+
+    for (path, name) in [
+        (&descriptor_path, WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
+        (&observation_path, HOST_HEARTBEAT_OBSERVATION_FILE_NAME),
+    ] {
+        match std::fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "heartbeat rollback artifact remains after exact removal: {name}"
+                )));
+            }
+            Err(error) => return Err(HostError::RecoveryRequired(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Confirms that no heartbeat artifact is present when the Host has no
+/// operation-bound carrier from which it could prove ownership.  Presence of
+/// even an unreadable file is recovery-required; metadata is used deliberately
+/// so a corrupt file cannot be mistaken for absence by the tolerant loader.
+pub(crate) fn require_no_start_artifacts(host_state_root: &Path) -> Result<(), HostError> {
+    let descriptor_path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+    if let Some(staging) = transport_staging_artifacts(&descriptor_path)?.first() {
+        return Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport staging artifact remains: {}",
+            staging.display()
+        )));
+    }
+    for name in [
+        WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME,
+        HOST_HEARTBEAT_OBSERVATION_FILE_NAME,
+    ] {
+        let path = host_state_root.join(name);
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "heartbeat rollback artifact remains: {name}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(HostError::RecoveryRequired(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
 /// Handle-bound pipe peer: PID plus executable image resolved from the
 /// live server handle at accept time (I1.6 independent observation).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1408,9 +1679,8 @@ impl HeartbeatListener {
         }
         let allowed_sid = eliot_windows_ipc::current_process_token_sid()
             .map_err(|error| HostError::Platform(error.to_string()))?;
-        let server =
-            eliot_windows_ipc::create_current_user_server(pipe_name, &allowed_sid, true)
-                .map_err(|error| HostError::Platform(error.to_string()))?;
+        let server = eliot_windows_ipc::create_current_user_server(pipe_name, &allowed_sid, true)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
         Ok(Self {
             server,
             pipe_name: pipe_name.to_owned(),
@@ -1447,18 +1717,15 @@ impl HeartbeatListener {
         }
         tokio::time::timeout(budget, self.server.connect())
             .await
-            .map_err(|_| {
-                HostError::RecoveryRequired("heartbeat listen window expired".to_owned())
-            })?
+            .map_err(|_| HostError::RecoveryRequired("heartbeat listen window expired".to_owned()))?
             .map_err(|error| HostError::Platform(error.to_string()))?;
         // Rejected peers: connects refused before the peer proves the bound
         // incarnation never reach admission, but they stay counted in the
         // readiness record.
-        let peer = eliot_windows_ipc::named_pipe_client_process(&self.server)
-            .map_err(|error| {
-                *rejected_peers += 1;
-                HostError::RecoveryRequired(format!("heartbeat peer is not bound: {error}"))
-            })?;
+        let peer = eliot_windows_ipc::named_pipe_client_process(&self.server).map_err(|error| {
+            *rejected_peers += 1;
+            HostError::RecoveryRequired(format!("heartbeat peer is not bound: {error}"))
+        })?;
         // Incarnation check at connect: the kernel-bound peer must be the
         // exact SCM-verified process the descriptor names. PID equality
         // alone cannot distinguish reuse, so the creation time is compared
@@ -1470,22 +1737,22 @@ impl HeartbeatListener {
                 "heartbeat peer is not the bound watchdog incarnation".to_owned(),
             ));
         }
-        let peer_start = eliot_windows_ipc::process_creation_ticks(peer.pid)
-            .map_err(|error| {
-                *rejected_peers += 1;
-                HostError::RecoveryRequired(format!(
-                    "heartbeat peer incarnation is unknown: {error}"
-                ))
-            })?;
+        let peer_start = eliot_windows_ipc::process_creation_ticks(peer.pid).map_err(|error| {
+            *rejected_peers += 1;
+            HostError::RecoveryRequired(format!("heartbeat peer incarnation is unknown: {error}"))
+        })?;
         if peer_start != self.expected_incarnation_start_100ns {
             *rejected_peers += 1;
             return Err(HostError::RecoveryRequired(
                 "heartbeat peer is not the bound watchdog incarnation".to_owned(),
             ));
         }
-        let next =
-            eliot_windows_ipc::create_current_user_server(&self.pipe_name, &self.allowed_sid, false)
-                .map_err(|error| HostError::Platform(error.to_string()))?;
+        let next = eliot_windows_ipc::create_current_user_server(
+            &self.pipe_name,
+            &self.allowed_sid,
+            false,
+        )
+        .map_err(|error| HostError::Platform(error.to_string()))?;
         let mut current = std::mem::replace(&mut self.server, next);
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
@@ -1777,10 +2044,7 @@ async fn collect_window_accepts(
         if Instant::now() >= deadline {
             break;
         }
-        if let Ok(accept) = listener
-            .accept_one(deadline, &mut rejected_peers)
-            .await
-        {
+        if let Ok(accept) = listener.accept_one(deadline, &mut rejected_peers).await {
             accepted.push(accept);
             if accepted.len() >= ADMISSION_MIN_BEATS {
                 break;
@@ -1880,7 +2144,9 @@ pub fn observe_armed_heartbeat(
         }
     }
     let observed = last_observed.ok_or_else(|| {
-        HostError::RecoveryRequired("armed heartbeat transport delivered no fresh heartbeat".to_owned())
+        HostError::RecoveryRequired(
+            "armed heartbeat transport delivered no fresh heartbeat".to_owned(),
+        )
     })?;
     let peer = accepted
         .last()
@@ -2035,7 +2301,9 @@ mod tests {
         let dir = test_dir();
         std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
         let issued = test_descriptor();
-        issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        issued
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must publish"));
         let loaded = HeartbeatTransportDescriptor::load(&dir)
             .unwrap_or_else(|_| panic!("descriptor must load"))
             .unwrap_or_else(|| panic!("descriptor must be present"));
@@ -2059,8 +2327,7 @@ mod tests {
         let canonical = descriptor
             .canonical_bytes()
             .unwrap_or_else(|_| panic!("canonical bytes must encode"));
-        let text =
-            String::from_utf8(canonical).unwrap_or_else(|_| panic!("canonical is UTF-8"));
+        let text = String::from_utf8(canonical).unwrap_or_else(|_| panic!("canonical is UTF-8"));
         let mut cursor = 0;
         for key in [
             "schema",
@@ -2092,8 +2359,15 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let first = derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-            .unwrap_or_else(|_| panic!("first read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("first read must derive"));
         assert_eq!(first.coverage, HostHeartbeatCoverage::Partial);
         assert_eq!(first.watchdog_readiness_sequence, 1);
         assert_eq!(first.kernel_epoch, 7);
@@ -2117,10 +2391,13 @@ mod tests {
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
         let good = test_message(&descriptor, 1);
-        let value: serde_json::Value = serde_json::from_slice(&good)
-            .unwrap_or_else(|_| panic!("test message must be JSON"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&good).unwrap_or_else(|_| panic!("test message must be JSON"));
         for (field, bad) in [
-            ("authority_state", serde_json::Value::String("RUNNING_NO_AUTHORITY".to_owned())),
+            (
+                "authority_state",
+                serde_json::Value::String("RUNNING_NO_AUTHORITY".to_owned()),
+            ),
             ("coverage_claimed", serde_json::Value::Bool(false)),
             ("kernel_epoch", serde_json::Value::Number(0.into())),
             ("watchdog_epoch", serde_json::Value::Number(0.into())),
@@ -2133,7 +2410,10 @@ mod tests {
                 "service_instance_guid",
                 serde_json::Value::String("0".repeat(32)),
             ),
-            ("watchdog_readiness_sequence", serde_json::Value::Number(0.into())),
+            (
+                "watchdog_readiness_sequence",
+                serde_json::Value::Number(0.into()),
+            ),
             ("service", serde_json::Value::String("Other".to_owned())),
             (
                 "watchdog_incarnation_pid",
@@ -2153,11 +2433,11 @@ mod tests {
                 "fault in {field} must be rejected"
             );
         }
-        assert!(derive_heartbeat_observation(b"not json", &descriptor, None, now, wall, 1).is_err());
-        // A pure writer-field record with no Host handshake is never evidence.
         assert!(
-            derive_heartbeat_observation(&good, &descriptor, None, now, wall, 0).is_err()
+            derive_heartbeat_observation(b"not json", &descriptor, None, now, wall, 1).is_err()
         );
+        // A pure writer-field record with no Host handshake is never evidence.
+        assert!(derive_heartbeat_observation(&good, &descriptor, None, now, wall, 0).is_err());
         // An unbound rendezvous names no proven peer.
         let unbound = test_descriptor();
         assert!(
@@ -2171,8 +2451,15 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let first = derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-            .unwrap_or_else(|_| panic!("first read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("first read must derive"));
         let prior = first.persisted_view();
         let gapped = derive_heartbeat_observation(
             &test_message(&descriptor, 3),
@@ -2191,12 +2478,25 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let observed =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
-        let admitted =
-            admit_heartbeat_observation(observed, &descriptor, 7, 11, &test_scm(), &test_peer(), &test_summary())
-                .unwrap_or_else(|_| panic!("fresh heartbeat must admit"));
+        let observed = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
+        let admitted = admit_heartbeat_observation(
+            observed,
+            &descriptor,
+            7,
+            11,
+            &test_scm(),
+            &test_peer(),
+            &test_summary(),
+        )
+        .unwrap_or_else(|_| panic!("fresh heartbeat must admit"));
         assert_eq!(admitted.evidence_refs.len(), 7);
         let texts: Vec<String> = admitted
             .evidence_refs
@@ -2218,7 +2518,10 @@ mod tests {
         let prior = load_prior_heartbeat_observation(&dir)
             .unwrap_or_else(|| panic!("observation must reload"));
         assert_eq!(prior.watchdog_readiness_sequence, 1);
-        assert_eq!(prior.observation_digest, admitted.observation.observation_digest);
+        assert_eq!(
+            prior.observation_digest,
+            admitted.observation.observation_digest
+        );
         assert_eq!(prior.handshake_count, 1);
         assert_eq!(prior.watchdog_incarnation_pid, pid);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2229,11 +2532,27 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let observed =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
-        assert!(admit_heartbeat_observation(observed.clone(), &descriptor, 8, 11, &test_scm(), &test_peer(), &test_summary())
-            .is_err());
+        let observed = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
+        assert!(
+            admit_heartbeat_observation(
+                observed.clone(),
+                &descriptor,
+                8,
+                11,
+                &test_scm(),
+                &test_peer(),
+                &test_summary()
+            )
+            .is_err()
+        );
         let mut foreign_peer = test_peer();
         foreign_peer.process_id = u32::try_from(observed.kernel_epoch)
             .unwrap_or_else(|_| panic!("epoch must fit u32"))
@@ -2247,13 +2566,31 @@ mod tests {
             accept_count: 1,
             distinct_peer_pids: vec![foreign_peer.process_id],
         };
-        assert!(admit_heartbeat_observation(observed.clone(), &descriptor, 7, 11, &test_scm(), &foreign_peer, &foreign_summary)
-            .is_err());
+        assert!(
+            admit_heartbeat_observation(
+                observed.clone(),
+                &descriptor,
+                7,
+                11,
+                &test_scm(),
+                &foreign_peer,
+                &foreign_summary
+            )
+            .is_err()
+        );
         let mut blind = observed.clone();
         blind.coverage = HostHeartbeatCoverage::Blind;
         assert!(
-            admit_heartbeat_observation(blind, &descriptor, 7, 11, &test_scm(), &test_peer(), &test_summary())
-                .is_err()
+            admit_heartbeat_observation(
+                blind,
+                &descriptor,
+                7,
+                11,
+                &test_scm(),
+                &test_peer(),
+                &test_summary()
+            )
+            .is_err()
         );
     }
 
@@ -2295,8 +2632,7 @@ mod tests {
             let held_a = tokio::net::windows::named_pipe::ClientOptions::new()
                 .open(pipe_name.as_str())
                 .unwrap_or_else(|_| panic!("foreign client must open"));
-            let Err(error) = listener.accept_one(deadline, &mut rejected_peers).await
-            else {
+            let Err(error) = listener.accept_one(deadline, &mut rejected_peers).await else {
                 panic!("foreign connect must be rejected")
             };
             assert!(
@@ -2320,8 +2656,7 @@ mod tests {
             let _held_b = tokio::net::windows::named_pipe::ClientOptions::new()
                 .open(pipe_name.as_str())
                 .unwrap_or_else(|_| panic!("second client must open"));
-            let Err(error) = listener.accept_one(deadline, &mut rejected_peers).await
-            else {
+            let Err(error) = listener.accept_one(deadline, &mut rejected_peers).await else {
                 panic!("second connect must be rejected")
             };
             assert!(
@@ -2355,13 +2690,11 @@ mod tests {
             .unwrap_or_else(|_| panic!("loopback listener must bind"));
             let mut out = Vec::new();
             for message in [&first_bytes, &second_bytes] {
-                let (accept, ()) = tokio::join!(
-                    listener.accept_one(deadline, &mut rejected_peers),
-                    async {
-                        let mut client =
-                            tokio::net::windows::named_pipe::ClientOptions::new()
-                                .open(descriptor.pipe_name.as_str())
-                                .unwrap_or_else(|_| panic!("loopback client must open"));
+                let (accept, ()) =
+                    tokio::join!(listener.accept_one(deadline, &mut rejected_peers), async {
+                        let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
+                            .open(descriptor.pipe_name.as_str())
+                            .unwrap_or_else(|_| panic!("loopback client must open"));
                         client
                             .write_all(message.as_slice())
                             .await
@@ -2374,8 +2707,7 @@ mod tests {
                             .flush()
                             .await
                             .unwrap_or_else(|_| panic!("loopback client must flush"));
-                    }
-                );
+                    });
                 out.push(accept.unwrap_or_else(|_| panic!("loopback accept must succeed")));
             }
             out
@@ -2442,11 +2774,8 @@ mod tests {
             "descriptor_digest": sha256_hex(&canonical),
         }))
         .unwrap_or_else(|_| panic!("descriptor must encode"));
-        std::fs::write(
-            dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
-            bytes,
-        )
-        .unwrap_or_else(|_| panic!("descriptor must write"));
+        std::fs::write(dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME), bytes)
+            .unwrap_or_else(|_| panic!("descriptor must write"));
     }
 
     #[test]
@@ -2456,9 +2785,12 @@ mod tests {
         // A bound prior naming this live process owns the rendezvous: a
         // fresh publish must keep it, never rotate under the live writer.
         let live = test_bound_descriptor();
-        live.publish(&dir).unwrap_or_else(|_| panic!("live prior must publish"));
+        live.publish(&dir)
+            .unwrap_or_else(|_| panic!("live prior must publish"));
         let fresh = test_descriptor();
-        fresh.publish(&dir).unwrap_or_else(|_| panic!("publish must keep live prior"));
+        fresh
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("publish must keep live prior"));
         let loaded = HeartbeatTransportDescriptor::load(&dir)
             .unwrap_or_else(|_| panic!("descriptor must load"))
             .unwrap_or_else(|| panic!("descriptor must be present"));
@@ -2473,12 +2805,16 @@ mod tests {
         let dead_pid = child.id();
         let dead_start = eliot_windows_ipc::process_creation_ticks(dead_pid)
             .unwrap_or_else(|_| panic!("probe incarnation must query"));
-        child.wait().unwrap_or_else(|_| panic!("probe process must exit"));
+        child
+            .wait()
+            .unwrap_or_else(|_| panic!("probe process must exit"));
         let mut stale = test_bound_descriptor();
         stale.watchdog_incarnation_pid = dead_pid;
         stale.watchdog_incarnation_start_100ns = dead_start;
         write_descriptor_bytes(&dir, &stale);
-        fresh.publish(&dir).unwrap_or_else(|_| panic!("stopped prior must rotate"));
+        fresh
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("stopped prior must rotate"));
         let rotated = HeartbeatTransportDescriptor::load(&dir)
             .unwrap_or_else(|_| panic!("descriptor must load"))
             .unwrap_or_else(|| panic!("descriptor must be present"));
@@ -2491,7 +2827,9 @@ mod tests {
         let dir = test_dir();
         std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
         let issued = test_descriptor();
-        issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        issued
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must publish"));
         let (pid, start) = self_incarnation();
         HeartbeatTransportDescriptor::bind_incarnation(&dir, pid, start)
             .unwrap_or_else(|_| panic!("incarnation must bind"));
@@ -2540,7 +2878,9 @@ mod tests {
         let dir = test_dir();
         std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
         let fresh = test_descriptor();
-        fresh.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        fresh
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must publish"));
         // Bind a now-dead incarnation: the conflicting owner is provably gone.
         let mut child = std::process::Command::new("cmd")
             .args(["/C", "exit 0"])
@@ -2549,7 +2889,9 @@ mod tests {
         let dead_pid = child.id();
         let dead_start = eliot_windows_ipc::process_creation_ticks(dead_pid)
             .unwrap_or_else(|_| panic!("probe incarnation must query"));
-        child.wait().unwrap_or_else(|_| panic!("probe process must exit"));
+        child
+            .wait()
+            .unwrap_or_else(|_| panic!("probe process must exit"));
         HeartbeatTransportDescriptor::bind_incarnation(&dir, dead_pid, dead_start)
             .unwrap_or_else(|_| panic!("dead incarnation must bind"));
         // The heal path rotates to the issued challenge and binds the live
@@ -2571,8 +2913,10 @@ mod tests {
         // incarnation fails closed and the verified binding survives.
         let foreign = test_descriptor();
         assert!(
-            HeartbeatTransportDescriptor::bind_incarnation_or_heal(&foreign, &dir, dead_pid, dead_start)
-                .is_err()
+            HeartbeatTransportDescriptor::bind_incarnation_or_heal(
+                &foreign, &dir, dead_pid, dead_start
+            )
+            .is_err()
         );
         let intact = HeartbeatTransportDescriptor::load(&dir)
             .unwrap_or_else(|_| panic!("descriptor must load"))
@@ -2588,7 +2932,9 @@ mod tests {
         let dir = test_dir();
         std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
         let issued = test_descriptor();
-        issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        issued
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must publish"));
         let barrier = Arc::new(Barrier::new(WRITERS));
         let outcomes: Vec<Result<(u32, u64), String>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..WRITERS)
@@ -2631,7 +2977,11 @@ mod tests {
             }
         }
         assert_eq!(winners.len(), 1, "exactly one concurrent bind must win");
-        assert_eq!(losers, WRITERS - 1, "every other concurrent bind must lose closed");
+        assert_eq!(
+            losers,
+            WRITERS - 1,
+            "every other concurrent bind must lose closed"
+        );
         let (pid, start) = winners
             .into_iter()
             .next()
@@ -2726,7 +3076,9 @@ mod tests {
         let dir = test_dir();
         std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
         let issued = test_descriptor();
-        issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        issued
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must publish"));
         // Hold the sibling lock file's exclusive OS lock on a second handle:
         // a rotation that proceeded unlocked would silently clobber here.
         // The contended bind runs on the test-visible CONTENTION_ATTEMPTS by
@@ -2786,7 +3138,9 @@ mod tests {
             "raw-written prior must miss the contour"
         );
         let fresh = test_descriptor();
-        fresh.publish(&dir).unwrap_or_else(|_| panic!("publish must replace"));
+        fresh
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("publish must replace"));
         let rotated = HeartbeatTransportDescriptor::load(&dir)
             .unwrap_or_else(|_| panic!("descriptor must load"))
             .unwrap_or_else(|| panic!("descriptor must be present"));
@@ -2832,9 +3186,15 @@ mod tests {
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
         let pid = std::process::id();
-        let first =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         // No handshake history: pure writer fields, never evidence.
         assert!(
             admit_heartbeat_observation(
@@ -2921,9 +3281,15 @@ mod tests {
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
         let pid = std::process::id();
         // Handshake count beyond the observed accepts.
-        let ahead =
-            derive_heartbeat_observation(&test_message(&descriptor, 2), &descriptor, None, now, wall, 2)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let ahead = derive_heartbeat_observation(
+            &test_message(&descriptor, 2),
+            &descriptor,
+            None,
+            now,
+            wall,
+            2,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         assert!(
             admit_heartbeat_observation(
                 ahead,
@@ -2937,9 +3303,15 @@ mod tests {
             .is_err()
         );
         // Zero handshake count is writer self-report, never evidence.
-        let first =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         let mut zero = first;
         zero.handshake_count = 0;
         assert!(
@@ -2955,9 +3327,15 @@ mod tests {
             .is_err()
         );
         // The boundary count (equal to the accepts) still admits.
-        let boundary =
-            derive_heartbeat_observation(&test_message(&descriptor, 2), &descriptor, None, now, wall, 2)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let boundary = derive_heartbeat_observation(
+            &test_message(&descriptor, 2),
+            &descriptor,
+            None,
+            now,
+            wall,
+            2,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         assert!(
             admit_heartbeat_observation(
                 boundary,
@@ -2980,9 +3358,15 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let first =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("first read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("first read must derive"));
         let prior = first.persisted_view();
         // Replayed window position with the next sequence: nonzero prior,
         // but no advancement, so no continuity.
@@ -3034,15 +3418,20 @@ mod tests {
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
         // Prior window admitted sequence 1 on the bound incarnation.
-        let first =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("first read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("first read must derive"));
         let prior = first.persisted_view();
         // A substituted writer knows the challenge and continues the
         // sequence, but on a new incarnation: derive rejects it outright.
-        let mut impostor: serde_json::Value =
-            serde_json::from_slice(&test_message(&descriptor, 2))
-                .unwrap_or_else(|_| panic!("test message must be JSON"));
+        let mut impostor: serde_json::Value = serde_json::from_slice(&test_message(&descriptor, 2))
+            .unwrap_or_else(|_| panic!("test message must be JSON"));
         impostor["watchdog_incarnation_pid"] = serde_json::Value::Number(4242.into());
         impostor["watchdog_incarnation_start_100ns"] = serde_json::Value::Number(999.into());
         let impostor_bytes = serde_json::to_vec(&impostor)
@@ -3070,9 +3459,15 @@ mod tests {
         // drifted SCM incarnation (PID reuse with a new start) fails.
         let mut drifted_scm = test_scm();
         drifted_scm.process.start_time_100ns = 1;
-        let observed =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let observed = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         assert!(
             admit_heartbeat_observation(
                 observed,
@@ -3092,9 +3487,15 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let first =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("first read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("first read must derive"));
         let base = first.persisted_view();
         let boot = host_boot_id().unwrap_or_else(|_| panic!("boot id must mint"));
         let mut rebooted = base.clone();
@@ -3122,14 +3523,19 @@ mod tests {
     #[test]
     fn continuity_cadence_is_measured_on_the_host_clock() {
         let descriptor = test_bound_descriptor();
-        let wire: WatchdogHeartbeatWire =
-            serde_json::from_slice(&test_message(&descriptor, 2))
-                .unwrap_or_else(|_| panic!("test message must parse"));
+        let wire: WatchdogHeartbeatWire = serde_json::from_slice(&test_message(&descriptor, 2))
+            .unwrap_or_else(|_| panic!("test message must parse"));
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let first =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("first read must derive"));
+        let first = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("first read must derive"));
         let window = Duration::from_secs(6);
         let boot = host_boot_id().unwrap_or_else(|_| panic!("boot id must mint"));
         let mut prior = first.persisted_view();
@@ -3137,13 +3543,25 @@ mod tests {
         // gap is measured on the monotonic clock, never the writer tick.
         prior.host_receive_monotonic_ms = 0;
         assert!(!continuous_chain_intact(
-            &wire, &descriptor, &prior, boot, 1_000_000, &window, 2
+            &wire,
+            &descriptor,
+            &prior,
+            boot,
+            1_000_000,
+            &window,
+            2
         ));
         // The live chain with a current monotonic reading holds.
         let live = first.persisted_view();
         let mono = host_monotonic_ms();
         assert!(continuous_chain_intact(
-            &wire, &descriptor, &live, boot, mono, &window, 2
+            &wire,
+            &descriptor,
+            &live,
+            boot,
+            mono,
+            &window,
+            2
         ));
     }
 
@@ -3152,9 +3570,15 @@ mod tests {
         let descriptor = test_bound_descriptor();
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let observed =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let observed = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         let pid = std::process::id();
         // No handshake history: pure writer fields, never evidence.
         assert!(
@@ -3233,9 +3657,15 @@ mod tests {
             .unwrap_or_else(|_| panic!("descriptor must carry the contour"));
         let now = Instant::now();
         let wall = wall_now_ms().unwrap_or_else(|_| panic!("wall clock must read"));
-        let observed =
-            derive_heartbeat_observation(&test_message(&descriptor, 1), &descriptor, None, now, wall, 1)
-                .unwrap_or_else(|_| panic!("read must derive"));
+        let observed = derive_heartbeat_observation(
+            &test_message(&descriptor, 1),
+            &descriptor,
+            None,
+            now,
+            wall,
+            1,
+        )
+        .unwrap_or_else(|_| panic!("read must derive"));
         let observation_path = persist_heartbeat_observation(&dir, &observed)
             .unwrap_or_else(|_| panic!("observation must persist"));
         eliot_windows_ipc::verify_file_owner_and_dacl(&observation_path)

@@ -8,14 +8,63 @@ use eliot_learning_activation_assessment::{
     MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES, MissingAssessmentField,
 };
 use eliot_learning_contracts::{
-    AgentAttemptId, AssessmentDimension, CampaignHarnessOverlayCandidate, CampaignId,
-    CampaignLearningStateView, CausalCeiling, ChangeOperation, ChangeSurface, Completeness,
+    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, AgentAttemptId,
+    AssessmentDimension, CampaignHarnessOverlayCandidate, CampaignId, CampaignLearningStateView,
+    CausalCeiling, ChangeOperation, ChangeSurface, Completeness, DeliverySection, DeliveryStatus,
     DimensionAssessment, DimensionStatus, InverseChange, LearningStateViewRecipe, LifecycleStage,
     MemberId, MemberProjection, MetricObservation, OmissionPolicy, OverlayChange, OverlayId,
-    OverlayOrigin, OwnerId, ProofCeiling, SlotDisposition, SlotId, SlotProjection, SlotRequirement,
-    SlotSpec, SourceDenominator, StageDisposition, StageObservation, TargetId, ValueState,
-    WorkScopeId,
+    OverlayOrigin, OwnerId, ProofCeiling, RetrievalSection, RetrievalStatus, SlotDisposition,
+    SlotId, SlotProjection, SlotRequirement, SlotSpec, SourceDenominator, StageDisposition,
+    StageObservation, TargetId, ValueState, WorkScopeId,
 };
+use std::sync::OnceLock;
+
+/// Shared default harness-activation evidence for the legacy `make_input` helper.
+///
+/// All sections default to unknown/missing with empty refs: no retrieval is
+/// claimed, no delivery packet is asserted, no acknowledgement substitutes for
+/// a qualifying use, and adherence stays unknown (I12.24 l256).
+struct DefaultExtra620 {
+    compiled_view_ref: ArtifactId,
+    context_compiler_revision: String,
+    render_profile_revision: String,
+    retrieval: RetrievalSection,
+    delivery: DeliverySection,
+    activation: ActivationSection,
+    adherence: AdherenceSection,
+}
+
+fn default_extra620() -> &'static DefaultExtra620 {
+    static CELL: OnceLock<DefaultExtra620> = OnceLock::new();
+    CELL.get_or_init(|| DefaultExtra620 {
+        compiled_view_ref: ArtifactId::new("compiled-view-620-default")
+            .expect("valid default compiled view ref"),
+        context_compiler_revision: "compiler-rev-620-default".to_owned(),
+        render_profile_revision: "render-rev-620-default".to_owned(),
+        retrieval: RetrievalSection {
+            status: RetrievalStatus::Unknown,
+            expansion_or_tool_query_refs: Vec::new(),
+        },
+        delivery: DeliverySection {
+            status: DeliveryStatus::Missing,
+            packet_position: None,
+            serialized_digest: None,
+            bytes: None,
+            actual_tokens: None,
+        },
+        activation: ActivationSection {
+            status: ActivationStatus::Unknown,
+            acknowledgement_ref: None,
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: AdherenceSection {
+            status: AdherenceStatus::Unknown,
+            early_mid_final_checkpoint_refs: Vec::new(),
+            prescribed_or_avoided_action_and_required_verifier_refs: Vec::new(),
+        },
+    })
+}
 
 fn aid(value: &str) -> Result<ArtifactId, Box<dyn std::error::Error>> {
     Ok(ArtifactId::new(value)?)
@@ -174,6 +223,10 @@ fn fixture() -> Result<
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding: binding.clone(),
         overlay_id: OverlayId::from_artifact(aid("overlay-620")?),
+        campaign_id: view.campaign_id.clone(),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
         base_view_digest: view.canonical_digest.clone(),
         parent_revision: TaskRevision::genesis(),
         admitted_delta_ids: vec![delta.delta_id.clone()],
@@ -201,6 +254,14 @@ fn fixture() -> Result<
         protected_surface_base_digest: digest("protected"),
         protected_surface_proposed_digest: digest("protected"),
         fixed_before_observation_discriminator: aid("overlay-fixed")?,
+        intended_mechanism: "assessment-mechanism".to_owned(),
+        prediction: "assessment-prediction".to_owned(),
+        expected_observable: "assessment-observable".to_owned(),
+        possible_regressions: "assessment-regressions".to_owned(),
+        confounders: "assessment-confounders".to_owned(),
+        preserved_success_constraint: "assessment-preserved".to_owned(),
+        next_discriminator_text: "assessment-next".to_owned(),
+        rollback_condition: "assessment-rollback".to_owned(),
         expires_at_ms: 2_000,
         invalidated: false,
         canonical_digest: String::new(),
@@ -267,6 +328,9 @@ fn make_input<'a>(
     dimensions: &'a [DimensionAssessment],
     external_refs: &'a [ArtifactId],
 ) -> AssessmentInput<'a> {
+    let extra = default_extra620();
+    let empty_refs: &[ArtifactId] = &[];
+    let empty_strings: &[String] = &[];
     AssessmentInput {
         binding,
         target,
@@ -286,6 +350,24 @@ fn make_input<'a>(
         dimensions,
         external_review_refs: external_refs,
         policy,
+        compiled_view_ref: &extra.compiled_view_ref,
+        context_compiler_revision: extra.context_compiler_revision.as_str(),
+        render_profile_revision: extra.render_profile_revision.as_str(),
+        stable_harness_refs: empty_refs,
+        task_family_harness_refs: empty_refs,
+        skill_refs: empty_refs,
+        memory_refs: empty_refs,
+        procedure_refs: empty_refs,
+        preserved_success_ref: None,
+        eligibility_and_retrieval_reason: None,
+        retrieval: &extra.retrieval,
+        delivery: &extra.delivery,
+        activation: &extra.activation,
+        adherence: &extra.adherence,
+        conflicts_suppression_or_compaction_loss: empty_refs,
+        downstream_refs: empty_refs,
+        receipt_completeness_and_missing_fields: empty_strings,
+        invalidation_expiry_and_missingness: empty_strings,
     }
 }
 
@@ -3242,6 +3324,9 @@ fn case_39_evidence_next_step_owner_link_without_promotion()
     let (view, delta, overlay, binding, target, recipe) = fixture()?;
     let policy = base_policy();
     let empty: [StageObservation; 0] = [];
+    let extra39 = default_extra620();
+    let empty_refs39: &[ArtifactId] = &[];
+    let empty_strings39: &[String] = &[];
     let outcome =
         eliot_learning_activation_assessment::assess_learning_activation(&AssessmentInput {
             binding: &binding,
@@ -3262,6 +3347,24 @@ fn case_39_evidence_next_step_owner_link_without_promotion()
             dimensions: &[],
             external_review_refs: &[],
             policy: &policy,
+            compiled_view_ref: &extra39.compiled_view_ref,
+            context_compiler_revision: extra39.context_compiler_revision.as_str(),
+            render_profile_revision: extra39.render_profile_revision.as_str(),
+            stable_harness_refs: empty_refs39,
+            task_family_harness_refs: empty_refs39,
+            skill_refs: empty_refs39,
+            memory_refs: empty_refs39,
+            procedure_refs: empty_refs39,
+            preserved_success_ref: None,
+            eligibility_and_retrieval_reason: None,
+            retrieval: &extra39.retrieval,
+            delivery: &extra39.delivery,
+            activation: &extra39.activation,
+            adherence: &extra39.adherence,
+            conflicts_suppression_or_compaction_loss: empty_refs39,
+            downstream_refs: empty_refs39,
+            receipt_completeness_and_missing_fields: empty_strings39,
+            invalidation_expiry_and_missingness: empty_strings39,
         })?;
     let AssessmentResultOrIncomplete::Incomplete(incomplete) = outcome else {
         return Err("expected incomplete".into());

@@ -32,6 +32,14 @@ serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 thiserror = "2.0.18"
 wasmparser = "0.256.0"
 
+# Host-only composition: the governed native path threads the live
+# Governor issuance and registries and must never enter the guest closure.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eliot-context-assembly = { path = "../eliot-context-assembly", version = "0.1.0" }
+eliot-governor = { path = "../../governor/eliot-governor", version = "0.1.0" }
+eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
+time = { version = "0.3.44", features = ["serde", "formatting", "parsing"] }
+
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }
 eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }

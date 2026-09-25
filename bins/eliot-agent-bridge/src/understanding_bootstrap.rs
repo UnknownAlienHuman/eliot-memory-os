@@ -156,6 +156,43 @@ pub struct BootstrapContext {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub governance: GovernanceEvidence,
+    /// Workspace instance identity carried from the canonical receipt.
+    ///
+    /// Opaque owner handle identifying the exact workspace instance the
+    /// receipt was compiled for (I4.4.1 `repository_lineage_and_workspace_
+    /// instance`). Carried verbatim so a changed worktree stays
+    /// representable in the projection; instance agreement itself is
+    /// enforced by the Governor compiler and the attach seal, never by
+    /// parsing this handle at the bridge.
+    #[serde(default)]
+    pub workspace_instance_ref: String,
+    /// Projection source identity carried from the canonical receipt.
+    ///
+    /// Opaque owner handle naming the source whose generation below was
+    /// observed; carried verbatim, never parsed.
+    #[serde(default)]
+    pub projection_source_ref: String,
+    /// Projection generation carried from the canonical receipt.
+    ///
+    /// Zero when an older producer did not state one; carried verbatim so
+    /// projection lag stays representable. Freshness adjudication stays
+    /// with the Governor readiness owner.
+    #[serde(default)]
+    pub projection_generation: u64,
+    /// Selected qualified route profile reference (opaque owner handle).
+    ///
+    /// Carried so the default bootstrap preserves the route profile the
+    /// Decision Safety Floor below was selected under; the bridge never
+    /// qualifies a route itself.
+    #[serde(default)]
+    pub route_profile_ref: String,
+    /// Decision Safety Floor member handles carried in default output.
+    ///
+    /// Opaque owner handles (bounded like governance evidence); full floor
+    /// content stays behind explicit expansion. Presence is not invented:
+    /// an empty list projects no floor rather than a forged one.
+    #[serde(default)]
+    pub decision_safety_floor_refs: Vec<String>,
     #[serde(default)]
     pub supported_count: u32,
     #[serde(default)]
@@ -165,6 +202,71 @@ pub struct BootstrapContext {
     #[serde(default)]
     pub conflicts_unknowns: Vec<String>,
     pub next_safe_expansion: String,
+}
+
+impl BootstrapContext {
+    /// Ref-bound projection constructor over the canonical
+    /// `OnboardingReadinessReceipt` (I4.4.1).
+    ///
+    /// The canonical readiness decision stays with the receipt; this only
+    /// carries its reference (`receipt_ref` -> `onboarding_readiness_ref`) and
+    /// passes the disposition through unchanged. It can never invent
+    /// readiness: the assessment is capped later by [`cap_assessment`] in
+    /// [`get_understanding_bootstrap`]. Fails closed via `validate_context`
+    /// on blank/unbounded refs and handles (reuse of `non_blank` /
+    /// `bounded_list` codes such as `READINESS_REF_MISSING`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_receipt(
+        receipt_ref: String,
+        principal_ref: String,
+        profile_ref: String,
+        workscope_ref: String,
+        onboarding_disposition: ReadinessDisposition,
+        revision_refs: Vec<String>,
+        orientation_handles: Vec<String>,
+        attention_handles: Vec<String>,
+        problem_handles: Vec<String>,
+        role_lease_ref: String,
+        state_fence_ref: String,
+        governance: GovernanceEvidence,
+        route_profile_ref: String,
+        decision_safety_floor_refs: Vec<String>,
+        workspace_instance_ref: String,
+        projection_source_ref: String,
+        projection_generation: u64,
+        supported_count: u32,
+        verified_count: u32,
+        candidate_count: u32,
+        conflicts_unknowns: Vec<String>,
+        next_safe_expansion: String,
+    ) -> Result<Self, BootstrapError> {
+        let context = Self {
+            principal_ref,
+            profile_ref,
+            workscope_ref,
+            onboarding_readiness_ref: receipt_ref,
+            onboarding_disposition,
+            revision_refs,
+            orientation_handles,
+            attention_handles,
+            problem_handles,
+            role_lease_ref,
+            state_fence_ref,
+            governance,
+            route_profile_ref,
+            decision_safety_floor_refs,
+            workspace_instance_ref,
+            projection_source_ref,
+            projection_generation,
+            supported_count,
+            verified_count,
+            candidate_count,
+            conflicts_unknowns,
+            next_safe_expansion,
+        };
+        validate_context(&context)?;
+        Ok(context)
+    }
 }
 
 /// Selected task identity with its exact revision.
@@ -205,6 +307,18 @@ pub struct UnderstandingBootstrap {
     pub role_lease_ref: String,
     pub state_fence_ref: String,
     pub current_assessment: CurrentAssessment,
+    /// Workspace instance identity projected from the composed context.
+    #[serde(default)]
+    pub workspace_instance_ref: String,
+    /// Projection source identity projected from the composed context.
+    #[serde(default)]
+    pub projection_source_ref: String,
+    /// Projection generation projected from the composed context.
+    #[serde(default)]
+    pub projection_generation: u64,
+    pub route_profile_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_safety_floor_refs: Vec<String>,
     pub supported_count: u32,
     pub verified_count: u32,
     pub candidate_count: u32,
@@ -300,6 +414,41 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
     bounded_list(&context.attention_handles, "ATTENTION_BOUND", MAX_HANDLES)?;
     bounded_list(&context.problem_handles, "PROBLEMS_BOUND", MAX_HANDLES)?;
     bounded_list(&context.conflicts_unknowns, "CONFLICTS_BOUND", MAX_HANDLES)?;
+    if context.route_profile_ref.len() > MAX_HANDLE_LEN {
+        return Err(BootstrapError::new(
+            "ROUTE_PROFILE_BOUND",
+            "route profile reference exceeds bound",
+        ));
+    }
+    if !context.route_profile_ref.is_empty() {
+        non_blank(&context.route_profile_ref, "ROUTE_PROFILE_MISSING")?;
+    }
+    if context.workspace_instance_ref.len() > MAX_HANDLE_LEN {
+        return Err(BootstrapError::new(
+            "WORKSPACE_INSTANCE_BOUND",
+            "workspace instance reference exceeds bound",
+        ));
+    }
+    if !context.workspace_instance_ref.is_empty() {
+        non_blank(
+            &context.workspace_instance_ref,
+            "WORKSPACE_INSTANCE_MISSING",
+        )?;
+    }
+    if context.projection_source_ref.len() > MAX_HANDLE_LEN {
+        return Err(BootstrapError::new(
+            "PROJECTION_SOURCE_BOUND",
+            "projection source reference exceeds bound",
+        ));
+    }
+    if !context.projection_source_ref.is_empty() {
+        non_blank(&context.projection_source_ref, "PROJECTION_SOURCE_MISSING")?;
+    }
+    bounded_list(
+        &context.decision_safety_floor_refs,
+        "FLOOR_BOUND",
+        MAX_EVIDENCE_HANDLES,
+    )?;
     validate_governance(&context.governance)
 }
 
@@ -412,6 +561,19 @@ fn bind_authoritative(
             "authoritative selection target carries no exact task revision; refusing to bind",
         ));
     };
+    if revision == 0 {
+        return Err(BootstrapError::new(
+            "SELECTION_REVISION_MISSING",
+            "authoritative selection target carries a zero task revision, not a current TaskContract revision; refusing to bind",
+        ));
+    }
+    let Some(acceptance_digest) = matched.acceptance_digest.clone() else {
+        return Err(BootstrapError::new(
+            "SELECTION_ACCEPTANCE_MISSING",
+            "authoritative selection target carries no acceptance digest; refusing to bind",
+        ));
+    };
+    non_blank(&acceptance_digest, "SELECTION_ACCEPTANCE_MISSING")?;
     Ok(TaskSelectionView {
         disposition: TaskSelectionDisposition::Bound,
         scope_level: tasks.scope_level,
@@ -420,7 +582,7 @@ fn bind_authoritative(
             task_ref: matched.handle.clone(),
             task_revision: revision,
         }),
-        acceptance_digest: matched.acceptance_digest.clone(),
+        acceptance_digest: Some(acceptance_digest),
         selection_source_and_reason: format!("{}: {}", selection.source, selection.reason),
         contamination_flags,
     })
@@ -462,6 +624,19 @@ fn bind_uncontended(
             "sole candidate carries no exact task revision; refusing to bind",
         ));
     };
+    if revision == 0 {
+        return Err(BootstrapError::new(
+            "SELECTION_REVISION_MISSING",
+            "sole candidate carries a zero task revision, not a current TaskContract revision; refusing to bind",
+        ));
+    }
+    let Some(acceptance_digest) = only.acceptance_digest.clone() else {
+        return Err(BootstrapError::new(
+            "SELECTION_ACCEPTANCE_MISSING",
+            "sole candidate carries no acceptance digest; refusing to bind",
+        ));
+    };
+    non_blank(&acceptance_digest, "SELECTION_ACCEPTANCE_MISSING")?;
     Ok(TaskSelectionView {
         disposition: TaskSelectionDisposition::Unique,
         scope_level: tasks.scope_level,
@@ -470,7 +645,7 @@ fn bind_uncontended(
             task_ref: only.handle.clone(),
             task_revision: revision,
         }),
-        acceptance_digest: only.acceptance_digest.clone(),
+        acceptance_digest: Some(acceptance_digest),
         selection_source_and_reason: "single eligible candidate; no choice made".to_owned(),
         contamination_flags,
     })
@@ -502,8 +677,13 @@ fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, B
 ///
 /// Validates the supplied context and task inputs, computes the deterministic
 /// task-selection disposition, and caps the assessment at the referenced
-/// canonical readiness. Fails closed whenever governance evidence, identity,
-/// revisions, or selection integrity are missing.
+/// canonical readiness. A host-authored readiness enum is not task authority:
+/// without a bound task (`NONE`/`AMBIGUOUS`) the projection reports
+/// `NOT_ONBOARDED` even when the referenced disposition claims material
+/// readiness, so a forged `READY_MATERIAL` with no task can never project
+/// `READY` (I4.4.1: `READY_MATERIAL` is always tied to one `TaskContract`
+/// revision). Fails closed whenever governance evidence, identity,
+/// revisions, acceptance, or selection integrity are missing.
 pub fn get_understanding_bootstrap(
     context: &BootstrapContext,
     tasks: &BootstrapTaskInputs,
@@ -514,6 +694,16 @@ pub fn get_understanding_bootstrap(
     let task_selection = compose_selection(tasks)?;
     let mut relevant_handles = context.orientation_handles.clone();
     relevant_handles.truncate(MAX_HANDLES);
+    // Без привязанной задачи готовности нет: проекция не вправе подтверждать
+    // READY по чужому слову хозяина входных данных.
+    let current_assessment = match task_selection.disposition {
+        TaskSelectionDisposition::Bound | TaskSelectionDisposition::Unique => {
+            cap_assessment(context.onboarding_disposition, requested_assessment)
+        }
+        TaskSelectionDisposition::Ambiguous | TaskSelectionDisposition::None => {
+            CurrentAssessment::NotOnboarded
+        }
+    };
     Ok(UnderstandingBootstrap {
         onboarding_readiness_ref: context.onboarding_readiness_ref.clone(),
         onboarding_readiness_disposition: context.onboarding_disposition,
@@ -523,7 +713,12 @@ pub fn get_understanding_bootstrap(
         task_selection,
         role_lease_ref: context.role_lease_ref.clone(),
         state_fence_ref: context.state_fence_ref.clone(),
-        current_assessment: cap_assessment(context.onboarding_disposition, requested_assessment),
+        current_assessment,
+        workspace_instance_ref: context.workspace_instance_ref.clone(),
+        projection_source_ref: context.projection_source_ref.clone(),
+        projection_generation: context.projection_generation,
+        route_profile_ref: context.route_profile_ref.clone(),
+        decision_safety_floor_refs: context.decision_safety_floor_refs.clone(),
         supported_count: context.supported_count,
         verified_count: context.verified_count,
         candidate_count: context.candidate_count,
@@ -603,6 +798,14 @@ mod tests {
             role_lease_ref: "role-lease-1".to_owned(),
             state_fence_ref: "fence-epoch-3-gen-7".to_owned(),
             governance: fixture_governance(),
+            route_profile_ref: "route-profile-constrained-1".to_owned(),
+            decision_safety_floor_refs: vec![
+                "floor:goal-scope-authority".to_owned(),
+                "floor:task-selection-proof".to_owned(),
+            ],
+            workspace_instance_ref: "instance:a".to_owned(),
+            projection_source_ref: "projection-source-1".to_owned(),
+            projection_generation: 9,
             supported_count: 4,
             verified_count: 3,
             candidate_count: 1,
@@ -633,7 +836,12 @@ mod tests {
         let first = session
             .take_auto_boot(&context, &tasks, CurrentAssessment::Ready)
             .expect("first response must carry the bootstrap");
-        assert_eq!(first.current_assessment, CurrentAssessment::Ready);
+        // No task bound: a host-authored READY_MATERIAL must not project READY.
+        assert_eq!(
+            first.task_selection.disposition,
+            TaskSelectionDisposition::None
+        );
+        assert_eq!(first.current_assessment, CurrentAssessment::NotOnboarded);
         assert_eq!(first.governance.profile_ref, "governance-profile-1");
         assert_eq!(first.governance.profile_revision, "rev-7");
         assert!(!first.governance.limiting_integration_evidence.is_empty());
@@ -674,6 +882,11 @@ mod tests {
             "ambiguous selection must choose no task",
         );
         assert!(bootstrap.task_selection.acceptance_digest.is_none());
+        assert_eq!(
+            bootstrap.current_assessment,
+            CurrentAssessment::NotOnboarded,
+            "ambiguous selection must never project READY",
+        );
     }
 
     #[test]
@@ -838,7 +1051,110 @@ mod tests {
         let read_only = fixture_context(ReadinessDisposition::ReadyReadOnly);
         let capped = get_understanding_bootstrap(&read_only, &tasks, CurrentAssessment::Ready)
             .expect("composition must succeed");
-        assert_eq!(capped.current_assessment, CurrentAssessment::Degraded);
+        // No task bound, so even read-only readiness cannot project past
+        // NOT_ONBOARDED: task selection is the readiness floor.
+        assert_eq!(capped.current_assessment, CurrentAssessment::NotOnboarded);
+    }
+
+    #[test]
+    fn unbound_or_defective_selection_never_reports_ready() {
+        let forged = fixture_context(ReadinessDisposition::ReadyMaterial);
+        let no_tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        let none = get_understanding_bootstrap(&forged, &no_tasks, CurrentAssessment::Ready)
+            .expect("composition must succeed");
+        assert_eq!(
+            none.task_selection.disposition,
+            TaskSelectionDisposition::None
+        );
+        assert_eq!(none.current_assessment, CurrentAssessment::NotOnboarded);
+
+        let ambiguous_tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Project,
+            candidates: (0..2).map(eligible_task).collect(),
+            authoritative_selection: None,
+        };
+        let ambiguous =
+            get_understanding_bootstrap(&forged, &ambiguous_tasks, CurrentAssessment::Ready)
+                .expect("composition must succeed");
+        assert_eq!(
+            ambiguous.task_selection.disposition,
+            TaskSelectionDisposition::Ambiguous
+        );
+        assert_eq!(
+            ambiguous.current_assessment,
+            CurrentAssessment::NotOnboarded
+        );
+
+        let zero_revision = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Task,
+            candidates: vec![TaskCandidate {
+                handle: "task-zero".to_owned(),
+                task_revision: Some(0),
+                acceptance_digest: Some("d".repeat(64)),
+                prior_evaluation_candidate_only: false,
+                independent_binding_supplied: true,
+            }],
+            authoritative_selection: None,
+        };
+        let error = get_understanding_bootstrap(&forged, &zero_revision, CurrentAssessment::Ready)
+            .expect_err("zero task revision must fail closed");
+        assert_eq!(error.code, "SELECTION_REVISION_MISSING");
+
+        let missing_acceptance = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Task,
+            candidates: vec![TaskCandidate {
+                handle: "task-noaccept".to_owned(),
+                task_revision: Some(3),
+                acceptance_digest: None,
+                prior_evaluation_candidate_only: false,
+                independent_binding_supplied: true,
+            }],
+            authoritative_selection: None,
+        };
+        let error =
+            get_understanding_bootstrap(&forged, &missing_acceptance, CurrentAssessment::Ready)
+                .expect_err("missing acceptance digest must fail closed");
+        assert_eq!(error.code, "SELECTION_ACCEPTANCE_MISSING");
+
+        let forged_authoritative = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Project,
+            candidates: vec![TaskCandidate {
+                handle: "task-forged".to_owned(),
+                task_revision: Some(0),
+                acceptance_digest: None,
+                prior_evaluation_candidate_only: false,
+                independent_binding_supplied: true,
+            }],
+            authoritative_selection: Some(AuthoritativeSelection {
+                selected_handle: "task-forged".to_owned(),
+                reason: "host claim".to_owned(),
+                source: "host-input".to_owned(),
+            }),
+        };
+        get_understanding_bootstrap(&forged, &forged_authoritative, CurrentAssessment::Ready)
+            .expect_err("authoritative pick without revision and acceptance must fail closed");
+
+        // A genuine bound task keeps its exact owner-supplied binding and READY.
+        let genuine = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Project,
+            candidates: vec![eligible_task(4)],
+            authoritative_selection: Some(AuthoritativeSelection {
+                selected_handle: "task-4".to_owned(),
+                reason: "governor work assignment".to_owned(),
+                source: "governor-ledger-4".to_owned(),
+            }),
+        };
+        let bound = get_understanding_bootstrap(&forged, &genuine, CurrentAssessment::Ready)
+            .expect("genuine binding must compose");
+        assert_eq!(
+            bound.task_selection.disposition,
+            TaskSelectionDisposition::Bound
+        );
+        assert_eq!(bound.current_assessment, CurrentAssessment::Ready);
     }
 
     #[test]
@@ -853,5 +1169,81 @@ mod tests {
         let error = get_understanding_bootstrap(&context, &tasks, CurrentAssessment::Ready)
             .expect_err("bootstrap without limiting integration evidence must fail");
         assert_eq!(error.code, "GOVERNANCE_EVIDENCE_MISSING");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_receipt_with(
+        receipt_ref: &str,
+        disposition: ReadinessDisposition,
+    ) -> Result<BootstrapContext, BootstrapError> {
+        BootstrapContext::from_receipt(
+            receipt_ref.to_owned(),
+            "principal-1".to_owned(),
+            "SPINE_FUNCTIONAL".to_owned(),
+            "workscope-1".to_owned(),
+            disposition,
+            vec!["source-gen-9".to_owned()],
+            vec!["orientation:project".to_owned()],
+            vec!["attention:conflict-1".to_owned()],
+            vec!["problem:stale-proof".to_owned()],
+            "role-lease-1".to_owned(),
+            "fence-epoch-3-gen-7".to_owned(),
+            fixture_governance(),
+            "route-profile-constrained-1".to_owned(),
+            vec![
+                "floor:goal-scope-authority".to_owned(),
+                "floor:task-selection-proof".to_owned(),
+            ],
+            "instance:a".to_owned(),
+            "projection-source-1".to_owned(),
+            9,
+            4,
+            3,
+            1,
+            Vec::new(),
+            "bind task before material effects".to_owned(),
+        )
+    }
+
+    #[test]
+    fn from_receipt_carries_canonical_ref_and_caps_assessment() {
+        let tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        let ready = from_receipt_with("readiness-receipt-1", ReadinessDisposition::ReadyMaterial)
+            .expect("ref-bound construction must succeed");
+        assert_eq!(ready.onboarding_readiness_ref, "readiness-receipt-1");
+        assert_eq!(
+            ready.onboarding_disposition,
+            ReadinessDisposition::ReadyMaterial
+        );
+        let bootstrap = get_understanding_bootstrap(&ready, &tasks, CurrentAssessment::Ready)
+            .expect("composition must succeed");
+        assert_eq!(bootstrap.onboarding_readiness_ref, "readiness-receipt-1");
+        // Referenced READY_MATERIAL with no bound task is not task authority:
+        // the projection reports the disposition but withholds READY.
+        assert_eq!(
+            bootstrap.onboarding_readiness_disposition,
+            ReadinessDisposition::ReadyMaterial
+        );
+        assert_eq!(
+            bootstrap.current_assessment,
+            CurrentAssessment::NotOnboarded
+        );
+
+        let gated = from_receipt_with("readiness-receipt-2", ReadinessDisposition::NeedsTask)
+            .expect("ref-bound construction must succeed");
+        let capped = get_understanding_bootstrap(&gated, &tasks, CurrentAssessment::Ready)
+            .expect("composition must succeed");
+        assert_eq!(capped.current_assessment, CurrentAssessment::NotOnboarded);
+    }
+
+    #[test]
+    fn from_receipt_blank_ref_fails_closed() {
+        let error = from_receipt_with("", ReadinessDisposition::ReadyMaterial)
+            .expect_err("blank receipt ref must fail closed");
+        assert_eq!(error.code, "READINESS_REF_MISSING");
     }
 }

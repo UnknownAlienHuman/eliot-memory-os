@@ -121,10 +121,10 @@ impl SwarmCommandCallerBinding {
         if self.view_revision != self.expected_view_revision {
             return Err(SwarmCommandCandidateError::StaleView);
         }
-        if self.view_fence.validate().is_err()
-            || self.expected_view_fence.validate().is_err()
-        {
-            return Err(SwarmCommandCandidateError::InvalidField("command.view_fence"));
+        if self.view_fence.validate().is_err() || self.expected_view_fence.validate().is_err() {
+            return Err(SwarmCommandCandidateError::InvalidField(
+                "command.view_fence",
+            ));
         }
         if !fences_match_exact(&self.view_fence, &self.expected_view_fence) {
             return Err(SwarmCommandCandidateError::StaleView);
@@ -217,7 +217,9 @@ impl LaunchRoleBinding {
         }
         validate_text(&self.entry_id, "command.routes.entry_id")?;
         validate_canonical_digest(&self.selection_digest, "command.routes.selection_digest")
-            .map_err(|_| SwarmCommandCandidateError::InvalidField("command.routes.selection_digest"))
+            .map_err(|_| {
+                SwarmCommandCandidateError::InvalidField("command.routes.selection_digest")
+            })
     }
 }
 
@@ -262,13 +264,9 @@ fn validate_refresh_payload(
     catalogue_digest_value: &str,
     reason: &str,
 ) -> Result<(), SwarmCommandCandidateError> {
-    validate_text(
-        catalogue_snapshot_id,
-        "command.catalogue_snapshot_id",
-    )?;
-    validate_canonical_digest(catalogue_digest_value, "command.catalogue_digest").map_err(
-        |_| SwarmCommandCandidateError::InvalidField("command.catalogue_digest"),
-    )?;
+    validate_text(catalogue_snapshot_id, "command.catalogue_snapshot_id")?;
+    validate_canonical_digest(catalogue_digest_value, "command.catalogue_digest")
+        .map_err(|_| SwarmCommandCandidateError::InvalidField("command.catalogue_digest"))?;
     validate_text(reason, "command.reason")
 }
 
@@ -280,13 +278,9 @@ fn validate_replace_payload(
 ) -> Result<(), SwarmCommandCandidateError> {
     validate_text(preference_policy_id, "command.preference_policy_id")?;
     validate_text(preference_revision, "command.preference_revision")?;
-    validate_canonical_digest(
-        expected_digest,
-        "command.preference_policy_digest",
-    )
-    .map_err(|_| {
-        SwarmCommandCandidateError::InvalidField("command.preference_policy_digest")
-    })?;
+    validate_canonical_digest(expected_digest, "command.preference_policy_digest").map_err(
+        |_| SwarmCommandCandidateError::InvalidField("command.preference_policy_digest"),
+    )?;
     policy.validate()?;
     if policy.policy_id != *preference_policy_id || policy.revision != *preference_revision {
         return Err(SwarmCommandCandidateError::InvalidField(
@@ -311,26 +305,13 @@ fn validate_launch_identities(
 ) -> Result<(), SwarmCommandCandidateError> {
     validate_text(task_id, "command.task_id")?;
     validate_text(plan_revision, "command.plan_revision")?;
-    validate_text(
-        catalogue_snapshot_id,
-        "command.catalogue_snapshot_id",
-    )?;
-    validate_canonical_digest(
-        catalogue_digest_value,
-        "command.catalogue_digest",
-    )
-    .map_err(|_| {
-        SwarmCommandCandidateError::InvalidField("command.catalogue_digest")
-    })?;
+    validate_text(catalogue_snapshot_id, "command.catalogue_snapshot_id")?;
+    validate_canonical_digest(catalogue_digest_value, "command.catalogue_digest")
+        .map_err(|_| SwarmCommandCandidateError::InvalidField("command.catalogue_digest"))?;
     validate_text(preference_policy_id, "command.preference_policy_id")?;
     validate_text(preference_revision, "command.preference_revision")?;
-    validate_canonical_digest(
-        policy_digest_value,
-        "command.preference_policy_digest",
-    )
-    .map_err(|_| {
-        SwarmCommandCandidateError::InvalidField("command.preference_policy_digest")
-    })
+    validate_canonical_digest(policy_digest_value, "command.preference_policy_digest")
+        .map_err(|_| SwarmCommandCandidateError::InvalidField("command.preference_policy_digest"))
 }
 
 fn validate_launch_routes(
@@ -343,8 +324,7 @@ fn validate_launch_routes(
     if !demand.is_sorted() || has_duplicates(demand) {
         return Err(SwarmCommandCandidateError::InvalidField("command.demand"));
     }
-    if !routes.is_sorted_by_key(|route| route.role)
-        || has_duplicates_by(routes, |route| route.role)
+    if !routes.is_sorted_by_key(|route| route.role) || has_duplicates_by(routes, |route| route.role)
     {
         return Err(SwarmCommandCandidateError::InvalidField("command.routes"));
     }
@@ -367,9 +347,8 @@ fn validate_cancel_payload(
     reason: &str,
 ) -> Result<(), SwarmCommandCandidateError> {
     validate_text(selection_id, "command.selection_id")?;
-    validate_canonical_digest(selection_digest, "command.selection_digest").map_err(|_| {
-        SwarmCommandCandidateError::InvalidField("command.selection_digest")
-    })?;
+    validate_canonical_digest(selection_digest, "command.selection_digest")
+        .map_err(|_| SwarmCommandCandidateError::InvalidField("command.selection_digest"))?;
     validate_text(reason, "command.reason")
 }
 
@@ -513,18 +492,23 @@ impl SwarmCommandCandidate {
             return Err(SwarmCommandCandidateError::MissingCapability);
         }
         validate_text(&self.view_revision, "command.view_revision")?;
-        validate_canonical_digest(&self.command_digest, "command.command_digest").map_err(
-            |_| SwarmCommandCandidateError::InvalidField("command.command_digest"),
-        )?;
+        validate_canonical_digest(&self.command_digest, "command.command_digest")
+            .map_err(|_| SwarmCommandCandidateError::InvalidField("command.command_digest"))?;
         if self.view_fence.validate().is_err() {
-            return Err(SwarmCommandCandidateError::InvalidField("command.view_fence"));
+            return Err(SwarmCommandCandidateError::InvalidField(
+                "command.view_fence",
+            ));
         }
         self.kind.validate()?;
         if !self.candidate_only || self.dispatch_authority {
-            return Err(SwarmCommandCandidateError::InvalidField("command.authority"));
+            return Err(SwarmCommandCandidateError::InvalidField(
+                "command.authority",
+            ));
         }
         if self.execution != ZeroModelExecutionCounters::zero() {
-            return Err(SwarmCommandCandidateError::InvalidField("command.execution"));
+            return Err(SwarmCommandCandidateError::InvalidField(
+                "command.execution",
+            ));
         }
         if self.command_digest != self.digest()? {
             return Err(SwarmCommandCandidateError::InvalidField(
@@ -617,7 +601,9 @@ fn canonical_demand(demand: &[ModelRole]) -> Result<Vec<ModelRole>, SwarmCommand
     canonical.sort();
     canonical.dedup();
     if canonical.len() != demand.len() {
-        return Err(SwarmCommandCandidateError::DuplicateIdentity("command.demand"));
+        return Err(SwarmCommandCandidateError::DuplicateIdentity(
+            "command.demand",
+        ));
     }
     Ok(canonical)
 }

@@ -238,6 +238,186 @@ impl MetricObservation {
     }
 }
 
+/// Retrieval disposition for one activation attempt. Orthogonal to delivery,
+/// observable activation, adherence and outcome; never a success ladder rung.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RetrievalStatus {
+    /// Surface was not eligible for this attempt.
+    NotEligible,
+    /// Eligible but not retrieved.
+    EligibleNotRetrieved,
+    /// Retrieved as compiled.
+    Retrieved,
+    /// Retrieved with expansion or tool-query augmentation.
+    Expanded,
+    /// Retrieval state is missing or inconclusive; never presumed.
+    Unknown,
+}
+
+impl RetrievalStatus {
+    /// Stable wire spelling used for logs and duplicate detection.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEligible => "NOT_ELIGIBLE",
+            Self::EligibleNotRetrieved => "ELIGIBLE_NOT_RETRIEVED",
+            Self::Retrieved => "RETRIEVED",
+            Self::Expanded => "EXPANDED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// Delivery disposition for one activation attempt. Orthogonal to retrieval,
+/// observable activation, adherence and outcome.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DeliveryStatus {
+    /// Compiled surface was not delivered.
+    NotDelivered,
+    /// Delivered in full.
+    Full,
+    /// Delivered partially.
+    Partial,
+    /// Delivery record is missing.
+    Missing,
+}
+
+impl DeliveryStatus {
+    /// Stable wire spelling used for logs and duplicate detection.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDelivered => "NOT_DELIVERED",
+            Self::Full => "FULL",
+            Self::Partial => "PARTIAL",
+            Self::Missing => "MISSING",
+        }
+    }
+}
+
+/// Observable-activation disposition for one attempt. An acknowledgement is a
+/// delivery/attention signal only and never substitutes for the first
+/// qualifying observable use ref. Missing or inconclusive observability
+/// remains `Unknown`, never presumed compliance or non-use.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivationStatus {
+    /// Activation was not assessed (e.g. observation out of scope).
+    NotAssessed,
+    /// No qualifying activation evidence was observed; does not prove non-use.
+    NotObserved,
+    /// Qualifying observable activation was evidenced.
+    Observed,
+    /// Observability is missing or inconclusive; never presumed compliance.
+    Unknown,
+}
+
+impl ActivationStatus {
+    /// Stable wire spelling used for logs and duplicate detection.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAssessed => "NOT_ASSESSED",
+            Self::NotObserved => "NOT_OBSERVED",
+            Self::Observed => "OBSERVED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// Adherence disposition for one attempt. Orthogonal to retrieval, delivery
+/// and observable activation. Missing or inconclusive observability remains
+/// `Unknown`, never presumed compliance.
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AdherenceStatus {
+    /// Adherence was not assessed.
+    NotAssessed,
+    /// Observed use followed the prescription.
+    ObservedFollowed,
+    /// Observed use partially followed the prescription.
+    ObservedPartial,
+    /// Observed use violated the prescription.
+    ObservedViolated,
+    /// Observability is missing or inconclusive; never presumed compliance.
+    Unknown,
+}
+
+impl AdherenceStatus {
+    /// Stable wire spelling used for logs and duplicate detection.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAssessed => "NOT_ASSESSED",
+            Self::ObservedFollowed => "OBSERVED_FOLLOWED",
+            Self::ObservedPartial => "OBSERVED_PARTIAL",
+            Self::ObservedViolated => "OBSERVED_VIOLATED",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// Retrieval evidence for one activation attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalSection {
+    /// Retrieval disposition; orthogonal to delivery/activation/adherence.
+    pub status: RetrievalStatus,
+    /// Expansion or tool-query refs backing an `Expanded` retrieval.
+    pub expansion_or_tool_query_refs: Vec<ArtifactId>,
+}
+
+/// Delivery evidence for one activation attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliverySection {
+    /// Delivery disposition; orthogonal to retrieval/activation/adherence.
+    pub status: DeliveryStatus,
+    /// Position of the delivered packet, when known.
+    pub packet_position: Option<u64>,
+    /// Serialized digest of the delivered packet, when known.
+    pub serialized_digest: Option<String>,
+    /// Serialized byte size of the delivered packet, when known.
+    pub bytes: Option<u64>,
+    /// Actual billed/measured tokens of the delivered packet, when known.
+    pub actual_tokens: Option<u64>,
+}
+
+/// Observable-activation evidence for one attempt. Receipt existence never
+/// implies delivery, use, adherence or benefit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationSection {
+    /// Activation disposition; `NotObserved` does not prove non-use.
+    pub status: ActivationStatus,
+    /// Delivery/attention signal only; never substitutes for
+    /// `first_qualifying_observable_use_ref`.
+    pub acknowledgement_ref: Option<ArtifactId>,
+    /// Why observation was limited, when applicable.
+    pub observation_limit_reason: Option<String>,
+    /// First qualifying observable use; required when `status` is `Observed`.
+    pub first_qualifying_observable_use_ref: Option<ArtifactId>,
+}
+
+/// Adherence evidence for one attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdherenceSection {
+    /// Adherence disposition; `Unknown` is never presumed compliance.
+    pub status: AdherenceStatus,
+    /// Early/mid/final checkpoint refs backing an observed disposition.
+    pub early_mid_final_checkpoint_refs: Vec<ArtifactId>,
+    /// Prescribed-or-avoided action and required verifier refs backing an
+    /// observed disposition.
+    pub prescribed_or_avoided_action_and_required_verifier_refs: Vec<ArtifactId>,
+}
+
 /// Observation-only activation receipt candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -270,12 +450,49 @@ pub struct HarnessActivationReceiptCandidate {
     pub confounders: Vec<ArtifactId>,
     /// Whether evaluator/source independence was evidenced.
     pub independent_evaluator_receipt: Option<ArtifactId>,
+    /// Full compiled-from campaign learning state view ref.
+    pub compiled_view_ref: ArtifactId,
+    /// Revision of the context compiler that rendered this attempt.
+    pub context_compiler_revision: String,
+    /// Revision of the render profile used for this attempt.
+    pub render_profile_revision: String,
+    /// Exact stable harness refs compiled into this attempt.
+    pub stable_harness_refs: Vec<ArtifactId>,
+    /// Task-family harness refs compiled into this attempt.
+    pub task_family_harness_refs: Vec<ArtifactId>,
+    /// Skill refs compiled into this attempt.
+    pub skill_refs: Vec<ArtifactId>,
+    /// Memory refs compiled into this attempt.
+    pub memory_refs: Vec<ArtifactId>,
+    /// Procedure refs compiled into this attempt.
+    pub procedure_refs: Vec<ArtifactId>,
+    /// Preserved success set or constraints ref, when one applies.
+    pub preserved_success_ref: Option<ArtifactId>,
+    /// Eligibility and retrieval reason for this attempt.
+    pub eligibility_and_retrieval_reason: Option<String>,
+    /// Retrieval evidence; orthogonal to delivery/activation/adherence.
+    pub retrieval: RetrievalSection,
+    /// Delivery evidence; orthogonal to retrieval/activation/adherence.
+    pub delivery: DeliverySection,
+    /// Observable-activation evidence; orthogonal to the other sections.
+    pub activation: ActivationSection,
+    /// Adherence evidence; orthogonal to the other sections.
+    pub adherence: AdherenceSection,
+    /// Conflict, suppression or compaction-loss refs for this attempt.
+    pub conflicts_suppression_or_compaction_loss: Vec<ArtifactId>,
+    /// Downstream decision, action, artifact and verifier refs.
+    pub downstream_decision_action_artifact_and_verifier_refs: Vec<ArtifactId>,
+    /// Receipt completeness notes and missing-field names.
+    pub receipt_completeness_and_missing_fields: Vec<String>,
+    /// Invalidation, expiry and missingness notes.
+    pub invalidation_expiry_and_missingness: Vec<String>,
     /// Canonical receipt candidate digest, excluding this field.
     pub canonical_digest: String,
 }
 
 impl HarnessActivationReceiptCandidate {
     /// Validate lineage and keep all lifecycle stages orthogonal.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), LearningContractError> {
         self.binding.validate()?;
         if self.activation_id.as_str().trim().is_empty() {
@@ -298,6 +515,121 @@ impl HarnessActivationReceiptCandidate {
         }
         self.overlay_id.validate()?;
         self.member_denominator.validate()?;
+        if self.compiled_view_ref.as_str().trim().is_empty() {
+            return Err(LearningContractError::Missing {
+                field: "activation.compiled_view_ref",
+            });
+        }
+        if self.context_compiler_revision.trim().is_empty() {
+            return Err(LearningContractError::Missing {
+                field: "activation.context_compiler_revision",
+            });
+        }
+        if self.render_profile_revision.trim().is_empty() {
+            return Err(LearningContractError::Missing {
+                field: "activation.render_profile_revision",
+            });
+        }
+        for (ids, field) in [
+            (
+                self.stable_harness_refs.as_slice(),
+                "activation.stable_harness_refs",
+            ),
+            (
+                self.task_family_harness_refs.as_slice(),
+                "activation.task_family_harness_refs",
+            ),
+            (self.skill_refs.as_slice(), "activation.skill_refs"),
+            (self.memory_refs.as_slice(), "activation.memory_refs"),
+            (self.procedure_refs.as_slice(), "activation.procedure_refs"),
+            (
+                self.conflicts_suppression_or_compaction_loss.as_slice(),
+                "activation.conflicts_suppression_or_compaction_loss",
+            ),
+            (
+                self.downstream_decision_action_artifact_and_verifier_refs
+                    .as_slice(),
+                "activation.downstream_decision_action_artifact_and_verifier_refs",
+            ),
+            (
+                self.retrieval.expansion_or_tool_query_refs.as_slice(),
+                "activation.retrieval.expansion_or_tool_query_refs",
+            ),
+            (
+                self.adherence.early_mid_final_checkpoint_refs.as_slice(),
+                "activation.adherence.early_mid_final_checkpoint_refs",
+            ),
+            (
+                self.adherence
+                    .prescribed_or_avoided_action_and_required_verifier_refs
+                    .as_slice(),
+                "activation.adherence.prescribed_or_avoided_action_and_required_verifier_refs",
+            ),
+        ] {
+            for id in ids {
+                if id.as_str().trim().is_empty() {
+                    return Err(LearningContractError::Missing { field });
+                }
+            }
+        }
+        if let Some(id) = &self.preserved_success_ref
+            && id.as_str().trim().is_empty()
+        {
+            return Err(LearningContractError::Missing {
+                field: "activation.preserved_success_ref",
+            });
+        }
+        if let Some(id) = &self.activation.acknowledgement_ref
+            && id.as_str().trim().is_empty()
+        {
+            return Err(LearningContractError::MissingOwnerEvidence {
+                field: "activation.acknowledgement_ref",
+            });
+        }
+        // An acknowledgement is a delivery/attention signal only and never
+        // substitutes for the first qualifying observable use ref.
+        if self.activation.status == ActivationStatus::Observed {
+            let qualifies = matches!(
+                &self.activation.first_qualifying_observable_use_ref,
+                Some(id)
+                    if !id.as_str().trim().is_empty()
+                        && Some(id) != self.activation.acknowledgement_ref.as_ref()
+            );
+            if !qualifies {
+                return Err(LearningContractError::MissingOwnerEvidence {
+                    field: "activation.first_qualifying_observable_use_ref",
+                });
+            }
+        } else if let Some(id) = &self.activation.first_qualifying_observable_use_ref
+            && id.as_str().trim().is_empty()
+        {
+            return Err(LearningContractError::MissingOwnerEvidence {
+                field: "activation.first_qualifying_observable_use_ref",
+            });
+        }
+        // Observed adherence dispositions require checkpoint and
+        // action/verifier evidence; UNKNOWN is never presumed compliance.
+        if matches!(
+            self.adherence.status,
+            AdherenceStatus::ObservedFollowed
+                | AdherenceStatus::ObservedPartial
+                | AdherenceStatus::ObservedViolated
+        ) {
+            if self.adherence.early_mid_final_checkpoint_refs.is_empty() {
+                return Err(LearningContractError::MissingOwnerEvidence {
+                    field: "activation.adherence.early_mid_final_checkpoint_refs",
+                });
+            }
+            if self
+                .adherence
+                .prescribed_or_avoided_action_and_required_verifier_refs
+                .is_empty()
+            {
+                return Err(LearningContractError::MissingOwnerEvidence {
+                    field: "activation.adherence.prescribed_or_avoided_action_and_required_verifier_refs",
+                });
+            }
+        }
         if self.stages.is_empty() {
             return Err(LearningContractError::Missing {
                 field: "activation.stages",
@@ -401,4 +733,147 @@ where
         }
     }
     Ok(())
+}
+
+/// Maximum governed reference length in bytes for one cross-task admission field.
+pub const CROSS_TASK_ADMISSION_REF_MAX_LEN: usize = 8192;
+
+/// Governed cross-task admission revalidating overlay scope for another campaign.
+///
+/// A `LOCAL_ADMITTED` overlay is ineligible outside its active campaign unless a
+/// new governed admission revalidates scope, authority, retention, evaluator,
+/// and rollback. Each reference is an owner-issued handle; this predicate only
+/// checks presence and bounds, never the referenced content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CrossTaskAdmission {
+    /// Revalidated scope handle for the requesting campaign.
+    pub scope_ref: String,
+    /// Revalidated authority handle for the requesting campaign.
+    pub authority_ref: String,
+    /// Revalidated retention handle for the requesting campaign.
+    pub retention_ref: String,
+    /// Revalidated evaluator handle for the requesting campaign.
+    pub evaluator_ref: String,
+    /// Revalidated rollback handle for the requesting campaign.
+    pub rollback_ref: String,
+}
+
+impl CrossTaskAdmission {
+    /// Validate that every revalidated reference is present and bounded.
+    pub fn validate(&self) -> Result<(), LearningContractError> {
+        for (value, field) in [
+            (self.scope_ref.as_str(), "cross_task_admission.scope_ref"),
+            (
+                self.authority_ref.as_str(),
+                "cross_task_admission.authority_ref",
+            ),
+            (
+                self.retention_ref.as_str(),
+                "cross_task_admission.retention_ref",
+            ),
+            (
+                self.evaluator_ref.as_str(),
+                "cross_task_admission.evaluator_ref",
+            ),
+            (
+                self.rollback_ref.as_str(),
+                "cross_task_admission.rollback_ref",
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(LearningContractError::Missing { field });
+            }
+            if value.len() > CROSS_TASK_ADMISSION_REF_MAX_LEN {
+                return Err(LearningContractError::Bound { field });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Eligibility of an overlay to influence a compatible attempt.
+///
+/// This is a pure predicate over already-observed flags: it never admits,
+/// activates, or carries over an overlay by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayEligibility {
+    /// The overlay may influence the requesting attempt.
+    Eligible,
+    /// The overlay must not influence the requesting attempt.
+    NotEligible {
+        /// Machine-stable reason for the denial.
+        reason: &'static str,
+    },
+}
+
+/// Decide whether an overlay may influence a compatible attempt before closure.
+///
+/// Before closure, only the exact non-expired `LOCAL_ADMITTED` overlay of the
+/// active campaign may influence a compatible attempt. Cross-task carryover
+/// requires a new governed admission that revalidates scope, authority,
+/// retention, evaluator, and rollback. Expiry invalidates influence; it does
+/// not silently retain the last behavior.
+///
+/// The checks run in order: invalidation, expiry, binding compatibility, then
+/// campaign scope. A same-campaign request accepts `None` or a valid
+/// admission; a cross-campaign request requires `Some` valid admission.
+pub fn overlay_eligibility(
+    overlay_campaign: &str,
+    requesting_campaign: &str,
+    invalidated: bool,
+    expires_at_ms: u64,
+    now_ms: u64,
+    binding_compatible: bool,
+    cross_task: Option<&CrossTaskAdmission>,
+) -> OverlayEligibility {
+    if invalidated {
+        return OverlayEligibility::NotEligible {
+            reason: "overlay_invalidated",
+        };
+    }
+    if expires_at_ms == 0 || now_ms >= expires_at_ms {
+        return OverlayEligibility::NotEligible {
+            reason: "overlay_expired",
+        };
+    }
+    if !binding_compatible {
+        return OverlayEligibility::NotEligible {
+            reason: "binding_incompatible",
+        };
+    }
+    if overlay_campaign.trim().is_empty() || requesting_campaign.trim().is_empty() {
+        return OverlayEligibility::NotEligible {
+            reason: "campaign_scope_missing",
+        };
+    }
+    if overlay_campaign == requesting_campaign {
+        match cross_task {
+            None => OverlayEligibility::Eligible,
+            Some(admission) => {
+                if admission.validate().is_ok() {
+                    OverlayEligibility::Eligible
+                } else {
+                    OverlayEligibility::NotEligible {
+                        reason: "cross_task_admission_invalid",
+                    }
+                }
+            }
+        }
+    } else {
+        match cross_task {
+            Some(admission) => {
+                if admission.validate().is_ok() {
+                    OverlayEligibility::Eligible
+                } else {
+                    OverlayEligibility::NotEligible {
+                        reason: "cross_task_admission_invalid",
+                    }
+                }
+            }
+            None => OverlayEligibility::NotEligible {
+                reason: "cross_task_admission_required",
+            },
+        }
+    }
 }

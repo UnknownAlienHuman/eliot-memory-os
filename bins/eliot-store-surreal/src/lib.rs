@@ -30,12 +30,16 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
-    StoreHealth, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
-    genesis_manifest, verify_canonical_request_hash,
+    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
+    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    ExactJsonBytes, IsolatedDestination, IsolatedRestorePort, IsolationEvidence, NamedReadRequest,
+    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
+    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage,
+    StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth, WriteReceipt,
+    decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
+    verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -79,6 +83,7 @@ use schema_bootstrap_contract::{
 pub use schema_bootstrap_contract::{
     StoreSchemaBootstrapCommand, StoreSchemaBootstrapError, StoreSchemaBootstrapReceipt,
 };
+mod backup_dispatch;
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
@@ -89,9 +94,9 @@ use request_dispatch::map_recovery_dispatch_result;
 use request_dispatch::{map_composition_error, map_genesis_dispatch_result};
 mod canonical_event;
 pub use canonical_event::{
-    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority, FencedProjectionPublication,
-    OrderingLink, ProjectionRebuildPlan, SemanticWritePath, ordering_link_hash,
-    request_projection_rebuild, request_rebuild_from_semantic_write,
+    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority,
+    FencedProjectionPublication, OrderingLink, ProjectionRebuildPlan, SemanticWritePath,
+    ordering_link_hash, request_projection_rebuild, request_rebuild_from_semantic_write,
 };
 mod connection_manager;
 pub use connection_manager::{
@@ -531,13 +536,13 @@ impl StoreComposition {
     ) -> Result<WriteReceipt, StoreCompositionError> {
         let authorities: Vec<Option<ExactJsonBytes>> =
             vec![None; transition.named_operations.len()];
-        self.apply_with_authority(
+        Box::pin(self.apply_with_authority(
             context,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             &authorities,
-        )
+        ))
         .await
     }
 
@@ -583,17 +588,15 @@ impl StoreComposition {
                 crate::task_binding_gate::map_rejection(&rejection),
             ));
         }
-        let outcome = self
-            .store
-            .apply_prepared_with_authority(
-                context,
-                transition,
-                expected_revision_heads,
-                expected_ordering_heads,
-                authorities,
-            )
-            .await
-            .map_err(map_adapter_error);
+        let outcome = Box::pin(self.store.apply_prepared_with_authority(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            authorities,
+        ))
+        .await
+        .map_err(map_adapter_error);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -627,6 +630,326 @@ impl StoreComposition {
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
         let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
+            .await
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Opens one bounded coherent snapshot capture through the sole canonical
+    /// backup path and returns the owner-issued handle (issue #975).
+    ///
+    /// Thin composition delegation cloning the `apply_reserved_write` shape:
+    /// the closed #950 begin request and transport context validate, the
+    /// fence pins to this composition, one bounded write slot is admitted,
+    /// and exactly one [`CanonicalSnapshotPort::begin_snapshot`] call runs.
+    /// The concrete port's explicit unimplemented result
+    /// (`Unavailable`/`UnknownOperation`) is preserved as a typed failure
+    /// with zero effects. No local state, lease, snapshot map, or alternate
+    /// persistence path.
+    pub async fn backup_begin(
+        &self,
+        context: &RequestMeta,
+        request: SnapshotBeginRequest,
+    ) -> Result<SnapshotHandle, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        request.validate().map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = CanonicalSnapshotPort::begin_snapshot(&self.store, context, request)
+            .await
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Reads one bounded page of an open capture under its owner-issued
+    /// consistency point (issue #975).
+    ///
+    /// Read-only observation on the bounded read set: exactly one
+    /// [`CanonicalSnapshotPort::read_snapshot_page`] call, never a write
+    /// slot. Page/handle binding and cumulative limits stay owned by the
+    /// #951 backend; this seam only validates, pins the fence, and maps.
+    pub async fn backup_page(
+        &self,
+        context: &RequestMeta,
+        handle: SnapshotHandle,
+        cursor: SnapshotCursor,
+    ) -> Result<SnapshotPage, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        handle.validate().map_err(StoreCompositionError::Store)?;
+        cursor.validate().map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Read)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome =
+            CanonicalSnapshotPort::read_snapshot_page(&self.store, context, handle, cursor)
+                .await
+                .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Read);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Closes one capture and issues its owner-issued end receipt
+    /// (issue #975).
+    ///
+    /// Same single-delegation shape as [`Self::backup_begin`]: exactly one
+    /// [`CanonicalSnapshotPort::end_snapshot`] call under one bounded write
+    /// slot. The unimplemented port refuses without effects.
+    pub async fn backup_end(
+        &self,
+        context: &RequestMeta,
+        handle: SnapshotHandle,
+    ) -> Result<SnapshotEndReceipt, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        handle.validate().map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = CanonicalSnapshotPort::end_snapshot(&self.store, context, handle)
+            .await
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Prepares one isolated restore destination from externally admitted
+    /// evidence (issue #975).
+    ///
+    /// Exactly one [`IsolatedRestorePort::prepare_isolated_destination`]
+    /// call under one bounded write slot. Admission-age and
+    /// purge/reference verification stay owned by the #952 backend; the
+    /// destination can never activate the installation, unblock effects, or
+    /// retire the source. Restore rights never flow from a normal-write
+    /// capability: admission arrived through the backup session capability
+    /// before dispatch.
+    pub async fn backup_prepare_destination(
+        &self,
+        context: &RequestMeta,
+        destination: IsolatedDestination,
+    ) -> Result<IsolationEvidence, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        destination
+            .validate()
+            .map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome =
+            IsolatedRestorePort::prepare_isolated_destination(&self.store, context, destination)
+                .await
+                .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Restores one bounded canonical batch into an admitted isolated
+    /// destination (issue #975).
+    ///
+    /// Exactly one [`IsolatedRestorePort::restore_canonical_batch`] call
+    /// under one bounded write slot. The opaque archive content stays data:
+    /// only the closed fixed restore statement runs, never caller SQL.
+    pub async fn backup_restore_batch(
+        &self,
+        context: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        batch.validate().map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = IsolatedRestorePort::restore_canonical_batch(&self.store, context, batch)
+            .await
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Validates one canonical restore batch without applying it
+    /// (issue #975).
+    ///
+    /// Read-only observation on the bounded read set: exactly one
+    /// [`IsolatedRestorePort::validate_restore`] call, never a write slot.
+    /// Validation can never import, restore, cut over, or unblock effects.
+    pub async fn backup_validate(
+        &self,
+        context: &RequestMeta,
+        batch: CanonicalRestoreBatch,
+    ) -> Result<RestoreValidationReceipt, StoreCompositionError> {
+        context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(StoreCompositionError::Store)?;
+        batch.validate().map_err(StoreCompositionError::Store)?;
+        if context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Read)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = IsolatedRestorePort::validate_restore(&self.store, context, batch)
+            .await
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Read);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    /// Observes the status of one backup operation by exact operation
+    /// identity (issue #975).
+    ///
+    /// Read-only projection over the one durable receipt readback used by
+    /// [`Self::receipt`]: exactly one `SurrealStoreAdapter::reconcile` call
+    /// on the bounded read set, never a write. A present, shape-valid,
+    /// envelope-bearing receipt projects to
+    /// [`StoreBackupStatusOutcome::Complete`]; a missing, invalid, or
+    /// envelope-less receipt projects to the explicit
+    /// [`StoreBackupStatusOutcome::Unknown`] — never success, never a new
+    /// operation, never a retry. The report binds the queried operation to
+    /// this composition's fence; `InProgress`/`Expired` are never emitted
+    /// without a backend source for them.
+    pub async fn backup_status(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<StoreBackupStatus, StoreCompositionError> {
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Read)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = self
+            .store
+            .reconcile(operation_id.clone())
+            .await
+            .map_err(map_adapter_error);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Read);
+            self.store.note_connection_loss();
+        }
+        let receipt = outcome?;
+        let is_complete = receipt.as_ref().is_some_and(|receipt| {
+            receipt.validate().is_ok() && receipt.require_reconciliation_envelope().is_ok()
+        });
+        Ok(StoreBackupStatus {
+            operation_id,
+            state_fence: self.state_fence.clone(),
+            outcome: if is_complete {
+                StoreBackupStatusOutcome::Complete
+            } else {
+                StoreBackupStatusOutcome::Unknown
+            },
+        })
+    }
+
+    /// Reconciles two identities for the same backup operation without
+    /// performing any mutation (issue #975).
+    ///
+    /// Exactly one [`IsolatedRestorePort::reconcile_operation`] call under
+    /// one bounded write slot. Reconciliation changes request correlation,
+    /// not the original operation: equal canonical request hashes replay
+    /// the identity, a changed hash is an identity conflict, and different
+    /// operation ids refuse. Unknown stays unknown; no blind retry.
+    pub async fn backup_reconcile(
+        &self,
+        first: OperationIdentity,
+        second: OperationIdentity,
+    ) -> Result<BackupOperationReconciliation, StoreCompositionError> {
+        first.validate().map_err(StoreCompositionError::Store)?;
+        second.validate().map_err(StoreCompositionError::Store)?;
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = IsolatedRestorePort::reconcile_operation(&self.store, first, second)
             .await
             .map_err(StoreCompositionError::Store);
         if matches!(
@@ -1052,6 +1375,12 @@ fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
                 .validate_for_context(context)
                 .map_err(|error| error.to_string())
         }
+        // Store backup edge (issue #975): the wire decode already ran the
+        // closed backup shape plus transport identity binding, and
+        // `validate_request_frame` already enforced the exact backup
+        // session capability. Backup operations live outside the generated
+        // named/apply catalogue, like Dreamer ledger requests.
+        Request::Backup { request } => request.validate().map_err(|error| error.to_string()),
         // Health, readiness, head, snapshot, recovery, and receipt requests
         // keep their own bounded validation and perform no canonical
         // mutation. Dreamer ledger requests join them here: the wire decode
@@ -1120,8 +1449,8 @@ mod tests {
         use eliot_store_api::{
             EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
-            ScopeId, SecurityContext, TransitionClass, canonical_request_hash,
-            operation_manifest_set_digest,
+            ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
+            canonical_request_hash, operation_manifest_set_digest,
         };
 
         let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
@@ -1142,6 +1471,11 @@ mod tests {
             requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: set_digest,
+            // Issue-#18 digests are derived below via `bind_issue18_digests`,
+            // never defaulted; no semantic source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -1157,6 +1491,7 @@ mod tests {
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
         };
+        bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
         transition.identity.canonical_request_hash = canonical_request_hash(
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
@@ -1359,6 +1694,8 @@ mod tests {
                 r"C:\ProgramData\Eliot\bin\eliot-native-worker.exe",
             ),
             native_worker_artifact_digest: handle("7".repeat(64)),
+            wasm_host_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-wasm-host.exe"),
+            wasm_host_artifact_digest: handle("f".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
         };
         reseal_runtime_launch(&mut descriptor);
@@ -2178,7 +2515,7 @@ mod tests {
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
             ScopeId, SecurityContext, TransitionClass,
         };
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-bridge").expect("operation id"),
                 idempotency_key: "idem-bridge".to_owned(),
@@ -2193,6 +2530,11 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived, never defaulted; no semantic
+            // source is bound here (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: std::collections::BTreeMap::from([(
@@ -2207,7 +2549,9 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     #[test]
@@ -2247,7 +2591,7 @@ mod tests {
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
             ScopeId, SecurityContext, TransitionClass,
         };
-        eliot_store_api::PreparedTransition {
+        let mut transition = eliot_store_api::PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
                 idempotency_key: "idem-erasure-bridge".to_owned(),
@@ -2262,6 +2606,11 @@ mod tests {
             admission_contract_set_digest: "b".repeat(64),
             operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
                 .expect("manifest digest"),
+            // Issue-#18 digests are derived below, never defaulted.
+            // Fence-scoped erasure binds no semantic source (`[]`).
+            admission_digest: String::new(),
+            mutation_plan_digest: String::new(),
+            semantic_source_revisions: Vec::new(),
             named_operations: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::ApplyErasure,
                 parameters: std::collections::BTreeMap::from([
@@ -2288,7 +2637,9 @@ mod tests {
             },
             security: SecurityContext::default(),
             required_proof_and_approval_refs: vec!["approval-user-1".to_owned()],
-        }
+        };
+        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+        transition
     }
 
     #[test]

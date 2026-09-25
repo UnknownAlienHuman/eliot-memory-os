@@ -45,9 +45,9 @@
 use std::sync::Mutex;
 
 use eliot_coordination::{
-    attach_plan_once_durable, CasOutcome, DurableAttachError, SwarmPlanAttachmentConsumer,
-    SwarmPlanAttachmentConsumerPort, SwarmPlanAttachmentError, SwarmPlanAttachmentOwner,
-    SwarmPlanAttachmentStore, SwarmPlanAttachmentVersion, SwarmPlanBinding,
+    CasOutcome, DurableAttachError, SwarmPlanAttachmentConsumer, SwarmPlanAttachmentConsumerPort,
+    SwarmPlanAttachmentError, SwarmPlanAttachmentOwner, SwarmPlanAttachmentStore,
+    SwarmPlanAttachmentVersion, SwarmPlanBinding, attach_plan_once_durable,
 };
 use eliot_store_api::{
     OrderingHeadExpectation, OrderingScopeId, RevisionHeadExpectation, RevisionKey, StateFence,

@@ -16,13 +16,23 @@ use std::time::Duration;
 use eliot_runtime::RuntimeConfig;
 use eliot_runtime::{Runtime, ShutdownHandle, ShutdownOutcome};
 use eliot_wasm_runtime::{
-    InvocationId, InvocationRequest, InvocationResult, RuntimeError, RuntimePorts, WasmRuntime,
+    ComponentEnginePort, InvocationId, InvocationRequest, InvocationResult, RuntimeError,
+    RuntimePorts, WasmRuntime,
 };
 
 mod admission;
 mod artifact_preflight;
+mod child_engine;
 mod cli_contract;
 mod contour;
+mod dispatch_drive;
+mod dispatch_material;
+mod governed_admission;
+mod guest_exec;
+mod installed_binary;
+mod parent_authority;
+mod parent_dispatch;
+mod parent_runtime;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -32,14 +42,43 @@ pub use admission::{PortGrantError, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
-pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
+pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
+pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
 pub use contour::{
     AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
-    STANDARD_GUEST_TARGET, admit_generation, admit_prototype, authorize_host_call,
-    check_activation_imports,
+    STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
+    authorize_host_call, check_activation_imports, check_admitted_request, experimental_manifest,
 };
+pub use dispatch_drive::{
+    DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
+    OwnerRecords, SeatedVerdicts, assemble_owner_records, drive_admission, drive_dispatch,
+    evaluate_lifecycle_verdicts, evaluate_seated_verdicts, guest_exec_argv,
+};
+pub use dispatch_material::{
+    DISPATCH_MATERIAL_MAX_BYTES, DispatchMaterialInput, MaterialError, ValidatedAssuranceInput,
+    ValidatedAssuranceRecord, ValidatedDispatchGrant, ValidatedDispatchMaterial,
+    ValidatedGuestCeilings, ValidatedGuestCeilingsInput, ValidatedManifestInput,
+    ValidatedManifestRecord, ValidatedPromotionInput, ValidatedPromotionRecord,
+    ValidatedSnapshotInput, ValidatedSnapshotRecord, ValidatedWorkInput, ValidatedWorkRecord,
+    WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
+    WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
+    WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, bind_dispatch_material, consume_staged,
+    read_dispatch_material, read_dispatch_material_from, read_staged_bytes,
+};
+pub use governed_admission::{HostAdmitError, admit_governed_host, check_governed_host_output};
+pub use guest_exec::{
+    ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
+    GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
+    validate_request,
+};
+pub use installed_binary::{
+    InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,
+};
+pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
+pub use parent_dispatch::drive_parent_dispatch;
+pub use parent_runtime::{GovernorPorts, drive_parent_runtime};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
@@ -49,7 +88,9 @@ pub use typed_execution::{
     ExecutionMode, TypedDescriptor, TypedExecutionError, TypedReceipt, default_experimental_limits,
     domain_handoff, execute_describe_experimental, execute_governed_refusal,
 };
-pub use wasmtime_provider::{WasmtimeBuildError, WasmtimeComponentEngine};
+pub use wasmtime_provider::{
+    WasmtimeBuildError, WasmtimeComponentEngine, provider_configuration_digest,
+};
 
 /// B-12's injected component-host runner.
 pub struct WasmHostRunner {
@@ -92,18 +133,20 @@ impl WasmHostRunner {
         Self::new(profile, runtime, wasm_runtime)
     }
 
-    /// Binds the concrete Wasmtime provider to the existing authority ports.
+    /// Binds the concrete engine provider to the existing authority ports.
     ///
     /// The supplied ports remain the owners of admission, generation, fencing,
     /// process authority, and promotion. This method only replaces the engine
-    /// slot with the provider-specific adapter.
+    /// slot with the provider-specific adapter: either the in-process
+    /// Wasmtime provider or the isolated-child engine (never both — pairing
+    /// them would execute the guest twice).
     pub fn with_wasmtime_engine(
         profile: Profile,
         runtime: Runtime,
         mut ports: RuntimePorts,
-        engine: WasmtimeComponentEngine,
+        engine: Box<dyn ComponentEnginePort>,
     ) -> Result<Self, RuntimeBuildError> {
-        ports.engine = Box::new(engine);
+        ports.engine = engine;
         Self::new(profile, runtime, WasmRuntime::new(Some(ports)))
     }
 
@@ -130,23 +173,22 @@ impl WasmHostRunner {
 
     /// Executes one request under a bound contour admission.
     ///
-    /// This host serves only the WASM component contour: an admission for
-    /// any other contour is refused with
-    /// [`ContourGateError::ContourNotServedHere`] before touching A-12, so
-    /// native-process work can never execute on the WASM host by mistake.
-    /// An admitted WASM generation delegates to the injected A-12 surface
-    /// verbatim and returns exactly its verdict — this method adds routing,
-    /// never semantics.
+    /// The host gate matches the caller request against the bound admission
+    /// — contour, component identity, and input envelope — before touching
+    /// A-12, so work admitted for another component, another contour, or a
+    /// larger input envelope can never reach Wasmtime here. Artifact and
+    /// interface digests were byte-verified at admission and are enforced
+    /// again at invoke by the engine and Governor coherence; fence/epoch
+    /// freshness stays with Governor/Kernel authority inside the execution
+    /// path. An admitted WASM generation delegates to the injected A-12
+    /// surface verbatim and returns exactly its verdict — this method adds
+    /// routing, never semantics.
     pub fn execute_admitted(
         &mut self,
         admitted: &AdmittedGeneration,
         request: InvocationRequest,
     ) -> Result<InvocationResult, ContourGateError> {
-        if *admitted.contour() != Contour::WasmComponent {
-            return Err(ContourGateError::ContourNotServedHere(
-                admitted.contour().to_string(),
-            ));
-        }
+        check_admitted_request(admitted, &request)?;
         Ok(self.wasm_runtime.execute(request))
     }
 
@@ -365,6 +407,7 @@ mod tests {
         use std::collections::BTreeSet;
 
         GenerationManifest {
+            component_id: "fixture-component".to_owned(),
             target: STANDARD_GUEST_TARGET.to_owned(),
             artifact_digest: eliot_wasm_runtime::Sha256Digest::of_bytes(b"caller-fixture"),
             wit_digest: eliot_wasm_runtime::Sha256Digest::of_bytes(b"caller-wit"),
@@ -455,6 +498,53 @@ mod tests {
             ContourGateError::ContourNotServedHere("ISOLATED_NATIVE_PROCESS".to_owned())
                 .to_string(),
             "CONTOUR_NOT_SERVED_HERE:ISOLATED_NATIVE_PROCESS"
+        );
+    }
+
+    #[test]
+    fn foreign_component_is_denied_without_touching_a12() {
+        // No ports are bound (`WasmRuntime::new(None)`): denial must come
+        // from the host gate alone, before any A-12 contact is possible.
+        let decision = PrototypeContourDecision::default();
+        let mut foreign_manifest = admitted_manifest();
+        foreign_manifest.component_id = "other-component".to_owned();
+        let admitted =
+            admit_generation(Some(&decision), &foreign_manifest, &[]).expect("foreign admission");
+        let mut runner = test_runner();
+        assert_eq!(
+            runner.execute_admitted(&admitted, request(false)),
+            Err(ContourGateError::ComponentNotAdmitted(
+                "fixture-component".to_owned()
+            ))
+        );
+        assert_eq!(
+            ContourGateError::ComponentNotAdmitted("fixture-component".to_owned()).to_string(),
+            "COMPONENT_NOT_ADMITTED:fixture-component"
+        );
+    }
+
+    #[test]
+    fn oversized_input_is_denied_without_touching_a12() {
+        let decision = PrototypeContourDecision::default();
+        let admitted =
+            admit_generation(Some(&decision), &admitted_manifest(), &[]).expect("admission");
+        let mut runner = test_runner();
+        let oversized = InvocationRequest::new(
+            InvocationId::new("fixture-oversized").expect("invocation"),
+            eliot_wasm_runtime::CapabilityId::new("fixture-component").expect("component"),
+            WorkUnitId::new("fixture-work-unit").expect("work unit"),
+            WorkScopeRef::new("fixture-scope").expect("scope"),
+            ExecutionContour::Shadow,
+            vec![0u8; 65],
+            7,
+            false,
+        )
+        .expect("request");
+        assert_eq!(
+            runner.execute_admitted(&admitted, oversized),
+            Err(ContourGateError::InputLimitExceeded(
+                "input-bytes".to_owned()
+            ))
         );
     }
 }

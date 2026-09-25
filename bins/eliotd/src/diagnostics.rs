@@ -857,6 +857,9 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         FabricError::UnknownChild(_) => {
             (RejectionReason::UnknownChild, OwningComponent::AgentFabric)
         }
+        FabricError::ProviderEvidenceRequired => {
+            (RejectionReason::Contract, OwningComponent::AgentFabric)
+        }
     }
 }
 
@@ -867,10 +870,11 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
 #[must_use]
 pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
     match error {
-        DaemonError::Composition(_) => OwningComponent::Governor,
+        DaemonError::Composition(_) | DaemonError::Finish(_) => OwningComponent::Governor,
         DaemonError::Kernel(_) => OwningComponent::Kernel,
         DaemonError::LaunchConfig(_) | DaemonError::Protected(_) => OwningComponent::DaemonConfig,
         DaemonError::Lifecycle(_) => OwningComponent::DaemonRuntime,
+        DaemonError::ProviderAdmission(error) => fabric_rejection_of(error).1,
     }
 }
 
@@ -1154,10 +1158,12 @@ impl ErrorRecord {
         let owner = daemon_error_owner(error);
         let (code, detail) = match error {
             DaemonError::Composition(_) => ("composition", error.to_string()),
+            DaemonError::Finish(_) => ("finish-attempt", error.to_string()),
             DaemonError::Kernel(_) => ("kernel-transport", error.to_string()),
             DaemonError::LaunchConfig(_) => ("launch-config", error.to_string()),
             DaemonError::Protected(_) => ("protected-path", error.to_string()),
             DaemonError::Lifecycle(_) => ("lifecycle", error.to_string()),
+            DaemonError::ProviderAdmission(_) => ("provider-admission", error.to_string()),
         };
         Self::of(owner, code, &detail)
     }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_evidence::EvidenceEnvelope;
+use eliot_evidence::{EvidenceCoverage, EvidenceEnvelope};
 use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,17 @@ pub struct ErasureRequest {
 }
 
 impl ErasureRequest {
+    /// Fail-closed admission validation: text/digest shapes, non-empty
+    /// duplicate-free locations, valid evidence fenced exactly to this
+    /// request, and closure coverage.
+    ///
+    /// A required partial/unknown closure blocks start (issue #688 case 2):
+    /// evidence carrying [`EvidenceCoverage::PartialForScope`] or
+    /// [`EvidenceCoverage::Unknown`] refuses with
+    /// [`ErasureError::InsufficientClosureEvidence`] before any intent is
+    /// recorded. `CompleteForScope` and `NotApplicable` coverage pass; an
+    /// absent evidence list stays an owner-policy decision, never an
+    /// invented closure proof.
     pub fn validate(&self) -> Result<(), ErasureError> {
         text(&self.request_id, "request_id")?;
         text(&self.subject_ref, "subject_ref")?;
@@ -49,6 +60,12 @@ impl ErasureRequest {
                 .map_err(|_| ErasureError::InvalidEvidence)?;
             if evidence.state_fence != self.state_fence {
                 return Err(ErasureError::FenceMismatch);
+            }
+            match evidence.coverage {
+                EvidenceCoverage::PartialForScope | EvidenceCoverage::Unknown => {
+                    return Err(ErasureError::InsufficientClosureEvidence);
+                }
+                EvidenceCoverage::CompleteForScope | EvidenceCoverage::NotApplicable => {}
             }
         }
         Ok(())
@@ -316,10 +333,8 @@ pub fn aggregate_surface_outcomes(
     if incomplete_seen {
         return Err(ErasureError::IncompleteErasure);
     }
-    let mut committed: Vec<PurgeLocation> = by_location
-        .values()
-        .map(SurfaceOutcome::location)
-        .collect();
+    let mut committed: Vec<PurgeLocation> =
+        by_location.values().map(SurfaceOutcome::location).collect();
     committed.sort_by_key(|location| location_code(*location));
     Ok(committed)
 }
@@ -404,10 +419,7 @@ pub trait ErasureBackend {
     /// per requested location; transport failures are `Err`, while
     /// per-surface `Incomplete`/`Unknown` states are `Ok` outcomes that the
     /// fail-closed aggregation refuses.
-    fn erase(
-        &mut self,
-        intent: &ErasureIntent,
-    ) -> Result<Vec<SurfaceOutcome>, Self::Error>;
+    fn erase(&mut self, intent: &ErasureIntent) -> Result<Vec<SurfaceOutcome>, Self::Error>;
 
     fn append_purge_ledger(&mut self, entry: PurgeLedgerEntry) -> Result<(), Self::Error>;
 }
@@ -422,7 +434,10 @@ pub struct ErasureReceipt {
 
 /// Executes one exact-fence erasure against the already-authoritative backend.
 ///
-/// Tombstone-first lifecycle: the intent is built and recorded, then the
+/// Admission runs first: malformed requests, stale revisions, and requests
+/// carrying partial/unknown-coverage closure evidence refuse here with zero
+/// backend calls, so a required partial/unknown closure blocks start before
+/// any intent is recorded. Tombstone-first lifecycle: the intent is built and recorded, then the
 /// durable tombstone is committed and load-verified, and only then does
 /// erasure fan out under the recorded intent and verified tombstone. An exact
 /// replay of a completed intent returns the original receipt with no second
@@ -469,9 +484,7 @@ pub fn execute<B: ErasureBackend>(
         let Some(stored) = stored else {
             return Err(ErasureError::MissingTombstone);
         };
-        if stored != candidate
-            || prior.purge.tombstone_digest != candidate.tombstone_digest
-        {
+        if stored != candidate || prior.purge.tombstone_digest != candidate.tombstone_digest {
             return Err(ErasureError::MissingTombstone);
         }
         return Ok(prior);
@@ -610,6 +623,8 @@ pub enum ErasureError {
     InvalidScope,
     #[error("erasure scope snapshot does not bind to this request")]
     ScopeMismatch,
+    #[error("erasure evidence has partial or unknown closure coverage; start refused")]
+    InsufficientClosureEvidence,
     #[error("erasure backend failed: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -704,11 +719,7 @@ mod tests {
     impl ErasureBackend for StaleEchoBackend {
         type Error = BackendError;
 
-        fn current_revision(
-            &self,
-            _subject_ref: &str,
-            _scope: &str,
-        ) -> Result<u64, Self::Error> {
+        fn current_revision(&self, _subject_ref: &str, _scope: &str) -> Result<u64, Self::Error> {
             Ok(self.revision)
         }
 
@@ -740,10 +751,7 @@ mod tests {
             Ok(tombstone)
         }
 
-        fn load_tombstone(
-            &self,
-            operation_id: &str,
-        ) -> Result<Option<Tombstone>, ErasureError> {
+        fn load_tombstone(&self, operation_id: &str) -> Result<Option<Tombstone>, ErasureError> {
             if operation_id.trim().is_empty() {
                 return Err(ErasureError::InvalidField("operation_id"));
             }
@@ -751,15 +759,11 @@ mod tests {
         }
 
         fn note_completed(&mut self, receipt: ErasureReceipt) -> Result<(), ErasureError> {
-            self.completions
-                .insert(receipt.request_id.clone(), receipt);
+            self.completions.insert(receipt.request_id.clone(), receipt);
             Ok(())
         }
 
-        fn erase(
-            &mut self,
-            intent: &ErasureIntent,
-        ) -> Result<Vec<SurfaceOutcome>, Self::Error> {
+        fn erase(&mut self, intent: &ErasureIntent) -> Result<Vec<SurfaceOutcome>, Self::Error> {
             self.erase_calls += 1;
             if intent.validate().is_err() {
                 return Err(BackendError("invalid intent at dispatch".to_string()));

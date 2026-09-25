@@ -10,6 +10,7 @@
 
 use std::{collections::BTreeMap, fmt, io::Read};
 
+use crate::activation_resolution::AgentActivationResolutionDisposition;
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
@@ -46,13 +47,49 @@ pub use reactive_context::{
     ReactiveContextViewBinding, reactive_context_contract_identity,
 };
 
+pub mod backup;
 pub mod dreamer_job;
+pub mod reactive_restore;
+pub use backup::contract_identity as backup_contract_identity;
+pub use backup::{
+    BACKUP_ARCHIVE_VALIDITY_ATTESTATION_WIRE_ID, BACKUP_ARCHIVE_VALIDITY_ATTESTATION_WIRE_VERSION,
+    BACKUP_ARCHIVE_VERIFICATION_WIRE_ID, BACKUP_ARCHIVE_VERIFICATION_WIRE_VERSION,
+    BACKUP_CANONICAL_ENCODING, BACKUP_CAPTURE_RECEIPT_WIRE_ID, BACKUP_CAPTURE_RECEIPT_WIRE_VERSION,
+    BACKUP_CAPTURE_REQUEST_WIRE_ID, BACKUP_CAPTURE_REQUEST_WIRE_VERSION, BACKUP_CONTRACT_NAME,
+    BACKUP_CONTRACT_VERSION, BACKUP_CUTOVER_ADMISSION_WIRE_ID,
+    BACKUP_CUTOVER_ADMISSION_WIRE_VERSION, BACKUP_CUTOVER_RECEIPT_WIRE_ID,
+    BACKUP_CUTOVER_RECEIPT_WIRE_VERSION, BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID,
+    BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION, BACKUP_PAYLOAD_TYPE,
+    BACKUP_PHASE_ATTESTATION_WIRE_ID, BACKUP_PHASE_ATTESTATION_WIRE_VERSION, BACKUP_PRODUCER_ID,
+    BACKUP_REHEARSAL_COMPLETE_WIRE_ID, BACKUP_REHEARSAL_COMPLETE_WIRE_VERSION,
+    BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
+    BACKUP_RESTORE_RECONCILE_WIRE_ID, BACKUP_RESTORE_RECONCILE_WIRE_VERSION,
+    BACKUP_RESTORE_STATUS_WIRE_ID, BACKUP_RESTORE_STATUS_WIRE_VERSION, BACKUP_RESTORE_STEP_WIRE_ID,
+    BACKUP_RESTORE_STEP_WIRE_VERSION, BACKUP_SNAPSHOT_PAGE_READ_WIRE_ID,
+    BACKUP_SNAPSHOT_PAGE_READ_WIRE_VERSION, BackupAdmissionRef, BackupArchiveValidityAttestation,
+    BackupArchiveVerification, BackupArtifactHandle, BackupAuthenticatedPrincipal,
+    BackupCapability, BackupCaptureReceipt, BackupCaptureRequest, BackupClassWire,
+    BackupCutoverAdmission, BackupCutoverReceipt, BackupDisposition, BackupError,
+    BackupIsolatedRestorePrepare, BackupMutationBinding, BackupOperationKind, BackupPageRef,
+    BackupPhaseAttestation, BackupRehearsalComplete, BackupReplayDisposition, BackupReplayLedger,
+    BackupRequestIdentity, BackupRestoreReconcile, BackupRestoreStatus, BackupRestoreStep,
+    BackupRole, BackupSnapshotPageRead, BackupStage, Denominator, HostAuditRef,
+    MAX_BACKUP_CONTENT_BYTES, MAX_BACKUP_OBSERVED_DISPOSITIONS, MAX_BACKUP_PAGE_MEMBERS,
+    MAX_BACKUP_PAYLOAD_BYTES, MAX_BACKUP_TEXT_BYTES, ack_phase_stage, attesting_roles,
+    operation_for_phase,
+};
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,
     DurableJobResponse, DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease,
     JobOperation, JobOperationKind, JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector,
     MutationDisposition, MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
+};
+pub use reactive_restore::{
+    MAX_RESTORE_LEDGER_BYTES, MAX_RESTORE_SNAPSHOT_BYTES, MAX_RESTORE_TEXT_BYTES, MAX_RESTORE_URIS,
+    REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_CONTRACT_NAME, REACTIVE_RESTORE_CONTRACT_VERSION,
+    REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreError,
+    ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot, restore_correlation,
 };
 
 /// Stable identity of this protocol surface.
@@ -97,7 +134,7 @@ pub const AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION: u16 = 1;
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
-pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 1;
+pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 2;
 /// Stable denial code for a Kernel-owned activation refusal with no typed
 /// daemon semantic result (pre-ticket immediate denial or result-less expiry).
 /// It never stands in for one of the six typed disposition codes below.
@@ -119,11 +156,6 @@ pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-ticket";
 /// Current semantic-resolution ticket wire version.
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 1;
-/// Stable wire identity for an eliotd-to-Kernel semantic-resolution decision.
-pub const AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID: &str =
-    "eliot.protocol.agent-activation-resolution-decision";
-/// Current semantic-resolution decision wire version.
-pub const AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_VERSION: u16 = 1;
 const FRAME_PREFIX_BYTES: usize = 4;
 
 /// A protocol contract validation or compatibility failure.
@@ -1877,159 +1909,6 @@ impl AgentActivationResolutionTicket {
     }
 }
 
-/// Immutable semantic decision returned by eliotd for one exact ticket.
-///
-/// These fields are a clone of the Governor's validated activation projection.
-/// No transport Session, nonce, fencing token, capability, or effect is
-/// issued by this contract.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentActivationResolutionDecision {
-    /// Stable decision wire identity.
-    pub wire_id: String,
-    /// Decision wire version.
-    pub wire_version: u16,
-    /// Exact resolution ticket identity.
-    pub ticket_id: String,
-    /// Digest of the exact resolution ticket.
-    pub ticket_sha256: String,
-    /// Exact Governor fence used for the decision.
-    pub state_fence: StateFence,
-    /// Resolved semantic principal identity.
-    pub principal_id: String,
-    /// Resolved semantic session identity.
-    pub session_id: String,
-    /// Resolved task identity.
-    pub task_id: String,
-    /// Resolved work-unit identity.
-    pub work_unit_id: String,
-    /// Resolved `WorkScope` identity.
-    pub work_scope_id: String,
-    /// Exact task revision.
-    pub task_revision: String,
-    /// Exact current plan identity.
-    pub plan_id: String,
-    /// Exact current plan revision.
-    pub plan_revision: String,
-    /// Lowercase SHA-256 over every decision field except this field.
-    pub decision_sha256: String,
-}
-
-impl AgentActivationResolutionDecision {
-    /// Current decision contract version.
-    pub const CONTRACT_VERSION: u16 = AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_VERSION;
-
-    /// Returns canonical bytes covered by `decision_sha256`.
-    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
-        let mut unsigned = self.clone();
-        unsigned.decision_sha256.clear();
-        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
-    }
-
-    /// Computes the canonical decision digest.
-    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
-        Ok(eliot_contracts::sha256_hex(
-            &self.canonical_unsigned_bytes()?,
-        ))
-    }
-
-    /// Populates the canonical decision digest.
-    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
-        self.decision_sha256 = self.compute_digest()?;
-        Ok(self)
-    }
-
-    /// Validates the closed immutable semantic projection.
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID
-            || self.wire_version != Self::CONTRACT_VERSION
-        {
-            return Err(ProtocolError::InvalidField {
-                field: "agent_activation_resolution_decision.wire",
-                reason: "unsupported semantic resolution decision",
-            });
-        }
-        bounded_text(
-            &self.ticket_id,
-            "agent_activation_resolution_decision.ticket_id",
-            512,
-        )?;
-        lowercase_sha256(
-            &self.ticket_sha256,
-            "agent_activation_resolution_decision.ticket_sha256",
-        )?;
-        self.state_fence
-            .validate()
-            .map_err(ProtocolError::Foundation)?;
-        for (value, field) in [
-            (
-                self.principal_id.as_str(),
-                "agent_activation_resolution_decision.principal_id",
-            ),
-            (
-                self.session_id.as_str(),
-                "agent_activation_resolution_decision.session_id",
-            ),
-            (
-                self.task_id.as_str(),
-                "agent_activation_resolution_decision.task_id",
-            ),
-            (
-                self.work_unit_id.as_str(),
-                "agent_activation_resolution_decision.work_unit_id",
-            ),
-            (
-                self.work_scope_id.as_str(),
-                "agent_activation_resolution_decision.work_scope_id",
-            ),
-            (
-                self.task_revision.as_str(),
-                "agent_activation_resolution_decision.task_revision",
-            ),
-            (
-                self.plan_id.as_str(),
-                "agent_activation_resolution_decision.plan_id",
-            ),
-            (
-                self.plan_revision.as_str(),
-                "agent_activation_resolution_decision.plan_revision",
-            ),
-        ] {
-            bounded_text(value, field, 512)?;
-        }
-        lowercase_sha256(
-            &self.decision_sha256,
-            "agent_activation_resolution_decision.decision_sha256",
-        )?;
-        if self.decision_sha256 != self.compute_digest()? {
-            return Err(ProtocolError::InvalidField {
-                field: "agent_activation_resolution_decision.decision_sha256",
-                reason: "decision digest mismatch",
-            });
-        }
-        Ok(())
-    }
-
-    /// Validates the decision against the exact ticket it resolves.
-    pub fn validate_against(
-        &self,
-        ticket: &AgentActivationResolutionTicket,
-    ) -> Result<(), ProtocolError> {
-        self.validate()?;
-        ticket.validate()?;
-        if self.ticket_id != ticket.ticket_id
-            || self.ticket_sha256 != ticket.ticket_sha256
-            || self.state_fence != ticket.state_fence
-        {
-            return Err(ProtocolError::InvalidField {
-                field: "agent_activation_resolution_decision.binding",
-                reason: "must bind the exact ticket identity, digest, and fence",
-            });
-        }
-        Ok(())
-    }
-}
-
 /// Transport-neutral projection of the Kernel-owned semantic activation fence.
 ///
 /// This is a response contract only. eliotd copies the authenticated Kernel
@@ -2159,6 +2038,12 @@ impl AgentBridgeAuthenticatedBinding {
 /// is Kernel-owned and is used only when no daemon disposition exists at all
 /// (pre-ticket immediate denial or result-less expiry); it never collapses two
 /// distinct dispositions into one code.
+///
+/// These wire codes are the Kernel↔bridge transport vocabulary, not the
+/// agent-facing reason catalogue: the bridge projects each code to its exact
+/// `I07-20-agent-facing-error-contract.md` catalogue `reason_code` (e.g.
+/// `SCOPE_AMBIGUOUS` → `AMBIGUOUS_RESULT`, `STALE_FENCE` → `STALE_STATE_FENCE`)
+/// at the agent face and never invents catalogue membership for them here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentBridgeActivationDenialCode {
@@ -2204,9 +2089,21 @@ pub enum AgentBridgeActivationDisposition {
         binding: Box<AgentBridgeAuthenticatedBinding>,
     },
     /// Typed fail-closed outcome with no semantic binding.
+    ///
+    /// Carries the denial code plus the exact owner-issued denial detail:
+    /// candidate/recovery handles for selection outcomes, the retry directive
+    /// (dependency revision plus earliest-retry bound) for `NOT_READY`, the
+    /// observed fence plus recovery handle for `STALE_FENCE`, and the failure
+    /// handle for `FAILED_INTERNAL`. `detail` is `None` only for the
+    /// Kernel-owned `SemanticResolutionUnavailable` refusal, which has no
+    /// daemon disposition to project; a typed disposition is never dropped
+    /// into a code-only denial.
     Denied {
         /// Stable denial code.
         reason_code: AgentBridgeActivationDenialCode,
+        /// Exact owner-issued denial detail; absent only when no daemon
+        /// disposition exists at all.
+        detail: Option<AgentActivationResolutionDisposition>,
     },
 }
 
@@ -2214,7 +2111,46 @@ impl AgentBridgeActivationDisposition {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Authenticated { binding } => binding.validate(),
-            Self::Denied { .. } => Ok(()),
+            Self::Denied {
+                reason_code,
+                detail,
+            } => match detail {
+                None => {
+                    if *reason_code
+                        != AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+                    {
+                        return Err(ProtocolError::InvalidField {
+                            field: "agent_bridge_activation_response.denial",
+                            reason: "a detail-less denial carries no daemon disposition and must keep the Kernel-owned code",
+                        });
+                    }
+                    Ok(())
+                }
+                Some(AgentActivationResolutionDisposition::Resolved { .. }) => {
+                    Err(ProtocolError::InvalidField {
+                        field: "agent_bridge_activation_response.denial",
+                        reason: "a Resolved disposition never projects a denial",
+                    })
+                }
+                Some(_) => {
+                    if *reason_code
+                        == AgentBridgeActivationDenialCode::SemanticResolutionUnavailable
+                    {
+                        return Err(ProtocolError::InvalidField {
+                            field: "agent_bridge_activation_response.denial",
+                            reason: "a typed daemon disposition never carries the Kernel-owned no-result code",
+                        });
+                    }
+                    let Some(detail) = detail else {
+                        return Err(ProtocolError::InvalidField {
+                            field: "agent_bridge_activation_response.denial",
+                            reason: "typed denial detail vanished during validation",
+                        });
+                    };
+                    detail.validate()?;
+                    Ok(())
+                }
+            },
         }
     }
 }
@@ -2243,11 +2179,14 @@ impl AgentBridgeActivationResponse {
 
     /// Constructs the fail-closed denial response for one exact request: either
     /// a Kernel-owned refusal with no daemon disposition (pre-ticket immediate
-    /// denial or result-less expiry) or the typed projection of one daemon
-    /// non-`Resolved` disposition supplied by the caller.
+    /// denial or result-less expiry, `detail` is `None`) or the typed
+    /// projection of one daemon non-`Resolved` disposition supplied by the
+    /// caller (the exact owner-issued detail travels verbatim; it is never
+    /// reduced to the code alone).
     pub fn denied(
         request: &AgentBridgeActivationRequest,
         reason_code: AgentBridgeActivationDenialCode,
+        detail: Option<AgentActivationResolutionDisposition>,
     ) -> Result<Self, ProtocolError> {
         request.validate()?;
         Self {
@@ -2255,10 +2194,17 @@ impl AgentBridgeActivationResponse {
             wire_version: Self::CONTRACT_VERSION,
             request_id: request.request_identity.request.metadata.request_id.clone(),
             request_sha256: request.request_sha256.clone(),
-            disposition: AgentBridgeActivationDisposition::Denied { reason_code },
+            disposition: AgentBridgeActivationDisposition::Denied {
+                reason_code,
+                detail,
+            },
             response_sha256: String::new(),
         }
         .with_computed_digest()
+        .and_then(|response| {
+            response.validate()?;
+            Ok(response)
+        })
     }
 
     /// Returns canonical bytes covered by `response_sha256`.
@@ -4144,7 +4090,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_resolution_ticket_and_decision_bind_exact_inputs() -> Result<(), ProtocolError> {
+    fn semantic_resolution_ticket_binds_exact_inputs() -> Result<(), ProtocolError> {
         let declaration = agent_bridge_client_declaration()?;
         let challenge = peer_challenge(&declaration)?;
         let hello = declaration.client_hello(&challenge.challenge_nonce)?;
@@ -4153,25 +4099,6 @@ mod tests {
         let ticket = resolution_ticket(&request, &receipt)?;
         ticket.validate()?;
         ticket.validate_against(&request, &receipt)?;
-
-        let decision = AgentActivationResolutionDecision {
-            wire_id: AGENT_ACTIVATION_RESOLUTION_DECISION_WIRE_ID.to_owned(),
-            wire_version: AgentActivationResolutionDecision::CONTRACT_VERSION,
-            ticket_id: ticket.ticket_id.clone(),
-            ticket_sha256: ticket.ticket_sha256.clone(),
-            state_fence: ticket.state_fence.clone(),
-            principal_id: "principal-1".to_owned(),
-            session_id: "session-1".to_owned(),
-            task_id: "task-1".to_owned(),
-            work_unit_id: "work-1".to_owned(),
-            work_scope_id: "scope-1".to_owned(),
-            task_revision: "1".to_owned(),
-            plan_id: "plan-1".to_owned(),
-            plan_revision: "plan-revision-1".to_owned(),
-            decision_sha256: String::new(),
-        }
-        .with_computed_digest()?;
-        decision.validate_against(&ticket)?;
 
         let mut substituted_ticket = ticket.clone();
         substituted_ticket.connection_id = "other-connection".to_owned();
@@ -4201,11 +4128,6 @@ mod tests {
         stale_ticket.ticket_sha256 = stale_ticket.compute_digest()?;
         assert!(stale_ticket.validate().is_ok());
         assert!(stale_ticket.validate_against(&request, &receipt).is_err());
-
-        let mut wrong_decision = decision.clone();
-        wrong_decision.ticket_id = "other-ticket".to_owned();
-        wrong_decision.decision_sha256 = wrong_decision.compute_digest()?;
-        assert!(wrong_decision.validate_against(&ticket).is_err());
 
         let mut unknown = serde_json::to_value(&ticket)
             .map_err(|error| ProtocolError::Json(error.to_string()))?;
@@ -4238,6 +4160,7 @@ mod tests {
         let response = AgentBridgeActivationResponse::denied(
             &request,
             AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+            None,
         )?;
 
         response.validate()?;

@@ -1,0 +1,66 @@
+{
+  "contract_version": {
+    "major": 1,
+    "minor": 0,
+    "patch": 0
+  },
+  "operation": {
+    "operation_id": "op-950-2",
+    "idempotency_key": "idem-950-2",
+    "canonical_request_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "source": {
+    "installation_id": "install-950-1",
+    "store_id": "store-950-1",
+    "schema": "eliot.storage.snapshot.v1",
+    "generation": 1
+  },
+  "destination": {
+    "destination_id": "restore-950-1",
+    "destination_class": "ISOLATED_RESTORE",
+    "source_store_id": "store-950-1",
+    "source_installation_id": "install-950-1",
+    "evidence": {
+      "admission_handle": "admit-950-1",
+      "admitted_at_unix_ms": 1758672000000,
+      "purge_policy_revision": 3
+    },
+    "target_schema": "eliot.storage.snapshot.v1"
+  },
+  "archive_member_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+  "target_schema": "eliot.storage.snapshot.v1",
+  "purge_policy_revision": 3,
+  "expected_revision_heads": [
+    {
+      "key": "scope-950-1",
+      "expected_revision": 9,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ],
+  "expected_ordering_heads": [
+    {
+      "scope": "order-950-1",
+      "expected_sequence": 4,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ],
+  "member_count": 3
+}

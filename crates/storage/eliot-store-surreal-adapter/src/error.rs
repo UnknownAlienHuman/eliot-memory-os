@@ -74,7 +74,9 @@ impl AdapterError {
     pub fn into_store_error(self) -> StoreError {
         match self {
             Self::Store(error) => error,
-            Self::ProviderUnavailable | Self::AllocationContention { .. } => StoreError::Unavailable,
+            Self::ProviderUnavailable | Self::AllocationContention { .. } => {
+                StoreError::Unavailable
+            }
             Self::ProviderConflict => StoreError::RevisionConflict,
             Self::UnknownOutcome { .. } | Self::PartialOutcome => {
                 StoreError::MissingReceiptEnvelope

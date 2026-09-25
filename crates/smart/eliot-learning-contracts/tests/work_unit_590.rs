@@ -214,6 +214,10 @@ fn valid_overlay(tag: &str) -> CampaignHarnessOverlayCandidate {
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding,
         overlay_id: OverlayId::from_artifact(aid(&format!("overlay-590-{tag}"))),
+        campaign_id: CampaignId::from_artifact(aid(&format!("campaign-590-{tag}"))),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
         base_view_digest: digest(&format!("base-view-590-{tag}")),
         parent_revision: TaskRevision::genesis(),
         admitted_delta_ids: vec![aid(&format!("admitted-590-{tag}"))],
@@ -238,6 +242,14 @@ fn valid_overlay(tag: &str) -> CampaignHarnessOverlayCandidate {
         protected_surface_base_digest: digest("protected-590"),
         protected_surface_proposed_digest: digest("protected-590"),
         fixed_before_observation_discriminator: aid(&format!("ov-disc-590-{tag}")),
+        intended_mechanism: format!("mechanism-590-{tag}"),
+        prediction: format!("prediction-590-{tag}"),
+        expected_observable: format!("observable-590-{tag}"),
+        possible_regressions: format!("regressions-590-{tag}"),
+        confounders: format!("confounders-590-{tag}"),
+        preserved_success_constraint: format!("preserved-590-{tag}"),
+        next_discriminator_text: format!("next-590-{tag}"),
+        rollback_condition: format!("rollback-590-{tag}"),
         expires_at_ms: 9_000,
         invalidated: false,
         canonical_digest: String::new(),
@@ -323,6 +335,42 @@ fn valid_activation(tag: &str) -> HarnessActivationReceiptCandidate {
         attrition: vec![],
         confounders: vec![],
         independent_evaluator_receipt: Some(aid(&format!("indep-590-{tag}"))),
+        compiled_view_ref: aid(&format!("view-590-{tag}")),
+        context_compiler_revision: format!("compiler-rev-590-{tag}"),
+        render_profile_revision: format!("render-profile-rev-590-{tag}"),
+        stable_harness_refs: vec![aid(&format!("stable-590-{tag}"))],
+        task_family_harness_refs: vec![aid(&format!("family-590-{tag}"))],
+        skill_refs: vec![aid(&format!("skill-590-{tag}"))],
+        memory_refs: vec![aid(&format!("memory-590-{tag}"))],
+        procedure_refs: vec![aid(&format!("procedure-590-{tag}"))],
+        preserved_success_ref: Some(aid(&format!("preserved-590-{tag}"))),
+        eligibility_and_retrieval_reason: Some(format!("eligible-590-{tag}")),
+        retrieval: eliot_learning_contracts::activation::RetrievalSection {
+            status: eliot_learning_contracts::activation::RetrievalStatus::Retrieved,
+            expansion_or_tool_query_refs: vec![],
+        },
+        delivery: eliot_learning_contracts::activation::DeliverySection {
+            status: eliot_learning_contracts::activation::DeliveryStatus::Full,
+            packet_position: Some(0),
+            serialized_digest: Some(digest(&format!("packet-590-{tag}"))),
+            bytes: Some(128),
+            actual_tokens: Some(32),
+        },
+        activation: eliot_learning_contracts::activation::ActivationSection {
+            status: eliot_learning_contracts::activation::ActivationStatus::NotObserved,
+            acknowledgement_ref: Some(aid(&format!("ack-590-{tag}"))),
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: eliot_learning_contracts::activation::AdherenceSection {
+            status: eliot_learning_contracts::activation::AdherenceStatus::NotAssessed,
+            early_mid_final_checkpoint_refs: vec![],
+            prescribed_or_avoided_action_and_required_verifier_refs: vec![],
+        },
+        conflicts_suppression_or_compaction_loss: vec![],
+        downstream_decision_action_artifact_and_verifier_refs: vec![],
+        receipt_completeness_and_missing_fields: vec![],
+        invalidation_expiry_and_missingness: vec![],
         canonical_digest: String::new(),
     };
     must(receipt.seal());
@@ -1751,6 +1799,63 @@ fn correlation_confidence_cannot_encode_causal_proof() {
     ));
 }
 
+fn overlay_c25(
+    view: &CampaignLearningStateView,
+    delta: &AttemptLearningDeltaCandidate,
+    target: TargetId,
+    proposed: ValueState,
+) -> CampaignHarnessOverlayCandidate {
+    CampaignHarnessOverlayCandidate {
+        binding: view.binding.clone(),
+        overlay_id: OverlayId::from_artifact(aid("overlay-590-c25")),
+        campaign_id: view.campaign_id.clone(),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
+        base_view_digest: view.canonical_digest.clone(),
+        parent_revision: TaskRevision::genesis(),
+        admitted_delta_ids: vec![delta.delta_id.clone()],
+        admitted_delta_digests: vec![delta.canonical_digest.clone()],
+        changes: vec![OverlayChange {
+            target: target.clone(),
+            surface: ChangeSurface::Strategy,
+            base: ValueState {
+                present: false,
+                digest: None,
+            },
+            proposed,
+            inverse: InverseChange {
+                forward_target: target.clone(),
+                inverse: ChangeOperation::Remove {
+                    target: target.clone(),
+                    surface: ChangeSurface::Strategy,
+                    before: ValueState {
+                        present: true,
+                        digest: Some(digest("overlay-590-c25")),
+                    },
+                },
+            },
+            origin: OverlayOrigin::Overlay,
+        }],
+        dependencies: vec![],
+        application_order: vec![target],
+        protected_surface_base_digest: digest("protected-590-c25"),
+        protected_surface_proposed_digest: digest("protected-590-c25"),
+        fixed_before_observation_discriminator: aid("ovdisc-590-c25"),
+        intended_mechanism: "mechanism-590-c25".to_owned(),
+        prediction: "prediction-590-c25".to_owned(),
+        expected_observable: "observable-590-c25".to_owned(),
+        possible_regressions: "regressions-590-c25".to_owned(),
+        confounders: "confounders-590-c25".to_owned(),
+        preserved_success_constraint: "preserved-590-c25".to_owned(),
+        next_discriminator_text: "next-590-c25".to_owned(),
+        rollback_condition: "rollback-590-c25".to_owned(),
+        expires_at_ms: 5_000,
+        invalidated: false,
+        canonical_digest: String::new(),
+    }
+}
+
 // WORK_UNIT_CASE: 590/25
 #[test]
 fn exact_overlay_base_parent_evaluation_admitted_delta() {
@@ -1794,43 +1899,7 @@ fn exact_overlay_base_parent_evaluation_admitted_delta() {
     };
     must(delta.seal());
     must(delta.validate_against_view(&view));
-    let mut overlay = CampaignHarnessOverlayCandidate {
-        binding: view.binding.clone(),
-        overlay_id: OverlayId::from_artifact(aid("overlay-590-c25")),
-        base_view_digest: view.canonical_digest.clone(),
-        parent_revision: TaskRevision::genesis(),
-        admitted_delta_ids: vec![delta.delta_id.clone()],
-        admitted_delta_digests: vec![delta.canonical_digest.clone()],
-        changes: vec![OverlayChange {
-            target: target.clone(),
-            surface: ChangeSurface::Strategy,
-            base: ValueState {
-                present: false,
-                digest: None,
-            },
-            proposed,
-            inverse: InverseChange {
-                forward_target: target.clone(),
-                inverse: ChangeOperation::Remove {
-                    target: target.clone(),
-                    surface: ChangeSurface::Strategy,
-                    before: ValueState {
-                        present: true,
-                        digest: Some(digest("overlay-590-c25")),
-                    },
-                },
-            },
-            origin: OverlayOrigin::Overlay,
-        }],
-        dependencies: vec![],
-        application_order: vec![target],
-        protected_surface_base_digest: digest("protected-590-c25"),
-        protected_surface_proposed_digest: digest("protected-590-c25"),
-        fixed_before_observation_discriminator: aid("ovdisc-590-c25"),
-        expires_at_ms: 5_000,
-        invalidated: false,
-        canonical_digest: String::new(),
-    };
+    let mut overlay = overlay_c25(&view, &delta, target, proposed);
     must(overlay.seal());
     must(overlay.validate_against_view_and_deltas(&view, core::slice::from_ref(&delta)));
     assert_eq!(overlay.base_view_digest, view.canonical_digest);
@@ -1928,6 +1997,10 @@ fn changed_surface_denominator_conflicts_alternatives() {
     let mut ordered = CampaignHarnessOverlayCandidate {
         binding,
         overlay_id: OverlayId::from_artifact(aid("overlay-590-c27c")),
+        campaign_id: CampaignId::from_artifact(aid("campaign-590-c27c")),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
         base_view_digest: digest("base-590-c27c"),
         parent_revision: TaskRevision::genesis(),
         admitted_delta_ids: vec![aid("admitted-590-c27c")],
@@ -1944,6 +2017,14 @@ fn changed_surface_denominator_conflicts_alternatives() {
         protected_surface_base_digest: digest("protected-590-c27c"),
         protected_surface_proposed_digest: digest("protected-590-c27c"),
         fixed_before_observation_discriminator: aid("disc-590-c27c"),
+        intended_mechanism: "mechanism-590-c27c".to_owned(),
+        prediction: "prediction-590-c27c".to_owned(),
+        expected_observable: "observable-590-c27c".to_owned(),
+        possible_regressions: "regressions-590-c27c".to_owned(),
+        confounders: "confounders-590-c27c".to_owned(),
+        preserved_success_constraint: "preserved-590-c27c".to_owned(),
+        next_discriminator_text: "next-590-c27c".to_owned(),
+        rollback_condition: "rollback-590-c27c".to_owned(),
         expires_at_ms: 7_000,
         invalidated: false,
         canonical_digest: String::new(),
@@ -3354,6 +3435,10 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding: view.binding.clone(),
         overlay_id: OverlayId::from_artifact(aid("overlay-590-c58")),
+        campaign_id: view.campaign_id.clone(),
+        admission_receipt: None,
+        revision: 1,
+        supersedes: None,
         base_view_digest: view.canonical_digest.clone(),
         parent_revision: TaskRevision::genesis(),
         admitted_delta_ids: vec![delta.delta_id.clone()],
@@ -3384,6 +3469,14 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
         protected_surface_base_digest: digest("protected-590-c58"),
         protected_surface_proposed_digest: digest("protected-590-c58"),
         fixed_before_observation_discriminator: aid("ovdisc-590-c58"),
+        intended_mechanism: "mechanism-590-c58".to_owned(),
+        prediction: "prediction-590-c58".to_owned(),
+        expected_observable: "observable-590-c58".to_owned(),
+        possible_regressions: "regressions-590-c58".to_owned(),
+        confounders: "confounders-590-c58".to_owned(),
+        preserved_success_constraint: "preserved-590-c58".to_owned(),
+        next_discriminator_text: "next-590-c58".to_owned(),
+        rollback_condition: "rollback-590-c58".to_owned(),
         expires_at_ms: 11_000,
         invalidated: false,
         canonical_digest: String::new(),
@@ -3418,6 +3511,42 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
         attrition: vec![],
         confounders: vec![],
         independent_evaluator_receipt: Some(aid("indep-590-c58")),
+        compiled_view_ref: aid("view-590-c58"),
+        context_compiler_revision: "compiler-rev-590-c58".to_owned(),
+        render_profile_revision: "render-profile-rev-590-c58".to_owned(),
+        stable_harness_refs: vec![aid("stable-590-c58")],
+        task_family_harness_refs: vec![aid("family-590-c58")],
+        skill_refs: vec![aid("skill-590-c58")],
+        memory_refs: vec![aid("memory-590-c58")],
+        procedure_refs: vec![aid("procedure-590-c58")],
+        preserved_success_ref: Some(aid("preserved-590-c58")),
+        eligibility_and_retrieval_reason: Some("eligible-590-c58".to_owned()),
+        retrieval: eliot_learning_contracts::activation::RetrievalSection {
+            status: eliot_learning_contracts::activation::RetrievalStatus::Retrieved,
+            expansion_or_tool_query_refs: vec![],
+        },
+        delivery: eliot_learning_contracts::activation::DeliverySection {
+            status: eliot_learning_contracts::activation::DeliveryStatus::Full,
+            packet_position: Some(0),
+            serialized_digest: Some(digest("packet-590-c58")),
+            bytes: Some(128),
+            actual_tokens: Some(32),
+        },
+        activation: eliot_learning_contracts::activation::ActivationSection {
+            status: eliot_learning_contracts::activation::ActivationStatus::NotObserved,
+            acknowledgement_ref: Some(aid("ack-590-c58")),
+            observation_limit_reason: None,
+            first_qualifying_observable_use_ref: None,
+        },
+        adherence: eliot_learning_contracts::activation::AdherenceSection {
+            status: eliot_learning_contracts::activation::AdherenceStatus::NotAssessed,
+            early_mid_final_checkpoint_refs: vec![],
+            prescribed_or_avoided_action_and_required_verifier_refs: vec![],
+        },
+        conflicts_suppression_or_compaction_loss: vec![],
+        downstream_decision_action_artifact_and_verifier_refs: vec![],
+        receipt_completeness_and_missing_fields: vec![],
+        invalidation_expiry_and_missingness: vec![],
         canonical_digest: String::new(),
     };
     must(activation.seal());

@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 
-use super::{DependencyVersion, SkillError, SkillStatus};
+use super::{DependencyVersion, SkillError, SkillScope, SkillStatus};
 
 /// Maximum visible characters for one index trigger line (`I7.12`).
 pub const MAX_TRIGGER_CHARS: usize = 140;
@@ -62,6 +62,20 @@ const AUTHORITY_CLAIM_PHRASES: &[&str] = &[
     "you are authorized to approve",
     "consider yourself approved",
 ];
+
+fn check_no_authority_claim(value: &str, field: &'static str) -> Result<(), SkillError> {
+    let lowered = value.to_lowercase();
+    if AUTHORITY_CLAIM_PHRASES
+        .iter()
+        .any(|phrase| lowered.contains(phrase))
+    {
+        return Err(SkillError::InvalidField {
+            field,
+            reason: "authority claims belong to a gate or tool",
+        });
+    }
+    Ok(())
+}
 
 fn check_text(value: &str, field: &'static str) -> Result<(), SkillError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -144,6 +158,9 @@ pub struct SkillIndexEntry {
     pub trigger: String,
     pub eligible_routes: Vec<String>,
     pub eligible_profiles: Vec<String>,
+    /// Policies this installation admits the Skill for (`I7.12` index covers
+    /// every route/profile/policy-eligible Skill).
+    pub eligible_policies: Vec<String>,
 }
 
 impl SkillIndexEntry {
@@ -151,14 +168,18 @@ impl SkillIndexEntry {
         check_text(&self.skill_id, "index.skill_id")?;
         check_text(&self.name, "index.name")?;
         check_single_line(&self.trigger, "index.trigger", MAX_TRIGGER_CHARS)?;
-        if self.eligible_routes.is_empty() && self.eligible_profiles.is_empty() {
+        if self.eligible_routes.is_empty()
+            && self.eligible_profiles.is_empty()
+            && self.eligible_policies.is_empty()
+        {
             return Err(SkillError::InvalidField {
                 field: "index.eligibility",
-                reason: "at least one eligible route or profile is required",
+                reason: "at least one eligible route, profile, or policy is required",
             });
         }
         check_unique(&self.eligible_routes, "index.eligible_routes")?;
         check_unique(&self.eligible_profiles, "index.eligible_profiles")?;
+        check_unique(&self.eligible_policies, "index.eligible_policies")?;
         Ok(())
     }
 }
@@ -247,7 +268,11 @@ impl SkillBody {
             });
         }
         check_unique(&self.where_not_apply, "body.where_not_apply")?;
+        for clause in &self.where_not_apply {
+            check_no_authority_claim(clause, "body.where_not_apply")?;
+        }
         check_text(&self.stop_escalation, "body.stop_escalation")?;
+        check_no_authority_claim(&self.stop_escalation, "body.stop_escalation")?;
         if self.stop_escalation.lines().count() != 1 {
             return Err(SkillError::InvalidField {
                 field: "body.stop_escalation",
@@ -351,6 +376,11 @@ impl SkillRuntimeMetadata {
 
 /// One validated catalogue entry: index plus body plus runtime plus the
 /// visible host/profile/dependency versions (`I7.12` + `I7.13`).
+///
+/// The entry is the canonical metadata record (issue #1882 W1): besides the
+/// trigger, body, runtime, budgets, dependencies, and status it binds the
+/// policy eligibility, the admitted scope, the persisted structural-validation
+/// results, and the promotion evidence that lifted it past provisional.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillCatalogueEntry {
@@ -360,8 +390,22 @@ pub struct SkillCatalogueEntry {
     pub dependencies: Vec<DependencyVersion>,
     pub host_version: String,
     pub profile_version: String,
+    /// Tool Definition version this entry was admitted under. Bound at
+    /// install from the Governor-admitted version and rechecked against the
+    /// live canonical source on the versioned paths: a registry move past
+    /// this version marks the entry stale until reinstall.
+    pub admitted_definition_version: String,
     pub status: SkillStatus,
     pub stale_reason: Option<String>,
+    /// Admitted scope binding: the Governor-owned scope this entry was
+    /// installed for. Display and delivery carry it, so a scoped entry is
+    /// never representable as generally admitted.
+    pub scope: SkillScope,
+    /// Persisted structural-validation results for this body revision.
+    pub validation: StructuralValidationReport,
+    /// Promotion evidence bound at promotion time. `None` until the
+    /// evidence path lifts the entry past provisional.
+    pub promotion_evidence: Option<PromotionEvidence>,
 }
 
 impl SkillCatalogueEntry {
@@ -389,6 +433,21 @@ impl SkillCatalogueEntry {
         }
         check_text(&self.host_version, "entry.host_version")?;
         check_text(&self.profile_version, "entry.profile_version")?;
+        check_text(
+            &self.admitted_definition_version,
+            "entry.admitted_definition_version",
+        )?;
+        self.scope.validate()?;
+        self.validation.validate()?;
+        if self.validation.skill_id != self.index.skill_id
+            || self.validation.body_version != self.body.body_version
+            || self.validation.body_digest != self.body.body_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if let Some(evidence) = &self.promotion_evidence {
+            evidence.validate()?;
+        }
         match self.status {
             SkillStatus::Stale | SkillStatus::Quarantined => {
                 let reason = self.stale_reason.as_deref().unwrap_or("");
@@ -454,6 +513,166 @@ impl PromotionEvidence {
         }
         Ok(())
     }
+
+    /// Canonical digest binding this evidence, for display and receipt-chain
+    /// bindings. Recomputed wherever the evidence is bound, never stored
+    /// beside it.
+    pub fn evidence_digest(&self) -> Result<String, SkillError> {
+        canonical_digest(
+            &(
+                self.independent_route_count,
+                &self.route_refs,
+                &self.human_approval_ref,
+                self.is_shared_or_critical,
+            ),
+            "promotion.evidence",
+        )
+    }
+}
+
+/// Name of one persisted structural check (`I7.13` validation rule).
+pub const CHECK_INDEX_ELIGIBILITY_TRIGGER: &str = "index.eligibility_trigger";
+pub const CHECK_BODY_STRUCTURE: &str = "body.structure";
+pub const CHECK_RUNTIME_BUDGETS: &str = "runtime.budgets";
+pub const CHECK_ENTRY_IDENTITY: &str = "entry.identity";
+pub const CHECK_ENTRY_VERSIONS: &str = "entry.versions";
+
+/// One persisted structural-check outcome: the check ran and this is what it
+/// found. A report is only ever recorded when every check passed — any
+/// failure fails the projection closed before the entry exists — so a stored
+/// `passed: false` fails validation rather than describing a live entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuralCheckRecord {
+    pub check: String,
+    pub passed: bool,
+}
+
+/// Persisted structural-validation results bound to one body revision
+/// (`I7.13`, issue #1882 W1).
+///
+/// Structural validation used to run transiently inside entry validation and
+/// leave no record: an activated Skill could not show WHICH checks its body
+/// passed. The report persists the outcome per body revision and binds it by
+/// digest, so the activation display and the receipt chain resolve to the
+/// exact validation record instead of re-stating that "validation ran".
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuralValidationReport {
+    pub skill_id: String,
+    pub body_version: String,
+    pub body_digest: String,
+    pub checks: Vec<StructuralCheckRecord>,
+    pub report_digest: String,
+}
+
+impl StructuralValidationReport {
+    fn identity_digest(&self) -> Result<String, SkillError> {
+        canonical_digest(
+            &(
+                &self.skill_id,
+                &self.body_version,
+                &self.body_digest,
+                &self.checks,
+            ),
+            "validation.report",
+        )
+    }
+
+    /// Runs the structural checks over projected entry parts and records the
+    /// outcome. Every check runs exactly as entry validation runs it; the
+    /// first failure fails closed with its own field, so a returned report
+    /// always records checks that ran and passed for this exact body digest.
+    pub fn record(
+        index: &SkillIndexEntry,
+        body: &SkillBody,
+        runtime: &SkillRuntimeMetadata,
+        dependencies: &[DependencyVersion],
+        host_version: &str,
+        profile_version: &str,
+        admitted_definition_version: &str,
+    ) -> Result<Self, SkillError> {
+        index.validate()?;
+        body.validate()?;
+        runtime.validate()?;
+        if index.skill_id != body.skill_id || index.skill_id != runtime.skill_id {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if body.body_version != runtime.body_version {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let mut sorted = dependencies.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        if sorted.len() != dependencies.len() {
+            return Err(SkillError::Duplicate {
+                field: "entry.dependencies",
+            });
+        }
+        for dependency in dependencies {
+            dependency.validate()?;
+        }
+        check_text(host_version, "entry.host_version")?;
+        check_text(profile_version, "entry.profile_version")?;
+        check_text(
+            admitted_definition_version,
+            "entry.admitted_definition_version",
+        )?;
+        let mut report = Self {
+            skill_id: index.skill_id.clone(),
+            body_version: body.body_version.clone(),
+            body_digest: body.body_digest.clone(),
+            checks: [
+                CHECK_INDEX_ELIGIBILITY_TRIGGER,
+                CHECK_BODY_STRUCTURE,
+                CHECK_RUNTIME_BUDGETS,
+                CHECK_ENTRY_IDENTITY,
+                CHECK_ENTRY_VERSIONS,
+            ]
+            .iter()
+            .map(|check| StructuralCheckRecord {
+                check: (*check).to_owned(),
+                passed: true,
+            })
+            .collect(),
+            report_digest: String::new(),
+        };
+        report.report_digest = report.identity_digest()?;
+        report.validate()?;
+        Ok(report)
+    }
+
+    pub fn validate(&self) -> Result<(), SkillError> {
+        check_text(&self.skill_id, "validation.skill_id")?;
+        check_text(&self.body_version, "validation.body_version")?;
+        check_digest(&self.body_digest, "validation.body_digest")?;
+        if self.checks.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "validation.checks",
+                reason: "at least one recorded structural check is required",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for record in &self.checks {
+            check_text(&record.check, "validation.check")?;
+            if !seen.insert(record.check.clone()) {
+                return Err(SkillError::Duplicate {
+                    field: "validation.check",
+                });
+            }
+            if !record.passed {
+                return Err(SkillError::InvalidField {
+                    field: "validation.checks",
+                    reason: "a recorded structural check failed",
+                });
+            }
+        }
+        check_digest(&self.report_digest, "validation.report_digest")?;
+        if self.identity_digest()? != self.report_digest {
+            return Err(SkillError::IdentityMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Governor-owned Skill catalogue keyed by stable Skill identity.
@@ -492,6 +711,14 @@ impl SkillCatalogue {
     #[must_use]
     pub fn get(&self, skill_id: &str) -> Option<&SkillCatalogueEntry> {
         self.entries.get(skill_id)
+    }
+
+    /// Returns every installed Skill identity in stable order. The
+    /// reconciliation driver uses it to visit standing entries without
+    /// holding entry borrows across the marks that may follow.
+    #[must_use]
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
     }
 
     #[must_use]
@@ -556,11 +783,91 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Marks the entry stale when the live Tool Definition version moved
+    /// past the version the entry was admitted under (`I7.13`).
+    ///
+    /// A changed Tool Definition version marks the Skill stale: the delivery
+    /// act admitted `admitted_version`, while the live canonical source now
+    /// binds `live_version`. The entry keeps its pinned state and gains a
+    /// `Stale` status with a reason naming both versions, blocking Material
+    /// use and redelivery until revalidated (reinstall under the new
+    /// version) or governed review. Quarantined and already-stale entries
+    /// report no change, as does agreement (no drift to mark). Returns `true`
+    /// when the entry became stale.
+    pub fn mark_definition_drift_stale(
+        &mut self,
+        skill_id: &str,
+        live_version: &str,
+        admitted_version: &str,
+    ) -> Result<bool, SkillError> {
+        check_text(live_version, "entry.definition_version")?;
+        check_text(admitted_version, "entry.admitted_version")?;
+        if live_version == admitted_version {
+            return Err(SkillError::InvalidField {
+                field: "entry.definition_version",
+                reason: "no version drift to mark",
+            });
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "tool definition drift: admitted {admitted_version}, live {live_version}"
+        ));
+        entry.validate()?;
+        Ok(true)
+    }
+
+    /// Marks the entry stale when its declared tool references no longer
+    /// resolve against the tool owner's view (`I7.13`).
+    ///
+    /// A changed host/tool/contract dependency marks the Skill stale: when
+    /// one or more `body.tool_refs` are unknown to the owner's `KnownTools`
+    /// view, the entry's tool basis changed out from under the installed
+    /// body. The entry keeps its pinned versions and gains a `Stale` status
+    /// with a reason naming every missing tool, blocking Material use and
+    /// redelivery until revalidated (reinstall) or governed review.
+    /// Quarantined entries are left untouched, mirroring
+    /// [`note_dependency_change`](Self::note_dependency_change); already-stale
+    /// entries report no change. Returns `true` when the entry became stale.
+    pub fn mark_tool_basis_stale(
+        &mut self,
+        skill_id: &str,
+        missing_tools: &[String],
+    ) -> Result<bool, SkillError> {
+        if missing_tools.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "entry.tool_basis",
+                reason: "at least one missing tool is required to mark the basis stale",
+            });
+        }
+        for tool in missing_tools {
+            check_text(tool, "entry.tool_basis")?;
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "tool basis changed: {} no longer known to the canonical tool view",
+            missing_tools.join(", ")
+        ));
+        entry.validate()?;
+        Ok(true)
+    }
+
     /// Promotes a provisional entry to current when the proportional depth
     /// rule holds (`I7.13`): one matching real route for host/task-specific
     /// Skills; two materially different routes plus approval for shared or
     /// Material/Critical instructions. Approval alone never certifies
-    /// cross-route validity.
+    /// cross-route validity. The bound evidence persists on the entry, so
+    /// later display and receipt chains resolve to the exact promotion
+    /// record instead of re-stating that "evidence existed".
     pub fn promote(
         &mut self,
         skill_id: &str,
@@ -579,6 +886,7 @@ impl SkillCatalogue {
                     return Err(SkillError::IndependentEvidenceRequired);
                 }
                 entry.status = SkillStatus::Current;
+                entry.promotion_evidence = Some(evidence.clone());
                 entry.validate()?;
                 Ok(())
             }
@@ -647,11 +955,34 @@ impl SkillCatalogue {
                 reason: "activation requires a delivery receipt for this Skill",
             });
         }
+        let catalogue_digest = receipt.catalogue_digest.clone();
+        let validation_digest = entry.validation.report_digest.clone();
+        let promotion_digest = entry
+            .promotion_evidence
+            .as_ref()
+            .map(PromotionEvidence::evidence_digest)
+            .transpose()?;
+        let receipt_chain_digest = canonical_digest(
+            &(
+                &validation_digest,
+                &catalogue_digest,
+                &receipt.receipt_digest,
+                &receipt.hotset_id,
+                &ack.receiver_id,
+                &ack.hotset_id,
+                match ack.disposition {
+                    HotsetAckDisposition::Applied => "applied",
+                    HotsetAckDisposition::Rejected { .. } => "rejected",
+                },
+            ),
+            "activation.receipt_chain",
+        )?;
         Ok(ActivatedSkillDisplay {
             skill_id: entry.index.skill_id.clone(),
             trigger: entry.index.trigger.clone(),
             body_version: entry.body.body_version.clone(),
             body_digest: entry.body.body_digest.clone(),
+            status: entry.status,
             index_tokens: entry.runtime.index_tokens,
             body_tokens: entry.runtime.body_tokens,
             runtime_tokens: entry.runtime.runtime_tokens,
@@ -661,9 +992,15 @@ impl SkillCatalogue {
             dependency_versions: entry.dependencies.clone(),
             eligible_routes: entry.index.eligible_routes.clone(),
             eligible_profiles: entry.index.eligible_profiles.clone(),
+            eligible_policies: entry.index.eligible_policies.clone(),
             host_version: entry.host_version.clone(),
             profile_version: entry.profile_version.clone(),
+            scope: entry.scope.clone(),
+            validation_digest,
+            promotion_digest,
+            catalogue_digest,
             delivery_receipt_digest: receipt.receipt_digest.clone(),
+            receipt_chain_digest,
         })
     }
 }
@@ -732,6 +1069,14 @@ impl HotsetDeliveryAck {
 /// a different order yields the same receipt. Delivery never implies
 /// usefulness or causal credit; it proves only that the Hotset carried
 /// the Skill.
+///
+/// The receipt carries its delivery ceiling explicitly: `provisional` is
+/// `false` only when every delivered Skill was `Current` at issuance, and
+/// `true` whenever any delivered Skill is `Provisional`, so bounded
+/// provisional use (`I7.13`: scoped/provisional without independent transfer
+/// evidence) is never representable as current-grade delivery. The flag is
+/// bound into the receipt digest; the per-Skill truth stays with the
+/// catalogue entry status and is shown on the activation display.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HotsetDeliveryReceipt {
@@ -743,6 +1088,8 @@ pub struct HotsetDeliveryReceipt {
     /// approval or canonical commit receipt, bound by the injector). A
     /// non-blank Hotset identity alone never authorizes issuance.
     pub approval_ref: String,
+    /// Delivery ceiling: `true` when any delivered Skill is `Provisional`.
+    pub provisional: bool,
     pub receipt_digest: String,
 }
 
@@ -755,6 +1102,7 @@ impl HotsetDeliveryReceipt {
                 &self.delivered_skill_ids,
                 &self.body_digests,
                 &self.approval_ref,
+                &self.provisional,
             ),
             "delivery.receipt",
         )
@@ -784,6 +1132,7 @@ impl HotsetDeliveryReceipt {
         check_unique(&delivered_skill_ids, "delivery.delivered_skill_ids")?;
         let catalogue_digest = catalogue.catalogue_digest()?;
         let mut body_digests = BTreeMap::new();
+        let mut provisional = false;
         let mut ordered_ids = delivered_skill_ids;
         ordered_ids.sort();
         for skill_id in &ordered_ids {
@@ -796,6 +1145,9 @@ impl HotsetDeliveryReceipt {
                     reason: "stale or retired Skills cannot be delivered",
                 });
             }
+            if entry.status != SkillStatus::Current {
+                provisional = true;
+            }
             body_digests.insert(skill_id.clone(), entry.body.body_digest.clone());
         }
         let mut receipt = Self {
@@ -804,6 +1156,7 @@ impl HotsetDeliveryReceipt {
             delivered_skill_ids: ordered_ids,
             body_digests,
             approval_ref,
+            provisional,
             receipt_digest: String::new(),
         };
         receipt.receipt_digest = receipt.identity_digest()?;
@@ -852,6 +1205,13 @@ impl HotsetDeliveryReceipt {
 }
 
 /// Activated Skill view: everything an activation must display.
+///
+/// Besides the trigger, body, budgets, dependencies, eligibility, and
+/// delivery receipt, the view binds the records an acceptance needs to
+/// resolve (issue #1882 A3): the persisted structural-validation record, the
+/// catalogue state the receipt bound (including entry statuses, so staleness
+/// is observable), and the exact receiver ack — all folded into the receipt
+/// chain digest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivatedSkillDisplay {
@@ -859,6 +1219,10 @@ pub struct ActivatedSkillDisplay {
     pub trigger: String,
     pub body_version: String,
     pub body_digest: String,
+    /// Entry status at display time: only `Current` or `Provisional` can
+    /// display (usability gate above). The status is the visible delivery
+    /// ceiling — a provisional activation never renders as current-grade.
+    pub status: SkillStatus,
     pub index_tokens: u32,
     pub body_tokens: u32,
     pub runtime_tokens: u32,
@@ -868,9 +1232,25 @@ pub struct ActivatedSkillDisplay {
     pub dependency_versions: Vec<DependencyVersion>,
     pub eligible_routes: Vec<String>,
     pub eligible_profiles: Vec<String>,
+    pub eligible_policies: Vec<String>,
     pub host_version: String,
     pub profile_version: String,
+    /// Admitted scope binding carried from the entry, so a scoped activation
+    /// never renders as generally admitted.
+    pub scope: SkillScope,
+    /// Digest of the persisted structural-validation report for this body
+    /// revision (validation record binding).
+    pub validation_digest: String,
+    /// Digest of the promotion evidence that lifted the entry past
+    /// provisional, when any (promotion record binding).
+    pub promotion_digest: Option<String>,
+    /// Catalogue digest the delivery receipt bound (staleness record
+    /// binding: the digest covers every entry status).
+    pub catalogue_digest: String,
     pub delivery_receipt_digest: String,
+    /// Receipt chain binding validation + catalogue-staleness + delivery-ack
+    /// records for this activation.
+    pub receipt_chain_digest: String,
 }
 
 impl ActivatedSkillDisplay {
@@ -879,18 +1259,38 @@ impl ActivatedSkillDisplay {
         check_single_line(&self.trigger, "activation.trigger", MAX_TRIGGER_CHARS)?;
         check_text(&self.body_version, "activation.body_version")?;
         check_digest(&self.body_digest, "activation.body_digest")?;
+        if !matches!(self.status, SkillStatus::Current | SkillStatus::Provisional) {
+            return Err(SkillError::InvalidField {
+                field: "activation.status",
+                reason: "only current or provisional Skills display",
+            });
+        }
         check_digest(
             &self.delivery_receipt_digest,
             "activation.delivery_receipt_digest",
         )?;
+        check_digest(&self.validation_digest, "activation.validation_digest")?;
+        if let Some(promotion) = &self.promotion_digest {
+            check_digest(promotion, "activation.promotion_digest")?;
+        }
+        check_digest(&self.catalogue_digest, "activation.catalogue_digest")?;
+        check_digest(
+            &self.receipt_chain_digest,
+            "activation.receipt_chain_digest",
+        )?;
         check_text(&self.host_version, "activation.host_version")?;
         check_text(&self.profile_version, "activation.profile_version")?;
-        if self.eligible_routes.is_empty() && self.eligible_profiles.is_empty() {
+        self.scope.validate()?;
+        if self.eligible_routes.is_empty()
+            && self.eligible_profiles.is_empty()
+            && self.eligible_policies.is_empty()
+        {
             return Err(SkillError::InvalidField {
                 field: "activation.eligibility",
-                reason: "at least one eligible route or profile is required",
+                reason: "at least one eligible route, profile, or policy is required",
             });
         }
+        check_unique(&self.eligible_policies, "activation.eligible_policies")?;
         for dependency in &self.dependency_versions {
             dependency.validate()?;
         }
@@ -903,6 +1303,14 @@ impl ActivatedSkillDisplay {
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("skill {} | {}", self.skill_id, self.trigger));
+        lines.push(format!(
+            "status {}",
+            match self.status {
+                SkillStatus::Current => "current",
+                SkillStatus::Provisional => "provisional",
+                _ => "blocked",
+            }
+        ));
         lines.push(format!(
             "body {} digest {}",
             self.body_version, self.body_digest
@@ -944,7 +1352,24 @@ impl ActivatedSkillDisplay {
             self.host_version,
             self.profile_version
         ));
+        lines.push(format!(
+            "eligible policies [{}]",
+            self.eligible_policies.join(", ")
+        ));
+        lines.push(format!(
+            "scope task {} host {} route {} governance {}",
+            self.scope.task_scope, self.scope.host, self.scope.route, self.scope.governance_scope
+        ));
+        lines.push(format!("validation {}", self.validation_digest));
+        lines.push(format!(
+            "promotion {}",
+            self.promotion_digest.as_deref().unwrap_or("none")
+        ));
         lines.push(format!("delivery receipt {}", self.delivery_receipt_digest));
+        lines.push(format!(
+            "receipt chain {} (catalogue {})",
+            self.receipt_chain_digest, self.catalogue_digest
+        ));
         lines.join("\n")
     }
 }
@@ -987,6 +1412,7 @@ mod tests {
             trigger: format!("when {skill_id} work arrives load this skill"),
             eligible_routes: vec!["route-1".to_owned()],
             eligible_profiles: vec!["profile-1".to_owned()],
+            eligible_policies: vec!["policy-1".to_owned()],
         }
     }
 
@@ -1031,16 +1457,46 @@ mod tests {
         }
     }
 
+    fn scope() -> SkillScope {
+        SkillScope {
+            task_scope: "task-scope-1".to_owned(),
+            host: "host-1".to_owned(),
+            route: "route-1".to_owned(),
+            governance_scope: "governance-1".to_owned(),
+        }
+    }
+
     fn entry(skill_id: &str) -> SkillCatalogueEntry {
+        let index = index(skill_id);
+        let body = body(skill_id, "1.0.0");
+        let runtime = runtime(skill_id, "1.0.0");
+        let dependencies = vec![dependency("tool-def-1")];
+        let host_version = "host-4.1.0".to_owned();
+        let profile_version = "profile-2.0.0".to_owned();
+        let admitted_definition_version = "1.2.0".to_owned();
+        let validation = StructuralValidationReport::record(
+            &index,
+            &body,
+            &runtime,
+            &dependencies,
+            &host_version,
+            &profile_version,
+            &admitted_definition_version,
+        )
+        .expect("test validation report");
         SkillCatalogueEntry {
-            index: index(skill_id),
-            body: body(skill_id, "1.0.0"),
-            runtime: runtime(skill_id, "1.0.0"),
-            dependencies: vec![dependency("tool-def-1")],
-            host_version: "host-4.1.0".to_owned(),
-            profile_version: "profile-2.0.0".to_owned(),
+            index,
+            body,
+            runtime,
+            dependencies,
+            host_version,
+            profile_version,
+            admitted_definition_version,
             status: SkillStatus::Provisional,
             stale_reason: None,
+            scope: scope(),
+            validation,
+            promotion_evidence: None,
         }
     }
 
@@ -1100,6 +1556,161 @@ mod tests {
         assert!(rendered.contains("route-1"));
         assert!(rendered.contains("profile-1"));
         assert!(rendered.contains(&receipt.receipt_digest));
+    }
+
+    #[test]
+    fn delivery_ceiling_is_provisional_until_evidence_promotion() {
+        // Provisional entry: the receipt and the display both carry the
+        // provisional ceiling — absence of verification never mints
+        // current-grade artifacts.
+        let mut catalogue = catalogue_two();
+        let provisional_receipt = HotsetDeliveryReceipt::issue(
+            "hotset-1".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "approval-commit-1".to_owned(),
+        )
+        .expect("delivery receipt");
+        assert!(provisional_receipt.provisional);
+        let provisional_display = catalogue
+            .activation_display(
+                "skill-alpha",
+                &provisional_receipt,
+                &applied_ack(&provisional_receipt),
+                &tools(),
+            )
+            .expect("activation display");
+        assert_eq!(provisional_display.status, SkillStatus::Provisional);
+        assert!(provisional_display.render().contains("status provisional"));
+
+        // Evidence promotion to Current (I7.13 depth rule) lifts the ceiling
+        // on later receipts and displays — the only path past provisional.
+        promote_current(&mut catalogue, "skill-alpha");
+        let current_receipt = HotsetDeliveryReceipt::issue(
+            "hotset-2".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "approval-commit-2".to_owned(),
+        )
+        .expect("delivery receipt");
+        assert!(!current_receipt.provisional);
+        let current_display = catalogue
+            .activation_display(
+                "skill-alpha",
+                &current_receipt,
+                &applied_ack(&current_receipt),
+                &tools(),
+            )
+            .expect("activation display");
+        assert_eq!(current_display.status, SkillStatus::Current);
+        assert!(current_display.render().contains("status current"));
+    }
+
+    #[test]
+    fn removed_tool_basis_marks_stale_until_revalidated() {
+        // #1882 acceptance: a changed tool dependency marks the Skill stale.
+        // The entry keeps its pinned versions and gains a Stale status naming
+        // the missing tool, blocking Material use and redelivery.
+        let mut catalogue = catalogue_two();
+        assert!(
+            catalogue
+                .mark_tool_basis_stale("skill-alpha", &["eliot.finish".to_owned()])
+                .expect("mark stale")
+        );
+        let stored = catalogue.get("skill-alpha").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Stale);
+        assert!(
+            stored
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("eliot.finish")
+        );
+        assert_eq!(stored.dependencies, vec![dependency("tool-def-1")]);
+        assert!(!catalogue.is_usable("skill-alpha"));
+        // Repeat marking reports no change; the sibling entry is untouched.
+        assert!(
+            !catalogue
+                .mark_tool_basis_stale("skill-alpha", &["eliot.finish".to_owned()])
+                .expect("repeat mark")
+        );
+        assert!(catalogue.is_usable("skill-beta"));
+        // Empty basis and unknown skills fail closed; quarantine is governed.
+        assert!(matches!(
+            catalogue.mark_tool_basis_stale("skill-alpha", &[]),
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.tool_basis"
+        ));
+        assert!(matches!(
+            catalogue.mark_tool_basis_stale("skill-missing", &["eliot.finish".to_owned()]),
+            Err(SkillError::NotFound)
+        ));
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut held =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        assert!(
+            !held
+                .mark_tool_basis_stale("skill-quarantined", &["eliot.finish".to_owned()])
+                .expect("quarantine preserved")
+        );
+        let stored = held.get("skill-quarantined").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Quarantined);
+        assert_eq!(stored.stale_reason.as_deref(), Some("governed review hold"));
+    }
+
+    #[test]
+    fn definition_drift_marks_stale_with_both_versions_named() {
+        // The live registry moved past the admitted definition version: the
+        // entry keeps its pinned state and gains a Stale status blocking
+        // Material use and redelivery until reinstall under the new version.
+        let mut catalogue = catalogue_two();
+        assert!(
+            catalogue
+                .mark_definition_drift_stale("skill-alpha", "9.9.9", "1.2.0")
+                .expect("mark drift")
+        );
+        let stored = catalogue.get("skill-alpha").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Stale);
+        assert!(
+            stored
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("admitted 1.2.0, live 9.9.9")
+        );
+        assert!(!catalogue.is_usable("skill-alpha"));
+        assert!(catalogue.is_usable("skill-beta"));
+        // Agreement, repeat, quarantine, blanks, and unknown skills.
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-alpha", "1.2.0", "1.2.0"),
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.definition_version"
+        ));
+        assert!(
+            !catalogue
+                .mark_definition_drift_stale("skill-alpha", "9.9.9", "1.2.0")
+                .expect("repeat drift")
+        );
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut held =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        assert!(
+            !held
+                .mark_definition_drift_stale("skill-quarantined", "9.9.9", "1.2.0")
+                .expect("quarantine preserved")
+        );
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-alpha", "   ", "1.2.0"),
+            Err(SkillError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-missing", "9.9.9", "1.2.0"),
+            Err(SkillError::NotFound)
+        ));
     }
 
     #[test]
@@ -1234,6 +1845,16 @@ mod tests {
         let mut revised = entry("skill-alpha");
         revised.body = body("skill-alpha", "2.0.0");
         revised.runtime = runtime("skill-alpha", "2.0.0");
+        revised.validation = StructuralValidationReport::record(
+            &revised.index,
+            &revised.body,
+            &revised.runtime,
+            &revised.dependencies,
+            &revised.host_version,
+            &revised.profile_version,
+            &revised.admitted_definition_version,
+        )
+        .expect("revised validation report");
         catalogue.insert(revised, &tools()).expect("revised entry");
         assert!(matches!(
             catalogue.activation_display("skill-alpha", &stale, &applied_ack(&stale), &tools()),
@@ -1284,6 +1905,16 @@ mod tests {
         let mut unknown = entry("skill-unknown-tool");
         unknown.body.tool_refs = vec!["phantom.missing".to_owned()];
         unknown.body.body_digest = digest_for(&unknown.body);
+        unknown.validation = StructuralValidationReport::record(
+            &unknown.index,
+            &unknown.body,
+            &unknown.runtime,
+            &unknown.dependencies,
+            &unknown.host_version,
+            &unknown.profile_version,
+            &unknown.admitted_definition_version,
+        )
+        .expect("re-recorded validation report");
         let mut catalogue = catalogue_two();
         assert!(matches!(
             catalogue.insert(unknown, &tools()),

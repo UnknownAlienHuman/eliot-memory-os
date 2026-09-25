@@ -31,8 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_skill::{
-    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, PromotionGate,
-    SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView, SkillRegistry,
+    ActivatedSkillDisplay, CanonicalToolSource, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    KnownTools, PromotionGate, SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView,
+    SkillRegistry,
 };
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
@@ -68,6 +69,30 @@ impl<'a, P: ?Sized> GovernorSkillLifecycle<'a, P> {
             kernel,
         }
     }
+}
+
+/// Builds the live canonical tool source the Skill delivery driver runs on
+/// (issue #1882).
+///
+/// Constructs the single production registry value from the Tool Definition
+/// owner (`eliot-mcp`) and returns it behind the Skill-owned
+/// [`CanonicalToolSource`] port together with the definition version the
+/// Governor admits. Both halves come from the same registry value: the
+/// admitted version is the version the source itself binds, so no definition
+/// literal lives in Governor or daemon code, and a Tool Definition change
+/// re-admits at this boundary instead of drifting silently. Drivers pass the
+/// pair into the versioned delivery act; the admitted-version gate there
+/// still refuses any source the composition did not admit.
+///
+/// A registry-build failure surfaces as [`SkillError::Surface`]: the tool
+/// authority is unavailable, never defaulted. Skill delivery is an optional
+/// capability, so callers degrade only the skill path (never daemon
+/// readiness) on this error.
+pub fn canonical_skill_tool_source() -> Result<(Box<dyn CanonicalToolSource>, String), SkillError> {
+    let registry =
+        eliot_mcp::canonical_registry().map_err(|error| SkillError::Surface(error.to_string()))?;
+    let admitted = registry.definition_version().to_owned();
+    Ok((Box::new(registry), admitted))
 }
 
 /// Reconstructs the production adapter manifest digest.
@@ -695,6 +720,12 @@ mod tests {
                     projection_refs: Vec::new(),
                     outbox_refs: Vec::new(),
                     operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    // Issue-#18 bindings are copied exactly from the admitted
+                    // transition, never defaulted; equality is enforced by
+                    // the receipt-issuing path below.
+                    admission_digest: transition.admission_digest.clone(),
+                    mutation_plan_digest: transition.mutation_plan_digest.clone(),
+                    semantic_source_revisions: transition.semantic_source_revisions.clone(),
                     error_code: None,
                     resubmission: eliot_store_api::Resubmission::None,
                     committed_at: Some(format!("commit-sequence-{sequence:016}")),
@@ -820,6 +851,7 @@ mod tests {
             verifier_ref: "verifier-1".to_owned(),
             evidence_refs: vec!["evidence-1".to_owned()],
             independent_route_count: 1,
+            is_shared_or_critical: false,
             human_approval_ref: None,
             reversible: true,
             state_fence: fence.clone(),
@@ -875,6 +907,19 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tool_source_hook_pins_the_live_registry_version() {
+        // Real tools owner, no fixtures: the hook builds the production
+        // registry and the admitted version is exactly what the frozen Tool
+        // Definition revision binds — pinned by the callee through the owned
+        // port, never by a Governor or daemon literal.
+        let (source, admitted) = canonical_skill_tool_source().expect("live registry builds");
+        assert_eq!(admitted, eliot_mcp::CANONICAL_DEFINITION_VERSION);
+        assert_eq!(source.definition_version(), admitted);
+        assert!(!admitted.trim().is_empty());
+        assert!(!source.knows_canonical_tool(""));
+    }
+
+    #[test]
     fn governor_display_fails_closed_without_catalogue_bodies() {
         let fence = fence();
         let base = base_view(&fence);
@@ -889,6 +934,7 @@ mod tests {
             delivered_skill_ids: vec!["skill-demo".to_owned()],
             body_digests: BTreeMap::new(),
             approval_ref: "approval-1".to_owned(),
+            provisional: true,
             receipt_digest: "d".repeat(64),
         };
         let ack = HotsetDeliveryAck {

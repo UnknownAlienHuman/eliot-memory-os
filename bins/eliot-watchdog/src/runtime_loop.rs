@@ -75,8 +75,7 @@ pub(super) fn run_watchdog(
         bootstrap,
         &stop_signal,
         heartbeat.clone(),
-    )?
-    {
+    )? {
         Some(admission) => {
             tracing::info!(
                 event = "watchdog.admission_reconciled",

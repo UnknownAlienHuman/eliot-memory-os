@@ -21,15 +21,17 @@ pub use break_glass::{
     BreakGlassAuthorization, BreakGlassAuthorizationId, BreakGlassPermit, BreakGlassState,
 };
 pub use effects::{
-    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord,
-    EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION, EffectAuthorizer,
-    EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt, ProposedEffect,
+    ActionContract, AuthorizedEffect, AuthorizedEffectRecoveryRecord, ContestedEffectAnnotation,
+    DependentEffectState, EFFECT_AUTHORIZER_RECOVERY_SCHEMA, EFFECT_AUTHORIZER_RECOVERY_VERSION,
+    EffectAuthorizer, EffectAuthorizerRecoverySnapshot, EffectOutcome, EffectReceipt,
+    ProposedEffect,
 };
 pub use grants::{
     AuthoritySet, CapabilityGrant, CapabilityIntroduction, EffectiveCapabilityPath,
     EffectiveCapabilitySnapshot, GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION,
-    GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
-    IntroductionId, IntroductionStatus, LogicalTime, PrincipalRef, ReceiptObligation, SnapshotId,
+    GrantClosureDelegation, GrantClosureMemberRef, GrantGraph, GrantGraphRecoverySnapshot, GrantId,
+    GrantRecoveryRecord, GrantStatus, IntroductionId, IntroductionStatus, LogicalTime,
+    PrincipalRef, ReceiptObligation, SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
 pub use revocation_history::{
@@ -64,6 +66,9 @@ pub enum AuthorityError {
     InvalidLifecycleTransition,
     ReceiptMismatch,
     P07Unavailable,
+    /// The bounded influence evaluator refused a typed request, snapshot, or
+    /// continuation; the cause is preserved for recovery diagnostics.
+    BoundedRevocation(eliot_influence::InfluenceError),
 }
 
 impl fmt::Display for AuthorityError {
@@ -95,6 +100,9 @@ impl fmt::Display for AuthorityError {
                 formatter.write_str("effect receipt does not match authorization")
             }
             Self::P07Unavailable => formatter.write_str("P-07 activation port is unavailable"),
+            Self::BoundedRevocation(error) => {
+                write!(formatter, "bounded revocation refused: {error}")
+            }
         }
     }
 }

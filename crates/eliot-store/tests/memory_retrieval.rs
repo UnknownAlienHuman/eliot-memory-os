@@ -1,12 +1,12 @@
 use eliot_store::{BlobStore, CanonicalStore};
 use eliot_types::{
-    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, CueKind, CueMatchMode,
-    CueStrength, EpistemicStatus, EvidenceAtomInput, EvidenceId, FailureFingerprintInput,
-    FetchAtomsL2Request, GovernorConfig, IdempotencyOptions, LifecycleStatus,
-    LifecycleWriteOptions, MemoryConfidence, MemoryWriteEnvelope, OperationId, ProjectId,
-    ProjectSequence, ReadConsistencyMode, RecallL0Request, RelationInput, RelationType,
-    SemanticCommandKind, SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility,
-    WriteId, WriteStatus,
+    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, CueMatchMode, CueStrength,
+    EpistemicStatus, EvidenceAtomInput, EvidenceId, FailureFingerprintInput, FetchAtomsL2Request,
+    GovernorConfig, IdempotencyOptions, LegacyCueKindV1, LifecycleStatus, LifecycleWriteOptions,
+    MemoryConfidence, MemoryWriteEnvelope, OperationId, ProjectId, ProjectSequence,
+    ReadConsistencyMode, RecallL0Request, RelationInput, RelationType, SemanticCommandKind,
+    SurrealServerConfig, TaintClass, TaskId, ToolObservationInput, Visibility, WriteId,
+    WriteStatus,
 };
 use serde_json::json;
 use std::error::Error;
@@ -136,7 +136,7 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
         "text/plain; charset=utf-8",
         &payload,
         vec![CueBinding {
-            cue_kind: CueKind::Concept,
+            cue_kind: LegacyCueKindV1::Concept,
             cue_value: "capacity-l2-tail".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

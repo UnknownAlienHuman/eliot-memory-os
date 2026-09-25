@@ -1,0 +1,3 @@
+# Transitive revocation fixture: single chain origin -> mid -> leaf.
+origin:alpha mid:beta
+mid:beta leaf:gamma

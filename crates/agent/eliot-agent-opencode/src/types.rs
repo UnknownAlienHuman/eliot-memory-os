@@ -1,17 +1,17 @@
 use std::{collections::BTreeMap, path::Path};
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, AssistantDeltaObservation,
+    AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, AssistantDeltaObservation, AttemptState,
     CONTRACT_VERSION, CancellationState, ClockReading, ContractError, ErrorObservation,
     EventCursor, EventId, ExecutionOutcome, HOST_EVENT_CONTRACT_VERSION,
     HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
-    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ProviderObservationLineage, ProviderTerminalObservation, ProviderTerminalStatus,
-    QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle, RouteFingerprint,
-    RouteObservationState, SessionLifecycleObservation, SessionLifecycleTransition,
-    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
-    WarningObservation, route_divergence_fields,
+    HostEventPrivacyClass, LowercaseSha256, NativeSession, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalObservation,
+    ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle,
+    RouteFingerprint, RouteObservationState, SessionLifecycleObservation,
+    SessionLifecycleTransition, UnsupportedDisposition, UnsupportedEventObservation,
+    UnsupportedEventReason, UsageReceipt, WarningObservation, route_divergence_fields,
 };
 use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
@@ -724,8 +724,9 @@ pub enum RunRequestError {
 /// public edge imports it as the canonical receipt (verified zero hits at
 /// this base). Conversion of its model/session/endpoint fields and
 /// unknown-field loss into the shared `PhysicalRouteObservationReceipt` is
-/// deferred until `eliot-agent-api` lands that owner; this crate must not
-/// duplicate the canonical type.
+/// total and versioned via [`OpenCodeWireRouteReceipt::to_physical_observation`]
+/// below; this crate never duplicates the canonical type and no adapter
+/// gains route authority from this projection.
 ///
 /// Loss visibility: `extra` preserves every unknown wire field through the
 /// flattened round-trip (never silently dropped). An unavailable record
@@ -753,6 +754,14 @@ pub struct OpenCodeWireRouteReceipt {
 /// Compatibility alias for pre-rename importers outside `src/` (e.g. the
 /// `tests/` integration suite). New code uses [`OpenCodeWireRouteReceipt`].
 pub type ActualRouteReceipt = OpenCodeWireRouteReceipt;
+
+/// Factored return shape for the observed-side classification below.
+type ObservedSideClassification = (
+    Option<RouteFingerprint>,
+    RouteObservationState,
+    Vec<String>,
+    Option<String>,
+);
 
 impl<'de> Deserialize<'de> for OpenCodeWireRouteReceipt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -922,8 +931,10 @@ impl OpenCodeWireRouteReceipt {
     /// Total versioned loss-visible conversion into the shared canonical
     /// [`PhysicalRouteObservationReceipt`].
     ///
-    /// - Unknown wire fields are never dropped: a non-empty `extra` map is
-    ///   hashed into `raw_evidence_digest`/`raw_evidence_ref` (loss handle).
+    /// - Unknown wire fields are never dropped: every explicit observation
+    ///   field (endpoint, session, directory, server, workspace, route
+    ///   fingerprint, provider) plus a non-empty `extra` map is hashed into
+    ///   `raw_evidence_digest`/`raw_evidence_ref` (loss handle).
     /// - Missing observed identity never synthesizes `observed = requested`:
     ///   `Unavailable` becomes `UNOBSERVED` with an explicit reason plus
     ///   `UNKNOWN_OUTCOME` quarantine (`recovery_ref`).
@@ -932,9 +943,130 @@ impl OpenCodeWireRouteReceipt {
     ///   from the wire, then classified via `route_divergence_fields`
     ///   (`Matched` only when field-complete equal, else `Diverged` with the
     ///   exact difference set and a quarantine `recovery_ref`).
+    /// - `request_digest` preserves the bound start-request commitment
+    ///   verbatim (never a re-hash of the wire bytes and never a zero
+    ///   placeholder); `validate_against` rejects any substituted value.
     /// - Session/route agreement and admission/binding linkage are enforced
     ///   via [`PhysicalRouteObservationReceipt::validate_against`]; a forged
     ///   binding or mismatched admission rejects.
+    ///
+    /// Builds the observed side of the canonical observation from the
+    /// wire state: `Unavailable` yields no observed fingerprint with an
+    /// explicit reason, `Observed` rebuilds the fingerprint from the
+    /// requested one with provider/model replaced from the wire and
+    /// classifies it field-complete (`Matched` only on full equality,
+    /// else `Diverged` with the exact difference set).
+    fn observed_side(
+        &self,
+        requested: &RouteFingerprint,
+    ) -> Result<ObservedSideClassification, OpenCodeObservationConversionError> {
+        match self.state {
+            OpenCodeWireRouteState::Unavailable => {
+                let reason = self
+                    .extra
+                    .get("unavailable_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("opencode wire unavailable")
+                    .to_owned();
+                Ok((
+                    None,
+                    RouteObservationState::Unobserved,
+                    Vec::new(),
+                    Some(reason),
+                ))
+            }
+            OpenCodeWireRouteState::Observed => {
+                let observed_wire =
+                    self.observed
+                        .as_ref()
+                        .ok_or(OpenCodeObservationConversionError::Wire(
+                            OpenCodeWireRouteError::ObservedIdentityMissing,
+                        ))?;
+                let mut observed_fp = requested.clone();
+                observed_fp.provider = observed_wire.provider_id.clone();
+                observed_fp.model = observed_wire.model_id.clone();
+                let diverged = route_divergence_fields(requested, &observed_fp);
+                let state = if diverged.is_empty() {
+                    RouteObservationState::Matched
+                } else {
+                    RouteObservationState::Diverged
+                };
+                Ok((Some(observed_fp), state, diverged, None))
+            }
+        }
+    }
+
+    /// Loss handle for wire observations (issue #369 W19/W28): every
+    /// explicit observation field (endpoint, session, directory, server
+    /// version, workspace, route fingerprint, provider) plus every unknown
+    /// `extra` field stays addressable by digest, never dropped silently.
+    /// Explicit attested fields take precedence over a colliding unknown key
+    /// under the same `wire.`-prefixed name.
+    fn wire_extra_evidence(
+        &self,
+    ) -> Result<(Option<LowercaseSha256>, Option<String>), OpenCodeObservationConversionError> {
+        let mut bound = self.extra.clone();
+        for (name, value) in [
+            ("wire.endpoint", self.endpoint.as_deref()),
+            ("wire.session_id", self.session_id.as_deref()),
+            ("wire.directory", self.directory.as_deref()),
+            ("wire.server_version", self.server_version.as_deref()),
+            ("wire.workspace_id", self.workspace_id.as_deref()),
+            ("wire.route_fingerprint", self.route_fingerprint.as_deref()),
+            ("wire.provider", self.provider.as_deref()),
+        ] {
+            if let Some(value) = value {
+                bound.insert(name.to_owned(), Value::String(value.to_owned()));
+            }
+        }
+        if bound.is_empty() {
+            return Ok((None, None));
+        }
+        let bytes = canonical_json_bytes(&bound).map_err(|error| {
+            OpenCodeObservationConversionError::Serialization(error.to_string())
+        })?;
+        let hex = sha256_hex(&bytes);
+        let digest: LowercaseSha256 =
+            serde_json::from_value(Value::String(hex)).map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?;
+        let reference = format!("opencode-wire-extra:{}", digest.as_str());
+        Ok((Some(digest), Some(reference)))
+    }
+
+    /// Execution axis following the route axis without collapsing them:
+    /// unavailable implies unknown outcome with quarantine; observed keeps
+    /// the caller-supplied terminal/cancellation and gains a quarantine
+    /// handle exactly when diverged.
+    fn execution_axis(
+        route_state: RouteObservationState,
+        terminal: ClockReading,
+        cancellation: Option<CancellationState>,
+    ) -> (
+        ExecutionOutcome,
+        ClockReading,
+        Option<CancellationState>,
+        Option<String>,
+    ) {
+        match route_state {
+            RouteObservationState::Unobserved => (
+                ExecutionOutcome::UnknownOutcome,
+                ClockReading::default(),
+                None,
+                Some("opencode-unobserved-recovery".to_owned()),
+            ),
+            RouteObservationState::Matched => {
+                (ExecutionOutcome::Observed, terminal, cancellation, None)
+            }
+            RouteObservationState::Diverged => (
+                ExecutionOutcome::Observed,
+                terminal,
+                cancellation,
+                Some("opencode-diverged-quarantine".to_owned()),
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn to_physical_observation(
         &self,
@@ -961,83 +1093,23 @@ impl OpenCodeWireRouteReceipt {
         if binding.route != *requested {
             return Err(eliot_agent_api::ContractError::BindingMismatch.into());
         }
-        let (observed_route, route_state, diverged_fields, unobserved_reason) = match self.state {
-            OpenCodeWireRouteState::Unavailable => {
-                let reason = self
-                    .extra
-                    .get("unavailable_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("opencode wire unavailable")
-                    .to_owned();
-                (
-                    None,
-                    RouteObservationState::Unobserved,
-                    Vec::new(),
-                    Some(reason),
-                )
-            }
-            OpenCodeWireRouteState::Observed => {
-                let observed_wire =
-                    self.observed
-                        .as_ref()
-                        .ok_or(OpenCodeObservationConversionError::Wire(
-                            OpenCodeWireRouteError::ObservedIdentityMissing,
-                        ))?;
-                let mut observed_fp = requested.clone();
-                observed_fp.provider = observed_wire.provider_id.clone();
-                observed_fp.model = observed_wire.model_id.clone();
-                let diverged = route_divergence_fields(requested, &observed_fp);
-                let state = if diverged.is_empty() {
-                    RouteObservationState::Matched
-                } else {
-                    RouteObservationState::Diverged
-                };
-                (Some(observed_fp), state, diverged, None)
-            }
-        };
+        let (observed_route, route_state, diverged_fields, unobserved_reason) =
+            self.observed_side(requested)?;
         // Loss handle: every unknown wire field stays addressable by digest.
-        let (raw_evidence_digest, raw_evidence_ref) = if self.extra.is_empty() {
-            (None, None)
-        } else {
-            let bytes = canonical_json_bytes(&self.extra).map_err(|error| {
-                OpenCodeObservationConversionError::Serialization(error.to_string())
-            })?;
-            let hex = sha256_hex(&bytes);
-            let digest: LowercaseSha256 =
-                serde_json::from_value(Value::String(hex)).map_err(|error| {
-                    OpenCodeObservationConversionError::Serialization(error.to_string())
-                })?;
-            let reference = format!("opencode-wire-extra:{}", digest.as_str());
-            (Some(digest), Some(reference))
-        };
+        let (raw_evidence_digest, raw_evidence_ref) = self.wire_extra_evidence()?;
         // Execution axis follows the route axis without collapsing them:
         // unavailable implies unknown outcome with quarantine; observed keeps
         // the caller-supplied terminal/cancellation and gains a quarantine
         // handle exactly when diverged.
-        let (execution_outcome, terminal, cancellation, recovery_ref) = match route_state {
-            RouteObservationState::Unobserved => (
-                ExecutionOutcome::UnknownOutcome,
-                ClockReading::default(),
-                None,
-                Some("opencode-unobserved-recovery".to_owned()),
-            ),
-            RouteObservationState::Matched => {
-                (ExecutionOutcome::Observed, terminal, cancellation, None)
-            }
-            RouteObservationState::Diverged => (
-                ExecutionOutcome::Observed,
-                terminal,
-                cancellation,
-                Some("opencode-diverged-quarantine".to_owned()),
-            ),
-        };
-        let request_bytes = canonical_json_bytes(&self.requested).map_err(|error| {
-            OpenCodeObservationConversionError::Serialization(error.to_string())
-        })?;
-        let request_digest: LowercaseSha256 =
-            serde_json::from_value(Value::String(sha256_hex(&request_bytes))).map_err(|error| {
-                OpenCodeObservationConversionError::Serialization(error.to_string())
-            })?;
+        let (execution_outcome, terminal, cancellation, recovery_ref) =
+            Self::execution_axis(route_state, terminal, cancellation);
+        // The request commitment is the bound start request preserved
+        // verbatim, never a re-hash of the adapter-local wire bytes: the
+        // wire `requested` value stays observable as `requested_route`, while
+        // `request_digest` identifies the exact launch request the binding
+        // pins. A substituted digest fails `validate_against` below.
+        let request_digest = PhysicalRouteObservationReceipt::bound_request_digest(binding)
+            .map_err(OpenCodeObservationConversionError::Contract)?;
         let mut observation = PhysicalRouteObservationReceipt {
             schema_version: CONTRACT_VERSION.to_owned(),
             attempt_id: binding.attempt_id.clone(),
@@ -1773,6 +1845,20 @@ pub enum AdmittedAttemptError {
     ModelMismatch,
     #[error("bound attempt is already terminal; a closed attempt never re-executes")]
     AttemptTerminal,
+    #[error("child session {child_id} remains open; parent cannot close")]
+    OpenChildSession { child_id: String },
+    #[error(
+        "bound attempt carries no owner-minted execution binding; an unresolved launch never executes"
+    )]
+    BindingUnclaimed,
+    #[error("bound attempt has owner-requested cancellation; fresh provider work is refused")]
+    CancelRequested,
+    #[error("presented or observed session is not the bound execution session")]
+    SessionMismatch,
+    #[error("presented or observed message is not the committed execution-unit message")]
+    MessageMismatch,
+    #[error("admitted slot continuity broken between dispatch and seal")]
+    SlotMismatch,
     #[error("read-only run request is invalid: {0}")]
     RequestRejected(RunRequestError),
     #[error("sealed candidate rejects the run result: {reason}")]
@@ -1835,12 +1921,18 @@ impl AdmittedOpenCodeAttempt {
         self.binding
             .validate_against_attempt(&self.attempt)
             .map_err(AdmittedAttemptError::BindingRejected)?;
-        if let Some(stored) = &self.attempt.provider_binding
-            && stored.execution_unit != self.binding.execution_unit
-        {
-            return Err(AdmittedAttemptError::BindingRejected(
-                ContractError::BindingMismatch,
-            ));
+        if let Some(stored) = &self.attempt.provider_binding {
+            if stored.execution_unit != self.binding.execution_unit {
+                return Err(AdmittedAttemptError::BindingRejected(
+                    ContractError::BindingMismatch,
+                ));
+            }
+        } else {
+            // The attempt owner records the claimed execution unit on the
+            // attempt itself (the S2 lifecycle sets exactly this field). An
+            // unresolved launch carries no attributable binding, so it never
+            // executes through this edge.
+            return Err(AdmittedAttemptError::BindingUnclaimed);
         }
         if self.admission.attempt_id != self.binding.attempt_id
             || self.admission.attempt_id != self.attempt.id
@@ -1877,8 +1969,21 @@ impl AdmittedOpenCodeAttempt {
         self.model.validate().map_err(|error| {
             AdmittedAttemptError::RequestRejected(RunRequestError::InvalidModel(error))
         })?;
+        if self.attempt.cancellation != CancellationState::NotRequested {
+            // Cancellation is durable owner state on the attempt record.
+            // Dispatching fresh provider work under an owner-requested cancel
+            // would violate owner intent, so the edge refuses before dispatch.
+            return Err(AdmittedAttemptError::CancelRequested);
+        }
         if self.attempt.state.is_terminal() {
             return Err(AdmittedAttemptError::AttemptTerminal);
+        }
+        if self.attempt.state != AttemptState::Admitted {
+            // Only a pre-execution attempt may dispatch fresh provider work
+            // through this edge. Any other live state means prior work for
+            // this exact slot is unresolved; reusing the slot would be a
+            // blind redispatch, so continuity fails closed here.
+            return Err(AdmittedAttemptError::SlotMismatch);
         }
         Ok(())
     }
@@ -1886,12 +1991,30 @@ impl AdmittedOpenCodeAttempt {
     /// Fail-closed pre-start check that the presented run request carries the
     /// exact admitted provider/model in a valid read-only shape. A prompt
     /// naming any other provider/model rejects before dispatch.
+    ///
+    /// The request session is pinned to the binding as well: a sessionful
+    /// binding executes only in exactly that session, while a sessionless
+    /// binding executes only attached to the bound native session — the
+    /// request never names a different session, and a sessionful request
+    /// under a sessionless binding is a foreign execution unit.
     pub fn verify_request(&self, request: &ReadOnlyRunRequest) -> Result<(), AdmittedAttemptError> {
         request
             .validate()
             .map_err(AdmittedAttemptError::RequestRejected)?;
         if request.model != self.model {
             return Err(AdmittedAttemptError::ModelMismatch);
+        }
+        match &self.binding.session_id {
+            Some(bound) => {
+                if request.session_id.as_deref() != Some(bound.as_str()) {
+                    return Err(AdmittedAttemptError::SessionMismatch);
+                }
+            }
+            None => {
+                if request.session_id.is_some() {
+                    return Err(AdmittedAttemptError::SessionMismatch);
+                }
+            }
         }
         Ok(())
     }
@@ -1930,6 +2053,52 @@ impl AdmittedOpenCodeAttempt {
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
         serde_json::from_value(Value::String(sha256_hex(&bytes)))
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
+    }
+
+    /// Claims exactly one admitted slot for the presented request,
+    /// snapshotting the attempt/lease/fence/generation identities from the
+    /// governing admission together with the exact execution-unit, start
+    /// request, session, and message commitments the dispatch must honor.
+    ///
+    /// The claim is fail-closed against owner state: it requires the
+    /// owner-minted execution binding on the attempt record (an unresolved
+    /// launch never dispatches) and a pre-execution attempt (a live or
+    /// terminal attempt means the slot is already spent). The supervised
+    /// runner calls this before dispatch and [`AdmittedSlotConsumption`]
+    /// confirms the observed execution against these commitments before the
+    /// seal; exact replay reconciles through the retained commitments while
+    /// changed requests and unresolved prior work never redispatch.
+    pub fn consume_one_slot(
+        &self,
+        request: &ReadOnlyRunRequest,
+    ) -> Result<AdmittedSlotConsumption, AdmittedAttemptError> {
+        let Some(stored) = &self.attempt.provider_binding else {
+            return Err(AdmittedAttemptError::BindingUnclaimed);
+        };
+        if stored.execution_unit != self.binding.execution_unit {
+            return Err(AdmittedAttemptError::BindingRejected(
+                ContractError::BindingMismatch,
+            ));
+        }
+        if self.attempt.state.is_terminal() {
+            return Err(AdmittedAttemptError::AttemptTerminal);
+        }
+        if self.attempt.state != AttemptState::Admitted {
+            return Err(AdmittedAttemptError::SlotMismatch);
+        }
+        Ok(AdmittedSlotConsumption {
+            attempt_id: self.admission.attempt_id.clone(),
+            lease_digest: slot_digest(&self.admission.lease_id),
+            fence_digest: slot_digest(&self.admission.state_fence),
+            generation_digest: slot_digest(&self.admission.runtime_generation),
+            unit_namespace: self.binding.execution_unit.namespace.clone(),
+            unit_id: self.binding.execution_unit.unit_id.clone(),
+            start_request_id: self.binding.start_request_id.to_string(),
+            start_request_sha256: self.binding.start_request_sha256.clone(),
+            session_commitment: bound_session_identity(&self.binding),
+            message_commitment: committed_message_id(self, request)?,
+            consumed: true,
+        })
     }
 }
 
@@ -1981,6 +2150,20 @@ impl AdmittedAttemptCandidate {
                 reason: "run result route differs from the admitted model",
             });
         }
+        // The observed run is joined to its binding before sealing: the
+        // returned session must be the bound execution session. A result
+        // observed in any other session is a foreign execution and never
+        // seals under this admission.
+        if let Some(bound) = &admitted.binding().session_id
+            && result.session_id.as_deref() != Some(bound.as_str())
+        {
+            return Err(AdmittedAttemptError::SessionMismatch);
+        }
+        if let NativeSession::Native(locator) = &admitted.binding().native_session
+            && result.session_id.as_deref() != Some(locator.locator.as_str())
+        {
+            return Err(AdmittedAttemptError::SessionMismatch);
+        }
         let bytes = canonical_json_bytes(result)
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
         let result_digest: LowercaseSha256 =
@@ -2002,6 +2185,290 @@ impl AdmittedAttemptCandidate {
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
         serde_json::from_value(Value::String(sha256_hex(&bytes)))
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
+    }
+}
+
+/// Edge-candidate marker for the admitted-attempt edge (issue #487).
+///
+/// Names the issue #487 proof ceiling ([`AuthorityCeiling::CandidateOnly`]):
+/// every artifact this edge emits is candidate evidence only and can never
+/// become a task completion or authority grant.
+pub const OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE: &str =
+    "OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE";
+
+/// Canonical digest of one admitted identity value for slot accounting.
+/// Serialization of a validated identity never fails in practice; a
+/// failure degrades to the debug rendering so slot consumption stays total.
+fn slot_digest(value: &impl Serialize) -> String {
+    canonical_json_bytes(value).map_or_else(|error| error.to_string(), |bytes| sha256_hex(&bytes))
+}
+
+/// Exactly one claimed admitted slot.
+///
+/// Snapshots the attempt identity plus the lease/fence/generation digests
+/// from the governing admission at claim time, together with the exact
+/// execution-unit, start-request, session, and message commitments the
+/// dispatch must honor. Constructed only via
+/// [`AdmittedOpenCodeAttempt::consume_one_slot`]; `consumed` is always true
+/// on construction. The snapshot is single-use by value: [`confirm`] takes
+/// it and checks every commitment against both the governing admission and
+/// the observed execution before the seal.
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedSlotConsumption {
+    attempt_id: AgentAttemptId,
+    lease_digest: String,
+    fence_digest: String,
+    generation_digest: String,
+    unit_namespace: String,
+    unit_id: String,
+    start_request_id: String,
+    start_request_sha256: String,
+    session_commitment: Option<String>,
+    message_commitment: String,
+    consumed: bool,
+}
+
+impl AdmittedSlotConsumption {
+    /// Returns the exact admitted attempt identity this slot was claimed for.
+    pub fn attempt_id(&self) -> &AgentAttemptId {
+        &self.attempt_id
+    }
+
+    /// Returns the committed execution-unit message the dispatch must use.
+    pub fn message_commitment(&self) -> &str {
+        &self.message_commitment
+    }
+
+    /// Returns the committed execution session, when the binding names one.
+    pub fn session_commitment(&self) -> Option<&str> {
+        self.session_commitment.as_deref()
+    }
+
+    /// Confirms the claimed slot still matches the governing admission and
+    /// that the observed execution honored every commitment. By-value so one
+    /// snapshot confirms at most once: a dispatch/seal gap that changed
+    /// attempt, lease, fence, generation, execution unit, start request, or
+    /// session, or an observed session/message that is not the committed
+    /// execution unit, rejects with [`AdmittedAttemptError::SlotMismatch`],
+    /// [`AdmittedAttemptError::SessionMismatch`], or
+    /// [`AdmittedAttemptError::MessageMismatch`].
+    pub fn confirm(
+        self,
+        admitted: &AdmittedOpenCodeAttempt,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), AdmittedAttemptError> {
+        if self.attempt_id != admitted.admission.attempt_id
+            || self.lease_digest != slot_digest(&admitted.admission.lease_id)
+            || self.fence_digest != slot_digest(&admitted.admission.state_fence)
+            || self.generation_digest != slot_digest(&admitted.admission.runtime_generation)
+            || self.unit_namespace != admitted.binding.execution_unit.namespace
+            || self.unit_id != admitted.binding.execution_unit.unit_id
+            || self.start_request_id != admitted.binding.start_request_id.to_string()
+            || self.start_request_sha256 != admitted.binding.start_request_sha256
+            || self.session_commitment != bound_session_identity(&admitted.binding)
+            || !self.consumed
+        {
+            return Err(AdmittedAttemptError::SlotMismatch);
+        }
+        match &self.session_commitment {
+            Some(committed) if committed == session_id => {}
+            _ => return Err(AdmittedAttemptError::SessionMismatch),
+        }
+        if self.message_commitment != message_id {
+            return Err(AdmittedAttemptError::MessageMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Resolves the bound execution session identity from the accepted
+/// provider-binding lifecycle: the admitted session when session admission
+/// names one, otherwise the provider-native session locator the binding was
+/// minted under. `None` only for sessionless bindings, which carry no
+/// attachable `OpenCode` session.
+pub(crate) fn bound_session_identity(binding: &ProviderExecutionBinding) -> Option<String> {
+    if let Some(session) = &binding.session_id {
+        return Some(session.as_str().to_owned());
+    }
+    match &binding.native_session {
+        NativeSession::Native(locator) => Some(locator.locator.clone()),
+        NativeSession::Sessionless => None,
+    }
+}
+
+/// Resolves the committed execution-unit message for one admitted dispatch:
+/// the request-named message when the caller commits one explicitly,
+/// otherwise a deterministic digest of the admitted attempt, prompt, and
+/// model. The derivation is replay-stable — the same admitted attempt with
+/// the same prompt and model always addresses the same execution unit, so
+/// exact replay reconciles instead of redispatching, while a changed prompt
+/// addresses a different unit and never silently reuses the committed one.
+pub fn committed_message_id(
+    admitted: &AdmittedOpenCodeAttempt,
+    request: &ReadOnlyRunRequest,
+) -> Result<String, AdmittedAttemptError> {
+    if let Some(message_id) = &request.message_id {
+        return Ok(message_id.clone());
+    }
+    let attempt_hex = admitted.attempt_digest()?;
+    let mut bytes = Vec::new();
+    for part in [
+        attempt_hex.as_str().as_bytes(),
+        request.prompt.as_bytes(),
+        request.model.provider_id.as_bytes(),
+        request.model.model_id.as_bytes(),
+    ] {
+        bytes.extend_from_slice(part);
+        bytes.push(0);
+    }
+    let hex = sha256_hex(&bytes);
+    Ok(format!("msg_{}", &hex[..48]))
+}
+
+/// Deterministic edge-proof gate for the admitted-attempt edge marker.
+///
+/// Runs on the reconciled server-side execution state before the
+/// `OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE` marker is recorded: the
+/// execution session must have settled out of live work (idle, or absent
+/// from the map after identity reconciliation). A session still busy,
+/// retrying, or reporting an unknown status fails the gate instead of
+/// emitting the marker. Pure function of observed owner state: no new
+/// round-trip, no invented evidence.
+pub fn admitted_edge_proof_gate(
+    session_id: &str,
+    statuses: &SessionStatusMap,
+) -> Result<(), AdmittedAttemptError> {
+    match statuses.get(session_id) {
+        None | Some(SessionStatus::Idle { .. }) => Ok(()),
+        Some(SessionStatus::Busy { .. } | SessionStatus::Retry { .. }) => {
+            Err(AdmittedAttemptError::SealRejected {
+                reason: "admitted edge proof gate: the execution session left the idle state before sealing",
+            })
+        }
+        Some(SessionStatus::Unknown { .. }) => Err(AdmittedAttemptError::SealRejected {
+            reason: "admitted edge proof gate: the execution session reported an unknown status before sealing",
+        }),
+    }
+}
+
+/// Enumerates and reconciles child sessions before a parent terminal
+/// disposition. An open child blocks the parent close: the first open child
+/// rejects with [`AdmittedAttemptError::OpenChildSession`].
+pub fn ensure_no_open_child_sessions(
+    parent_session_id: &str,
+    children: &[(String, bool)],
+) -> Result<(), AdmittedAttemptError> {
+    for (child_id, is_open) in children {
+        if child_id == parent_session_id {
+            continue;
+        }
+        if *is_open {
+            return Err(AdmittedAttemptError::OpenChildSession {
+                child_id: child_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Observation axis bound to one exact admitted attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmittedObservationKind {
+    Heartbeat,
+    Progress,
+    Quota,
+    Terminal,
+}
+
+/// One heartbeat/progress/quota/terminal observation bound to the exact
+/// attempt it was observed under. The attempt identity is copied from the
+/// admitted attempt at construction; observations never invent, retarget, or
+/// widen attempt authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedObservation {
+    pub attempt_id: AgentAttemptId,
+    pub kind: AdmittedObservationKind,
+    pub detail: String,
+}
+
+impl AdmittedObservation {
+    /// Binds one observation to the exact admitted attempt.
+    pub fn new(
+        attempt: &AdmittedOpenCodeAttempt,
+        kind: AdmittedObservationKind,
+        detail: String,
+    ) -> Self {
+        Self {
+            attempt_id: attempt.attempt().id.clone(),
+            kind,
+            detail,
+        }
+    }
+}
+
+/// Attested executable identity for the policy owner (consumed by
+/// `client.rs`). Carries the executable fingerprint text only; it proves
+/// nothing by itself until the policy owner admits it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableFingerprint(String);
+
+/// Rejected executable fingerprint text. The supplied value is never echoed.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutableFingerprintError {
+    #[error("executable fingerprint must not be blank")]
+    Blank,
+    #[error("executable fingerprint must not carry control characters")]
+    ControlCharacters,
+}
+
+impl ExecutableFingerprint {
+    /// Constructs a validated non-blank executable fingerprint.
+    pub fn new(value: impl Into<String>) -> Result<Self, ExecutableFingerprintError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(ExecutableFingerprintError::Blank);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ExecutableFingerprintError::ControlCharacters);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the canonical fingerprint text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes this fingerprint and returns its text.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Attested environment allowlist for the policy owner (consumed by
+/// `client.rs`). Membership is exact-text equality; entries carry no
+/// authority until the policy owner admits them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentAllowlist(Vec<String>);
+
+impl EnvironmentAllowlist {
+    /// Constructs an allowlist from its exact entries.
+    pub fn new(entries: Vec<String>) -> Self {
+        Self(entries)
+    }
+
+    /// Returns whether the exact entry text is allowlisted.
+    pub fn contains(&self, entry: &str) -> bool {
+        self.0.iter().any(|item| item == entry)
+    }
+
+    /// Returns the exact allowlisted entries.
+    pub fn list(&self) -> &[String] {
+        &self.0
     }
 }
 
@@ -2193,7 +2660,13 @@ mod tests {
             observed: Some(model()?),
             provider: Some("opencode-go".to_owned()),
             endpoint: Some("http://127.0.0.1:4096".to_owned()),
-            route_fingerprint: Some("sha256:route".to_owned()),
+            // Production-shaped wire fingerprint (`sha256:<hex>` as minted
+            // by the client): the wire projection carries the observed
+            // locator, never a `sha256:*` label placeholder.
+            route_fingerprint: Some(
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_owned(),
+            ),
             session_id: Some("ses_1".to_owned()),
             directory: Some(r"C:\Scratch".to_owned()),
             server_version: Some("1.4.3".to_owned()),
@@ -2219,7 +2692,7 @@ mod tests {
             "observed": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
             "providerID": "opencode-go",
             "endpointURL": "http://127.0.0.1:4096",
-            "routeFingerprint": "sha256:route",
+            "routeFingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "sessionID": "ses_1",
             "cwd": "C:\\Scratch",
             "serverVersion": "1.4.3",
@@ -2383,7 +2856,7 @@ mod tests {
             "requested": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
             "provider": "opencode-go",
             "endpoint": "http://127.0.0.1:4096",
-            "route_fingerprint": "sha256:route",
+            "route_fingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "session_id": "ses_1",
             "directory": "C:\\Scratch",
             "server_version": "1.4.3",

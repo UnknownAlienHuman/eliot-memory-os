@@ -181,9 +181,10 @@ fn base_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: fixture_digest(
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )?,
+        // The reported commitment is the bound start request preserved
+        // verbatim: `validate_against` rejects any substituted value, so
+        // the happy-path fixture must carry the binding's commitment.
+        request_digest: fixture_digest(&binding.start_request_sha256)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
