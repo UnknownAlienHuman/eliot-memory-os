@@ -9,6 +9,11 @@ Current document:
 - [`SURREALDB_CREDENTIAL_AUTHORITY.md`](SURREALDB_CREDENTIAL_AUTHORITY.md) —
   credential-owner, validation, and recovery boundary for the canonical-store
   bridge.
+- [`AGENT_DELIVERY_GUIDE.md`](AGENT_DELIVERY_GUIDE.md) — agent working rules
+  (evidence = executed tests, A-code/A-live acceptance split, Linux/Windows
+  verification commands, Issue template v2) and the OSP1 critical path. Its
+  sections 0–2 and appendices are a dated diagnosis of `main@2eaa864`
+  (2026-09-25), not live status; they are refreshed or removed when OSP1 lands.
 
 Dated branch-cleanup handoffs, milestone runbooks, live-runtime campaign notes,
 and one-off production-cutover reports are intentionally absent. Current live
