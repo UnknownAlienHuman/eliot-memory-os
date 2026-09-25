@@ -13,9 +13,11 @@
 //! There are no parallel observation, evidence, query, or projection types
 //! here: failure/revision shapes stay with `eliot-observation-contracts`,
 //! self-query/accepted-source shapes stay with `eliot-dreamer-contracts`,
-//! and task/safety projections stay with `eliot-context-contracts`. This
-//! crate performs no compilation, admission, briefing, or model work, owns
-//! no reactive path, and promotes nothing: output is candidate-only for the
+//! and task/safety projections stay with `eliot-context-contracts`. The bound
+//! freeze revision is embedded at compile time and verified before any intake
+//! is read, so an absent or drifted schema freeze produces no candidate. This
+//! crate performs no compilation, admission, briefing, or model work, owns no
+//! reactive path, and promotes nothing: output is candidate-only for the
 //! Governor transition path.
 
 #![forbid(unsafe_code)]
@@ -70,7 +72,7 @@ pub enum RevisionError {
     /// A fence is incompatible with its governing fence.
     #[error("dreamer memory revision: fence mismatch at {field}")]
     FenceMismatch { field: &'static str },
-    /// A posed digest does not match the query it claims.
+    /// A checked digest or pinned identity does not match what it claims.
     #[error("dreamer memory revision: digest mismatch at {field}")]
     DigestMismatch { field: &'static str },
     /// A cited source triple is stale or uncited.
@@ -247,6 +249,158 @@ impl NegativeMemoryExtinctionCandidate {
     }
 }
 
+// The freeze-binding block below sits after the serde-carrying types so the
+// generated protected-wire inventory in
+// `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
+// records a small uniform line offset for those declarations instead of one
+// larger than the whole block. Either way that inventory is a generated
+// snapshot whose accepted sync belongs to the #929 owner, not to this crate.
+
+/// Exact bytes of the Wave 1 static field contract freeze this consumer is
+/// bound to, read at compile time from its owning path.
+///
+/// `include_bytes!` is the fail-closed choice: a missing, moved, or renamed
+/// freeze is a compile error in this crate, so no build of this consumer can
+/// ship against an absent schema-freeze input. A runtime path lookup was
+/// rejected because it would depend on the process working directory and on
+/// the repository layout surviving packaging, which is a hidden failure source
+/// rather than a closed one. The accepted cost is that the freeze bytes are
+/// embedded in every consumer binary; the same trade is already taken for the
+/// typed WIT and toolchain contracts in `eliot-context-compiler-wasm`, which
+/// read their owning artifacts the same way so they cannot drift by
+/// hand-copying.
+pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-schema-freeze.toml");
+
+/// Lowercase sha256 over the exact [`FREEZE_BYTES`].
+///
+/// Recorded out of band in the `CC-W9-REV12-HANDOFF` handoff row of
+/// `crates/smart/cognitive-contract-challenges.toml` because a digest of a
+/// file's own bytes cannot live inside those bytes. Only the digest is pinned
+/// here: the freeze's own `[readback].rule` states the rule as sha256 over the
+/// exact file bytes, so pinning the byte length as well would invent a second
+/// rule the freeze does not state. The length is recorded next to the digest
+/// in the handoff row and checked by `scripts/read_freeze_digest.py`.
+pub const REQUIRED_FREEZE_DIGEST: &str =
+    "737571ecfba0a1731875a2d66f0dbc863d4a756e983244dacbd266d79738b50c";
+
+/// Typed freeze-binding divergence.
+///
+/// Distinct from [`RevisionError::DigestMismatch`]: that variant reports drift
+/// in a candidate's own digest, while these report that this crate is not bound
+/// to the freeze revision it claims. Both sides are named so the divergence is
+/// diagnosable without opening the freeze.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum FreezeVerificationError {
+    /// The embedded freeze declares a different `freeze_id` than this crate pins.
+    #[error(
+        "dreamer memory revision: freeze id divergence: crate pins {expected}, freeze declares {observed}"
+    )]
+    FreezeIdDivergence {
+        /// `freeze_id` this crate pins.
+        expected: String,
+        /// `freeze_id` the embedded freeze declares.
+        observed: String,
+    },
+    /// The embedded freeze bytes do not hash to [`REQUIRED_FREEZE_DIGEST`].
+    #[error(
+        "dreamer memory revision: freeze digest divergence: pinned {expected}, observed {observed}"
+    )]
+    FreezeDigestDivergence {
+        /// Digest this crate pins.
+        expected: String,
+        /// Digest computed over the embedded freeze bytes.
+        observed: String,
+    },
+    /// The embedded freeze does not declare exactly one well-formed column-0
+    /// `freeze_id` line; the count of matching lines is reported.
+    #[error(
+        "dreamer memory revision: freeze declares {observed} column-0 freeze_id lines, exactly one is required"
+    )]
+    FreezeIdUnreadable {
+        /// Number of matching `freeze_id` lines found.
+        observed: usize,
+    },
+    /// The embedded freeze bytes are not valid UTF-8, so no `freeze_id` line
+    /// can be read from them at all.
+    #[error("dreamer memory revision: freeze bytes are not valid UTF-8; no freeze_id is readable")]
+    FreezeBytesNotUtf8,
+}
+
+/// Read the single column-0 `freeze_id` the embedded freeze declares.
+///
+/// The column-0 anchor is load-bearing: it is what keeps the freeze's own
+/// `supersedes_freeze_id` line from being read as the current identity. An
+/// unterminated, repeated, or absent declaration is reported as a count, never
+/// as a best-effort value.
+fn declared_freeze_id(source: &str) -> Result<&str, FreezeVerificationError> {
+    const PREFIX: &str = "freeze_id = \"";
+    let mut declared: Option<&str> = None;
+    let mut lines = 0usize;
+    for line in source.lines() {
+        let Some(rest) = line.strip_prefix(PREFIX) else {
+            continue;
+        };
+        lines += 1;
+        declared = rest.strip_suffix('"');
+    }
+    match (lines, declared) {
+        (1, Some(value)) => Ok(value),
+        (lines, _) => Err(FreezeVerificationError::FreezeIdUnreadable { observed: lines }),
+    }
+}
+
+/// Verify that this crate is bound to the exact freeze revision it pins.
+///
+/// Compares the `freeze_id` declared by the embedded [`FREEZE_BYTES`] against
+/// [`FREEZE_ID`] and the sha256 of those exact bytes against
+/// [`REQUIRED_FREEZE_DIGEST`]. A freeze that is absent cannot reach this
+/// function: [`FREEZE_BYTES`] would not have compiled. Divergence is always a
+/// typed [`FreezeVerificationError`], never a boolean and never a best-effort
+/// identity.
+pub fn verify_freeze_binding() -> Result<(), FreezeVerificationError> {
+    let source = std::str::from_utf8(FREEZE_BYTES)
+        .map_err(|_| FreezeVerificationError::FreezeBytesNotUtf8)?;
+    let observed_id = declared_freeze_id(source)?;
+    if observed_id != FREEZE_ID {
+        return Err(FreezeVerificationError::FreezeIdDivergence {
+            expected: FREEZE_ID.to_owned(),
+            observed: observed_id.to_owned(),
+        });
+    }
+    let observed_digest = sha256_hex(FREEZE_BYTES);
+    if observed_digest != REQUIRED_FREEZE_DIGEST {
+        return Err(FreezeVerificationError::FreezeDigestDivergence {
+            expected: REQUIRED_FREEZE_DIGEST.to_owned(),
+            observed: observed_digest,
+        });
+    }
+    Ok(())
+}
+
+impl From<FreezeVerificationError> for RevisionError {
+    /// Collapses the typed divergence onto the existing
+    /// [`RevisionError::DigestMismatch`] field discriminator instead of adding
+    /// a tenth [`RevisionError`] variant, because
+    /// `impl From<RevisionError> for ExperienceDriverError` in
+    /// `bins/eliotd/src/experience_runtime.rs` matches all nine current
+    /// variants exhaustively with no wildcard arm: a tenth variant would break
+    /// the `eliotd` build outright rather than fail closed. The cost is that
+    /// [`propose`] loses the expected and observed values at this one
+    /// boundary. A caller that needs them calls [`verify_freeze_binding`]
+    /// directly and gets the typed [`FreezeVerificationError`]; adding a
+    /// `RevisionError` arm on the `eliotd` side is the follow-up that would
+    /// let the typed values cross.
+    fn from(error: FreezeVerificationError) -> Self {
+        let field = match error {
+            FreezeVerificationError::FreezeIdDivergence { .. } => "freeze.freeze_id",
+            FreezeVerificationError::FreezeDigestDivergence { .. } => "freeze.digest",
+            FreezeVerificationError::FreezeIdUnreadable { .. } => "freeze.freeze_id.declarations",
+            FreezeVerificationError::FreezeBytesNotUtf8 => "freeze.bytes",
+        };
+        RevisionError::DigestMismatch { field }
+    }
+}
+
 /// Complete validated intake for one extinction assessment.
 pub struct RevisionIntake<'a> {
     /// Owner-neutral failure observation, by value.
@@ -281,13 +435,16 @@ fn check_candidate_id(value: &ArtifactId) -> Result<(), RevisionError> {
 
 /// Propose one advisory extinction candidate over validated intake.
 ///
-/// Intake contract violations (invalid shapes, scope/fence mismatch, stale
-/// citations, digest drift) fail closed as [`RevisionError`]. Valid intake
-/// with insufficient evidence yields `Ok` with state `Inconclusive` or
-/// `Unsupported` and the exact missing evidence named.
+/// The freeze binding is verified first, so a crate not bound to the exact
+/// revision it pins fails closed before any intake is read. Intake contract
+/// violations (invalid shapes, scope/fence mismatch, stale citations, digest
+/// drift) fail closed as [`RevisionError`]. Valid intake with insufficient
+/// evidence yields `Ok` with state `Inconclusive` or `Unsupported` and the
+/// exact missing evidence named.
 pub fn propose(
     intake: &RevisionIntake<'_>,
 ) -> Result<NegativeMemoryExtinctionCandidate, RevisionError> {
+    verify_freeze_binding()?;
     intake.observation.validate()?;
     if intake.evidence.len() > MAX_REVISION_EVIDENCE {
         return Err(RevisionError::Bounds {

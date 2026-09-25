@@ -167,8 +167,8 @@ use thiserror::Error;
 
 /// Freeze identity this package builds against.
 ///
-/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml` (r5).
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r5";
+/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml` (r6).
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r6";
 
 /// Coordination kind of the consumed audit payload.
 ///
