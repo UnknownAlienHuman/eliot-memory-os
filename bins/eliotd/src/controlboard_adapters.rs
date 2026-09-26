@@ -27,10 +27,9 @@
 //! - Operator submission admits one exact-view intent against the live
 //!   snapshot fence and returns a candidate-only receipt. Acceptance is
 //!   transport acknowledgement, never task completion or a canonical write:
-//!   there is no commit path in this module. Boards built from one daemon
-//!   composition share one volatile replay handle
-//!   ([`SharedOperatorReplay`]); durable operator identity lives in Kernel
-//!   ORS through the async Governor operator borrow.
+//!   there is no commit path in this module, so nothing here reaches Kernel
+//!   ORS. Boards built from one daemon composition share one volatile replay
+//!   handle ([`SharedOperatorReplay`]) and nothing else.
 //! - The same port reconciles an already-issued operation
 //!   ([`GovernorOperatorCommand::reconcile`], #1187 piece B). It answers only
 //!   what the process-retained handle can prove — the exact original receipt
@@ -865,12 +864,12 @@ impl CanonicalStatePort for GovernorCanonicalState {
 /// created board replay an admission without a second effecting-port call
 /// while the process lives, and it is what
 /// [`GovernorOperatorCommand::reconcile`] reads to answer the reconnect case
-/// with the original command receipt. Durable operator identity lives in Kernel
-/// ORS and is reconciled through the async Governor operator borrow
-/// (`GovernorComposition::operator_reconciliation`); a restart drops this map
-/// and a replay resolves through that receipt route instead — which this
-/// adapter cannot yet reach, so it refuses with
-/// [`MISSING_OPERATOR_RECEIPT_READ`] instead of guessing.
+/// with the original command receipt. A restart drops this map, and no other
+/// port can answer for a dropped operation: the Governor's operator borrow
+/// reaches only `KernelTransitionPort::receipt`, whose `WriteReceipt` carries
+/// neither the `session_id` nor the `access_digest` a reconciled board receipt
+/// must carry (see [`MISSING_OPERATOR_RECEIPT_READ`]). So the adapter refuses
+/// with that exact named contract instead of guessing.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SharedOperatorReplay {
     inner: Arc<Mutex<HashMap<String, (CommandRequest, CommandReceipt)>>>,
@@ -1040,7 +1039,7 @@ impl OperatorCommandPort for GovernorOperatorCommand {
 }
 
 /// The exact durable read contract this owner cannot reach for a possibly
-/// submitted operator command (#1187 piece B).
+/// submitted operator command (#1187 piece B, corrected by piece C).
 ///
 /// The Governor *does* own a typed query-by-operation-identity read:
 /// `eliot_governor`'s `KernelTransitionPort::receipt(OperationId)`, documented
@@ -1053,26 +1052,47 @@ impl OperatorCommandPort for GovernorOperatorCommand {
 /// [`ControlBoardGovernorSnapshot`] can answer "what is the current disposition
 /// of operation X", and this module never invents a second client to ask.
 ///
-/// Reaching the real read means borrowing
-/// `GovernorComposition::operator_reconciliation()` at
-/// [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard)
-/// and forwarding the lookup through a port that takes that borrow. That seam
-/// is in `bins/eliotd/src/lib.rs`, outside #1187 piece B's writable set, and
-/// the Governor's only public entry today is
-/// `GovernorOperatorReconciliation::admit_operator_command` — a *submit*, whose
-/// commit leg would re-admit rather than query, so calling it from a reconcile
-/// would be precisely the blind repeat A8 forbids.
+/// **Forwarding the Governor operator borrow is NOT sufficient, and must not be
+/// attempted as the fix.** `KernelTransitionPort::receipt` answers with an
+/// `eliot_store_api::WriteReceipt`. Its closed field set is `operation_id`,
+/// `idempotency_key`, `canonical_request_hash`, `transition_class`, `status`,
+/// `commit_id`, `state_fence`, `ordering_sequences`, `revision_before_after`,
+/// the applied/emitted/projection/outbox refs, the manifest, admission and
+/// mutation-plan digests, `semantic_source_revisions`, `error_code`,
+/// `resubmission`, `committed_at`, and `envelope`. It carries **no**
+/// `session_id` and **no** `access_digest`, and those two are precisely what
+/// `eliot_controlboard`'s `validate_reconciled_receipt` requires of any answer:
+/// it shape-checks `receipt_ref`, `session_id`, and `access_digest`, and
+/// refuses `ReceiptBindingMismatch` when `receipt.session_id` is not the
+/// session the access resolver just admitted. (`action_digest`, both ceilings,
+/// and the observed revision are deliberately *not* re-checked there, because a
+/// query does not carry them — so the blocker is exactly these two fields, not
+/// the whole set.) A `WriteReceipt` therefore cannot be projected onto the
+/// board's `CommandReceipt` at all, whatever borrow reaches it, and inventing
+/// those two values locally would be inventing a receipt.
+///
+/// What is actually missing is a *command-receipt projection read* owned by the
+/// Governor/Kernel slice: one read of the exact `OperationId` that returns the
+/// command-bound fields this port must echo. The `AppendAuditEvent` parameters
+/// `operator_command_envelope` writes do carry `session_id`, `access_digest`,
+/// `action_digest`, and `expected_revision`, but no port the operator adapter
+/// can reach returns them: `KernelTransitionPort` exposes only `apply_prepared`,
+/// `receipt`, and `health`, and `RecoveryOwner` has no `Operator` member, so no
+/// recovered owner image carries an operator command row. Reading them back
+/// instead would mean giving this adapter a store client, which is exactly the
+/// second owner `AGENTS.md` forbids. Until the projection read exists, the
+/// operation stays `UNKNOWN_OUTCOME`/`RECONCILING`.
 ///
 /// The refusal is therefore exact and typed, and names this contract, instead
 /// of a fabricated success, a zero, or a stringly-typed "unknown".
-const MISSING_OPERATOR_RECEIPT_READ: &str =
-    "eliot_governor::GovernorOperatorReconciliation / KernelTransitionPort::receipt \
-     (operator receipt lookup by OperationId) is unreachable from \
-     GovernorOperatorCommand: ControlBoardGovernorSnapshot carries no command \
-     state, no canonical admission owner, and no Kernel transition port. \
-     DaemonComposition::controlboard must forward the Governor operator borrow \
-     for this disposition to resolve; until then the operation stays \
-     UNKNOWN_OUTCOME/RECONCILING and must not be resubmitted.";
+const MISSING_OPERATOR_RECEIPT_READ: &str = "no owner publishes an operator command-receipt read for the exact \
+     OperationId. eliot_governor's KernelTransitionPort::receipt answers with an \
+     eliot_store_api::WriteReceipt, which carries no session_id and no \
+     access_digest, so it cannot be projected onto the board's CommandReceipt, \
+     whose reconciled form must name the admitting session, even though \
+     GovernorOperatorReconciliation borrows it. GovernorOperatorCommand holds no \
+     such record; the operation stays UNKNOWN_OUTCOME/RECONCILING and must not be \
+     resubmitted.";
 
 /// Governor-backed Swarm projection reader.
 ///
