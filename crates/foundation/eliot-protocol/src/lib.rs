@@ -2989,7 +2989,7 @@ pub struct HostRequestIdentity {
     /// Cancellation identity for the request lifecycle.
     pub cancellation_id: String,
     /// Exact previously admitted operation targeted by Cancellation, Status,
-    /// and Reconciliation kinds; lineage reference otherwise.
+    /// and Reconciliation kinds; absent only for lookup-only Status.
     pub parent_operation_id: Option<String>,
     /// Kernel-owned absolute deadline in Unix milliseconds.
     pub deadline_unix_ms: u64,
@@ -3130,10 +3130,14 @@ impl HostRequestIdentity {
                         reason: "only cancellations may carry a cancellation-domain projection",
                     });
                 }
-                if self.parent_operation_id.is_none() {
+                if self.parent_operation_id.is_none()
+                    && !(kind == HostRequestKind::Status
+                        && self.session_id.is_some()
+                        && self.correlation_projection.is_none())
+                {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.parent_operation_id",
-                        reason: "must target one exact previously admitted operation",
+                        reason: "must target one exact previously admitted operation unless this is an untyped lookup-only Status",
                     });
                 }
             }
@@ -3291,6 +3295,21 @@ impl HostRequestEnvelope {
         self.validate_identity_separation()
     }
 
+    /// Validates an envelope that may receive a Kernel admission receipt.
+    ///
+    /// Parentless `Status` envelopes are lookup-only observations and cannot
+    /// be admitted or reconciled as new host-request operations.
+    pub fn validate_for_admission(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.kind == HostRequestKind::Status && self.identity.parent_operation_id.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.parent_operation_id",
+                reason: "lookup-only Status cannot receive an admission receipt",
+            });
+        }
+        Ok(())
+    }
+
     /// Rejects reuse of one string value across distinct identity domains.
     fn validate_identity_separation(&self) -> Result<(), ProtocolError> {
         let mut domains: Vec<(&str, &'static str)> = vec![
@@ -3422,7 +3441,7 @@ impl HostRequestAdmissionReceipt {
 
     /// Issues a receipt for one validated envelope.
     pub fn issue(envelope: &HostRequestEnvelope) -> Result<Self, ProtocolError> {
-        envelope.validate()?;
+        envelope.validate_for_admission()?;
         Self {
             wire_id: HOST_REQUEST_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
             wire_version: Self::CONTRACT_VERSION,
@@ -3522,7 +3541,7 @@ impl HostRequestAdmissionReceipt {
     /// Validates that this receipt was issued for the exact envelope.
     pub fn validate_envelope(&self, envelope: &HostRequestEnvelope) -> Result<(), ProtocolError> {
         self.validate()?;
-        envelope.validate()?;
+        envelope.validate_for_admission()?;
         if self.operation_id != host_request_operation_id(envelope)
             || self.request_id != envelope.identity.request_id
             || self.kind != envelope.kind
