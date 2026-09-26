@@ -620,10 +620,8 @@ fn denominator_coverage(
     rows: usize,
     heads: &[RevisionHead],
 ) -> Result<AutomationDenominatorCoverage, StoreError> {
-    let malformed = |field: &'static str, reason: &'static str| StoreError::InvalidField {
-        field,
-        reason,
-    };
+    let malformed =
+        |field: &'static str, reason: &'static str| StoreError::InvalidField { field, reason };
     let block = payload
         .get(AUTOMATION_PAGE_COMPLETENESS_FIELD)
         .ok_or_else(|| {
@@ -962,7 +960,10 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
             fence,
         )?;
-        let response = self.client.execute_named(query).await?;
+        // The request is validated against its own response, and
+        // `NamedReadRequest` is not `Copy`, so the send takes a clone. This is
+        // the same shape the other validating reads in this file already use.
+        let response = self.client.execute_named(query.clone()).await?;
         validate_named_response(&query, &response)?;
         let entries = response
             .payload
@@ -1203,7 +1204,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
             fence.clone(),
         )?;
-        let response = self.client.execute_named(query).await?;
+        // Validated against its own response; `NamedReadRequest` is not `Copy`.
+        let response = self.client.execute_named(query.clone()).await?;
         validate_named_response(&query, &response)?;
         let entries = response
             .payload
@@ -1213,11 +1215,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 field: "automation.invocations",
                 reason: "store invocation projection malformed",
             })?;
-        let coverage = denominator_coverage(
-            &response.payload,
-            entries.len(),
-            &response.revision_heads,
-        )?;
+        let coverage =
+            denominator_coverage(&response.payload, entries.len(), &response.revision_heads)?;
         let mut references: Vec<AutomationReconciliationReference> = Vec::new();
         let mut inspected_bytes: usize = 0;
         let mut budget_exhausted = false;
@@ -1243,12 +1242,10 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         if budget_exhausted || !coverage.complete {
             let reference =
                 incomplete_denominator_reference(automation_id, &coverage.read_revision);
-            reference
-                .validate()
-                .map_err(|_| StoreError::InvalidField {
-                    field: "automation.reconciliation",
-                    reason: "incomplete denominator reference invalid",
-                })?;
+            reference.validate().map_err(|_| StoreError::InvalidField {
+                field: "automation.reconciliation",
+                reason: "incomplete denominator reference invalid",
+            })?;
             references.push(reference);
         }
         let mut by_occurrence: BTreeMap<String, AutomationReconciliationReference> =

@@ -2096,8 +2096,8 @@ fn automation_page_completeness(
         .values()
         .map(|head| (head.key.as_str().to_owned(), head.revision))
         .collect();
-    let read_revision = audit_heads_digest(&heads)
-        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let read_revision =
+        audit_heads_digest(&heads).map_err(|error| serde_json::Error::custom(error.to_string()))?;
     Ok(json!({
         "read_revision": read_revision,
         "returned": returned,

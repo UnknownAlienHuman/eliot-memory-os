@@ -1220,8 +1220,7 @@ impl AutomationReconciliationReference {
         text(&self.occurrence_id, "reconciliation.occurrence_id")?;
         text(&self.operation_ref, "reconciliation.operation_ref")?;
         text(&self.read_revision, "reconciliation.read_revision")?;
-        let handle_is_expected =
-            self.cause == AutomationReconciliationCause::IncompleteDenominator;
+        let handle_is_expected = self.cause == AutomationReconciliationCause::IncompleteDenominator;
         if handle_is_expected != self.denominator_query_ref.is_some() {
             return Err(UserAutomationError::Invalid(
                 "reconciliation.denominator_query_ref",
