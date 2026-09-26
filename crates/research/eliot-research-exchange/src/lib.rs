@@ -8,9 +8,10 @@
 //! outcome. The live `ExchangeSnapshot` is only the process-local projection of
 //! that record: a resumed key is served only from a record that still
 //! validates, so a retry resumes the same exchange by idempotency identity
-//! instead of duplicating a transfer. Persisting one record durably is the
-//! owning ELIOT store's call through the store-neutral `ExchangeJobLedger`
-//! contract; this crate owns no database, remote-store fallback or scheduler.
+//! instead of duplicating a transfer. `DurableExchange` is the durable form: it
+//! drives this one state machine and writes the record it produced through the
+//! store-neutral `ExchangeJobLedger` port the owning ELIOT store implements.
+//! This crate owns no database, remote-store fallback or scheduler.
 
 #![forbid(unsafe_code)]
 
@@ -20,7 +21,8 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::{ContractVersion, StateFence};
 use eliot_research_exchange_api::{
-    ExchangeJobLifecycleRecord, GapContinuation, ResearchContractError, ResearchEvidenceBundle,
+    CancellationState, CompletionDisposition, ExchangeJobLedger, ExchangeJobLifecycleRecord,
+    GapContinuation, IdempotentResume, ResearchContractError, ResearchEvidenceBundle,
     ResearchExportBundle, ResearchHeldSourceGap, ResearchQueryRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,37 @@ pub enum ExchangeStatus {
     Failed,
 }
 
+impl ExchangeStatus {
+    /// The live status one durable record states.
+    ///
+    /// The live status is derived from the record, never the other way round, so
+    /// a job rebuilt from a durable store cannot claim a cleaner state than the
+    /// record carries. A cancellation the bridge never confirmed stays
+    /// cancellation-unconfirmed rather than decoding as a clean stop, and a
+    /// cancelled terminal outcome is a cancelled job however the record reached
+    /// it.
+    #[must_use]
+    pub fn of(record: &ExchangeJobLifecycleRecord) -> Self {
+        match &record.cancellation {
+            CancellationState::Confirmed { .. } => return Self::Cancelled,
+            CancellationState::Requested { .. } => return Self::CancelRequested,
+            CancellationState::NotRequested => {}
+        }
+        match &record.terminal {
+            Some(terminal) if terminal.disposition() == CompletionDisposition::Cancelled => {
+                Self::Cancelled
+            }
+            Some(_) => Self::Completed,
+            None if !record.transferred_partials().is_empty()
+                || record.progress.spent_units > 0 =>
+            {
+                Self::Partial
+            }
+            None => Self::Accepted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExchangeJob {
     pub exchange_id: String,
@@ -60,6 +93,43 @@ pub struct ExchangeJob {
     /// through this record, so the live fields above never state a lifecycle
     /// fact the durable record does not carry.
     pub lifecycle: ExchangeJobLifecycleRecord,
+}
+
+impl ExchangeJob {
+    /// Rebuilds the live projection of one job from its durable record.
+    ///
+    /// I21.11: an interrupted exchange "resume[s] by idempotency identity
+    /// rather than duplicate transfer", so a retry that arrives with the
+    /// identity already admitted is served the job the store holds, with the
+    /// progress and partial results it had already paid for. The record is
+    /// validated first, so a stored record is only ever served when it still
+    /// hashes to its own digest, still satisfies its lifecycle invariants and
+    /// still binds this request's canonical content digest; anything else is a
+    /// conflict, never a second job.
+    ///
+    /// The delivered evidence stays with the evidence owner — the durable record
+    /// binds its digest — so a rebuilt job carries no delivered bundle and can
+    /// present no result until the owner hands that bundle back.
+    pub fn resumed(
+        request: ResearchQueryRequest,
+        record: ExchangeJobLifecycleRecord,
+    ) -> Result<Self, ExchangeError> {
+        record.validate()?;
+        if record.resumes(&request)? != IdempotentResume::SameJob {
+            return Err(ExchangeError::IdempotencyConflict);
+        }
+        Ok(Self {
+            status: ExchangeStatus::of(&record),
+            progress_units: record.progress.spent_units,
+            exchange_id: record.exchange_id.clone(),
+            job_id: record.job_id.clone(),
+            state_fence: record.state_fence.clone(),
+            lifecycle: record,
+            request,
+            result: None,
+            failure: None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -175,16 +245,60 @@ impl<B> GovernedExchange<B> {
             .ok_or(ExchangeError::NotFound)?;
         Ok(job.lifecycle.dependent_inquiry_gap(inquiry_id)?)
     }
+
+    /// Installs one job rebuilt from a durable record into the process-local
+    /// projection.
+    ///
+    /// The duplicate-suppression is structural, not advisory: an identity this
+    /// exchange already holds is never rebound, and a job identity already held
+    /// under a different idempotency key is never claimed. A replayed load of
+    /// the same record therefore reports the job already held instead of
+    /// installing a second copy of it, so the live projection can never hold two
+    /// jobs for one durable identity and a reloaded transfer cannot re-open a
+    /// job that already closed.
+    pub fn adopt_resumed(&mut self, job: ExchangeJob) -> Result<ExchangeJob, ExchangeError> {
+        job.lifecycle.validate()?;
+        let idempotency_key = job.request.idempotency_key.clone();
+        if let Some(bound) = self.snapshot.idempotency.get(&idempotency_key) {
+            let held = self
+                .snapshot
+                .jobs
+                .get(bound)
+                .ok_or(ExchangeError::NotFound)?;
+            if held.lifecycle.record_digest != job.lifecycle.record_digest {
+                return Err(ExchangeError::IdempotencyConflict);
+            }
+            return Ok(held.clone());
+        }
+        if self.snapshot.jobs.contains_key(&job.job_id) {
+            return Err(ExchangeError::IdempotencyConflict);
+        }
+        self.snapshot
+            .idempotency
+            .insert(idempotency_key, job.job_id.clone());
+        self.snapshot.jobs.insert(job.job_id.clone(), job.clone());
+        Ok(job)
+    }
 }
 
 impl<B: ResearchBridge> GovernedExchange<B> {
     /// Accepts one query, or resumes the interrupted exchange already bound
-    /// to its idempotency key with partial progress preserved. A resumed
-    /// key never re-contacts the bridge, so at most one provider job exists
-    /// per identity. A resumed job is served only from a durable record that
-    /// still validates, so a restored snapshot can never decode a drifted
-    /// record as a live job.
+    /// to its idempotency key with partial progress preserved.
     pub fn submit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeJob, ExchangeError> {
+        self.admit(request).map(|admission| admission.job().clone())
+    }
+
+    /// Accepts one query, or resumes the interrupted exchange already bound to
+    /// its idempotency key, and reports which of the two happened.
+    ///
+    /// A resumed key never re-contacts the bridge, so at most one provider job
+    /// exists per identity. A resumed job is served only from a durable record
+    /// that still validates, so a restored snapshot can never decode a drifted
+    /// record as a live job.
+    pub fn admit(
+        &mut self,
+        request: ResearchQueryRequest,
+    ) -> Result<ExchangeAdmission, ExchangeError> {
         request.validate()?;
         if let Some(job_id) = self.snapshot.idempotency.get(&request.idempotency_key) {
             let existing = self
@@ -196,7 +310,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
                 return Err(ExchangeError::IdempotencyConflict);
             }
             existing.lifecycle.validate()?;
-            return Ok(existing.clone());
+            return Ok(ExchangeAdmission::Resumed(existing.clone()));
         }
         let job_id = self
             .bridge
@@ -220,7 +334,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             .idempotency
             .insert(job.request.idempotency_key.clone(), job_id.clone());
         self.snapshot.jobs.insert(job_id, job.clone());
-        Ok(job)
+        Ok(ExchangeAdmission::Started(job))
     }
 
     pub fn mark_running(
@@ -470,5 +584,250 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         }
         job.status = status;
         Ok(job.clone())
+    }
+}
+
+/// How one idempotency identity resolved against the durable ledger.
+///
+/// I21.11: a retry "resume[s] by idempotency identity rather than duplicate
+/// transfer". The two cases are distinct types rather than a flag so a caller
+/// cannot read a resumed job as a newly started transfer, or the reverse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExchangeAdmission {
+    /// The identity was never admitted: a provider job was created for it and
+    /// its opened durable record was stored.
+    Started(ExchangeJob),
+    /// The identity was already admitted: the interrupted job was recovered from
+    /// its durable record, carrying the progress and partial results it had
+    /// already paid for. No provider job was created and no transfer repeated.
+    Resumed(ExchangeJob),
+}
+
+impl ExchangeAdmission {
+    /// The admitted job, whichever way the identity resolved.
+    #[must_use]
+    pub const fn job(&self) -> &ExchangeJob {
+        match self {
+            Self::Started(job) | Self::Resumed(job) => job,
+        }
+    }
+}
+
+/// A refused durable exchange transition, with the owner-reported ledger failure
+/// kept in the owner's own error type.
+///
+/// A record that cannot be persisted is a typed failure rather than a silently
+/// lost job, and the two causes stay distinct: `Exchange` is this crate's
+/// refusal (a conflicting identity, an illegal transition, a contract
+/// violation), `Ledger` is the owning store's own reported failure.
+#[derive(Debug, Error)]
+pub enum DurableExchangeError<E: std::error::Error + Send + Sync + 'static> {
+    /// The exchange refused the transition.
+    #[error("exchange transition refused: {0}")]
+    Exchange(#[from] ExchangeError),
+    /// The owning store refused the durable record.
+    #[error("durable exchange-job ledger refused the record: {0}")]
+    Ledger(E),
+}
+
+/// A [`GovernedExchange`] whose durable lifecycle record is persisted through the
+/// owning ELIOT store's store-neutral [`ExchangeJobLedger`] port.
+///
+/// # Why this is the durable path
+///
+/// I21.11 requires a pending import/export to "remain durable exchange job[s] and
+/// resume by idempotency identity rather than duplicate transfer", while the
+/// federation "never shares ELIOT's canonical database". So the record is durable
+/// only when the owning store holds it, and this type is the seam: it drives the
+/// one [`GovernedExchange`] state machine and writes the record it produced
+/// through the port after every transition. It defines no database, no
+/// remote-store fallback and no scheduler, and the concrete store implementor
+/// belongs to the canonical store owner.
+///
+/// # What the port buys
+///
+/// * A submit that loads first resumes an already-admitted identity and never
+///   contacts the bridge for it, so a retry across a restart is one provider job
+///   and one transfer.
+/// * A refusal cannot hide a state change that did happen: the record reached is
+///   written whether or not the transition succeeded, which is what keeps an
+///   issued-but-unconfirmed cancellation from decoding as a clean stop after a
+///   restart.
+/// * A durable record is only ever served after it re-validates, so a stored
+///   record cannot resurrect a supported answer on an exhausted job.
+pub struct DurableExchange<B, L> {
+    exchange: GovernedExchange<B>,
+    ledger: L,
+}
+
+impl<B, L> DurableExchange<B, L> {
+    /// Binds one exchange to the store that holds its durable records.
+    #[must_use]
+    pub fn new(bridge: B, ledger: L) -> Self {
+        Self {
+            exchange: GovernedExchange::new(bridge),
+            ledger,
+        }
+    }
+
+    /// Rebuilds one exchange over an already-restored process-local projection
+    /// and the store that holds its durable records.
+    #[must_use]
+    pub fn from_snapshot(bridge: B, snapshot: ExchangeSnapshot, ledger: L) -> Self {
+        Self {
+            exchange: GovernedExchange::from_snapshot(bridge, snapshot),
+            ledger,
+        }
+    }
+
+    /// The process-local projection of the jobs this exchange holds.
+    #[must_use]
+    pub fn snapshot(&self) -> &ExchangeSnapshot {
+        self.exchange.snapshot()
+    }
+
+    /// The state machine behind this durable exchange.
+    #[must_use]
+    pub fn exchange(&self) -> &GovernedExchange<B> {
+        &self.exchange
+    }
+
+    /// Splits the exchange back into its bridge, its store and its projection,
+    /// so a store owner can hold the port across process boundaries.
+    #[must_use]
+    pub fn into_parts(self) -> (B, L, ExchangeSnapshot) {
+        let (bridge, snapshot) = self.exchange.into_parts();
+        (bridge, self.ledger, snapshot)
+    }
+}
+
+impl<B: ResearchBridge, L: ExchangeJobLedger> DurableExchange<B, L> {
+    /// Admits one query, or resumes the interrupted exchange already durable
+    /// under its idempotency key.
+    ///
+    /// The ledger is read before the bridge is contacted, so an identity that is
+    /// already admitted never starts a second transfer: the stored record is
+    /// re-validated, rebuilt through [`ExchangeJob::resumed`] and installed
+    /// through [`GovernedExchange::adopt_resumed`], which report the progress and
+    /// partial results that job had already paid for. An identity bound to
+    /// different request content is a conflict, never a second job. Only a
+    /// genuinely new identity reaches the bridge, and its opened record is stored
+    /// before this call returns, so an interruption right after cannot lose the
+    /// job.
+    pub fn submit(
+        &mut self,
+        request: ResearchQueryRequest,
+    ) -> Result<ExchangeAdmission, DurableExchangeError<L::Error>> {
+        request.validate().map_err(ExchangeError::from)?;
+        if let Some(record) = self
+            .ledger
+            .load(&request.idempotency_key)
+            .map_err(DurableExchangeError::Ledger)?
+        {
+            let job = ExchangeJob::resumed(request, record)?;
+            return Ok(ExchangeAdmission::Resumed(
+                self.exchange.adopt_resumed(job)?,
+            ));
+        }
+        let job = self.exchange.admit(request)?;
+        self.ledger
+            .store(job.job().lifecycle.clone())
+            .map_err(DurableExchangeError::Ledger)?;
+        Ok(job)
+    }
+
+    /// Spends progress against the admitted budget and stores the record.
+    pub fn record_progress(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        units: u64,
+    ) -> Result<ExchangeJob, DurableExchangeError<L::Error>> {
+        let job = self.exchange.record_progress(job_id, fence, units)?;
+        self.persist(&job.job_id)?;
+        Ok(job)
+    }
+
+    /// Records verified partial evidence and stores the record.
+    ///
+    /// A replayed delivery of a bundle this job already transferred leaves the
+    /// record unchanged — no second partial, no second charge against the
+    /// admitted budget — so a retry reports prior partial results instead of
+    /// repeating the transfer.
+    pub fn record_partial_bundle(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        units: u64,
+        bundle: &ResearchEvidenceBundle,
+    ) -> Result<ExchangeJob, DurableExchangeError<L::Error>> {
+        let job = self
+            .exchange
+            .record_partial_bundle(job_id, fence, units, bundle)?;
+        self.persist(&job.job_id)?;
+        Ok(job)
+    }
+
+    /// Closes one job with a delivered evidence bundle and stores the record.
+    ///
+    /// A supported answer is still reachable only through the bundle's
+    /// supported-close witness, so a durable close of an empty or exhausted
+    /// exchange is refused here exactly as it is in the live state machine.
+    pub fn import_bundle(
+        &mut self,
+        bundle: ResearchEvidenceBundle,
+    ) -> Result<ExchangeJob, DurableExchangeError<L::Error>> {
+        let job = self.exchange.import_bundle(bundle)?;
+        self.persist(&job.job_id)?;
+        Ok(job)
+    }
+
+    /// Cancels one job and stores the record the exchange actually reached.
+    ///
+    /// The record is written even when the bridge refuses to confirm, because the
+    /// issued cancellation is itself a durable fact: without it an interrupted
+    /// cancellation would restart as a clean job. The refusal is still returned.
+    pub fn cancel(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+    ) -> Result<ExchangeJob, DurableExchangeError<L::Error>> {
+        let outcome = self.exchange.cancel(job_id, fence);
+        self.persist(job_id)?;
+        outcome.map_err(Into::into)
+    }
+
+    /// The typed dependent-inquiry gap this exchange's degradation opens for one
+    /// dependent current task, or `None` when this exchange declares no such gap
+    /// and the inquiry continues on its own evidence.
+    ///
+    /// This is a pure projection over the durable record, so it writes nothing
+    /// and keeps the failure local to the dependent external-knowledge dependency.
+    pub fn dependent_inquiry_gap(
+        &self,
+        job_id: &str,
+        inquiry_id: &str,
+    ) -> Result<Option<ResearchHeldSourceGap>, DurableExchangeError<L::Error>> {
+        self.exchange
+            .dependent_inquiry_gap(job_id, inquiry_id)
+            .map_err(Into::into)
+    }
+
+    /// Writes the durable record of one job through the port.
+    ///
+    /// The record is validated before it is stored, so a store is never handed a
+    /// record that contradicts its own invariants, and the write is keyed by the
+    /// record's own idempotency identity.
+    fn persist(&mut self, job_id: &str) -> Result<(), DurableExchangeError<L::Error>> {
+        let job = self
+            .exchange
+            .snapshot()
+            .jobs
+            .get(job_id)
+            .ok_or(ExchangeError::NotFound)?;
+        job.lifecycle.validate().map_err(ExchangeError::from)?;
+        self.ledger
+            .store(job.lifecycle.clone())
+            .map_err(DurableExchangeError::Ledger)
     }
 }

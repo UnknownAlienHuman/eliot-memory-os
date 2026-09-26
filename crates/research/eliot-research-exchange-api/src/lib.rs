@@ -2872,6 +2872,13 @@ impl ExchangeJobLifecycleRecord {
     /// I21.11: jobs expose partial results, so an interrupted exchange keeps
     /// what it already transferred under the bound job identity. A job that
     /// already closed never accepts more evidence.
+    ///
+    /// A replayed transfer is recognised rather than repeated: a bundle this
+    /// record already carries leaves it unchanged, so a retried delivery neither
+    /// spends the admitted budget twice nor appears as a second partial.
+    /// I21.11 requires a retry to "resume by idempotency identity rather than
+    /// duplicate transfer", and the transfer's immutable bundle digest is that
+    /// identity.
     pub fn with_partial(
         &self,
         bundle: &ResearchEvidenceBundle,
@@ -2879,6 +2886,9 @@ impl ExchangeJobLifecycleRecord {
     ) -> Result<Self, ResearchContractError> {
         if self.is_terminal() || !self.binds(bundle) {
             return Err(ResearchContractError::InvalidDisposition);
+        }
+        if self.already_transferred(bundle) {
+            return Ok(self.clone());
         }
         let mut next = self.advanced(units)?.observed(bundle);
         next.partial_bundles
@@ -3038,6 +3048,51 @@ impl ExchangeJobLifecycleRecord {
         bundle.exchange_id == self.exchange_id && bundle.job_id == self.job_id
     }
 
+    /// Whether this record already carries one delivered bundle.
+    ///
+    /// The immutable bundle digest is the identity of a transfer: a delivery
+    /// that repeats it replayed a transfer this job already made, so it is not
+    /// recorded again and its cost is not paid again.
+    #[must_use]
+    pub fn already_transferred(&self, bundle: &ResearchEvidenceBundle) -> bool {
+        self.partial_bundles
+            .iter()
+            .any(|partial| partial.bundle_digest == bundle.immutable_bundle_digest)
+    }
+
+    /// The partial bundles this job already transferred, in delivery order.
+    ///
+    /// A resumed exchange reports this instead of repeating the transfer; the
+    /// bundle bytes stay with the evidence owner and these records bind their
+    /// digests.
+    #[must_use]
+    pub fn transferred_partials(&self) -> &[PartialEvidenceBundle] {
+        &self.partial_bundles
+    }
+
+    /// Whether this durable record may serve one retry of `request` under its own
+    /// idempotency identity.
+    ///
+    /// The comparison is the record's own content identity: the stored request
+    /// digest must equal the canonical digest of the request the retry supplied,
+    /// under the same idempotency key and exchange. `SameJob` is the only answer
+    /// that may resume, which is what makes a second transfer structurally
+    /// impossible for one identity; `DifferentContent` is a conflict, never a
+    /// fresh job.
+    pub fn resumes(
+        &self,
+        request: &ResearchQueryRequest,
+    ) -> Result<IdempotentResume, ResearchContractError> {
+        let same_job = self.idempotency_key == request.idempotency_key
+            && self.exchange_id == request.exchange_id
+            && self.request_digest == Self::request_digest(request)?;
+        Ok(if same_job {
+            IdempotentResume::SameJob
+        } else {
+            IdempotentResume::DifferentContent
+        })
+    }
+
     /// Folds the observed evidence of one bundle into the record: the measured
     /// coverage, the disclosure/source generation that was observed, and the
     /// invalidation the bundle declared. A generation is verified only when the
@@ -3113,6 +3168,24 @@ impl ExchangeJobLifecycleRecord {
             })?;
         Ok(sha256_hex(&bytes))
     }
+}
+
+/// Whether one durable record may serve a retry under its own idempotency
+/// identity.
+///
+/// I21.11: "Pending exports/imports remain durable exchange jobs and resume by
+/// idempotency identity rather than duplicate transfer." This verdict is the
+/// comparison that decides it, and it has exactly two answers, so no retry can
+/// be read as a fresh transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdempotentResume {
+    /// The record binds exactly the request content the retry supplied: the
+    /// retry resumes this job and reports its prior progress and partial
+    /// results instead of starting a second transfer.
+    SameJob,
+    /// The identity is already bound to different request content, so the retry
+    /// is a conflict rather than a resume.
+    DifferentContent,
 }
 
 /// The typed gap a Research-held source failure opens for one dependent current
@@ -3224,5 +3297,11 @@ pub trait ExchangeJobLedger {
 
     /// Stores one durable record under its own idempotency key. A record that
     /// does not validate must be refused rather than stored.
+    ///
+    /// A second write may advance the record already bound to a key, but it must
+    /// never rebind that key to another record: rebinding is the one way a
+    /// durable store could turn a retry into a second transfer, and
+    /// "resume by idempotency identity rather than duplicate transfer" (I21.11)
+    /// is a property of the store, not only of the caller that reads it.
     fn store(&mut self, record: ExchangeJobLifecycleRecord) -> Result<(), Self::Error>;
 }
