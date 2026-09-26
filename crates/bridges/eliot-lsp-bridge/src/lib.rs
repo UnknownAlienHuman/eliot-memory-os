@@ -30,6 +30,10 @@ pub use scip_cache::{
 
 use std::sync::Arc;
 
+use eliot_evidence::{
+    AbsenceVerdict, EvidenceCoverage, EvidenceFreshness, UnknownOutcome,
+    check_absence_preconditions,
+};
 use eliot_instrument_scip::ScipIndex;
 use eliot_process::{
     CancellationReceipt, ExitDisposition, OperationId, ProcessEvidence, ProcessEvidenceSink,
@@ -224,6 +228,17 @@ impl AnalyzerConfig {
             self.scip_output_path.as_deref().unwrap_or("-")
         );
         hex_bytes(Sha256::digest(canonical.as_bytes()).as_slice())
+    }
+
+    /// Reports whether this configuration narrows analyzed coverage past what
+    /// the receipt records. Disabled build scripts leave build-generated cfg
+    /// unevaluated and disabled proc macros leave macro-generated code
+    /// unobserved, so an empty lookup under either flag cannot prove absence
+    /// for the affected scope (I10.8.6
+    /// `unknown_due_to_cfg_or_macro_coverage`).
+    #[must_use]
+    pub const fn cfg_or_macro_coverage_limited(&self) -> bool {
+        self.disable_build_scripts || self.disable_proc_macros
     }
 
     fn diagnostic_flags(&self) -> Vec<String> {
@@ -650,6 +665,151 @@ impl NormalizedResult {
             | Self::Rename { receipt, .. }
             | Self::Version { receipt, .. } => receipt,
         }
+    }
+
+    /// Classifies this result's lookup through the I10.8.6 absence gate.
+    ///
+    /// `config` is the analyzer configuration that produced this result; its
+    /// build-script and proc-macro flags are read here because they narrow
+    /// analyzed coverage past what the receipt records. `scope_complete_for_query`
+    /// attests that the receipt's declared scope covers the query (a subset
+    /// listing answers only its own scope, never the workspace).
+    /// `exact_candidate_binding` attests that the analyzed index is bound to
+    /// the exact candidate and scope under evaluation; the receipt alone never
+    /// proves that binding. The bridge tracks no counterevidence, so
+    /// contradiction is always unattested here and downstream disagreement
+    /// handling (I10.8.19) owns it instead.
+    #[must_use]
+    pub fn lookup_outcome(
+        &self,
+        config: &AnalyzerConfig,
+        scope_complete_for_query: bool,
+        exact_candidate_binding: bool,
+    ) -> LookupOutcome {
+        let found_any = match self {
+            Self::Definitions { items, .. } => !items.is_empty(),
+            Self::References { items, .. } => !items.is_empty(),
+            Self::Symbols { items, .. } => !items.is_empty(),
+            Self::Diagnostics { observations, .. } => !observations.is_empty(),
+            Self::Rename { candidate, .. } => !candidate.edits.is_empty(),
+            Self::Version { version, .. } => !version.is_empty(),
+        };
+        classify_lookup(
+            self.receipt(),
+            LookupClassification {
+                scope_complete_for_query,
+                found_any,
+                exact_candidate_binding,
+                cfg_or_macro_coverage_limited: config.cfg_or_macro_coverage_limited(),
+                contradicted_by_higher_authority: false,
+            },
+        )
+    }
+}
+
+/// Lookup outcome classified from an observation receipt (I10.8.6).
+///
+/// An empty lookup is `ProvenAbsent` only when the receipt records a
+/// complete run over a complete scope with an exact candidate binding;
+/// every other empty lookup is a typed [`UnknownOutcome`] or
+/// [`LookupOutcome::Contradicted`], never "not found".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LookupOutcome {
+    /// The lookup returned items. They are observations, never absence
+    /// proof, and their receipt still bounds their use.
+    Found,
+    /// The empty lookup proves absence for the queried scope.
+    ProvenAbsent,
+    /// The empty lookup cannot prove absence; absence is this typed
+    /// unknown and must not be treated as proof.
+    Unknown(UnknownOutcome),
+    /// Higher-authority evidence contradicts the absence; the claim is
+    /// contested rather than unknown.
+    Contradicted,
+}
+
+/// Caller attestations for one lookup classification.
+///
+/// The receipt records what the run observed; these flags record what the
+/// caller has established about the query: whether the receipt's declared
+/// scope covers it, whether the lookup returned anything, whether the
+/// analyzed index is bound to the exact candidate and scope, whether the
+/// analyzer configuration narrowed cfg/macro coverage, and whether
+/// higher-authority evidence contradicts the absence.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "five independent caller attestations; an enum per flag would quintuple the vocabulary for one call"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LookupClassification {
+    /// The receipt's declared scope covers the query.
+    pub scope_complete_for_query: bool,
+    /// The lookup returned at least one item.
+    pub found_any: bool,
+    /// The analyzed index is bound to the exact candidate and scope.
+    pub exact_candidate_binding: bool,
+    /// Disabled build scripts or proc macros narrowed cfg/macro coverage.
+    pub cfg_or_macro_coverage_limited: bool,
+    /// Higher-authority evidence contradicts the absence.
+    pub contradicted_by_higher_authority: bool,
+}
+
+/// Classifies one lookup from its observation receipt.
+///
+/// A run that failed, truncated, or did not normalize reports
+/// [`UnknownOutcome::UnknownDueToTruncationOrToolFailure`] even though the
+/// receipt also records stale freshness: the disposition names the root
+/// cause while staleness is its derived symptom. A successful run under a
+/// cfg/macro-narrowed configuration reports
+/// [`UnknownOutcome::UnknownDueToCfgOrMacroCoverage`] before freshness and
+/// coverage are consulted, because the narrowed view bounds what the run
+/// could have observed. A merely current run is still freshness-unknown for
+/// absence until the caller attests the exact candidate binding, because run
+/// currency never proves candidate identity.
+#[must_use]
+pub fn classify_lookup(
+    receipt: &ObservationReceipt,
+    classification: LookupClassification,
+) -> LookupOutcome {
+    if classification.found_any {
+        return LookupOutcome::Found;
+    }
+    let absence_capability = match receipt.disposition {
+        FailureDisposition::Success => {
+            if classification.cfg_or_macro_coverage_limited {
+                Err(UnknownOutcome::UnknownDueToCfgOrMacroCoverage)
+            } else {
+                Ok(())
+            }
+        }
+        FailureDisposition::ToolFailed { .. }
+        | FailureDisposition::OutputTruncated
+        | FailureDisposition::ParseFailed { .. }
+        | FailureDisposition::UnsupportedOperation => {
+            Err(UnknownOutcome::UnknownDueToTruncationOrToolFailure)
+        }
+    };
+    let freshness = match receipt.freshness {
+        Freshness::Current if classification.exact_candidate_binding => {
+            EvidenceFreshness::ExactCandidate
+        }
+        Freshness::Current => EvidenceFreshness::Unknown,
+        Freshness::Stale { .. } => EvidenceFreshness::Stale,
+    };
+    let coverage = match receipt.coverage {
+        Coverage::ProbeOnly => EvidenceCoverage::Unknown,
+        _ if !classification.scope_complete_for_query => EvidenceCoverage::PartialForScope,
+        _ => EvidenceCoverage::CompleteForScope,
+    };
+    match check_absence_preconditions(
+        freshness,
+        coverage,
+        absence_capability,
+        classification.contradicted_by_higher_authority,
+    ) {
+        AbsenceVerdict::Admitted => LookupOutcome::ProvenAbsent,
+        AbsenceVerdict::Unknown(outcome) => LookupOutcome::Unknown(outcome),
+        AbsenceVerdict::Contested => LookupOutcome::Contradicted,
     }
 }
 

@@ -342,11 +342,151 @@ pub struct NormalizedEvidence {
 }
 
 impl NormalizedEvidence {
+    /// Key under which typed capture provenance rides inside `value`.
+    pub const CAPTURE_PROVENANCE_KEY: &str = "capture_provenance";
+
     /// Validates lineage and semantic axes without promoting the evidence.
     pub fn validate(&self) -> Result<(), InstrumentContractError> {
         validate_text(&self.kind, "kind")?;
         validate_text(&self.summary, "summary")?;
         self.axes.validate()
+    }
+
+    /// Attaches typed I10.8.5 capture provenance to this item's `value`
+    /// object. Readers that do not know the key ignore it; the normalized
+    /// shape itself never changes.
+    pub fn attach_capture_provenance(
+        &mut self,
+        capture: &CaptureProvenance,
+    ) -> Result<(), InstrumentContractError> {
+        capture.validate()?;
+        let stored = serde_json::to_value(capture)
+            .map_err(|error| InstrumentContractError::Canonicalization(error.to_string()))?;
+        match &mut self.value {
+            Value::Object(map) => {
+                map.insert(Self::CAPTURE_PROVENANCE_KEY.to_owned(), stored);
+                Ok(())
+            }
+            _ => Err(InstrumentContractError::EvidenceState {
+                field: "value",
+                reason: "capture provenance requires an object value",
+            }),
+        }
+    }
+
+    /// Reads back attached capture provenance. A missing key yields `None`;
+    /// a present but malformed bundle fails closed.
+    pub fn capture_provenance(&self) -> Result<Option<CaptureProvenance>, InstrumentContractError> {
+        let Some(stored) = self.value.get(Self::CAPTURE_PROVENANCE_KEY) else {
+            return Ok(None);
+        };
+        serde_json::from_value(stored.clone())
+            .map(Some)
+            .map_err(|_| InstrumentContractError::EvidenceState {
+                field: "capture_provenance",
+                reason: "capture provenance bundle is malformed",
+            })
+    }
+}
+
+/// WorkScope/base/candidate/worktree identity observed for one run.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkscopeIdentity {
+    /// Observed branch, when the source observation carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Observed commit, when the source observation carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Observed dirty-state digest, when the source observation carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_state_sha256: Option<String>,
+    /// Exact project/worktree target of the instrument invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Declared scope used for coverage and freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+impl WorkscopeIdentity {
+    /// Validates the present identity fields without inventing absent ones.
+    pub fn validate(&self) -> Result<(), InstrumentContractError> {
+        for (field, value) in [
+            ("workscope.branch", self.branch.as_deref()),
+            ("workscope.commit", self.commit.as_deref()),
+            (
+                "workscope.dirty_state_sha256",
+                self.dirty_state_sha256.as_deref(),
+            ),
+            ("workscope.target", self.target.as_deref()),
+            ("workscope.scope", self.scope.as_deref()),
+        ] {
+            if let Some(text) = value {
+                validate_text(text, field)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// I10.8.5 capture provenance attached by parsers and bridge adapters.
+///
+/// Every field is caller-observed: executable identity, config hash,
+/// WorkScope/candidate identity, profile revision, resource/timing outcome,
+/// truncation, and parse metadata. Absent fields stay absent; parsers never
+/// invent identity. Timing detail stays on the run clocks; `resource_outcome`
+/// carries only the coarse outcome summary when the boundary projects one.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureProvenance {
+    /// Owner-observed executable identity (`path=...;sha256=...`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_identity: Option<String>,
+    /// Config/environment/feature/toolchain hash selected for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
+    /// WorkScope/base/candidate/worktree identity observed for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workscope: Option<WorkscopeIdentity>,
+    /// Instrument profile name/revision that produced the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    /// Coarse resource/timing outcome summary, when projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_outcome: Option<String>,
+    /// Whether any source stream for this item ended at an explicit
+    /// truncation boundary.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Parser consumption note. Absent when the parser proves full
+    /// consumption by failing closed instead of noting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_note: Option<String>,
+}
+
+impl CaptureProvenance {
+    /// Validates the present attach fields without inventing absent ones.
+    pub fn validate(&self) -> Result<(), InstrumentContractError> {
+        for (field, value) in [
+            (
+                "capture.executable_identity",
+                self.executable_identity.as_deref(),
+            ),
+            ("capture.config_hash", self.config_hash.as_deref()),
+            ("capture.profile_revision", self.profile_revision.as_deref()),
+            ("capture.resource_outcome", self.resource_outcome.as_deref()),
+            ("capture.parse_note", self.parse_note.as_deref()),
+        ] {
+            if let Some(text) = value {
+                validate_text(text, field)?;
+            }
+        }
+        if let Some(workscope) = &self.workscope {
+            workscope.validate()?;
+        }
+        Ok(())
     }
 }
 
