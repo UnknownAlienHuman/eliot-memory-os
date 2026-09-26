@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use super::*;
+use crate::approved_generation_registry::{
+    TestSupportRegistryFixtureContour, test_support_activation_fixture,
+};
 #[cfg(windows)]
 use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
@@ -3569,8 +3572,11 @@ fn signed_activation_projection_registry_conflict_quarantines_after_transaction_
         test_handle("approval:projection-foreign"),
     );
     must(registry.mutate_atomic(1, |registry| {
-        registry
-            .stage_pending_activation_from_transaction_with_approval(&registering, other_approval)
+        registry.stage_pending_activation_from_transaction_for_test_support(
+            &registering,
+            other_approval,
+            TestSupportRegistryFixtureContour::InMemory,
+        )
     }));
     let mut transaction_store = must(
         RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(
@@ -4903,7 +4909,7 @@ fn all_effects_gate_blocks_registry_projection_until_authoritative_readback() {
 
     let mut registry = ApprovedGenerationRegistry::new();
     assert!(matches!(
-        registry.stage_pending_activation_from_transaction_with_approval(
+        registry.stage_pending_activation_from_transaction_for_test_support(
             &transaction,
             test_activation_approval(
                 &transaction.candidate_manifest,
@@ -4911,6 +4917,7 @@ fn all_effects_gate_blocks_registry_projection_until_authoritative_readback() {
                 transaction.installer_plan_digest.clone(),
                 test_handle("approval:blocked"),
             ),
+            TestSupportRegistryFixtureContour::InMemory,
         ),
         Err(InstallationError::IncompleteObservation(_))
     ));
@@ -8068,24 +8075,18 @@ fn registry_rejects_pending_while_active_rebind_is_active() {
     must(upgrade.validate());
     let upgrade_tx = test_handle("transaction:active-blocks-pending");
     let upgrade_plan = test_handle("f".repeat(64));
-    let upgrade_approval = InstallationActivationApproval {
-        approval_ref: test_handle("approval:active-blocks-pending-2"),
-        transaction_id: upgrade_tx.clone(),
-        installer_plan_digest: upgrade_plan.clone(),
-        generation: upgrade.generation.clone(),
-        candidate_manifest_digest: must(candidate_manifest_digest(&upgrade)),
-        runtime_descriptor_digest: upgrade.runtime_launch.descriptor_digest.clone(),
-        required_owner: test_handle("owner:test"),
-        signature_ref: upgrade.signature_ref.clone(),
-        authority_descriptor_path: upgrade.runtime_launch.authority_descriptor_path.clone(),
-        authority_descriptor_digest: upgrade.runtime_launch.authority_descriptor_digest.clone(),
-        authority_generation: upgrade.runtime_launch.authority_generation,
-        authority_state_fence: upgrade.runtime_launch.authority_state_fence.clone(),
-    };
+    let upgrade_fixture = must(test_support_activation_fixture(
+        &upgrade_tx,
+        &upgrade_plan,
+        &upgrade,
+        &test_handle("approval:active-blocks-pending-2"),
+        &test_handle("owner:test"),
+        TestSupportRegistryFixtureContour::InMemory,
+    ));
     let mut direct = must(registry.load());
     direct.revision = must(registry.load()).revision();
     assert!(matches!(
-        direct.stage_pending_activation_unchecked(upgrade.clone(), upgrade_approval, &[]),
+        direct.stage_pending_activation_unchecked(upgrade.clone(), &upgrade_fixture, &[]),
         Err(InstallationError::IdentityConflict)
     ));
     must(direct.validate());

@@ -2833,6 +2833,148 @@ pub enum PendingActivationState {
         reason: String,
     },
 }
+
+/// Domain separator of the one installation-owned test-support activation
+/// fixture preimage.  The production activation-intent identity is owned by
+/// `activation_projection_intent_digest` over
+/// `InstallationActivationProjectionIntent`; this domain exists only so a
+/// fixture identity can never be confused with a production one.
+#[cfg(any(test, feature = "test-support"))]
+const TEST_SUPPORT_ACTIVATION_FIXTURE_DOMAIN: &str =
+    "eliot.installation.test-support.pending-activation-fixture";
+
+/// Version of the installation-owned test-support activation fixture preimage.
+/// Bumping it changes every fixture identity, exactly as a canonical encoding
+/// version change must.
+#[cfg(any(test, feature = "test-support"))]
+const TEST_SUPPORT_ACTIVATION_FIXTURE_VERSION: u32 = 1;
+
+/// Registry fixture surface that one synthetic activation identity is minted
+/// for.
+///
+/// The contour is part of the fixture preimage, so an identity minted for the
+/// in-memory state-machine surface can never be replayed into the durable
+/// projection, or the reverse.  It deliberately carries no registry revision:
+/// an exact fixture replay observed at a later CAS revision must reproduce one
+/// identical identity, and a changed transaction, plan, manifest, approval or
+/// intent under one fixture identity must refuse before any mutation.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestSupportRegistryFixtureContour {
+    /// In-memory `ApprovedGenerationRegistry` used by the state-machine, wire
+    /// and launch fixtures.
+    InMemory,
+    /// Durable redb `RedbInstallationRegistry` used by the store and Host
+    /// recovery fixtures.
+    Durable,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestSupportRegistryFixtureContour {
+    /// Canonical label bound into the fixture preimage.
+    fn canonical_label(self) -> &'static str {
+        match self {
+            Self::InMemory => "IN_MEMORY_REGISTRY",
+            Self::Durable => "DURABLE_REDB_REGISTRY",
+        }
+    }
+}
+
+/// The single versioned, domain-separated canonical preimage that yields both
+/// the fixture approval and the fixture activation-intent digest.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TestSupportActivationFixturePreimage {
+    domain: &'static str,
+    version: u32,
+    transaction_id: PlatformHandle,
+    installer_plan_digest: PlatformHandle,
+    candidate_manifest_digest: PlatformHandle,
+    approval_binding: InstallationActivationApprovalBinding,
+    registry_fixture_contour: &'static str,
+}
+
+/// Installation-owned deterministic activation fixture binding.
+///
+/// This is the single test-scoped source of a synthetic activation-intent
+/// digest.  It exists only for a fixture that intentionally begins after signed
+/// activation, where the transaction retains no production
+/// `InstallationActivationProjectionIntent` envelope.  The approval and the
+/// activation-intent digest are produced together from one versioned,
+/// domain-separated canonical preimage bound to the exact transaction id, plan
+/// digest, candidate manifest digest, approval binding and registry fixture
+/// contour.  No caller can supply a free-form digest, and the whole item
+/// disappears from a production build, so it can never become a production
+/// admission route.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TestSupportActivationFixture {
+    /// The typed installer approval bound by this fixture.
+    pub(crate) approval: InstallationActivationApproval,
+    /// The activation-intent identity derived from the same preimage.
+    pub(crate) activation_intent_digest: PlatformHandle,
+}
+
+/// Builds the one installation-owned test-support activation fixture binding.
+///
+/// `approval_ref` is the fixture's own detached approval evidence reference,
+/// not an activation-intent identity: the intent digest is always computed
+/// here.  The caller therefore cannot smuggle a chosen digest past the
+/// registry's fail-closed validation.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_support_activation_fixture(
+    transaction_id: &PlatformHandle,
+    plan_digest: &PlatformHandle,
+    manifest: &CandidateManifest,
+    approval_ref: &PlatformHandle,
+    required_owner: &PlatformHandle,
+    registry_fixture_contour: TestSupportRegistryFixtureContour,
+) -> Result<TestSupportActivationFixture, InstallationError> {
+    manifest.validate()?;
+    let manifest_digest = candidate_manifest_digest(manifest)?;
+    let runtime = &manifest.runtime_launch;
+    let approval = InstallationActivationApproval::from_verified_parts(
+        approval_ref.clone(),
+        transaction_id.clone(),
+        plan_digest.clone(),
+        manifest.generation.clone(),
+        manifest_digest.clone(),
+        runtime.descriptor_digest.clone(),
+        required_owner.clone(),
+        manifest.signature_ref.clone(),
+        runtime.authority_descriptor_path.clone(),
+        runtime.authority_descriptor_digest.clone(),
+        runtime.authority_generation,
+        runtime.authority_state_fence.clone(),
+    );
+    approval.validate()?;
+    validate_approval_against_manifest(&approval, manifest, "test_support_activation_fixture")?;
+    let preimage = TestSupportActivationFixturePreimage {
+        domain: TEST_SUPPORT_ACTIVATION_FIXTURE_DOMAIN,
+        version: TEST_SUPPORT_ACTIVATION_FIXTURE_VERSION,
+        transaction_id: transaction_id.clone(),
+        installer_plan_digest: plan_digest.clone(),
+        candidate_manifest_digest: manifest_digest,
+        approval_binding: InstallationActivationApprovalBinding::from_approval(&approval),
+        registry_fixture_contour: registry_fixture_contour.canonical_label(),
+    };
+    let bytes =
+        canonical_json_bytes(&preimage).map_err(|error| InstallationError::InvalidField {
+            field: "test_support_activation_fixture.preimage".to_owned(),
+            reason: error.to_string(),
+        })?;
+    let activation_intent_digest = PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "test_support_activation_fixture.activation_intent_digest".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(TestSupportActivationFixture {
+        approval,
+        activation_intent_digest,
+    })
+}
+
 impl ApprovedGenerationRegistry {
     /// Creates an empty registry.
     #[must_use]
@@ -2901,50 +3043,54 @@ impl ApprovedGenerationRegistry {
                 "SystemService activation requires transaction-bound SCM approvals".to_owned(),
             ));
         }
-        let runtime = &manifest.runtime_launch;
-        let approval = InstallationActivationApproval {
-            approval_ref,
-            transaction_id,
-            installer_plan_digest: plan_digest,
-            generation: manifest.generation.clone(),
-            candidate_manifest_digest: candidate_manifest_digest(&manifest)?,
-            runtime_descriptor_digest: runtime.descriptor_digest.clone(),
-            required_owner: PlatformHandle::new("owner:test").map_err(|error| {
-                InstallationError::InvalidField {
-                    field: "activation_approval.required_owner".to_owned(),
-                    reason: error.to_string(),
-                }
-            })?,
-            signature_ref: manifest.signature_ref.clone(),
-            authority_descriptor_path: runtime.authority_descriptor_path.clone(),
-            authority_descriptor_digest: runtime.authority_descriptor_digest.clone(),
-            authority_generation: runtime.authority_generation,
-            authority_state_fence: runtime.authority_state_fence.clone(),
-        };
-        self.stage_pending_activation_unchecked(manifest, approval, &[])
+        let required_owner =
+            PlatformHandle::new("owner:test").map_err(|error| InstallationError::InvalidField {
+                field: "activation_approval.required_owner".to_owned(),
+                reason: error.to_string(),
+            })?;
+        let activation_fixture = test_support_activation_fixture(
+            &transaction_id,
+            &plan_digest,
+            &manifest,
+            &approval_ref,
+            &required_owner,
+            TestSupportRegistryFixtureContour::InMemory,
+        )?;
+        self.stage_pending_activation_unchecked(manifest, &activation_fixture, &[])
     }
 
+    /// Stages a fixture pending activation for a test that intentionally begins
+    /// after signed activation.
+    ///
+    /// The installation-owned fixture binding is an explicit argument: this seam
+    /// never manufactures the absence of an activation intent, and it has no
+    /// production build form.  A transaction that still carries its real
+    /// `InstallationActivationProjectionIntent` must use
+    /// `stage_pending_activation_from_transaction_for_test_support`, which
+    /// prefers that production owner.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn stage_pending_activation_unchecked(
         &mut self,
         manifest: CandidateManifest,
-        approval: InstallationActivationApproval,
+        activation_fixture: &TestSupportActivationFixture,
         service_registration_approvals: &[InstallerServiceRegistrationApproval],
     ) -> Result<(), InstallationError> {
         self.stage_pending_activation_unchecked_with_intent(
             manifest,
-            approval,
+            activation_fixture.approval.clone(),
             service_registration_approvals,
-            None,
+            activation_fixture.activation_intent_digest.clone(),
         )
     }
 
+    /// Lowest staging seam.  The activation intent is a required concrete
+    /// identity: there is no representation of "staged without an intent".
     fn stage_pending_activation_unchecked_with_intent(
         &mut self,
         manifest: CandidateManifest,
         approval: InstallationActivationApproval,
         service_registration_approvals: &[InstallerServiceRegistrationApproval],
-        activation_intent_digest: Option<PlatformHandle>,
+        activation_intent_digest: PlatformHandle,
     ) -> Result<(), InstallationError> {
         self.validate()?;
         if self
@@ -2954,16 +3100,14 @@ impl ApprovedGenerationRegistry {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        sha256_handle(
+            &activation_intent_digest,
+            "pending_activation.activation_intent_digest",
+        )?;
         manifest.validate()?;
         approval.validate()?;
         validate_approval_against_manifest(&approval, &manifest, "pending_activation")?;
         let manifest_digest = candidate_manifest_digest(&manifest)?;
-        let activation_intent_digest = activation_intent_digest.ok_or_else(|| {
-            InstallationError::IncompleteObservation(
-                "pending activation requires the transaction-owned activation intent digest"
-                    .to_owned(),
-            )
-        })?;
         let pending = PendingActivation {
             transaction_id: approval.transaction_id.clone(),
             plan_digest: approval.installer_plan_digest.clone(),
@@ -3023,31 +3167,66 @@ impl ApprovedGenerationRegistry {
         self.validate()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn stage_pending_activation_from_transaction_with_approval(
+    /// Stages a pending activation for a fixture transaction that never runs the
+    /// production installer activation boundary.
+    ///
+    /// The production owner is always preferred.  When the transaction still
+    /// retains its real `InstallationActivationProjectionIntent`, that intent
+    /// validates against the exact transaction and the existing
+    /// `activation_projection_intent_digest` function owns the identity; the
+    /// manifest, plan and approval digests are never substituted for it.  Only
+    /// a fixture that intentionally begins after signed activation and retains
+    /// no production envelope falls back to the one installation-owned
+    /// activation fixture binding, which is a separate, domain-separated
+    /// identity and is not a production admission route.
+    #[cfg(test)]
+    pub(crate) fn stage_pending_activation_from_transaction_for_test_support(
         &mut self,
         transaction: &InstallationTransaction,
         approval: InstallationActivationApproval,
+        registry_fixture_contour: TestSupportRegistryFixtureContour,
     ) -> Result<(), InstallationError> {
-        self.stage_pending_activation_from_transaction_with_approval_and_intent(
+        approval.validate_against(transaction)?;
+        if let Some(intent) = transaction.activation_projection_intent() {
+            return self.stage_pending_activation_from_transaction_with_approval_and_intent(
+                transaction,
+                &approval,
+                intent,
+            );
+        }
+        let activation_fixture = test_support_activation_fixture(
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest,
+            &approval.approval_ref,
+            &approval.required_owner,
+            registry_fixture_contour,
+        )?;
+        if activation_fixture.approval != approval {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let approvals = transaction.service_registration_approvals()?;
+        if transaction.profile == InstallationProfile::SystemService && approvals.len() != 2 {
+            return Err(InstallationError::IncompleteObservation(
+                "SystemService transaction requires exactly Host and Watchdog SCM approvals"
+                    .to_owned(),
+            ));
+        }
+        self.stage_pending_activation_from_transaction_with_digest(
             transaction,
-            approval,
-            None,
+            &activation_fixture.approval,
+            &activation_fixture.activation_intent_digest,
+            &approvals,
         )
     }
 
     fn stage_pending_activation_from_transaction_with_approval_and_intent(
         &mut self,
         transaction: &InstallationTransaction,
-        approval: InstallationActivationApproval,
-        activation_intent: Option<&InstallationActivationProjectionIntent>,
+        approval: &InstallationActivationApproval,
+        activation_intent: &InstallationActivationProjectionIntent,
     ) -> Result<(), InstallationError> {
         approval.validate_against(transaction)?;
-        let activation_intent = activation_intent.ok_or_else(|| {
-            InstallationError::IncompleteObservation(
-                "pending activation requires the transaction-owned activation intent".to_owned(),
-            )
-        })?;
         activation_intent.validate_against_transaction(transaction)?;
         let activation_intent_digest = activation_projection_intent_digest(activation_intent)?;
         let approvals = transaction.service_registration_approvals()?;
@@ -3057,16 +3236,35 @@ impl ApprovedGenerationRegistry {
                     .to_owned(),
             ));
         }
+        self.stage_pending_activation_from_transaction_with_digest(
+            transaction,
+            approval,
+            &activation_intent_digest,
+            &approvals,
+        )
+    }
+
+    /// Applies the exact replay/conflict rule for one already-identified
+    /// activation intent.  An exact repeat is idempotent; any changed
+    /// transaction, plan, manifest, approval or intent refuses with
+    /// `IdentityConflict` before the registry is mutated.
+    fn stage_pending_activation_from_transaction_with_digest(
+        &mut self,
+        transaction: &InstallationTransaction,
+        approval: &InstallationActivationApproval,
+        activation_intent_digest: &PlatformHandle,
+        approvals: &[InstallerServiceRegistrationApproval],
+    ) -> Result<(), InstallationError> {
         if let Some(existing) = self.pending_activation.as_ref()
             && existing.transaction_id == transaction.transaction_id
             && existing.plan_digest == transaction.installer_plan_digest
             && existing.manifest == transaction.candidate_manifest
-            && existing.approval == approval
-            && existing.activation_intent_digest.as_ref() == Some(&activation_intent_digest)
+            && &existing.approval == approval
+            && existing.activation_intent_digest.as_ref() == Some(activation_intent_digest)
         {
-            for approval in &approvals {
-                if self.service_registration_approval(&approval.generation, approval.role)
-                    != Some(approval)
+            for scm_approval in approvals {
+                if self.service_registration_approval(&scm_approval.generation, scm_approval.role)
+                    != Some(scm_approval)
                 {
                     return Err(InstallationError::IdentityConflict);
                 }
@@ -3075,17 +3273,16 @@ impl ApprovedGenerationRegistry {
         }
         self.stage_pending_activation_unchecked_with_intent(
             transaction.candidate_manifest.clone(),
-            approval,
-            &approvals,
-            Some(activation_intent_digest),
-        )?;
-        Ok(())
+            approval.clone(),
+            approvals,
+            activation_intent_digest.clone(),
+        )
     }
 
     pub(crate) fn stage_pending_activation_from_transaction_with_pre_activation_approval(
         &mut self,
         transaction: &InstallationTransaction,
-        approval: InstallationActivationApproval,
+        approval: &InstallationActivationApproval,
     ) -> Result<(), InstallationError> {
         transaction.require_signed_pending_activation_effects()?;
         let intent = transaction
@@ -3094,7 +3291,7 @@ impl ApprovedGenerationRegistry {
         self.stage_pending_activation_from_transaction_with_approval_and_intent(
             transaction,
             approval,
-            Some(intent),
+            intent,
         )
     }
 
