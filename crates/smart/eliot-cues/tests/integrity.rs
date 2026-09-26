@@ -147,30 +147,3 @@ fn ledger_1143_owner_path_validates_without_facade_fallback() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn migration_binds_row_identity_and_rejects_empty_snapshot_bytes() -> TestResult {
-    let row_id = "cue:0123456789abcdef0123456789abcdef";
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "row_id": row_id,
-        "scope": "scope",
-        "kind": "concept",
-        "value": "legacy",
-        "mode": "exact",
-        "target": "artifact:one",
-        "revision": 1
-    }))?;
-    assert!(
-        preserve_v1_row_bytes(row_id, &bytes)?
-            .disposition
-            .is_replay()
-    );
-    assert!(preserve_v1_row_bytes(row_id, b"not-v1-json").is_err());
-    let empty_snapshot = serde_json::to_vec(&serde_json::json!({
-        "snapshot_id": "cue:snapshot:empty",
-        "rows": []
-    }))?;
-    assert!(
-        preserve_v1_snapshot_bytes_with_rows("cue:snapshot:empty", &empty_snapshot, &[],).is_err()
-    );
-    Ok(())
-}

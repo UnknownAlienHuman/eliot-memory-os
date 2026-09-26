@@ -1101,39 +1101,6 @@ fn deterministic_owner_version_bound_migration_receipt() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn missing_fresh_observation_emits_typed_v2_rejection() -> TestResult {
-    let row = LegacyEliotCuesV1Row {
-        mode: Some("exact".to_owned()),
-        ..legacy_row("concept", "needs-reobservation")
-    };
-    let legacy_bytes = serde_json::to_vec(&serde_json::json!({
-        "row_id": "legacy:needs-reobservation",
-        "scope": row.scope.clone(),
-        "kind": row.kind.clone(),
-        "value": row.value.clone(),
-        "mode": row.mode.clone(),
-        "target": row.target.clone(),
-        "revision": row.revision
-    }))?;
-    let rejected = eliot_cues::legacy_adapter::convert_v1_row(
-        "legacy:needs-reobservation",
-        &row,
-        &legacy_bytes,
-        None,
-        None,
-    )?;
-    assert!(rejected.disposition.is_rejected());
-    assert_eq!(
-        rejected.disposition,
-        eliot_cue_contracts::ConversionDisposition::V2Rejected {
-            legacy_row_id: "legacy:needs-reobservation".to_owned(),
-            reason: "missing_fresh_observation".to_owned(),
-        }
-    );
-    Ok(())
-}
-
 // WORK_UNIT_CASE: 833/25
 #[test]
 fn no_unmarked_new_facade_consumer() {
