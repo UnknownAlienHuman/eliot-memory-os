@@ -329,10 +329,22 @@ impl McpInvocationCorrelation {
     /// Request/response payloads are never logged. Every event honestly
     /// declares its host/UI coverage ceiling: ELIOT-side stages are observed,
     /// host/UI terminal state stays `partial_unknown` until a live run
-    /// observes it out of band.
+    /// observes it out of band. When ELIOT provably emitted exactly once, the
+    /// event also carries the typed route degradation and recovery directive
+    /// so a stuck host indicator can be triaged without inventing canonical
+    /// outcome; otherwise those fields stay empty.
     pub(crate) fn emit(&self) {
         let coverage = PartialObservation::stdio_boundary();
         let gaps: Vec<&str> = coverage.missing.iter().map(|gap| gap.as_str()).collect();
+        let route = RouteDegradation::emitted_but_unobserved(self);
+        let recovery_actions = route.as_ref().map_or_else(String::new, |(_, directive)| {
+            directive
+                .actions
+                .iter()
+                .map(|action| action.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        });
         tracing::info!(
             schema = self.schema,
             mcp_request_id = %self.mcp_request_id,
@@ -349,6 +361,13 @@ impl McpInvocationCorrelation {
             response_bytes = self.response_bytes.unwrap_or(0),
             emission_cause = self.emission.map_or("", |receipt| receipt.cause.as_str()),
             emitted_exactly_once = self.emitted_exactly_once(),
+            route_degradation =
+                route.as_ref().map_or("", |(degradation, _)| degradation.code.as_str()),
+            route_degradation_detail =
+                route.as_ref().map_or("", |(degradation, _)| degradation.detail.as_str()),
+            recovery_actions = %recovery_actions,
+            recovery_evidence_hint =
+                route.as_ref().map_or("", |(_, directive)| directive.evidence_hint.as_str()),
             host_observation = "partial_unknown",
             coverage_gaps = ?gaps,
             coverage_note = %coverage.coverage_note,
@@ -463,10 +482,6 @@ impl CoverageGap {
 /// This reports route health only. It fabricates neither canonical failure
 /// nor canonical success: the canonical operation outcome stays exactly what
 /// the committing tool returned.
-#[allow(
-    dead_code,
-    reason = "TEST-PHASE hook: built from the correlation record plus live-run host evidence (#7)"
-)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RouteDegradation {
     /// Machine-readable degradation class.
@@ -478,25 +493,25 @@ pub(crate) struct RouteDegradation {
 }
 
 /// Machine-readable route degradation classes.
-#[allow(
-    dead_code,
-    reason = "TEST-PHASE hook: built from the correlation record plus live-run host evidence (#7)"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RouteDegradationCode {
     /// ELIOT wrote and flushed a valid frame; host completion unobserved.
     EmittedButHostCompletionUnobserved,
     /// The host observed bytes but misclassified them (timeout/error/stale).
+    #[allow(
+        dead_code,
+        reason = "TEST-PHASE vocabulary: classified only from out-of-band live-run host evidence (#7)"
+    )]
     ResponseMisclassifiedByHost,
     /// The transport was lost after flush; redelivery state is unknown.
+    #[allow(
+        dead_code,
+        reason = "TEST-PHASE vocabulary: classified only from out-of-band live-run host evidence (#7)"
+    )]
     TransportLostAfterFlush,
 }
 
-#[allow(
-    dead_code,
-    reason = "TEST-PHASE hook: built from the correlation record plus live-run host evidence (#7)"
-)]
 impl RouteDegradationCode {
     /// Stable wire name for structured events.
     pub(crate) const fn as_str(self) -> &'static str {
@@ -509,10 +524,6 @@ impl RouteDegradationCode {
 }
 
 /// Usable recovery directive accompanying a route degradation.
-#[allow(
-    dead_code,
-    reason = "TEST-PHASE hook: built from the correlation record plus live-run host evidence (#7)"
-)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RecoveryDirective {
     /// Ordered recovery actions; later actions apply if earlier ones fail.
@@ -522,10 +533,6 @@ pub(crate) struct RecoveryDirective {
 }
 
 /// One bounded recovery action that never invents canonical outcome.
-#[allow(
-    dead_code,
-    reason = "TEST-PHASE hook: built from the correlation record plus live-run host evidence (#7)"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RecoveryAction {
@@ -541,15 +548,27 @@ pub(crate) enum RecoveryAction {
     EscalateWithCorrelationEvidence,
 }
 
-#[allow(
-    dead_code,
-    reason = "TEST-PHASE hook: built from the correlation record plus live-run host evidence (#7)"
-)]
+impl RecoveryAction {
+    /// Stable wire name for structured events.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReconnectStdioRoute => "reconnect_stdio_route",
+            Self::RefreshDesktopView => "refresh_desktop_view",
+            Self::QueryStatusTool => "query_status_tool",
+            Self::ResubmitSameOperationIdentity => "resubmit_same_operation_identity",
+            Self::EscalateWithCorrelationEvidence => "escalate_with_correlation_evidence",
+        }
+    }
+}
+
 impl RouteDegradation {
     /// Builds the degradation for an emitted-but-unobserved response.
     ///
     /// Requires the ELIOT-side record to show exactly-once emission; anything
-    /// else is an ELIOT delivery defect, not a host-route degradation.
+    /// else is an ELIOT delivery defect, not a host-route degradation. Called
+    /// from [`McpInvocationCorrelation::emit`], which surfaces the record as
+    /// structured event fields; this constructor stays a pure builder so one
+    /// invocation produces one correlation event.
     pub(crate) fn emitted_but_unobserved(
         correlation: &McpInvocationCorrelation,
     ) -> Option<(Self, RecoveryDirective)> {
@@ -566,26 +585,22 @@ impl RouteDegradation {
                 correlation.response_bytes.unwrap_or(0),
             ),
         };
+        let mut actions = vec![
+            RecoveryAction::QueryStatusTool,
+            RecoveryAction::RefreshDesktopView,
+            RecoveryAction::ReconnectStdioRoute,
+        ];
+        if !correlation.operation.is_empty() {
+            actions.push(RecoveryAction::ResubmitSameOperationIdentity);
+        }
+        actions.push(RecoveryAction::EscalateWithCorrelationEvidence);
         let directive = RecoveryDirective {
-            actions: vec![
-                RecoveryAction::QueryStatusTool,
-                RecoveryAction::RefreshDesktopView,
-                RecoveryAction::ReconnectStdioRoute,
-                RecoveryAction::EscalateWithCorrelationEvidence,
-            ],
+            actions,
             evidence_hint: format!(
                 "attach {} record for request {}",
                 CORRELATION_SCHEMA_ID, correlation.mcp_request_id
             ),
         };
-        tracing::warn!(
-            schema = CORRELATION_SCHEMA_ID,
-            degradation = degradation.code.as_str(),
-            stage = degradation.last_observed_stage.as_str(),
-            detail = %degradation.detail,
-            evidence_hint = %directive.evidence_hint,
-            "mcp route degradation"
-        );
         Some((degradation, directive))
     }
 }
