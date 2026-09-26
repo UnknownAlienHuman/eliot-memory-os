@@ -574,15 +574,20 @@ where
 
 /// Stages the open unknown-commit record and pauses its scopes: the
 /// visible Problem State for Doctor/Human disposition.
+///
+/// The ORS handle is resolved BEFORE the in-memory pause index is touched.
+/// Indexing first and bailing after would mark every affected Ordering Scope
+/// paused with no durable record behind it: the scope would be quarantined
+/// forever, nothing would ever resolve it, and the caller would be told the
+/// outcome is unpreserved — a silent permanent lockout rather than a
+/// recoverable Problem State, and a contradiction of this function's own
+/// contract that a scope is paused *because* a preserved record says so.
 fn open_problem_state(
     ors: Option<&RedbRecoveryStore>,
     paused: &Mutex<BTreeSet<String>>,
     identity: &OperationIdentity,
     ordering_scopes: &[String],
 ) -> Result<WriteReceipt, CommitRecoveryError> {
-    if let Ok(mut index) = paused.lock() {
-        index.extend(ordering_scopes.iter().cloned());
-    }
     let Some(ors) = ors else {
         return Err(CommitRecoveryError::OrsUnavailable {
             detail: format!(
@@ -591,6 +596,9 @@ fn open_problem_state(
             ),
         });
     };
+    if let Ok(mut index) = paused.lock() {
+        index.extend(ordering_scopes.iter().cloned());
+    }
     let record = open_record_for(identity, ordering_scopes)?;
     match ors.stage_unknown_commit(&record) {
         Ok(_) => Err(CommitRecoveryError::UnknownCommitOpen {

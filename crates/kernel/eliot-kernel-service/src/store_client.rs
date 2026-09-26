@@ -205,7 +205,13 @@ pub(crate) enum DreamerCommitEvidence {
     /// hash, so the commit outcome of this attempt is decided. This receipt is
     /// the `I14.21` evidence and is never discarded; the Kernel classifies its
     /// status before reporting anything.
-    Reconciled(WriteReceipt),
+    ///
+    /// Boxed because `WriteReceipt` is a 22-field closed record several times
+    /// the size of the other two variants; carrying it inline would make every
+    /// `Refused` and `Unknown` — the two variants that exist precisely to be
+    /// cheap — pay for it. Boxing is the only change to how this evidence
+    /// travels: the receipt is still the exact one, moved rather than rebuilt.
+    Reconciled(Box<WriteReceipt>),
     /// Neither a commit nor a rollback receipt exists for the admitted
     /// identity: the outcome stays unknown and must be preserved, not retried.
     Unknown,
@@ -482,7 +488,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .receipt_exact(operation_id.clone(), canonical_request_hash)
             .await
         {
-            Ok(receipt) => Err(DreamerCommitEvidence::Reconciled(receipt)),
+            Ok(receipt) => Err(DreamerCommitEvidence::Reconciled(Box::new(receipt))),
             Err(StoreError::MissingReceiptEnvelope | StoreError::Unavailable) => {
                 Err(DreamerCommitEvidence::Unknown)
             }
