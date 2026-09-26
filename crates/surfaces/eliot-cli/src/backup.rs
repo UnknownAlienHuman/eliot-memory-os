@@ -1356,9 +1356,13 @@ pub fn backup_restore_test(
         requested_scope: None,
         archive_id: None,
         operation_id: operation_id.clone(),
-        // Exactly the identities the request declared: the capture
-        // operation that produced the source snapshot, and the provisioned
-        // isolated destination store. Neither is defaulted.
+        // Exactly the identities the request DECLARED, and nothing more: the
+        // capture operation the request named as the source of the snapshot,
+        // and the destination store identity the request asked to restore
+        // into. No owner provisioned, admitted or issued either one - the
+        // Kernel rehearsed shape only - so the human projection prints them
+        // under `source:`/`destination:` as the request's own claim, not as a
+        // provisioned destination or an admitted source. Neither is defaulted.
         source_identity: Some(params.capture_operation_id.clone()),
         destination_identity: Some(params.dest_store_id.clone()),
         effect,
@@ -1386,8 +1390,17 @@ pub fn backup_restore_test(
                 return Err(BackupClientError::Client(CliError::ResultMismatch));
             }
             outcome.gates_passed = envelope_gates(&response)?;
-            outcome.missing_obligations =
-                vec![envelope_text(&response, "missing_owner")?.to_owned()];
+            // The Kernel's own owner name comes first, unresolved, exactly as
+            // the reply wrote it. The second entry is this surface's own
+            // bounded declaration obligation, not an owner answer: the
+            // `source:`/`destination:` lines above are what the request
+            // declared, and no owner provisioned, admitted or issued either
+            // identity, so the projection must not read as a provisioned
+            // destination or an admitted source.
+            outcome.missing_obligations = vec![
+                envelope_text(&response, "missing_owner")?.to_owned(),
+                RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
+            ];
             envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
         }
         BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED => {
@@ -1399,3 +1412,15 @@ pub fn backup_restore_test(
     }
     respond(request, CommandId::BackupRestoreTest, &outcome)
 }
+
+/// This surface's own declaration obligation, reported beside the Kernel's
+/// owner name when a restore-test rehearsal comes back `blocked`.
+///
+/// The `source:` and `destination:` lines of the human projection are exactly
+/// what the request declared, and no owner provisioned that isolated
+/// destination, admitted the durable journal, or issued either identity. The
+/// field contract already admits a field-level obligation, so this fixed
+/// bounded string states that obligation where an operator reads it, instead
+/// of adding a new field to an outcome shared with create and verify. It is
+/// not an owner answer, not a receipt, and it never mints an identity.
+const RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION: &str = "request-declared source and destination identities are not owner-provisioned or owner-admitted";
