@@ -1343,6 +1343,13 @@ pub trait WasmHostRequestChannel {
     /// The default has no external source and has nothing to retire.
     fn retire_control(&mut self) {}
 
+    /// Releases the last polled frame back to staged without admitting it.
+    /// Called only when the single command slot is occupied, so a control
+    /// step that cannot run yet is re-offered on a later tick instead of
+    /// being dropped or admitted twice (issue #2785 P1/W2). The default has
+    /// no external source and has nothing to release.
+    fn release_control(&mut self) {}
+
     /// Publishes one correlated result frame: the one stdout emission
     /// owner for the ordinary result stream (#2787 step 2).
     ///
@@ -1482,8 +1489,11 @@ type ControlSlotList = Vec<ControlSlot>;
 /// control lane. A delivery is retired only after the loop has accepted its
 /// frame ([`KernelControlReader::commit`]): `follow_up` advances only when
 /// the command was really handed to the worker (issue #2785 P1/I2), so a
-/// delivery whose command is refused stays staged and replayable instead of
-/// being retired for a control step that never ran.
+/// delivery the command channel refuses stays staged and replayable
+/// instead of being retired for a control step that never ran. A step
+/// admission itself refuses is retired with its exact refusal recorded as
+/// the loop's residual; a step that only waits for the occupied command
+/// slot stays staged and is re-offered.
 pub struct KernelControlReader {
     /// Loader-derived install directory holding the delivery set and spool.
     directory: PathBuf,
@@ -1872,10 +1882,15 @@ impl KernelControlReader {
         Some(frame)
     }
 
-    /// Offers the first ordered control only when it can interrupt pending
-    /// guest work. Reconcile remains staged and unacknowledged until idle;
-    /// Cancel/Shutdown also remain unacknowledged until their owner action
-    /// reaches the worker. No fixed or versioned control file is consumed.
+    /// Offers the first ordered urgent control — one staged Cancel/Shutdown
+    /// naming this operation, still unacknowledged — or `None` when nothing
+    /// urgent is staged (#2568 A3). Reconcile remains staged and
+    /// unacknowledged until idle: it observes a finished attempt, so it
+    /// never preempts outstanding work. Cancel/Shutdown also remain
+    /// unacknowledged until their owner action reaches the worker, and a
+    /// yielded frame is retired only after its demand is accepted and
+    /// delivered, never before (issue #2785 P1). No fixed or versioned
+    /// control file is consumed here.
     fn poll_urgent(&mut self) -> Option<WasmHostRequestFrame> {
         let frame = self.poll()?;
         if matches!(
@@ -2159,6 +2174,12 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     fn retire_control(&mut self) {
         if let Some(control) = self.control.as_mut() {
             control.commit();
+        }
+    }
+
+    fn release_control(&mut self) {
+        if let Some(control) = self.control.as_mut() {
+            control.pending = None;
         }
     }
 
@@ -2465,6 +2486,15 @@ struct AdmissionState {
     /// An admitted Shutdown demanded typed shutdown: the post-outcome path
     /// skips follow-ups and proceeds to drain and typed shutdown (#2568 A3).
     shutdown_demanded: bool,
+    /// An owner Cancel is staged for the currently accepted command. This is
+    /// interruption demand, not a second command: the bound-1 slot stays
+    /// single-owner, the tick interrupts the guest through the stored
+    /// engine handle, and the Cancel command itself is admitted, sent and
+    /// retired by the control lane once the slot frees. Cleared when the
+    /// Cancel is handed to the worker or when the accepted command's own
+    /// reply settles, so demand never outlives its execution (#2568 A3,
+    /// issue #2785 I2/P1).
+    cancel_demanded: bool,
 }
 
 /// Bounded state of the ordinary request loop.
@@ -2561,6 +2591,7 @@ impl BoundedRequestLoop {
                 one_shot_spent: false,
                 follow_up: FollowUp::None,
                 shutdown_demanded: false,
+                cancel_demanded: false,
             },
             published: None,
             denial: None,
@@ -2784,6 +2815,11 @@ impl BoundedRequestLoop {
     /// either way the original operation identity is retained for the
     /// owner-side reconciliation record rather than reissued.
     fn on_outcome(&mut self, outcome: WorkerOutcome) -> Option<WasmHostResultFrame> {
+        // The accepted command's own reply settled, so interruption demand
+        // for that execution is moot: a still-staged Cancel is re-demanded
+        // by the next urgent tick while a command stays accepted, and the
+        // Cancel command itself travels the control lane.
+        self.admission.cancel_demanded = false;
         if outcome.command == WorkerCommand::Shutdown {
             self.shutdown_request_won = outcome.shutdown_request_won;
             return None;
@@ -2915,7 +2951,10 @@ impl BoundedRequestLoop {
             token: COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         });
         match command {
-            WorkerCommand::Cancel => self.admission.follow_up = FollowUp::Contained,
+            WorkerCommand::Cancel => {
+                self.admission.follow_up = FollowUp::Contained;
+                self.admission.cancel_demanded = false;
+            }
             WorkerCommand::Reconcile => self.admission.follow_up = FollowUp::Reconciled,
             WorkerCommand::Execute | WorkerCommand::Shutdown => {}
         }
@@ -2926,19 +2965,17 @@ impl BoundedRequestLoop {
     }
 
     /// Fires the stored guest-interruption handle while a command is
-    /// outstanding and interruption-class control is pending (#2568 A3): an
-    /// admitted Cancel held in `queued`, or an admitted Shutdown. Firing is
-    /// best-effort and idempotent, so the tick retries until the outcome
-    /// arrives — this closes the race where the worker has accepted the
-    /// command but not started the child yet. Never sends: the bound-1 slot
-    /// stays single-owner.
+    /// accepted and interruption-class control is demanded (#2568 A3): a
+    /// staged owner Cancel recorded as cancel demand, or an admitted
+    /// Shutdown. Firing is best-effort and idempotent, so the tick retries
+    /// until the outcome arrives — this closes the race where the worker
+    /// has accepted the command but not started the child yet. Never sends:
+    /// the bound-1 slot stays single-owner.
     fn interrupt_outstanding(&self) {
         if self.accepted_command().is_none() {
             return;
         }
-        let pending = self.requested_command() == Some(WorkerCommand::Cancel)
-            || self.admission.shutdown_demanded;
-        if !pending {
+        if !self.admission.cancel_demanded && !self.admission.shutdown_demanded {
             return;
         }
         if let Some(handle) = self.interrupt.as_ref() {
@@ -3063,6 +3100,17 @@ pub fn run_request_loop(
         &worker.outcomes,
         &worker.handle,
     );
+    drain_and_shutdown_request_worker(&mut state, &mut channel, worker, drive)
+}
+
+/// Drains accepted work, shuts down and joins the worker, then returns the
+/// exact terminal result of the ordinary request loop.
+fn drain_and_shutdown_request_worker(
+    state: &mut BoundedRequestLoop,
+    channel: &mut DeliverySetChannel,
+    worker: EngineWorker,
+    drive: Result<(), LoopError>,
+) -> Result<WasmHostResultFrame, LoopError> {
     // Close Execute admission and keep draining (issue #2785 W1): intake
     // returns on close or exhaustion with a command possibly accepted, so
     // replies are polled until the worker idles. Joining with a command
@@ -3070,21 +3118,23 @@ pub fn run_request_loop(
     // reply behind the unread outcome on the bound-1 channel.
     state.close_admission();
     drain_to_settlement(
-        &mut state,
-        &mut channel,
+        state,
+        channel,
         &worker.commands,
         &worker.outcomes,
         &worker.handle,
     );
     // Step 2: the tracked Shutdown, the single termination protocol
-    // (issue #2785 I5). It is only requested once the command slot is free,
-    // and `send` refuses — rather than silently claiming delivery — if the
-    // command channel does not take it. The live authority cell is revoked
-    // first, so nothing further can resolve through it while the worker
-    // stops.
+    // (issue #2785 I5). The slot is checked BEFORE the request is taken:
+    // requesting first would occupy the slot and clobber an unsettled
+    // accepted command, so the check-then-request order is what keeps the
+    // accepted-command accounting exact. `send` refuses — rather than
+    // silently claiming delivery — if the command channel does not take
+    // it. The live authority cell is revoked first, so nothing further can
+    // resolve through it while the worker stops.
     state.live.revoke();
-    state.request(WorkerCommand::Shutdown);
     let shutdown_sent = if state.command_slot_free() {
+        state.request(WorkerCommand::Shutdown);
         match state.send(WorkerCommand::Shutdown, &worker.commands) {
             Ok(()) => true,
             Err(error) => {
@@ -3106,8 +3156,8 @@ pub fn run_request_loop(
     }
     if shutdown_sent {
         drain_to_settlement(
-            &mut state,
-            &mut channel,
+            state,
+            channel,
             &worker.commands,
             &worker.outcomes,
             &worker.handle,
@@ -3116,7 +3166,7 @@ pub fn run_request_loop(
     // Step 3: `join` is called only after the worker owner observed the
     // thread finished; the wait keeps draining any late bounded outcome so a
     // producer can never be left blocked on an unread full outcome channel.
-    if !supervise_to_worker_exit(&mut state, &mut channel, &worker.outcomes, &worker.handle) {
+    if !supervise_to_worker_exit(state, channel, &worker.outcomes, &worker.handle) {
         // Process-level containment path (issue #2785 A6): the worker is
         // still alive past the admitted drain bound, so this thread is not
         // joinable and cannot be reported as terminated. The process that
@@ -3126,7 +3176,7 @@ pub fn run_request_loop(
         // shutdown. The retained operation record is this process's written
         // handover to that owner: the loop ends with an explicit unresolved
         // result rather than an implicit stop.
-        return Err(contained_failure(&mut state, &mut channel));
+        return Err(contained_failure(state, channel));
     }
     let shutdown_observed = shutdown_sent
         && state.accepted_command() != Some(WorkerCommand::Shutdown)
@@ -3137,7 +3187,7 @@ pub fn run_request_loop(
     // `JoinHandle::join` is called only after the worker owner confirms
     // termination. The wait also drains any late bounded outcome before the
     // handle can be joined.
-    let joined = join_shutdown_worker(&mut state, &mut channel, worker.handle, &mut confirm_error);
+    let joined = join_shutdown_worker(state, channel, worker.handle, &mut confirm_error);
     if joined {
         state.worker = WorkerState::Terminated;
     }
@@ -3168,7 +3218,7 @@ pub fn run_request_loop(
         let error = LoopError::WorkerTerminatedWithoutOutcome {
             command: "shutdown",
         };
-        state.publish_lost_response(&mut channel, error);
+        state.publish_lost_response(channel, error);
         state.record_residual(error);
         return Err(error);
     }
@@ -3185,7 +3235,7 @@ pub fn run_request_loop(
     // I6): "the worker stopped" is not "the effect is resolved". The
     // operation's disposition belongs to the outer process-containment
     // owner, and this process can only attest what it observed itself.
-    state.guest_child_exited = Some(operation_containment_observed(&state));
+    state.guest_child_exited = Some(operation_containment_observed(state));
     if state.guest_child_exited != Some(true) {
         return Err(LoopError::OperationContainmentUnresolved {
             operation_id: UNATTESTED_OPERATION,
@@ -3304,6 +3354,7 @@ fn contained_failure(
     state: &mut BoundedRequestLoop,
     channel: &mut DeliverySetChannel,
 ) -> LoopError {
+    state.worker = WorkerState::Contained;
     let executing = match state.delivery {
         Some(
             CommandDelivery::Requested(command)
@@ -3331,6 +3382,17 @@ fn drain_bound(material: &ValidatedDispatchMaterial) -> Duration {
     Duration::from_millis(material.ceilings.wall_deadline_ms) + CONTROL_POLL
 }
 
+/// Whether the staged frame needs the single command slot to be admitted.
+/// `Shutdown` never does: it only closes `Execute` admission and records
+/// its demand. Anything unparseable is refused by admission, which likewise
+/// needs no slot.
+fn frame_needs_command_slot(frame: &WasmHostRequestFrame) -> bool {
+    matches!(
+        WasmHostRequestFrame::parse(frame),
+        Ok(WasmHostRequest::Invoke(_) | WasmHostRequest::Cancel(_) | WasmHostRequest::Reconcile(_))
+    )
+}
+
 /// Services the owner-staged control lane exactly once, through the same
 /// admission path internal control uses (issue #2785 I3/P1).
 ///
@@ -3338,7 +3400,10 @@ fn drain_bound(material: &ValidatedDispatchMaterial) -> Duration {
 /// stops new execution, never the reply and control servicing needed to
 /// terminate the already-owned worker. The staged control file is retired
 /// only after the command channel accepted the frame's command, so the
-/// delivery edge never deletes a request that was not delivered.
+/// delivery edge never deletes a request that was not delivered. A frame
+/// that needs the command slot while a command is accepted is deferred —
+/// released back to staged for a later tick — so the accepted command's
+/// accounting is never clobbered by a second request (issue #2785 I1/W2).
 fn service_control_lane(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
@@ -3347,12 +3412,17 @@ fn service_control_lane(
     let Some(frame) = channel.poll_control()? else {
         return Ok(());
     };
+    if !state.command_slot_free() && frame_needs_command_slot(&frame) {
+        channel.release_control();
+        return Ok(());
+    }
     match state.admit(&frame) {
         Err(error) => {
             // The frame never reached the loop's own binding, so the
-            // admitted operation itself is not refused by it; the control
-            // request is refused and its staged file is retired by the
-            // owner's next reclamation.
+            // admitted operation itself is not refused by it. The exact
+            // refusal is recorded as the loop's residual and the staged
+            // file is retired at once, reclaiming the fixed control name
+            // for the owner's next frame.
             state.record_residual(error);
             channel.retire_control();
         }
@@ -3396,12 +3466,15 @@ fn containment_step(state: &mut BoundedRequestLoop) {
     }
 }
 
-/// Admits one staged urgent Cancel/Shutdown through the same admission path
-/// internal control uses (#2568 A3). Runs before the single-gate intake
-/// check, so the caller can interrupt accepted guest work; the caller never
-/// sends while a command is accepted, so an admitted Cancel or Shutdown is
-/// only *requested* here and takes the single slot once the accepted
-/// command's own reply settles.
+/// Records one staged urgent Cancel/Shutdown as interruption demand
+/// (#2568 A3). Runs while a command is accepted, so the tick interrupts
+/// accepted guest work through the stored engine handle instead of waiting
+/// for the reply. Nothing here takes the single command slot: a Shutdown
+/// is admitted (it needs no slot) and its file retired at once, while a
+/// Cancel only sets cancel demand and stays staged — the Cancel command
+/// itself is admitted, sent and retired by the control lane once the slot
+/// frees, so no second command stacks behind the accepted one (issue #2785
+/// W2) and the file is never deleted for a step that never ran (P1).
 fn admit_external_control_urgent(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
@@ -3409,12 +3482,23 @@ fn admit_external_control_urgent(
     let Ok(Some(frame)) = channel.poll_control_urgent() else {
         return;
     };
-    if let Err(error) = state.admit(&frame) {
-        // The staged request never reached the loop's own binding, so the
-        // admitted operation itself is not refused by it. Record the exact
-        // refusal as this loop's bounded residual and keep servicing; the
-        // file stays staged for the owner's own reclamation.
-        state.record_residual(error);
+    match WasmHostRequestFrame::parse(&frame) {
+        Ok(WasmHostRequest::Shutdown) => {
+            if let Err(error) = state.admit(&frame) {
+                state.record_residual(error);
+            }
+            channel.retire_control();
+        }
+        Ok(WasmHostRequest::Cancel(control)) => match check_control(&state.binding, &control) {
+            Ok(()) => state.admission.cancel_demanded = true,
+            Err(error) => {
+                state.record_residual(error);
+                channel.retire_control();
+            }
+        },
+        // Reconcile, Invoke and unparseable bytes never surface here: the
+        // urgent poll filters them, so there is nothing to demand.
+        Ok(_) | Err(_) => {}
     }
 }
 
@@ -3532,14 +3616,15 @@ fn poll_pending(
             }
             // The command slot is occupied by the accepted command, so no
             // second command may be requested behind it; the owner-staged
-            // control lane is still serviced, so an owner's Cancel, Reconcile
-            // or Shutdown is admitted at this tick instead of being deferred
-            // until the reply arrives (issue #2785 I3).
+            // control lane is still serviced, so a Shutdown is admitted at
+            // this tick while a Cancel or Reconcile stays staged for the
+            // tick the slot frees (issue #2785 I3). A staged Cancel still
+            // interrupts this execution through the urgent demand below.
             service_control_lane(state, channel, commands)?;
-            // Interrupt, don't queue (#2568 A3): an admitted Cancel or
-            // Shutdown terminates accepted guest work through the stored
-            // engine handle instead of waiting for the reply. Firing never
-            // sends, so the bound-1 slot stays single-owner and the uncertain
+            // Interrupt, don't queue (#2568 A3): a staged Cancel or Shutdown
+            // terminates accepted guest work through the stored engine
+            // handle instead of waiting for the reply. Firing never sends,
+            // so the bound-1 slot stays single-owner and the uncertain
             // attempt still settles through the follow-up taxonomy once its
             // own reply is observed.
             admit_external_control_urgent(state, channel);
