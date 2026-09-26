@@ -31,8 +31,8 @@ pub use evidence_portfolio::{
 // reaching into a module path for a vocabulary it must match on.
 pub use inquiry_governance::{
     AcquisitionOutcome, BlindedField, CandidateEvidence, ClaimAuditRecord, CounterSearchStatus,
-    CoverageGoal, CoverageReceipt, DenominatorKind, EnumerationState, EvidenceFreeze, EvidenceGrade,
-    EvidenceSetPrecision, GovernorInquiryAdmissionRequest, HypothesisPolicy,
+    CoverageGoal, CoverageReceipt, DenominatorKind, EnumerationState, EvidenceFreeze,
+    EvidenceGrade, EvidenceSetPrecision, GovernorInquiryAdmissionRequest, HypothesisPolicy,
     IndependenceBlindingPolicy, IndependenceDimension, IndependenceProfile, InquiryError,
     InquiryGovernance, InquiryHorizon, InquiryLane, InquiryObservation, InquiryOutputContract,
     InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
