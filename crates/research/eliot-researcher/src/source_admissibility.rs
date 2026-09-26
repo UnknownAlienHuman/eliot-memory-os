@@ -11,6 +11,29 @@
 //! quarantine, is owned by [`crate::evidence_portfolio::SourceRecord`]. This
 //! module references that record rather than restating it, and adds only the
 //! eligibility decision an inquiry evidence set needs.
+//!
+//! # The two records, and which half is missing
+//!
+//! A positive admitted source has to show two distinct linked records. This
+//! module owns the first:
+//!
+//! 1. [`SourceAdmissibilityRecord`] — the Researcher's own decision for one
+//!    inquiry evidence set, committed to its own bytes and re-proved by
+//!    `validate_integrity`.
+//! 2. [`GovernorSourceTransitionRequest`] — the restricted proposal handed to
+//!    the Governor, also committed to its own bytes.
+//!
+//! The second half of the pair — the actual Governor/Kernel/Store commit
+//! receipt — is **the owner's and does not exist yet** in this repository: the
+//! Kernel's research-provider surface publishes exactly four operations
+//! (`dispatch`, `status`, `cancel`, `reconcile`) and none of them is a
+//! source-admission transition, so there is no named Governor transition this
+//! module could submit to. This domain therefore stops at a validated,
+//! tamper-evident proposal and never fabricates the owner half, never states a
+//! `pending`/`rejected`/`conflict`/`committed` outcome on the owner's behalf,
+//! and never re-reads a receipt it does not have. Anything beyond
+//! [`SourceAdmissibilityRecord::transition_request`] on the canonical path is
+//! BLOCKED on that transition existing.
 
 #![forbid(unsafe_code)]
 
@@ -468,11 +491,10 @@ impl SourceAdmissibilityRecord {
         // `state_fence` a fact about the decision instead of a free field
         // printed beside it: a decision whose fence was rewritten after the
         // fact no longer re-proves its own digest.
-        let fence = canonical_json_bytes(&self.state_fence).map_err(|_| {
-            InquiryError::Unencodable {
+        let fence =
+            canonical_json_bytes(&self.state_fence).map_err(|_| InquiryError::Unencodable {
                 field: "admissibility.state_fence",
-            }
-        })?;
+            })?;
         push_field(
             &mut preimage,
             "state_fence",
@@ -616,11 +638,10 @@ impl GovernorSourceTransitionRequest {
             &self.admissibility_digest,
         );
         push_field(&mut preimage, "scope", &self.scope);
-        let fence = canonical_json_bytes(&self.state_fence).map_err(|_| {
-            InquiryError::Unencodable {
+        let fence =
+            canonical_json_bytes(&self.state_fence).map_err(|_| InquiryError::Unencodable {
                 field: "source_transition_request.state_fence",
-            }
-        })?;
+            })?;
         push_field(
             &mut preimage,
             "state_fence",

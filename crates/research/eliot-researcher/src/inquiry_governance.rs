@@ -280,7 +280,10 @@ impl std::fmt::Display for InquiryError {
                 )
             }
             Self::Unencodable { field } => {
-                write!(formatter, "{field} cannot be encoded into its canonical preimage")
+                write!(
+                    formatter,
+                    "{field} cannot be encoded into its canonical preimage"
+                )
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
             Self::Contract(error) => {
@@ -4286,6 +4289,13 @@ pub struct InquiryGovernance {
     /// Governor-facing profile admission request.
     pub profile_admission_request: GovernorInquiryAdmissionRequest,
     /// Governor-facing source transition requests.
+    ///
+    /// The Researcher half of the two-record pair, one request per
+    /// admissibility decision, each committed to its own bytes. There is
+    /// deliberately no owner receipt field beside them: the
+    /// Governor/Kernel/Store commit receipt is the owner's, this domain has no
+    /// named transition to submit to, and inventing a placeholder for it would
+    /// be a false proof claim under A0.3.
     pub source_admission_requests: Vec<GovernorSourceTransitionRequest>,
     /// Compiler inputs for the existing `TaskGraphCompiler` owner.
     pub compilation_inputs: TaskGraphCompilationInputs,

@@ -24,7 +24,7 @@ use eliot_contracts::StateFence;
 use eliot_process::ExitDisposition;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
 use eliot_research_exchange_api::{
-    CoverageGapKind, ResearchQueryRequest, ResearchSourceGapOutcome, SourceClass,
+    CoverageGapKind, DisclosureClass, ResearchQueryRequest, ResearchSourceGapOutcome, SourceClass,
 };
 use eliot_researcher::{
     AcquisitionOutcome, CandidateEvidence, InquiryGovernance, InquiryHorizon, InquiryObservation,

@@ -91,6 +91,17 @@ pub enum HandoffError {
     /// The seal digest does not cover the presented shape.
     #[error("handoff seal digest mismatch")]
     DigestMismatch,
+    /// The sealed gap handles and their typed kinds are not the same length.
+    ///
+    /// The two lists are documented as one frozen pairing, and they are bound
+    /// by the digest as two independent lists, so nothing in the digest
+    /// comparison can see a pairing that was broken before sealing. A seal
+    /// carrying a handle with no kind, or a kind with no handle, would otherwise
+    /// re-prove its own digest and be reported as a valid account of which
+    /// degradation was observed over which missing source — the exact claim the
+    /// kinds exist to make checkable.
+    #[error("handoff coverage-gap handles and kinds are not paired")]
+    UnpairedCoverageGapKinds,
 }
 
 /// Disclosure widening order: material may only travel at or below its
@@ -351,6 +362,14 @@ impl ReceiptJournal {
 /// sorted handles, so irrelevant receipt and source order never changes the
 /// frozen bytes, and it covers every field the seal publishes except itself, so
 /// a reader can re-prove it from the seal alone.
+///
+/// The three defaulted collection fields are safe to default *because*
+/// `system_generation` is not: a seal serialized before those fields existed
+/// carries no `system_generation`, so `deny_unknown_fields` plus a required
+/// field makes it fail to decode instead of decoding as a seal with an empty
+/// producer, no gap kinds and no source digests. The default can therefore only
+/// ever be reached by a writer that omitted an empty list, never by an old seal
+/// quietly filling in a shape it was never sealed over.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffSeal {
@@ -590,7 +609,12 @@ pub fn seal_handoff(
     let mut gaps: Vec<(String, String)> = bundle
         .coverage_gaps
         .iter()
-        .map(|gap| (gap.source_handle.clone(), gap_kind_wire(gap.kind).to_owned()))
+        .map(|gap| {
+            (
+                gap.source_handle.clone(),
+                gap_kind_wire(gap.kind).to_owned(),
+            )
+        })
         .collect();
     gaps.sort();
     gaps.dedup();
@@ -649,8 +673,16 @@ pub fn seal_handoff(
 ///
 /// Returns [`HandoffError::Expired`] past `expires_ms`,
 /// [`HandoffError::StaleManifest`] when the sealed manifest digest or revision is
-/// not the current one, and [`HandoffError::DigestMismatch`] when the digest is
-/// not a lowercase SHA-256 digest or does not cover the presented shape.
+/// not the current one, [`HandoffError::UnpairedCoverageGapKinds`] when the
+/// sealed gap handles and their typed kinds are not the same length, and
+/// [`HandoffError::DigestMismatch`] when the digest is not a lowercase SHA-256
+/// digest or does not cover the presented shape.
+///
+/// A seal minted under the superseded `evidence-handoff/v1` preimage cannot be
+/// distinguished here from a tampered one, because both present a digest that
+/// does not re-prove. That is the intended reading: the domain string is inside
+/// the preimage, so a superseded seal fails closed as [`HandoffError::DigestMismatch`]
+/// rather than being reported as a current audit.
 pub fn verify_seal(
     seal: &HandoffSeal,
     manifest_digest: &str,
@@ -662,6 +694,9 @@ pub fn verify_seal(
     }
     if seal.manifest_digest != manifest_digest || seal.manifest_revision != manifest_revision {
         return Err(HandoffError::StaleManifest);
+    }
+    if seal.coverage_gap_handles.len() != seal.coverage_gap_kinds.len() {
+        return Err(HandoffError::UnpairedCoverageGapKinds);
     }
     if !is_payload_digest(&seal.seal_digest)
         || seal.seal_digest != sha256_hex(seal_shape_preimage(seal).as_bytes())
