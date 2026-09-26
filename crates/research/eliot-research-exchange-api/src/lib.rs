@@ -40,6 +40,11 @@ pub enum ResearchContractError {
     UnsupportedPrecision,
     #[error("bundle disposition is incompatible with its evidence")]
     InvalidDisposition,
+    #[error("{field} is not an accepted value for this record")]
+    FieldNotAccepted {
+        /// Failing field path.
+        field: &'static str,
+    },
     #[error("{field} cannot be encoded into its canonical preimage")]
     Unencodable {
         /// The record that has no canonical encoding.
@@ -584,15 +589,41 @@ impl ResearchQueryRequest {
             .validate()
             .map_err(|_| ResearchContractError::InvalidFence)?;
         self.allowed_references.validate()?;
-        if self.allowed_references.state_fence != self.state_fence
-            || disclosure_breadth(self.allowed_references.disclosure)
-                > disclosure_breadth(self.disclosure)
-            || self.allowed_references.retention_class != self.retention
-            || self.budget_units == 0
-            || self.deadline_ms <= 0
-            || self.source_classes.is_empty()
+        // A manifest may never be wider than the request that carries it. Each
+        // refusal names the field that disagrees, so an operator reading the
+        // error is told which declaration to correct instead of inferring it
+        // from a disposition error that says nothing about the cause.
+        if self.allowed_references.state_fence != self.state_fence {
+            return Err(ResearchContractError::FieldNotAccepted {
+                field: "allowed_references.state_fence",
+            });
+        }
+        if disclosure_breadth(self.allowed_references.disclosure)
+            > disclosure_breadth(self.disclosure)
         {
-            return Err(ResearchContractError::InvalidDisposition);
+            return Err(ResearchContractError::FieldNotAccepted {
+                field: "allowed_references.disclosure",
+            });
+        }
+        if self.allowed_references.retention_class != self.retention {
+            return Err(ResearchContractError::FieldNotAccepted {
+                field: "allowed_references.retention_class",
+            });
+        }
+        if self.budget_units == 0 {
+            return Err(ResearchContractError::FieldNotAccepted {
+                field: "budget_units",
+            });
+        }
+        if self.deadline_ms <= 0 {
+            return Err(ResearchContractError::FieldNotAccepted {
+                field: "deadline_ms",
+            });
+        }
+        if self.source_classes.is_empty() {
+            return Err(ResearchContractError::EmptyCollection {
+                field: "source_classes",
+            });
         }
         Ok(())
     }

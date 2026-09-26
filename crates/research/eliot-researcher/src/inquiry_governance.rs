@@ -3198,6 +3198,10 @@ pub struct UnadmittedReference {
     /// Why the run-bound manifest does not admit it.
     pub reason: String,
     /// State Fence the diagnostic was observed under.
+    ///
+    /// Inside [`Self::digest`]: a fence that can change what a retained
+    /// diagnostic means has to be inside the preimage, so a diagnostic moved
+    /// onto a different fence cannot re-present the old digest.
     pub state_fence: StateFence,
     /// Always false: an unadmitted reference is never trusted.
     pub trusted: bool,
@@ -3240,6 +3244,11 @@ impl UnadmittedReference {
 
     /// Re-proves this diagnostic's own digest and its candidate-only shape.
     ///
+    /// The preimage covers the fence as well as the retained text, so this
+    /// stands alone: a diagnostic whose fence was moved fails here, and not
+    /// only where [`InquiryGovernance`] happens to cross-check the fence against
+    /// its own.
+    ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
@@ -3253,6 +3262,14 @@ impl UnadmittedReference {
         Ok(())
     }
 
+    /// I21.7 reference firewall: the fence is part of what this record means, so
+    /// it is inside the preimage and not only cross-checked by the governance
+    /// record. No sibling record in this crate pushes a fence of its own, so the
+    /// encoding is the crate's single canonical one — `push_field` per fence
+    /// component, tagged with the `StateFence` field names that
+    /// `canonical_json_bytes` gives the same value inside the sealed
+    /// `AllowedReferenceManifest` — and an absent optional revision is spelled
+    /// `none` under its own tag, as everywhere else in these preimages.
     fn compute_digest(&self) -> String {
         let mut preimage = String::from("unadmitted-reference/v1;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
@@ -3260,6 +3277,34 @@ impl UnadmittedReference {
         push_field(&mut preimage, "reference", &self.reference);
         push_field(&mut preimage, "kind", self.kind.wire_name());
         push_field(&mut preimage, "reason", &self.reason);
+        push_field(
+            &mut preimage,
+            "authority_epoch_lineage",
+            self.state_fence.authority_epoch.lineage_id.as_str(),
+        );
+        push_field(
+            &mut preimage,
+            "authority_epoch_sequence",
+            &self.state_fence.authority_epoch.sequence.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "resource_generation",
+            &self.state_fence.resource_generation.value().to_string(),
+        );
+        for (tag, revision) in [
+            ("task_revision", self.state_fence.task_revision),
+            ("policy_revision", self.state_fence.policy_revision),
+            (
+                "integration_revision",
+                self.state_fence.integration_revision,
+            ),
+        ] {
+            match revision {
+                Some(value) => push_field(&mut preimage, tag, &value.value().to_string()),
+                None => push_field(&mut preimage, tag, "none"),
+            }
+        }
         push_field(&mut preimage, "trusted", bool_text(self.trusted));
         freeze(&preimage)
     }

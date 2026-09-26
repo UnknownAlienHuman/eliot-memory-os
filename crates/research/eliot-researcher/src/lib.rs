@@ -108,6 +108,15 @@ impl<B: ResearchBridge> Researcher<B> {
         budget_units: u64,
         deadline_ms: i64,
     ) -> Result<ExchangeJob, ExchangeError> {
+        // The request inherits the manifest's retention class rather than
+        // declaring one of its own. `ResearchQueryRequest::validate` requires
+        // `allowed_references.retention_class == retention`, so a façade that
+        // hardcoded a retention string guaranteed a refusal for every manifest
+        // `manifest()` builds with any other one, and that refusal did not name
+        // either field. As with `disclosure` below, the run-bound manifest is
+        // the authority for the classes a run declares and the façade only fills
+        // in the protocol boilerplate around it.
+        let retention = allowed_references.retention_class.clone();
         self.submit_query(ResearchQueryRequest {
             exchange_id: exchange_id.into(),
             protocol_revision: eliot_research_exchange_api::CONTRACT_VERSION,
@@ -122,7 +131,7 @@ impl<B: ResearchBridge> Researcher<B> {
             coverage_goal: "bounded exact sources with explicit unknowns".into(),
             allowed_references,
             disclosure: DisclosureClass::ProjectBound,
-            retention: "governed-by-caller".into(),
+            retention,
             license_policy: "caller-policy".into(),
             budget_units,
             deadline_ms,
@@ -144,6 +153,21 @@ impl<B: ResearchBridge> Researcher<B> {
 /// narrowest-but-one disclosure class, an explicit retention class, and no
 /// admitted URL, tool definition, verifier or expansion route. A run that
 /// admits none of those admits none of them.
+///
+/// # The anchor ceiling is `Document`, and that is a change
+///
+/// This helper used to stamp `AnchorPrecision::Section`. It now stamps
+/// `Document`, and the reason belongs here rather than in a diff: `Section` was
+/// a pre-firewall default with nothing behind it, while the ceiling is now
+/// load-bearing. `AnchorPrecision::permits` is a `>=` test, so a `Section`
+/// ceiling lets a delivered bundle anchor a citation at a section without any
+/// Governor-admitted support at that granularity ever existing. `Document`
+/// refuses the same delivery with `CitationNotAllowed` at
+/// `ResearchEvidenceBundle::validate_against`, which is the honest answer for a
+/// manifest nobody has sealed against a support relation finer than the
+/// document. A run that genuinely admits section anchors should not use this
+/// weakest-manifest constructor; it should build the manifest itself and seal
+/// it, which is the only thing that can widen a ceiling on the record.
 ///
 /// # Errors
 ///
@@ -167,6 +191,8 @@ pub fn manifest(
         url_handles: Vec::new(),
         tool_refs: Vec::new(),
         verifier_refs: Vec::new(),
+        // The weakest honest ceiling, and lower than this helper used to stamp:
+        // see "The anchor ceiling is `Document`" above before widening it.
         allowed_anchor_precision: AnchorPrecision::Document,
         scope_class: scope_class.into(),
         disclosure: DisclosureClass::ProjectBound,
