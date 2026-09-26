@@ -24,6 +24,7 @@ pub enum CausalHopStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectCausalHop {
     pub hop_kind: CausalHopKind,
     pub from: String,
@@ -34,6 +35,7 @@ pub struct ProjectCausalHop {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectUnderstandingIntent {
     pub exact_user_goal_ref: String,
     pub normalized_goal: String,
@@ -43,6 +45,7 @@ pub struct ProjectUnderstandingIntent {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectUnderstandingSystem {
     pub project_purpose: String,
     pub subsystem_refs: Vec<String>,
@@ -51,6 +54,7 @@ pub struct ProjectUnderstandingSystem {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectCausalModel {
     pub hops: Vec<ProjectCausalHop>,
     pub unknown_hops: Vec<CausalHopKind>,
@@ -58,12 +62,14 @@ pub struct ProjectCausalModel {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContinuityAcceptanceState {
     pub acceptance_ref: String,
     pub satisfied: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContinuityGitState {
     pub branch: String,
     pub commit: String,
@@ -72,6 +78,7 @@ pub struct ContinuityGitState {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectContinuityState {
     pub exact_goal: String,
     pub acceptance_state: Vec<ContinuityAcceptanceState>,
@@ -88,6 +95,7 @@ pub struct ProjectContinuityState {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectUnderstandingEvidence {
     pub project_purpose: String,
     pub subsystem_refs: Vec<String>,
@@ -101,6 +109,7 @@ pub struct ProjectUnderstandingEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectUnderstandingModel {
     pub schema_version: String,
     pub project_id: ProjectId,
