@@ -425,6 +425,122 @@ pub enum TransportError {
     RegistryFull,
 }
 
+/// One named exhaustible dimension behind [`TransportError::Backpressure`]
+/// (issue #2731, item 6; I14.3 multidimensional reserve accounting).
+///
+/// The [`TransportError::Backpressure`] variant itself stays a bare unit so
+/// every existing producer and exhaustive consumer keeps compiling:
+/// saturation sites that know their exact resource name it with one of the
+/// canonical [`BackpressureSignal`] constants below, while a bare error
+/// observed at the transport seam attributes only the dispatch lane through
+/// [`TransportError::backpressure_signal`]. Each signal names the exhausted
+/// resource, the permitted recovery action, and the shed, deferred, or
+/// quarantined work — never an authentication failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackpressureSignal {
+    /// Stable wire name of the exhausted dimension.
+    pub dimension: &'static str,
+    /// The permitted recovery action the receiver may take.
+    pub recovery_action: &'static str,
+    /// The work shed, deferred, or quarantined by this disposition.
+    pub shed_work: &'static str,
+}
+
+impl BackpressureSignal {
+    /// Names one signal with its exhausted dimension, permitted recovery
+    /// action, and shed/deferred/quarantined work.
+    #[must_use]
+    pub const fn new(
+        dimension: &'static str,
+        recovery_action: &'static str,
+        shed_work: &'static str,
+    ) -> Self {
+        Self {
+            dimension,
+            recovery_action,
+            shed_work,
+        }
+    }
+}
+
+/// Staged bridge-event handoff rows exhausted their 2048-row delivery budget:
+/// new delivery intents shed while retained obligations stay staged.
+/// Recover by presenting consumed frontiers through reconcile so the bounded
+/// retirement releases eligible charges, then resubmit the shed frame; the
+/// reconcile, gap, and retirement legs need no normal event slot.
+pub const BACKPRESSURE_BRIDGE_HANDOFF_ROWS: BackpressureSignal = BackpressureSignal::new(
+    "bridge-event-handoff-rows",
+    "reconcile consumed frontiers so eligible handoff charges retire, then resubmit",
+    "this delivery frame shed and deferred; staged obligations retained, nothing evicted",
+);
+
+/// Staged bridge-event records exhausted their delivery budget: new payloads
+/// shed while retained rows stay staged. Recover exactly like the handoff
+/// budget above — reconcile first, then resubmit the shed frame.
+pub const BACKPRESSURE_BRIDGE_EVENT_RECORDS: BackpressureSignal = BackpressureSignal::new(
+    "bridge-event-records",
+    "reconcile consumed frontiers so eligible charges retire, then resubmit",
+    "this delivery frame shed and deferred; staged obligations retained, nothing evicted",
+);
+
+/// The canonical envelope exceeded the 256 KiB structured-response ceiling:
+/// oversize envelopes never occupy unbounded durable memory. Recover by
+/// shrinking the envelope or carrying a large payload by Blob/Resource
+/// handle (I7.2), then resubmit; the attempt itself staged nothing.
+pub const BACKPRESSURE_BRIDGE_ENVELOPE_BYTES: BackpressureSignal = BackpressureSignal::new(
+    "bridge-envelope-bytes",
+    "shrink the envelope or carry a large payload by Blob/Resource handle, then resubmit",
+    "this delivery frame shed; nothing staged, nothing retained",
+);
+
+/// The Kernel serves degraded duty: delivery sheds load while the gap and
+/// reconcile recovery legs stay admitted. Recover by waiting for Ready and
+/// using gap/reconcile meanwhile; the shed event is not lost by the
+/// producer — it retries instead of losing the event.
+pub const BACKPRESSURE_KERNEL_DEGRADED: BackpressureSignal = BackpressureSignal::new(
+    "kernel-service-degraded",
+    "wait for Ready; run gap and reconcile recovery on the admitted session meanwhile",
+    "this delivery frame shed and deferred; recovery legs stay admitted",
+);
+
+/// Ordinary in-flight queue items or bytes are exhausted while the control
+/// reserve stays available: a `Cancel`, heartbeat, or `Control` frame is
+/// still admitted. Recover by retrying the ordinary frame later, or by
+/// stopping work through the control lane now.
+pub const BACKPRESSURE_QUEUE_SATURATED: BackpressureSignal = BackpressureSignal::new(
+    "transport-queue-items-or-bytes",
+    "retry the ordinary frame later, or cancel/stop through the reserved control lane",
+    "this frame shed and deferred; control-lane capacity reserved, never consumed",
+);
+
+/// A bare [`TransportError::Backpressure`] observed at the transport seam,
+/// where the exhausted resource is unattributed: the admitted bridge
+/// host-request dispatch refused this frame. The admitted session is
+/// retained — this is load shedding, not a fence — so gap, reconcile, and
+/// eligible-retirement recovery stay usable on the same transport, and the
+/// shed frame's fate is unknown rather than denied: resubmit only through
+/// the idempotent duplicate/reconcile legs, never as a blind retry.
+pub const BACKPRESSURE_BRIDGE_DISPATCH: BackpressureSignal = BackpressureSignal::new(
+    "bridge-host-request-dispatch",
+    "retain the admitted session; run gap/reconcile recovery, then resubmit duplicate-safe",
+    "this frame shed; its commit fate is unknown, never denied; the session is retained",
+);
+
+impl TransportError {
+    /// Reports the backpressure dimension attributable at the transport
+    /// seam: [`BACKPRESSURE_BRIDGE_DISPATCH`] for [`TransportError::Backpressure`],
+    /// whose precise resource is unattributed here — producing routes name
+    /// their exact dimension from the canonical signals above. Any other
+    /// error carries no backpressure dimension.
+    #[must_use]
+    pub const fn backpressure_signal(&self) -> Option<BackpressureSignal> {
+        match self {
+            TransportError::Backpressure => Some(BACKPRESSURE_BRIDGE_DISPATCH),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(windows)]
 fn map_platform_error(error: eliot_platform_windows::WindowsAdapterError) -> TransportError {
     use eliot_platform_windows::WindowsAdapterError;
