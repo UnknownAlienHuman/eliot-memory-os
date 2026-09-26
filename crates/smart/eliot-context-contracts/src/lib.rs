@@ -11,6 +11,7 @@ mod admission;
 mod admission_input;
 mod atom;
 mod canonical_projections;
+mod decision_lineage;
 mod economy;
 mod error;
 mod identity;
@@ -45,6 +46,14 @@ pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
     ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,
     SafetyProjection, TaskProjection,
+};
+pub use decision_lineage::{
+    DecisionExecutionLineageRefs, DecisionLineageActionContractRef, DecisionLineageAnchorLink,
+    DecisionLineageArtifact, DecisionLineageAuthorization, DecisionLineageCompleteness,
+    DecisionLineageEffect, DecisionLineageEpochRefs, DecisionLineageExpectedObservable,
+    DecisionLineagePhase, DecisionLineageRef, DecisionLineageReferenceKind, DecisionLineageReview,
+    DecisionLineageRival, DecisionLineageSlot, DecisionLineageSupersession,
+    DecisionLineageVerifier,
 };
 pub use economy::{ContextEconomyReceipt, EconomyAllocations};
 pub use error::{
