@@ -3022,6 +3022,14 @@ impl KernelComposition {
     /// canonical request hash are sealed by the canonical Store owner over the
     /// exact prepared transition. The route therefore creates no authority, no
     /// principal, and no second canonical writer.
+    ///
+    /// The answer is one post-commit orchestration transition. The canonical
+    /// Store commit, the wake publication/cancellation handoff over the
+    /// authenticated `USER_AUTOMATION_RUNTIME_OPERATION` channel, and the
+    /// execution disposition are reported as three separate typed phases, and
+    /// the top-level `status`/`recovery` pair is computed from those phases: a
+    /// required handoff that is absent or unknown can never answer `known` with
+    /// `recovery: null` (issue #2806, I11.12).
     pub(crate) async fn user_automation_operator_operation(
         &self,
         session: &Session,
@@ -3066,42 +3074,93 @@ impl KernelComposition {
             },
             intent,
         };
-        let gateway = self.retained_store_gateway()?;
-        let response = Box::pin(gateway.execute_user_automation_operation(request))
+        // The existing authenticated Host execution channel is composed for
+        // exactly the operations that own a wake or execution handoff, so a
+        // read-only answer never depends on the Host contour. The composed
+        // `UserAutomationOperatorRuntime` is the concrete runtime port the
+        // post-commit transition calls; no second transport or route is created.
+        let runtime_channel = match self
+            .user_automation_operator_runtime_channel(
+                &request.intent.operation,
+                &session.module_generation.state_fence,
+            )
             .await
-            .map_err(|_error| {
-                super::kernel_diagnostics::observe_terminal_error(
-                    "daemon_user_automation_operator_store",
-                );
-                TransportError::SessionFenced
-            })?;
-        let outcome = match &response.outcome {
-            eliot_kernel_service::UserAutomationStoreOutcome::Read { .. } => "read",
-            eliot_kernel_service::UserAutomationStoreOutcome::Committed { .. } => "committed",
-            eliot_kernel_service::UserAutomationStoreOutcome::Replayed { .. } => "replayed",
+        {
+            Ok(channel) => channel,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
         };
+        let runtime = runtime_channel
+            .as_ref()
+            .map(eliot_kernel_service::UserAutomationOperatorRuntime::new);
+        let gateway = self.retained_store_gateway()?;
+        let transition =
+            Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
+                .await
+                .map_err(|_error| {
+                    super::kernel_diagnostics::observe_terminal_error(
+                        "daemon_user_automation_operator_store",
+                    );
+                    TransportError::SessionFenced
+                })?;
         // The Human inspect surface shows the deterministic schedule
         // projection before activation: the same normalized occurrence set the
         // trigger contract uses, compiled here into the immutable
         // revision-bound occurrence identities. A schedule the compiler cannot
         // compile fails closed instead of projecting a guessed occurrence.
         let occurrences =
-            Self::user_automation_inspection_occurrences(&response.outcome).map_err(|_error| {
+            Self::user_automation_inspection_occurrences(&transition).map_err(|_error| {
                 super::kernel_diagnostics::observe_terminal_error(
                     "daemon_user_automation_occurrence_projection",
                 );
                 TransportError::SessionFenced
             })?;
+        let recovery = transition.recovery();
         Ok(serde_json::json!({
-            "status": "known",
+            "status": if transition.is_known() { "known" } else { "unknown" },
             "value": {
-                "outcome": outcome,
-                "state_fence": response.state_fence,
-                "result": response.outcome,
+                "identity": transition.identity,
+                "state_fence": transition.state_fence,
+                "configuration": transition.configuration,
+                "wake": transition.wake,
+                "execution": transition.execution,
                 "occurrences": occurrences,
             },
-            "recovery": null,
+            "recovery": recovery,
         }))
+    }
+
+    /// Composes the existing authenticated Host execution channel for the
+    /// operations that own a wake or execution handoff.
+    ///
+    /// The channel is the same server-authored `user_automation_runtime`
+    /// transport the runtime route already serves, so this adds no authority and
+    /// no new operation name. A read-only answer composes nothing, so it never
+    /// depends on the Host contour. An unavailable channel is a typed runtime
+    /// error and is reported as such, not as a Store-only success.
+    #[cfg(windows)]
+    async fn user_automation_operator_runtime_channel(
+        &self,
+        operation: &eliot_kernel_core::UserAutomationOperation,
+        state_fence: &StateFence,
+    ) -> Result<
+        Option<
+            UserAutomationHostExecutionClient<AuthenticatedUserAutomationHostExecutionTransport>,
+        >,
+        UserAutomationRuntimeError,
+    > {
+        if !user_automation_operation_owns_runtime_handoff(operation) {
+            return Ok(None);
+        }
+        let transport = AuthenticatedUserAutomationHostExecutionTransport::connect_server_authored(
+            self.ipc_limits().operation_timeout,
+        )
+        .await?;
+        if transport.channel_binding().state_fence != *state_fence {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(Some(UserAutomationHostExecutionClient::new(transport)?))
     }
 
     /// Compiles the deterministic next-occurrence projection of every revision
@@ -3111,13 +3170,15 @@ impl KernelComposition {
     /// list rather than re-deriving a revision the caller did not ask for.
     #[cfg(windows)]
     fn user_automation_inspection_occurrences(
-        outcome: &eliot_kernel_service::UserAutomationStoreOutcome,
+        transition: &eliot_kernel_service::UserAutomationOperatorTransition,
     ) -> Result<Vec<serde_json::Value>, UserAutomationRuntimeError> {
         use eliot_kernel_service::UserAutomationReadResult;
-        let eliot_kernel_service::UserAutomationStoreOutcome::Read { result } = outcome else {
+        let eliot_kernel_service::UserAutomationConfigurationPhase::Read { result } =
+            &transition.configuration
+        else {
             return Ok(Vec::new());
         };
-        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result {
+        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result.as_ref() {
             UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
             UserAutomationReadResult::Status { revision, .. }
             | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
@@ -5673,6 +5734,25 @@ fn validate_user_automation_trigger_text(
     }
     let _ = field;
     Ok(())
+}
+
+/// Reports whether one closed operator operation owns a runtime handoff.
+///
+/// Only `run-now` and the operations that retire or supersede the not-yet-
+/// admitted wakes of a revision own one. A read or a first configuration commit
+/// owns none, so it composes no runtime channel and reports both handoff phases
+/// as not applicable instead of implying an absent owner.
+#[cfg(windows)]
+fn user_automation_operation_owns_runtime_handoff(
+    operation: &eliot_kernel_core::UserAutomationOperation,
+) -> bool {
+    matches!(
+        operation,
+        eliot_kernel_core::UserAutomationOperation::RunNow { .. }
+            | eliot_kernel_core::UserAutomationOperation::Remove { .. }
+            | eliot_kernel_core::UserAutomationOperation::Pause { .. }
+            | eliot_kernel_core::UserAutomationOperation::Edit { .. }
+    )
 }
 
 #[cfg(test)]
