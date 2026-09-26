@@ -580,6 +580,7 @@ mod cue_composition_tests {
             },
             payload: None,
             revision_heads: Vec::new(),
+            identity: None,
         };
         let cue_payload = match &cue_state {
             ProjectionState::KnownEmpty => Some(Value::Null),
@@ -600,6 +601,7 @@ mod cue_composition_tests {
                 state: cue_state,
                 payload: cue_payload,
                 revision_heads: Vec::new(),
+                identity: None,
             },
             negative_memory: unavailable(),
             evidence: unavailable(),
