@@ -292,26 +292,29 @@ pub(crate) enum CanonicalSourceClass {
         statement: &'static str,
     },
     /// Declared by the single owner but not defined by the admitted
-    /// `SCHEMA_DDL_V2` generation.
+    /// generation's own baseline.
     ///
-    /// `SurrealAdapterConfig::validate` pins
-    /// `expected_schema_generation == GENERATION_V2`, and `SCHEMA_DDL_V2`
-    /// (`schema.rs`) defines exactly the eleven tables this enumeration reads:
-    /// the two [`CanonicalSourceClass::CapturePoint`] rows plus the nine
+    /// `SurrealAdapterConfig::validate` pins `expected_schema_generation` to
+    /// `GENERATION_V2` today, and the v2 baseline (`schema.rs`) defines exactly
+    /// the eleven tables this enumeration reads: the two
+    /// [`CanonicalSourceClass::CapturePoint`] rows plus the nine
     /// [`CanonicalSourceClass::Member`] rows. The twelve classes below are not
-    /// among them: the erasure, notification, reactive-session, resource,
-    /// automation and experience families are defined by the superseded
-    /// first-generation baseline and by additive deltas the admitted
-    /// generation never reaches, and `automation_failure` /
-    /// `automation_last_failure` are in no baseline DDL at all. Reading a table
-    /// the admitted generation does not define inside one `BEGIN … COMMIT`
-    /// batch aborts the whole transaction (see the recorded provider
-    /// observations in `apply/read_boundary.rs`), so capturing these rows would
-    /// make every capture fail on an admitted store. Each therefore has exactly
-    /// one disposition — declared, not captured — instead of being silently
-    /// omitted or reported as an undeclared exclusion, and
+    /// among them. Reading a table the admitted generation does not define
+    /// inside one `BEGIN … COMMIT` batch aborts the whole transaction (see the
+    /// recorded provider observations in `apply/read_boundary.rs`), so capturing
+    /// these rows would make every capture fail on an admitted store. Each
+    /// therefore has exactly one disposition — declared, not captured — instead
+    /// of being silently omitted or reported as an undeclared exclusion, and
     /// `verify_canonical_source_classes` proves that 1:1 against the single
     /// owner's own table list.
+    ///
+    /// This disposition is a property of the *admitted* generation, not of the
+    /// table. The additive v3 baseline re-defines `erasure_intent` and
+    /// `erasure_outcome`, so under a v3 pin those two rows are no longer outside
+    /// the admitted generation and the census refuses that pin instead of
+    /// dropping the erasure ledger from a v3 store's capture; a bridge that
+    /// admits v3 must give them captured [`CanonicalSourceClass::Member`]
+    /// dispositions first.
     OutsideAdmittedGeneration {
         /// Physical table name owned by [`crate::schema`].
         table: &'static str,
@@ -491,34 +494,64 @@ fn captured_member_classes() -> impl Iterator<Item = &'static MemberClass> {
         })
 }
 
-/// Reports whether the admitted generation defines `table` exactly.
+/// The baseline DDL of the schema generation a capture is admitted against.
 ///
-/// The admitted generation is exactly `GENERATION_V2`, and only its baseline
-/// DDL is evidence of what a capture may read: `SurrealAdapterConfig::validate`
-/// pins `expected_schema_generation` to `GENERATION_V2` and `begin_snapshot`
-/// re-checks the observed generation against that same pinned value, so a
-/// capture never runs against another generation. The superseded v1 baseline is
-/// deliberately *not* consulted here even though it is a strict superset of the
-/// v2 table set: it defines `erasure_intent`, `erasure_outcome`,
-/// `notification_record`, `reactive_session`, `resource_snapshot`, the three
-/// captured automation tables, `experience_bank` and `experience_feedback`, so
-/// OR-ing it in would make every one of those declared classes read as
-/// admitted and the census would refuse every capture before any provider I/O.
-/// The marker carries the trailing space, so `relation_record_extra` can never
-/// satisfy `relation_record`.
-fn admitted_generation_defines(table: &str) -> bool {
+/// [`crate::schema`] stays the single owner of every physical name and every
+/// baseline DDL (A2.3); this only *selects* among the baselines it already
+/// ships. Naming the generation here instead of restating one baseline is the
+/// whole point: a census run against a baseline other than the admitted one
+/// reclassifies real tables, and it does so silently. A generation this crate
+/// ships no baseline for is refused rather than guessed at.
+fn admitted_generation_ddl(generation: &str) -> Option<&'static str> {
+    if generation == crate::schema::GENERATION_V2 {
+        Some(crate::schema::SCHEMA_DDL_V2)
+    } else if generation == crate::schema::GENERATION_V3 {
+        Some(crate::schema::SCHEMA_DDL_V3)
+    } else {
+        None
+    }
+}
+
+/// Reports whether the admitted generation's baseline defines `table` exactly.
+///
+/// The admitted generation is the one `SurrealAdapterConfig::validate` pins in
+/// `expected_schema_generation` and that `begin_snapshot` re-checks the observed
+/// generation against, so a capture never runs against another generation, and
+/// this census is therefore run against that same generation's baseline. Only
+/// that baseline is evidence of what a capture may read: the superseded
+/// first-generation baseline is deliberately *not* consulted, even though it is a
+/// strict superset of the v2 table set — it defines `erasure_intent`,
+/// `erasure_outcome`, `notification_record`, `reactive_session`,
+/// `resource_snapshot`, the three captured automation tables, `experience_bank`
+/// and `experience_feedback`, so OR-ing it in would make every one of those
+/// declared classes read as admitted and the census would refuse every capture
+/// before any provider I/O. The marker carries the trailing space, so
+/// `relation_record_extra` can never satisfy `relation_record`.
+///
+/// The v3 baseline is additive over v2 and re-defines the two erasure tables, so
+/// a bridge that ever admits v3 must give those two classes a captured
+/// disposition instead of the declared-outside one they carry today; until it
+/// does, `verify_canonical_source_classes` refuses that pin as the composition
+/// defect it is, rather than reading v2's baseline and silently omitting the
+/// erasure ledger from a v3 store's capture.
+fn admitted_generation_defines(ddl: &'static str, table: &str) -> bool {
     let marker = format!("DEFINE TABLE {table} ");
-    crate::schema::SCHEMA_DDL_V2.contains(&marker)
+    ddl.contains(&marker)
 }
 
 /// Walks every declared canonical source class and proves its one disposition.
 ///
 /// Fails closed when the composition drifts from the single owner: a class
-/// declared outside the admitted generation that a baseline DDL actually
+/// declared outside the admitted generation that the admitted baseline actually
 /// defines would be silently dropped from the capture, and a capture point
 /// whose pinned read does not name its own table would bind the wrong point.
 /// Both are composition defects, not caller input, so both are refused before
 /// any provider I/O instead of being absorbed into a later error.
+///
+/// The census runs against the baseline of the generation the adapter itself
+/// admits, never against a generation restated in this module: the pin belongs to
+/// `SurrealAdapterConfig`, and reading a different baseline here would classify
+/// real tables against the wrong owner without any error.
 ///
 /// The census denominator is [`crate::schema::table::ALL_TABLES`], not this
 /// enumeration. The previous guard incremented a counter once per loop
@@ -529,12 +562,18 @@ fn admitted_generation_defines(table: &str) -> bool {
 /// exactly one disposition, and every disposition names an owner table — so a
 /// table that is added, renamed, duplicated or dropped is a typed refusal
 /// before any provider I/O.
-fn verify_canonical_source_classes() -> Result<(), StoreError> {
+fn verify_canonical_source_classes(generation: &str) -> Result<(), StoreError> {
+    let Some(ddl) = admitted_generation_ddl(generation) else {
+        return Err(StoreError::InvalidField {
+            field: SNAPSHOT_CLASS_FIELD,
+            reason: "admitted schema generation has no baseline in the schema owner",
+        });
+    };
     let mut disposed: BTreeSet<&'static str> = BTreeSet::new();
     for class in CANONICAL_SOURCE_CLASSES {
         let table = match class {
             CanonicalSourceClass::Member(member) => {
-                if !admitted_generation_defines(member.table) {
+                if !admitted_generation_defines(ddl, member.table) {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
                         reason: "captured class is not defined by the admitted generation",
@@ -552,7 +591,7 @@ fn verify_canonical_source_classes() -> Result<(), StoreError> {
                     });
                 }
                 if let Some(reference) = &member.reference
-                    && !admitted_generation_defines(reference.target_table)
+                    && !admitted_generation_defines(ddl, reference.target_table)
                 {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
@@ -571,7 +610,7 @@ fn verify_canonical_source_classes() -> Result<(), StoreError> {
                 *table
             }
             CanonicalSourceClass::OutsideAdmittedGeneration { table } => {
-                if admitted_generation_defines(table) {
+                if admitted_generation_defines(ddl, table) {
                     return Err(StoreError::InvalidField {
                         field: SNAPSHOT_CLASS_FIELD,
                         reason: "declared class is defined by the admitted generation",
@@ -979,6 +1018,16 @@ impl EnumerationEvidence {
 /// Result offsets are fixed: 0 is the retained `BEGIN TRANSACTION` result, 1 the
 /// schema generation, 2 the canonical fence, then one whole-record array per
 /// captured class in declaration order.
+///
+/// A class that came back with more rows than the capture's own global member
+/// ceiling ([`crate::client::MEMBER_CLASS_ROW_LIMIT`]) is certainly truncated —
+/// the statement reads one row past the ceiling precisely so that this is
+/// decidable — so its denominator is unknown rather than merely large. That is
+/// refused here, at the observation boundary, instead of being carried into
+/// [`reconcile_denominator`] as a short class: a truncated class would otherwise
+/// let a capture bind a denominator smaller than the store's, which is exactly
+/// the "truncation is explicit" requirement of the capture contract. A class
+/// holding exactly the ceiling is complete and is served normally.
 async fn read_enumeration(
     adapter: &SurrealStoreAdapter,
 ) -> Result<(CapturePoint, Vec<Vec<Map<String, Value>>>), StoreError> {
@@ -1010,6 +1059,9 @@ async fn read_enumeration(
             .take(offset)
             .map_err(AdapterError::into_store_error)
             .map_err(redact_snapshot_error)?;
+        if class_rows.len() > crate::client::MEMBER_CLASS_ROW_LIMIT {
+            return Err(StoreError::PayloadTooLarge);
+        }
         rows.push(class_rows);
     }
     Ok((point, rows))
@@ -1875,7 +1927,7 @@ pub(crate) async fn begin_snapshot(
     }
     // The acting principal is named, not assumed, before any protected read.
     bind_capture_principal(adapter, SNAPSHOT_BEGIN_OPERATION)?;
-    verify_canonical_source_classes()?;
+    verify_canonical_source_classes(adapter.config.expected_schema_generation.as_str())?;
     // Resolve the exact logical begin through the registry BEFORE the source is
     // read. An exact replay returns the retained handle and the retained
     // progress; re-enumerating here would present a second observation as the

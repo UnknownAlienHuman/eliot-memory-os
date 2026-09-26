@@ -52,8 +52,8 @@ pub(crate) use backup_restore::{
 /// and [`crate::backup_snapshot`], carries no caller bindings, and caller text
 /// can never become a statement, table, connection, or credential override.
 pub(crate) use backup_snapshot::{
-    SNAPSHOT_MEMBERS_OPERATION, fixed_snapshot_statement, snapshot_capability,
-    validate_snapshot_operation,
+    MEMBER_CLASS_ROW_LIMIT, SNAPSHOT_MEMBERS_OPERATION, fixed_snapshot_statement,
+    snapshot_capability, validate_snapshot_operation,
 };
 pub(crate) use provider_owner::ProviderOwner;
 use session::RpcSession;
