@@ -185,7 +185,7 @@ pub struct InjectionReceipt {
     pub policy_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct MemoryInfluenceAckInput {
     #[serde(default)]
     pub project_id: Option<String>,
@@ -195,4 +195,105 @@ pub struct MemoryInfluenceAckInput {
     pub influence_class: MemoryInfluenceClass,
     #[serde(default)]
     pub downstream_outcome_ref: Option<String>,
+}
+
+const MEMORY_INFLUENCE_ACK_FIELDS: &[&str] = &[
+    "project_id",
+    "write_id",
+    "memory_handle",
+    "influence_class",
+    "downstream_outcome_ref",
+];
+
+impl<'de> Deserialize<'de> for MemoryInfluenceAckInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "MemoryInfluenceAckInput",
+            MEMORY_INFLUENCE_ACK_FIELDS,
+            MemoryInfluenceAckInputVisitor,
+        )
+    }
+}
+
+struct MemoryInfluenceAckInputVisitor;
+
+impl<'de> serde::de::Visitor<'de> for MemoryInfluenceAckInputVisitor {
+    type Value = MemoryInfluenceAckInput;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a memory influence acknowledgement input")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut project_id: Option<Option<String>> = None;
+        let mut write_id: Option<Option<String>> = None;
+        let mut memory_handle: Option<String> = None;
+        let mut influence_class: Option<MemoryInfluenceClass> = None;
+        let mut downstream_outcome_ref: Option<Option<String>> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "project_id" => next_once(&mut map, &mut project_id, "project_id")?,
+                "write_id" => next_once(&mut map, &mut write_id, "write_id")?,
+                "memory_handle" => next_once(&mut map, &mut memory_handle, "memory_handle")?,
+                "influence_class" => {
+                    next_once(&mut map, &mut influence_class, "influence_class")?;
+                }
+                "downstream_outcome_ref" => {
+                    next_once(
+                        &mut map,
+                        &mut downstream_outcome_ref,
+                        "downstream_outcome_ref",
+                    )?;
+                }
+                _ => {
+                    return Err(serde::de::Error::unknown_field(
+                        key.as_str(),
+                        MEMORY_INFLUENCE_ACK_FIELDS,
+                    ));
+                }
+            }
+        }
+
+        Ok(MemoryInfluenceAckInput {
+            project_id: project_id.unwrap_or_default(),
+            write_id: write_id.unwrap_or_default(),
+            memory_handle: required(memory_handle, "memory_handle")?,
+            influence_class: required(influence_class, "influence_class")?,
+            downstream_outcome_ref: downstream_outcome_ref.unwrap_or_default(),
+        })
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let project_id = seq.next_element::<Option<String>>()?.unwrap_or_default();
+        let write_id = seq.next_element::<Option<String>>()?.unwrap_or_default();
+        let memory_handle = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+        let influence_class = seq
+            .next_element()?
+            .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
+        let downstream_outcome_ref = seq.next_element::<Option<String>>()?.unwrap_or_default();
+
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::invalid_length(6, &self));
+        }
+
+        Ok(MemoryInfluenceAckInput {
+            project_id,
+            write_id,
+            memory_handle,
+            influence_class,
+            downstream_outcome_ref,
+        })
+    }
 }
