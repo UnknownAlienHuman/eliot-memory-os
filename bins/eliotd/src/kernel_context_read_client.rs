@@ -68,10 +68,10 @@
 //! envelope, not an admitted Cue array, a qualified capability or a ready
 //! packet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use eliot_context_admission::admit_context;
+use eliot_context_admission::{MaterialRankTraceDelivery, admit_context_traced};
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view,
 };
@@ -81,13 +81,14 @@ use eliot_context_candidates::{
     ProjectionState as CandidateProjectionState, construct_context_candidates,
 };
 use eliot_context_contracts::{
-    AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity, AdmittedContextSet,
-    CONTEXT_CONTRACT_VERSION, ContextError, ContextOutcome, ContextRecipe,
+    AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
+    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextError, ContextOutcome, ContextRecipe,
     DecisionContextIncomplete, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
     QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
 };
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, sha256_hex,
+    ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    sha256_hex,
 };
 use eliot_governor::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
@@ -1242,6 +1243,13 @@ pub enum PacketCompositionError {
     /// The assembly owner rejected the admitted set.
     #[error("packet assembly failed: {0}")]
     Assembly(Box<AssemblyError>),
+    /// The assembled packet does not carry exactly the materials the
+    /// per-material rank traces reported as delivered. The admission owner's
+    /// trace set is the delivery acceptance record, so a divergence between it
+    /// and the rendered packet fails closed instead of shipping an
+    /// unattributable context.
+    #[error("packet delivery does not match the per-material rank traces: {0}")]
+    TraceDelivery(ContextError),
 }
 
 /// Owner-supplied admission closure for one packet compilation.
@@ -1271,7 +1279,8 @@ impl KernelContextReadClient {
     /// I2: candidate → admission → assembly).
     ///
     /// Production Governor/eliotd owner edge for
-    /// [`construct_context_candidates`], [`admit_context`], and
+    /// [`construct_context_candidates`],
+    /// [`eliot_context_admission::admit_context_traced`], and
     /// [`assemble_active_view`]: maps the reconstructed seven roles to the
     /// candidate stage's typed inputs, admits the resulting candidate set, and
     /// assembles the admitted view — all in the semantic owner (Governor/eliotd),
@@ -1392,36 +1401,107 @@ impl KernelContextReadClient {
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let admitted = admit_packet_candidates(&input)?;
-        assemble_active_view(&admitted, recipe, quality, assembly, measure)
-            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))
+        let (admitted, delivery) = admit_packet_candidates(&input)?;
+        let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
+            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
+        check_delivered_traces(&delivery, &assembled)
+            .map_err(PacketCompositionError::TraceDelivery)?;
+        Ok(assembled)
     }
 }
 
 /// Admits one packet candidate set through the admission owner with the
-/// input/result join checked.
+/// input/result join checked, and returns the per-material rank-trace delivery
+/// record beside the admitted set.
 ///
-/// Runs [`admit_context`] over the caller-built [`AdmissionInput`], proves
-/// the result against that same input
+/// Runs the admission owner's traced join
+/// ([`eliot_context_admission::admit_context_traced`]) over the caller-built
+/// [`AdmissionInput`], proves the result against that same input
 /// ([`AdmissionResult::validate_for`](eliot_context_contracts::AdmissionInput)),
 /// and returns the admitted set only for an explicit `Complete` outcome. An
 /// `Incomplete` outcome returns the owner's gaps as
 /// [`PacketCompositionError::AdmissionIncomplete`]: a partial floor is typed
 /// incompleteness, never a silently cut view.
+///
+/// I12.26: the returned [`MaterialRankTraceDelivery`] is the delivery
+/// acceptance record for this packet. It carries one handle-bound
+/// [`eliot_context_admission::MaterialRankTrace`] per evaluated material with
+/// its selected or suppressed state, rule basis and explicit suppression
+/// reason, plus the visible and suppressed counts and the full rank-trace
+/// handle. [`check_delivered_traces`] binds it to the assembled packet
+/// location; it is never dropped.
 fn admit_packet_candidates(
     input: &AdmissionInput,
-) -> Result<AdmittedContextSet, PacketCompositionError> {
-    let result =
-        admit_context(input).map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
+    let (result, traces) = admit_context_traced(input)
+        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
     result
         .validate_for(input)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-    match result.outcome {
-        ContextOutcome::Complete(admitted) => Ok(admitted),
+    let delivery = MaterialRankTraceDelivery::new(&result, traces)
+        .map_err(PacketCompositionError::TraceDelivery)?;
+    let admitted = match result.outcome {
+        ContextOutcome::Complete(admitted) => admitted,
         ContextOutcome::Incomplete(gaps) => {
-            Err(PacketCompositionError::AdmissionIncomplete(Box::new(gaps)))
+            return Err(PacketCompositionError::AdmissionIncomplete(Box::new(gaps)));
+        }
+    };
+    Ok((admitted, delivery))
+}
+
+/// Binds one per-material rank-trace delivery record to the assembled packet.
+///
+/// I12.26 requires the active packet location to be resolvable from the
+/// delivered traces. The admission owner located each material in its decision
+/// compilation; the assembly owner placed it in the rendered packet. This check
+/// reconciles the two at that exact boundary and fails closed on any
+/// divergence:
+///
+/// - every material the delivery reported as visible must appear exactly once
+///   in the rendered packet, and that position is its packet location;
+/// - every rendered material must be covered by exactly one visible trace, so
+///   a rendered material without a trace cannot ship;
+/// - the reported visible count must equal the rendered material count.
+fn check_delivered_traces(
+    delivery: &MaterialRankTraceDelivery,
+    assembled: &ActiveUnderstandingViewResult,
+) -> Result<(), ContextError> {
+    let rendered: Vec<&ArtifactId> = assembled
+        .view
+        .rendered
+        .iter()
+        .map(|atom| &atom.atom_id)
+        .collect();
+    let rendered_ids: BTreeSet<&ArtifactId> = rendered.iter().copied().collect();
+    if rendered_ids.len() != rendered.len() {
+        return Err(ContextError::Duplicate("packet.rendered.atom_id"));
+    }
+    let mut visible = 0_usize;
+    for trace in &delivery.traces {
+        let delivered = rendered_ids.contains(&trace.atom_id);
+        match trace.disposition {
+            AdmissionDisposition::Include | AdmissionDisposition::HandleOnly => {
+                if !delivered {
+                    return Err(ContextError::SelectionIntegrityMismatch);
+                }
+                visible = visible.checked_add(1).ok_or(ContextError::Overflow)?;
+            }
+            AdmissionDisposition::Suppress
+            | AdmissionDisposition::Quarantine
+            | AdmissionDisposition::Revalidate
+            | AdmissionDisposition::Blocked
+            | AdmissionDisposition::Unavailable
+            | AdmissionDisposition::OverBudget => {
+                if delivered {
+                    return Err(ContextError::SelectionIntegrityMismatch);
+                }
+            }
         }
     }
+    if visible != delivery.visible || visible != rendered.len() {
+        return Err(ContextError::SelectionIntegrityMismatch);
+    }
+    Ok(())
 }
 
 /// Renders the observed scope-head revision of one acquisition closure.
