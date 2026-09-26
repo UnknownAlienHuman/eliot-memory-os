@@ -1,4 +1,5 @@
 # format eliot.user-automation.zone-table.v1
+# offset_unit seconds
 # release 2026c
 # source_files africa antarctica asia australasia europe northamerica southamerica etcetera backward
 # refused_source_files factory backzone
