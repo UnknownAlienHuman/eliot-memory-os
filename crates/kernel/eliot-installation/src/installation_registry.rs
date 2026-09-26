@@ -58,10 +58,11 @@ use crate::validate_approval_against_manifest;
 use crate::{
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgeStagePrepared,
-    ApprovedGenerationRegistry, HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
-    HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
-    InstallationError, PendingActivation, PendingActivationAbortReceipt, WindowsPathIdentity,
-    activation_terminal_digest, candidate_manifest_digest, valid_installation_key,
+    ApprovedGenerationRegistry, CommittedCutoverActivation, HostPhaseBMaterializationIntent,
+    HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
+    InstallationActivationApproval, InstallationError, PendingActivation,
+    PendingActivationAbortReceipt, WindowsPathIdentity, activation_terminal_digest,
+    candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
@@ -1013,23 +1014,32 @@ impl RedbInstallationRegistry {
     /// installer approval: the target must already be approved in the
     /// projection (staged by the installer/preparation flow), and the caller
     /// holds the separately-admitted cutover operation plus the Host
-    /// retirement barrier. The operation audit binding lives in the Host
-    /// journal `EpochRetirement` record; this CAS is the activation
-    /// linearization point only. Exact replay (active already equals the
-    /// approved target) succeeds without mutating; any other predecessor
-    /// mismatch is `IdentityConflict` and changes nothing.
+    /// retirement barrier. This CAS is the activation linearization point and
+    /// the *only* place that records which operation performed it (#2737).
+    ///
+    /// `active_generation` is a pointer, not attribution. An active pointer
+    /// alone cannot attribute an activation to one operation, so the
+    /// operation binding is written inside the same closure that performs the
+    /// flip and the exact-replay branch below is admitted only when the
+    /// recorded binding already names this same operation identity and
+    /// canonical request digest. Every other active-pointer-equals-target
+    /// case is `IdentityConflict`: a cutover whose response was lost, or a
+    /// different operation that selected the same target, must not be
+    /// silently treated as this operation's success.
     ///
     /// # Errors
     ///
     /// Returns [`InstallationError`] when the owner capability is not live,
-    /// the generation handles are malformed, the target is not approved, or
-    /// the expected revision/predecessor disagrees with durable state.
+    /// the generation handles are malformed, the binding does not describe
+    /// this exact predecessor/target pair, the target is not approved, or the
+    /// expected revision/predecessor disagrees with durable state.
     pub fn commit_cutover_activation(
         &self,
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         expected_predecessor: &PlatformHandle,
         target_generation: &PlatformHandle,
+        committed: &CommittedCutoverActivation,
     ) -> Result<(), InstallationError> {
         let _guard = host
             .live_guard()
@@ -1042,8 +1052,18 @@ impl RedbInstallationRegistry {
                 reason: "cutover target must differ from the expected predecessor".to_owned(),
             });
         }
+        // A receipt that disagrees with the CAS it claims to describe is an
+        // identity conflict, not a malformed field: the caller has bound one
+        // operation to a different transition.
+        committed.validate()?;
+        if committed.expected_predecessor != *expected_predecessor
+            || committed.target_generation != *target_generation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
         let expected_predecessor = expected_predecessor.clone();
         let target_generation = target_generation.clone();
+        let committed = committed.clone();
         self.mutate_atomic(expected_revision, |registry| {
             if !registry
                 .generations
@@ -1056,16 +1076,23 @@ impl RedbInstallationRegistry {
             }
             if registry.active_generation.as_ref() == Some(&target_generation) {
                 // Exact replay of an already-committed cutover: the
-                // predecessor was consumed by the first commit. Succeed
-                // without mutating; Host journal reconciliation
-                // disambiguates same-operation replay from cross-operation
-                // confusion through the operation-bound retirement record.
+                // predecessor was consumed by the first commit. Admit it only
+                // when the durable operation binding already names this same
+                // operation identity and canonical request digest, so a
+                // same-pointer-different-operation case cannot be mistaken
+                // for this operation's own success (#2737). A registry that
+                // has never recorded a binding has no attributable flip and
+                // refuses here rather than guessing.
+                if registry.committed_cutover_activation() != Some(&committed) {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 return Ok(());
             }
             if registry.active_generation.as_ref() != Some(&expected_predecessor) {
                 return Err(InstallationError::IdentityConflict);
             }
-            registry.activate(&target_generation)
+            registry.activate(&target_generation)?;
+            registry.record_cutover_activation(&committed)
         })
     }
 
