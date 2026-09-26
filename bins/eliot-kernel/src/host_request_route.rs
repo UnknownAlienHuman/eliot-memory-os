@@ -812,6 +812,16 @@ impl KernelComposition {
                 Err(_) => {
                     if check_task_controller_admission(envelope, tool).is_ok() {
                         self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
+                    } else if check_local_state_admission(envelope, tool).is_ok() {
+                        // #2564 I4 state-carrier seam: validated `eliot.state`
+                        // pairs attempt the shared local-read carrier for the
+                        // outbound-only eliotd poller. The carrier enqueue
+                        // gate and the claim gate are query-only today, so the
+                        // attempt is refused without side effects (the gate is
+                        // the first statement of the enqueue fn, before any
+                        // mutation); the serve leg that admits state pairs is
+                        // #2565's dispatch lane.
+                        let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
                     }
                 }
             }
@@ -4487,6 +4497,111 @@ pub(crate) fn check_local_read_admission(
     tool: &serde_json::Value,
 ) -> Result<LocalReadAdmission, TransportError> {
     local_read_admission_from_tool(envelope, tool)
+}
+
+/// Closed local-state selectors for one admitted `eliot.state` tool.
+///
+/// The trusted envelope scope (work scope else session — never an MCP
+/// argument) plus the exact `include` projection-field list from the
+/// `StateInput` arguments. An absent `include` is the default projection
+/// (authenticated discovery with no field filter); entries mirror the MCP
+/// contract's `unique_non_blank` rule exactly, so a blank, control-bearing,
+/// or duplicated field fails closed here rather than travelling to the
+/// Governor state owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalStateSelectors {
+    pub(crate) scope_id: ScopeId,
+    pub(crate) include: Vec<String>,
+}
+
+/// Derives the closed local-state selectors from one linked envelope+tool pair.
+///
+/// Returns the real selectors for `eliot.state`: the pair rides the shared
+/// admitted-pair carrier (queued for the outbound-only eliotd poller by
+/// [`KernelComposition::invoke_read_host_request`]) instead of hitting the
+/// query-only stub. Fails closed as `SessionFenced` for any other tool name,
+/// for a capability mismatch, for a non-object `arguments`, for a present
+/// `include` that is not an array of unique non-blank control-free field
+/// names, and for a missing or blank trusted scope. Mirrors the MCP
+/// `StateInput` contract field-for-field without taking an MCP edge; linkage
+/// (capability + payload digest) must already be proven by the caller through
+/// [`HostRequestInvokeReadPayload`]. Pure: deriving selectors performs no
+/// store IO.
+pub(crate) fn local_state_selectors_from_tool(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalStateSelectors, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if name != "eliot.state" || envelope.identity.capability != name {
+        return Err(TransportError::SessionFenced);
+    }
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    let include = match arguments.get("include") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut include = Vec::with_capacity(items.len());
+            for item in items {
+                let field = item
+                    .as_str()
+                    .filter(|field| {
+                        !field.trim().is_empty() && !field.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
+                if !seen.insert(field) {
+                    return Err(TransportError::SessionFenced);
+                }
+                include.push(field.to_owned());
+            }
+            include
+        }
+        Some(_) => return Err(TransportError::SessionFenced),
+    };
+    let scope_text = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|scope| !scope.trim().is_empty())
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
+    Ok(LocalStateSelectors { scope_id, include })
+}
+
+/// Validates one local-state admission before any store read (no IO).
+///
+/// Runs the exact invoke-read linkage gate ([`HostRequestInvokeReadPayload`])
+/// plus the closed state-selector derivation, so a changed payload digest, a
+/// forged descriptor or capability, or a malformed `include` list is rejected
+/// before the caller performs any Gateway IO or queues the pair for the
+/// eliotd poller. Pure: validation performs no IO by construction, which is
+/// the rejection-before-reading proof.
+pub(crate) fn check_local_state_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalStateSelectors, TransportError> {
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    local_state_selectors_from_tool(envelope, tool)
 }
 
 /// Serves an exact replay of a resulted operation without re-dispatch (no IO).
