@@ -10,17 +10,22 @@ use super::*;
 // (#984 still open).
 //
 // Observation-only contract (mirrors the #891 `lib.rs` helpers): every call
-// projects a boundary already decided by the semantic owner. Arguments are
-// static literals only — no digests, revisions, approvals, fences, or error
-// text are formatted, so no secret material can cross (I15.4) and no extra
-// evaluation runs on the semantic path. Sink outcome never alters result,
-// order, state, receipt, or cleanup. There is no mutable global dedup cache
-// and no terminal emission here: one terminal per failed operation is owned by
-// the single outermost contour (`lib.rs` `HostTerminalGuard` / Unknown
-// terminals), while these inner phases correlate by stage order only
-// (case 22). A positive commit record is emitted only after exact durable
-// readback confirms it (case 15); failures and unknowns emit no success
-// record.
+// projects a boundary already decided by the semantic owner. The boundary
+// label is a frozen literal; operation-bound observations additionally
+// project the CURRENT nonsecret identities of the live pending activation,
+// staged record, or commit fence (`ActivationObservation`): transaction,
+// installer plan, candidate generation, manifest digest, disposition state,
+// effect/request digests, and the staged-or-final receipt digest. Still
+// never carried: approval evidence internals, recovery reason text, raw
+// paths, or arbitrary `Debug`/error text — so bounding limits size, not
+// sensitivity (I15.4). Stale/foreign/conflict reasons stay in the frozen
+// labels. Sink outcome never alters result, order, state, receipt, or
+// cleanup. There is no mutable global dedup cache and no terminal emission
+// here: one terminal per failed operation is owned by the single outermost
+// contour (`lib.rs` `HostTerminalGuard` / Unknown terminals), while these
+// inner phases correlate by stage order only (case 22). A positive commit
+// record is emitted only after exact durable readback confirms it
+// (case 15); failures and unknowns emit no success record.
 #[cfg(windows)]
 fn host_activation_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
@@ -35,6 +40,248 @@ fn host_activation_observe(detail: &str) {
     );
 }
 
+/// Stable diagnostic label for one pending activation state (F-LOG-HOST-2
+/// W1). A 1:1 discriminant map, never `Debug` and never the recovery reason
+/// text: diagnostics project owner vocabulary without formatting internals.
+#[cfg(windows)]
+fn activation_state_label(state: &PendingActivationState) -> &'static str {
+    match state {
+        PendingActivationState::Pending => "pending",
+        PendingActivationState::RecoveryRequired { .. } => "recovery-required",
+    }
+}
+
+/// Current nonsecret identities bound to one activation observation
+/// (F-LOG-HOST-2 W1). Every field projects a fact the semantic owner already
+/// produced for the live pending activation, staged record, or commit fence;
+/// see the observation-only contract above for the exact carried/forbidden
+/// sets. Absent keys are omitted from the record, never rendered as a
+/// placeholder value.
+#[cfg(windows)]
+struct ActivationObservation<'a> {
+    label: &'static str,
+    transaction: Option<&'a str>,
+    plan: Option<&'a str>,
+    generation: Option<&'a str>,
+    manifest: Option<&'a str>,
+    state: Option<&'static str>,
+    effect: Option<&'a str>,
+    request: Option<&'a str>,
+    receipt: Option<&'a str>,
+}
+
+#[cfg(windows)]
+impl<'a> ActivationObservation<'a> {
+    /// Binds the pending activation identities: transaction, installer plan,
+    /// candidate generation, manifest digest, and disposition state.
+    fn for_pending(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+    ) -> Self {
+        Self {
+            label,
+            transaction: Some(pending.transaction_id.as_str()),
+            plan: Some(pending.plan_digest.as_str()),
+            generation: Some(pending.manifest.generation.as_str()),
+            manifest: Some(pending.manifest_digest.as_str()),
+            state: Some(activation_state_label(&pending.state)),
+            effect: None,
+            request: None,
+            receipt: None,
+        }
+    }
+
+    /// Binds the pending activation plus the staged intent effect and
+    /// request identities.
+    fn for_intent(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        intent: &'a HostPhaseBMaterializationIntent,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.effect = Some(intent.effect_id.as_str());
+        observation.request = Some(intent.request_digest.as_str());
+        observation
+    }
+
+    /// Binds the pending activation plus the staged preparation effect,
+    /// request, and prepared-record digests.
+    fn for_prepared(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        prepared: &'a HostPhaseBPreparedMaterialization,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.effect = Some(prepared.effect_id.as_str());
+        observation.request = Some(prepared.request_digest.as_str());
+        observation.receipt = Some(prepared.prepared_digest.as_str());
+        observation
+    }
+
+    /// Binds the pending activation plus the staged bridge-stage effect,
+    /// request, and prepared-record digests.
+    fn for_stage(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        stage: &'a AgentBridgeStagePrepared,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.effect = Some(stage.effect_id.as_str());
+        observation.request = Some(stage.request_digest.as_str());
+        observation.receipt = Some(stage.prepared_digest.as_str());
+        observation
+    }
+
+    /// Binds the pending activation plus the staged receipt effect,
+    /// request, and receipt digests.
+    fn for_receipt(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        receipt: &'a HostPhaseBMaterializationReceipt,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.effect = Some(receipt.effect_id.as_str());
+        observation.request = Some(receipt.request_digest.as_str());
+        observation.receipt = Some(receipt.receipt_digest.as_str());
+        observation
+    }
+
+    /// Binds the pending activation plus the staged prepared-receipt
+    /// effect, request, and receipt digests.
+    fn for_prepared_receipt(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        receipt: &'a eliot_installation::HostPhaseBPreparedReceipt,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.effect = Some(receipt.effect_id.as_str());
+        observation.request = Some(receipt.request_digest.as_str());
+        observation.receipt = Some(receipt.receipt_digest.as_str());
+        observation
+    }
+
+    /// Binds the rebind intent identities: transaction, plan, manifest,
+    /// effect, and request. The candidate generation arrives with the
+    /// prepared record, not the intent.
+    fn for_rebind_intent(label: &'static str, intent: &'a ActivePhaseBRebindIntent) -> Self {
+        Self {
+            label,
+            transaction: Some(intent.transaction_id.as_str()),
+            plan: Some(intent.plan_digest.as_str()),
+            generation: None,
+            manifest: Some(intent.manifest_digest.as_str()),
+            state: None,
+            effect: Some(intent.effect_id.as_str()),
+            request: Some(intent.request_digest.as_str()),
+            receipt: None,
+        }
+    }
+
+    /// Binds the rebind recovery transition plus its intent: recovery,
+    /// prior-receipt, and intent identities.
+    fn for_rebind_recovery(
+        label: &'static str,
+        recovery: &'a ActivePhaseBRebindRecovery,
+        intent: &'a ActivePhaseBRebindIntent,
+    ) -> Self {
+        let mut observation = Self::for_rebind_intent(label, intent);
+        observation.receipt = Some(recovery.recovery_digest.as_str());
+        observation
+    }
+
+    /// Binds the rebind preparation identities: transaction, manifest,
+    /// effect, request, and prepared-record digest.
+    fn for_rebind_prepared(
+        label: &'static str,
+        prepared: &'a HostPhaseBPreparedMaterialization,
+    ) -> Self {
+        Self {
+            label,
+            transaction: Some(prepared.transaction_id.as_str()),
+            plan: None,
+            generation: None,
+            manifest: Some(prepared.manifest_digest.as_str()),
+            state: None,
+            effect: Some(prepared.effect_id.as_str()),
+            request: Some(prepared.request_digest.as_str()),
+            receipt: Some(prepared.prepared_digest.as_str()),
+        }
+    }
+
+    /// Binds the rebind receipt identities: transaction, manifest, effect,
+    /// request, and receipt digest.
+    fn for_rebind_receipt(label: &'static str, receipt: &'a ActivePhaseBRebindReceipt) -> Self {
+        Self {
+            label,
+            transaction: Some(receipt.transaction_id.as_str()),
+            plan: None,
+            generation: None,
+            manifest: Some(receipt.manifest_digest.as_str()),
+            state: None,
+            effect: Some(receipt.effect_id.as_str()),
+            request: Some(receipt.request_digest.as_str()),
+            receipt: Some(receipt.receipt_digest.as_str()),
+        }
+    }
+
+    /// Binds the commit fence identities: generation and the Kernel-ready
+    /// receipt digest. The transaction travels with the pending activation,
+    /// not the fence.
+    fn for_commit_fence(label: &'static str, fence: &'a ActivationCommitFence) -> Self {
+        Self {
+            label,
+            transaction: None,
+            plan: None,
+            generation: Some(fence.generation.as_str()),
+            manifest: None,
+            state: None,
+            effect: None,
+            request: None,
+            receipt: Some(fence.ready_receipt_digest.as_str()),
+        }
+    }
+
+    /// Binds the pending activation plus the commit fence receipt digest.
+    fn for_commit(
+        label: &'static str,
+        pending: &'a eliot_installation::PendingActivation,
+        fence: &'a ActivationCommitFence,
+    ) -> Self {
+        let mut observation = Self::for_pending(label, pending);
+        observation.receipt = Some(fence.ready_receipt_digest.as_str());
+        observation
+    }
+}
+
+/// Emits one identity-bound activation observation through the #889 facade.
+///
+/// The frozen boundary label stays first so label-prefix consumers keep
+/// matching; the current identities follow as `k=v` pairs. Length stays
+/// under the facade's detail bound for pinned handle shapes, and any longer
+/// input is cut by that bound with its truncation honesty record.
+#[cfg(windows)]
+fn host_activation_observe_bound(observation: &ActivationObservation) {
+    let mut detail = String::from(observation.label);
+    for (key, value) in [
+        ("tx", observation.transaction),
+        ("plan", observation.plan),
+        ("gen", observation.generation),
+        ("manifest", observation.manifest),
+        ("state", observation.state),
+        ("effect", observation.effect),
+        ("req", observation.request),
+        ("receipt", observation.receipt),
+    ] {
+        if let Some(text) = value {
+            detail.push(' ');
+            detail.push_str(key);
+            detail.push('=');
+            detail.push_str(text);
+        }
+    }
+    host_activation_observe(&detail);
+}
+
 impl HostComposition {
     #[cfg(windows)]
     pub(super) fn reconcile_pending_activation(
@@ -42,7 +289,10 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — pending activation reconciliation requested.
-        host_activation_observe("host.activation reconcile requested");
+        host_activation_observe_bound(&ActivationObservation::for_pending(
+            "host.activation reconcile requested",
+            pending,
+        ));
         self.ensure_pending_activation_continuation_open(pending)?;
         let host_capability = self.owner_lease.activation_capability();
         let pending = self.claim_pending_durable(pending, &host_capability)?;
@@ -87,7 +337,10 @@ impl HostComposition {
         self.commit_pending_durable(&pending, &host_capability)?;
         // WORK_UNIT_CASE: 893/14 — pending activation reconciled and
         // committed; abort/stale paths above emit no reconciled record.
-        host_activation_observe("host.activation reconciled");
+        host_activation_observe_bound(&ActivationObservation::for_pending(
+            "host.activation reconciled",
+            &pending,
+        ));
         Ok(())
     }
 
@@ -98,7 +351,10 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<eliot_installation::PendingActivation, HostError> {
         // WORK_UNIT_CASE: 893/14 — pending activation claim (stage) requested.
-        host_activation_observe("host.activation claim requested");
+        host_activation_observe_bound(&ActivationObservation::for_pending(
+            "host.activation claim requested",
+            pending,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current.approval == pending.approval
@@ -135,7 +391,10 @@ impl HostComposition {
         match outcome {
             Ok(returned) if exact_readback && Some(&returned) == recovered.as_ref() => {
                 // WORK_UNIT_CASE: 893/14 — claim staged by direct CAS.
-                host_activation_observe("host.activation claim staged");
+                host_activation_observe_bound(&ActivationObservation::for_pending(
+                    "host.activation claim staged",
+                    pending,
+                ));
                 Ok(returned)
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -155,7 +414,10 @@ impl HostComposition {
                 // WORK_UNIT_CASE: 893/14 — claim confirmed by exact readback
                 // after an unknown CAS outcome; distinct from the direct CAS
                 // above, never a second stage effect.
-                host_activation_observe("host.activation claim staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_pending(
+                    "host.activation claim staged readback",
+                    pending,
+                ));
                 Ok(claimed)
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -172,7 +434,11 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — Phase-B intent persistence requested.
-        host_activation_observe("host.activation intent requested");
+        host_activation_observe_bound(&ActivationObservation::for_intent(
+            "host.activation intent requested",
+            pending,
+            intent,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current
@@ -209,7 +475,11 @@ impl HostComposition {
         match outcome {
             Ok(returned) if exact_readback && returned == *intent => {
                 // WORK_UNIT_CASE: 893/14 — intent staged by direct CAS.
-                host_activation_observe("host.activation intent staged");
+                host_activation_observe_bound(&ActivationObservation::for_intent(
+                    "host.activation intent staged",
+                    pending,
+                    intent,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -221,7 +491,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/14 — intent confirmed staged by exact
                 // readback after an unknown CAS outcome.
-                host_activation_observe("host.activation intent staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_intent(
+                    "host.activation intent staged readback",
+                    pending,
+                    intent,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -238,7 +512,11 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/3 — Phase-B preparation persistence requested.
-        host_activation_observe("host.activation prepared requested");
+        host_activation_observe_bound(&ActivationObservation::for_prepared(
+            "host.activation prepared requested",
+            pending,
+            prepared,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current
@@ -278,7 +556,11 @@ impl HostComposition {
             Ok(returned) if exact_readback && returned == *prepared => {
                 // WORK_UNIT_CASE: 893/3 — preparation staged by direct CAS;
                 // distinct from materialization.
-                host_activation_observe("host.activation prepared staged");
+                host_activation_observe_bound(&ActivationObservation::for_prepared(
+                    "host.activation prepared staged",
+                    pending,
+                    prepared,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -290,7 +572,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/3 — preparation confirmed staged by
                 // exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation prepared staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_prepared(
+                    "host.activation prepared staged readback",
+                    pending,
+                    prepared,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -307,7 +593,11 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/3 — Agent Bridge stage persistence requested.
-        host_activation_observe("host.activation bridge-stage requested");
+        host_activation_observe_bound(&ActivationObservation::for_stage(
+            "host.activation bridge-stage requested",
+            pending,
+            stage,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
@@ -346,7 +636,11 @@ impl HostComposition {
         match outcome {
             Ok(returned) if exact_readback && returned == *stage => {
                 // WORK_UNIT_CASE: 893/3 — bridge stage persisted by direct CAS.
-                host_activation_observe("host.activation bridge-stage staged");
+                host_activation_observe_bound(&ActivationObservation::for_stage(
+                    "host.activation bridge-stage staged",
+                    pending,
+                    stage,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -360,7 +654,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/3 — bridge stage confirmed staged by
                 // exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation bridge-stage staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_stage(
+                    "host.activation bridge-stage staged readback",
+                    pending,
+                    stage,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -377,7 +675,11 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — bridge-stage clear requested.
-        host_activation_observe("host.activation bridge-stage-clear requested");
+        host_activation_observe_bound(&ActivationObservation::for_stage(
+            "host.activation bridge-stage-clear requested",
+            pending,
+            stage,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
@@ -416,7 +718,11 @@ impl HostComposition {
         match outcome {
             Ok(()) if exact_readback => {
                 // WORK_UNIT_CASE: 893/14 — bridge stage cleared by direct CAS.
-                host_activation_observe("host.activation bridge-stage cleared");
+                host_activation_observe_bound(&ActivationObservation::for_stage(
+                    "host.activation bridge-stage cleared",
+                    pending,
+                    stage,
+                ));
                 Ok(())
             }
             Ok(()) => Err(HostError::RecoveryRequired(
@@ -425,7 +731,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/14 — bridge-stage clear confirmed by
                 // exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation bridge-stage cleared readback");
+                host_activation_observe_bound(&ActivationObservation::for_stage(
+                    "host.activation bridge-stage cleared readback",
+                    pending,
+                    stage,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -443,7 +753,11 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/15 — Phase-B receipt persistence requested; the
         // positive receipt record below requires exact durable readback.
-        host_activation_observe("host.activation receipt requested");
+        host_activation_observe_bound(&ActivationObservation::for_receipt(
+            "host.activation receipt requested",
+            pending,
+            receipt,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current
@@ -480,7 +794,11 @@ impl HostComposition {
             Ok(returned) if exact_readback && returned == *receipt => {
                 // WORK_UNIT_CASE: 893/15 — receipt staged by direct CAS with
                 // exact readback.
-                host_activation_observe("host.activation receipt staged");
+                host_activation_observe_bound(&ActivationObservation::for_receipt(
+                    "host.activation receipt staged",
+                    pending,
+                    receipt,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -492,7 +810,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/15 — receipt confirmed staged by exact
                 // readback after an unknown CAS outcome.
-                host_activation_observe("host.activation receipt staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_receipt(
+                    "host.activation receipt staged readback",
+                    pending,
+                    receipt,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -525,7 +847,11 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/15 — prepared-receipt persistence requested.
-        host_activation_observe("host.activation prepared-receipt requested");
+        host_activation_observe_bound(&ActivationObservation::for_prepared_receipt(
+            "host.activation prepared-receipt requested",
+            pending,
+            receipt,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -563,13 +889,21 @@ impl HostComposition {
             Ok(returned) if exact_readback && returned == *receipt => {
                 // WORK_UNIT_CASE: 893/15 — prepared receipt staged by direct
                 // CAS with exact readback.
-                host_activation_observe("host.activation prepared-receipt staged");
+                host_activation_observe_bound(&ActivationObservation::for_prepared_receipt(
+                    "host.activation prepared-receipt staged",
+                    pending,
+                    receipt,
+                ));
                 Ok(())
             }
             Err(_) if exact_readback => {
                 // WORK_UNIT_CASE: 893/15 — prepared receipt confirmed staged
                 // by exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation prepared-receipt staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_prepared_receipt(
+                    "host.activation prepared-receipt staged readback",
+                    pending,
+                    receipt,
+                ));
                 Ok(())
             }
             Ok(_) => Err(HostError::RecoveryRequired(
@@ -588,7 +922,10 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — rebind-intent persistence requested.
-        host_activation_observe("host.activation rebind-intent requested");
+        host_activation_observe_bound(&ActivationObservation::for_rebind_intent(
+            "host.activation rebind-intent requested",
+            intent,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -619,7 +956,10 @@ impl HostComposition {
         match outcome {
             Ok(returned) if exact_readback && returned == *intent => {
                 // WORK_UNIT_CASE: 893/14 — rebind intent staged by direct CAS.
-                host_activation_observe("host.activation rebind-intent staged");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_intent(
+                    "host.activation rebind-intent staged",
+                    intent,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -633,7 +973,10 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/14 — rebind intent confirmed staged by
                 // exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation rebind-intent staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_intent(
+                    "host.activation rebind-intent staged readback",
+                    intent,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -650,7 +993,11 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — rebind recovery/intent persistence requested.
-        host_activation_observe("host.activation rebind-recovery requested");
+        host_activation_observe_bound(&ActivationObservation::for_rebind_recovery(
+            "host.activation rebind-recovery requested",
+            recovery,
+            intent,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision =
             if self
@@ -704,7 +1051,11 @@ impl HostComposition {
                         .is_some_and(|existing| existing == recovery) =>
             {
                 // WORK_UNIT_CASE: 893/14 — rebind recovery staged by direct CAS.
-                host_activation_observe("host.activation rebind-recovery staged");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_recovery(
+                    "host.activation rebind-recovery staged",
+                    recovery,
+                    intent,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -718,7 +1069,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/14 — rebind recovery confirmed staged
                 // by exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation rebind-recovery staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_recovery(
+                    "host.activation rebind-recovery staged readback",
+                    recovery,
+                    intent,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -734,7 +1089,10 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — rebind-preparation persistence requested.
-        host_activation_observe("host.activation rebind-prepared requested");
+        host_activation_observe_bound(&ActivationObservation::for_rebind_prepared(
+            "host.activation rebind-prepared requested",
+            prepared,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -766,7 +1124,10 @@ impl HostComposition {
             Ok(returned) if exact_readback && returned == *prepared => {
                 // WORK_UNIT_CASE: 893/14 — rebind preparation staged by
                 // direct CAS.
-                host_activation_observe("host.activation rebind-prepared staged");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_prepared(
+                    "host.activation rebind-prepared staged",
+                    prepared,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -780,7 +1141,10 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/14 — rebind preparation confirmed
                 // staged by exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation rebind-prepared staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_prepared(
+                    "host.activation rebind-prepared staged readback",
+                    prepared,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -797,7 +1161,10 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/15 — rebind-receipt persistence requested; the
         // positive record below requires exact durable readback.
-        host_activation_observe("host.activation rebind-receipt requested");
+        host_activation_observe_bound(&ActivationObservation::for_rebind_receipt(
+            "host.activation rebind-receipt requested",
+            receipt,
+        ));
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -829,7 +1196,10 @@ impl HostComposition {
             Ok(returned) if exact_readback && returned == *receipt => {
                 // WORK_UNIT_CASE: 893/15 — rebind receipt staged by direct CAS
                 // with exact readback.
-                host_activation_observe("host.activation rebind-receipt staged");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_receipt(
+                    "host.activation rebind-receipt staged",
+                    receipt,
+                ));
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -843,7 +1213,10 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/15 — rebind receipt confirmed staged by
                 // exact readback after an unknown CAS outcome.
-                host_activation_observe("host.activation rebind-receipt staged readback");
+                host_activation_observe_bound(&ActivationObservation::for_rebind_receipt(
+                    "host.activation rebind-receipt staged readback",
+                    receipt,
+                ));
                 Ok(())
             }
             Err(error) => Err(HostError::RecoveryRequired(format!(
@@ -923,7 +1296,10 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — pending activation abort requested.
-        host_activation_observe("host.activation abort requested");
+        host_activation_observe_bound(&ActivationObservation::for_pending(
+            "host.activation abort requested",
+            pending,
+        ));
         let activation_intent_digest =
             pending.activation_intent_digest.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
@@ -952,7 +1328,10 @@ impl HostComposition {
                     "exact pending activation abort receipt was found but registry reload failed: {error}"
                 ))
             })?;
-            host_activation_observe("host.activation aborted readback");
+            host_activation_observe_bound(&ActivationObservation::for_pending(
+                "host.activation aborted readback",
+                pending,
+            ));
             return Ok(());
         }
 
@@ -997,13 +1376,19 @@ impl HostComposition {
             Ok(()) if exact_ack.is_some() => {
                 // WORK_UNIT_CASE: 893/14 — pending activation aborted by the
                 // exact owner CAS and confirmed by its durable receipt.
-                host_activation_observe("host.activation aborted");
+                host_activation_observe_bound(&ActivationObservation::for_pending(
+                    "host.activation aborted",
+                    pending,
+                ));
                 Ok(())
             }
             Err(_error) if exact_ack.is_some() => {
                 // WORK_UNIT_CASE: 893/14 — abort confirmed by the exact
                 // operation-bound receipt after an unknown CAS outcome.
-                host_activation_observe("host.activation aborted readback");
+                host_activation_observe_bound(&ActivationObservation::for_pending(
+                    "host.activation aborted readback",
+                    pending,
+                ));
                 Ok(())
             }
             Ok(()) => Err(HostError::RecoveryRequired(
@@ -1027,7 +1412,10 @@ impl HostComposition {
     ) -> Result<ActivationCommitFence, HostError> {
         // WORK_UNIT_CASE: 893/14 — commit-fence observation requested; the
         // fence is rebuilt from fresh durable evidence below.
-        host_activation_observe("host.activation commit-fence requested");
+        host_activation_observe_bound(&ActivationObservation::for_pending(
+            "host.activation commit-fence requested",
+            pending,
+        ));
         self.ensure_admission_open()?;
         let durable = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
@@ -1250,7 +1638,11 @@ impl HostComposition {
         // WORK_UNIT_CASE: 893/14 — commit fence observed from fresh
         // readiness/journal/Phase-B evidence; stale or substituted fences
         // above emit no observed record.
-        host_activation_observe("host.activation commit-fence observed");
+        host_activation_observe_bound(&ActivationObservation::for_commit(
+            "host.activation commit-fence observed",
+            pending,
+            &fence,
+        ));
         Ok(fence)
     }
 
@@ -1260,7 +1652,10 @@ impl HostComposition {
         commit_fence: &ActivationCommitFence,
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/14 — pre-CAS journal-fence re-verification requested.
-        host_activation_observe("host.activation journal-fence requested");
+        host_activation_observe_bound(&ActivationObservation::for_commit_fence(
+            "host.activation journal-fence requested",
+            commit_fence,
+        ));
         // The registry readback itself is not a liveness barrier. Re-snapshot
         // the journal after that read and immediately before the CAS so an
         // intervening degraded/recovery append cannot reuse the earlier fence.
@@ -1297,7 +1692,10 @@ impl HostComposition {
         }
         // WORK_UNIT_CASE: 893/14 — journal fence still exact immediately
         // before the commit CAS.
-        host_activation_observe("host.activation journal-fence observed");
+        host_activation_observe_bound(&ActivationObservation::for_commit_fence(
+            "host.activation journal-fence observed",
+            commit_fence,
+        ));
         Ok(())
     }
 
@@ -1309,7 +1707,10 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // WORK_UNIT_CASE: 893/15 — pending activation commit requested; the
         // positive commit record below requires exact durable readback.
-        host_activation_observe("host.activation commit requested");
+        host_activation_observe_bound(&ActivationObservation::for_pending(
+            "host.activation commit requested",
+            pending,
+        ));
         let commit_fence = self.fresh_pending_commit_fence(pending)?;
         let durable_before_commit = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
@@ -1361,7 +1762,11 @@ impl HostComposition {
             Ok(()) if exact_readback => {
                 // WORK_UNIT_CASE: 893/15 — activation committed by direct CAS
                 // with exact readback.
-                host_activation_observe("host.activation committed");
+                host_activation_observe_bound(&ActivationObservation::for_commit(
+                    "host.activation committed",
+                    pending,
+                    &commit_fence,
+                ));
                 return Ok(());
             }
             Ok(()) => HostError::RecoveryRequired(
@@ -1370,7 +1775,11 @@ impl HostComposition {
             Err(_error) if exact_readback => {
                 // WORK_UNIT_CASE: 893/15 — commit confirmed by exact readback
                 // after an unknown CAS outcome; never a second commit effect.
-                host_activation_observe("host.activation committed readback");
+                host_activation_observe_bound(&ActivationObservation::for_commit(
+                    "host.activation committed readback",
+                    pending,
+                    &commit_fence,
+                ));
                 return Ok(());
             }
             Err(error) => HostError::RecoveryRequired(format!(
