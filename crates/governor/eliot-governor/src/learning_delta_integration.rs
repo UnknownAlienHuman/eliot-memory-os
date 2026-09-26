@@ -207,7 +207,7 @@ pub fn store_attempt_close(
     })?;
     let delta_digest = eliot_contracts::sha256_hex(&binding);
     let delta_artifact =
-        ArtifactId::new(format!("learning-delta:{}", delta_digest)).map_err(|_| {
+        ArtifactId::new(format!("learning-delta:{delta_digest}")).map_err(|_| {
             LearningDeltaError::InvalidInput {
                 field: "stored.delta_artifact",
             }

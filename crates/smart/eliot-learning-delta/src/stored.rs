@@ -142,10 +142,15 @@ impl StoredRetryRelation {
         }
         require_non_empty_unique(&self.prior_observable_refs, "retry.prior_observable_refs")?;
         require_non_empty_unique(&self.prior_evidence, "retry.prior_evidence")?;
+        // A declared equivalence must be backed by the matching fingerprint
+        // observation and a declared distinctness by its opposite; `Unknown`
+        // admits every basis because no fingerprint was established at all.
+        // Any other pairing is incoherent and is refused rather than silently
+        // downgraded to `Unknown`.
         match (self.equivalence, self.basis) {
-            (RetryEquivalence::Equivalent, RetryEquivalenceBasis::PriorFingerprintMatches) => {}
-            (RetryEquivalence::Distinct, RetryEquivalenceBasis::PriorFingerprintDiffers) => {}
-            (
+            (RetryEquivalence::Equivalent, RetryEquivalenceBasis::PriorFingerprintMatches)
+            | (RetryEquivalence::Distinct, RetryEquivalenceBasis::PriorFingerprintDiffers)
+            | (
                 RetryEquivalence::Unknown,
                 RetryEquivalenceBasis::PriorFingerprintMatches
                 | RetryEquivalenceBasis::PriorFingerprintDiffers
