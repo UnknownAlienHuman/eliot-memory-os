@@ -112,7 +112,9 @@ $script:GovernorRetirementNonAdmissionReasons = @(
 # plugin-relative paths (for example 'plugin/eliot-governor/' and
 # 'eliot-governor --config') that name the retiring surface without one of the
 # qualified spellings, and the environment-variable spelling catches launch
-# references such as '{env:ELIOT_GOVERNOR_EXE}'. Detection stays purely
+# references such as '{env:ELIOT_GOVERNOR_EXE}'. The bare facade package name
+# catches references through the package ('cargo run -p eliot-app',
+# 'crates/eliot-app/...') without a governor spelling. Detection stays purely
 # content-based, so candidate shrinkage of CONSUMER_SURFACES can never remove
 # a reference from the denominator.
 $script:GovernorRetirementClosureTokens = @(
@@ -122,6 +124,7 @@ $script:GovernorRetirementClosureTokens = @(
     'codex_controller'
     'eliot-governor'
     'ELIOT_GOVERNOR'
+    'eliot-app'
 )
 
 
