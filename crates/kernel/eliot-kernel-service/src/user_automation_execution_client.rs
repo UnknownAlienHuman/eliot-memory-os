@@ -5,7 +5,6 @@
 //! receipt, and State Fence binding; this module does not mint a grant,
 //! scheduler identity, Durable Job identity, or Host journal record.
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -717,9 +716,13 @@ impl UserAutomationHostExecutionResponse {
                 Ok(())
             }
             (
-                UserAutomationHostExecutionOperation::CancelPendingWakes { .. },
+                UserAutomationHostExecutionOperation::CancelPendingWakes {
+                    request: cancellation,
+                },
                 Self::Cancelled { wake_ids, .. },
-            ) => validate_unique_text(wake_ids),
+            ) => cancellation
+                .validate_cancelled_wake_ids(wake_ids)
+                .map_err(|_| UserAutomationRuntimeError::IdentityConflict),
             (
                 UserAutomationHostExecutionOperation::ReadPendingWake { request },
                 Self::WakeRead { readback, .. },
@@ -1368,17 +1371,6 @@ fn validate_sha256(value: &str, field: &'static str) -> Result<(), UserAutomatio
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
         return Err(rejected(format!("{field} must be lowercase sha256")));
-    }
-    Ok(())
-}
-
-fn validate_unique_text(values: &[String]) -> Result<(), UserAutomationRuntimeError> {
-    let mut unique = BTreeSet::new();
-    for value in values {
-        validate_text(value, "wake_id")?;
-        if !unique.insert(value.as_str()) {
-            return Err(rejected("duplicate wake cancellation identity"));
-        }
     }
     Ok(())
 }
