@@ -2237,7 +2237,12 @@ async fn run_local_read_poll(
             LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
             LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
-        return Ok(step(outcome, startup_readiness));
+        // #2647: this leg builds a board over the composition and reads it; it
+        // attaches no startup capability and re-evaluates no readiness, so the
+        // flight observed nothing and carries no delta. Settling it therefore
+        // cannot overwrite owner observations the loop recorded meanwhile, the
+        // same contract the ordinary forwarded read below settles under.
+        return Ok(step(outcome, None));
     }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
