@@ -1,27 +1,41 @@
 //! Bounded owner-issued configuration evidence projection for backup (issue #958).
 //!
-//! Pure logical projection over explicitly supplied evidence: owner lease
-//! reference, approved generation, manifest/build digests, purge-ledger
-//! revision, and the caller-observed [`StateFence`]. No I/O, no registry
-//! reads, no secret material. Every digest is shape-checked lowercase hex;
-//! every identity is bounded text. Stale or mixed evidence is rejected with
-//! the exact field named; nothing is ever silently refreshed.
+//! Pure logical projection over explicitly supplied evidence: approved
+//! generation, manifest/build digests, the owner state fence, and the
+//! presented request. No I/O, no registry reads, no secret material. Every
+//! digest is shape-checked lowercase hex; every identity is bounded text. Stale
+//! or mixed evidence is rejected with the exact field named; nothing is ever
+//! silently refreshed.
 //!
 //! # What the owner actually proves
 //!
 //! On the production path the owner proves exactly three things, and each is
 //! compared field-for-field against presented evidence: the numeric
 //! authority generation, the configuration digest and the approved artifact
-//! digest set. The owner lease reference, the source installation identity and
-//! the purge-ledger revision have no owner source on this path, so they remain
-//! caller-presented and are documented as presented on
-//! [`BackupConfigProjection`]. A field with no owner evidence is stated as
-//! presented; it is never documented as verified (I5.27 forbids carrying a
-//! field that affects authority silently, in either direction).
+//! digest set. The owner-issued approved build identity and profile token are
+//! compared against the same validated approved record inside
+//! `crate::backup_preparation::DelegatedPreparation::prepare`.
 //!
-//! The optional [`AuditFenceNote`] is forensic only: [`describe_audit_fence`]
-//! renders a non-authoritative note, and no API converts it into a lease,
-//! grant, or current-state assertion.
+//! For three further fields this path has no owner evidence at all: an owner
+//! lease reference, a purge-ledger revision, and a forensic audit note. The
+//! installation registry, the [`ApprovedGeneration`] record, the activation
+//! commit fence and the host-state records observed here carry none of them, so
+//! a presented value could not be corroborated by anything. Such a value is
+//! therefore **refused** with [`ProjectionError::OwnerEvidenceUnavailable`],
+//! which names the missing owner obligation, instead of being copied into an
+//! owner-issued projection and its digest. With no claim presented the record
+//! carries the absence and the digest binds that absence explicitly: I5.27
+//! forbids silently omitting or defaulting a field that affects authority, in
+//! either direction.
+//!
+//! The presented source installation identity is bounded presented text. The
+//! only owner-issued installation identity on this contour is the launch
+//! installation handle, and it is proved against the presented value by
+//! `BackupCallerAuth::authenticate_for_owner` at
+//! `HostComposition::prepare_backup_destination` before any projection runs.
+//! The projector itself performs no installation-identity comparison, and the
+//! source root bound next to it in the prepared-destination receipt is the
+//! owner-issued manifest-bound installation root, not presented text.
 //!
 //! # Production caller
 //!
@@ -30,15 +44,17 @@
 //! `crate::backup_preparation`, which
 //! `crate::backup_preparation::DelegatedPreparation::prepare` runs for every
 //! delegated preparation, so its [`BackupConfigProjection`] is the evidence the
-//! prepared-destination receipt binds. [`describe_audit_fence`] is rendered
-//! there into the same receipt.
+//! prepared-destination receipt binds. Because that projector refuses a
+//! presented audit note, [`describe_audit_fence`] renders no caller-authored
+//! forensic text on the production path and the prepared-destination receipt
+//! carries no audit claim at all.
 //!
 //! [`project_backup_config`] is the current-authority-snapshot variant. It has
 //! no production caller, and deliberately so: its [`AuthoritySnapshot`] needs
 //! an owner-issued lease reference and a purge-ledger revision, and the
 //! installation registry, [`ApprovedGeneration`] and the activation commit
-//! fence carry neither. See [`project_backup_config_owner_bound`] for exactly
-//! which fields stay caller-presented until #954.
+//! fence carry neither. See [`project_backup_config_owner_bound`] for the
+//! refusals that replace those two comparisons on the production path.
 
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_installation::ApprovedGeneration;
@@ -70,6 +86,17 @@ pub enum ProjectionError {
     /// Presented evidence disagrees with current authority evidence.
     #[error("stale evidence in field {field}: presented value differs from current authority")]
     StaleEvidence { field: &'static str },
+    /// The owner issues no evidence for a field the request presents.
+    ///
+    /// Issued instead of copying an uncorroborated caller claim into an
+    /// owner-issued record. `obligation` names the exact owner that must issue
+    /// the value before such a request can be admitted; it is a static sentence
+    /// and never echoes the presented value.
+    #[error("no owner-issued evidence for field {field}: {obligation}")]
+    OwnerEvidenceUnavailable {
+        field: &'static str,
+        obligation: &'static str,
+    },
 }
 
 // F-LOG-HOST-8 (#983) backup configuration diagnostics: observation-only helpers.
@@ -122,6 +149,9 @@ fn projection_error_category(error: &ProjectionError) -> (&'static str, &'static
         ProjectionError::InvalidIdentity { field } => ("invalid_identity", field),
         ProjectionError::BoundsExceeded { field } => ("bounds_exceeded", field),
         ProjectionError::StaleEvidence { field } => ("stale_evidence", field),
+        ProjectionError::OwnerEvidenceUnavailable { field, .. } => {
+            ("owner_evidence_unavailable", field)
+        }
     }
 }
 
@@ -198,10 +228,12 @@ fn note_config_error(op: &'static str, error: ProjectionError) -> ProjectionErro
 /// would turn the comparison into a self-comparison that can never fail.
 ///
 /// The production path is [`project_backup_config_owner_bound`], which compares
-/// the three fields the owner really does issue and documents the rest as
-/// caller-presented. This struct is retained as the snapshot-shaped comparison
-/// set for that variant; it is not, and must not be read as, a description of
-/// evidence a production caller supplies.
+/// the three fields the owner really does issue and **refuses** a presented
+/// lease reference or purge-ledger revision with
+/// [`ProjectionError::OwnerEvidenceUnavailable`] instead of comparing them
+/// against a value the same caller supplied. This struct is retained as the
+/// snapshot-shaped comparison set for that variant; it is not, and must not be
+/// read as, a description of evidence a production caller supplies.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritySnapshot {
     /// Owner lease reference (opaque bounded text, never a secret value).
@@ -220,17 +252,29 @@ pub struct AuthoritySnapshot {
 ///
 /// Every field is presented evidence; the projector never invents currency for
 /// any of them. Where the owner issues a value for a field, the projector
-/// refuses a mismatch; where it does not, the field stays presented and is
-/// documented as such on [`BackupConfigProjection`]. The production projector
+/// refuses a mismatch; where the owner issues nothing and the field is not part
+/// of the record the receipt may carry, the projector refuses the presented
+/// value itself with [`ProjectionError::OwnerEvidenceUnavailable`].
 /// [`project_backup_config_owner_bound`] compares `manifest_digest`,
-/// `build_digests` and `generation` against owner-issued values;
-/// [`project_backup_config`] compares all five against an [`AuthoritySnapshot`]
-/// that has no production constructor.
+/// `build_digests` and `generation` against owner-issued values and refuses a
+/// presented `owner_lease_ref`, `purge_ledger_revision` or `audit`;
+/// [`project_backup_config`] compares all five against an
+/// [`AuthoritySnapshot`] that has no production constructor.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackupConfigRequest {
     /// Source installation identity (bounded text).
+    ///
+    /// Presented. The only owner-issued installation identity on this contour is
+    /// the launch installation handle, proved against the presented value at
+    /// `HostComposition::prepare_backup_destination` before the delegated
+    /// projection runs; the projector itself makes no such comparison.
     pub installation_id: String,
     /// Owner lease reference the requester claims.
+    ///
+    /// Refused on the owner-bound production path: no owner here issues a lease
+    /// reference, so any presented value is uncorroborated. Lease issuance
+    /// belongs to the #954 control contracts, which are open. The snapshot
+    /// variant still compares it against its [`AuthoritySnapshot`].
     pub owner_lease_ref: String,
     /// Generation the requester claims as approved. On the owner-bound
     /// production path this is refused unless it equals the owner-issued
@@ -241,8 +285,18 @@ pub struct BackupConfigRequest {
     /// Approved build digests claimed.
     pub build_digests: Vec<String>,
     /// Purge-ledger revision claimed.
+    ///
+    /// Refused on the owner-bound production path: purge-ledger authority is
+    /// owned outside Host backup preparation and no owner here observes a
+    /// revision, so any presented value is uncorroborated. The snapshot variant
+    /// still compares it against its [`AuthoritySnapshot`].
     pub purge_ledger_revision: u64,
     /// Optional forensic audit note; never authority (case 958/3).
+    ///
+    /// Refused on the owner-bound production path: the note is caller-authored
+    /// and nothing here compares its digest or its observed dispositions to Host
+    /// state, so carrying it would put unverified claims into an owner-issued
+    /// record. The snapshot variant accepts it and keeps its forensic ceiling.
     pub audit: Option<AuditFenceNote>,
 }
 
@@ -252,6 +306,11 @@ pub struct BackupConfigRequest {
 /// constructor, conversion, or method that turns this into a lease, grant,
 /// or current-state assertion; [`describe_audit_fence`] renders the note
 /// with its ceiling stated.
+///
+/// Nothing on the owner-bound production path issues or corroborates such a
+/// note, so [`project_backup_config_owner_bound`] refuses a presented one and
+/// the prepared-destination receipt never carries one. I5.13 keeps the
+/// `HostStateAuditFence` optional for exactly this reason.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuditFenceNote {
     /// Digest of the observed installation lineage/dispositions.
@@ -266,8 +325,9 @@ pub struct AuditFenceNote {
 /// `crate::backup_preparation::OwnerEvidence::project_backup_configuration`,
 /// which is the only path a receipt is built from. A field is called verified
 /// only when the projector compared the presented value against a value the
-/// owner issued; a field with no owner source says so instead of borrowing the
-/// word. [`project_backup_config`] produces the same record from an
+/// owner issued; a field the owner cannot issue says so, and a presented value
+/// for such a field is refused rather than copied.
+/// [`project_backup_config`] produces the same record from an
 /// [`AuthoritySnapshot`] that has no production constructor, and is documented
 /// at that function as not being on the production path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -275,21 +335,25 @@ pub struct BackupConfigProjection {
     /// Projection format version ([`CONFIG_PROJECTION_VERSION`]).
     pub version: u32,
     /// Source installation identity, as presented by the requester and
-    /// shape-checked. The owner issues no installation identity on this path
-    /// (the installation registry is not consulted by this projection), so this
-    /// is a caller-presented value bound into the digest, not a verified one.
-    /// Bounded text only; the source root itself is never carried here.
+    /// shape-checked. The projector makes no installation-identity comparison
+    /// of its own: the installation registry is not consulted here, and the one
+    /// owner-issued installation identity on this contour (the launch
+    /// installation handle) is proved against the presented value at
+    /// `HostComposition::prepare_backup_destination` before the delegated
+    /// projection runs. Bounded text only; the source root itself is never
+    /// carried here.
     pub installation_id: String,
-    /// Owner lease reference, as presented by the requester and
-    /// shape-checked. The owner issues no lease reference here: lease issuance
-    /// belongs to the #954 control contracts and `HostComposition` delegation,
-    /// which are open. This value is bounded and bound into the digest so the
-    /// receipt names the lease that was presented, but no comparison against
-    /// owner evidence is or can be made on this path.
+    /// Owner lease reference. Always **empty** on the owner-bound production
+    /// path: no owner issues a lease reference there, so a presented one is
+    /// refused with [`ProjectionError::OwnerEvidenceUnavailable`] rather than
+    /// copied, and the record states the absence instead. Lease issuance
+    /// belongs to the #954 control contracts, which are open. The snapshot
+    /// variant fills this from its [`AuthoritySnapshot`].
     pub owner_lease_ref: String,
-    /// Approved generation, verified equal to the owner-issued authority
-    /// generation of the active approved record on the production path, and
-    /// equal to the supplied [`AuthoritySnapshot`] on the snapshot variant.
+    /// Approved generation, refused unless it equals the owner-issued
+    /// authority generation of the active approved record on the production
+    /// path, and refused unless it equals the supplied [`AuthoritySnapshot`] on
+    /// the snapshot variant.
     pub generation: u64,
     /// Configuration digest of the approved record. It equals the owner-issued
     /// configuration digest whenever the projector was given a presented digest
@@ -303,14 +367,18 @@ pub struct BackupConfigProjection {
     /// Build digests, each verified to be a member of the owner-issued
     /// approved artifact digest set.
     pub build_digests: Vec<String>,
-    /// Purge-ledger revision, as presented by the requester. The owner issues
-    /// no purge-ledger revision here: purge-ledger authority belongs to #954
-    /// control contracts and `HostComposition` delegation, which are open. This
-    /// value is bounded and bound into the digest so the receipt names the
-    /// revision that was presented, but no comparison against owner evidence is
-    /// or can be made on this path.
+    /// Purge-ledger revision. Always **zero** on the owner-bound production
+    /// path: purge-ledger authority is owned outside Host backup preparation
+    /// and no owner observed here issues a revision, so a presented one is
+    /// refused with [`ProjectionError::OwnerEvidenceUnavailable`] and the
+    /// record states the absence. The snapshot variant fills this from its
+    /// [`AuthoritySnapshot`].
     pub purge_ledger_revision: u64,
-    /// State fence bound at projection time (caller-observed evidence).
+    /// State fence bound at projection time.
+    ///
+    /// On the owner-bound production path this is the committed activation
+    /// fence's authority state fence, so it is owner-issued; on the snapshot
+    /// variant it is the fence the caller handed over.
     pub state_fence: StateFence,
     /// Projection digest binding every field above (domain-separated SHA-256).
     pub projection_digest: String,
@@ -357,6 +425,10 @@ fn hash_state_fence(hasher: &mut Sha256, fence: &StateFence) -> Result<(), Proje
 /// and the receipt could not say which evidence was presented. The note keeps
 /// its forensic ceiling — it is still never a lease, grant or current-state
 /// assertion — binding it only discriminates the request it belongs to.
+///
+/// Only [`project_backup_config`] can reach this with a present note:
+/// [`project_backup_config_owner_bound`] refuses a presented note outright, so
+/// on the production path this binds the observed absence.
 fn hash_audit_note(hasher: &mut Sha256, audit: Option<&AuditFenceNote>) {
     let Some(note) = audit else {
         hash_field(hasher, b"audit", b"absent");
@@ -407,11 +479,14 @@ fn check_bounded_list(values: &[String], field: &'static str) -> Result<(), Proj
 /// (case 958/3). The returned text is evidence only and can never act as a
 /// lease, grant, or current-state assertion.
 ///
-/// Production caller: `crate::backup_preparation::OwnerEvidence`'s delegated
-/// preparation path renders the presented note through this function into the
-/// prepared-destination receipt and the preparation journal record, so a
-/// receipt states which forensic note was presented without the note ever
-/// becoming authority.
+/// The note it renders is **caller-authored**, and the owner-bound production
+/// path therefore refuses a presented note
+/// ([`project_backup_config_owner_bound`]): no owner here compares the note
+/// digest or its observed dispositions to Host state, so this renderer is
+/// deliberately not reached from `crate::backup_preparation` and no
+/// prepared-destination receipt carries such text. It remains the only place
+/// the ceiling wording exists, for the snapshot variant and for the declared
+/// case 958/3 proof.
 #[must_use]
 pub fn describe_audit_fence(note: &AuditFenceNote) -> String {
     format!(
@@ -431,8 +506,8 @@ pub fn describe_audit_fence(note: &AuditFenceNote) -> String {
 /// comparison shape, for the case where one owner-issued value is available for
 /// every field at once. A snapshot assembled from the very request it checks
 /// compares only with itself, which is why its lease and purge-ledger arms are
-/// unreachable from any production path today and why those two fields are no
-/// longer documented as verified on [`BackupConfigProjection`].
+/// unreachable from any production path today and why the production projector
+/// refuses those two fields instead of comparing them.
 ///
 /// The production path is [`project_backup_config_owner_bound`], which compares
 /// against the owner-issued generation, configuration digest and artifact
@@ -578,9 +653,13 @@ pub fn project_backup_config(
 /// authority generation of the same record, never a caller-chosen number.
 ///
 /// The lease reference, the installation identity, the purge-ledger revision and
-/// the target build/profile stay caller-presented until #954 control contracts
-/// and `HostComposition` delegation land, and are documented as such at
-/// [`project_backup_config_owner_bound`].
+/// the target build/profile comparison itself stay outside this record: the
+/// first three are refused by [`project_backup_config_owner_bound`] because no
+/// owner here issues them, and the last is compared in
+/// `crate::backup_preparation::DelegatedPreparation::prepare` against
+/// [`ApprovedBuildBinding::generation_handle`] and
+/// [`ApprovedBuildBinding::approved_profile`], the two owner-issued names a
+/// presented target may equal.
 ///
 /// **Provenance is a property of the constructor, not of the type.** Every field
 /// is `pub` and the type is not `#[non_exhaustive]`, so a caller can construct
@@ -593,6 +672,11 @@ pub fn project_backup_config(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovedBuildBinding {
     /// Owner-issued generation identity handle text.
+    ///
+    /// This is the owner-issued approved build identity of the destination
+    /// contour: the only build identity the installation authority names. A
+    /// presented target build may equal it and nothing else, because no
+    /// broader build-name catalogue exists on this path.
     pub generation_handle: String,
     /// Owner-issued numeric authority generation of the approved record.
     ///
@@ -608,6 +692,13 @@ pub struct ApprovedBuildBinding {
     pub config_digest: String,
     /// Owner-issued approved artifact digests in manifest order.
     pub artifact_digests: Vec<String>,
+    /// Owner-issued installation profile token (lowercase `snake_case`).
+    ///
+    /// The approved record's own canonical serialization of
+    /// `runtime_launch.profile`, read through the owner type's derived
+    /// `Serialize`, so the spelling is the owner's and not a local table. A
+    /// presented target profile may equal this and nothing else.
+    pub approved_profile: String,
 }
 
 /// Binds the exact active approved generation to its owner-issued facts.
@@ -621,7 +712,9 @@ pub struct ApprovedBuildBinding {
 /// a record whose manifest runtime launch descriptor disagrees with the
 /// activation approval about the authority generation, so
 /// [`ApprovedBuildBinding::authority_generation`] can only ever be read off a
-/// record whose manifest and approval agree on it.
+/// record whose manifest and approval agree on it. The profile token is read
+/// through the owner type's own serialization and fails closed rather than
+/// falling back to a local spelling.
 pub fn bind_approved_build(
     approved: &ApprovedGeneration,
 ) -> Result<ApprovedBuildBinding, ProjectionError> {
@@ -642,6 +735,19 @@ pub fn bind_approved_build(
         )
     })?;
     let manifest = &approved.manifest;
+    let approved_profile = serde_json::to_value(manifest.runtime_launch.profile)
+        .ok()
+        .and_then(|profile| profile.as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            note_config_error(
+                "bind_build",
+                ProjectionError::OwnerEvidenceUnavailable {
+                    field: "approved_profile",
+                    obligation:
+                        "the approved record must carry a serializable installation profile",
+                },
+            )
+        })?;
     let binding = ApprovedBuildBinding {
         generation_handle: manifest.generation.as_str().to_owned(),
         authority_generation: manifest.runtime_launch.authority_generation,
@@ -656,6 +762,7 @@ pub fn bind_approved_build(
             manifest.native_worker_artifact_digest.as_str().to_owned(),
             manifest.wasm_host_artifact_digest.as_str().to_owned(),
         ],
+        approved_profile,
     };
     // Owner-issued facts only; the count observes the binding, never values.
     observe_bind_progress("bound", backup_config_count(binding.artifact_digests.len()));
@@ -675,25 +782,46 @@ pub fn bind_approved_build(
 /// - every presented `build_digests` entry must be one of the owner-issued
 ///   artifact digests.
 ///
-/// The generation arm runs first on purpose: it is the scope every other
-/// owner-issued fact belongs to, so a request that mixes one generation's
-/// digest into another generation's claim is refused as a generation mismatch
-/// rather than as a digest mismatch.
+/// The generation arm runs first among the owner comparisons on purpose: it is
+/// the scope every other owner-issued fact belongs to, so a request that mixes
+/// one generation's digest into another generation's claim is refused as a
+/// generation mismatch rather than as a digest mismatch. The uncorroborable-field
+/// refusals above run before all of them, because a value nothing can check is
+/// not evidence in any generation.
+///
+/// # Fields the owner cannot issue are refused, not copied
+///
+/// Three presented fields have no owner evidence anywhere on this path, so a
+/// presented value is refused with
+/// [`ProjectionError::OwnerEvidenceUnavailable`] rather than compared against
+/// the caller's own value or carried into an owner-issued record:
+///
+/// - a non-empty `owner_lease_ref` — lease issuance belongs to the #954
+///   control contracts, which are open;
+/// - a non-zero `purge_ledger_revision` — purge-ledger authority is owned
+///   outside Host backup preparation and no owner observed here issues one;
+/// - any `audit` note — the note is caller-authored and nothing here compares
+///   its digest or observed dispositions to Host state, so binding it would
+///   carry unverified disposition claims into an owner-issued receipt.
+///
+/// Each refusal names the exact owner obligation that is missing. With no claim
+/// presented, the record states the absence and the digest binds that absence
+/// explicitly, so an absent owner value is as visible as a present one.
 ///
 /// The projection digest binds the owner-issued generation handle, the
 /// owner-issued authority generation and the owner-issued configuration digest
 /// in addition to the presented fields, so a receipt cannot migrate across
-/// authority generations. Its domain separator is `v3`, distinct from
-/// [`project_backup_config`]'s `v2`: this construction covers strictly more and
-/// must not be mistaken for it.
+/// authority generations. Its domain separator is `v4`, distinct from
+/// [`project_backup_config`]'s `v2` and from this path's own earlier `v3`:
+/// `v3` still hashed the caller's lease reference and purge-ledger revision as
+/// if they were evidence, and a stored `v3` receipt must not silently match a
+/// `v4` digest over the same logical input (I5.27). `CONFIG_PROJECTION_VERSION`
+/// is the serialized record schema version, not the digest revision, and does
+/// not move: the record shape is unchanged.
 ///
-/// Owner binding covers the numeric generation, the manifest and the builds.
-/// The installation identity, the lease reference, the purge-ledger revision
-/// and the target build/profile stay caller-presented: lease issuance and
-/// purge-ledger authority belong to #954 control contracts and
-/// `HostComposition` delegation, which are open. They are shape-checked and
-/// bound into the digest, and [`BackupConfigProjection`] documents them as
-/// presented rather than verified. No secret-typed field exists here.
+/// The installation identity stays presented here and is compared by its real
+/// owner at `HostComposition::prepare_backup_destination`, not by this
+/// function. No secret-typed field exists here.
 ///
 /// This is the production projector. Its caller is
 /// `crate::backup_preparation::OwnerEvidence::project_backup_configuration`,
@@ -721,8 +849,6 @@ pub fn project_backup_config_owner_bound(
 ) -> Result<BackupConfigProjection, ProjectionError> {
     check_identity(&request.installation_id, "installation_id")
         .map_err(|error| note_config_error("project_owner_bound", error))?;
-    check_identity(&request.owner_lease_ref, "owner_lease_ref")
-        .map_err(|error| note_config_error("project_owner_bound", error))?;
     check_digest(&request.manifest_digest, "manifest_digest")
         .map_err(|error| note_config_error("project_owner_bound", error))?;
     check_bounded_list(&request.build_digests, "build_digests")
@@ -731,15 +857,42 @@ pub fn project_backup_config_owner_bound(
         check_digest(digest, "build_digests[]")
             .map_err(|error| note_config_error("project_owner_bound", error))?;
     }
-    if let Some(audit) = &request.audit {
-        check_digest(&audit.note_digest, "audit.note_digest")
-            .map_err(|error| note_config_error("project_owner_bound", error))?;
-        check_bounded_list(&audit.observed_dispositions, "audit.observed_dispositions")
-            .map_err(|error| note_config_error("project_owner_bound", error))?;
-        for disposition in &audit.observed_dispositions {
-            check_identity(disposition, "audit.observed_dispositions[]")
-                .map_err(|error| note_config_error("project_owner_bound", error))?;
-        }
+    // Uncorroborable presented claims, refused before any owner comparison runs.
+    // Each names the exact owner obligation that is missing. Nothing here can
+    // compare these three against owner evidence, so the alternatives would be a
+    // self-comparison against the caller's own value or an owner field invented
+    // only to make a check pass; both are refused by design.
+    if !request.owner_lease_ref.is_empty() {
+        return Err(note_config_error(
+            "project_owner_bound",
+            ProjectionError::OwnerEvidenceUnavailable {
+                field: "owner_lease_ref",
+                obligation: "an owner-issued lease reference must come from the #954 caller-control \
+                     contracts, which are open; no installation record observed here issues one",
+            },
+        ));
+    }
+    if request.purge_ledger_revision != 0 {
+        return Err(note_config_error(
+            "project_owner_bound",
+            ProjectionError::OwnerEvidenceUnavailable {
+                field: "purge_ledger_revision",
+                obligation: "the purge-ledger owner must issue the revision observed by Host backup \
+                     preparation; no registry, approved-generation, commit-fence or host-state \
+                     record observed here carries one",
+            },
+        ));
+    }
+    if request.audit.is_some() {
+        return Err(note_config_error(
+            "project_owner_bound",
+            ProjectionError::OwnerEvidenceUnavailable {
+                field: "audit",
+                obligation: "a HostStateAuditFence must be issued or corroborated by the owner that \
+                     observed the installation lineage; a caller-authored note is not evidence \
+                     and I5.13 keeps that fence optional",
+            },
+        ));
     }
     // Owner-issued numeric authority generation, refused before any digest is
     // named. `DestinationAdmission` in `crate::backup_preparation` already
@@ -780,28 +933,28 @@ pub fn project_backup_config_owner_bound(
             ));
         }
     }
+    // The three refusals above run before any digest is computed: nothing that
+    // reaches this point carries a caller-declared lease reference, purge-ledger
+    // revision or audit note, so none of them can reach the record below.
     let mut hasher = Sha256::new();
-    // v3 on this path only: v2 covered the presented generation but never the
-    // owner-issued authority generation, so a v2 digest and a v3 digest over
-    // the same logical input differ and an old stored receipt would mismatch a
-    // freshly computed one with nothing to explain it. Naming the revision in
-    // the domain separator is what makes that mismatch legible instead of
-    // silent (I5.27). `CONFIG_PROJECTION_VERSION` is the serialized record
-    // schema version, not the digest revision, and does not move: the record
-    // shape is unchanged. See [`project_backup_config`] for the snapshot
+    // v4 on this path only: v3 still hashed the presented lease reference and
+    // purge-ledger revision as if they were evidence, so a stored v3 receipt
+    // must not silently match a v4 digest over the same logical request. Naming
+    // the revision in the domain separator is what makes that mismatch legible
+    // instead of silent (I5.27). `CONFIG_PROJECTION_VERSION` is the serialized
+    // record schema version, not the digest revision, and does not move: the
+    // record shape is unchanged. See [`project_backup_config`] for the snapshot
     // variant, whose coverage is unchanged and which stays at v2.
-    hasher.update(b"eliot.backup.config-projection.v3\0");
+    hasher.update(b"eliot.backup.config-projection.v4\0");
     hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
     hash_field(
         &mut hasher,
         b"installation_id",
         request.installation_id.as_bytes(),
     );
-    hash_field(
-        &mut hasher,
-        b"owner_lease_ref",
-        request.owner_lease_ref.as_bytes(),
-    );
+    // The absence is bound explicitly, never an empty caller string that could
+    // be read as "an empty lease reference was presented and accepted".
+    hash_field(&mut hasher, b"owner_lease_ref", b"absent");
     hasher.update(b"generation\0");
     hasher.update(request.generation.to_le_bytes());
     // Owner-issued authority generation, bound under its own label rather than
@@ -821,36 +974,42 @@ pub fn project_backup_config_owner_bound(
     );
     hash_field(
         &mut hasher,
+        b"approved_profile",
+        binding.approved_profile.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
         b"manifest_digest",
         binding.config_digest.as_bytes(),
     );
     for digest in &request.build_digests {
         hash_field(&mut hasher, b"build_digest", digest.as_bytes());
     }
-    hasher.update(b"purge_ledger_revision\0");
-    hasher.update(request.purge_ledger_revision.to_le_bytes());
+    hash_field(&mut hasher, b"purge_ledger_revision", b"absent");
     hash_state_fence(&mut hasher, fence)
         .map_err(|error| note_config_error("project_owner_bound", error))?;
-    hash_audit_note(&mut hasher, request.audit.as_ref());
+    // No audit note can be present here, so this binds the observed absence.
+    hash_audit_note(&mut hasher, None);
     let projection_digest = format!("{:x}", hasher.finalize());
     // Observed owner-bound projection only, never authority. Numeric facts
-    // come from the produced value; the forensic note stays non-authoritative.
+    // come from the produced value; the refused fields carry no observation.
     observe_config_progress(
         "project_owner_bound",
         "projected_owner_bound",
         request.generation,
-        request.purge_ledger_revision,
+        0,
         backup_config_count(request.build_digests.len()),
-        request.audit.is_some(),
+        false,
     );
     Ok(BackupConfigProjection {
         version: CONFIG_PROJECTION_VERSION,
         installation_id: request.installation_id.clone(),
-        owner_lease_ref: request.owner_lease_ref.clone(),
+        // Empty and zero by construction: a presented value was refused above.
+        owner_lease_ref: String::new(),
         generation: request.generation,
         manifest_digest: binding.config_digest.clone(),
         build_digests: request.build_digests.clone(),
-        purge_ledger_revision: request.purge_ledger_revision,
+        purge_ledger_revision: 0,
         state_fence: fence.clone(),
         projection_digest,
     })
