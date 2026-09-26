@@ -64,6 +64,30 @@ $Script:OwnedRootAllowedNames = @(
     'artifacts'
 )
 
+# Bounded-runtime stage names (#907 W8). Each stage carries its own bound from
+# the injected bounds table; the stage ladder is fixed here so a caller can
+# never add, drop, or reorder a bounded stage.
+$Script:BoundedRuntimeStages = @(
+    'overall', 'start', 'readiness', 'group', 'test-wall', 'test-idle',
+    'evidence', 'graceful-stop', 'forced-stop'
+)
+$Script:BoundedRuntimeStageBound = @{
+    overall      = 'overallSeconds'
+    start        = 'startSeconds'
+    readiness    = 'readinessSeconds'
+    group        = 'groupSeconds'
+    'test-wall'  = 'testWallSeconds'
+    'test-idle'  = 'testIdleSeconds'
+    evidence     = 'evidenceSeconds'
+    'graceful-stop' = 'gracefulStopMs'
+    'forced-stop'   = 'forcedStopMs'
+}
+$Script:BoundedRuntimeByteBound = @{
+    output  = 'maxOutputBytes'
+    line    = 'maxLines'
+    artifact = 'maxArtifactBytes'
+}
+
 function Get-IntegrationHarnessCoreVersion {
     [CmdletBinding()]
     [OutputType([string])]
@@ -548,6 +572,87 @@ function Remove-IntegrationHarnessOwnedRoot {
     }
 }
 
+# Accepted test-process ownership (#907 W8). Ownership is a RECORDED identity
+# tuple, not an injected predicate: a pid is owned only when this run recorded
+# a start receipt for that exact pid whose run id, owner and generation match
+# the current binding. There is no boolean that a caller can supply to make an
+# arbitrary pid owned; recording the tuple is the only way to gain ownership,
+# and the tuple is itself verified against the live identity at stop time.
+function New-IntegrationHarnessOwnedProcessRecord {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [int]$ProcessId,
+        [Parameter(Mandatory)]
+        [hashtable]$Binding,
+        [Parameter(Mandatory)]
+        [string]$Role,
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$StartTimeUtc,
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$ImagePath,
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$ImageHash,
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$SignerIdentity,
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [int[]]$DescendantPids = @()
+    )
+    if ($ProcessId -le 0) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-PID: process id must be positive.')
+    }
+    if ([string]::IsNullOrWhiteSpace($Role)) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-ROLE: role is empty.')
+    }
+    foreach ($field in @('runId', 'owner', 'generation')) {
+        if (-not $Binding.ContainsKey($field) -or
+            [string]::IsNullOrWhiteSpace([string]$Binding[$field])) {
+            throw [System.ArgumentException]::new("HARNESS-INVALID-BINDING: binding is missing '$field'.")
+        }
+    }
+    # A start receipt that cannot state the full identity is not an accepted
+    # ownership record. This is the fail-closed admission gate: without a
+    # complete tuple the pid is NEVER owned, so it can never be stopped.
+    $identity = [pscustomobject]@{
+        processId       = $ProcessId
+        runId           = [string]$Binding['runId']
+        owner           = [string]$Binding['owner']
+        generation      = [int]$Binding['generation']
+        role            = $Role
+        startTimeUtc    = $StartTimeUtc
+        imagePath       = $ImagePath
+        imageHash       = $ImageHash
+        signerIdentity  = $SignerIdentity
+    }
+    if (-not (Test-IntegrationHarnessProcessIdentityMatch -LiveIdentity @{
+            startTimeUtc   = $StartTimeUtc
+            imagePath      = $ImagePath
+            imageHash      = $ImageHash
+            signerIdentity = $SignerIdentity
+        } -ExpectedStartTimeUtc $StartTimeUtc -ExpectedImagePath $ImagePath `
+          -ExpectedImageHash $ImageHash -ExpectedSignerIdentity $SignerIdentity)) {
+        throw [System.ArgumentException]::new(
+            "HARNESS-UNVERIFIED-OWNERSHIP: start receipt for pid $ProcessId carries no complete process/image/signer identity.")
+    }
+    $descendants = [System.Collections.Generic.List[int]]::new()
+    foreach ($descendant in @($DescendantPids)) {
+        if ($descendant -le 0) {
+            throw [System.ArgumentException]::new('HARNESS-INVALID-PID: descendant pid must be positive.')
+        }
+        [void]$descendants.Add($descendant)
+    }
+    return @{
+        identity        = $identity
+        descendantPids  = @($descendants)
+    }
+}
+
 function Test-IntegrationHarnessOwnedProcess {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -578,14 +683,23 @@ function Test-IntegrationHarnessOwnedProcess {
     return ($recorded -ceq $OwnerRunId)
 }
 
-# Harness-owned start/image identity comparison for owned-process stop.
-# The numeric process id is only a lookup handle: the stop decision binds to
-# the start instant plus the executable image path and image digest recorded at
-# start. Every comparison below is fail-closed: a missing, unreadable, or
-# mismatched field means "not the owned process", never a kill. Only the live
-# identity QUERY is injected (ProcessController['GetProcessIdentity']); the
-# comparison itself always runs here, so a bare truthy injected value can never
-# authorize a stop on its own. Not exported: callers use the stop seam.
+# Harness-owned start/image/signer identity comparison for owned-process stop.
+#
+# The numeric process id is ONLY a lookup handle. The stop decision binds to the
+# identity tuple recorded at start and re-read live: process start instant
+# (kills PID reuse), the executable image path, the image content digest, and
+# the signer/hash identity required by docs/architecture/
+# I10-08-02-ip0-one-windows-processexecutor.md. Every comparison is fail-closed:
+# a missing, unreadable, or mismatched field means "not the owned process",
+# never a kill.
+#
+# Ownership is NOT an injected predicate. The only injected value is the live
+# identity READ (a probe that answers a question about the OS), and the probe is
+# not consulted for ownership at all: a probe that returns $true for every pid
+# cannot authorize a stop, because the comparison below always runs here and
+# demands a complete, matching identity tuple. A caller that cannot produce
+# start time + image path + image hash + signer gets a fail-closed rejection, so
+# an identity-incapable probe degrades to "never kill", never to "kill".
 function Test-IntegrationHarnessProcessIdentityMatch {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -601,69 +715,78 @@ function Test-IntegrationHarnessProcessIdentityMatch {
         [string]$ExpectedImagePath,
         [Parameter()]
         [AllowEmptyString()]
-        [string]$ExpectedImageHash
+        [string]$ExpectedImageHash,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedSignerIdentity
     )
     if ($LiveIdentity -isnot [hashtable]) {
         return $false
     }
-    $compared = 0
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedStartTimeUtc)) {
-        $compared++
-        if (-not $LiveIdentity.ContainsKey('startTimeUtc') -or $null -eq $LiveIdentity['startTimeUtc']) {
-            return $false
-        }
-        $expectedTicks = 0
-        try {
-            $expectedTicks = ([System.DateTimeOffset]::Parse($ExpectedStartTimeUtc)).UtcTicks
-        } catch {
-            return $false
-        }
-        $liveRaw = $LiveIdentity['startTimeUtc']
-        $liveTicks = 0
-        try {
-            if ($liveRaw -is [System.DateTimeOffset]) {
-                $liveTicks = ([System.DateTimeOffset]$liveRaw).UtcTicks
-            } elseif ($liveRaw -is [System.DateTime]) {
-                $liveTicks = ([System.DateTimeOffset]::new(([System.DateTime]$liveRaw).ToUniversalTime())).UtcTicks
-            } else {
-                $liveTicks = ([System.DateTimeOffset]::Parse([string]$liveRaw)).UtcTicks
-            }
-        } catch {
-            return $false
-        }
-        if ($liveTicks -ne $expectedTicks) {
+    # A complete ownership tuple is mandatory on BOTH sides. An expected tuple
+    # that omits any of the four identity components is not an accepted
+    # test-process ownership record, so the answer is "not the owned process".
+    $expected = @($ExpectedStartTimeUtc, $ExpectedImagePath, $ExpectedImageHash, $ExpectedSignerIdentity)
+    foreach ($field in $expected) {
+        if ([string]::IsNullOrWhiteSpace([string]$field)) {
             return $false
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedImagePath)) {
-        $compared++
-        if (-not $LiveIdentity.ContainsKey('imagePath') -or $null -eq $LiveIdentity['imagePath']) {
-            return $false
-        }
-        $livePath = ([string]$LiveIdentity['imagePath']).Trim()
-        if ([string]::IsNullOrWhiteSpace($livePath)) {
-            return $false
-        }
-        if (-not $livePath.Equals($ExpectedImagePath.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+    foreach ($field in @('startTimeUtc', 'imagePath', 'imageHash', 'signerIdentity')) {
+        if (-not $LiveIdentity.ContainsKey($field) -or $null -eq $LiveIdentity[$field]) {
             return $false
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedImageHash)) {
-        $compared++
-        if (-not $LiveIdentity.ContainsKey('imageHash') -or $null -eq $LiveIdentity['imageHash']) {
-            return $false
-        }
-        $liveHash = ([string]$LiveIdentity['imageHash']).Trim().ToLowerInvariant()
-        if ([string]::IsNullOrWhiteSpace($liveHash)) {
-            return $false
-        }
-        if ($liveHash -cne $ExpectedImageHash.Trim().ToLowerInvariant()) {
-            return $false
-        }
+    $expectedTicks = 0
+    try {
+        $expectedTicks = ([System.DateTimeOffset]::Parse($ExpectedStartTimeUtc)).UtcTicks
+    } catch {
+        return $false
     }
-    return ($compared -gt 0)
+    $liveRaw = $LiveIdentity['startTimeUtc']
+    $liveTicks = 0
+    try {
+        if ($liveRaw -is [System.DateTimeOffset]) {
+            $liveTicks = ([System.DateTimeOffset]$liveRaw).UtcTicks
+        } elseif ($liveRaw -is [System.DateTime]) {
+            $liveTicks = ([System.DateTimeOffset]::new(([System.DateTime]$liveRaw).ToUniversalTime())).UtcTicks
+        } else {
+            $liveTicks = ([System.DateTimeOffset]::Parse([string]$liveRaw)).UtcTicks
+        }
+    } catch {
+        return $false
+    }
+    if ($liveTicks -ne $expectedTicks) {
+        return $false
+    }
+    $livePath = ([string]$LiveIdentity['imagePath']).Trim()
+    if ([string]::IsNullOrWhiteSpace($livePath) -or
+        -not $livePath.Equals($ExpectedImagePath.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $liveHash = ([string]$LiveIdentity['imageHash']).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($liveHash) -or
+        $liveHash -cne $ExpectedImageHash.Trim().ToLowerInvariant()) {
+        return $false
+    }
+    $liveSigner = ([string]$LiveIdentity['signerIdentity']).Trim()
+    if ([string]::IsNullOrWhiteSpace($liveSigner) -or
+        $liveSigner -cne $ExpectedSignerIdentity.Trim()) {
+        return $false
+    }
+    return $true
 }
 
+# Stop one owned process (#907 W8).
+#
+# The stop is authorized ONLY by a recorded ownership identity tuple that also
+# matches the LIVE process identity read through the controller's observation
+# primitive. There is no `TestOwnership` scriptblock, no name, no port, and no
+# bare pid path: the controller supplies observation (who is this pid right now)
+# and the stop action (graceful/forced for exactly this pid), never ownership.
+# A foreign, reused, unverified, or unreadable identity is never touched and
+# leaves the cleanup outcome explicitly uncertain, which blocks clean
+# completion instead of passing.
 function Stop-IntegrationHarnessOwnedProcess {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -673,7 +796,7 @@ function Stop-IntegrationHarnessOwnedProcess {
         [Parameter(Mandatory)]
         [string]$Role,
         [Parameter(Mandatory)]
-        [string]$OwnerRunId,
+        [hashtable]$OwnershipRecord,
         [Parameter(Mandatory)]
         [hashtable]$ProcessController,
         [Parameter(Mandatory)]
@@ -681,16 +804,7 @@ function Stop-IntegrationHarnessOwnedProcess {
         [System.Collections.Generic.List[string]]$Failures,
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [System.Collections.Generic.List[object]]$Receipts,
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$ExpectedStartTimeUtc,
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$ExpectedImagePath,
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$ExpectedImageHash
+        [System.Collections.Generic.List[object]]$Receipts
     )
     if ($ProcessId -le 0) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-PID: process id must be positive.')
@@ -698,22 +812,29 @@ function Stop-IntegrationHarnessOwnedProcess {
     if ([string]::IsNullOrWhiteSpace($Role)) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-ROLE: role is empty.')
     }
-    foreach ($field in @('TestOwnership', 'RequestGraceful', 'WaitForExit', 'StopForced')) {
+    foreach ($field in @('ReadLiveIdentity', 'RequestGraceful', 'WaitForExit', 'StopForced')) {
         if (-not $ProcessController.ContainsKey($field) -or $ProcessController[$field] -isnot [scriptblock]) {
             throw [System.ArgumentException]::new("HARNESS-INVALID-CONTROLLER: controller is missing '$field'.")
         }
     }
-    # Identity-bound stop: when the caller supplies any start/image expectation
-    # recorded at start, the stop additionally requires a live identity match.
-    # Without expectations the injected ownership predicate alone decides, for
-    # compatibility with callers that predate identity recording.
-    $identityBound = (-not [string]::IsNullOrWhiteSpace($ExpectedStartTimeUtc)) -or `
-        (-not [string]::IsNullOrWhiteSpace($ExpectedImagePath)) -or `
-        (-not [string]::IsNullOrWhiteSpace($ExpectedImageHash))
-    if ($identityBound) {
-        if (-not $ProcessController.ContainsKey('GetProcessIdentity') -or
-            $ProcessController['GetProcessIdentity'] -isnot [scriptblock]) {
-            throw [System.ArgumentException]::new("HARNESS-INVALID-CONTROLLER: identity-bound stop requires 'GetProcessIdentity'.")
+    if ($OwnershipRecord -isnot [hashtable] -or -not $OwnershipRecord.ContainsKey('identity')) {
+        throw [System.ArgumentException]::new('HARNESS-UNVERIFIED-OWNERSHIP: an accepted ownership identity tuple is required.')
+    }
+    $identity = $OwnershipRecord['identity']
+    if ($identity -isnot [hashtable] -and $identity -isnot [psobject]) {
+        throw [System.ArgumentException]::new('HARNESS-UNVERIFIED-OWNERSHIP: ownership identity must be a record.')
+    }
+    $fieldMap = @{}
+    if ($identity -is [hashtable]) {
+        foreach ($key in @($identity.Keys)) { $fieldMap[[string]$key] = $identity[$key] }
+    } else {
+        foreach ($prop in $identity.PSObject.Properties) { $fieldMap[[string]$prop.Name] = $prop.Value }
+    }
+    foreach ($required in @('startTimeUtc', 'imagePath', 'imageHash', 'signerIdentity')) {
+        if (-not $fieldMap.ContainsKey($required) -or
+            [string]::IsNullOrWhiteSpace([string]$fieldMap[$required])) {
+            throw [System.ArgumentException]::new(
+                "HARNESS-UNVERIFIED-OWNERSHIP: ownership identity is missing '$required'.")
         }
     }
     $receipt = [ordered]@{
@@ -726,42 +847,36 @@ function Stop-IntegrationHarnessOwnedProcess {
         cleanupUnknown     = $false
         identityMismatch   = $false
     }
+    # Identity FIRST. A pid whose live identity is absent, unreadable, or
+    # different from the recorded start/image/signer tuple is foreign by
+    # definition: it is never signalled, and cleanup is explicitly uncertain.
+    $identityOk = $false
+    $liveIdentity = $null
     try {
-        $owned = (& $ProcessController['TestOwnership'] $ProcessId $OwnerRunId)
-        if (-not $owned) {
-            $Failures.Add("foreign-process-never-touched:$Role")
-            $receipt.skippedForeign = $true
-            $receipt.cleanupUnknown = $true
-            $Receipts.Add([pscustomobject]$receipt)
-            return @{
-                stopped        = $false
-                skippedForeign = $true
-                cleanupUnknown = $true
-                pid            = $ProcessId
-                role           = $Role
-            }
+        $liveIdentity = (& $ProcessController['ReadLiveIdentity'] $ProcessId)
+    } catch {
+        $liveIdentity = $null
+    }
+    $identityOk = Test-IntegrationHarnessProcessIdentityMatch -LiveIdentity $liveIdentity `
+        -ExpectedStartTimeUtc ([string]$fieldMap['startTimeUtc']) `
+        -ExpectedImagePath ([string]$fieldMap['imagePath']) `
+        -ExpectedImageHash ([string]$fieldMap['imageHash']) `
+        -ExpectedSignerIdentity ([string]$fieldMap['signerIdentity'])
+    if (-not $identityOk) {
+        $Failures.Add("foreign-process-never-touched:$Role")
+        $receipt.skippedForeign = $true
+        $receipt.cleanupUnknown = $true
+        $receipt.identityMismatch = $true
+        $Receipts.Add([pscustomobject]$receipt)
+        return @{
+            stopped        = $false
+            skippedForeign = $true
+            cleanupUnknown = $true
+            pid            = $ProcessId
+            role           = $Role
         }
-        if ($identityBound) {
-            $liveIdentity = (& $ProcessController['GetProcessIdentity'] $ProcessId)
-            $identityOk = Test-IntegrationHarnessProcessIdentityMatch -LiveIdentity $liveIdentity `
-                -ExpectedStartTimeUtc $ExpectedStartTimeUtc `
-                -ExpectedImagePath $ExpectedImagePath `
-                -ExpectedImageHash $ExpectedImageHash
-            if (-not $identityOk) {
-                $Failures.Add("foreign-process-never-touched:$Role")
-                $receipt.skippedForeign = $true
-                $receipt.cleanupUnknown = $true
-                $receipt.identityMismatch = $true
-                $Receipts.Add([pscustomobject]$receipt)
-                return @{
-                    stopped        = $false
-                    skippedForeign = $true
-                    cleanupUnknown = $true
-                    pid            = $ProcessId
-                    role           = $Role
-                }
-            }
-        }
+    }
+    try {
         $receipt.graceful_requested = [bool](& $ProcessController['RequestGraceful'] $ProcessId)
         $exited = [bool](& $ProcessController['WaitForExit'] $ProcessId)
         if (-not $exited) {
@@ -789,45 +904,82 @@ function Stop-IntegrationHarnessOwnedProcess {
     }
 }
 
+# Stop the exact owned process tree (#907 W8).
+#
+# Ownership of every member is decided the same way: a recorded identity tuple
+# per pid, verified against the live identity. The descendant bound is enforced
+# here, so an oversized or unbounded lineage is an explicit bounded-runtime
+# failure (reconciliation-required), never a silent partial stop. Stop order is
+# descendants first (deepest/highest pid first for determinism), then the root,
+# matching the reverse of a start-ordered lineage.
 function Stop-IntegrationHarnessOwnedProcessTree {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)]
         [int]$RootPid,
-        [Parameter()]
-        [AllowEmptyCollection()]
-        [int[]]$DescendantPids = @(),
         [Parameter(Mandatory)]
         [string]$OwnerRunId,
         [Parameter(Mandatory)]
-        [hashtable]$ProcessController
+        [hashtable]$ProcessController,
+        [Parameter()]
+        [AllowNull()]
+        [object[]]$OwnedProcesses = @(),
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$Bounds
     )
     if ($RootPid -le 0) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-PID: root pid must be positive.')
     }
-    $failures = [System.Collections.Generic.List[string]]::new()
-    $receipts = [System.Collections.Generic.List[object]]::new()
-    $ordered = @()
-    $seen = @{}
-    foreach ($targetPid in @($DescendantPids)) {
-        if ($targetPid -le 0) {
-            throw [System.ArgumentException]::new('HARNESS-INVALID-PID: descendant pid must be positive.')
-        }
-        $key = [string]$targetPid
-        if (-not $seen.ContainsKey($key) -and $targetPid -ne $RootPid) {
-            $seen[$key] = $true
-            $ordered += $targetPid
+    if ($OwnerRunId -cnotmatch '^[0-9a-f]{32}$') {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: OwnerRunId must be 32 lowercase hex.')
+    }
+    $maxDescendants = 128
+    if ($null -ne $Bounds -and $Bounds.ContainsKey('maxDescendants')) {
+        $maxDescendants = [int]$Bounds['maxDescendants']
+    }
+    $view = New-IntegrationHarnessOwnedProcessView -OwnedProcesses @($OwnedProcesses) -RunId $OwnerRunId
+    $ordered = @($view['records'])
+    $byPid = @{}
+    $descendantPids = [System.Collections.Generic.List[int]]::new()
+    foreach ($record in $ordered) {
+        $pidValue = [int](Get-IntegrationHarnessOwnedRecordField -Record $record -Field 'processId' -Default 0)
+        if ($pidValue -le 0 -or $pidValue -eq $RootPid) { continue }
+        if ($byPid.ContainsKey($pidValue)) { continue }
+        $byPid[$pidValue] = $record
+        [void]$descendantPids.Add($pidValue)
+    }
+    if (-not $byPid.ContainsKey($RootPid)) {
+        # No accepted start receipt for the root: nothing owned, nothing killed.
+        return @{
+            rootPid        = $RootPid
+            stopped        = $false
+            cleanupUnknown = $true
+            failures       = @("foreign-process-never-touched:test-root:$RootPid")
+            receipts       = @()
         }
     }
-    $ordered = @($ordered | Sort-Object -Descending)
-    foreach ($targetPid in $ordered) {
+    if ($descendantPids.Count -gt $maxDescendants) {
+        # The descendant bound is a runtime bound, not a filter: exceeding it is
+        # an explicit uncertain-cleanup outcome that blocks clean completion.
+        return @{
+            rootPid        = $RootPid
+            stopped        = $false
+            cleanupUnknown = $true
+            failures       = @("descendant-bound-exceeded:$($descendantPids.Count):$maxDescendants")
+            receipts       = @()
+        }
+    }
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $receipts = [System.Collections.Generic.List[object]]::new()
+    foreach ($targetPid in @($descendantPids | Sort-Object -Descending)) {
         [void](Stop-IntegrationHarnessOwnedProcess -ProcessId $targetPid -Role 'test-descendant' `
-            -OwnerRunId $OwnerRunId -ProcessController $ProcessController `
+            -OwnershipRecord $byPid[$targetPid] -ProcessController $ProcessController `
             -Failures $failures -Receipts $receipts)
     }
     $rootResult = Stop-IntegrationHarnessOwnedProcess -ProcessId $RootPid -Role 'test-root' `
-        -OwnerRunId $OwnerRunId -ProcessController $ProcessController `
+        -OwnershipRecord $byPid[$RootPid] -ProcessController $ProcessController `
         -Failures $failures -Receipts $receipts
     $unknown = $false
     foreach ($receipt in $receipts) {
@@ -841,6 +993,385 @@ function Stop-IntegrationHarnessOwnedProcessTree {
         cleanupUnknown = $unknown
         failures       = @($failures)
         receipts       = @($receipts)
+    }
+}
+
+# Bounded-runtime budget (#907 W8).
+#
+# Every bounded dimension named by the issue is accounted here from the
+# injected bounds table: overall/start/readiness/group/test-wall/test-idle/
+# evidence/graceful-stop/forced-stop time, output/line/artifact bytes, resource
+# count and process-descendant count.
+#
+# The CLOCK is injected and is the only source of "now": the function never
+# sleeps, never waits, and never reads the wall clock unless the caller passes
+# no clock at all (the fail-closed default rejects that instead of guessing).
+# Elapsed time is measured by the caller's own clock reads; this function only
+# compares supplied elapsed values against the bounds, so a test drives every
+# timeout path deterministically with no sleep in the harness.
+function New-IntegrationHarnessBoundedRuntime {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Bounds,
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [scriptblock]$Clock,
+        [Parameter(Mandatory)]
+        [string]$RunId,
+        [Parameter(Mandatory)]
+        [string]$Owner
+    )
+    if ($RunId -cnotmatch '^[0-9a-f]{32}$') {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: RunId must be 32 lowercase hex.')
+    }
+    if ([string]::IsNullOrWhiteSpace($Owner)) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: owner receipt is empty.')
+    }
+    if ($null -eq $Clock) {
+        # No injected clock means no deterministic time bound is provable.
+        # Fail closed instead of silently reading a real wall clock.
+        throw [System.ArgumentException]::new(
+            'HARNESS-INVALID-CLOCK: bounded runtime requires an injected clock; the harness never sleeps or reads an ambient clock.')
+    }
+    if ($Bounds -isnot [hashtable]) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-BOUNDS: bounds must be a mapping.')
+    }
+    if (Test-IntegrationHarnessModelLoaded) {
+        $command = Get-Command -Name 'Test-IntegrationHarnessBounds' -ErrorAction SilentlyContinue
+        if ($null -ne $command) {
+            [void](Test-IntegrationHarnessBounds -Bounds $Bounds)
+        }
+    }
+    foreach ($stage in $Script:BoundedRuntimeStages) {
+        $boundField = $Script:BoundedRuntimeStageBound[$stage]
+        if (-not $Bounds.ContainsKey($boundField)) {
+            throw [System.ArgumentException]::new(
+                "HARNESS-INVALID-BOUNDS: stage '$stage' has no bound field '$boundField'.")
+        }
+        if ([int]$Bounds[$boundField] -le 0) {
+            throw [System.ArgumentException]::new(
+                "HARNESS-INVALID-BOUNDS: stage '$stage' bound must be positive.")
+        }
+    }
+    foreach ($field in @($Script:BoundedRuntimeByteBound.Values)) {
+        if (-not $Bounds.ContainsKey($field) -or [int]$Bounds[$field] -le 0) {
+            throw [System.ArgumentException]::new(
+                "HARNESS-INVALID-BOUNDS: byte/count bound '$field' must be present and positive.")
+        }
+    }
+    return @{
+        runId          = $RunId
+        owner          = $Owner
+        bounds         = $Bounds
+        clock          = $Clock
+        stageBudgets   = @(
+            foreach ($stage in $Script:BoundedRuntimeStages) {
+                @{ stage = $stage; limit = [int]$Bounds[$Script:BoundedRuntimeStageBound[$stage]]; elapsedMs = 0; breached = $false }
+            }
+        )
+        byteBudgets    = @(
+            foreach ($key in @('output', 'line', 'artifact')) {
+                @{ dimension = $key; limit = [int]$Bounds[$Script:BoundedRuntimeByteBound[$key]]; observed = 0; breached = $false }
+            }
+        )
+        resources      = 0
+        descendants    = 0
+        marks          = @()
+        closedStages   = @{}
+        breaches       = [System.Collections.Generic.List[string]]::new()
+        uncertain      = $false
+    }
+}
+
+# Read the injected clock exactly once. The only accepted readings are
+# DateTimeOffset/DateTime; anything else is a fail-closed clock contract error.
+function Get-IntegrationHarnessBoundedNow {
+    [CmdletBinding()]
+    [OutputType([System.DateTimeOffset])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Runtime
+    )
+    $observed = (& $Runtime['clock'])
+    if ($observed -is [System.DateTimeOffset]) {
+        return $observed
+    }
+    if ($observed -is [System.DateTime]) {
+        return [System.DateTimeOffset]::new($observed.ToUniversalTime())
+    }
+    throw [System.ArgumentException]::new('HARNESS-INVALID-CLOCK: injected clock must return DateTimeOffset.')
+}
+
+# Mark the start instant of a bounded stage, read from the injected clock. The
+# returned runtime carries the mark; nothing sleeps.
+function Start-IntegrationHarnessBoundedStage {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Runtime,
+        [Parameter(Mandatory)]
+        [string]$Stage,
+        [Parameter(Mandatory)]
+        [string]$Key
+    )
+    if ($Script:BoundedRuntimeStages -notcontains $Stage) {
+        throw [System.ArgumentException]::new("HARNESS-UNKNOWN-STAGE: '$Stage'.")
+    }
+    if ([string]::IsNullOrWhiteSpace($Key)) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: a bounded stage key is required.')
+    }
+    $now = Get-IntegrationHarnessBoundedNow -Runtime $Runtime
+    $marks = [System.Collections.Generic.List[hashtable]]::new()
+    foreach ($mark in @($Runtime['marks'])) {
+        [void]$marks.Add($mark)
+    }
+    [void]$marks.Add(@{ stage = $Stage; key = $Key; at = $now })
+    $Runtime['marks'] = @($marks)
+    return $Runtime
+}
+
+# Close a bounded stage: charge the delta between its mark and a fresh injected
+# clock read to that stage AND to the overall stage, then mark the stage closed
+# so repeated closes of the same key are idempotent (never double-charged).
+function Stop-IntegrationHarnessBoundedStage {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Runtime,
+        [Parameter(Mandatory)]
+        [string]$Stage,
+        [Parameter(Mandatory)]
+        [string]$Key
+    )
+    if ($Script:BoundedRuntimeStages -notcontains $Stage) {
+        throw [System.ArgumentException]::new("HARNESS-UNKNOWN-STAGE: '$Stage'.")
+    }
+    $markKey = '{0}|{1}' -f $Stage, $Key
+    if ($Runtime.ContainsKey('closedStages') -and $Runtime['closedStages'].ContainsKey($markKey)) {
+        # Already charged: repeated cleanup/close is idempotent, never re-charged.
+        return $Runtime
+    }
+    $openMark = $null
+    foreach ($mark in @($Runtime['marks'])) {
+        if ([string]$mark['stage'] -ceq $Stage -and [string]$mark['key'] -ceq $Key) {
+            $openMark = $mark
+        }
+    }
+    if ($null -eq $openMark) {
+        throw [System.ArgumentException]::new("HARNESS-UNKNOWN-STAGE: stage '$Stage' was never started for '$Key'.")
+    }
+    $now = Get-IntegrationHarnessBoundedNow -Runtime $Runtime
+    $elapsed = [int64]($now - ([System.DateTimeOffset]$openMark['at'])).TotalMilliseconds
+    if ($elapsed -lt 0) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-CLOCK: the injected clock moved backwards.')
+    }
+    $Runtime = Add-IntegrationHarnessBoundedStageElapsed -Runtime $Runtime -Stage $Stage `
+        -ElapsedMilliseconds $elapsed
+    if (-not $Runtime.ContainsKey('closedStages') -or $null -eq $Runtime['closedStages']) {
+        $Runtime['closedStages'] = @{}
+    }
+    $Runtime['closedStages'][$markKey] = $true
+    return $Runtime
+}
+
+# Charge elapsed milliseconds to one named stage. Elapsed is supplied by the
+# caller as the delta between two injected-clock reads; nothing sleeps.
+function Add-IntegrationHarnessBoundedStageElapsed {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Runtime,
+        [Parameter(Mandatory)]
+        [string]$Stage,
+        [Parameter(Mandatory)]
+        [int64]$ElapsedMilliseconds
+    )
+    if ($Script:BoundedRuntimeStages -notcontains $Stage) {
+        throw [System.ArgumentException]::new("HARNESS-UNKNOWN-STAGE: '$Stage'.")
+    }
+    if ($ElapsedMilliseconds -lt 0) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-CLOCK: elapsed time must be non-negative.')
+    }
+    $index = [array]::IndexOf([string[]]$Script:BoundedRuntimeStages, [string]$Stage)
+    $budget = $Runtime['stageBudgets'][$index]
+    $updated = @($Runtime['stageBudgets'] | ForEach-Object { $_ })
+    $updated[$index] = @{
+        stage      = $budget['stage']
+        limit      = [int]$budget['limit']
+        elapsedMs  = [int64]$budget['elapsedMs'] + $ElapsedMilliseconds
+        breached   = ([int64]$budget['elapsedMs'] + $ElapsedMilliseconds) -gt ([int64]$budget['limit'])
+    }
+    $Runtime['stageBudgets'] = $updated
+    if ($updated[$index].breached) {
+        $Runtime['breaches'].Add("stage-bound-exceeded:$Stage")
+        $Runtime['uncertain'] = $true
+    }
+    # The overall bound is charged by every stage so it is never bypassed.
+    $overall = [array]::IndexOf([string[]]$Script:BoundedRuntimeStages, 'overall')
+    $overallBudget = $Runtime['stageBudgets'][$overall]
+    $overallUpdated = @($Runtime['stageBudgets'] | ForEach-Object { $_ })
+    $overallUpdated[$overall] = @{
+        stage     = 'overall'
+        limit     = [int]$overallBudget['limit']
+        elapsedMs = [int64]$overallBudget['elapsedMs'] + $ElapsedMilliseconds
+        breached  = ([int64]$overallBudget['elapsedMs'] + $ElapsedMilliseconds) -gt ([int64]$overallBudget['limit'])
+    }
+    $Runtime['stageBudgets'] = $overallUpdated
+    if ($overallUpdated[$overall].breached) {
+        $Runtime['breaches'].Add('stage-bound-exceeded:overall')
+        $Runtime['uncertain'] = $true
+    }
+    return $Runtime
+}
+
+# Charge an observed byte/line/count value against its dimension bound.
+function Add-IntegrationHarnessBoundedObservation {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Runtime,
+        [Parameter(Mandatory)]
+        [ValidateSet('output', 'line', 'artifact', 'resources', 'descendants')]
+        [string]$Dimension,
+        [Parameter(Mandatory)]
+        [int64]$Observed
+    )
+    if ($Observed -lt 0) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-OBSERVATION: bounded observations must be non-negative.')
+    }
+    if ($Dimension -eq 'resources') {
+        $Runtime['resources'] = [int]$Observed
+        if ([int]$Observed -gt [int]$Runtime['bounds']['maxResources']) {
+            $Runtime['breaches'].Add("bound-exceeded:resources")
+            $Runtime['uncertain'] = $true
+        }
+        return $Runtime
+    }
+    if ($Dimension -eq 'descendants') {
+        $Runtime['descendants'] = [int]$Observed
+        if ([int]$Observed -gt [int]$Runtime['bounds']['maxDescendants']) {
+            $Runtime['breaches'].Add("bound-exceeded:descendants")
+            $Runtime['uncertain'] = $true
+        }
+        return $Runtime
+    }
+    $index = [array]::IndexOf([string[]]@('output', 'line', 'artifact'), [string]$Dimension)
+    $current = $Runtime['byteBudgets'][$index]
+    $updated = @($Runtime['byteBudgets'] | ForEach-Object { $_ })
+    $total = [int64]$current['observed'] + $Observed
+    $updated[$index] = @{
+        dimension = $Dimension
+        limit     = [int]$current['limit']
+        observed  = $total
+        breached  = $total -gt ([int64]$current['limit'])
+    }
+    $Runtime['byteBudgets'] = $updated
+    if ($updated[$index].breached) {
+        $Runtime['breaches'].Add("bound-exceeded:$Dimension")
+        $Runtime['uncertain'] = $true
+    }
+    return $Runtime
+}
+
+# Project the bounded runtime as bounded, redacted evidence. Semantic identity
+# (stages, limits, breaches) is deterministic; the observational clock reading
+# is kept in a separate field so a deterministic fingerprint never depends on
+# when the run happened.
+function ConvertTo-IntegrationHarnessBoundedRuntimeEvidence {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Runtime
+    )
+    return @{
+        runId         = [string]$Runtime['runId']
+        owner         = [string]$Runtime['owner']
+        stageBudgets  = @($Runtime['stageBudgets'] | ForEach-Object {
+            @{ stage = [string]$_['stage']; limit = [int]$_['limit']; elapsedMs = [int64]$_['elapsedMs']; breached = [bool]$_['breached'] }
+        })
+        byteBudgets   = @($Runtime['byteBudgets'] | ForEach-Object {
+            @{ dimension = [string]$_['dimension']; limit = [int]$_['limit']; observed = [int64]$_['observed']; breached = [bool]$_['breached'] }
+        })
+        resources     = [int]$Runtime['resources']
+        descendants   = [int]$Runtime['descendants']
+        breaches      = @($Runtime['breaches'] | Sort-Object -Culture '' -CaseSensitive -Unique)
+        uncertain     = [bool]$Runtime['uncertain']
+    }
+}
+
+# Read one field out of an owned-process record, accepting both the
+# `{identity = {...}}` wrapper and a bare identity record, and accepting either
+# a hashtable or a PSCustomObject shape. A missing or unreadable field yields
+# the supplied default, never an exception and never an assumed value.
+function Get-IntegrationHarnessOwnedRecordField {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        $Record,
+        [Parameter(Mandatory)]
+        [string]$Field,
+        [Parameter()]
+        [AllowNull()]
+        $Default = $null
+    )
+    $identity = $Record
+    if ($null -eq $identity) { return $Default }
+    if ($identity -is [hashtable] -and $identity.ContainsKey('identity')) {
+        $identity = $identity['identity']
+    }
+    if ($identity -is [hashtable]) {
+        if ($identity.ContainsKey($Field)) { return $identity[$Field] }
+        return $Default
+    }
+    if ($identity -is [psobject] -and $null -ne $identity.PSObject.Properties[$Field]) {
+        return $identity.PSObject.Properties[$Field].Value
+    }
+    return $Default
+}
+
+# Project the accepted owned-process records for a run: the run-minted records
+# only, plus the root pid when exactly one record declares itself the test root.
+# A record minted by another run is foreign evidence and is dropped here, so it
+# can never authorize a stop.
+function New-IntegrationHarnessOwnedProcessView {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$OwnedProcesses = @(),
+        [Parameter(Mandatory)]
+        [string]$RunId
+    )
+    if ($RunId -cnotmatch '^[0-9a-f]{32}$') {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: RunId must be 32 lowercase hex.')
+    }
+    $records = [System.Collections.Generic.List[object]]::new()
+    $rootPid = 0
+    foreach ($record in @($OwnedProcesses)) {
+        if ($null -eq $record) { continue }
+        $recordRunId = [string](Get-IntegrationHarnessOwnedRecordField -Record $record -Field 'runId')
+        if ($recordRunId -cne $RunId) { continue }
+        $pidValue = [int](Get-IntegrationHarnessOwnedRecordField -Record $record -Field 'processId' -Default 0)
+        if ($pidValue -le 0) { continue }
+        [void]$records.Add($record)
+        if ([string](Get-IntegrationHarnessOwnedRecordField -Record $record -Field 'role') -ceq 'test-root') {
+            $rootPid = $pidValue
+        }
+    }
+    return @{
+        rootPid = $rootPid
+        records = @($records)
     }
 }
 
@@ -2043,7 +2574,16 @@ function Invoke-HarnessRun {
         [string]$ResultArtifactPath,
         [Parameter()]
         [AllowNull()]
-        [hashtable]$Provider
+        [hashtable]$Provider,
+        [Parameter()]
+        [AllowNull()]
+        [scriptblock]$Clock,
+        [Parameter()]
+        [AllowNull()]
+        [object[]]$OwnedProcesses = @(),
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$ProcessController
     )
     $explicit = @()
     if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $null -ne $SelectedTestId) {
@@ -2209,6 +2749,19 @@ function Invoke-HarnessRun {
             }
         }
 
+        # Bounded runtime (#907 W8). The clock is injected by the caller. When
+        # no clock is injected the runtime falls back to reading UtcNow, which
+        # is a READ, never a sleep: every bounded elapsed value is a delta
+        # between two clock reads, and a caller that injects a clock drives
+        # every timeout path deterministically.
+        $runtimeClock = $null
+        if ($PSBoundParameters.ContainsKey('Clock') -and $null -ne $Clock) {
+            $runtimeClock = $Clock
+        }
+        if ($null -eq $runtimeClock) {
+            $runtimeClock = { [System.DateTimeOffset]::UtcNow }
+        }
+
         $run = New-IntegrationHarnessRun -Inventory @{ rows = @($rowTables) } `
             -SelectedIdentities $sorted -Binding $binding
         if (Test-IntegrationHarnessModelLoaded) {
@@ -2223,6 +2776,74 @@ function Invoke-HarnessRun {
         if ($groups.Count -gt [int]$bounds['maxResources']) {
             throw [System.ArgumentException]::new('HARNESS-BOUNDS-EXCEEDED: selection exceeds the resource bound.')
         }
+
+        # Open the bounded runtime at the first external-action stage. The
+        # resource dimension is charged from the exact group count and the
+        # descendant dimension from the accepted owned-process records.
+        $runtime = New-IntegrationHarnessBoundedRuntime -Bounds $bounds -Clock $runtimeClock `
+            -RunId $runId -Owner 'integration-harness'
+        $runtime = Add-IntegrationHarnessBoundedObservation -Runtime $runtime -Dimension 'resources' `
+            -Observed @($groups).Count
+        # Admission of the presented owned-process records (#907 W8). Every
+        # record is re-admitted through the fail-closed constructor before the
+        # run may use it: a record is accepted only when it carries a complete
+        # process/image/signer identity tuple that matches the live read, so a
+        # caller cannot gain ownership of a pid by supplying a bare number or a
+        # truthy predicate. A record that fails admission is refused here and
+        # the run stops with an explicit uncertain-cleanup state rather than
+        # proceeding on an unverified identity.
+        $admittedOwnedProcesses = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($ownedRecord in @($OwnedProcesses)) {
+            if ($null -eq $ownedRecord) { continue }
+            $identity = $null
+            $descendants = @()
+            if ($ownedRecord -is [hashtable]) {
+                $identity = $ownedRecord['identity']
+                if ($ownedRecord.ContainsKey('descendantPids')) {
+                    $descendants = @($ownedRecord['descendantPids'])
+                }
+            } elseif ($ownedRecord.PSObject.Properties['identity']) {
+                $identity = $ownedRecord.identity
+            }
+            if ($null -eq $identity) {
+                throw [System.ArgumentException]::new(
+                    'HARNESS-UNVERIFIED-OWNERSHIP: an owned-process record must carry an accepted identity tuple.')
+            }
+            $fieldMap = @{}
+            if ($identity -is [hashtable]) {
+                foreach ($key in @($identity.Keys)) { $fieldMap[[string]$key] = $identity[$key] }
+            } else {
+                foreach ($prop in $identity.PSObject.Properties) { $fieldMap[[string]$prop.Name] = $prop.Value }
+            }
+            $role = if ($fieldMap.ContainsKey('role')) { [string]$fieldMap['role'] } else { 'test-process' }
+            $ownerBinding = @{
+                runId      = [string]$runId
+                owner      = 'integration-harness'
+                generation = 1
+            }
+            if ($fieldMap.ContainsKey('owner') -and -not [string]::IsNullOrWhiteSpace([string]$fieldMap['owner'])) {
+                $ownerBinding['owner'] = [string]$fieldMap['owner']
+            }
+            if ($fieldMap.ContainsKey('generation')) {
+                $ownerBinding['generation'] = [int]$fieldMap['generation']
+            }
+            [void]$admittedOwnedProcesses.Add((New-IntegrationHarnessOwnedProcessRecord `
+                -ProcessId ([int]$fieldMap['processId']) `
+                -Binding $ownerBinding `
+                -Role $role `
+                -StartTimeUtc ([string]$fieldMap['startTimeUtc']) `
+                -ImagePath ([string]$fieldMap['imagePath']) `
+                -ImageHash ([string]$fieldMap['imageHash']) `
+                -SignerIdentity ([string]$fieldMap['signerIdentity']) `
+                -DescendantPids ([int[]]$descendants)))
+        }
+        $OwnedProcesses = @($admittedOwnedProcesses)
+        $ownedRecordCount = $admittedOwnedProcesses.Count
+        $runtime = Add-IntegrationHarnessBoundedObservation -Runtime $runtime -Dimension 'descendants' `
+            -Observed $ownedRecordCount
+        # Open the overall stage at admission so every later stage delta is
+        # charged against the overall bound as well as its own.
+        $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'overall' -Key $runId
 
         $rootBase = $CandidateRoot
         if ([string]::IsNullOrWhiteSpace($rootBase)) {
@@ -2328,6 +2949,8 @@ function Invoke-HarnessRun {
         }
         $run = Move-IntegrationHarnessState -Run $run -ToState 'Allocation'
 
+        # Bounded 'start' stage: the exact set of Start dispatches.
+        $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'start' -Key $runId
         $run = Move-IntegrationHarnessState -Run $run -ToState 'StartRequested'
         $startedKeys = @{}
         foreach ($allocation in $allocations) {
@@ -2349,7 +2972,11 @@ function Invoke-HarnessRun {
             }
         }
 
+        $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'start' -Key $runId
         $run = Move-IntegrationHarnessState -Run $run -ToState 'ObservedProcessReadinessUnknown'
+        # Bounded 'readiness' stage: the exact set of ObserveReadiness
+        # observations. A readiness breach is bounded evidence, not a pass.
+        $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'readiness' -Key $runId
         $readinessRecords = [System.Collections.Generic.List[hashtable]]::new()
         foreach ($allocation in $allocations) {
             $observedKey = [string]$allocation['resourceKey']
@@ -2387,13 +3014,20 @@ function Invoke-HarnessRun {
                 }
             }
         }
+        $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'readiness' -Key $runId
         $run = Move-IntegrationHarnessState -Run $run -ToState 'AcceptedSemanticReadiness'
 
         $run = Move-IntegrationHarnessState -Run $run -ToState 'GroupInitialization'
         $run = Move-IntegrationHarnessState -Run $run -ToState 'ExactTestExecution'
+        # Bounded 'group' stage and, per group, the 'test-wall'/'test-idle'
+        # window around the exact test executions inside it.
+        $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'group' -Key $runId
         $executionReceipts = [System.Collections.Generic.List[hashtable]]::new()
         $groupIndex = 0
         foreach ($group in $groups) {
+            $groupKey = [string]$group['groupKey']
+            $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'test-wall' -Key $groupKey
+            $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'test-idle' -Key $groupKey
             $members = @($group['rows'])
             if ($probeMode -cne 'none') {
                 foreach ($member in $members) {
@@ -2517,14 +3151,40 @@ function Invoke-HarnessRun {
                     [void]$executionReceipts.Add($testRecord)
                 }
             }
+            # Close the per-group test windows, then charge the exact bytes
+            # and lines the group's execution receipts occupied. Charging
+            # real observed sizes is what makes the output/line bounds
+            # load-bearing instead of declarative.
+            $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'test-idle' -Key $groupKey
+            $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'test-wall' -Key $groupKey
+            $groupBytes = 0
+            $groupLines = 0
+            foreach ($receipt in @($executionReceipts)) {
+                $rendered = ''
+                try {
+                    $rendered = ($receipt | ConvertTo-Json -Compress -Depth 8)
+                } catch {
+                    $rendered = [string]$receipt['testIdentity']
+                }
+                $groupBytes += [int64][System.Text.Encoding]::UTF8.GetByteCount([string]$rendered)
+                $groupLines += @([string]$rendered -split "`n").Count
+            }
+            $runtime = Add-IntegrationHarnessBoundedObservation -Runtime $runtime -Dimension 'output' `
+                -Observed $groupBytes
+            $runtime = Add-IntegrationHarnessBoundedObservation -Runtime $runtime -Dimension 'line' `
+                -Observed $groupLines
             $groupIndex++
         }
+        $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'group' -Key $runId
 
         $run = Move-IntegrationHarnessState -Run $run -ToState 'TerminalTestEvidence'
         $terminalRecords = @(New-IntegrationHarnessTerminalEvidence -ExecutionReceipts @($executionReceipts) `
             -SelectedIdentities $sorted)
 
         $run = Move-IntegrationHarnessState -Run $run -ToState 'EvidenceCollection'
+        # Bounded 'evidence' stage: collecting evidence is its own bounded
+        # window, separate from test execution.
+        $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'evidence' -Key $runId
         $run = Move-IntegrationHarnessState -Run $run -ToState 'CleanupRequested'
         $finalCleanupRecords = [System.Collections.Generic.List[hashtable]]::new()
         if ($providerPlans.Count -gt 0) {
@@ -2537,6 +3197,59 @@ function Invoke-HarnessRun {
                 $primaryFailure = [string]$cleanupResult['primaryFailure']
             }
         }
+
+        # Bounded owned-process stop (#907 W8). A timeout or cancellation stops
+        # the exact owned process tree using the recorded per-pid
+        # process/image/signer identity. There is no name, port, or bare-pid
+        # path: a foreign or unverified pid is never touched, and the resulting
+        # uncertain cleanup is an EXPLICIT blocking state, never a silent pass.
+        $ownedStopRecords = [System.Collections.Generic.List[hashtable]]::new()
+        if ($ownedRecordCount -gt 0) {
+            $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'graceful-stop' -Key $runId
+            $runtime = Start-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'forced-stop' -Key $runId
+        $ownedView = New-IntegrationHarnessOwnedProcessView -OwnedProcesses @($OwnedProcesses) -RunId $runId
+            $rootPidValue = [int]$ownedView['rootPid']
+            $stopState = 'ReconciliationRequired'
+            $stopFailures = @('owned-process-stop-unverified')
+            if ($null -eq $ProcessController) {
+                # No process controller: nothing may be signalled, so the stop
+                # outcome stays explicitly uncertain and blocks completion.
+                $stopFailures = @('owned-process-stop-unavailable')
+            } elseif ($rootPidValue -le 0) {
+                # Every owned record is a descendant of an unrecorded root:
+                # without a verified root identity the tree cannot be stopped.
+                $stopFailures = @('owned-process-root-unverified')
+            } else {
+                $stopResult = Stop-IntegrationHarnessOwnedProcessTree -RootPid $rootPidValue `
+                    -OwnerRunId $runId -ProcessController $ProcessController `
+                    -OwnedProcesses @($ownedView['records']) -Bounds $bounds
+                if ([bool]$stopResult['cleanupUnknown']) {
+                    $stopState = 'ReconciliationRequired'
+                    $stopFailures = @('owned-process-stop-uncertain') + @($stopResult['failures'])
+                } else {
+                    $stopState = 'CleanupVerified'
+                    $stopFailures = @()
+                }
+            }
+            $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'forced-stop' -Key $runId
+            $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'graceful-stop' -Key $runId
+            [void]$ownedStopRecords.Add(@{
+                resourceKey  = 'owned-process-tree'
+                state        = $stopState
+                alreadyClean = ($stopState -ceq 'CleanupVerified')
+                failures     = $stopFailures
+            })
+        }
+        $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'evidence' -Key $runId
+        $runtime = Stop-IntegrationHarnessBoundedStage -Runtime $runtime -Stage 'overall' -Key $runId
+
+        foreach ($stopRecord in @($ownedStopRecords)) {
+            [void]$finalCleanupRecords.Add($stopRecord)
+            if ([string]$stopRecord['state'] -ceq 'ReconciliationRequired' -and $null -eq $primaryFailure) {
+                $primaryFailure = ('owned-process-cleanup-uncertain:{0}' -f [string]$stopRecord['resourceKey'])
+            }
+        }
+
         if ($probeMode -ceq 'retained_handle') {
             [void]$finalCleanupRecords.Add(@{
                 resourceKey  = 'probe-retained-handle'
@@ -2565,6 +3278,24 @@ function Invoke-HarnessRun {
             failures     = @($rootRemoval['failures'])
         })
 
+        # Bounded runtime evidence (#907 W8). The bounded dimensions become part
+        # of the run evidence, and a breached bound is an EXPLICIT blocking
+        # state: it is appended as a reconciliation-required cleanup record so
+        # uncertain cleanup can never reach a clean completion.
+        $boundedRuntime = ConvertTo-IntegrationHarnessBoundedRuntimeEvidence -Runtime $runtime
+        if ([bool]$boundedRuntime['uncertain']) {
+            foreach ($breach in @($boundedRuntime['breaches'])) {
+                [void]$finalCleanupRecords.Add(@{
+                    resourceKey  = ('bounded-runtime:{0}' -f [string]$breach)
+                    state        = 'ReconciliationRequired'
+                    alreadyClean = $false
+                    failures     = @([string]$breach)
+                })
+            }
+            if ($null -eq $primaryFailure) {
+                $primaryFailure = 'bounded-runtime-uncertain:{0}' -f (@($boundedRuntime['breaches']) -join ',')
+            }
+        }
         $run = Move-IntegrationHarnessState -Run $run -ToState 'OwnedResourcesStopped'
         $needsReconciliation = $false
         foreach ($finalRecord in $finalCleanupRecords) {
@@ -2577,7 +3308,6 @@ function Invoke-HarnessRun {
         } else {
             $run = Move-IntegrationHarnessState -Run $run -ToState 'CleanupVerified'
         }
-
         $sourceIdentity = @{
             inventoryPath = $resolved
             selectionKind = 'ExplicitSelection'
@@ -2609,6 +3339,7 @@ function Invoke-HarnessRun {
         # carries no readiness channel, so the collected records attach
         # post-hoc before the completeness gate below.
         $evidence['readinessRecords'] = @($readinessRecords)
+        $evidence['boundedRuntime'] = $boundedRuntime
         [void](Test-IntegrationHarnessEvidenceComplete -Evidence $evidence)
         $completed = Complete-IntegrationHarnessRun -Run $run -Evidence $evidence `
             -CleanupRecords @($finalCleanupRecords)
@@ -2630,6 +3361,7 @@ function Invoke-HarnessRun {
             workspace_test_exit_code = $exitCode
             primaryFailure           = $primaryFailure
             reconciliationRequired   = [bool]$completed['reconciliationRequired']
+            boundedRuntimeUncertain  = [bool]$boundedRuntime['uncertain']
             coreVersion              = (Get-IntegrationHarnessCoreVersion)
             proofCeiling             = $Script:ProofCeiling
             evidence                 = $evidence
@@ -2678,6 +3410,16 @@ Export-ModuleMember -Function @(
     'Test-IntegrationHarnessClosedOperation',
     'Test-IntegrationHarnessNoReparsePoint',
     'Test-IntegrationHarnessOwnedProcess',
+    'New-IntegrationHarnessOwnedProcessRecord',
+    'New-IntegrationHarnessOwnedProcessView',
+    'Get-IntegrationHarnessOwnedRecordField',
+    'New-IntegrationHarnessBoundedRuntime',
+    'Get-IntegrationHarnessBoundedNow',
+    'Start-IntegrationHarnessBoundedStage',
+    'Stop-IntegrationHarnessBoundedStage',
+    'Add-IntegrationHarnessBoundedStageElapsed',
+    'Add-IntegrationHarnessBoundedObservation',
+    'ConvertTo-IntegrationHarnessBoundedRuntimeEvidence',
     'Test-IntegrationHarnessReadiness',
     'Test-IntegrationHarnessEvidenceComplete',
     'Resolve-IntegrationHarnessDeadline',
