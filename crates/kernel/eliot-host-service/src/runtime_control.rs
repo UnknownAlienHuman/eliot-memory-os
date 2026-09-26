@@ -800,7 +800,8 @@ fn validate_user_automation_response(
                 .map_err(|error| format!("user automation failure projection: {error}"))?;
             Ok(())
         }
-        UserAutomationHostExecutionResponse::WakeRead { .. } => Err(
+        UserAutomationHostExecutionResponse::WakeRead { .. }
+        | UserAutomationHostExecutionResponse::WakeTargetsRead { .. } => Err(
             "user automation readback travels over the execution transport, never runtime-control"
                 .to_owned(),
         ),

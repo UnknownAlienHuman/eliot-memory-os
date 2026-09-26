@@ -104,6 +104,12 @@ where
                     readback,
                 })
             }
+            UserAutomationHostExecutionOperation::ReadPendingWakeTargets { .. } => {
+                Err(UserAutomationRuntimeError::Unavailable(
+                    "wake target enumeration requires an authenticated Host owner session"
+                        .to_owned(),
+                ))
+            }
         }
     }
 
@@ -150,6 +156,17 @@ where
                     request_sha256,
                     state_fence,
                     readback,
+                })
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWakeTargets { request } => {
+                if request.state_fence != state_fence {
+                    return Err(UserAutomationRuntimeError::IdentityConflict);
+                }
+                let snapshot = self.wake.read_pending_wake_targets(request).await?;
+                Ok(UserAutomationHostExecutionResponse::WakeTargetsRead {
+                    request_sha256,
+                    state_fence,
+                    snapshot,
                 })
             }
         }

@@ -12,14 +12,13 @@ use std::collections::BTreeSet;
 use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    AutomationCapabilityProfile, AutomationExecutionReference, AutomationOccurrenceIdentity,
-    AutomationReconciliationCause, AutomationReconciliationReference, AutomationWorkClass,
-    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
-    UserAutomationExecutionMode, UserAutomationExecutionProjection,
-    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
-    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
-    UserAutomationPreflightReceipt, UserAutomationRevision, UserAutomationTrigger,
-    UserAutomationTriggerOrigin,
+    AutomationCapabilityProfile, AutomationExecutionReference, AutomationReconciliationCause,
+    AutomationReconciliationReference, AutomationWorkClass, ProviderFingerprintPolicy,
+    UserAutomationConfigurationState, UserAutomationError, UserAutomationExecutionMode,
+    UserAutomationExecutionProjection, UserAutomationFailureProjection, UserAutomationInvocation,
+    UserAutomationPreflightContext, UserAutomationPreflightDecision,
+    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
+    UserAutomationTrigger, UserAutomationTriggerOrigin,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
@@ -308,6 +307,42 @@ impl UserAutomationWakeCancellationTarget {
         }
         Ok(())
     }
+
+    /// Validates this pending target against the exact owner snapshot request.
+    pub fn validate_for_snapshot(
+        &self,
+        request: &UserAutomationWakeTargetSnapshotRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        for (value, field) in [
+            (&self.automation_id, "wake_target.target.automation_id"),
+            (
+                &self.automation_revision,
+                "wake_target.target.automation_revision",
+            ),
+            (&self.wake_id, "wake_target.target.wake_id"),
+            (&self.operation_id, "wake_target.target.operation_id"),
+            (&self.idempotency_key, "wake_target.target.idempotency_key"),
+        ] {
+            validate_text(value, field)?;
+        }
+        validate_digest(&self.record_checksum, "wake_target.target.record_checksum")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if self.automation_id != request.automation_id
+            || self.automation_revision != request.automation_revision
+            || self.state_fence != request.state_fence
+            || !request
+                .accepted_occurrence_ids
+                .iter()
+                .any(|occurrence_id| occurrence_id == &self.wake_id)
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake target snapshot binding",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Authenticated occurrence request constructed by the Kernel selector.
@@ -558,6 +593,11 @@ impl UserAutomationWakeCancellation {
                 "cancellation must be same-fence and unadmitted-only",
             ));
         }
+        if self.targets.len() > USER_AUTOMATION_WAKE_TARGET_SNAPSHOT_MAX_OCCURRENCES {
+            return Err(UserAutomationExecutionError::Contract(
+                UserAutomationError::LimitExceeded("cancellation.targets"),
+            ));
+        }
         let mut wake_ids = BTreeSet::new();
         for target in &self.targets {
             target.validate_for(self)?;
@@ -683,6 +723,337 @@ impl UserAutomationWakeReadback {
             ));
         }
         Ok(())
+    }
+}
+
+/// Maximum number of normalized occurrences accepted in one Host journal
+/// snapshot request. This matches the existing `UserAutomation` contract bound.
+pub const USER_AUTOMATION_WAKE_TARGET_SNAPSHOT_MAX_OCCURRENCES: usize = 256;
+
+/// Exact authenticated request to read every normalized wake target for one
+/// immutable `UserAutomation` revision from a single Host journal snapshot.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeTargetSnapshotRequest {
+    /// Live authenticated request metadata and State Fence.
+    pub context: RequestMetadata,
+    /// Principal authenticated by Kernel/Host.
+    pub authenticated_principal: String,
+    /// Original canonical operation identity whose retirement/edit/pause
+    /// requires this exact target read.
+    pub identity: OperationIdentity,
+    /// Immutable automation identity.
+    pub automation_id: String,
+    /// Immutable revision identity.
+    pub automation_revision: String,
+    /// Digest of the exact persisted immutable revision document.
+    pub revision_digest: String,
+    /// Fence under which the exact owner read is authorized.
+    pub state_fence: StateFence,
+    /// Complete accepted occurrence set, in the revision compiler's order.
+    pub accepted_occurrence_ids: Vec<String>,
+}
+
+impl UserAutomationWakeTargetSnapshotRequest {
+    /// Builds the complete bounded occurrence request from one immutable
+    /// revision and the already-authenticated parent operation.
+    pub fn for_revision(
+        context: &RequestMetadata,
+        authenticated_principal: &str,
+        identity: &OperationIdentity,
+        revision: &UserAutomationRevision,
+    ) -> Result<Self, UserAutomationExecutionError> {
+        revision
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        let accepted_occurrence_ids = revision
+            .compile_occurrence_identities()
+            .map_err(UserAutomationExecutionError::Contract)?
+            .into_iter()
+            .map(|occurrence| occurrence.occurrence_id)
+            .collect();
+        let request = Self {
+            context: context.clone(),
+            authenticated_principal: authenticated_principal.to_owned(),
+            identity: identity.clone(),
+            automation_id: revision.automation_id.clone(),
+            automation_revision: revision.revision.clone(),
+            revision_digest: revision
+                .digest()
+                .map_err(UserAutomationExecutionError::Contract)?,
+            state_fence: context.state_fence.clone(),
+            accepted_occurrence_ids,
+        };
+        request.validate_against_revision(revision)?;
+        Ok(request)
+    }
+
+    /// Validates the authenticated request envelope and bounded occurrence
+    /// denominator without treating an empty caller set as evidence.
+    pub fn validate(&self) -> Result<(), UserAutomationExecutionError> {
+        self.context
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        validate_text(
+            &self.authenticated_principal,
+            "wake_target.authenticated_principal",
+        )?;
+        validate_text(&self.automation_id, "wake_target.automation_id")?;
+        validate_text(&self.automation_revision, "wake_target.automation_revision")?;
+        validate_digest(&self.revision_digest, "wake_target.revision_digest")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if self.state_fence != self.context.state_fence {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake target snapshot fence",
+            ));
+        }
+        if self.accepted_occurrence_ids.is_empty() {
+            return Err(UserAutomationExecutionError::Contract(
+                UserAutomationError::Invalid("wake_target.accepted_occurrence_ids"),
+            ));
+        }
+        if self.accepted_occurrence_ids.len() > USER_AUTOMATION_WAKE_TARGET_SNAPSHOT_MAX_OCCURRENCES
+        {
+            return Err(UserAutomationExecutionError::Contract(
+                UserAutomationError::LimitExceeded("wake_target.accepted_occurrence_ids"),
+            ));
+        }
+        validate_unique_horizon_list(
+            &self.accepted_occurrence_ids,
+            "wake_target.accepted_occurrence_ids",
+        )?;
+        Ok(())
+    }
+
+    /// Cross-checks the caller denominator and authenticated principal against
+    /// the exact persisted immutable revision document.
+    pub fn validate_against_revision(
+        &self,
+        revision: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationExecutionError> {
+        self.validate()?;
+        revision
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        let digest = revision
+            .digest()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        let expected = revision
+            .compile_occurrence_identities()
+            .map_err(UserAutomationExecutionError::Contract)?
+            .into_iter()
+            .map(|occurrence| occurrence.occurrence_id)
+            .collect::<Vec<_>>();
+        if self.automation_id != revision.automation_id
+            || self.automation_revision != revision.revision
+            || self.revision_digest != digest
+            || self.authenticated_principal != revision.owner_principal
+            || self.accepted_occurrence_ids != expected
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake target snapshot is not bound to the persisted revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One occurrence's owner-read classification from the same Host journal
+/// snapshot sequence as every other entry in the aggregate result.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeTargetSnapshotEntry {
+    /// Exact accepted occurrence identity answered by the Host owner.
+    pub occurrence_id: String,
+    /// Explicit retained-pending, retained-nonpending, or proven-absent state.
+    pub disposition: UserAutomationWakeTargetSnapshotDisposition,
+}
+
+/// Closed classification of one accepted occurrence in an owner snapshot.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "disposition", deny_unknown_fields)]
+pub enum UserAutomationWakeTargetSnapshotDisposition {
+    /// Exact retained pending wake and cancellation identity from the Host.
+    Pending {
+        /// All cancellation fields copied from the exact retained journal row.
+        target: UserAutomationWakeCancellationTarget,
+    },
+    /// Exact retained wake that is already claimed, admitted, completed,
+    /// cancelled, expired, or failed and must remain historical/reconciling.
+    NonPending {
+        /// Exact retained wake identity.
+        wake_id: String,
+        /// Lifecycle state from the retained journal record.
+        state: WakeIntentState,
+        /// Exact Host journal operation identity.
+        operation_id: String,
+        /// Exact Host journal idempotency key.
+        idempotency_key: String,
+        /// Digest of the complete retained Host wake record.
+        record_checksum: String,
+        /// Original fence carried by this retained record.
+        state_fence: StateFence,
+    },
+    /// The Host journal snapshot proved no wake record is retained for this
+    /// exact accepted occurrence.
+    Absent,
+}
+
+/// Complete owner result for one bounded accepted occurrence set.
+///
+/// Every entry belongs to the one `snapshot_sequence`; `validate_for` rejects
+/// partial, duplicated, reordered, foreign, or internally conflicting results.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeTargetSnapshot {
+    /// Principal authenticated by Kernel/Host for the original operation.
+    pub authenticated_principal: String,
+    /// Original canonical operation identity echoed by the owner boundary.
+    pub identity: OperationIdentity,
+    /// Automation identity read from the exact immutable revision binding.
+    pub automation_id: String,
+    /// Immutable revision identity read from the exact revision binding.
+    pub automation_revision: String,
+    /// Digest of the exact persisted immutable revision document.
+    pub revision_digest: String,
+    /// State Fence used to authorize the aggregate snapshot read.
+    pub state_fence: StateFence,
+    /// One Host journal snapshot sequence covering every entry below.
+    pub snapshot_sequence: u64,
+    /// Exactly one ordered owner answer per accepted occurrence.
+    pub entries: Vec<UserAutomationWakeTargetSnapshotEntry>,
+}
+
+impl UserAutomationWakeTargetSnapshot {
+    /// Validates all binding fields and exact one-to-one ordered coverage.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationWakeTargetSnapshotRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request.validate()?;
+        validate_text(
+            &self.authenticated_principal,
+            "wake_target.snapshot.authenticated_principal",
+        )?;
+        validate_text(&self.automation_id, "wake_target.snapshot.automation_id")?;
+        validate_text(
+            &self.automation_revision,
+            "wake_target.snapshot.automation_revision",
+        )?;
+        validate_digest(
+            &self.revision_digest,
+            "wake_target.snapshot.revision_digest",
+        )?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if self.authenticated_principal != request.authenticated_principal
+            || self.identity != request.identity
+            || self.automation_id != request.automation_id
+            || self.automation_revision != request.automation_revision
+            || self.revision_digest != request.revision_digest
+            || self.state_fence != request.state_fence
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake target snapshot identity binding",
+            ));
+        }
+        if self.entries.len() != request.accepted_occurrence_ids.len() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "wake target snapshot coverage is incomplete",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for (entry, expected_occurrence_id) in
+            self.entries.iter().zip(&request.accepted_occurrence_ids)
+        {
+            validate_text(&entry.occurrence_id, "wake_target.snapshot.occurrence_id")?;
+            if !seen.insert(entry.occurrence_id.as_str()) {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "duplicate wake target snapshot occurrence",
+                ));
+            }
+            if &entry.occurrence_id != expected_occurrence_id {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "wake target snapshot occurrence coverage",
+                ));
+            }
+            match &entry.disposition {
+                UserAutomationWakeTargetSnapshotDisposition::Pending { target } => {
+                    target.validate_for_snapshot(request)?;
+                    if target.wake_id != entry.occurrence_id {
+                        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                            "pending wake target occurrence identity",
+                        ));
+                    }
+                }
+                UserAutomationWakeTargetSnapshotDisposition::NonPending {
+                    wake_id,
+                    state,
+                    operation_id,
+                    idempotency_key,
+                    record_checksum,
+                    state_fence,
+                } => {
+                    validate_text(wake_id, "wake_target.snapshot.wake_id")?;
+                    validate_text(operation_id, "wake_target.snapshot.operation_id")?;
+                    validate_text(idempotency_key, "wake_target.snapshot.idempotency_key")?;
+                    validate_digest(record_checksum, "wake_target.snapshot.record_checksum")?;
+                    state_fence.validate().map_err(|error| {
+                        UserAutomationExecutionError::Metadata(error.to_string())
+                    })?;
+                    if wake_id != &entry.occurrence_id || *state == WakeIntentState::Pending {
+                        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                            "nonpending wake snapshot state or identity",
+                        ));
+                    }
+                }
+                UserAutomationWakeTargetSnapshotDisposition::Absent => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the snapshot against the exact persisted revision before any
+    /// cancellation decision is derived from its entries.
+    pub fn validate_against_revision(
+        &self,
+        request: &UserAutomationWakeTargetSnapshotRequest,
+        revision: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request.validate_against_revision(revision)?;
+        self.validate_for(request)
+    }
+
+    /// Returns pending targets only after validating complete revision-bound
+    /// coverage; an unvalidated empty vector can never prove absence.
+    pub fn pending_targets(
+        &self,
+        request: &UserAutomationWakeTargetSnapshotRequest,
+        revision: &UserAutomationRevision,
+    ) -> Result<Vec<UserAutomationWakeCancellationTarget>, UserAutomationExecutionError> {
+        self.validate_against_revision(request, revision)?;
+        Ok(self
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.disposition {
+                UserAutomationWakeTargetSnapshotDisposition::Pending { target } => {
+                    Some(target.clone())
+                }
+                UserAutomationWakeTargetSnapshotDisposition::NonPending { .. }
+                | UserAutomationWakeTargetSnapshotDisposition::Absent => None,
+            })
+            .collect())
     }
 }
 
@@ -2021,6 +2392,17 @@ pub trait UserAutomationWakePort: Send + Sync {
         ))
     }
 
+    /// Reads a complete bounded occurrence set from exactly one owner journal
+    /// snapshot. Implementations without aggregate owner readback fail closed.
+    async fn read_pending_wake_targets(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeTargetSnapshotRequest>>,
+    ) -> Result<UserAutomationWakeTargetSnapshot, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "UserAutomation aggregate wake target snapshot is unavailable".to_owned(),
+        ))
+    }
+
     /// Reads one exact persisted Pending wake from the existing owner.
     /// Implementations without a readback path fail closed.
     async fn read_pending_wake(
@@ -2402,26 +2784,20 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
     }
 
     /// Retires one revision and cancels the exact owner-issued pending wake
-    /// targets observed for that revision.
+    /// targets observed for that immutable revision.
     ///
     /// This is the production retirement contour of the authenticated
     /// `Remove` operator route: `KernelStoreGateway::remove_handoff` reads the
     /// complete fail-closed owner execution view, enumerates the owner-issued
-    /// targets from the wake owner itself, and then calls this method so the
-    /// cancellation and the retirement share one owner view, one admitted
-    /// identity, and one runtime port.
-    ///
-    /// The targets are never empty on this path. An empty list is structurally
-    /// valid for the request but asks the wake owner to cancel nothing while
-    /// reporting that nothing needed cancelling, which is exactly the
-    /// absence-of-evidence-as-success failure this method must not perform; the
-    /// concrete Host owner refuses an empty list for the same reason. A
-    /// retirement whose targets are not owner-proven is reported as an
-    /// unresolved wake phase by the caller instead of reaching this method.
+    /// targets from one wake-owner snapshot, and then calls this method so the
+    /// cancellation and retirement share one owner view and one admitted
+    /// identity. A zero-pending result is accepted only when the supplied full
+    /// snapshot proves complete coverage of the persisted immutable revision.
     pub async fn remove_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
-        targets: Vec<UserAutomationWakeCancellationTarget>,
+        immutable_revision: &UserAutomationRevision,
+        snapshot: UserAutomationWakeTargetSnapshot,
         runtime: &R,
     ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
         let (automation_id, automation_revision) = match &request.intent.operation {
@@ -2435,6 +2811,20 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 ));
             }
         };
+        if immutable_revision.automation_id != automation_id
+            || immutable_revision.revision != automation_revision
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "remove immutable revision identity",
+            ));
+        }
+        let snapshot_request = UserAutomationWakeTargetSnapshotRequest::for_revision(
+            &request.context,
+            &request.authenticated_principal,
+            &request.identity,
+            immutable_revision,
+        )?;
+        snapshot.validate_against_revision(&snapshot_request, immutable_revision)?;
         // Wake cancellation acts on the same complete, fail-closed owner view as
         // execution admission (issue #2808). `remove_and_cancel_with_targets`
         // is one of the four consumer legs of the single `execution_projection`
@@ -2463,27 +2853,22 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 "remove returned a non-revision result",
             ));
         };
-        if revision.automation_id != automation_id
-            || revision.revision != automation_revision
-            || revision.configuration_state != UserAutomationConfigurationState::Retired
-        {
+        let mut expected_retirement = immutable_revision.clone();
+        expected_retirement.configuration_state = UserAutomationConfigurationState::Retired;
+        if revision != expected_retirement {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "remove revision",
             ));
         }
-        let cancellation = UserAutomationWakeCancellation {
-            context: request.context.clone(),
-            authenticated_principal: request.authenticated_principal,
-            identity: request.identity,
-            automation_id,
-            automation_revision,
-            state_fence: request.context.state_fence.clone(),
-            only_unadmitted: true,
-            targets,
-        };
-        cancellation.validate()?;
-        let cancelled_wake_ids = runtime.cancel_pending_wakes(cancellation).await?;
-        validate_unique_text_list(&cancelled_wake_ids, "cancelled_wake_ids")?;
+        let cancelled_wake_ids = cancel_proven_pending_wake_targets(
+            &request.context,
+            &request.authenticated_principal,
+            &request.identity,
+            immutable_revision,
+            &snapshot,
+            runtime,
+        )
+        .await?;
         Ok(UserAutomationRemovalResult {
             revision,
             receipt,
@@ -2491,6 +2876,66 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             replayed,
         })
     }
+}
+
+/// Cancels only the Pending targets from one complete, revision-bound owner
+/// snapshot. An empty return is proof of zero Pending targets and sends no
+/// cancellation; a nonempty return is accepted only when the runtime echoes
+/// exactly the requested wake ID set.
+pub async fn cancel_proven_pending_wake_targets<R: UserAutomationRuntimePort + ?Sized>(
+    context: &RequestMetadata,
+    principal: &str,
+    identity: &OperationIdentity,
+    immutable_revision: &UserAutomationRevision,
+    snapshot: &UserAutomationWakeTargetSnapshot,
+    runtime: &R,
+) -> Result<Vec<String>, UserAutomationExecutionError> {
+    let snapshot_request = UserAutomationWakeTargetSnapshotRequest::for_revision(
+        context,
+        principal,
+        identity,
+        immutable_revision,
+    )?;
+    let targets = snapshot.pending_targets(&snapshot_request, immutable_revision)?;
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cancellation = UserAutomationWakeCancellation {
+        context: context.clone(),
+        authenticated_principal: principal.to_owned(),
+        identity: identity.clone(),
+        automation_id: immutable_revision.automation_id.clone(),
+        automation_revision: immutable_revision.revision.clone(),
+        state_fence: context.state_fence.clone(),
+        only_unadmitted: true,
+        targets: targets.clone(),
+    };
+    cancellation.validate()?;
+    let cancelled_wake_ids = runtime.cancel_pending_wakes(cancellation).await?;
+    validate_exact_cancelled_wake_ids(&cancelled_wake_ids, &targets)?;
+    Ok(cancelled_wake_ids)
+}
+
+fn validate_exact_cancelled_wake_ids(
+    cancelled_wake_ids: &[String],
+    targets: &[UserAutomationWakeCancellationTarget],
+) -> Result<(), UserAutomationExecutionError> {
+    validate_unique_text_list(cancelled_wake_ids, "cancelled_wake_ids")?;
+    let expected = targets
+        .iter()
+        .map(|target| target.wake_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual = cancelled_wake_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() || actual.len() != cancelled_wake_ids.len() || actual != expected {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "cancelled wake identities do not match exact pending target set",
+        ));
+    }
+    Ok(())
 }
 
 /// Closed outcome of reading the exact owner-issued pending wake targets of one
@@ -2501,21 +2946,16 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 /// itself returned for one exact occurrence of the committed revision's own
 /// normalized occurrence denominator.
 ///
-/// `Proven` means the owner answered for every occurrence, so the set is
-/// complete. An empty `targets` under `Proven` is a PROVEN absence: the owner
-/// read its own state for every committed occurrence and definitively retains no
-/// unadmitted wake for any of them. It is not a partial list — a partial list is
-/// `Unproven`, because it is indistinguishable from a complete one at the
-/// cancellation owner (issue #2808, I5.16).
+/// `Proven` carries the complete answer for every occurrence from one journal
+/// snapshot. Callers derive cancellation targets only after validating that
+/// proof against the exact persisted immutable revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserAutomationWakeTargetEnumeration {
-    /// The wake owner answered for every committed occurrence: it returned an
-    /// exact retained pending record for the ones it still holds, and a
-    /// definitive "retains no such record" for the rest.
+    /// The wake owner answered for every committed occurrence from one snapshot
+    /// sequence, distinguishing Pending, nonpending, and absent records.
     Proven {
-        /// Exact owner-issued targets, one per retained pending wake. Empty only
-        /// when the owner proved there is no unadmitted wake to cancel.
-        targets: Vec<UserAutomationWakeCancellationTarget>,
+        /// Complete proof-bearing owner snapshot.
+        snapshot: Box<UserAutomationWakeTargetSnapshot>,
     },
     /// No complete exact target list is owner-proven, so no cancellation is
     /// issued and the wake handoff of this retirement stays unresolved.
@@ -2529,29 +2969,9 @@ pub enum UserAutomationWakeTargetEnumeration {
 ///
 /// The occurrence set asked about is the committed revision's own normalized
 /// occurrence denominator — the same bounded set the horizon publication owner
-/// compiles from that revision, not a page of execution history and not the
-/// Durable Job history this projection already references. Each member is read
-/// back from the existing wake owner, which resolves it against its own journal
-/// and returns the record it actually retains; only that returned record
-/// supplies the wake identity, journal operation identity, idempotency key,
-/// record checksum and State Fence a cancellation target carries.
-///
-/// Each read has exactly two honest answers, and the walk keeps them apart. A
-/// returned record is a target. A
-/// [`UserAutomationRuntimeError::NotRetained`] is the owner's complete negative
-/// answer for that occurrence — it read its own state and definitively retains
-/// no such record — so the walk continues with that occurrence accounted for and
-/// nothing to cancel there. Every other answer, including
-/// [`UserAutomationRuntimeError::Unavailable`] for an owner that could not be
-/// read, makes the whole walk `Unproven`: an unknown target set is never
-/// reported as a partial one, and "nothing needs cancelling" is never inferred
-/// from an owner that could not answer.
-///
-/// A committed revision that declares no occurrence identity is `Unproven` as
-/// well. The walk asked nobody, so it proved nothing; an empty denominator is
-/// not evidence of an empty wake set. A valid normalized schedule always
-/// declares at least one occurrence, so this is a fail-closed guard rather than
-/// a reachable product state.
+/// compiles from that revision, not a page of execution history. The owner must
+/// answer that complete set from one journal snapshot sequence. Independent
+/// per-occurrence reads cannot establish a complete cancellation set.
 pub async fn read_retirement_wake_targets<R>(
     revision: &UserAutomationRevision,
     context: &RequestMetadata,
@@ -2561,116 +2981,31 @@ pub async fn read_retirement_wake_targets<R>(
 where
     R: UserAutomationWakePort + ?Sized,
 {
-    let identities = revision
-        .compile_occurrence_identities()
-        .map_err(UserAutomationExecutionError::Contract)?;
-    // The read is authenticated as the revision's own owner principal: a
-    // published calendar wake belongs to the revision owner, and the wake read
-    // refuses a request whose principal does not name the invocation it
-    // selects. The carrier identity is the caller's already-admitted remove
-    // identity, so this read mints no canonical operation of its own.
-    let mut targets: Vec<UserAutomationWakeCancellationTarget> = Vec::new();
-    for occurrence in &identities {
-        let request = retirement_wake_read_request(revision, occurrence, context, identity)?;
-        let read_request = request.clone();
-        match UserAutomationWakePort::read_pending_wake(runtime, request).await {
-            Ok(readback) => {
-                readback.validate_for(&read_request)?;
-                targets.push(UserAutomationWakeCancellationTarget {
-                    automation_id: revision.automation_id.clone(),
-                    automation_revision: revision.revision.clone(),
-                    wake_id: readback.intent.wake_id.clone(),
-                    operation_id: readback.operation_id.clone(),
-                    idempotency_key: readback.idempotency_key.clone(),
-                    record_checksum: readback.record_checksum.clone(),
-                    state_fence: readback.intent.state_fence.clone(),
-                });
-            }
-            // The owner is the sole writer of its wake journal and has just read
-            // it, so retaining no record for this exact occurrence is a complete
-            // negative answer: there is no unadmitted wake here to cancel. The
-            // walk continues, and the set stays provable.
-            Err(UserAutomationRuntimeError::NotRetained(_)) => {}
-            Err(error) => {
-                return Ok(UserAutomationWakeTargetEnumeration::Unproven {
-                    reason: format!(
-                        "the wake owner did not answer for occurrence {} of retired revision {}: \
-                         {error}; the exact unadmitted set is unknown, so no cancellation is \
-                         issued from a partial denominator",
-                        occurrence.occurrence_id, revision.revision
-                    ),
-                });
-            }
-        }
-    }
-    if identities.is_empty() {
-        // The walk asked nobody, so it proved nothing. An empty denominator is
-        // not evidence of an empty wake set, and reporting it as a proven
-        // absence would be exactly the failure this function refuses elsewhere.
-        return Ok(UserAutomationWakeTargetEnumeration::Unproven {
+    let request = UserAutomationWakeTargetSnapshotRequest::for_revision(
+        context,
+        &revision.owner_principal,
+        identity,
+        revision,
+    )?;
+    request.validate_against_revision(revision)?;
+    match UserAutomationWakePort::read_pending_wake_targets(runtime, request.clone()).await {
+        Ok(snapshot) => match snapshot.validate_against_revision(&request, revision) {
+            Ok(()) => Ok(UserAutomationWakeTargetEnumeration::Proven {
+                snapshot: Box::new(snapshot),
+            }),
+            Err(error) => Ok(UserAutomationWakeTargetEnumeration::Unproven {
+                reason: format!(
+                    "the wake owner returned an incomplete or invalid snapshot: {error}"
+                ),
+            }),
+        },
+        Err(error) => Ok(UserAutomationWakeTargetEnumeration::Unproven {
             reason: format!(
-                "retired revision {} of {} declares no committed occurrence identity, so no wake \
-                 owner was asked and the unadmitted wake set is unknown rather than proven empty",
+                "the wake owner could not provide one complete snapshot for revision {} of {}: {error}",
                 revision.revision, revision.automation_id
             ),
-        });
+        }),
     }
-    // Every committed occurrence was answered: a retained record became a target
-    // and a definitive `NotRetained` was accounted for. An empty set here is a
-    // proven absence, not a missing answer.
-    Ok(UserAutomationWakeTargetEnumeration::Proven { targets })
-}
-
-/// Builds the exact wake-owner read request for one committed occurrence of a
-/// retired revision.
-///
-/// Every field is owner-issued. The automation, immutable revision and calendar
-/// trigger come from the committed revision's own occurrence compiler, and the
-/// principal, `WorkScope`, workdir and mode come from that same committed
-/// revision document. Nothing here consults an ambient identity, a clock, a
-/// reason string, or a row index, and the request names no wake: the wake
-/// identity, journal operation identity, idempotency key, record checksum and
-/// State Fence of a cancellation target are all returned by the wake owner.
-fn retirement_wake_read_request(
-    revision: &UserAutomationRevision,
-    occurrence: &AutomationOccurrenceIdentity,
-    context: &RequestMetadata,
-    identity: &OperationIdentity,
-) -> Result<UserAutomationWakeReadRequest, UserAutomationExecutionError> {
-    if occurrence.automation_id != revision.automation_id
-        || occurrence.revision != revision.revision
-        || occurrence.occurrence_id
-            != UserAutomationInvocation::occurrence_identity_for(
-                &revision.automation_id,
-                &revision.revision,
-                &occurrence.trigger,
-            )
-            .map_err(UserAutomationExecutionError::Contract)?
-    {
-        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
-            "retirement wake occurrence is not a member of the committed revision",
-        ));
-    }
-    Ok(UserAutomationWakeReadRequest {
-        context: context.clone(),
-        authenticated_principal: revision.owner_principal.clone(),
-        identity: identity.clone(),
-        invocation: UserAutomationInvocation {
-            automation_id: revision.automation_id.clone(),
-            automation_revision: revision.revision.clone(),
-            trigger: occurrence.trigger.clone(),
-            mode: revision.mode,
-            principal_ref: revision.owner_principal.clone(),
-            work_scope_ref: revision.work_scope.scope_id.clone(),
-            workdir_ref: revision.workdir_ref.clone(),
-            trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
-            // A published calendar occurrence of this revision is not an
-            // admitted child of another automation, so its own lineage depth is
-            // the root one.
-            child_depth: 0,
-            provenance: None,
-        },
-    })
 }
 
 /// Refuses a runtime boundary whose owner view is not a complete, fail-closed

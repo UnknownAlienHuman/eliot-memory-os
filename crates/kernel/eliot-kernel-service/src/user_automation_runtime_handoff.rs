@@ -32,7 +32,8 @@ use super::user_automation_execution::{
     UserAutomationDurableJobPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
     UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
     UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, UserAutomationWakeTargetSnapshot,
+    UserAutomationWakeTargetSnapshotRequest,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionTransport,
@@ -626,6 +627,13 @@ impl<T> UserAutomationWakePort for UserAutomationOperatorRuntime<'_, T>
 where
     T: UserAutomationHostExecutionTransport,
 {
+    async fn read_pending_wake_targets(
+        &self,
+        request: impl Into<Box<UserAutomationWakeTargetSnapshotRequest>>,
+    ) -> Result<UserAutomationWakeTargetSnapshot, UserAutomationRuntimeError> {
+        UserAutomationWakePort::read_pending_wake_targets(self.client, request).await
+    }
+
     async fn read_pending_wake(
         &self,
         request: impl Into<Box<UserAutomationWakeReadRequest>>,

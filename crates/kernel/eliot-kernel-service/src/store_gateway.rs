@@ -48,7 +48,9 @@ use crate::store_write_reservation::{
     writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
+    UserAutomationWakeTargetEnumeration, UserAutomationWakeTargetSnapshot,
+    UserAutomationWakeTargetSnapshotRequest, cancel_proven_pending_wake_targets,
+    read_retirement_wake_targets,
 };
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
@@ -1375,23 +1377,294 @@ impl KernelStoreGateway {
             UserAutomationOperation::Remove { .. } => {
                 self.remove_handoff(sealed, configuration, runtime).await
             }
-            UserAutomationOperation::Pause {
-                automation_id,
-                automation_revision,
-            } => retirement_handoff(
-                configuration,
-                Some(automation_id),
-                automation_revision,
-                UserAutomationConfigurationState::Paused,
-            ),
-            UserAutomationOperation::Edit {
-                previous_revision, ..
-            } => Ok((
-                superseded_wake_phase(&previous_revision.revision)?,
-                not_applicable_execution(),
-            )),
+            UserAutomationOperation::Pause { .. } => {
+                self.pause_handoff(sealed, configuration, runtime).await
+            }
+            UserAutomationOperation::Edit { .. } => {
+                self.edit_handoff(sealed, configuration, runtime).await
+            }
             _ => Ok((not_applicable_wake(), not_applicable_execution())),
         }
+    }
+
+    /// Cancels the exact pending Host wakes after a committed Pause. The
+    /// immutable Store document, rather than the state-flipped result, binds
+    /// the owner snapshot to the accepted occurrence set.
+    async fn pause_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let UserAutomationOperation::Pause {
+            automation_id,
+            automation_revision,
+        } = &sealed.intent.operation
+        else {
+            return Err("the pause handoff requires pause".to_owned());
+        };
+        let execution = not_applicable_execution();
+        let projected = committed_retirement_revision(
+            configuration,
+            Some(automation_id),
+            automation_revision,
+            UserAutomationConfigurationState::Paused,
+        )?;
+        let revision = match self
+            .read_exact_immutable_automation_revision(
+                &sealed.context.state_fence,
+                automation_id,
+                automation_revision,
+                &sealed.authenticated_principal,
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Ok(unresolved_retirement_phases(
+                    format!(
+                        "Pause committed, but the immutable affected revision could not be read: {error}"
+                    ),
+                    execution,
+                ));
+            }
+        };
+        let mut expected = revision.clone();
+        expected.configuration_state = UserAutomationConfigurationState::Paused;
+        if projected != expected {
+            return Ok(unresolved_retirement_phases(
+                "Pause committed, but its result differs from the persisted immutable revision"
+                    .to_owned(),
+                execution,
+            ));
+        }
+        Ok((
+            self.cancel_affected_revision_wakes(sealed, &revision, runtime)
+                .await,
+            execution,
+        ))
+    }
+
+    /// A superseding Edit owns cancellation of its persisted predecessor, not
+    /// of the newly committed revision whose horizon is a separate phase.
+    async fn edit_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let UserAutomationOperation::Edit {
+            previous_revision,
+            revision,
+        } = &sealed.intent.operation
+        else {
+            return Err("the edit handoff requires edit".to_owned());
+        };
+        let execution = not_applicable_execution();
+        if committed_revision(configuration) != Some(revision) {
+            return Ok(unresolved_retirement_phases(
+                "Edit committed, but its result differs from the requested successor revision"
+                    .to_owned(),
+                execution,
+            ));
+        }
+        let predecessor = match self
+            .read_exact_immutable_automation_revision(
+                &sealed.context.state_fence,
+                &previous_revision.automation_id,
+                &previous_revision.revision,
+                &sealed.authenticated_principal,
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Ok(unresolved_retirement_phases(
+                    format!(
+                        "Edit committed, but its immutable predecessor could not be read: {error}"
+                    ),
+                    execution,
+                ));
+            }
+        };
+        if predecessor != *previous_revision || revision.validate_supersedes(&predecessor).is_err()
+        {
+            return Ok(unresolved_retirement_phases(
+                "Edit committed, but its submitted predecessor differs from the persisted immutable revision".to_owned(),
+                execution,
+            ));
+        }
+        Ok((
+            self.cancel_affected_revision_wakes(sealed, &predecessor, runtime)
+                .await,
+            execution,
+        ))
+    }
+
+    /// A complete single owner snapshot is the only basis for a zero-target
+    /// answer or an exact cancellation request. A lost or stale owner answer
+    /// leaves the committed transition explicitly unresolved.
+    async fn cancel_affected_revision_wakes<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        runtime: Option<&R>,
+    ) -> UserAutomationWakePhase
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let Some(runtime) = runtime else {
+            return UserAutomationWakePhase::Unavailable {
+                reason: unproven_wake_channel_reason(),
+            };
+        };
+        let snapshot = match read_retirement_wake_targets(
+            revision,
+            &sealed.context,
+            &sealed.identity,
+            runtime,
+        )
+        .await
+        {
+            Ok(UserAutomationWakeTargetEnumeration::Proven { snapshot }) => snapshot,
+            Ok(UserAutomationWakeTargetEnumeration::Unproven { reason }) => {
+                return UserAutomationWakePhase::UnknownOutcome { reason };
+            }
+            Err(error) => {
+                return UserAutomationWakePhase::UnknownOutcome {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        let request = match UserAutomationWakeTargetSnapshotRequest::for_revision(
+            &sealed.context,
+            &sealed.authenticated_principal,
+            &sealed.identity,
+            revision,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return UserAutomationWakePhase::UnknownOutcome {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        let targets = match snapshot.pending_targets(&request, revision) {
+            Ok(targets) => targets,
+            Err(error) => {
+                return UserAutomationWakePhase::UnknownOutcome {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if targets.is_empty() {
+            return UserAutomationWakePhase::NotApplicable {
+                reason: format!(
+                    "the Host owner answered every accepted occurrence of revision {} from one journal snapshot and retained no Pending wake",
+                    revision.revision,
+                ),
+            };
+        }
+        match cancel_proven_pending_wake_targets(
+            &sealed.context,
+            &sealed.authenticated_principal,
+            &sealed.identity,
+            revision,
+            &snapshot,
+            runtime,
+        )
+        .await
+        {
+            Ok(cancelled_wake_ids) => UserAutomationWakePhase::Cancelled { cancelled_wake_ids },
+            Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                reason: format!(
+                    "revision {} committed, but exact pending wake cancellation is unresolved: {error}",
+                    revision.revision,
+                ),
+            },
+        }
+    }
+
+    /// Cross-checks a committed Pause or Remove projection against the exact
+    /// persisted immutable document whose occurrence set will be queried.
+    async fn read_committed_immutable_retirement_revision(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        automation_id: &str,
+        automation_revision: &str,
+        expected_state: UserAutomationConfigurationState,
+    ) -> Result<UserAutomationRevision, String> {
+        let projected = committed_retirement_revision(
+            configuration,
+            Some(automation_id),
+            automation_revision,
+            expected_state,
+        )?;
+        let revision = self
+            .read_exact_immutable_automation_revision(
+                &sealed.context.state_fence,
+                automation_id,
+                automation_revision,
+                &sealed.authenticated_principal,
+            )
+            .await?;
+        let mut expected = revision.clone();
+        expected.configuration_state = expected_state;
+        if projected != expected {
+            return Err(
+                "committed retirement result differs from the persisted immutable revision"
+                    .to_owned(),
+            );
+        }
+        Ok(revision)
+    }
+
+    /// Returns only a complete, revision-bound answer from one Host snapshot.
+    /// The boolean means proven zero Pending; it is never a caller-supplied
+    /// empty vector or a partial page.
+    async fn read_proven_wake_snapshot<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        runtime: &R,
+    ) -> Result<(UserAutomationWakeTargetSnapshot, usize, bool), String>
+    where
+        R: UserAutomationWakePort + ?Sized,
+    {
+        let snapshot = match read_retirement_wake_targets(
+            revision,
+            &sealed.context,
+            &sealed.identity,
+            runtime,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        {
+            UserAutomationWakeTargetEnumeration::Proven { snapshot } => snapshot,
+            UserAutomationWakeTargetEnumeration::Unproven { reason } => return Err(reason),
+        };
+        let request = UserAutomationWakeTargetSnapshotRequest::for_revision(
+            &sealed.context,
+            &sealed.authenticated_principal,
+            &sealed.identity,
+            revision,
+        )
+        .map_err(|error| error.to_string())?;
+        let pending = snapshot
+            .pending_targets(&request, revision)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            *snapshot,
+            request.accepted_occurrence_ids.len(),
+            pending.is_empty(),
+        ))
     }
 
     /// Completes the wake handoff of a committed `Remove` against the wake owner.
@@ -1443,19 +1716,27 @@ impl KernelStoreGateway {
         else {
             return Err("the remove handoff requires remove".to_owned());
         };
-        let revision = committed_retirement_revision(
-            configuration,
-            Some(automation_id),
-            automation_revision,
-            UserAutomationConfigurationState::Retired,
-        )?;
-        // The revision is immutable, so this deterministic recompile of its own
-        // normalized denominator is the exact set the wake walk below asks about.
-        let committed_occurrences = revision
-            .compile_occurrence_identities()
-            .map_err(|error| error.to_string())?
-            .len();
         let execution = not_applicable_execution();
+        let revision = match self
+            .read_committed_immutable_retirement_revision(
+                sealed,
+                configuration,
+                automation_id,
+                automation_revision,
+                UserAutomationConfigurationState::Retired,
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Ok(unresolved_retirement_phases(
+                    format!(
+                        "Remove committed, but its immutable revision proof is unresolved: {error}"
+                    ),
+                    execution,
+                ));
+            }
+        };
         let Some(runtime) = runtime else {
             return Ok((
                 UserAutomationWakePhase::Unavailable {
@@ -1464,42 +1745,13 @@ impl KernelStoreGateway {
                 execution,
             ));
         };
-        let targets = match read_retirement_wake_targets(
-            &revision,
-            &sealed.context,
-            &sealed.identity,
-            runtime,
-        )
-        .await
+        let (snapshot, committed_occurrences, proven_empty) = match self
+            .read_proven_wake_snapshot(sealed, &revision, runtime)
+            .await
         {
-            Ok(UserAutomationWakeTargetEnumeration::Proven { targets }) => targets,
-            Ok(UserAutomationWakeTargetEnumeration::Unproven { reason }) => {
-                return Ok(unresolved_retirement_phases(reason, execution));
-            }
-            // A committed revision whose own occurrence denominator does not
-            // compile is a canonical identity defect, not an absent owner.
-            Err(error) => return Err(error.to_string()),
+            Ok(answer) => answer,
+            Err(reason) => return Ok(unresolved_retirement_phases(reason, execution)),
         };
-        if targets.is_empty() {
-            // The owner read its own journal for every committed occurrence and
-            // definitively retains no unadmitted wake for any of them. That is a
-            // complete negative answer, so the retirement is reported as resolved
-            // and no cancellation is requested: the concrete Host owner refuses
-            // an empty target list by design, and asking it to cancel nothing
-            // would be a request whose only possible answer is a refusal.
-            return Ok((
-                UserAutomationWakePhase::NotApplicable {
-                    reason: format!(
-                        "the wake owner read its own journal for all {committed_occurrences} \
-                         committed occurrence identities of retired revision {} and definitively \
-                         retains no unadmitted pending wake for any of them, so there is nothing \
-                         to cancel",
-                        revision.revision
-                    ),
-                },
-                execution,
-            ));
-        }
         // The retirement transition is replayed under the same admitted identity
         // this route already committed, so the owner view, the retirement and
         // the cancellation observe one canonical operation rather than two.
@@ -1507,7 +1759,12 @@ impl KernelStoreGateway {
             UserAutomationService::new(&CanonicalUserAutomationStore::new(
                 BorrowedCanonicalStoreClient::new(self.store.as_ref()),
             ))
-            .remove_and_cancel_with_targets(sealed.clone(), targets, runtime),
+            .remove_and_cancel_with_targets(
+                sealed.clone(),
+                &revision,
+                snapshot,
+                runtime,
+            ),
         )
         .await
         {
@@ -1528,9 +1785,23 @@ impl KernelStoreGateway {
                 ));
             }
         };
-        // Reached only with a NON-EMPTY proven target set. An owner that
-        // cancelled none of the targets it was handed contradicted itself, so
-        // that is an unresolved handoff rather than a proven absence.
+        if proven_empty {
+            // The method above still checked the complete owner execution view
+            // and replayed the exact retirement identity. Its validated owner
+            // snapshot proves zero Pending wakes, so no Host cancellation was
+            // requested and the wake phase is resolved.
+            return Ok((
+                UserAutomationWakePhase::NotApplicable {
+                    reason: format!(
+                        "Host snapshot covered all {committed_occurrences} occurrences of retired revision {} and proved zero Pending wakes",
+                        revision.revision
+                    ),
+                },
+                execution,
+            ));
+        }
+        // Reached only with a nonempty proven target set. An owner that
+        // cancelled none of those targets contradicted itself.
         if removal.cancelled_wake_ids.is_empty() {
             return Ok(unresolved_retirement_phases(
                 format!(
@@ -1547,6 +1818,33 @@ impl KernelStoreGateway {
             },
             execution,
         ))
+    }
+
+    /// Reads the exact immutable Store document that supplies a cancellation
+    /// denominator. A committed state-change result is a mechanical projection
+    /// with a different configuration state, not the immutable document whose
+    /// digest and occurrence set were accepted before the transition.
+    async fn read_exact_immutable_automation_revision(
+        &self,
+        fence: &StateFence,
+        automation_id: &str,
+        revision_id: &str,
+        authenticated_principal: &str,
+    ) -> Result<UserAutomationRevision, String> {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        let revision = store
+            .read_revision_document(fence, automation_id, revision_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if revision.owner_principal != authenticated_principal {
+            return Err(
+                "stored immutable revision principal differs from the authenticated owner"
+                    .to_owned(),
+            );
+        }
+        Ok(revision)
     }
 
     /// Compiles and publishes the bounded recurring wake horizon this committed
@@ -2733,38 +3031,6 @@ fn unreached_horizon_phase(
     }
 }
 
-/// Completes the retirement handoff for `Pause`.
-///
-/// A `Pause` stops the revision admitting new occurrences but this contour owns
-/// no proof of which already published wakes its owner still retains, so the
-/// phase stays unresolved rather than asserting a cancellation it cannot
-/// enumerate.
-fn retirement_handoff(
-    configuration: &UserAutomationConfigurationPhase,
-    automation_id: Option<&str>,
-    automation_revision: &str,
-    expected_state: UserAutomationConfigurationState,
-) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String> {
-    let revision = committed_retirement_revision(
-        configuration,
-        automation_id,
-        automation_revision,
-        expected_state,
-    )?;
-    let committed_occurrences = revision
-        .compile_occurrence_identities()
-        .map_err(|error| error.to_string())?
-        .len();
-    Ok((
-        unproven_wake_target_phase(
-            &revision.automation_id,
-            &revision.revision,
-            committed_occurrences,
-        ),
-        not_applicable_execution(),
-    ))
-}
-
 /// Returns the committed revision a retirement committed, after checking it
 /// against the exact request this identity asked for.
 ///
@@ -2808,53 +3074,10 @@ fn not_applicable_execution() -> UserAutomationExecutionPhase {
     }
 }
 
-/// Wake phase for a superseding `Edit`, whose affected revision is the retired
-/// predecessor rather than the committed document.
-///
-/// The superseded document is not the answer of this identity, so its committed
-/// occurrence denominator cannot be counted here. The phase is therefore
-/// unresolved by construction instead of asserting that no wake exists.
-fn superseded_wake_phase(previous_revision: &str) -> Result<UserAutomationWakePhase, String> {
-    if previous_revision.trim().is_empty() {
-        return Err("superseding edit did not name the affected revision".to_owned());
-    }
-    Ok(UserAutomationWakePhase::UnknownOutcome {
-        reason: format!(
-            "superseded revision {previous_revision} is not the committed document of this identity, \
-             so its committed occurrence denominator is unknown; its not-yet-admitted wakes cannot \
-             be cancelled from a bounded subset and stay unknown until the owner enumerates them"
-        ),
-    })
-}
-
-/// Wake phase for a retirement whose exact owner-issued target list could not be
-/// proven complete.
-///
-/// The canonical revision exposes its committed calendar occurrence identities,
-/// but the authenticated wake owner publishes an exact per-occurrence readback
-/// only for a Human `RunNow` occurrence. A retirement therefore cannot present
-/// a non-empty, complete, exact cancellation target list here, and an empty list
-/// is not proof that no unadmitted wake exists: the phase stays unknown.
-fn unproven_wake_target_phase(
-    automation_id: &str,
-    automation_revision: &str,
-    committed_occurrences: usize,
-) -> UserAutomationWakePhase {
-    UserAutomationWakePhase::UnknownOutcome {
-        reason: format!(
-            "retired revision {automation_revision} of {automation_id} exposes {committed_occurrences} \
-             committed calendar occurrence identities, but the authenticated wake owner publishes an \
-             exact per-occurrence target only for a Human run-now occurrence, so no complete exact \
-             unadmitted target list is owner-proven; no cancellation is issued and the already \
-             admitted jobs, immutable history and unresolved obligations are preserved"
-        ),
-    }
-}
-
 /// Wake phase reason used when no authenticated runtime channel was composed.
 fn unproven_wake_channel_reason() -> String {
     "no authenticated UserAutomation runtime channel was composed for this transition, so the \
-     committed occurrence was not handed to the wake owner"
+     committed transition's wake handoff was not sent to the wake owner"
         .to_owned()
 }
 

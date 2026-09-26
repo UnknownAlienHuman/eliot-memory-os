@@ -2956,6 +2956,14 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
+            UserAutomationHostExecutionOperation::ReadPendingWakeTargets { .. } => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(
+                        "pending-wake target snapshots are internal to the committed operator handoff"
+                            .to_owned(),
+                    ),
+                ));
+            }
         };
         if request_fence != &session.module_generation.state_fence {
             return Err(TransportError::SessionFenced);
@@ -2987,6 +2995,9 @@ impl KernelComposition {
                     self.revalidate_user_automation_wake_read(session, request)
                         .await,
                 )
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWakeTargets { .. } => {
+                return Err(TransportError::SessionFenced);
             }
         };
         if let Some(answer) = owner_check {
@@ -3040,6 +3051,9 @@ impl KernelComposition {
                     self.revalidate_user_automation_wake_read(session, request)
                         .await,
                 )
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWakeTargets { .. } => {
+                return Err(TransportError::SessionFenced);
             }
         };
         if let Some(answer) = owner_check {
@@ -3095,6 +3109,9 @@ impl KernelComposition {
                     })),
                     Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
                 }
+            }
+            UserAutomationHostExecutionOperation::ReadPendingWakeTargets { .. } => {
+                Err(TransportError::SessionFenced)
             }
         }
     }

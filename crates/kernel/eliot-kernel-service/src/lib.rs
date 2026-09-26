@@ -218,6 +218,8 @@ pub use user_automation_execution::{
     UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
     UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication, UserAutomationWakePort,
     UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeTargetSnapshot, UserAutomationWakeTargetSnapshotDisposition,
+    UserAutomationWakeTargetSnapshotEntry, UserAutomationWakeTargetSnapshotRequest,
     advance_wake_horizon, compile_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
     resolve_due_wake,
 };

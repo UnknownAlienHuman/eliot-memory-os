@@ -5,7 +5,10 @@
 //! lifecycle state to `Cancelled`; all timing, capability, safety, budget,
 //! evidence, Host fence, and existing operation fields remain journal-owned.
 //!
-//! The read path keeps a proven absence distinct from an unreadable owner.  A
+//! The single-occurrence read path keeps a proven absence distinct from an
+//! unreadable owner. The bounded target read emits one entry per accepted
+//! normalized occurrence from one journal snapshot, preserving absent and
+//! non-Pending identities alongside exact Pending cancellation targets. A
 //! successful journal snapshot that holds no such wake is
 //! [`UserAutomationRuntimeError::NotRetained`], a complete negative answer; a
 //! journal that could not be read is
@@ -13,15 +16,20 @@
 //! are different facts and a caller that must decide whether a retirement has
 //! anything left to cancel cannot be given the same value for both.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use eliot_contracts::sha256_hex;
 use eliot_host_state::{
-    AppendDisposition, BackendError, HostStateJournalService, HostStateRecord, IdempotencyIdentity,
-    JournalBackend, JournalError, WakeCancellationBatchEntry, WakeCancellationBatchRecord,
-    record_checksum,
+    AppendDisposition, BackendError, HostState, HostStateJournalService, HostStateRecord,
+    IdempotencyIdentity, JournalBackend, JournalError, WakeCancellationBatchEntry,
+    WakeCancellationBatchRecord, record_checksum,
 };
 use eliot_kernel_service::{
-    UserAutomationRuntimeError, UserAutomationWakeCancellation, UserAutomationWakePort,
-    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationRuntimeError, UserAutomationWakeCancellation,
+    UserAutomationWakeCancellationTarget, UserAutomationWakePort, UserAutomationWakeReadRequest,
+    UserAutomationWakeReadback, UserAutomationWakeTargetSnapshot,
+    UserAutomationWakeTargetSnapshotDisposition, UserAutomationWakeTargetSnapshotEntry,
+    UserAutomationWakeTargetSnapshotRequest,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::WakeIntentState;
@@ -83,6 +91,21 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
                 "exact UserAutomation wake is not retained by the Host journal".to_owned(),
             )
         })
+    }
+
+    async fn read_pending_wake_targets(
+        &self,
+        request: impl Into<Box<UserAutomationWakeTargetSnapshotRequest>>,
+    ) -> Result<UserAutomationWakeTargetSnapshot, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeTargetSnapshotRequest> = request.into();
+        request
+            .validate()
+            .map_err(|error| rejected(format!("Wake target snapshot: {error}")))?;
+
+        // One owner snapshot supplies both the complete denominator result and
+        // its revision. This operation is observational and never appends.
+        let snapshot = self.journal.snapshot().map_err(map_journal_error)?;
+        wake_target_snapshot(&request, &snapshot)
     }
 
     async fn cancel_pending_wakes(
@@ -195,6 +218,95 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
         }
         Ok(cancelled)
     }
+}
+
+fn wake_target_snapshot(
+    request: &UserAutomationWakeTargetSnapshotRequest,
+    snapshot: &HostState,
+) -> Result<UserAutomationWakeTargetSnapshot, UserAutomationRuntimeError> {
+    let requested_ids: BTreeSet<&str> = request
+        .accepted_occurrence_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if requested_ids.len() != request.accepted_occurrence_ids.len() {
+        return Err(rejected(
+            "wake target snapshot contains duplicate occurrence ids",
+        ));
+    }
+
+    let mut retained = BTreeMap::new();
+    for wake in &snapshot.wakes {
+        let wake_id = wake.wake_id.as_str();
+        if requested_ids.contains(wake_id) && retained.insert(wake_id, wake).is_some() {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(request.accepted_occurrence_ids.len());
+    for occurrence_id in &request.accepted_occurrence_ids {
+        let disposition = match retained.get(occurrence_id.as_str()) {
+            None => UserAutomationWakeTargetSnapshotDisposition::Absent,
+            Some(wake) => {
+                if wake.wake_id.as_str() != wake.intent.wake_id.as_str()
+                    || wake.intent.state_fence != request.state_fence
+                {
+                    return Err(UserAutomationRuntimeError::IdentityConflict);
+                }
+                let checksum = record_checksum(&HostStateRecord::Wake((**wake).clone()))
+                    .map_err(map_journal_error)?;
+                let operation_id = wake.operation.operation_id.as_str().to_owned();
+                let idempotency_key = wake.operation.idempotency_key.as_str().to_owned();
+                match wake.intent.state {
+                    WakeIntentState::Pending => {
+                        UserAutomationWakeTargetSnapshotDisposition::Pending {
+                            target: UserAutomationWakeCancellationTarget {
+                                automation_id: request.automation_id.clone(),
+                                automation_revision: request.automation_revision.clone(),
+                                wake_id: wake.wake_id.as_str().to_owned(),
+                                operation_id,
+                                idempotency_key,
+                                record_checksum: checksum,
+                                state_fence: wake.intent.state_fence.clone(),
+                            },
+                        }
+                    }
+                    state => UserAutomationWakeTargetSnapshotDisposition::NonPending {
+                        wake_id: wake.wake_id.as_str().to_owned(),
+                        state,
+                        operation_id,
+                        idempotency_key,
+                        record_checksum: checksum,
+                        state_fence: wake.intent.state_fence.clone(),
+                    },
+                }
+            }
+        };
+        entries.push(UserAutomationWakeTargetSnapshotEntry {
+            occurrence_id: occurrence_id.clone(),
+            disposition,
+        });
+    }
+
+    // Principal, revision and normalized occurrence membership are validated
+    // by the Kernel against its canonical revision before this authenticated
+    // owner request is sent. HostState's WakeRecord has no typed principal or
+    // revision field; Host binds each result to the request and only reports a
+    // retained record when the exact journal wake identity and fence agree.
+    let result = UserAutomationWakeTargetSnapshot {
+        authenticated_principal: request.authenticated_principal.clone(),
+        automation_id: request.automation_id.clone(),
+        automation_revision: request.automation_revision.clone(),
+        identity: request.identity.clone(),
+        revision_digest: request.revision_digest.clone(),
+        state_fence: request.state_fence.clone(),
+        snapshot_sequence: snapshot.sequence,
+        entries,
+    };
+    result
+        .validate_for(request)
+        .map_err(|error| rejected(format!("Wake target snapshot response: {error}")))?;
+    Ok(result)
 }
 
 fn cancellation_batch_identity(

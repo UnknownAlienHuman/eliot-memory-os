@@ -1237,7 +1237,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
 
     /// Reads one immutable revision document and validates it through
     /// the Kernel-owned domain.
-    async fn read_revision_document(
+    pub(crate) async fn read_revision_document(
         &self,
         fence: &StateFence,
         automation_id: &str,
