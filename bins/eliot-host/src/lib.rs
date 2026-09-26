@@ -76,33 +76,33 @@ pub mod windows_event_log;
 // inner phase observations share correlation by stage order only.
 pub use host_diagnostics::note_event_log_sink_status;
 
-fn host_lifecycle_observe_requested(detail: &str) {
+fn host_lifecycle_observe_requested(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::Startup,
-        host_lifecycle_frozen_event(detail),
+        host_lifecycle_frozen_event(boundary),
     );
 }
 
-fn host_lifecycle_observe_scm(detail: &str) {
+fn host_lifecycle_observe_scm(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ScmDispatch,
-        host_lifecycle_frozen_event(detail),
+        host_lifecycle_frozen_event(boundary),
     );
 }
 
-fn host_lifecycle_observe_drain(detail: &str) {
+fn host_lifecycle_observe_drain(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ShutdownDrain,
-        host_lifecycle_frozen_event(detail),
+        host_lifecycle_frozen_event(boundary),
     );
 }
 
-fn host_lifecycle_observe_terminal(code: &str) {
+fn host_lifecycle_observe_terminal(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
-    host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(code));
+    host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));
 }
 
 /// Single-terminal guard for one public fallible operation.
@@ -112,14 +112,17 @@ fn host_lifecycle_observe_terminal(code: &str) {
 /// terminal record with the operation's frozen code. Emitting here never
 /// changes the `Result`: the guard only observes the already-produced
 /// outcome. No dedup cache, no lock, no second evaluation.
-struct HostTerminalGuard<'a> {
-    code: &'a str,
+struct HostTerminalGuard {
+    boundary: &'static HostLifecycleBoundary,
     armed: bool,
 }
 
-impl<'a> HostTerminalGuard<'a> {
-    fn armed(code: &'a str) -> Self {
-        Self { code, armed: true }
+impl HostTerminalGuard {
+    fn armed(boundary: &'static HostLifecycleBoundary) -> Self {
+        Self {
+            boundary,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -127,10 +130,10 @@ impl<'a> HostTerminalGuard<'a> {
     }
 }
 
-impl Drop for HostTerminalGuard<'_> {
+impl Drop for HostTerminalGuard {
     fn drop(&mut self) {
         if self.armed {
-            host_lifecycle_observe_terminal(self.code);
+            host_lifecycle_observe_terminal(self.boundary);
         }
     }
 }
@@ -162,12 +165,13 @@ struct HostLifecycleBoundary {
 
 /// Frozen finite table of lib.rs lifecycle/error boundaries (#891 W1).
 ///
-/// This is the single source of emitted boundary vocabulary: every
-/// production observation flows through [`host_lifecycle_frozen_event`],
-/// which returns the frozen `event` spelling from the matching row, so a
-/// boundary cannot drift its spelling without leaving this table. Unknown
-/// spellings pass through unchanged (diagnostics never break production)
-/// and trip a debug assertion. Rows whose `event` starts with
+/// This is the single source of emitted boundary vocabulary by construction:
+/// every production observation selects its static row through a `BOUNDARY_*`
+/// identifier, and [`host_lifecycle_frozen_event`] returns that row's frozen
+/// `event` spelling. There is no string lookup and no fallback, so an
+/// unlisted spelling cannot reach production: [`boundary_by_event`] fails the
+/// build, and the uniqueness assertions below reject duplicate rows.
+/// Rows whose `event` starts with
 /// `propagated:` own no emission; they record exactly where the emission
 /// lives instead of duplicating it, per the child-coordination rule.
 ///
@@ -333,7 +337,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::credential_control",
         owner_state: "owner lease credential capability",
         event: "host.credential-control requested",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -341,7 +345,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::credential_control",
         owner_state: "owner lease credential capability",
         event: concat!("host-credential-", "control-failed"),
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-14",
     },
     HostLifecycleBoundary {
@@ -349,7 +353,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::credential_control",
         owner_state: "control handle, identities only",
         event: "host.credential-control admitted receipt",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -477,7 +481,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::runtime_control",
         owner_state: "owner lease activation capability",
         event: "host.runtime-control requested",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -485,7 +489,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::runtime_control",
         owner_state: "owner lease activation capability",
         event: "host-runtime-control-failed",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-14",
     },
     HostLifecycleBoundary {
@@ -493,7 +497,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::runtime_control",
         owner_state: "control handle/queues",
         event: "host.runtime-control admitted receipt",
-        caller: "main::fail_host_service",
+        caller: "main::service_main",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -501,7 +505,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::process_user_automation_requests",
         owner_state: "kernel owner/execution queue",
         event: "host.user-automation owner requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "main::process_user_automation_request/process_user_automation_owner_requests",
         test: "891/case-4",
     },
     HostLifecycleBoundary {
@@ -821,7 +825,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::has_durable_branch_fence",
         owner_state: "durable fence probe",
         event: "host.branch-fence requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "main::service_main/HostIdleDrainSupervisor::evaluate",
         test: "891/case-13",
     },
     HostLifecycleBoundary {
@@ -845,7 +849,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "activation/drain records",
         event: "host.stop requested",
-        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -853,7 +857,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "activation/drain records/owner lease",
         event: concat!("host-", "stop-failed"),
-        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -861,7 +865,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "running activation/SCM stop control",
         event: "host.stop cancellation requested",
-        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/case-12",
     },
     HostLifecycleBoundary {
@@ -893,7 +897,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "StoppedClean/clean marker",
         event: "host.stop stopped-clean drained",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -901,7 +905,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::stop",
         owner_state: "released lease/stopped contour",
         event: "host.stop stopped",
-        caller: "HostComposition::stop",
+        caller: "main::dispatch/finish_console_shutdown/service_main",
         test: "891/T-A",
     },
     HostLifecycleBoundary {
@@ -952,25 +956,463 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         caller: "none (cutover_generation unwired)",
         test: "891/case-11",
     },
+    HostLifecycleBoundary {
+        name: "activation-admission.requested",
+        source_item: "HostComposition::activation_admission",
+        owner_state: "activation record/generations",
+        event: "host.activation-admission requested",
+        caller: "main::report_activation_diagnostics",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "observable-use.terminal",
+        source_item: "HostComposition::note_observable_use",
+        owner_state: "activation record/drain generation",
+        event: "host-observable-use-failed",
+        caller: "main::HostIdleDrainSupervisor::note_observable_use",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "observable-use.coalesced",
+        source_item: "HostComposition::note_observable_use",
+        owner_state: "drain generation/coalesced trigger",
+        event: "host.observable-use coalesced",
+        caller: "main::HostIdleDrainSupervisor::note_observable_use",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "observable-use.drain-cancelled",
+        source_item: "HostComposition::note_observable_use",
+        owner_state: "drain record/evidence refs",
+        event: "host.observable-use drain-cancelled",
+        caller: "main::HostIdleDrainSupervisor::note_observable_use",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "observable-use.next-generation-queued",
+        source_item: "HostComposition::note_observable_use",
+        owner_state: "drain commit/queued intent",
+        event: "host.observable-use next-generation-queued",
+        caller: "main::HostIdleDrainSupervisor::note_observable_use",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "observable-use.replay-already-consumed",
+        source_item: "HostComposition::note_observable_use",
+        owner_state: "drain record/evidence refs",
+        event: "host.observable-use replay-already-consumed",
+        caller: "main::HostIdleDrainSupervisor::note_observable_use",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "drain-resume.terminal",
+        source_item: "HostComposition::resume_cancelled_drain",
+        owner_state: "activation record/drain disposition",
+        event: "host-drain-resume-failed",
+        caller: "main::HostIdleDrainSupervisor::observe_readiness",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "drain-resume.active-restored",
+        source_item: "HostComposition::resume_cancelled_drain",
+        owner_state: "drain disposition/readiness proof",
+        event: "host.drain-resume active-restored",
+        caller: "main::HostIdleDrainSupervisor::observe_readiness",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain.terminal",
+        source_item: "HostComposition::begin_idle_drain",
+        owner_state: "census code/activation record",
+        event: "host-idle-drain-begin-failed",
+        caller: "main::HostIdleDrainSupervisor::evaluate",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain.drain-failed-blocked",
+        source_item: "HostComposition::begin_idle_drain",
+        owner_state: "failed drain attempt/census",
+        event: "host.idle-drain drain-failed blocked",
+        caller: "main::HostIdleDrainSupervisor::evaluate",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain.not-active",
+        source_item: "HostComposition::begin_idle_drain",
+        owner_state: "activation state/census",
+        event: "host.idle-drain not-active",
+        caller: "main::HostIdleDrainSupervisor::evaluate",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain.pre-commit-open",
+        source_item: "HostComposition::begin_idle_drain",
+        owner_state: "drain record/pre-commit",
+        event: "host.idle-drain pre-commit open",
+        caller: "main::HostIdleDrainSupervisor::evaluate",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain-rearm.not-active",
+        source_item: "HostComposition::rearm_cancelled_drain",
+        owner_state: "activation state/predecessor",
+        event: "host.idle-drain rearm-not-active",
+        caller: "HostComposition::begin_idle_drain",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain-rearm.census-not-idle",
+        source_item: "HostComposition::rearm_cancelled_drain",
+        owner_state: "lease census/predecessor",
+        event: "host.idle-drain rearm-census-not-idle",
+        caller: "HostComposition::begin_idle_drain",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "idle-drain-rearm.requested",
+        source_item: "HostComposition::rearm_cancelled_drain",
+        owner_state: "predecessor drain/census",
+        event: "host.idle-drain rearm-requested",
+        caller: "HostComposition::begin_idle_drain",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "lease-census.requested",
+        source_item: "HostComposition::idle_lease_census",
+        owner_state: "lease refs/supervision obligation",
+        event: "host.lease-census requested",
+        caller: "main::HostIdleDrainSupervisor::evaluate/HostComposition::rearm_cancelled_drain",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "wake-revalidation.observed",
+        source_item: "HostComposition::revalidate_pending_wakes",
+        owner_state: "pending wakes/trigger evidence",
+        event: "host.wake-revalidation observed",
+        caller: "HostComposition::note_observable_use",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "wake-satisfy.terminal",
+        source_item: "HostComposition::satisfy_claimed_wakes",
+        owner_state: "claimed wakes/activation record",
+        event: "host-wake-satisfy-failed",
+        caller: "main::HostIdleDrainSupervisor::observe_readiness",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "wake-satisfied.observed",
+        source_item: "HostComposition::satisfy_claimed_wakes",
+        owner_state: "satisfied wakes/count",
+        event: "host.wake-satisfied observed",
+        caller: "main::HostIdleDrainSupervisor::observe_readiness",
+        test: "891/case-13",
+    },
 ];
 
-/// Returns the frozen table spelling for an emitted detail or code.
+/// Compile-time `&str` equality over raw bytes, so boundary lookup
+/// can run in `const` context.
+const fn boundary_str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Returns the frozen row for an emitted `event` spelling, or fails
+/// the build when the spelling is not listed: unknown vocabulary
+/// can never silently enter production observations.
+const fn boundary_by_event(event: &str) -> &'static HostLifecycleBoundary {
+    let mut i = 0;
+    while i < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+        if boundary_str_eq(HOST_LIFECYCLE_BOUNDARY_TABLE[i].event, event) {
+            return &HOST_LIFECYCLE_BOUNDARY_TABLE[i];
+        }
+        i += 1;
+    }
+    panic!("unlisted host lifecycle boundary event");
+}
+
+/// Compile-time proof that no two rows share an `event` spelling:
+/// every observation selects exactly one boundary.
+const fn boundary_table_events_unique() -> bool {
+    let mut i = 0;
+    while i < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+        let mut j = i + 1;
+        while j < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+            if boundary_str_eq(
+                HOST_LIFECYCLE_BOUNDARY_TABLE[i].event,
+                HOST_LIFECYCLE_BOUNDARY_TABLE[j].event,
+            ) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Compile-time proof that no two rows share a `name`: every
+/// `operation.phase` identity is bound once.
+const fn boundary_table_names_unique() -> bool {
+    let mut i = 0;
+    while i < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+        let mut j = i + 1;
+        while j < HOST_LIFECYCLE_BOUNDARY_TABLE.len() {
+            if boundary_str_eq(
+                HOST_LIFECYCLE_BOUNDARY_TABLE[i].name,
+                HOST_LIFECYCLE_BOUNDARY_TABLE[j].name,
+            ) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    boundary_table_events_unique(),
+    "duplicate event spelling in HOST_LIFECYCLE_BOUNDARY_TABLE",
+);
+const _: () = assert!(
+    boundary_table_names_unique(),
+    "duplicate name in HOST_LIFECYCLE_BOUNDARY_TABLE",
+);
+
+/// Static boundary identifiers: every observation call selects one of
+/// these instead of passing a free string, so the emitted `event`,
+/// `name`, `source_item`, `owner_state`, `caller` and `test` always
+/// come from the exact frozen row.
+const BOUNDARY_JOBS_REQUESTED: &HostLifecycleBoundary = boundary_by_event("host.jobs requested");
+const BOUNDARY_JOBS_ADMITTED: &HostLifecycleBoundary = boundary_by_event("host.jobs admitted");
+const BOUNDARY_JOBS_FENCED_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.jobs-fenced requested");
+const BOUNDARY_JOBS_FENCED_ADMITTED: &HostLifecycleBoundary =
+    boundary_by_event("host.jobs-fenced admitted");
+const BOUNDARY_BRANCH_RECONCILE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.branch-reconcile requested");
+const BOUNDARY_KERNEL_TERMINATE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-terminate requested");
+const BOUNDARY_KERNEL_TERMINATE_STOPPED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-terminate stopped");
+const BOUNDARY_STORE_TERMINATE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.store-terminate requested");
+const BOUNDARY_STORE_TERMINATE_STOPPED: &HostLifecycleBoundary =
+    boundary_by_event("host.store-terminate stopped");
+const BOUNDARY_CUTOVER_ROLLBACK_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.cutover-rollback requested");
+const BOUNDARY_CUTOVER_ROLLBACK_RESTORED: &HostLifecycleBoundary =
+    boundary_by_event("host.cutover-rollback restored");
+const BOUNDARY_CUTOVER_ROLLBACK_REACTIVATED: &HostLifecycleBoundary =
+    boundary_by_event("host.cutover-rollback reactivated");
+const BOUNDARY_OPEN_REQUESTED: &HostLifecycleBoundary = boundary_by_event("host.open requested");
+const BOUNDARY_OPEN_TERMINAL: &HostLifecycleBoundary = boundary_by_event("host-open-failed");
+const BOUNDARY_OPEN_FENCED_STORE_RECOVERY: &HostLifecycleBoundary =
+    boundary_by_event("host.open fenced store-recovery");
+const BOUNDARY_OPEN_FENCED_BRIDGE_STAGE: &HostLifecycleBoundary =
+    boundary_by_event("host.open fenced bridge-stage");
+const BOUNDARY_OPEN_DEGRADED_PREPARED_WITHOUT_RECEIPT: &HostLifecycleBoundary =
+    boundary_by_event("host.open degraded prepared-without-receipt");
+const BOUNDARY_OPEN_FENCED_STORE_RECOVERY_ACTIVE: &HostLifecycleBoundary =
+    boundary_by_event("host.open fenced store-recovery-active");
+const BOUNDARY_OPEN_ADMITTED: &HostLifecycleBoundary = boundary_by_event("host.open admitted");
+const BOUNDARY_CREDENTIAL_CONTROL_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.credential-control requested");
+const BOUNDARY_CREDENTIAL_CONTROL_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-credential-control-failed");
+const BOUNDARY_CREDENTIAL_CONTROL_ADMITTED_RECEIPT: &HostLifecycleBoundary =
+    boundary_by_event("host.credential-control admitted receipt");
+const BOUNDARY_PHASE_B_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b requested");
+const BOUNDARY_PHASE_B_UNKNOWN_STORE_RECOVERY_FENCE: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b unknown store-recovery-fence");
+const BOUNDARY_PHASE_B_TERMINAL: &HostLifecycleBoundary = boundary_by_event("host-phase-b-unknown");
+const BOUNDARY_PHASE_B_PREPARED_RECEIPT: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b prepared receipt");
+const BOUNDARY_PHASE_B_UNKNOWN: &HostLifecycleBoundary = boundary_by_event("host.phase-b unknown");
+const BOUNDARY_PHASE_B_FINALIZE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-finalize requested");
+const BOUNDARY_PHASE_B_FINALIZE_READY_COMPLETION: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-finalize ready completion");
+const BOUNDARY_PHASE_B_FINALIZE_UNKNOWN: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-finalize unknown");
+const BOUNDARY_PHASE_B_FINALIZE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-phase-b-finalize-unknown");
+const BOUNDARY_PHASE_B_RECONCILE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-reconcile requested");
+const BOUNDARY_PHASE_B_RECONCILE_UNKNOWN_STORE_RECOVERY_FENCE: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-reconcile unknown store-recovery-fence");
+const BOUNDARY_PHASE_B_RECONCILE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-phase-b-reconcile-unknown");
+const BOUNDARY_PHASE_B_RECONCILE_PREPARED_READBACK_REPLAY: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-reconcile prepared readback replay");
+const BOUNDARY_PHASE_B_RECONCILE_RECEIPT_READBACK_REPLAY: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-reconcile receipt readback replay");
+const BOUNDARY_PHASE_B_RECONCILE_UNKNOWN: &HostLifecycleBoundary =
+    boundary_by_event("host.phase-b-reconcile unknown");
+const BOUNDARY_RUNTIME_CONTROL_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.runtime-control requested");
+const BOUNDARY_RUNTIME_CONTROL_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-runtime-control-failed");
+const BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT: &HostLifecycleBoundary =
+    boundary_by_event("host.runtime-control admitted receipt");
+const BOUNDARY_USER_AUTOMATION_OWNER_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.user-automation owner requested");
+const BOUNDARY_KERNEL_RESTART_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart requested");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart reconcile-delegated readback");
+const BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart unknown owner-fenced");
+const BOUNDARY_KERNEL_RESTART_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-kernel-restart-unknown");
+const BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart receipt completion");
+const BOUNDARY_KERNEL_RESTART_UNKNOWN: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart unknown");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile requested");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile unknown owner-fenced");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile unknown validation");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile receipt readback replay");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile unknown conflict");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile unknown pending");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile unknown snapshot");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-reconcile unknown");
+const BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-kernel-restart-reconcile-unknown");
+const BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-execute requested");
+const BOUNDARY_KERNEL_RESTART_EXECUTE_RECEIPT: &HostLifecycleBoundary =
+    boundary_by_event("host.kernel-restart-execute receipt");
+const BOUNDARY_START_REQUESTED: &HostLifecycleBoundary = boundary_by_event("host.start requested");
+const BOUNDARY_START_TERMINAL: &HostLifecycleBoundary = boundary_by_event("host-start-failed");
+const BOUNDARY_START_STARTED: &HostLifecycleBoundary = boundary_by_event("host.start started");
+const BOUNDARY_RESUME_PENDING_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.resume-pending requested");
+const BOUNDARY_RESUME_PENDING_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-resume-pending-failed");
+const BOUNDARY_RESUME_PENDING_ADMITTED: &HostLifecycleBoundary =
+    boundary_by_event("host.resume-pending admitted");
+const BOUNDARY_RESUME_PENDING_RECEIPT_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.resume-pending-receipt requested");
+const BOUNDARY_START_MANIFEST_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.start-manifest requested");
+const BOUNDARY_START_MANIFEST_STARTED: &HostLifecycleBoundary =
+    boundary_by_event("host.start-manifest started");
+const BOUNDARY_LIVENESS_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.liveness requested");
+const BOUNDARY_LIVENESS_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-liveness-failed");
+const BOUNDARY_LIVENESS_OBSERVED: &HostLifecycleBoundary =
+    boundary_by_event("host.liveness observed");
+const BOUNDARY_RECONCILE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.reconcile requested");
+const BOUNDARY_RECONCILE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-reconcile-failed");
+const BOUNDARY_RECONCILE_ADMITTED: &HostLifecycleBoundary =
+    boundary_by_event("host.reconcile admitted");
+const BOUNDARY_READINESS_DEGRADED: &HostLifecycleBoundary =
+    boundary_by_event("host.readiness degraded");
+const BOUNDARY_READINESS_REQUESTED_PROOF: &HostLifecycleBoundary =
+    boundary_by_event("host.readiness requested proof");
+const BOUNDARY_READINESS_READY_PROOF: &HostLifecycleBoundary =
+    boundary_by_event("host.readiness ready proof");
+const BOUNDARY_READINESS_CONTOUR_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.readiness-contour requested");
+const BOUNDARY_READINESS_PROOF_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.readiness-proof requested");
+const BOUNDARY_READINESS_PROOF_READY: &HostLifecycleBoundary =
+    boundary_by_event("host.readiness-proof ready");
+const BOUNDARY_DEGRADED_OBSERVATION_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.degraded-observation requested");
+const BOUNDARY_BRANCH_FENCE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.branch-fence requested");
+const BOUNDARY_CLEANUP_ACTIVE_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.cleanup-active requested");
+const BOUNDARY_CLEANUP_LAUNCHED_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.cleanup-launched requested");
+const BOUNDARY_STOP_REQUESTED: &HostLifecycleBoundary = boundary_by_event("host.stop requested");
+const BOUNDARY_STOP_TERMINAL: &HostLifecycleBoundary = boundary_by_event("host-stop-failed");
+const BOUNDARY_STOP_CANCELLATION_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.stop cancellation requested");
+const BOUNDARY_DRAIN_REQUESTED: &HostLifecycleBoundary = boundary_by_event("host.drain requested");
+const BOUNDARY_DRAIN_DRAINING: &HostLifecycleBoundary = boundary_by_event("host.drain draining");
+const BOUNDARY_DRAIN_COMMIT: &HostLifecycleBoundary = boundary_by_event("host.drain commit");
+const BOUNDARY_STOP_STOPPED_CLEAN_DRAINED: &HostLifecycleBoundary =
+    boundary_by_event("host.stop stopped-clean drained");
+const BOUNDARY_STOP_STOPPED: &HostLifecycleBoundary = boundary_by_event("host.stop stopped");
+const BOUNDARY_LIFECYCLE_CONTEXT_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.lifecycle-context requested");
+const BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-lifecycle-context-failed");
+const BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED: &HostLifecycleBoundary =
+    boundary_by_event("host.lifecycle-context admitted");
+const BOUNDARY_ACTIVATION_ADMISSION_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.activation-admission requested");
+const BOUNDARY_OBSERVABLE_USE_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-observable-use-failed");
+const BOUNDARY_OBSERVABLE_USE_COALESCED: &HostLifecycleBoundary =
+    boundary_by_event("host.observable-use coalesced");
+const BOUNDARY_OBSERVABLE_USE_DRAIN_CANCELLED: &HostLifecycleBoundary =
+    boundary_by_event("host.observable-use drain-cancelled");
+const BOUNDARY_OBSERVABLE_USE_NEXT_GENERATION_QUEUED: &HostLifecycleBoundary =
+    boundary_by_event("host.observable-use next-generation-queued");
+const BOUNDARY_OBSERVABLE_USE_REPLAY_ALREADY_CONSUMED: &HostLifecycleBoundary =
+    boundary_by_event("host.observable-use replay-already-consumed");
+const BOUNDARY_DRAIN_RESUME_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-drain-resume-failed");
+const BOUNDARY_DRAIN_RESUME_ACTIVE_RESTORED: &HostLifecycleBoundary =
+    boundary_by_event("host.drain-resume active-restored");
+const BOUNDARY_IDLE_DRAIN_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-idle-drain-begin-failed");
+const BOUNDARY_IDLE_DRAIN_DRAIN_FAILED_BLOCKED: &HostLifecycleBoundary =
+    boundary_by_event("host.idle-drain drain-failed blocked");
+const BOUNDARY_IDLE_DRAIN_NOT_ACTIVE: &HostLifecycleBoundary =
+    boundary_by_event("host.idle-drain not-active");
+const BOUNDARY_IDLE_DRAIN_PRE_COMMIT_OPEN: &HostLifecycleBoundary =
+    boundary_by_event("host.idle-drain pre-commit open");
+const BOUNDARY_IDLE_DRAIN_REARM_NOT_ACTIVE: &HostLifecycleBoundary =
+    boundary_by_event("host.idle-drain rearm-not-active");
+const BOUNDARY_IDLE_DRAIN_REARM_CENSUS_NOT_IDLE: &HostLifecycleBoundary =
+    boundary_by_event("host.idle-drain rearm-census-not-idle");
+const BOUNDARY_IDLE_DRAIN_REARM_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.idle-drain rearm-requested");
+const BOUNDARY_LEASE_CENSUS_REQUESTED: &HostLifecycleBoundary =
+    boundary_by_event("host.lease-census requested");
+const BOUNDARY_WAKE_REVALIDATION_OBSERVED: &HostLifecycleBoundary =
+    boundary_by_event("host.wake-revalidation observed");
+const BOUNDARY_WAKE_SATISFY_TERMINAL: &HostLifecycleBoundary =
+    boundary_by_event("host-wake-satisfy-failed");
+const BOUNDARY_WAKE_SATISFIED_OBSERVED: &HostLifecycleBoundary =
+    boundary_by_event("host.wake-satisfied observed");
+/// Returns the frozen `event` spelling for the selected boundary row.
 ///
-/// Every production observation flows through this lookup, so
-/// [`HOST_LIFECYCLE_BOUNDARY_TABLE`] is the single source of emitted
-/// boundary vocabulary. An unknown spelling passes through unchanged and
-/// trips a debug assertion so vocabulary drift is caught in development
-/// without ever breaking production diagnostics.
-fn host_lifecycle_frozen_event(detail: &str) -> &str {
-    let found = HOST_LIFECYCLE_BOUNDARY_TABLE
-        .iter()
-        .find(|row| row.event == detail)
-        .map(|row| row.event);
-    debug_assert!(
-        found.is_some(),
-        "unlisted lifecycle boundary event: {detail}"
-    );
-    found.unwrap_or(detail)
+/// Every production observation passes its static [`HOST_LIFECYCLE_BOUNDARY_TABLE`]
+/// row, so the table is the single source of emitted boundary vocabulary by
+/// construction: there is no string lookup and no fallback an unlisted
+/// spelling could pass through.
+fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'static str {
+    boundary.event
 }
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
@@ -1862,7 +2304,7 @@ impl HostJobBranches {
     pub fn new(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
         // F-LOG-HOST-1: phase only; the outermost `open` guard owns the single
         // terminal for this contour. Liveness is not readiness here.
-        host_lifecycle_observe_requested("host.jobs requested");
+        host_lifecycle_observe_requested(BOUNDARY_JOBS_REQUESTED);
         let suffix = format!(
             "{}-{}",
             host.epoch.current.lineage_id.as_str(),
@@ -1871,7 +2313,7 @@ impl HostJobBranches {
         let kernel_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?;
         let store_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Store-{suffix}"))?;
         let kernel_launch_binding = KernelLaunchBinding::observe_current()?;
-        host_lifecycle_observe_requested("host.jobs admitted");
+        host_lifecycle_observe_requested(BOUNDARY_JOBS_ADMITTED);
         Ok(Self {
             kernel: None,
             store: None,
@@ -1935,7 +2377,7 @@ impl HostJobBranches {
     /// approved contour admission.
     pub fn new_fenced(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
         // F-LOG-HOST-1: phase only; outermost `open` owns the terminal.
-        host_lifecycle_observe_requested("host.jobs-fenced requested");
+        host_lifecycle_observe_requested(BOUNDARY_JOBS_FENCED_REQUESTED);
         let suffix = format!(
             "{}-{}",
             host.epoch.current.lineage_id.as_str(),
@@ -1971,7 +2413,7 @@ impl HostJobBranches {
             kernel_restart_attempts: 0,
             store_restart_attempts: 0,
         };
-        host_lifecycle_observe_requested("host.jobs-fenced admitted");
+        host_lifecycle_observe_requested(BOUNDARY_JOBS_FENCED_ADMITTED);
         Ok(branches)
     }
 
@@ -4034,7 +4476,7 @@ impl HostJobBranches {
     ) -> Result<HostBranchDisposition, HostError> {
         // F-LOG-HOST-1: phase only; outer `reconcile_approved_contour` owns
         // the single terminal. Liveness here is never readiness.
-        host_lifecycle_observe_requested("host.branch-reconcile requested");
+        host_lifecycle_observe_requested(BOUNDARY_BRANCH_RECONCILE_REQUESTED);
         // This low-level branch helper has no journal/outer-intent authority.
         // A dead Store must therefore be recovered by HostComposition's one
         // durable Store-recovery operation, never by the generic relaunch
@@ -4236,7 +4678,7 @@ impl HostJobBranches {
                 // restoration. The candidate failed, so restoration of the
                 // prior approved contour is now requested; the pair
                 // completes at `host.cutover-rollback restored` below.
-                host_lifecycle_observe_requested("host.cutover-rollback requested");
+                host_lifecycle_observe_requested(BOUNDARY_CUTOVER_ROLLBACK_REQUESTED);
                 let rollback = self
                     .start_approved(
                         prior_kernel,
@@ -4260,7 +4702,7 @@ impl HostJobBranches {
                 rollback.map(|()| {
                     // F-LOG-HOST-1: prior contour relaunched, so the
                     // requested restoration is verified by its owner.
-                    host_lifecycle_observe_requested("host.cutover-rollback restored");
+                    host_lifecycle_observe_requested(BOUNDARY_CUTOVER_ROLLBACK_RESTORED);
                     CutoverLaunchOutcome::Rollback {
                         candidate_error: candidate_error.to_string(),
                     }
@@ -4277,7 +4719,7 @@ impl HostJobBranches {
     pub fn terminate_kernel(&mut self) -> Result<(), HostError> {
         // F-LOG-HOST-1: phase only; outer `stop`/reconcile owns the terminal.
         // Termination requested is distinct from stopped.
-        host_lifecycle_observe_drain("host.kernel-terminate requested");
+        host_lifecycle_observe_drain(BOUNDARY_KERNEL_TERMINATE_REQUESTED);
         if let Some(kernel) = self.kernel.as_mut() {
             kernel
                 .terminate_in_place(0xE017_0001)
@@ -4286,7 +4728,7 @@ impl HostJobBranches {
         }
         self.kernel_candidate = None;
         self.kernel_activation_receipt = None;
-        host_lifecycle_observe_drain("host.kernel-terminate stopped");
+        host_lifecycle_observe_drain(BOUNDARY_KERNEL_TERMINATE_STOPPED);
         Ok(())
     }
 
@@ -4297,14 +4739,14 @@ impl HostJobBranches {
     /// Returns an error if the owned store Job branch cannot be terminated.
     pub fn terminate_store(&mut self) -> Result<(), HostError> {
         // F-LOG-HOST-1: phase only; outer `stop`/reconcile owns the terminal.
-        host_lifecycle_observe_drain("host.store-terminate requested");
+        host_lifecycle_observe_drain(BOUNDARY_STORE_TERMINATE_REQUESTED);
         if let Some(store) = self.store.as_mut() {
             store
                 .terminate_in_place(0xE017_0002)
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
             self.store.take();
         }
-        host_lifecycle_observe_drain("host.store-terminate stopped");
+        host_lifecycle_observe_drain(BOUNDARY_STORE_TERMINATE_STOPPED);
         Ok(())
     }
 
@@ -5547,8 +5989,8 @@ impl HostComposition {
     pub fn open(launch_options: HostLaunchOptions) -> Result<Self, HostError> {
         // F-LOG-HOST-1: request/admitted distinction; single terminal via
         // guard. Missing evidence suppresses `admitted`, never a new branch.
-        host_lifecycle_observe_requested("host.open requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-open-failed");
+        host_lifecycle_observe_requested(BOUNDARY_OPEN_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_OPEN_TERMINAL);
         // Backup dispatch wiring (#962): pin the accepted preparation /
         // cutover routing into the production startup path so it cannot rot
         // unwired. Wiring-only: no backup operation runs here.
@@ -5718,7 +6160,7 @@ impl HostComposition {
             composition.readiness_gate.branch_degraded();
             // F-LOG-HOST-1: fenced is distinct from admitted; no false ready.
             host_terminal.disarm();
-            host_lifecycle_observe_requested("host.open fenced store-recovery");
+            host_lifecycle_observe_requested(BOUNDARY_OPEN_FENCED_STORE_RECOVERY);
             return Ok(composition);
         }
         #[cfg(windows)]
@@ -5734,7 +6176,7 @@ impl HostComposition {
                 composition.readiness_gate.branch_degraded();
                 // F-LOG-HOST-1: fenced bridge-stage is not admitted/ready.
                 host_terminal.disarm();
-                host_lifecycle_observe_requested("host.open fenced bridge-stage");
+                host_lifecycle_observe_requested(BOUNDARY_OPEN_FENCED_BRIDGE_STAGE);
                 return Ok(composition);
             }
             if let Some(prepared) = pending.phase_b_prepared.as_ref() {
@@ -5799,7 +6241,9 @@ impl HostComposition {
                     composition.readiness_gate.branch_degraded();
                     // F-LOG-HOST-1: prepared without receipt is degraded, not ready.
                     host_terminal.disarm();
-                    host_lifecycle_observe_requested("host.open degraded prepared-without-receipt");
+                    host_lifecycle_observe_requested(
+                        BOUNDARY_OPEN_DEGRADED_PREPARED_WITHOUT_RECEIPT,
+                    );
                     return Ok(composition);
                 } else if let Some(binding) = materialization.agent_bridge() {
                     // A crash after the receipt CAS and before backup cleanup
@@ -5839,7 +6283,7 @@ impl HostComposition {
                 composition.readiness_gate.branch_degraded();
                 // F-LOG-HOST-1: fenced is distinct from admitted.
                 host_terminal.disarm();
-                host_lifecycle_observe_requested("host.open fenced store-recovery-active");
+                host_lifecycle_observe_requested(BOUNDARY_OPEN_FENCED_STORE_RECOVERY_ACTIVE);
                 return Ok(composition);
             }
             // A committed ActiveVerified fence is source evidence only.  Every
@@ -5859,7 +6303,7 @@ impl HostComposition {
         }
         // F-LOG-HOST-1: admitted only with durable evidence; guard disarmed.
         host_terminal.disarm();
-        host_lifecycle_observe_requested("host.open admitted");
+        host_lifecycle_observe_requested(BOUNDARY_OPEN_ADMITTED);
         Ok(composition)
     }
 
@@ -5881,8 +6325,8 @@ impl HostComposition {
     pub fn credential_control(&self) -> Result<HostCredentialControl, HostError> {
         // F-LOG-HOST-1: SCM receipt boundary; identities only, never secret
         // values/env/payloads. Single terminal via guard.
-        host_lifecycle_observe_scm("host.credential-control requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-credential-control-failed");
+        host_lifecycle_observe_scm(BOUNDARY_CREDENTIAL_CONTROL_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_CREDENTIAL_CONTROL_TERMINAL);
         let capability = self
             .owner_lease
             .credential_mutation_capability()
@@ -5895,7 +6339,7 @@ impl HostComposition {
         )
         .map_err(HostError::Platform)?;
         host_terminal.disarm();
-        host_lifecycle_observe_scm("host.credential-control admitted receipt");
+        host_lifecycle_observe_scm(BOUNDARY_CREDENTIAL_CONTROL_ADMITTED_RECEIPT);
         Ok(control)
     }
 
@@ -5917,10 +6361,10 @@ impl HostComposition {
         // F-LOG-HOST-1: SCM receipt vs Unknown; failed vs unknown preserved
         // by distinct details/codes. One terminal per Unknown outcome; the
         // inner `?` chain shares correlation and never emits its own terminal.
-        host_lifecycle_observe_scm("host.phase-b requested");
+        host_lifecycle_observe_scm(BOUNDARY_PHASE_B_REQUESTED);
         if self.store_recovery_startup_fence.is_fenced() {
-            host_lifecycle_observe_scm("host.phase-b unknown store-recovery-fence");
-            host_lifecycle_observe_terminal("host-phase-b-unknown");
+            host_lifecycle_observe_scm(BOUNDARY_PHASE_B_UNKNOWN_STORE_RECOVERY_FENCE);
+            host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_TERMINAL);
             return HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref(
                     "store-recovery-fence",
@@ -6044,14 +6488,14 @@ impl HostComposition {
         match result {
             Ok(receipt) => {
                 // Receipt (prepared) is distinct from completion (finalized).
-                host_lifecycle_observe_scm("host.phase-b prepared receipt");
+                host_lifecycle_observe_scm(BOUNDARY_PHASE_B_PREPARED_RECEIPT);
                 HostCredentialControlResponse::PhaseBPrepared {
                     receipt: Box::new(receipt),
                 }
             }
             Err(_error) => {
-                host_lifecycle_observe_scm("host.phase-b unknown");
-                host_lifecycle_observe_terminal("host-phase-b-unknown");
+                host_lifecycle_observe_scm(BOUNDARY_PHASE_B_UNKNOWN);
+                host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_TERMINAL);
                 HostCredentialControlResponse::Unknown {
                     pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
                 }
@@ -6070,7 +6514,7 @@ impl HostComposition {
     ) -> HostCredentialControlResponse {
         // F-LOG-HOST-1: prepared receipt vs ready completion; Unknown never
         // false-success. Single terminal for the Unknown outcome.
-        host_lifecycle_observe_scm("host.phase-b-finalize requested");
+        host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_REQUESTED);
         let result = (|| {
             intent
                 .validate()
@@ -6155,13 +6599,13 @@ impl HostComposition {
         })();
         if let Ok(receipt) = result {
             // Ready completion is distinct from prepared receipt.
-            host_lifecycle_observe_scm("host.phase-b-finalize ready completion");
+            host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_READY_COMPLETION);
             HostCredentialControlResponse::PhaseBReady {
                 receipt: Box::new(receipt),
             }
         } else {
-            host_lifecycle_observe_scm("host.phase-b-finalize unknown");
-            host_lifecycle_observe_terminal("host-phase-b-finalize-unknown");
+            host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_UNKNOWN);
+            host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_FINALIZE_TERMINAL);
             HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("phase-b-finalize", "FinalizePhaseB", intent),
             }
@@ -6187,10 +6631,10 @@ impl HostComposition {
     ) -> HostCredentialControlResponse {
         // F-LOG-HOST-1: query-only replay/readback is never another commit.
         // Unknown stays Unknown, never false-success; single terminal.
-        host_lifecycle_observe_scm("host.phase-b-reconcile requested");
+        host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_REQUESTED);
         if self.store_recovery_startup_fence.is_fenced() {
-            host_lifecycle_observe_scm("host.phase-b-reconcile unknown store-recovery-fence");
-            host_lifecycle_observe_terminal("host-phase-b-reconcile-unknown");
+            host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_UNKNOWN_STORE_RECOVERY_FENCE);
+            host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_RECONCILE_TERMINAL);
             return HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("store-recovery-fence", "ReconcilePhaseB", intent),
             };
@@ -6209,7 +6653,7 @@ impl HostComposition {
             && receipt.request_digest == intent.request_digest
         {
             // F-LOG-HOST-1: replay/readback, not another commit.
-            host_lifecycle_observe_scm("host.phase-b-reconcile prepared readback replay");
+            host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_PREPARED_READBACK_REPLAY);
             return HostCredentialControlResponse::PhaseBPrepared {
                 receipt: Box::new(receipt.clone()),
             };
@@ -6414,14 +6858,14 @@ impl HostComposition {
         match result {
             Ok(receipt) => {
                 // Committed receipt readback is replay, not another commit.
-                host_lifecycle_observe_scm("host.phase-b-reconcile receipt readback replay");
+                host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_RECEIPT_READBACK_REPLAY);
                 HostCredentialControlResponse::PhaseBReady {
                     receipt: Box::new(receipt),
                 }
             }
             Err(_error) => {
-                host_lifecycle_observe_scm("host.phase-b-reconcile unknown");
-                host_lifecycle_observe_terminal("host-phase-b-reconcile-unknown");
+                host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_UNKNOWN);
+                host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_RECONCILE_TERMINAL);
                 HostCredentialControlResponse::Unknown {
                     pending_ref: phase_b_unknown_ref("phase-b-query", "ReconcilePhaseB", intent),
                 }
@@ -6433,8 +6877,8 @@ impl HostComposition {
     #[allow(missing_docs, clippy::missing_errors_doc)]
     pub fn runtime_control(&self) -> Result<HostRuntimeControl, HostError> {
         // F-LOG-HOST-1: SCM control receipt boundary; single terminal.
-        host_lifecycle_observe_scm("host.runtime-control requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-runtime-control-failed");
+        host_lifecycle_observe_scm(BOUNDARY_RUNTIME_CONTROL_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_RUNTIME_CONTROL_TERMINAL);
         let capability = self.owner_lease.activation_capability();
         let _guard = capability
             .live_guard()
@@ -6446,7 +6890,7 @@ impl HostComposition {
         )
         .map_err(HostError::Platform)?;
         host_terminal.disarm();
-        host_lifecycle_observe_scm("host.runtime-control admitted receipt");
+        host_lifecycle_observe_scm(BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT);
         Ok(control)
     }
 
@@ -6495,7 +6939,7 @@ impl HostComposition {
         if queue_empty {
             return Ok(0);
         }
-        host_lifecycle_observe_scm("host.user-automation owner requested");
+        host_lifecycle_observe_scm(BOUNDARY_USER_AUTOMATION_OWNER_REQUESTED);
         let (kernel_owner, unavailable_reason) = match self.user_automation_owner() {
             Ok(owner) => (Some(owner), None),
             Err(error) => (None, Some(error.to_string())),
@@ -6582,10 +7026,10 @@ impl HostComposition {
         // completion. Unsupported op stays typed Unknown, never false-success.
         // One terminal per Unknown outcome; inner `execute` shares correlation
         // and never emits its own terminal.
-        host_lifecycle_observe_scm("host.kernel-restart requested");
+        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
-            host_lifecycle_observe_scm("host.kernel-restart reconcile-delegated readback");
+            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK);
             return self.reconcile_kernel_restart_request(request);
         }
         if self
@@ -6594,8 +7038,8 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
-            host_lifecycle_observe_scm("host.kernel-restart unknown owner-fenced");
-            host_lifecycle_observe_terminal("host-kernel-restart-unknown");
+            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED);
+            host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart", request),
@@ -6604,14 +7048,14 @@ impl HostComposition {
         let result = self.execute_kernel_restart(request);
         match result {
             Ok(receipt) => {
-                host_lifecycle_observe_scm("host.kernel-restart receipt completion");
+                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION);
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             }
             Err(_error) => {
                 // Unsupported op, pending/unknown, or failed restart all stay
                 // typed Unknown preserving identity; never false-success.
-                host_lifecycle_observe_scm("host.kernel-restart unknown");
-                host_lifecycle_observe_terminal("host-kernel-restart-unknown");
+                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN);
+                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
                 HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart", request),
@@ -6630,23 +7074,23 @@ impl HostComposition {
         // false-success and never rewrites the durable receipt. Timeout or
         // possible state change stays Unknown until reconciliation evidence.
         // One terminal per Unknown outcome; success readback is replay.
-        host_lifecycle_observe_scm("host.kernel-restart-reconcile requested");
+        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
         if self
             .owner_lease
             .activation_capability()
             .live_guard()
             .is_err()
         {
-            host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown owner-fenced");
-            host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED);
+            host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
             );
         }
         if request.validate().is_err() {
-            host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown validation");
-            host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION);
+            host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
@@ -6655,11 +7099,13 @@ impl HostComposition {
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
             return if let Ok(receipt) = rebind_runtime_restart_receipt(&receipt, request) {
-                host_lifecycle_observe_scm("host.kernel-restart-reconcile receipt readback replay");
+                host_lifecycle_observe_scm(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY,
+                );
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             } else {
-                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown conflict");
-                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT);
+                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-conflict", request),
@@ -6670,8 +7116,8 @@ impl HostComposition {
             Ok(true) | Err(_) => {
                 // Pending or unreadable pending stays Unknown; a timeout is
                 // never proof of effect or non-effect.
-                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown pending");
-                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
+                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-pending", request),
@@ -6682,8 +7128,8 @@ impl HostComposition {
         let snapshot = match self.journal.snapshot() {
             Ok(s) => s,
             Err(_e) => {
-                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown snapshot");
-                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT);
+                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-snapshot", request),
@@ -6693,8 +7139,8 @@ impl HostComposition {
         if let Some(kernel) = snapshot.kernel.as_ref() {
             let _ = kernel;
         }
-        host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown");
-        host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN);
+        host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
         HostRuntimeControlResponse::unknown_for(
             request,
             runtime_control_unknown_ref("kernel-restart-reconcile-unknown", request),
@@ -6714,7 +7160,7 @@ impl HostComposition {
     ) -> Result<HostKernelRestartReceipt, HostError> {
         // F-LOG-HOST-1: inner phase only; outer `handle_kernel_restart_request`
         // owns the single terminal. Unsupported op stays typed, never success.
-        host_lifecycle_observe_scm("host.kernel-restart-execute requested");
+        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED);
         request.validate().map_err(HostError::ProcessContour)?;
         if request.operation != HostRuntimeControlOperation::RestartKernel {
             return Err(HostError::ProcessContour(
@@ -6989,7 +7435,7 @@ impl HostComposition {
         self.runtime_restarts.insert(key, receipt.clone());
         self.readiness_gate.branch_degraded();
         // F-LOG-HOST-1: receipt (restart) is distinct from reconcile readback.
-        host_lifecycle_observe_scm("host.kernel-restart-execute receipt");
+        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_EXECUTE_RECEIPT);
         Ok(receipt)
     }
 
@@ -7644,8 +8090,8 @@ impl HostComposition {
         // F-LOG-HOST-1: request vs admitted vs started vs ready preserved.
         // Single terminal via guard; inner `start_manifest_contour` is phase
         // only and shares correlation without its own terminal.
-        host_lifecycle_observe_requested("host.start requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-start-failed");
+        host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_START_TERMINAL);
         let active =
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
@@ -7665,7 +8111,7 @@ impl HostComposition {
         host_terminal.disarm();
         // Started is distinct from ready: readiness still requires its own
         // authenticated proof via the readiness contour.
-        host_lifecycle_observe_requested("host.start started");
+        host_lifecycle_observe_requested(BOUNDARY_START_STARTED);
         Ok(())
     }
 
@@ -7681,8 +8127,8 @@ impl HostComposition {
     #[cfg(windows)]
     pub fn resume_pending_activation_after_phase_b(&mut self) -> Result<(), HostError> {
         // F-LOG-HOST-1: pending resume boundary; single terminal via guard.
-        host_lifecycle_observe_requested("host.resume-pending requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-resume-pending-failed");
+        host_lifecycle_observe_requested(BOUNDARY_RESUME_PENDING_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_RESUME_PENDING_TERMINAL);
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::ProcessContour("no pending activation requires Phase-B resume".to_owned())
         })?;
@@ -7698,14 +8144,14 @@ impl HostComposition {
         }
         self.reconcile_pending_activation(&pending)?;
         host_terminal.disarm();
-        host_lifecycle_observe_requested("host.resume-pending admitted");
+        host_lifecycle_observe_requested(BOUNDARY_RESUME_PENDING_ADMITTED);
         Ok(())
     }
 
     #[cfg(windows)]
     fn resume_pending_phase_b_receipt(&mut self) -> Result<(), HostError> {
         // F-LOG-HOST-1: inner phase only; outer resume owns the terminal.
-        host_lifecycle_observe_requested("host.resume-pending-receipt requested");
+        host_lifecycle_observe_requested(BOUNDARY_RESUME_PENDING_RECEIPT_REQUESTED);
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::RecoveryRequired(
                 "Phase-B receipt continuation has no exact pending activation".to_owned(),
@@ -7757,7 +8203,7 @@ impl HostComposition {
         // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
         // owns the single terminal. Requested vs started vs ready preserved:
         // started here is never readiness.
-        host_lifecycle_observe_requested("host.start-manifest requested");
+        host_lifecycle_observe_requested(BOUNDARY_START_MANIFEST_REQUESTED);
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
         let manifest_digest = phase_b_manifest_digest(manifest)?;
         let phase_b = match self
@@ -7915,7 +8361,7 @@ impl HostComposition {
         // intact for exact SCM/heartbeat reconciliation.
         self.watchdog_start_recovery = None;
         // F-LOG-HOST-1: started only; readiness needs its own proof.
-        host_lifecycle_observe_requested("host.start-manifest started");
+        host_lifecycle_observe_requested(BOUNDARY_START_MANIFEST_STARTED);
         Ok(())
     }
 
@@ -8077,7 +8523,7 @@ impl HostComposition {
             // (kernel reactivated, registry persisted, observations
             // persisted); the returned Err reports the candidate
             // rejection, not a rollback failure.
-            host_lifecycle_observe_requested("host.cutover-rollback reactivated");
+            host_lifecycle_observe_requested(BOUNDARY_CUTOVER_ROLLBACK_REACTIVATED);
             return Err(HostError::ProcessContour(format!(
                 "candidate rejected; prior approved contour durably reactivated: {candidate_error}"
             )));
@@ -8172,8 +8618,8 @@ impl HostComposition {
     pub fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
         // F-LOG-HOST-1: liveness is never readiness. Single terminal via
         // guard; the readiness contour here is identity rederivation only.
-        host_lifecycle_observe_requested("host.liveness requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-liveness-failed");
+        host_lifecycle_observe_requested(BOUNDARY_LIVENESS_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_LIVENESS_TERMINAL);
         self.ensure_admission_open()?;
         let liveness = self.jobs.liveness_only();
         let active_manifest = self.registry.active().map(|active| &active.manifest);
@@ -8201,7 +8647,7 @@ impl HostComposition {
         self.readiness_gate = readiness_gate;
         host_terminal.disarm();
         // Liveness observation only; never claims ready.
-        host_lifecycle_observe_requested("host.liveness observed");
+        host_lifecycle_observe_requested(BOUNDARY_LIVENESS_OBSERVED);
         Ok(tick)
     }
 
@@ -8219,8 +8665,8 @@ impl HostComposition {
         // F-LOG-HOST-1: reconcile vs liveness vs readiness preserved.
         // Readiness is claimed only inside `reconcile_branch_readiness_at`
         // with authenticated evidence; this outer only admits the contour.
-        host_lifecycle_observe_requested("host.reconcile requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-reconcile-failed");
+        host_lifecycle_observe_requested(BOUNDARY_RECONCILE_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_RECONCILE_TERMINAL);
         self.ensure_admission_open()?;
         let active =
             self.registry.active().cloned().ok_or_else(|| {
@@ -8395,7 +8841,7 @@ impl HostComposition {
         );
         host_terminal.disarm();
         // Admitted only; ready vs degraded is owned by the readiness contour.
-        host_lifecycle_observe_requested("host.reconcile admitted");
+        host_lifecycle_observe_requested(BOUNDARY_RECONCILE_ADMITTED);
         Ok(disposition)
     }
 
@@ -8478,7 +8924,7 @@ impl HostComposition {
             });
         if disposition != HostBranchDisposition::LiveAwaitingReadiness {
             self.readiness_gate.branch_degraded();
-            host_lifecycle_observe_requested("host.readiness degraded");
+            host_lifecycle_observe_requested(BOUNDARY_READINESS_DEGRADED);
             if supervised_system_service
                 && !self.persist_supervised_degraded_activation(generation, disposition, now)
             {
@@ -8535,7 +8981,7 @@ impl HostComposition {
             );
             return HostBranchDisposition::ReadinessDegraded;
         }
-        host_lifecycle_observe_requested("host.readiness requested proof");
+        host_lifecycle_observe_requested(BOUNDARY_READINESS_REQUESTED_PROOF);
         let contour =
             self.current_readiness_contour(generation, kernel_artifact, store_artifact, config);
         let contour_unavailable = contour.is_err();
@@ -8569,7 +9015,7 @@ impl HostComposition {
                 self.readiness_gate.branch_degraded();
                 return HostBranchDisposition::ReadinessDegraded;
             }
-            host_lifecycle_observe_requested("host.readiness ready proof");
+            host_lifecycle_observe_requested(BOUNDARY_READINESS_READY_PROOF);
         } else if !self.persist_authenticated_readiness_degradation(
             generation,
             outcome,
@@ -8706,7 +9152,7 @@ impl HostComposition {
                 .fail(None, readiness_failure_kind(&error), now);
             return false;
         }
-        host_lifecycle_observe_requested("host.readiness degraded");
+        host_lifecycle_observe_requested(BOUNDARY_READINESS_DEGRADED);
         true
     }
 
@@ -8747,7 +9193,7 @@ impl HostComposition {
     ) -> Result<ReadinessContourIdentity, HostError> {
         // F-LOG-HOST-1: contour probe only; never claims ready by itself.
         // The ready claim happens only after the authenticated proof fence.
-        host_lifecycle_observe_requested("host.readiness-contour requested");
+        host_lifecycle_observe_requested(BOUNDARY_READINESS_CONTOUR_REQUESTED);
         if self.jobs.approved_generation.as_ref() != Some(generation)
             || self.jobs.kernel_artifact_digest.as_ref() != Some(kernel_artifact)
             || self.jobs.store_artifact_digest.as_ref() != Some(store_artifact)
@@ -9011,7 +9457,7 @@ impl HostComposition {
     ) -> Result<ReadinessContourIdentity, HostError> {
         // F-LOG-HOST-1: ready only with actual proof fence; phase only here,
         // outer reconcile owns the terminal. Never claims ready from liveness.
-        host_lifecycle_observe_requested("host.readiness-proof requested");
+        host_lifecycle_observe_requested(BOUNDARY_READINESS_PROOF_REQUESTED);
         // A pending candidate is approved but intentionally not active until
         // this fresh proof crosses the registry CAS.  Resolve the exact
         // generation from the registry projection rather than treating the
@@ -9152,7 +9598,7 @@ impl HostComposition {
             ));
         }
         // F-LOG-HOST-1: ready only now that the proof fence is confirmed.
-        host_lifecycle_observe_requested("host.readiness-proof ready");
+        host_lifecycle_observe_requested(BOUNDARY_READINESS_PROOF_READY);
         Ok(confirmed)
     }
 
@@ -9165,7 +9611,7 @@ impl HostComposition {
         failure_ref: Option<&PlatformHandle>,
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: degraded is distinct from ready; phase only.
-        host_lifecycle_observe_requested("host.degraded-observation requested");
+        host_lifecycle_observe_requested(BOUNDARY_DEGRADED_OBSERVATION_REQUESTED);
         debug_assert_ne!(
             disposition,
             HostBranchDisposition::LiveAwaitingReadiness,
@@ -9233,7 +9679,7 @@ impl HostComposition {
     /// Returns an error if the durable Host state cannot be loaded.
     pub fn has_durable_branch_fence(&self) -> Result<bool, HostError> {
         // F-LOG-HOST-1: guard probe only; never a terminal and never readiness.
-        host_lifecycle_observe_requested("host.branch-fence requested");
+        host_lifecycle_observe_requested(BOUNDARY_BRANCH_FENCE_REQUESTED);
         let state = self.snapshot()?;
         let supervised = self.registry.active().is_some_and(|active| {
             active.manifest.runtime_launch.profile == InstallationProfile::SystemService
@@ -9264,7 +9710,7 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: cleanup phase only; outer start/stop owns the terminal.
         // `evidence` is an already-produced typed reason, never free text.
-        host_lifecycle_observe_drain("host.cleanup-active requested");
+        host_lifecycle_observe_drain(BOUNDARY_CLEANUP_ACTIVE_REQUESTED);
         let durable = self
             .journal
             .snapshot()
@@ -9299,7 +9745,7 @@ impl HostComposition {
     #[cfg(windows)]
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
         // F-LOG-HOST-1: cleanup phase only; outer owns the terminal.
-        host_lifecycle_observe_drain("host.cleanup-launched requested");
+        host_lifecycle_observe_drain(BOUNDARY_CLEANUP_LAUNCHED_REQUESTED);
         let projection = (|| -> Result<(), HostError> {
             let activation_state = self
                 .journal
@@ -9554,15 +10000,15 @@ impl HostComposition {
         // merged. Cancellation requested stays distinct from stopped via the
         // labelled pair below. Single terminal via guard; inner terminates
         // are phase only.
-        host_lifecycle_observe_drain("host.stop requested");
-        let mut host_terminal = HostTerminalGuard::armed("host-stop-failed");
+        host_lifecycle_observe_drain(BOUNDARY_STOP_REQUESTED);
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_STOP_TERMINAL);
         if !self.running {
             return Err(HostError::Stopped);
         }
         // F-LOG-HOST-1: cancellation requested versus stopped. A running
         // activation exists, so the SCM stop control now cancels it; the
         // labelled pair completes at `host.stop stopped` below.
-        host_lifecycle_observe_drain("host.stop cancellation requested");
+        host_lifecycle_observe_drain(BOUNDARY_STOP_CANCELLATION_REQUESTED);
         #[cfg(windows)]
         if self.store_recovery_startup_fence.is_fenced() {
             self.readiness_gate.branch_degraded();
@@ -9600,7 +10046,7 @@ impl HostComposition {
                         }))?;
                         // F-LOG-HOST-1: drain Requested is distinct from
                         // Draining; shares one drain_generation correlation.
-                        host_lifecycle_observe_drain("host.drain requested");
+                        host_lifecycle_observe_drain(BOUNDARY_DRAIN_REQUESTED);
                     }
                     if self
                         .journal
@@ -9622,7 +10068,7 @@ impl HostComposition {
                         }))?;
                         // F-LOG-HOST-1: Draining is distinct from Requested and
                         // from drained/StoppedClean; one correlation.
-                        host_lifecycle_observe_drain("host.drain draining");
+                        host_lifecycle_observe_drain(BOUNDARY_DRAIN_DRAINING);
                     }
                     if self
                         .journal
@@ -9649,7 +10095,7 @@ impl HostComposition {
                         // F-LOG-HOST-1: drain commit is distinct from
                         // Requested/Draining; one drain_generation
                         // correlation.
-                        host_lifecycle_observe_drain("host.drain commit");
+                        host_lifecycle_observe_drain(BOUNDARY_DRAIN_COMMIT);
                         self.append_record(HostStateRecord::DrainCommit(commit))?;
                     }
                 }
@@ -9677,7 +10123,7 @@ impl HostComposition {
                         drain_commit_record_for_stop(&state, &activation, &drain.drain_generation)?;
                     // F-LOG-HOST-1: drain commit is distinct from
                     // Requested/Draining; one drain_generation correlation.
-                    host_lifecycle_observe_drain("host.drain commit");
+                    host_lifecycle_observe_drain(BOUNDARY_DRAIN_COMMIT);
                     self.append_record(HostStateRecord::DrainCommit(commit))?;
                 }
                 ActivationState::DegradedRecovery => {
@@ -9739,7 +10185,7 @@ impl HostComposition {
                 self.transition_activation(ActivationState::StoppedClean, "host-stopped-clean")?;
                 // F-LOG-HOST-1: StoppedClean (drained) is distinct from
                 // Draining and from requested/stopped.
-                host_lifecycle_observe_drain("host.stop stopped-clean drained");
+                host_lifecycle_observe_drain(BOUNDARY_STOP_STOPPED_CLEAN_DRAINED);
             }
             #[cfg(windows)]
             cleanup_completed_store_recovery_supporting_evidence(
@@ -9771,7 +10217,7 @@ impl HostComposition {
         // F-LOG-HOST-1: stopped is distinct from requested/draining; the
         // single guard terminal stays armed only for failures.
         host_terminal.disarm();
-        host_lifecycle_observe_drain("host.stop stopped");
+        host_lifecycle_observe_drain(BOUNDARY_STOP_STOPPED);
         Ok(())
     }
 
@@ -9831,7 +10277,7 @@ fn lifecycle_context(
     // produced by the owner. `operation` is a static caller literal, never
     // SCM payload/env/credentials. Single terminal via manual observe: the
     // guard cannot wrap this free function without changing its signature.
-    host_lifecycle_observe_requested("host.lifecycle-context requested");
+    host_lifecycle_observe_requested(BOUNDARY_LIFECYCLE_CONTEXT_REQUESTED);
     let request_id = RequestId::new(format!(
         "host:{}:{}:{}:{}",
         host.epoch.current.lineage_id,
@@ -9840,7 +10286,7 @@ fn lifecycle_context(
         std::process::id()
     ))
     .map_err(|error| {
-        host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+        host_lifecycle_observe_terminal(BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL);
         HostError::Platform(error.to_string())
     })?;
     let context = RequestMetadata {
@@ -9848,17 +10294,17 @@ fn lifecycle_context(
         session_id: None,
         task_id: None,
         product_id: ProductId::new("eliot-host").map_err(|error| {
-            host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+            host_lifecycle_observe_terminal(BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL);
             HostError::Platform(error.to_string())
         })?,
         source_id: SourceId::new("eliot-host-service").map_err(|error| {
-            host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+            host_lifecycle_observe_terminal(BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL);
             HostError::Platform(error.to_string())
         })?,
         state_fence: StateFence::new(host.epoch.current.clone(), ResourceGeneration::genesis()),
         clock: ClockReading::default(),
     };
-    host_lifecycle_observe_requested("host.lifecycle-context admitted");
+    host_lifecycle_observe_requested(BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED);
     Ok(context)
 }
 
