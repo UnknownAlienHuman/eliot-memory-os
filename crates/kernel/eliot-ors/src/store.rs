@@ -10233,33 +10233,43 @@ impl RedbRecoveryStore {
         }))
     }
 
-    /// Counts one namespace's #2730 ordered position rows with their total
-    /// encoded bytes (issue #2731, item 4): key bytes plus serialized-record
-    /// bytes, the accountable persisted size. Read-only — positions are
-    /// owned, written, and capped by #2730/#2885 and are never mutated
-    /// here. Called by [`Self::bridge_capacity_accounting_for`]; kept
-    /// separate so the inventory stays within its line budget.
+    /// Streams one namespace's #2730 ordered position range and accounts its
+    /// count and encoded key/value bytes (issue #2731, item 4). Each row's
+    /// decoded value and canonical namespace/sequence key are validated; no
+    /// rows are collected. Read-only — positions are owned, written, and
+    /// capped by #2730/#2885 and are never mutated here. Called by
+    /// [`Self::bridge_capacity_accounting_for`]; kept separate so the
+    /// inventory stays within its line budget.
     fn bridge_position_accounting_for(
         read: &redb::ReadTransaction,
         namespace: &str,
     ) -> Result<(u64, u64), OrsError> {
         let stored = read.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
         let prefix = format!("{namespace}::");
+        let prefix_end = format!("{namespace}\u{10ffff}");
         let mut positions = 0_u64;
         let mut position_bytes = 0_u64;
-        for entry in stored.iter().map_err(storage)? {
+        for entry in stored
+            .range(prefix.as_str()..=prefix_end.as_str())
+            .map_err(storage)?
+        {
             let (key, value) = entry.map_err(storage)?;
-            if !key.value().starts_with(prefix.as_str()) {
-                continue;
+            let key = key.value();
+            if !key.starts_with(prefix.as_str()) {
+                break;
             }
-            let (key_namespace, _) = Self::parse_bridge_position_key(key.value())?;
-            if key_namespace != namespace {
-                continue;
+            let (key_namespace, sequence) = Self::parse_bridge_position_key(key)?;
+            if key_namespace != namespace || key != Self::bridge_position_key(namespace, sequence) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "position key does not match its exact namespace and sequence"
+                        .to_owned(),
+                });
             }
             let position: BridgeEventPosition = decode(value.value())?;
             position.validate()?;
             positions += 1;
-            position_bytes += (key.value().len() + value.value().len()) as u64;
+            position_bytes += (key.len() + value.value().len()) as u64;
         }
         Ok((positions, position_bytes))
     }
