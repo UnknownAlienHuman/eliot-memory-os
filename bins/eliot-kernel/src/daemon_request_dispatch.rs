@@ -4202,20 +4202,32 @@ impl KernelComposition {
             .await
         {
             Ok(readback) => readback,
-            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
+            // The owner read its own journal and definitively retains no such
+            // record. That is a complete negative answer about this delivery, so
+            // it is refused with the same typed cause as before rather than with
+            // an ad-hoc body: a duplicate or superseded delivery is refused here,
+            // before any effect owner is contacted.
+            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
                 return UserAutomationDueWakeRead::Answer(
-                        Self::user_automation_due_wake_refused_response(
-                            &UserAutomationDueWakeRejection::new(
-                                eliot_kernel_service::UserAutomationDueWakeRejectionCause::WakeNotRetained,
-                                occurrence_id.to_owned(),
-                                format!(
-                                    "the schedule owner retains no pending wake for this \
-                                     occurrence: {reason}"
-                                ),
+                    Self::user_automation_due_wake_refused_response(
+                        &UserAutomationDueWakeRejection::new(
+                            eliot_kernel_service::UserAutomationDueWakeRejectionCause::WakeNotRetained,
+                            occurrence_id.to_owned(),
+                            format!(
+                                "the schedule owner read its own journal and definitively retains \
+                                 no pending wake for this occurrence: {reason}"
                             ),
                         ),
-                    );
+                    ),
+                );
             }
+            // `Unavailable` on this route is now only a journal the owner could
+            // not read, which proves nothing about this occurrence. No
+            // `UserAutomationDueWakeRejectionCause` expresses "the owner could
+            // not answer", and reusing `WakeNotRetained` here would assert a
+            // proven absence that was never proven, so it keeps the existing
+            // generic projection: an unknown answer with a recovery directive,
+            // which is fail-closed and cannot be read as a normal empty result.
             Err(error) => {
                 return UserAutomationDueWakeRead::Answer(
                     Self::user_automation_runtime_error_response(error),
@@ -4609,11 +4621,19 @@ impl KernelComposition {
         match error {
             // A complete negative answer from the owner: it read its own state
             // and definitively retains no such record. This is a known outcome,
-            // not an unknown one — the same product fact the due-wake contour
-            // already models as `WakeNotRetained` — so it is reported as a
-            // definitive non-acceptance with nothing left to reconcile. It is
-            // deliberately not folded into `unavailable`, which means the owner
-            // could not answer at all.
+            // not an unknown one, so it is reported as a definitive
+            // non-acceptance with nothing left to reconcile. It is deliberately
+            // not folded into `unavailable`, which means the owner could not
+            // answer at all.
+            //
+            // The due-wake readback does not reach this arm: it refuses a proven
+            // absence itself with the typed
+            // `UserAutomationDueWakeRejectionCause::WakeNotRetained`, because its
+            // consumer is the wake-owner contract and not this JSON projection.
+            // This arm serves the remaining readback call sites that forward an
+            // owner error verbatim: the `USER_AUTOMATION_RUNTIME_OPERATION`
+            // route's `ReadPendingWake` operation, and the run-now trigger
+            // preflight readback.
             UserAutomationRuntimeError::NotRetained(reason) => serde_json::json!({
                 "status": "known",
                 "value": {
