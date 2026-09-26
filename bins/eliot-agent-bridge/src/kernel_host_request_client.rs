@@ -138,7 +138,10 @@ const RESOLVE_HANDLE_PAYLOAD_FILLER: &str =
 /// Exact payload-schema identity for the canonical `ToolRequest` bytes.
 const HOST_REQUEST_PAYLOAD_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 /// Bridge-proposed relative deadline when the host states no preference.
-/// The kernel owns the absolute deadline; this is a bounded preference only.
+/// Added to the local clock to form the submitted absolute deadline. The
+/// Kernel enforces expiry at admission but neither re-derives nor clamps
+/// the submitted value, so Kernel-issued absolute-deadline ownership stays
+/// open contract work under issue #77 (`wave_1_kernel_contract`).
 const DEFAULT_DEADLINE_PREFERENCE_MS: u64 = 60_000;
 
 /// Gateway-side face of the single retained transport owner.
