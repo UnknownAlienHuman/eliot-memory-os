@@ -25,6 +25,8 @@ use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
 use thiserror::Error;
 
 use crate::profile::{AdmittedProfile, AdmittedStage};
+use crate::registry::{RegistryEntry, RegistryError};
+use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
 use crate::{InstrumentBinding, InstrumentRequestPort, InstrumentRunner, RunnerError};
 
 /// Failures raised while planning or recording profile runs.
@@ -616,5 +618,87 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         let plan = StageOrchestrator::plan(admitted);
         let runs = StageOrchestrator::launch_plan(self, &plan, launcher).await;
         ProfileAggregate::assemble(&plan, runs)
+    }
+}
+
+/// Production [`StageLauncher`] serving composition-root-admitted invocations.
+///
+/// The composition root admits one typed [`InstrumentInvocation`] per planned
+/// stage identity and hands the map to the orchestrator together with its
+/// request port and evidence sink. Lookup is exact: a stage without an
+/// admitted invocation fails into an explicit missing run through the
+/// orchestrator's existing total-walk behavior, never into a synthesized
+/// command or a silently skipped stage.
+pub struct MappedStageLauncher<'p> {
+    invocations: BTreeMap<String, InstrumentInvocation>,
+    port: &'p dyn InstrumentRequestPort,
+    sink: Arc<dyn ProcessEvidenceSink>,
+}
+
+impl<'p> MappedStageLauncher<'p> {
+    /// Serves `invocations` through `port`, retaining evidence via `sink`.
+    pub fn new(
+        invocations: BTreeMap<String, InstrumentInvocation>,
+        port: &'p dyn InstrumentRequestPort,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Self {
+        Self {
+            invocations,
+            port,
+            sink,
+        }
+    }
+}
+
+impl StageLauncher for MappedStageLauncher<'_> {
+    fn invocation(&self, stage: &PlannedStage) -> Result<InstrumentInvocation, RunnerError> {
+        let stage_id = stage.route.stage().stage_id.as_str();
+        self.invocations.get(stage_id).cloned().ok_or_else(|| {
+            RunnerError::Binding(format!("no admitted invocation for stage '{stage_id}'"))
+        })
+    }
+
+    fn port(&self, _stage: &PlannedStage) -> &dyn InstrumentRequestPort {
+        self.port
+    }
+
+    fn sink(&self, _stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink> {
+        Arc::clone(&self.sink)
+    }
+}
+
+/// Production [`TestdAdmissionPort`] behind the test execution plane (I10.8.15).
+///
+/// External build/test stages resolve through the provider registry first;
+/// this admission records which of them live `eliot-testd` can dispatch
+/// today. Only [`InstrumentKind::Test`] dispatches: every other class keeps
+/// its registry resolution and is reported as the typed
+/// [`TestdPortError::UnsupportedByTestd`] refusal instead of failing the plan.
+pub struct TestdPlaneAdmission;
+
+impl TestdAdmissionPort for TestdPlaneAdmission {
+    fn admit(
+        &self,
+        invocation: &InstrumentInvocation,
+        entry: &RegistryEntry,
+    ) -> Result<TestdAdmission, TestdPortError> {
+        if entry.instrument.as_str() != invocation.instrument.as_str() {
+            return Err(TestdPortError::Registry(RegistryError::Missing {
+                instrument: invocation.instrument.as_str().to_owned(),
+                kind: invocation.kind,
+            }));
+        }
+        if !entry.supports(invocation.kind) {
+            return Err(TestdPortError::Registry(RegistryError::Unsupported {
+                adapter: entry.adapter.clone(),
+                kind: invocation.kind,
+            }));
+        }
+        if !testd_dispatchable(invocation.kind) {
+            return Err(TestdPortError::UnsupportedByTestd {
+                kind: invocation.kind,
+            });
+        }
+        Ok(TestdAdmission::new(invocation.clone(), entry))
     }
 }

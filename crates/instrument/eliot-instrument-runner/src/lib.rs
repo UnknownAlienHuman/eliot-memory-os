@@ -38,8 +38,9 @@ pub use profile::{
     TargetLayout, WorkScope,
 };
 pub use profile_run::{
-    AggregateStatus, InstrumentRun, PlannedStage, ProfileAggregate, ProfileRunError, StageEvidence,
-    StageIdentity, StageLauncher, StageOrchestrator, StagePlan, TestExecutionPlaneRoute,
+    AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
+    ProfileRunError, StageEvidence, StageIdentity, StageLauncher, StageOrchestrator, StagePlan,
+    TestExecutionPlaneRoute, TestdPlaneAdmission,
 };
 pub use registry::{
     ExecutableIdentityCause, ProviderRegistry, RegistryEntry, RegistryError,

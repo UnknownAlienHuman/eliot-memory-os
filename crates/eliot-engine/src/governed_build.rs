@@ -23,10 +23,12 @@ use eliot_contracts::sha256_hex;
 use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_instrument_runner::registry::RegistryFreshness;
 use eliot_instrument_runner::{
-    CacheLaneAttestations, CompiledProfile, InstrumentBinding, InstrumentObservation,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, KernelInstrumentAdmission,
-    KernelInstrumentRequestPort, ProfileCompiler, ProviderRegistry, RegistryEntry,
-    ResolvedExecutableIdentity, RunnerError,
+    AggregateStatus, CacheLaneAttestations, CompiledProfile, InstrumentBinding,
+    InstrumentObservation, InstrumentRegistry, InstrumentRequestPort, InstrumentRunner,
+    KernelInstrumentAdmission, KernelInstrumentRequestPort, ProfileAggregate, ProfileCompiler,
+    ProviderRegistry, RegistryEntry, ResolvedExecutableIdentity, RunnerError, StageLauncher,
+    StageOrchestrator, StagePlan, TestdAdmission, TestdAdmissionPort, TestdPlaneAdmission,
+    TestdPortError,
 };
 use eliot_process::{OperationId, ProcessEvidenceSink, ProcessExecutor};
 use thiserror::Error;
@@ -153,6 +155,13 @@ pub struct GovernedBuildOutcome {
     /// pins the exact revision and stage graph, while quarantined legacy text
     /// carries no governed claim.
     pub profile: CompiledProfile,
+    /// Deterministic stage plan expanded from the governed admission, if any.
+    /// Quarantined legacy text carries no stage graph.
+    pub stage_plan: Option<StagePlan>,
+    /// Test execution plane admission for the launched invocation, if any.
+    /// Cache hits launch nothing and admit nothing; non-test classes resolve
+    /// through the registry and record the typed testd refusal.
+    pub testd_admission: Option<Result<TestdAdmission, TestdPortError>>,
 }
 
 /// Failures that prevent a governed BUILD from returning an artifact.
@@ -198,6 +207,18 @@ pub enum GovernedBuildError {
         expected: String,
         /// Digest of bytes read after the build exited.
         observed: String,
+    },
+    /// A profile DAG run did not reach full success, so it cannot be
+    /// represented as a successful verification result. Missing or failed
+    /// required stages stay visible in the aggregate instead.
+    #[error("governed profile '{profile}' revision {revision} did not succeed: {status:?}")]
+    ProfileNotSuccessful {
+        /// Admitted profile name.
+        profile: String,
+        /// Exact admitted revision.
+        revision: u64,
+        /// Aggregate status; never successful over missing/failed required work.
+        status: AggregateStatus,
     },
 }
 
@@ -270,24 +291,7 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
         }
 
         let invocation = request.invocation.clone();
-        // Route the invocation profile through the single profile compiler
-        // (#1813). Governed admissions pin the exact revision and stage graph
-        // and reject foreign invocation classes; quarantined legacy text
-        // keeps its current behavior with no governed claim.
-        let instrument_registry =
-            InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
-                EngineError::ServiceNotReady {
-                    service: "instrument-profile".to_owned(),
-                    reason: format!("builtin profile registry is unavailable: {error}"),
-                }
-            })?;
-        let compiled = ProfileCompiler::new(&instrument_registry).compile(&invocation.profile);
-        let _admitted = compiled.require_kind(invocation.kind).map_err(|error| {
-            EngineError::ServiceNotReady {
-                service: "instrument-profile".to_owned(),
-                reason: format!("profile compiler rejected the build invocation: {error}"),
-            }
-        })?;
+        let (compiled, stage_plan) = compile_build_plan(&invocation)?;
         let mut attestations = request.attestations.clone();
         let expected =
             valid_digest(&attestations.content_digest).then(|| attestations.content_digest.clone());
@@ -306,6 +310,8 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
                     cache_consulted: true,
                     execution: BuildExecution::CacheHit,
                     profile: compiled.clone(),
+                    stage_plan: stage_plan.clone(),
+                    testd_admission: None,
                 });
             }
             newest_rejection(&before, &self.cache.rejected())
@@ -330,6 +336,10 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
                 service: "cache-derivation".to_owned(),
                 reason: format!("registry rejected the build launch: {error}"),
             })?;
+        // Admit the resolved invocation behind the test execution plane
+        // (#1813). Non-test classes keep their registry resolution and record
+        // the typed testd refusal; nothing here gates the governed launch.
+        let testd_admission = Some(TestdPlaneAdmission.admit(&invocation, entry));
         let (operation_id, observation, bytes) = self.execute_build(&request, entry).await?;
         let observed_digest = sha256_hex(&bytes);
         match expected.as_deref() {
@@ -372,7 +382,61 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
                 observation: Box::new(observation),
             },
             profile: compiled,
+            stage_plan,
+            testd_admission,
         })
+    }
+
+    /// Runs one admitted profile DAG end to end: compile, plan, launch,
+    /// aggregate.
+    ///
+    /// The profile name compiles through the single [`ProfileCompiler`], so
+    /// the same admitted name always resolves to the same revision and stage
+    /// graph. Quarantined legacy text has no stage graph and fails closed
+    /// here; the single-invocation [`GovernedBuildRuntime::run`] path keeps
+    /// serving it. Every planned stage launches through the existing
+    /// [`InstrumentRunner`]/[`ProcessExecutor`](eliot_process::ProcessExecutor)
+    /// composition with caller-supplied [`StageLauncher`] provisions, and the
+    /// returned [`ProfileAggregate`] retains every success, partial-failure,
+    /// missing-stage, and evidence-handle state. A non-successful aggregate
+    /// is refused as an error instead of being representable as successful
+    /// verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernedBuildError::Engine`] when the builtin registry is
+    /// unavailable or the profile quarantines, or
+    /// [`GovernedBuildError::ProfileNotSuccessful`] when the aggregate does
+    /// not reach full success.
+    pub async fn run_profile(
+        &self,
+        profile: &str,
+        launcher: &dyn StageLauncher,
+    ) -> Result<ProfileAggregate, GovernedBuildError> {
+        let instrument_registry =
+            InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
+                EngineError::ServiceNotReady {
+                    service: "instrument-profile".to_owned(),
+                    reason: format!("builtin profile registry is unavailable: {error}"),
+                }
+            })?;
+        let compiled = ProfileCompiler::new(&instrument_registry).compile(profile);
+        let admitted = compiled
+            .admitted()
+            .map_err(|error| EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!("profile execution requires a governed admission: {error}"),
+            })?;
+        let aggregate = self.runner.run_profile_stages(admitted, launcher).await;
+        if aggregate.is_success() {
+            Ok(aggregate)
+        } else {
+            Err(GovernedBuildError::ProfileNotSuccessful {
+                profile: aggregate.profile.clone(),
+                revision: aggregate.revision,
+                status: aggregate.status,
+            })
+        }
     }
 
     async fn execute_build(
@@ -427,6 +491,39 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
             tokio::time::sleep(request.options.poll_interval).await;
         }
     }
+}
+
+/// Compiles the invocation profile through the single profile compiler
+/// and expands the deterministic stage plan from a governed admission.
+///
+/// Governed admissions pin the exact revision and stage graph and reject
+/// foreign invocation classes; quarantined legacy text carries no stage
+/// graph and keeps its current behavior with no governed claim.
+fn compile_build_plan(
+    invocation: &InstrumentInvocation,
+) -> Result<(CompiledProfile, Option<StagePlan>), GovernedBuildError> {
+    // Route the invocation profile through the single profile compiler
+    // (#1813). Governed admissions pin the exact revision and stage graph
+    // and reject foreign invocation classes; quarantined legacy text
+    // keeps its current behavior with no governed claim.
+    let instrument_registry = InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
+        EngineError::ServiceNotReady {
+            service: "instrument-profile".to_owned(),
+            reason: format!("builtin profile registry is unavailable: {error}"),
+        }
+    })?;
+    let compiled = ProfileCompiler::new(&instrument_registry).compile(&invocation.profile);
+    let admitted =
+        compiled
+            .require_kind(invocation.kind)
+            .map_err(|error| EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!("profile compiler rejected the build invocation: {error}"),
+            })?;
+    // Expand the deterministic stage plan from the governed admission.
+    // Quarantined legacy text carries no stage graph.
+    let stage_plan = admitted.map(StageOrchestrator::plan);
+    Ok((compiled, stage_plan))
 }
 
 fn read_artifact(path: &Path) -> Result<Vec<u8>, GovernedBuildError> {
