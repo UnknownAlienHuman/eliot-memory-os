@@ -11,10 +11,11 @@ discovery/classification API owned by issue #929
 (``scripts/serde_boundary_inventory.py`` + generated artifact
 ``crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml``).
 This coordinator implements no inventory scanner and no production decoder: it
-loads rows through the #929 generator/rules as documented and fails closed
-with a precise ``missing file:<line>`` diagnostic when that input is absent.
-Actual decoder behaviour stays tested in the owning Rust packages; no
-production Rust/Cargo/WIT is touched.
+requires the existing source-validating ``check(root)`` exactly once and
+fails closed with a precise cause before evaluating any closure case when
+that checked input is absent or stale. Unchecked stored rows and unvalidated
+rescans are never a fallback. Actual decoder behaviour stays tested in the
+owning Rust packages; no production Rust/Cargo/WIT is touched.
 
 Denominator: exactly cases 1..20 per #710. Cases 1-10 (denominator, unknown
 envelope/nested fields, raw duplicates, variants, tag/payload, defaults,
@@ -49,14 +50,11 @@ ARTIFACT_REL = (
 FIXTURE_DIR_REL = "scripts/testdata/serde-boundary-closure"
 TEST_REL = "scripts/tests/test_audit_serde_boundary_closure.py"
 
-# Public #929 generator/rules entry points this coordinator is documented to
-# call (first available wins). The inventory module is owned by #929; the
-# names below come from that issue's sync/check/artifact contract.
-EXPECTED_INVENTORY_SYMBOLS = (
-    "load_artifact",
-    "iter_candidate_rows",
-    "check",
-)
+# The single #929 generator/rules entry point this coordinator calls. The
+# inventory module is owned by #929; unchecked stored loaders
+# (``load_artifact``) and unvalidated rescans (``iter_candidate_rows``) are
+# never a fallback for the source-validating check.
+REQUIRED_INVENTORY_SYMBOL = "check"
 
 COVERED_DISPOSITIONS = frozenset(
     {"current-closed", "named-legacy", "exact-internal", "specific-owner"}
@@ -88,7 +86,15 @@ BYPASS_SHAPES = frozenset({"flatten", "untagged", "alias", "manual-visitor"})
 
 
 class InventoryUnavailable(Exception):
-    """Raised when #929 input is absent; always carries a file:line pointer."""
+    """Raised when no checked #929 inventory is available; precise cause.
+
+    Causes: ``missing file:`` (a genuinely absent input file),
+    ``stale inventory [CODE]:`` (the surfaced #929 InventoryError
+    code/detail), ``inventory module failure:`` (import failure),
+    ``inventory api failure:`` (missing ``check`` or an unexpected
+    exception), ``inventory contract failure:`` (a malformed ``check``
+    result that neither validates nor silently drops).
+    """
 
 
 @dataclass(frozen=True)
@@ -106,6 +112,28 @@ class InventoryRow:
     digest: str = ""
 
 
+@dataclass(frozen=True)
+class CheckedInventory:
+    """One successful ``check(root)`` binding carried into reconciliation.
+
+    Freshness against current source was decided inside #929's
+    ``validate_against_artifact`` (fresh source/rule/profile/owner-map
+    identities and rows compared with the stored artifact). This object
+    only carries that checked result — the exact rows, the aggregate and
+    denominator identities, the informational base, and the proof
+    ceiling — into the 20 cases and the text/JSON output. It never
+    recomputes source identity and never relabels a copied digest pair
+    as an independent source comparison.
+    """
+
+    rows: tuple[InventoryRow, ...]
+    aggregate_digest: str
+    denominator_digest: str
+    base_sha: str
+    proof_ceiling: str
+    candidate_count: int
+
+
 @dataclass
 class ReconciliationInput:
     """Everything the 20-case coordinator evaluates.
@@ -117,8 +145,9 @@ class ReconciliationInput:
     """
 
     rows: list[InventoryRow] = field(default_factory=list)
-    expected_digest: str = ""
-    actual_digest: str = ""
+    # Successful check(root) binding the evaluated rows were taken from.
+    # None means freshness was never established: case 1 fails closed.
+    inventory: CheckedInventory | None = None
     # candidate_id -> list of positive fixture identities.
     positive_fixtures: dict[str, list[str]] = field(default_factory=dict)
     # candidate_id -> {"raw": bytes/str, "observed": "rejected"|...,
@@ -157,7 +186,15 @@ class ReconciliationResult:
     failed_cases: tuple[int, ...]
     case_results: tuple[CaseResult, ...]
     row_count: int
+    # Digest of this closure result (rows + case verdicts). This is the
+    # closure-result identity only; inventory freshness identity travels
+    # separately in the checked_inventory block below.
     canonical_digest: str
+    inventory_aggregate_digest: str = ""
+    inventory_denominator_digest: str = ""
+    inventory_base_sha: str = ""
+    inventory_proof_ceiling: str = ""
+    inventory_candidate_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,11 +205,35 @@ class ReconciliationResult:
             "failed_cases": list(self.failed_cases),
             "row_count": self.row_count,
             "canonical_digest": self.canonical_digest,
+            "checked_inventory": {
+                "aggregate_digest": self.inventory_aggregate_digest,
+                "denominator_digest": self.inventory_denominator_digest,
+                "base_sha": self.inventory_base_sha,
+                "proof_ceiling": self.inventory_proof_ceiling,
+                "candidate_count": self.inventory_candidate_count,
+            },
             "cases": [
                 {"case": r.case, "passed": r.passed, "detail": r.detail}
                 for r in self.case_results
             ],
         }
+
+
+def blocked_report(cause: str) -> dict[str, Any]:
+    """Freshness-failure report carrying the same cause as the text output.
+
+    No closure case was evaluated, so there is no row count, no
+    closure-result digest, and no case verdict to present as current.
+    """
+    return {
+        "issue": ISSUE,
+        "denominator": list(DENOMINATOR_CASES),
+        "passed": False,
+        "blocked_cause": cause,
+        "row_count": 0,
+        "canonical_digest": "",
+        "cases": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +326,8 @@ def inventory_script_path(root: Path) -> Path:
     return root / INVENTORY_SCRIPT_REL
 
 
-def artifact_path(root: Path) -> Path:
-    return root / ARTIFACT_REL
-
-
 def load_inventory_module(root: Path) -> Any:
-    """Import the #929 generator/rules module or fail closed precisely."""
+    """Import the #929 module and require its callable ``check`` entry."""
     script = inventory_script_path(root)
     if not script.is_file():
         raise InventoryUnavailable(
@@ -283,7 +340,7 @@ def load_inventory_module(root: Path) -> Any:
     )
     if spec is None or spec.loader is None:
         raise InventoryUnavailable(
-            f"missing file: {INVENTORY_SCRIPT_REL}:1 "
+            f"inventory module failure: {INVENTORY_SCRIPT_REL}:1 "
             "(unloadable inventory module; cannot reconcile)"
         )
     module = importlib.util.module_from_spec(spec)
@@ -291,100 +348,158 @@ def load_inventory_module(root: Path) -> Any:
         spec.loader.exec_module(module)
     except Exception as error:
         raise InventoryUnavailable(
-            f"missing file: {INVENTORY_SCRIPT_REL}:1 "
+            f"inventory module failure: {INVENTORY_SCRIPT_REL}:1 "
             f"(inventory module failed to load: {error})"
         ) from error
-    missing = [
-        name for name in EXPECTED_INVENTORY_SYMBOLS if not hasattr(module, name)
-    ]
-    if len(missing) == len(EXPECTED_INVENTORY_SYMBOLS):
+    if not callable(getattr(module, REQUIRED_INVENTORY_SYMBOL, None)):
         raise InventoryUnavailable(
-            f"missing file: {INVENTORY_SCRIPT_REL}:1 "
-            f"(no documented public entry {list(EXPECTED_INVENTORY_SYMBOLS)}; "
-            f"cannot reconcile via #{INVENTORY_ISSUE} API)"
+            f"inventory api failure: {INVENTORY_SCRIPT_REL}:1 "
+            f"(no callable '{REQUIRED_INVENTORY_SYMBOL}(root)'; "
+            "unchecked loaders are not a fallback)"
         )
     return module
 
 
-def load_rows_via_inventory_api(root: Path) -> tuple[list[InventoryRow], str]:
-    """Load candidate rows through the #929 API; fail closed if absent."""
+def _is_inventory_error(error: Exception) -> bool:
+    """Match #929's stable InventoryError contract (code + detail)."""
+    return (
+        type(error).__name__ == "InventoryError"
+        and isinstance(getattr(error, "code", None), str)
+        and isinstance(getattr(error, "detail", None), str)
+    )
+
+
+def load_checked_inventory(root: Path) -> CheckedInventory:
+    """Invoke #929 ``check(root)`` exactly once; refuse anything unchecked.
+
+    No first-available loader probing, no signature probing, no sync: an
+    absent API, an import failure, or any check exception stops
+    current-source closure evaluation before the 20 cases run. A missing
+    or malformed artifact is reported by ``check`` itself through its
+    typed InventoryError, not by a coordinator pre-check.
+    """
     module = load_inventory_module(root)
-    artifact = artifact_path(root)
-    if not artifact.is_file():
+    check = getattr(module, REQUIRED_INVENTORY_SYMBOL)
+    try:
+        result = check(root)
+    except Exception as error:
+        if _is_inventory_error(error):
+            raise InventoryUnavailable(
+                f"stale inventory [{error.code}]: {error.detail}"
+            ) from error
         raise InventoryUnavailable(
-            f"missing file: {ARTIFACT_REL}:1 "
-            f"(shipped inventory artifact owned by #{INVENTORY_ISSUE}; "
-            "run its accepted sync before reconciliation)"
+            f"inventory api failure: {INVENTORY_SCRIPT_REL}:1 "
+            f"('{REQUIRED_INVENTORY_SYMBOL}(root)' raised "
+            f"{type(error).__name__}: {error})"
+        ) from error
+    return _validate_checked_result(result)
+
+
+def _validate_checked_result(result: Any) -> CheckedInventory:
+    """Validate ``check(root)``'s exact contract without rescanning source.
+
+    Rejects malformed result/row shapes, missing or duplicate
+    identities, digest mismatch between the result and its header, and
+    header counts inconsistent with the returned rows. Legitimate
+    unknown/needs-repair rows pass through untouched: #929's
+    classification stays authoritative and this adapter replaces none
+    of it.
+    """
+    if not isinstance(result, Mapping):
+        raise InventoryUnavailable(
+            "inventory contract failure: check(root) returned "
+            f"{type(result).__name__}, expected a mapping with "
+            "rows/digest/header"
         )
-    for name in EXPECTED_INVENTORY_SYMBOLS:
-        func = getattr(module, name, None)
-        if callable(func):
-            try:
-                loaded = func(root) if name != "check" else func(root)
-            except TypeError:
-                try:
-                    loaded = func(str(root))
-                except Exception as error:
-                    raise InventoryUnavailable(
-                        f"missing file: {INVENTORY_SCRIPT_REL}:1 "
-                        f"(inventory entry '{name}' failed: {error})"
-                    ) from error
-            except Exception as error:
-                raise InventoryUnavailable(
-                    f"missing file: {INVENTORY_SCRIPT_REL}:1 "
-                    f"(inventory entry '{name}' failed: {error})"
-                ) from error
-            rows = _coerce_rows(loaded)
-            digest = _digest_rows(rows)
-            return rows, digest
-    raise InventoryUnavailable(
-        f"missing file: {INVENTORY_SCRIPT_REL}:1 "
-        "(no callable documented inventory entry; cannot reconcile)"
-    )
-
-
-def _coerce_rows(loaded: Any) -> list[InventoryRow]:
+    rows_raw = result.get("rows")
+    if not isinstance(rows_raw, list):
+        raise InventoryUnavailable(
+            "inventory contract failure: check(root) result has no rows list"
+        )
+    digest = result.get("digest")
+    if not isinstance(digest, str) or not digest:
+        raise InventoryUnavailable(
+            "inventory contract failure: check(root) result has no "
+            "aggregate digest"
+        )
+    header = result.get("header")
+    if not isinstance(header, Mapping):
+        raise InventoryUnavailable(
+            "inventory contract failure: check(root) result has no header "
+            "mapping"
+        )
+    if header.get("aggregate_digest") != digest:
+        raise InventoryUnavailable(
+            "inventory contract failure: result digest does not match "
+            "header aggregate_digest"
+        )
+    denominator = header.get("denominator_digest")
+    if not isinstance(denominator, str) or not denominator:
+        raise InventoryUnavailable(
+            "inventory contract failure: header has no denominator_digest"
+        )
+    candidate_count = header.get("candidate_count")
+    if not isinstance(candidate_count, int) or candidate_count != len(rows_raw):
+        raise InventoryUnavailable(
+            "inventory contract failure: header candidate_count "
+            f"{candidate_count!r} != returned rows {len(rows_raw)}"
+        )
+    base_sha = header.get("base_sha")
+    if not isinstance(base_sha, str):
+        raise InventoryUnavailable(
+            "inventory contract failure: header has no base_sha"
+        )
+    proof_ceiling = header.get("proof_ceiling")
+    if not isinstance(proof_ceiling, str):
+        raise InventoryUnavailable(
+            "inventory contract failure: header has no proof_ceiling"
+        )
     rows: list[InventoryRow] = []
-    candidates: Any = loaded
-    if isinstance(loaded, Mapping):
-        for key in ("rows", "candidates", "items"):
-            if isinstance(loaded.get(key), list):
-                candidates = loaded[key]
-                break
-    if not isinstance(candidates, list):
-        return rows
-    for entry in candidates:
-        if isinstance(entry, InventoryRow):
-            rows.append(entry)
-        elif isinstance(entry, Mapping):
-            cid = str(entry.get("candidate_id") or entry.get("id") or "")
-            if cid:
-                rows.append(
-                    InventoryRow(
-                        candidate_id=cid,
-                        disposition=str(entry.get("disposition", "")),
-                        owner=str(entry.get("owner", "")),
-                        digest=str(entry.get("digest", "")),
-                    )
-                )
-    return rows
-
-
-def _digest_rows(rows: Sequence[InventoryRow]) -> str:
-    payload = json.dumps(
-        [
-            {
-                "candidate_id": r.candidate_id,
-                "disposition": r.disposition,
-                "owner": r.owner,
-                "digest": r.digest,
-            }
-            for r in sorted(rows, key=lambda r: r.candidate_id)
-        ],
-        sort_keys=True,
-        separators=(",", ":"),
+    seen: set[str] = set()
+    for entry in rows_raw:
+        if not isinstance(entry, Mapping):
+            raise InventoryUnavailable(
+                "inventory contract failure: row is "
+                f"{type(entry).__name__}, expected a mapping"
+            )
+        cid = entry.get("candidate_id") or entry.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise InventoryUnavailable(
+                "inventory contract failure: row without candidate identity"
+            )
+        if cid in seen:
+            raise InventoryUnavailable(
+                f"inventory contract failure: duplicate row {cid}"
+            )
+        seen.add(cid)
+        disposition = entry.get("disposition")
+        owner = entry.get("owner")
+        row_digest = entry.get("digest")
+        if (
+            not isinstance(disposition, str)
+            or not isinstance(owner, str)
+            or not isinstance(row_digest, str)
+        ):
+            raise InventoryUnavailable(
+                f"inventory contract failure: row {cid} has malformed "
+                "disposition/owner/digest"
+            )
+        rows.append(
+            InventoryRow(
+                candidate_id=cid,
+                disposition=disposition,
+                owner=owner,
+                digest=row_digest,
+            )
+        )
+    return CheckedInventory(
+        rows=tuple(rows),
+        aggregate_digest=digest,
+        denominator_digest=denominator,
+        base_sha=base_sha,
+        proof_ceiling=proof_ceiling,
+        candidate_count=candidate_count,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +508,37 @@ def _digest_rows(rows: Sequence[InventoryRow]) -> str:
 
 
 def evaluate_case_01_denominator(data: ReconciliationInput) -> CaseResult:
-    """Case 1: exact 1..20 denominator; stale digests invalidate."""
-    if not data.expected_digest or not data.actual_digest:
-        return CaseResult(1, False, "case-01: missing expected/actual digest")
-    if data.expected_digest != data.actual_digest:
+    """Case 1: closure evaluates only over a checked inventory binding.
+
+    Freshness against current source was decided inside #929 ``check``
+    (``validate_against_artifact``); this case asserts that the binding
+    is present and internally consistent instead of comparing a copied
+    digest pair as if it were an independent source comparison.
+    """
+    binding = data.inventory
+    if binding is None:
         return CaseResult(
-            1, False, "case-01: source/inventory/profile change invalidated"
+            1, False, "case-01: no checked inventory binding; freshness "
+            "unevaluated"
         )
-    return CaseResult(1, True, "case-01: denominator 1..20 with fresh digest")
+    if not binding.aggregate_digest or not binding.denominator_digest:
+        return CaseResult(
+            1,
+            False,
+            "case-01: checked binding lacks aggregate/denominator identity",
+        )
+    if binding.candidate_count != len(data.rows):
+        return CaseResult(
+            1,
+            False,
+            "case-01: binding count does not match evaluated rows",
+        )
+    return CaseResult(
+        1,
+        True,
+        f"case-01: denominator 1..20 over checked inventory "
+        f"{binding.aggregate_digest[:16]} ({binding.candidate_count} rows)",
+    )
 
 
 def evaluate_case_02_assignment(data: ReconciliationInput) -> CaseResult:
@@ -855,6 +993,7 @@ def reconcile(data: ReconciliationInput) -> ReconciliationResult:
         separators=(",", ":"),
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    binding = data.inventory
     return ReconciliationResult(
         passed=not failed,
         passed_count=sum(1 for r in results if r.passed),
@@ -862,15 +1001,26 @@ def reconcile(data: ReconciliationInput) -> ReconciliationResult:
         case_results=results,
         row_count=len(data.rows),
         canonical_digest=digest,
+        inventory_aggregate_digest=binding.aggregate_digest
+        if binding is not None
+        else "",
+        inventory_denominator_digest=binding.denominator_digest
+        if binding is not None
+        else "",
+        inventory_base_sha=binding.base_sha if binding is not None else "",
+        inventory_proof_ceiling=binding.proof_ceiling
+        if binding is not None
+        else "",
+        inventory_candidate_count=binding.candidate_count
+        if binding is not None
+        else 0,
     )
 
 
 def audit(root: Path) -> ReconciliationResult:
-    """Read-only reconciliation against current #929 inputs (fails closed)."""
-    rows, digest = load_rows_via_inventory_api(root)
-    data = ReconciliationInput(
-        rows=rows, expected_digest=digest, actual_digest=digest
-    )
+    """Read-only reconciliation against checked #929 input (fails closed)."""
+    binding = load_checked_inventory(root)
+    data = ReconciliationInput(rows=list(binding.rows), inventory=binding)
     return reconcile(data)
 
 
@@ -893,10 +1043,17 @@ def build_self_test_input() -> ReconciliationInput:
     unknown_raw = b'{"id":"1","bogus_field":true}'
     duplicate_raw = b'{"id":"1","id":"2"}'
     agreement_digest = hashlib.sha256(b"self-test").hexdigest()
+    binding = CheckedInventory(
+        rows=tuple(rows),
+        aggregate_digest="selftest-aggregate",
+        denominator_digest="selftest-denominator",
+        base_sha="selftest-base",
+        proof_ceiling="SOURCE_INVENTORY_AND_OWNERSHIP_ONLY",
+        candidate_count=len(rows),
+    )
     return ReconciliationInput(
         rows=rows,
-        expected_digest="selftest",
-        actual_digest="selftest",
+        inventory=binding,
         positive_fixtures={cid: ["selftest-positive-1"]},
         unknown_envelope={
             cid: {
@@ -989,6 +1146,13 @@ def print_human(result: ReconciliationResult) -> None:
     status = "PASS" if result.passed else "FAIL"
     print(f"SERDE_BOUNDARY_CLOSURE: {status}")
     print(f"rows: {result.row_count}")
+    if result.inventory_aggregate_digest:
+        print(
+            f"inventory: aggregate={result.inventory_aggregate_digest[:16]} "
+            f"denominator={result.inventory_denominator_digest[:16]} "
+            f"base={result.inventory_base_sha} "
+            f"ceiling={result.inventory_proof_ceiling}"
+        )
     print(f"cases: {result.passed_count}/20 passed")
     if result.failed_cases:
         print(f"failed: {list(result.failed_cases)}")
@@ -1004,7 +1168,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = audit(root)
     except InventoryUnavailable as error:
-        print(f"SERDE_BOUNDARY_CLOSURE: BLOCKED: {error}", file=sys.stderr)
+        cause = str(error)
+        print(f"SERDE_BOUNDARY_CLOSURE: BLOCKED: {cause}", file=sys.stderr)
+        if args.json_out is not None:
+            args.json_out.write_text(
+                json.dumps(blocked_report(cause), indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
         return 2
     print_human(result)
     if args.json_out is not None:
