@@ -402,6 +402,8 @@ pub enum TransportError {
     SessionFenced,
     #[error("transport queue is full")]
     Backpressure,
+    #[error("transport capacity is exhausted: {0:?}")]
+    AttributedBackpressure(BackpressureSignal),
     #[error("transport operation timed out")]
     Timeout,
     #[error("transport operation was cancelled")]
@@ -425,14 +427,15 @@ pub enum TransportError {
     RegistryFull,
 }
 
-/// One named exhaustible dimension behind [`TransportError::Backpressure`]
-/// (issue #2731, item 6; I14.3 multidimensional reserve accounting).
+/// One named exhaustible dimension carried by
+/// [`TransportError::AttributedBackpressure`] (issue #2731, item 6; I14.3
+/// multidimensional reserve accounting).
 ///
-/// The [`TransportError::Backpressure`] variant itself stays a bare unit so
-/// every existing producer and exhaustive consumer keeps compiling:
-/// saturation sites that know their exact resource name it with one of the
-/// canonical [`BackpressureSignal`] constants below, while a bare error
-/// observed at the transport seam attributes only the dispatch lane through
+/// The bare [`TransportError::Backpressure`] remains available to existing
+/// non-event and unattributed callers. A producer that knows the exhausted
+/// resource uses [`TransportError::AttributedBackpressure`] with one of the
+/// canonical [`BackpressureSignal`] constants below. A bare error observed at
+/// the transport seam attributes only the dispatch lane through
 /// [`TransportError::backpressure_signal`]. Each signal names the exhausted
 /// resource, the permitted recovery action, and the shed, deferred, or
 /// quarantined work — never an authentication failure.
@@ -536,6 +539,7 @@ impl TransportError {
     pub const fn backpressure_signal(&self) -> Option<BackpressureSignal> {
         match self {
             TransportError::Backpressure => Some(BACKPRESSURE_BRIDGE_DISPATCH),
+            TransportError::AttributedBackpressure(signal) => Some(*signal),
             _ => None,
         }
     }

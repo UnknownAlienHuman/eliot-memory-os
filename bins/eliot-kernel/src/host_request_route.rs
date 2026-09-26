@@ -3500,7 +3500,9 @@ impl KernelComposition {
         match event.delivery_class {
             DeliveryClass::DurableControl | DeliveryClass::DurableObservation => {
                 if degraded {
-                    return Err(TransportError::Backpressure);
+                    return Err(TransportError::AttributedBackpressure(
+                        eliot_ipc::BACKPRESSURE_KERNEL_DEGRADED,
+                    ));
                 }
                 let evidence = bridge_owner_evidence(session, frame_fence)?;
                 self.stage_bridge_event_durable(
@@ -3563,10 +3565,7 @@ impl KernelComposition {
             .get("redacted_classes")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let redaction_reason = privacy
-            .get("redaction_reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        let redaction_reason = privacy["redaction_reason"].as_str().unwrap_or("");
         let staged = serde_json::json!({
             "stream_id": event.stream_id,
             "event_id": event.event_id,
@@ -3587,11 +3586,11 @@ impl KernelComposition {
             "owner_launch_nonce": evidence.launch_nonce,
             "owner_session_epoch": evidence.session_epoch,
         });
-        let outcome = self
+        let outcome = match self
             .generation_gateway
             .ors
-            .stage_bridge_event_checked(&staged);
-        let outcome = match outcome {
+            .stage_bridge_event_checked(&staged)
+        {
             Ok(outcome) => outcome,
             Err(OrsError::DuplicateConflict) => {
                 // Changed bytes under a known identity are a
@@ -3611,9 +3610,12 @@ impl KernelComposition {
                     &event.event_id,
                 ));
             }
-            Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
-                return Err(TransportError::Backpressure);
+            Err(OrsError::PayloadTooLarge) => {
+                return Err(TransportError::AttributedBackpressure(
+                    eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
+                ));
             }
+            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
             Err(_) => return Err(TransportError::SessionFenced),
         };
         // An elapsed absolute deadline is staged honestly, then
@@ -3745,7 +3747,9 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
             KernelServiceState::Ready
         ) {
-            return Err(TransportError::Backpressure);
+            return Err(TransportError::AttributedBackpressure(
+                eliot_ipc::BACKPRESSURE_KERNEL_DEGRADED,
+            ));
         }
         let _ = session;
         Ok(serde_json::json!({
