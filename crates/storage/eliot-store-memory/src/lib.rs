@@ -38,14 +38,14 @@ use eliot_store_api::{
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    bind_issue18_receipt, canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
-    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
-    decode_resource_content, generated_operation_manifests, genesis_manifest, genesis_transition,
-    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_automation_read_params,
-    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    audit_heads_digest, bind_issue18_receipt, canonical_json_bytes, canonical_request_hash,
+    decode_automation_mutation, decode_erasure_surfaces, decode_notification_mutation,
+    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
+    genesis_manifest, genesis_transition, is_genesis_fence, issue_genesis_receipt_envelope,
+    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
+    validate_automation_read_params, validate_genesis_receipt_envelope,
+    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
+    validate_store_receipt_envelope, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -1895,9 +1895,11 @@ fn audit_range_payload(
 /// is defense in depth, never a distinct dispatch outcome. `list` projects
 /// same-fence current pointers in automation-id order (retired excluded
 /// unless requested); `current` projects one pointer or explicit absence;
-/// `history` projects the bounded verbatim revision set; `invocations`
-/// projects the bounded verbatim invocation set; `failure` projects the
-/// last same-fence failure row or explicit absence.
+/// `history` and `invocations` project the bounded verbatim row set plus the
+/// owner-issued `completeness` metadata (read revision and `COMPLETE` /
+/// `TRUNCATED` coverage) that proves whether the page exhausts the declared
+/// denominator; `failure` projects the last same-fence failure row or
+/// explicit absence.
 #[allow(clippy::too_many_lines)]
 fn automation_state_payload(
     state: &MemoryState,
@@ -1966,6 +1968,7 @@ fn automation_state_payload(
                 serde_json::Error::custom("exact automation selector is required")
             })?;
             let mut revisions = Vec::new();
+            let mut truncated = false;
             if let Some(requested_revision) = decoded.requested_revision.as_deref() {
                 if let Some(row) = state.automation_revisions.values().find(|row| {
                     row.automation_id == id
@@ -1983,7 +1986,11 @@ fn automation_state_payload(
                     if row.automation_id != id || row.state_fence != *fence {
                         continue;
                     }
-                    if revisions.len() >= limit {
+                    // One probe row past the bound decides owner-proven
+                    // completeness: a page that merely happens to be shorter
+                    // than the bound is not proof that no later row exists.
+                    if revisions.len() > limit {
+                        truncated = true;
                         break;
                     }
                     revisions.push(json!({
@@ -1992,11 +1999,16 @@ fn automation_state_payload(
                         "revision_json": row.revision_json,
                     }));
                 }
+                if truncated {
+                    revisions.pop();
+                }
             }
+            let returned = revisions.len();
             serde_json::to_value(json!({
                 "revisions": revisions,
-                "revision": revisions.len(),
+                "revision": returned,
                 "state_fence": fence,
+                "completeness": automation_page_completeness(state, returned, truncated)?,
             }))
         }
         AUTOMATION_QUERY_INVOCATIONS => {
@@ -2022,6 +2034,12 @@ fn automation_state_payload(
 }
 
 /// Projects the bounded same-fence invocation set for one automation.
+///
+/// The bound plus one probe row decides owner-proven coverage: `truncated`
+/// stays false only when the owner read past the bound and matched no further
+/// same-fence row. `completeness` carries that proof together with the
+/// owner-issued read revision, so a consumer can never read a short first
+/// page as a complete denominator.
 fn automation_invocations_payload(
     state: &MemoryState,
     fence: &StateFence,
@@ -2030,6 +2048,7 @@ fn automation_invocations_payload(
     requested_occurrence_id: Option<&str>,
 ) -> Result<Value, serde_json::Error> {
     let mut invocations = Vec::new();
+    let mut truncated = false;
     for row in state.automation_invocations.values() {
         if row.automation_id != automation_id || row.state_fence != *fence {
             continue;
@@ -2037,7 +2056,8 @@ fn automation_invocations_payload(
         if requested_occurrence_id.is_some_and(|occurrence_id| row.occurrence_id != occurrence_id) {
             continue;
         }
-        if invocations.len() >= limit {
+        if invocations.len() > limit {
+            truncated = true;
             break;
         }
         invocations.push(json!({
@@ -2046,10 +2066,42 @@ fn automation_invocations_payload(
             "invocation_json": row.invocation_json,
         }));
     }
+    if truncated {
+        invocations.pop();
+    }
+    let returned = invocations.len();
     serde_json::to_value(json!({
         "invocations": invocations,
-        "revision": invocations.len(),
+        "revision": returned,
         "state_fence": fence,
+        "completeness": automation_page_completeness(state, returned, truncated)?,
+    }))
+}
+
+/// Builds the owner-issued denominator completeness metadata for one page.
+///
+/// `read_revision` digests the exact revision-head set this read observed
+/// through the store-api head digest, so it is owner-issued rather than a
+/// caller claim, and it changes whenever a commit advances any head (a new
+/// occurrence, a retirement, or an edit). `coverage` is the closed
+/// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts that the owner read
+/// one probe row past the bound and matched nothing further.
+fn automation_page_completeness(
+    state: &MemoryState,
+    returned: usize,
+    truncated: bool,
+) -> Result<Value, serde_json::Error> {
+    let heads: Vec<(String, u64)> = state
+        .revision_heads
+        .values()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let read_revision = audit_heads_digest(&heads)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    Ok(json!({
+        "read_revision": read_revision,
+        "returned": returned,
+        "coverage": if truncated { "TRUNCATED" } else { "COMPLETE" },
     }))
 }
 

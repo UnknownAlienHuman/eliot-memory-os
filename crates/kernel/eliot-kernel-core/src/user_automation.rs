@@ -1155,21 +1155,82 @@ impl AutomationExecutionReference {
     }
 }
 
+/// Why one automation occurrence still carries an unresolved effect
+/// obligation (I14.21, I5.16).
+///
+/// The disposition of a stored occurrence is never inferred from the absence
+/// of a closure or coverage record: an occurrence whose owner-issued evidence
+/// cannot be read, or one whose denominator could not be proven complete,
+/// keeps an explicit typed obligation instead of silently reading as "no
+/// effect".
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AutomationReconciliationCause {
+    /// The admitting canonical operation has no committed receipt, or its
+    /// committed receipt still requires a reconciliation envelope.
+    UnresolvedOperation,
+    /// The stored invocation row carries no usable owner-issued invocation
+    /// document (absent, legacy, or malformed). I5.16: absence of a coverage
+    /// record is `unknown`, not unrestricted/complete.
+    MissingInvocationEvidence,
+    /// The stored invocation document carries no owner-issued provenance, so
+    /// the admitting canonical operation cannot be resolved for this row.
+    MissingInvocationProvenance,
+    /// The canonical receipt lookup for the admitting operation could not be
+    /// read; the effect disposition is unknown, not absent.
+    ReceiptEvidenceUnavailable,
+    /// The declared occurrence denominator was not owner-proven complete at
+    /// the read revision, so later occurrences may still carry unresolved
+    /// effects that are not represented inline.
+    IncompleteDenominator,
+}
+
 /// Existing reconciliation obligation for an uncertain effect.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomationReconciliationReference {
-    /// Occurrence whose effect remains uncertain.
+    /// Occurrence whose effect remains uncertain, or the exact automation
+    /// denominator identity when the obligation is denominator coverage
+    /// rather than one occurrence.
     pub occurrence_id: String,
-    /// Existing ORS/reconciliation operation reference.
+    /// Existing ORS/reconciliation operation reference, or the actionable
+    /// migration reference for a row whose owner evidence is unusable. It
+    /// never claims a committed or failed outcome that was not observed.
     pub operation_ref: String,
+    /// Typed reason this obligation exists.
+    pub cause: AutomationReconciliationCause,
+    /// Owner-issued read revision the occurrence denominator was read at.
+    /// Every obligation in one projection carries the same value, so Status,
+    /// History, preflight and Remove answer from one denominator revision.
+    pub read_revision: String,
+    /// Durable owner query handle that enumerates the rest of the declared
+    /// denominator. Present exactly when coverage is not owner-proven.
+    pub denominator_query_ref: Option<String>,
 }
 
 impl AutomationReconciliationReference {
     /// Validates one reconciliation reference.
+    ///
+    /// The durable denominator handle is required exactly for
+    /// [`AutomationReconciliationCause::IncompleteDenominator`]: an
+    /// unrepresented remainder of the denominator must remain addressable
+    /// after retirement, and a per-occurrence obligation must not carry a
+    /// collection handle that implies more rows.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         text(&self.occurrence_id, "reconciliation.occurrence_id")?;
-        text(&self.operation_ref, "reconciliation.operation_ref")
+        text(&self.operation_ref, "reconciliation.operation_ref")?;
+        text(&self.read_revision, "reconciliation.read_revision")?;
+        let handle_is_expected =
+            self.cause == AutomationReconciliationCause::IncompleteDenominator;
+        if handle_is_expected != self.denominator_query_ref.is_some() {
+            return Err(UserAutomationError::Invalid(
+                "reconciliation.denominator_query_ref",
+            ));
+        }
+        if let Some(handle) = &self.denominator_query_ref {
+            text(handle, "reconciliation.denominator_query_ref")?;
+        }
+        Ok(())
     }
 }
 
@@ -1187,6 +1248,12 @@ pub struct UserAutomationExecutionProjection {
 
 impl UserAutomationExecutionProjection {
     /// Validates projection shape and retains unknown outcomes as obligations.
+    ///
+    /// Every retained obligation must also agree on one owner-issued
+    /// denominator read revision. Two revisions in one projection mean the
+    /// read raced a successor commit or retirement, so the set was assembled
+    /// from two snapshots and fails closed instead of answering as one
+    /// complete denominator.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         list_len(
             self.current_execution_refs.len(),
@@ -1199,8 +1266,18 @@ impl UserAutomationExecutionProjection {
             self.unresolved_reconciliation_refs.len(),
             "execution.unresolved_reconciliation_refs",
         )?;
+        let mut read_revision: Option<&str> = None;
         for reconciliation in &self.unresolved_reconciliation_refs {
             reconciliation.validate()?;
+            match read_revision {
+                None => read_revision = Some(reconciliation.read_revision.as_str()),
+                Some(observed) if observed == reconciliation.read_revision => {}
+                Some(_) => {
+                    return Err(UserAutomationError::Invalid(
+                        "execution.unresolved_reconciliation_refs",
+                    ));
+                }
+            }
         }
         text(&self.history_query_ref, "execution.history_query_ref")
     }
@@ -1214,6 +1291,10 @@ impl UserAutomationExecutionProjection {
     }
 
     /// Returns whether an effect must be reconciled before a new admission.
+    ///
+    /// An unproven occurrence denominator is itself an obligation, so an
+    /// incomplete or unreadable denominator reads as blocking rather than as
+    /// "no reconciliation obligation" (I5.16).
     #[must_use]
     pub fn requires_reconciliation(&self) -> bool {
         !self.unresolved_reconciliation_refs.is_empty()

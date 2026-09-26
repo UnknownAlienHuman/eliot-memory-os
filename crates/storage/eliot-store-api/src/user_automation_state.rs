@@ -27,6 +27,29 @@
 //! row immutability. Read queries mirror the domain `UserAutomationQueryKind`
 //! minus `Preflight` (B-owned config projection per the frozen domain
 //! `USER_AUTOMATION_PREFLIGHT_SELECTOR`).
+//!
+//! Paged denominator completeness (issue #2808). The bounded `history` and
+//! `invocations` page payloads additionally carry one owner-issued
+//! `completeness` object, so a consumer can never read a bounded first page
+//! as a complete invocation denominator:
+//!
+//! ```text
+//! completeness = {
+//!   read_revision: <lowercase SHA-256 hex digest of the sorted
+//!                   (revision-head key, revision) set this read observed>;
+//!   returned:      <rows carried by this page>;
+//!   coverage:      "COMPLETE" | "TRUNCATED";
+//! }
+//! ```
+//!
+//! `COMPLETE` is an owner proof, not a page-length observation: the owner
+//! read one probe row past `max_records` and matched no further same-fence
+//! row of the declared denominator. A page shorter than `max_records` is
+//! never completeness by itself. `read_revision` changes whenever a commit
+//! advances any revision head, so a new occurrence, an edit, or a retirement
+//! all belong to a successor read and a page can never be presented as
+//! current under a stale denominator. Absence of the object is `unknown`,
+//! never unrestricted/complete (I5.16).
 
 use std::collections::BTreeMap;
 
