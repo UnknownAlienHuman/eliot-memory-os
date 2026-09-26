@@ -5136,6 +5136,11 @@ pub struct ScanDisclosureOrsRecord {
     pub host_generation_ref: String,
     /// Discovery lease identity this scan consumed.
     pub lease_ref: String,
+    /// Discovery lease consumption units already consumed when the owner
+    /// issued the write binding: the lease operation window this write rode
+    /// on. Part of the canonical request hash, so the same key with a
+    /// different consumption window conflicts.
+    pub lease_consumed: u64,
     /// Candidate root this scan covered.
     pub candidate_root_ref: String,
     /// Privacy boundary admitted for this scan.
@@ -5180,6 +5185,7 @@ impl ScanDisclosureOrsRecord {
             && self.session_ref == other.session_ref
             && self.host_generation_ref == other.host_generation_ref
             && self.lease_ref == other.lease_ref
+            && self.lease_consumed == other.lease_consumed
             && self.candidate_root_ref == other.candidate_root_ref
             && self.privacy_boundary_ref == other.privacy_boundary_ref
             && self.state_fence_ref == other.state_fence_ref

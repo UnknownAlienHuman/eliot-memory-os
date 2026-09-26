@@ -622,6 +622,12 @@ pub struct ScanDisclosureOwnerBinding {
     pub authority_epoch_ref: Option<String>,
     pub operation_id: String,
     pub idempotency_key: String,
+    /// Discovery lease consumption units already consumed when the owner
+    /// issued this binding. [`BootstrapScanner::scan`] charges the lease
+    /// before the write and refuses a binding that claims more consumption
+    /// than the lease shows, so the write identity always names the lease
+    /// operation window it rode on.
+    pub lease_consumed: u64,
     pub policy_revision: u64,
     pub deadline: u64,
 }
@@ -660,7 +666,9 @@ impl ScanDisclosureOwnerBinding {
         counter(self.deadline, "scan_binding.deadline")?;
         Ok(())
     }
-
+    ///
+    /// Derived from the installation identity alone: the durable owner, not
+    /// the caller, owns the storage contour behind it.
     /// Owner/store identity this binding authorizes writes against.
     ///
     /// Derived from the installation identity alone: the durable owner, not
@@ -684,14 +692,15 @@ impl ScanDisclosureOwnerBinding {
     ///
     /// The encoding is deterministic and versioned: domain separator,
     /// installation, idempotency namespace, encoding version, receipt digest,
-    /// principal/scope binding, operation identity and retention window all
-    /// feed the hash, so reusing an idempotency key with different content
-    /// conflicts instead of overwriting.
+    /// principal/scope binding, lease identity and consumed operation,
+    /// operation identity and retention window all feed the hash, so reusing
+    /// an idempotency key with different content conflicts instead of
+    /// overwriting.
     #[must_use]
     pub fn request_hash(&self, receipt_digest: &str, schema_version: u32) -> String {
         sha256_hex(
             format!(
-                "{domain}\n{idempotency_namespace}\n{encoding_version}\n{installation}\n{receipt_digest}\n{principal}:{session}:{host}:{lease}:{root}:{boundary}\n{fence}:{epoch}\n{operation}:{idempotency}\n{policy}:{deadline}\n{schema_version}",
+                "{domain}\n{idempotency_namespace}\n{encoding_version}\n{installation}\n{receipt_digest}\n{principal}:{session}:{host}:{lease}:{lease_consumed}:{root}:{boundary}\n{fence}:{epoch}\n{operation}:{idempotency}\n{policy}:{deadline}\n{schema_version}",
                 domain = SCAN_DISCLOSURE_OPERATION_DOMAIN,
                 idempotency_namespace = self.operation_key(),
                 encoding_version = SCAN_DISCLOSURE_SCHEMA_VERSION,
@@ -700,6 +709,7 @@ impl ScanDisclosureOwnerBinding {
                 session = self.session_ref,
                 host = self.host_generation_ref,
                 lease = self.lease_ref,
+                lease_consumed = self.lease_consumed,
                 root = self.candidate_root_ref,
                 boundary = self.privacy_boundary_ref,
                 fence = self.state_fence_ref.as_deref().unwrap_or("-"),
@@ -1315,6 +1325,9 @@ impl BootstrapScanner {
             privacy_boundary_ref: Some(boundary.boundary_ref.clone()),
         };
         receipt.validate()?;
+        if binding.lease_consumed > u64::from(lease.consumed) {
+            return Err(WorkScopeError::ScanContourNotAdmitted);
+        }
         let bytes =
             canonical_json_bytes(&receipt).map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
         let receipt_digest = sha256_hex(&bytes);
