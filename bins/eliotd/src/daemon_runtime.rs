@@ -1305,6 +1305,31 @@ fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressPro
     }
 }
 
+/// Builds the sanitized maintenance observation for one wired trigger site.
+///
+/// Shared by every trigger arm so each one names the same self-observed family
+/// and passes its evidence identities through the shared diagnostics sanitizer:
+/// a trigger can never carry control characters, secrets, or unbounded detail
+/// into the evaluator's own field validation. The family is the one
+/// self-observed family this daemon can honestly name today; the registered
+/// per-observation family catalog is #1693's to supply.
+fn maintenance_observation(
+    origin: MaintenanceTriggerOrigin,
+    evidence_refs: Vec<String>,
+    activation_in_flight: bool,
+) -> MaintenanceObservation {
+    let evidence_refs = evidence_refs
+        .iter()
+        .map(|reference| eliotd::diagnostics::sanitize_identity(reference))
+        .collect();
+    MaintenanceObservation {
+        origin,
+        family: SELF_OBSERVED_FAMILY,
+        evidence_refs,
+        activation_in_flight,
+    }
+}
+
 /// Runs one Governor maintenance trigger evaluation from a real durable
 /// trigger site (I14.22, issue #1688).
 ///
@@ -1315,28 +1340,17 @@ fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressPro
 /// startup gate, a readiness gate, or a daemon-killing error. I14.22 keeps an
 /// unevaluable trigger durable and surfaces it on the next eligible startup
 /// rather than dropping it.
-///
-/// Evidence identities are passed through the shared diagnostics sanitizer so
-/// a trigger can never carry control characters, secrets or unbounded detail
-/// into the evaluator's own field validation. The family is the one
-/// self-observed family this daemon can honestly name today; the registered
-/// per-observation family catalog is #1693's to supply.
 fn note_maintenance_trigger_at(
     composition: &DaemonComposition,
     origin: MaintenanceTriggerOrigin,
     evidence_refs: Vec<String>,
     activation_in_flight: bool,
 ) {
-    let evidence_refs = evidence_refs
-        .iter()
-        .map(|reference| eliotd::diagnostics::sanitize_identity(reference))
-        .collect();
-    composition.note_maintenance_trigger(MaintenanceObservation {
+    composition.note_maintenance_trigger(maintenance_observation(
         origin,
-        family: SELF_OBSERVED_FAMILY,
         evidence_refs,
         activation_in_flight,
-    });
+    ));
 }
 
 /// Evaluates the idle trigger from the activation-poll cadence branch.
@@ -1355,6 +1369,51 @@ async fn note_idle_maintenance_trigger(composition: &SharedComposition, flight: 
         vec![format!("activation_in_flight={activation_in_flight}")],
         activation_in_flight,
     );
+}
+
+/// Submits one owner-side canonical notification for a blocked automation
+/// decision (issue #1780, I11.5).
+///
+/// I11.5 makes the persistent record the durable obligation and delivery only
+/// the presentation, so a refused emission is an explicit typed gap recorded
+/// through the existing minimal operational diagnostics — never a silent drop
+/// and never a daemon-killing error. The heartbeat's own liveness obligations
+/// (the Kernel health poll and the supervision submit below) are unaffected by
+/// it, which is exactly the A13.8 visible-degradation contract: the daemon
+/// stays alive and observable while the operator can see the refusal.
+async fn note_blocked_automation_notification(
+    kernel: &Arc<DaemonKernelClient>,
+    fence: eliot_contracts::StateFence,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) {
+    match eliotd::notification_state_emit::emit_blocked_automation_notification(
+        kernel, fence, decision,
+    )
+    .await
+    {
+        Ok(Some(eliotd::notification_state_emit::NotificationStateEmit::Committed {
+            dedup_key,
+            notification_id,
+            operation_id,
+        })) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.notification_state_emitted",
+                dedup_key = %dedup_key,
+                notification_id = %notification_id,
+                operation_id = %operation_id,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "notification-state",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
 }
 
 /// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
@@ -1390,7 +1449,13 @@ async fn run_health_heartbeat_tick(
     // what this tick actually did.
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
     let readiness_verdict;
-    {
+    // Issue #1780 (I11.5): an admitted automation decision that admits no job
+    // is an automation failure, and I11.5 requires it to become one persistent
+    // canonical notification instead of a log line. The decision and the
+    // admission fence are both taken from the composition under this one lock;
+    // the canonical write itself happens after the lock is released, so no
+    // Kernel exchange ever crosses the composition mutex (issue #18 N3).
+    let blocked_automation = {
         let guard = composition.lock().await;
         // #2560: re-read the composition's own owner facts once per heartbeat.
         // This performs no capability IO and re-files no slot, so a slow
@@ -1408,15 +1473,30 @@ async fn run_health_heartbeat_tick(
             &guard.status(),
             false,
         );
-        note_maintenance_trigger_at(
-            &guard,
+        // Same tolerance as `DaemonComposition::note_maintenance_trigger`: a
+        // rejected evaluation is an explicit typed gap, never a daemon-killing
+        // error, and the trigger stays durable for the next eligible pass.
+        match guard.evaluate_maintenance_trigger(maintenance_observation(
             MaintenanceTriggerOrigin::AdmittedObservation,
             vec![
                 format!("store_health={:?}", health.status),
                 health.manifest_digest.as_str().to_owned(),
             ],
             activation_in_flight,
-        );
+        )) {
+            Ok(decision) if decision.admits_job => None,
+            Ok(decision) => guard
+                .notification_state_admission_fence()
+                .ok()
+                .map(|fence| (fence, decision)),
+            Err(error) => {
+                let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                None
+            }
+        }
+    };
+    if let Some((fence, decision)) = blocked_automation {
+        note_blocked_automation_notification(kernel, fence, &decision).await;
     }
     // #2560: the same readiness evaluation that produced the startup record
     // reaches diagnostics here, so an operator sees exactly when a core

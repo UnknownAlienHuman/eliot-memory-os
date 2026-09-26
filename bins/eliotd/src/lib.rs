@@ -63,6 +63,7 @@ mod kernel_transition_client;
 pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
 pub mod notification_board_attach;
+pub mod notification_state_emit;
 mod observation_adapters;
 mod owner_feed;
 mod process_origin;
@@ -178,6 +179,10 @@ pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+};
+pub use notification_state_emit::{
+    AutomationFailureKey, NotificationStateEmit, automation_failure_key,
+    emit_blocked_automation_notification, read_notification_ordering_head,
 };
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{
@@ -1117,6 +1122,34 @@ impl DaemonComposition {
     /// [`Self::controlboard`] keep the empty inbox behaviour.
     pub fn note_notification_snapshot(&mut self, records: Vec<Notification>) {
         self.notification_snapshot = records;
+    }
+
+    /// Joins the owner-side canonical notification-state admission to this
+    /// composition's live retained fact: material readiness plus the exact
+    /// admitted State Fence the transition must be built and submitted under
+    /// (issue #1780, I1.8).
+    ///
+    /// The fence is read from the retained Governor snapshot, never from a
+    /// caller claim, so a transported or cached fence cannot substitute it.
+    ///
+    /// This is deliberately **not** a write intake and carries no commit. It
+    /// performs no canonical write, never calls
+    /// [`Self::commit_canonical_and_refresh`], and never calls
+    /// `GovernorComposition::check_canonical_write_work_scope`: that gate
+    /// withholds any write whose `scope_id` is not the bound `WorkScope`, and
+    /// the fixed canonical notification scope
+    /// (`eliot_store_api::NOTIFICATION_STATE_SCOPE`) is by contract never that
+    /// `WorkScope` — a notification write routed through the gate would be
+    /// silently withheld rather than refused. Submission therefore goes to the
+    /// admitted Kernel `ApplyNotificationState` route over the retained daemon
+    /// transport through [`crate::notification_state_emit`], which rechecks the
+    /// fixed scope, ordering scope, transition class, and closed leg parameters
+    /// itself and additionally requires a same-fence record read-back.
+    pub fn notification_state_admission_fence(&self) -> Result<StateFence, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(self.governor.kernel_snapshot().state_fence().clone())
     }
 
     /// Builds one provider-neutral `ControlBoard` over the current Governor
