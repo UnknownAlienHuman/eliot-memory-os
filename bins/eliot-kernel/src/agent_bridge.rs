@@ -124,6 +124,22 @@ impl KernelComposition {
         peer: &PeerIdentity,
     ) -> Result<(), TransportError> {
         observe_bridge("kernel.bridge_peer_validate", "attempt");
+        let result = Self::validate_agent_bridge_peer_inner(admission, peer);
+        // F-LOG-KERNEL-1 (#897 T9): the peer admission outcome is recorded
+        // on the production bridge path (`begin_agent_bridge` validates
+        // here). Info only; the caller owns the terminal.
+        match &result {
+            Ok(()) => observe_bridge("kernel.bridge_peer_observed", "admitted"),
+            Err(_) => observe_bridge("kernel.bridge_peer_observed", "not_admitted"),
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn validate_agent_bridge_peer_inner(
+        admission: &AgentBridgeAdmissionDescriptor,
+        peer: &PeerIdentity,
+    ) -> Result<(), TransportError> {
         admission
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
