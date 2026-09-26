@@ -6,8 +6,9 @@
 //! admission artifact through the existing owner entrypoint
 //! `eliot_swarm::plan_admission_request`. It applies coordinator-side
 //! admission-preparation gates only — a validated coordinator configuration, a
-//! non-empty work graph, nonzero WIP ceilings, and a work-item count within
-//! `CoordinatorConfig::max_ready_items` — and returns a candidate-only
+//! non-empty work graph, nonzero WIP ceilings, a work-item count within
+//! `CoordinatorConfig::max_ready_items`, and exact plan/root lineage agreement
+//! with the sealed-map coordination binding — and returns a candidate-only
 //! `SwarmDefinitionAdmissionPrep`.
 //!
 //! Preparation is strictly pre-admission. No Governor receipt is minted,
@@ -126,7 +127,9 @@ impl SwarmDefinitionAdmissionPrep {
 /// 3. definition WIP ceilings are nonzero;
 /// 4. the work-item count fits the coordinator ready-item ceiling, otherwise
 ///    `CoordinatorError::Backpressure`;
-/// 5. the exact Governor admission artifact is compiled through the existing
+/// 5. proposal plan and root-context revisions equal the sealed-map binding,
+///    otherwise `CoordinatorError::IdentityConflict`;
+/// 6. the exact Governor admission artifact is compiled through the existing
 ///    `eliot_swarm::plan_admission_request` owner entrypoint.
 ///
 /// A Governor admission receipt is never required nor produced: unavailable
@@ -136,8 +139,10 @@ impl SwarmDefinitionAdmissionPrep {
 ///
 /// Returns `CoordinatorError::InvalidField` for a degenerate configuration or
 /// definition, `CoordinatorError::Backpressure` when the work graph alone
-/// exceeds the ready-item ceiling, or `CoordinatorError::Serialization` when
-/// the admission artifact cannot be canonically digested.
+/// exceeds the ready-item ceiling, `CoordinatorError::IdentityConflict` when
+/// proposal lineage differs from the sealed-map binding, or
+/// `CoordinatorError::Serialization` when the admission artifact cannot be
+/// canonically digested.
 pub fn compile_swarm_definition_admission(
     config: &CoordinatorConfig,
     proposal: &SwarmPlanProposal,
@@ -158,6 +163,12 @@ pub fn compile_swarm_definition_admission(
             requested: proposal.work_items.len(),
             limit: config.max_ready_items,
         });
+    }
+    let (bound_plan_revision, bound_root_context_revision) = maps.admission_plan_lineage();
+    if proposal.plan_revision != *bound_plan_revision
+        || proposal.root_context_revision != *bound_root_context_revision
+    {
+        return Err(CoordinatorError::IdentityConflict("swarm_lineage"));
     }
     let admission_request = plan_admission_request(proposal, maps)
         .map_err(|_| CoordinatorError::Serialization("swarm plan admission request".to_owned()))?;

@@ -510,6 +510,17 @@ impl SealedIndependentMaps {
         &self.expected_lanes
     }
 
+    /// Plan and root-context revisions bound by the sealed coordination binding.
+    ///
+    /// Coordinator admission preparation uses these owner-supplied revisions
+    /// to reject proposals whose lineage differs from the sealed maps before
+    /// compiling the Governor admission request.
+    #[must_use]
+    pub fn admission_plan_lineage(&self) -> (&RevisionId, &RootContextRevision) {
+        let binding = self.coordination_binding();
+        (&binding.plan_revision, &binding.root_context_revision)
+    }
+
     fn coordination_binding(&self) -> &ProviderBinding {
         &self.maps[0].provider_binding
     }
