@@ -132,13 +132,29 @@ impl OrsGenerationCoordinator {
                 observe_recovery("kernel.recovery.journal_retention_absent", "empty");
                 return Ok(());
             }
+            let mut refused = 0usize;
             for stream in &streams {
                 if self.ors.apply_restore_journal_retention(stream).is_err() {
-                    // A per-stream refusal degrades only the reclamation it names.
-                    // The error text is deliberately not observed: this seam carries
-                    // no owner error strings (I15.4, I07.20).
+                    // A per-stream refusal degrades only the reclamation it names,
+                    // so the remaining streams are still attempted. The error text
+                    // is deliberately not observed: this seam carries no owner
+                    // error strings (I15.4, I07.20).
+                    refused = refused.saturating_add(1);
                     observe_recovery("kernel.recovery.journal_retention_refused", "rejected");
                 }
+            }
+            if refused > 0 {
+                // The aggregate is NOT a clean completion: at least one stream's
+                // reclamation did not happen. Reporting "success" here would be a
+                // success-shaped outcome for work that did not occur, and would
+                // also suppress the composition-level degraded observation. The
+                // caller deliberately does not map this to a build failure, so
+                // daemon readiness is unaffected.
+                observe_recovery("kernel.recovery.journal_retention_incomplete", "rejected");
+                return Err(format!(
+                    "{refused} of {} restore-journal retention passes were refused",
+                    streams.len()
+                ));
             }
             observe_recovery("kernel.recovery.journal_retention_completed", "success");
             Ok(())

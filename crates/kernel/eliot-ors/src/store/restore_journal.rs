@@ -268,14 +268,7 @@ impl JournalState {
 /// three, is refused rather than silently ignored while a read or a receipt
 /// verification reports success.
 fn validate_journal_table_names(read: &redb::ReadTransaction) -> Result<(), OrsError> {
-    let mut discovered = BTreeSet::new();
-    for table in read.list_tables().map_err(storage)? {
-        discovered.insert(bound_table_name(table.name())?);
-        if discovered.len() > MAX_JOURNAL_TABLES_SCANNED {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-    }
-    classify_journal_table_family(&discovered, false)
+    classify_journal_table_family(&bounded_read_table_names(read)?, false)
 }
 
 /// Classifies an enumerated table-name set against the declared journal family.
@@ -391,9 +384,9 @@ fn bounded_table_names(write: &WriteTransaction) -> Result<BTreeSet<String>, Ors
     Ok(discovered)
 }
 
-/// Read-side twin of [`bounded_table_names`], so the maintenance-side stream
-/// enumeration and the ordinary read paths bound the table scan identically
-/// instead of each open-coding the cap.
+/// Read-side twin of [`bounded_table_names`]. The ordinary strict read path and
+/// the maintenance-side stream enumeration both bound their table scan here, so
+/// a change to the cap or the name bound is made in one place.
 fn bounded_read_table_names(read: &redb::ReadTransaction) -> Result<BTreeSet<String>, OrsError> {
     let mut discovered = BTreeSet::new();
     for table in read.list_tables().map_err(storage)? {
@@ -1603,14 +1596,16 @@ impl RedbRecoveryStore {
     /// `run_restore_journal_retention` refuses an unbound stream and
     /// `validate_stream_closures` refuses to retain one.
     ///
-    /// The base-`META` adoption marker is read BEFORE the family is classified,
-    /// exactly as `initialize_restore_journal_schema` does, and that marker
-    /// lives outside the journal family so it survives deletion of those tables.
-    /// A store that never adopted a family genuinely has no streams and reports
-    /// an empty list; a store that adopted one and then lost it is a migration
-    /// error, never a healthy empty result. A present family is read back
-    /// through the ordinary strict read path, so a partial family cannot be
-    /// laundered into a shorter list of streams.
+    /// The base-`META` adoption marker is consulted alongside the family
+    /// classification, and that marker lives outside the journal family so it
+    /// survives deletion of those tables. `initialize_restore_journal_schema`
+    /// applies the same two facts, discovering the family first and reading the
+    /// marker second; neither read can change what the other observes, so the
+    /// order carries no meaning here. A store that never adopted a family
+    /// genuinely has no streams and reports an empty list; a store that adopted
+    /// one and then lost it is a migration error, never a healthy empty result.
+    /// A present family is read back through the ordinary strict read path, so a
+    /// partial family cannot be laundered into a shorter list of streams.
     pub fn list_restore_journal_streams(&self) -> Result<Vec<String>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
         let already_adopted = read_adoption_marker_from(&read)?.is_some();
