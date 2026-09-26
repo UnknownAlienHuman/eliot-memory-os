@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::StateFence;
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass,
-    ResearchContractError, SourceClass,
+    LocatorClass, ResearchContractError, SourceClass, classify_locator,
 };
 
 use crate::evidence_portfolio::{
@@ -58,7 +58,33 @@ use crate::source_admissibility::{
 /// Stable identity of this domain surface.
 pub const INQUIRY_GOVERNANCE_CONTRACT: &str = "eliot.research.inquiry-governance";
 /// Current revision of this domain surface.
-pub const INQUIRY_GOVERNANCE_VERSION: &str = "1.0.0";
+///
+/// #2894: `1.0.0` -> `2.0.0`. The untrusted-reference diagnostic changed
+/// incompatibly: `UnadmittedReferenceKind` gained
+/// `INTERNAL_OWNED_REFERENCE` and `AMBIGUOUS_REFERENCE`, the kind of every
+/// unadmitted reference is now read from
+/// `eliot_research_exchange_api::classify_locator` instead of a `://` substring
+/// test, and every reason now names the lever that can actually change the
+/// verdict on this path. Both the `kind` and the `reason` are inside
+/// `UnadmittedReference::compute_digest`, so every retained diagnostic has a
+/// different digest than it did under `absolute-locator/1`.
+///
+/// **What this constant does not do, stated plainly:** it is in no digest
+/// preimage. It appears only in the `Display` impl below. The invalidation above
+/// is real but rests entirely on the five reason strings having changed text, not
+/// on this constant. Two consequences a reader must not assume away:
+///
+/// - a future classifier change that produced the *same* `(kind, reason)` pair for
+///   a handle would not move any digest, so bumping this constant alone would
+///   invalidate nothing;
+/// - `UnadmittedReference::observe` is `pub`, so a caller can construct a
+///   diagnostic carrying a pre-bump `(kind, reason)` pair and
+///   `validate_integrity` will accept it, because that method re-proves the digest
+///   against the pair it was handed rather than against a version.
+///
+/// So the honest statement is: a diagnostic *this path* produced before the bump
+/// cannot re-present as one produced after it, and nothing stronger is claimed.
+pub const INQUIRY_GOVERNANCE_VERSION: &str = "2.0.0";
 
 /// Typed inquiry-governance failure. Every variant names the failing concept or
 /// field path only; no supplied value is ever echoed back.
@@ -3223,9 +3249,33 @@ pub struct CandidateEvidence {
 /// I21.7: "It cannot mint a valid citation, URL, source ID, line range, artifact
 /// handle or support relation through prose." Naming which of those identities
 /// was observed is what makes the retained diagnostic actionable, because each
-/// has a different acquisition path: a URL needs a provider to resolve and
-/// snapshot it, an artifact handle needs a manifest transition, and a stale or
-/// revoked handle needs a fresh admission rather than any acquisition at all.
+/// has a different acquisition path: a URL needs an exact `url_handles` entry and
+/// a provider to resolve and snapshot it, an internally owned reference and a
+/// plain handle both need a manifest transition that admits the handle, an
+/// ambiguous spelling needs nothing to be acquired first — the text itself has to
+/// become a classifiable reference — and a stale or revoked handle needs a fresh
+/// admission rather than any acquisition at all.
+///
+/// Every arm is chosen by the one shared classifier,
+/// [`eliot_research_exchange_api::classify_locator`], which is the same function
+/// the delivered-bundle firewall in
+/// [`eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`]
+/// applies to `SourceSnapshot::locator`. Before #2894 this path tested
+/// `handle.contains("://")` instead, so `https://…` was named a URL in one path
+/// and a non-URL in the other, and `urn:`/`mailto:` were named artifact handles
+/// even though the enforcement path gated them as URLs. The kinds are now
+/// projections of one classification, not a second spelling of it.
+///
+/// # A kind names the reference; the reason names the lever
+///
+/// A candidate handle is a reference identity, and the only thing that admits one
+/// on this path is `AllowedReferenceManifest::allows`, which reads
+/// `source_handles`, `evidence_handles` and `artifact_handles`. `url_handles`
+/// belongs to the separate `admits_url` predicate on the delivered-locator path
+/// and is never consulted here. So `LocatorUrl` says *what the spelling presents
+/// itself as* and the reason says *which list can change the verdict*; a reader
+/// who follows the reason reaches the lever, and the two cannot disagree because
+/// both come from the same function.
 ///
 /// # What the live record path can actually observe
 ///
@@ -3234,41 +3284,70 @@ pub struct CandidateEvidence {
 /// set a property of what a candidate handle can be, not of all six identities
 /// I21.7 enumerates:
 ///
-/// - `ArtifactHandle` is what the live path produces. The composition root
-///   supplies exactly one candidate, derived from the retained provider artifact
-///   digest as `provider-artifact:<sha256>`
-///   (`retained_provider_material` in `bins/eliot-mod-research`), which is
-///   caller-influenced text the manifest does not admit.
-/// - `LocatorUrl` is **not** reachable on the live path today, and the reason is
-///   structural: the arm is chosen by a `://` test, and the single live handle
-///   `provider-artifact:<sha256>` contains no scheme separator. A URL inside the
-///   provider body is never observable here because the projection never decodes
-///   the body; the URL surface is closed instead at
-///   `SourceSnapshot::locator` in
-///   `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
-/// - `StaleOrRevoked` is reachable only for a manifest that lists a candidate
-///   handle in `stale_or_revoked_handles`. The live handle is minted after
-///   admission from a digest an out-of-repo envelope has no reason to list, so
-///   the live path does not reach it either — but the case it names is real and
-///   distinct: a reference the manifest *did* admit and that has since gone
-///   stale, which [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`]
-///   reports as `ManifestEntryRevoked`.
+/// - The single live candidate is the `provider-artifact:<sha256>` handle that
+///   `retained_provider_material` in `bins/eliot-mod-research` derives from the
+///   retained stdout digest, so the live kind is `InternalOwnedReference`. That
+///   spelling carries a valid RFC 3986 scheme token (`provider-artifact`)
+///   followed by a non-colon, so it is formally a URI with an opaque part; it is
+///   internally owned because a named owner mints it under a closed 64-hex
+///   grammar (see `owned_scheme` in `eliot_research_exchange_api`). The `://`
+///   test used to name it `ArtifactHandle` and the first #2894 revision named it
+///   `LocatorUrl`; both were wrong, in opposite directions.
+/// - Nothing is promoted by that reading.
+///   `AllowedReferenceManifest::allows` is unchanged, so the live handle is still
+///   unadmitted exactly as before and the diagnostic is still candidate-only.
+///   Only the named kind and reason change — from a label that sent the reader to
+///   a list which cannot admit the value, to one that names the list which can.
+/// - `LocatorUrl` is reached by any other unadmitted candidate whose scheme is
+///   not internally owned, which includes `https://…`, `urn:…` and `mailto:…`
+///   that the `://` test mislabelled as artifact handles.
 ///
-/// All three variants are kept because this is the retained diagnostic's
-/// vocabulary and a candidate handle is caller-shaped, not fixed: a bridge that
-/// projects a URL-shaped or manifest-revoked candidate reaches the other two
-/// arms with no code change here. A source identity is judged on the
-/// `SourceRecord.handle` the observation projects into
+/// A URL inside the provider body is still not observable here, because the
+/// projection never decodes the body; the delivered-locator surface is closed at
+/// `SourceSnapshot::locator` in
+/// `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+///
+/// `AmbiguousReference` is reachable for a candidate that breaks the shared
+/// classifier's own grammar — a blank or oversized spelling, a bare scheme
+/// separator, a non-canonical internal form, or a malformed `name::…`. A
+/// *well-formed* `name::id` is not one of these: it is a namespaced opaque handle
+/// and classifies as `ArtifactHandle`. No current production caller projects an
+/// `AmbiguousReference` — the one live candidate is `provider-artifact:<sha256>`
+/// — and the kind is kept because a candidate handle is caller-shaped, not fixed.
+/// A source identity is judged on the `SourceRecord.handle` the observation
+/// projects into
 /// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`], and a
 /// line range is judged by the manifest's admitted anchor precision in
 /// [`EvidenceSetPrecision::evaluate`]; neither can be a *citation* on this path,
 /// so neither is a candidate diagnostic here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnadmittedReferenceKind {
-    /// A URL the manifest does not list as a URL handle.
+    /// An absolute locator URL, named for what the spelling presents itself as.
+    ///
+    /// It says nothing about `url_handles`: `reference_firewall` never calls
+    /// `admits_url`, so it cannot know whether the manifest lists this value
+    /// there. A value can be listed in `url_handles` and still be unadmitted as a
+    /// handle, and this kind is still the right one. The lever is in the reason.
     LocatorUrl,
-    /// An artifact handle the manifest does not list.
+    /// An opaque handle the manifest does not list.
     ArtifactHandle,
+    /// A reference a named owner mints internally — a canonical `eliot://`
+    /// resource identity, or a `provider-artifact:<sha256>` content handle —
+    /// presented as a candidate handle.
+    ///
+    /// Not named "resource URI": the live case is a provider artifact handle,
+    /// not a bridge resource, and a diagnostic that misnames the one candidate
+    /// the product actually produces is its own defect.
+    InternalOwnedReference,
+    /// A spelling the shared classifier cannot classify as a reference at all:
+    /// blank, control-bearing, oversized, a scheme-separator with nothing after
+    /// it, a non-canonical internal form, or a `name::id` spelling that breaks the
+    /// namespaced-handle grammar.
+    ///
+    /// A *well-formed* `name::id` is not in this kind — it classifies as
+    /// `ArtifactHandle`, because a namespaced opaque handle is a handle and the
+    /// grammar is what keeps it distinct from a URI scheme.
+    AmbiguousReference,
     /// A handle the manifest lists but marks stale or revoked.
     StaleOrRevoked,
 }
@@ -3280,6 +3359,8 @@ impl UnadmittedReferenceKind {
         match self {
             Self::LocatorUrl => "LOCATOR_URL",
             Self::ArtifactHandle => "ARTIFACT_HANDLE",
+            Self::InternalOwnedReference => "INTERNAL_OWNED_REFERENCE",
+            Self::AmbiguousReference => "AMBIGUOUS_REFERENCE",
             Self::StaleOrRevoked => "STALE_OR_REVOKED",
         }
     }
@@ -3861,10 +3942,28 @@ fn assess_sources(
 /// The candidate handle is the reference identity this boundary can observe: the
 /// composition root derives it from the retained provider artifact digest, so it
 /// is caller-influenced text and is checked against the manifest like any other.
-/// A URL appearing inside the provider body is not observable here — the live
-/// projection never decodes the body — so a URL is admitted or refused at the
-/// `SourceSnapshot::locator` boundary in
-/// `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+///
+/// #2894: the kind is read from the one shared classifier,
+/// [`eliot_research_exchange_api::classify_locator`], which is the same
+/// classification the delivered-bundle firewall applies to
+/// `SourceSnapshot::locator`. This path used to test `handle.contains("://")`,
+/// so it disagreed with the enforcement path in both directions: `https://…` was
+/// named a URL here while the enforcement path could not name it one, and
+/// `urn:`/`mailto:` were named artifact handles while the enforcement path gates
+/// them as URLs. There is no `contains` test left in this function.
+///
+/// Every reason this function emits names a lever that can change the verdict
+/// here, and the branch comment records which list that is. Two mistakes this
+/// replaces are worth naming, because they are mirror images of each other: the
+/// first #2894 revision told a reader that an unadmitted URL-shaped candidate
+/// needed an exact `url_handles` entry, and this function never calls
+/// `admits_url`, so following that advice left the diagnostic recurring forever;
+/// and the same revision told a reader that an unclassifiable spelling could be
+/// admitted by no list at all, which was equally wrong in the other direction —
+/// this path tests `manifest.allows` and nothing else, so a handle entry removes
+/// the diagnostic whatever the spelling is. A reason here names a list this
+/// function actually reads, and says plainly when the remaining problem is the
+/// text rather than the list.
 fn reference_firewall(
     observation: &InquiryObservation,
 ) -> Result<Vec<UnadmittedReference>, InquiryError> {
@@ -3875,25 +3974,81 @@ fn reference_firewall(
         if !seen.insert(candidate.handle.clone()) {
             continue;
         }
-        let (kind, reason) = if manifest
+        let (kind, reason): (UnadmittedReferenceKind, String) = if manifest
             .stale_or_revoked_handles
             .iter()
             .any(|stale| stale == &candidate.handle)
         {
+            // Revocation is applied after membership and on every call, so this
+            // verdict survives a handle-list entry too. The reason says that, or
+            // a reader adds the handle to a list, the diagnostic recurs, and the
+            // firewall looks broken.
             (
                 UnadmittedReferenceKind::StaleOrRevoked,
-                "the run-bound manifest lists this reference as stale or revoked",
+                "the run-bound manifest lists this reference as stale or revoked, and revocation \
+                 applies after membership, so a handle entry alone does not readmit it"
+                    .to_owned(),
             )
         } else if !manifest.allows(&candidate.handle) {
-            let kind = if candidate.handle.contains("://") {
-                UnadmittedReferenceKind::LocatorUrl
-            } else {
-                UnadmittedReferenceKind::ArtifactHandle
-            };
-            (
-                kind,
-                "the run-bound manifest does not admit this reference handle",
-            )
+            // Every reason below names the one thing that can change this
+            // verdict, and the arm it names is one this path actually reads.
+            // This path tests `manifest.allows` and nothing else:
+            // `AllowedReferenceManifest::allows` reads `source_handles`,
+            // `evidence_handles` and `artifact_handles`, so the handle allowlist
+            // is the only lever here. `url_handles` belongs to the separate
+            // `admits_url` predicate, which is the delivered-locator path in
+            // `eliot_research_exchange_api` and is never called from this
+            // function — so a reason that told a reader to add the value to
+            // `url_handles` would name a list that cannot admit it and the
+            // diagnostic would recur forever.
+            match classify_locator(&candidate.handle) {
+                // The spelling presents as an absolute locator, and the lever is
+                // still the handle allowlist: a candidate handle is a reference
+                // identity, not a `SourceSnapshot::locator`, so it is admitted by
+                // `allows` or by nothing. Saying so is the whole point — naming
+                // `url_handles` here would send the reader to the wrong list.
+                LocatorClass::ExternalUri { .. } => (
+                    UnadmittedReferenceKind::LocatorUrl,
+                    "this reference presents as an absolute locator URL; a candidate handle is \
+                     admitted only by the manifest's source, evidence and artifact handles, and \
+                     url_handles is not consulted on this path"
+                        .to_owned(),
+                ),
+                // An internally owned reference is still just a handle identity:
+                // being internal is not admission, so the lever is the same
+                // handle allowlist.
+                LocatorClass::InternalUri { .. } => (
+                    UnadmittedReferenceKind::InternalOwnedReference,
+                    "this reference is an internally owned handle; admission is a source, evidence \
+                     or artifact handle entry, and being internal is not admission"
+                        .to_owned(),
+                ),
+                LocatorClass::OpaqueHandle => (
+                    UnadmittedReferenceKind::ArtifactHandle,
+                    "the run-bound manifest does not admit this reference handle in its source, \
+                     evidence or artifact handles"
+                        .to_owned(),
+                ),
+                // A spelling the classifier cannot read. The lever is STILL the
+                // handle allowlist, and this is the arm where that is easiest to
+                // get wrong: `classify_locator` plays no part in the admission
+                // decision above — it only chose this kind and this string. A
+                // manifest handle entry for this exact text removes the
+                // diagnostic, exactly as it does for every other arm, so the
+                // reason says so rather than claiming no list can help. What no
+                // entry can do is make the *text* classifiable: that is a
+                // property of the spelling, and the reason names the rule that
+                // failed so a reader knows which one to fix.
+                LocatorClass::MalformedOrAmbiguous { reason } => (
+                    UnadmittedReferenceKind::AmbiguousReference,
+                    format!(
+                        "this reference is not a classifiable locator: {}; a source, evidence or \
+                         artifact handle entry admits it like any other candidate, but no entry \
+                         can make the text itself classifiable",
+                        reason.wire_name()
+                    ),
+                ),
+            }
         } else {
             continue;
         };
@@ -3902,7 +4057,7 @@ fn reference_firewall(
             &observation.evidence_set_id,
             &candidate.handle,
             kind,
-            reason,
+            &reason,
             &manifest.state_fence,
         )?);
     }
