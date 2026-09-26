@@ -2316,29 +2316,55 @@ async fn run_local_read_poll(
     // read can never poison the poller or drop a pair. The composition guard is
     // held only around the read; it never crosses the submit leg.
     //
-    // NOT REACHABLE AT RUNTIME (#1187 piece C, verified against the current
-    // Kernel source). No claimed pair can carry `controlboard.read`, so the
-    // predicate below is always false and this branch is source-reachable only.
-    // The Kernel queues a host request for this outbound poller exactly when
-    // `host_request_route::check_local_read_admission` resolves selectors, and
-    // `host_request_route::local_read_selectors_from_tool` returns selectors
-    // only for `tool.name == "eliot.query"` whose `envelope.identity.capability`
-    // equals it; `host_request_route::KernelComposition::claim_local_read_pair`
-    // then independently skips every candidate whose
-    // `envelope.identity.capability != "eliot.query"`. Both gates are in
-    // `bins/eliot-kernel/src/host_request_route.rs`, cited by symbol rather than
+    // NOT REACHABLE AT RUNTIME (#1187 piece C, re-verified against the current
+    // source of both crates). The predicate below is always false, and closing it
+    // takes FOUR independent gates, not one. Each is cited by symbol rather than
     // by line, because a line number in a comment is wrong the next time the
-    // file moves. No host request naming the broker-admitted
-    // `controlboard.read` or `operator.command` capability is ever queued for, or
-    // claimed by, this poller, so neither reaches a daemon branch here. The same
-    // two gates make the `is_skill_tool` branches above unreachable as well; that
-    // is recorded for root, not claimed here.
+    // file moves:
     //
-    // Consequence for the operator command: adding an `operator.command` branch
-    // here would NOT create a production caller, and claiming one would be false.
-    // The missing owner act is the Kernel's poller routing for that
-    // broker-admitted capability, which is outside `bins/eliotd` and outside this
-    // issue's mutable scope.
+    // 1. Queue. `host_request_route::KernelComposition::invoke_read_host_request`
+    //    is the only production entry that queues a pair for this poller, and it
+    //    queues only what `host_request_route::check_local_read_admission`
+    //    resolves. That routes through
+    //    `host_request_route::local_read_admission_from_tool`, whose closed
+    //    `match` admits `eliot.packet` and `eliot.query` and refuses every other
+    //    name, and the fallback
+    //    `host_request_route::daemon_claim_queue::check_task_controller_admission`
+    //    refuses it as well, so such a request is admitted with no lane that can
+    //    ever answer it.
+    // 2. Claim. `host_request_route::KernelComposition::claim_local_read_pair`
+    //    independently skips every candidate whose
+    //    `envelope.identity.capability != "eliot.query"`.
+    // 3. Claim receipt. `daemon_kernel_client::DaemonKernelClient::claim_local_read_pair_async`
+    //    independently refuses any claimed pair that is not `eliot.query` on
+    //    both the envelope capability and the tool name. That gate is production
+    //    code inside `bins/eliotd` — not a test — and it sits on the same
+    //    `local_read_claim` wire operation as gate 2.
+    // 4. Submit. `host_request_route::KernelComposition::submit_local_read_result`
+    //    joins the durable ORS record on `capability_ref == "eliot.query"`, so a
+    //    claimed pair could not settle its own result body either.
+    //
+    // A fifth gap sits upstream of all four and is not a gate at all: nothing in
+    // this repository presents a host request naming this capability. The only
+    // production envelope builder is `kernel_host_request_client::finish_envelope`
+    // in `eliot-agent-bridge`; its tool surface is the closed `ADMITTED_TOOL_NAMES`
+    // set in `eliot_mcp::contract` (eight `eliot.*` names, and this is not one of
+    // them); and the Operator's own closed set in
+    // `apps/Eliot.Operator/Protocol/OperatorIntent.cs::LegacyOperatorAdapter::AdmittedTools`
+    // does not carry it either.
+    //
+    // Gates 1, 2 and 4 are one Kernel act in `host_request_route.rs`, and doing
+    // only that is worse than doing nothing: it would hand this poller a pair
+    // that gate 3 refuses, and a refused claim is a step failure, which
+    // `settle_local_read_completion` escalates into a failed daemon. Gate 3 and
+    // the absent producer are separate owner acts in files this lane does not
+    // own, so this branch stays source-reachable only.
+    //
+    // The same gates make the `is_skill_tool` branches above unreachable as well;
+    // that is recorded here, not claimed here. For `operator.command` the answer
+    // is the same: adding a branch for it would NOT create a production caller,
+    // and claiming one would be false, because that capability is refused by
+    // every one of those four gates and no producer presents it either.
     if eliotd::is_controlboard_read_tool(&tool) {
         let body = {
             let guard = composition.lock().await;
