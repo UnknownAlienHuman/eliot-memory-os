@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::canonical_json_bytes;
 use eliot_platform::PlatformHandle;
+use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
     AuthorityBinding, GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureOrsReceiptRef,
     ReceiptDispositionKind, ReceiptEnvelope, ReceiptIdentity,
@@ -66,14 +67,17 @@ use crate::{
     OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
     OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
+    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
     RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
     RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
-    StageReceipt, StagedOperation, StateFenceSnapshot, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
@@ -104,6 +108,17 @@ const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_evidence_v1");
+/// Versioned per-stream process-evidence recovery projections (issue #269).
+///
+/// One row per `(operation_id, stream)` identity, keyed `operation:stdout` or
+/// `operation:stderr`, so stdout and stderr stay independent and exact. The
+/// rows carry the immutable locator identity, exact durable coverage, the
+/// typed transport/persistence state, the gap set and the reconciliation
+/// owner/state — never stream bytes. This is one more table in the existing ORS
+/// table family, owned by the same `RedbRecoveryStore` and written through the
+/// same `persistence_codec`; it is not a second journal or table owner.
+const PROCESS_STREAM_RECOVERY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_process_stream_recovery_v1");
 const SUPERVISION_LEASE_STAGED: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_staged_v1");
 const SUPERVISION_LEASE_CURRENT: TableDefinition<&str, &str> =
@@ -3479,7 +3494,7 @@ impl RedbRecoveryStore {
                         .map(|value| {
                             let winner: crate::HostRequestRecord = decode(value.value())?;
                             winner.validate()?;
-                            Ok(winner)
+                            Ok::<_, OrsError>(winner)
                         })
                         .transpose()?
                         .ok_or_else(|| OrsError::IntegrityProblem {
@@ -10956,6 +10971,291 @@ impl RedbRecoveryStore {
         Ok(records)
     }
 
+    /// Durable key of one `(operation, stream)` recovery projection.
+    ///
+    /// Stdout and stderr never share a key, so one stream can never satisfy,
+    /// overwrite or be read back as the other.
+    fn process_stream_recovery_key(
+        operation_id: &crate::OperationIdentity,
+        stream: ProcessStreamKind,
+    ) -> String {
+        format!(
+            "{}:{}",
+            operation_id.as_str(),
+            ProcessStreamRecoveryProjection::stream_key(stream)
+        )
+    }
+
+    /// Writes one process-stream recovery projection.
+    ///
+    /// The evidence axes are immutable after the first durable write. A later
+    /// write may advance only availability, reconciliation and activation, and
+    /// only when `evidence_axes_sha256` is unchanged and the activation
+    /// transition is permitted. A conflicting evidence rewrite is rejected
+    /// rather than overwriting retained history, so no revalidation path can
+    /// rewrite typed transport or persistence state.
+    pub fn put_process_stream_recovery(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        projection.validate()?;
+        let key = projection.record_key()?;
+        let incoming_axes = projection.evidence_axes_sha256()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let mut table = write.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
+            let existing = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
+                .transpose()?;
+            match existing {
+                Some(existing) if existing == *projection => {
+                    ProcessStreamRecoveryWriteOutcome::Unchanged
+                }
+                Some(existing) => {
+                    if existing.evidence_axes_sha256()? != incoming_axes {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "process_stream_recovery",
+                            reason: "recovery evidence axes are immutable".to_owned(),
+                        });
+                    }
+                    if !existing
+                        .activation
+                        .permits_transition_to(projection.activation)
+                    {
+                        return Err(OrsError::InvalidField {
+                            field: "stream_recovery_activation",
+                            reason: "durable activation transition is not permitted",
+                        });
+                    }
+                    let payload = encode(projection)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    ProcessStreamRecoveryWriteOutcome::Advanced
+                }
+                None => {
+                    let payload = encode(projection)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    ProcessStreamRecoveryWriteOutcome::Inserted
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Reads both stream projections for one operation, in canonical order.
+    ///
+    /// Each row is read by its own exact key, decoded through the existing ORS
+    /// codec, revalidated, and checked against its own operation and stream
+    /// identity. A codec-version mismatch and an interrupted or unreadable row
+    /// are distinct, explicit dispositions; neither is silently repaired,
+    /// upgraded or dropped.
+    pub fn load_process_stream_recovery(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Vec<ProcessStreamRecoveryProjection>, ProcessStreamRecoveryLoadError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
+        let table = read
+            .open_table(PROCESS_STREAM_RECOVERY)
+            .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?;
+        let mut projections = Vec::with_capacity(2);
+        for stream in [ProcessStreamKind::Stdout, ProcessStreamKind::Stderr] {
+            let key = Self::process_stream_recovery_key(operation_id, stream);
+            let Some(value) = table
+                .get(key.as_str())
+                .map_err(|error| Self::stream_recovery_read_error(&storage(error)))?
+            else {
+                continue;
+            };
+            let projection: ProcessStreamRecoveryProjection =
+                decode(value.value()).map_err(Self::stream_recovery_load_error)?;
+            let canonical = projection
+                .record_key()
+                .map_err(Self::stream_recovery_load_error)?;
+            if projection.operation_id != *operation_id
+                || projection.stream != stream
+                || canonical != key
+            {
+                return Err(ProcessStreamRecoveryLoadError::InterruptedRead {
+                    reason: "durable row does not match its canonical operation/stream key"
+                        .to_owned(),
+                });
+            }
+            projections.push(projection);
+        }
+        Ok(projections)
+    }
+
+    /// Revalidates both stream projections for one operation and persists only
+    /// the resulting availability observation.
+    ///
+    /// Returned outcomes are aligned with
+    /// [`Self::load_process_stream_recovery`], so stdout and stderr stay
+    /// independently observable. This path never writes transport, persistence
+    /// or gaps: a failed revalidation records a typed availability fault and
+    /// preserves the prior typed state exactly, and no outcome can promote
+    /// `PARTIAL_SOURCE` or `SOURCE_UNAVAILABLE` to `COMPLETE_SOURCE`.
+    pub fn revalidate_process_stream_recovery(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        fence: &ProcessStreamRecoveryFence,
+        resolver: &dyn ProcessStreamSourceResolver,
+    ) -> Result<Vec<ProcessStreamRecoveryRevalidation>, ProcessStreamRecoveryLoadError> {
+        let mut outcomes = Vec::new();
+        for projection in self.load_process_stream_recovery(operation_id)? {
+            let outcome = projection.revalidate(fence, resolver);
+            if let Some(availability) = outcome.availability() {
+                let observed = projection
+                    .with_availability(availability)
+                    .map_err(Self::stream_recovery_load_error)?;
+                self.put_process_stream_recovery(&observed)
+                    .map_err(Self::stream_recovery_load_error)?;
+            }
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
+    /// Projects the available stream recovery state for one operation into the
+    /// ORS status/recovery view.
+    ///
+    /// The view exposes availability, authenticated handles, the exact durable
+    /// coverage and the exact gap set. It carries no stream bytes and no
+    /// parser, evaluator, task or finish claim, so it can never assert semantic
+    /// proof.
+    pub fn process_stream_recovery_status(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Vec<ProcessStreamRecoveryStatusProjection>, ProcessStreamRecoveryLoadError> {
+        Ok(self
+            .load_process_stream_recovery(operation_id)?
+            .iter()
+            .map(ProcessStreamRecoveryStatusProjection::from_projection)
+            .collect())
+    }
+
+    /// Retires one recovery projection after the owning operation contract has
+    /// proven both terminal disposition and the evidence handoff readback.
+    ///
+    /// Retirement is not deletion: the row stays durable as terminal evidence so
+    /// a mistaken retirement remains recoverable, which is why the Architecture
+    /// forbids destroying it outright. Nothing here infers terminality from the
+    /// projection; the terminal reservation state, its named recovery owner,
+    /// its terminal receipt and the proven handoff digest must all agree.
+    pub fn retire_process_stream_recovery(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+        proof: &ProcessStreamRetirementProof,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        projection.validate()?;
+        proof.validate()?;
+        let key = projection.record_key()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        {
+            let table = read.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?;
+            let stored = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ProcessStreamRecoveryProjection>(value.value()))
+                .transpose()?
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "process_stream_recovery",
+                    reason: "the named recovery projection row is not durable".to_owned(),
+                })?;
+            if stored.evidence_axes_sha256()? != projection.evidence_axes_sha256()? {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "process_stream_recovery",
+                    reason: "retirement target does not match the durable evidence axes".to_owned(),
+                });
+            }
+        }
+        let reservation_id = {
+            let operations = read.open_table(OPERATIONS).map_err(storage)?;
+            operations
+                .get(projection.operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+                .ok_or(OrsError::ReservationNotFound)?
+        };
+        if reservation_id != proof.reservation_id.as_str() {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        let reservation = {
+            let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+            let value = reservations
+                .get(reservation_id.as_str())
+                .map_err(storage)?
+                .ok_or(OrsError::ReservationNotFound)?;
+            decode::<ReservationRecord>(value.value())?
+        };
+        if reservation.token.recovery_owner != proof.recovery_owner
+            || projection.reconciliation.owner != proof.recovery_owner
+        {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        if !reservation.state.is_terminal() {
+            return Err(OrsError::UnsafeExpiry);
+        }
+        if reservation.terminal_receipt_id.as_ref() != Some(&proof.terminal_receipt_id)
+            || projection.reconciliation.handoff_sha256.as_deref()
+                != Some(proof.handoff_sha256.as_str())
+        {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        drop(read);
+        let retired = projection.with_activation(StreamRecoveryActivation::Retired)?;
+        self.put_process_stream_recovery(&retired)
+    }
+
+    /// Imports a recovery projection from backup/restore as suspended evidence.
+    ///
+    /// The incoming activation state is discarded: an imported projection is
+    /// always `Suspended`, and an already-`Retired` projection stays `Retired`.
+    /// A restore therefore can never revive old process, session or authority
+    /// state through this record. Only the recovery projection row is written;
+    /// no reservation, session or authority row is created, reactivated or
+    /// otherwise revived.
+    pub fn import_process_stream_recovery_suspended(
+        &self,
+        projection: &ProcessStreamRecoveryProjection,
+    ) -> Result<ProcessStreamRecoveryWriteOutcome, OrsError> {
+        projection.validate()?;
+        let imported = if projection.activation == StreamRecoveryActivation::Retired {
+            projection.clone()
+        } else {
+            projection.with_activation(StreamRecoveryActivation::Suspended)?
+        };
+        self.put_process_stream_recovery(&imported)
+    }
+
+    /// Maps a codec failure onto its explicit recovery disposition.
+    fn stream_recovery_load_error(error: OrsError) -> ProcessStreamRecoveryLoadError {
+        match error {
+            OrsError::UnsupportedContractVersion(found) => {
+                ProcessStreamRecoveryLoadError::CodecVersionMismatch {
+                    found,
+                    current: crate::CONTRACT_VERSION,
+                }
+            }
+            other => Self::stream_recovery_read_error(&other),
+        }
+    }
+
+    /// Maps any storage or read failure onto the interrupted-read disposition.
+    fn stream_recovery_read_error(error: &OrsError) -> ProcessStreamRecoveryLoadError {
+        ProcessStreamRecoveryLoadError::InterruptedRead {
+            reason: error.to_string(),
+        }
+    }
+
     fn supervision_ticket_matches_prepare(
         ticket: &SupervisionLeaseCommitTicket,
         request: &SupervisionLeasePrepareRequest,
@@ -12278,6 +12578,7 @@ impl RedbRecoveryStore {
         drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
         drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
         drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
+        drop(write.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?);
         drop(
             write
                 .open_table(SUPERVISION_LEASE_STAGED)
