@@ -948,6 +948,36 @@ impl FrozenInquiry {
         push_field(&mut preimage, "partial_policy", &params.partial_policy);
         push_field(&mut preimage, "operation_id", &params.operation_id);
         push_field(&mut preimage, "replay_id", &params.replay_id);
+        // The fence is validated and stored on the frozen inquiry, so it is part
+        // of the inquiry's identity: two inquiries differing only in their fence
+        // must not share a digest. Each revision is formatted in its own type —
+        // `task_revision`, `policy_revision` and `integration_revision` are three
+        // distinct types, not one iterable.
+        push_field(
+            &mut preimage,
+            "fence_authority_epoch",
+            &format!("{:?}", params.fence.authority_epoch),
+        );
+        push_field(
+            &mut preimage,
+            "fence_resource_generation",
+            &format!("{:?}", params.fence.resource_generation),
+        );
+        push_field(
+            &mut preimage,
+            "fence_task_revision",
+            &format!("{:?}", params.fence.task_revision),
+        );
+        push_field(
+            &mut preimage,
+            "fence_policy_revision",
+            &format!("{:?}", params.fence.policy_revision),
+        );
+        push_field(
+            &mut preimage,
+            "fence_integration_revision",
+            &format!("{:?}", params.fence.integration_revision),
+        );
         Ok(Self {
             schema: params.schema,
             protocol: params.protocol,
@@ -2161,6 +2191,10 @@ pub enum ClaimOutcome {
     Unsupported,
     /// Preserved counterevidence contests the claim.
     Contradicted,
+    /// An attached counterclaim identity is preserved but cannot be verified as
+    /// relevant to this claim's domain under the frozen manifest, so it neither
+    /// contradicts nor supports.
+    NotVerifiableInScope,
     /// A citation falls outside the frozen manifest.
     OutsideManifest,
     /// Stale material limits the claim without closing it.
@@ -2177,6 +2211,7 @@ impl ClaimOutcome {
             Self::PartiallySupported => "PARTIALLY_SUPPORTED",
             Self::Unsupported => "UNSUPPORTED",
             Self::Contradicted => "CONTRADICTED",
+            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
             Self::OutsideManifest => "OUTSIDE_MANIFEST",
             Self::StaleLimited => "STALE_LIMITED",
             Self::IncompleteAccounting => "INCOMPLETE_ACCOUNTING",
@@ -2449,53 +2484,7 @@ impl AuthorizedManifest {
         params.conflicts.sort();
         params.unknowns.sort();
         params.allowlist.sort();
-        let mut preimage = String::from("authorized-manifest/v1;");
-        push_field(&mut preimage, "inquiry_digest", &params.inquiry_digest);
-        push_field(
-            &mut preimage,
-            "denominator_digest",
-            &params.denominator_digest,
-        );
-        push_count(&mut preimage, "sources", params.sources.len());
-        for (handle, (content, raw)) in &params.sources {
-            push_field(&mut preimage, "source", handle);
-            push_field(&mut preimage, "content", content);
-            if let Some(raw) = raw {
-                push_field(&mut preimage, "raw", raw);
-            }
-        }
-        push_count(&mut preimage, "edges", params.dependence_edges.len());
-        for (from, to) in &params.dependence_edges {
-            push_field(&mut preimage, "from", from);
-            push_field(&mut preimage, "to", to);
-        }
-        push_field(&mut preimage, "coverage_digest", &params.coverage_digest);
-        for limit in &params.grade_limits {
-            push_field(&mut preimage, "grade_limit", limit);
-        }
-        for item in &params.counterevidence {
-            push_field(&mut preimage, "counterevidence", item);
-        }
-        for item in &params.conflicts {
-            push_field(&mut preimage, "conflict", item);
-        }
-        for item in &params.unknowns {
-            push_field(&mut preimage, "unknown", item);
-        }
-        for handle in &params.allowlist {
-            push_field(&mut preimage, "allowed", handle);
-        }
-        for handle in &params.revoked {
-            push_field(&mut preimage, "revoked", handle);
-        }
-        push_field(
-            &mut preimage,
-            "disclosure",
-            &format!("{:?}", params.disclosure),
-        );
-        push_field(&mut preimage, "expires_ms", &params.expires_ms.to_string());
-        push_field(&mut preimage, "revision", &params.revision.to_string());
-        Ok(Self {
+        let mut manifest = Self {
             inquiry_digest: params.inquiry_digest,
             denominator_digest: params.denominator_digest,
             sources: params.sources,
@@ -2510,8 +2499,10 @@ impl AuthorizedManifest {
             disclosure: params.disclosure,
             expires_ms: params.expires_ms,
             revision: params.revision,
-            digest: freeze(&preimage),
-        })
+            digest: String::new(),
+        };
+        manifest.digest = freeze(&authorized_manifest_preimage(&manifest));
+        Ok(manifest)
     }
 
     /// Whether `handle` is citable under this manifest: allowlisted and not
@@ -2522,30 +2513,75 @@ impl AuthorizedManifest {
 
     /// Canonical bytes of the frozen manifest shape (without the digest
     /// field), stable under arrival order.
+    ///
+    /// This is the same encoder [`Self::freeze`] digests, over the same declared
+    /// domain, so the two cannot describe different field sets again. It was
+    /// previously a second, shorter encoder that reused the
+    /// `authorized-manifest/v1` domain prefix while omitting grade limits,
+    /// counterevidence, conflicts, unknowns, the allowlist, revoked handles,
+    /// disclosure, expiry and revision — two records could then share a declared
+    /// domain without sharing an identity.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut preimage = String::from("authorized-manifest/v1;");
-        push_field(&mut preimage, "inquiry_digest", &self.inquiry_digest);
-        push_field(
-            &mut preimage,
-            "denominator_digest",
-            &self.denominator_digest,
-        );
-        push_count(&mut preimage, "sources", self.sources.len());
-        for (handle, (content, raw)) in &self.sources {
-            push_field(&mut preimage, "source", handle);
-            push_field(&mut preimage, "content", content);
-            if let Some(raw) = raw {
-                push_field(&mut preimage, "raw", raw);
-            }
-        }
-        push_count(&mut preimage, "edges", self.dependence_edges.len());
-        for (from, to) in &self.dependence_edges {
-            push_field(&mut preimage, "from", from);
-            push_field(&mut preimage, "to", to);
-        }
-        push_field(&mut preimage, "coverage_digest", &self.coverage_digest);
-        preimage.into_bytes()
+        authorized_manifest_preimage(self).into_bytes()
     }
+}
+
+/// The single canonical encoder for the declared `authorized-manifest/v1`
+/// domain. Both the frozen digest and [`AuthorizedManifest::canonical_bytes`] go
+/// through here, so every field that can change what the manifest authorizes is
+/// covered by exactly one field set.
+fn authorized_manifest_preimage(manifest: &AuthorizedManifest) -> String {
+    let mut preimage = String::from("authorized-manifest/v1;");
+    push_field(&mut preimage, "inquiry_digest", &manifest.inquiry_digest);
+    push_field(
+        &mut preimage,
+        "denominator_digest",
+        &manifest.denominator_digest,
+    );
+    push_count(&mut preimage, "sources", manifest.sources.len());
+    for (handle, (content, raw)) in &manifest.sources {
+        push_field(&mut preimage, "source", handle);
+        push_field(&mut preimage, "content", content);
+        if let Some(raw) = raw {
+            push_field(&mut preimage, "raw", raw);
+        }
+    }
+    push_count(&mut preimage, "edges", manifest.dependence_edges.len());
+    for (from, to) in &manifest.dependence_edges {
+        push_field(&mut preimage, "from", from);
+        push_field(&mut preimage, "to", to);
+    }
+    push_field(&mut preimage, "coverage_digest", &manifest.coverage_digest);
+    for limit in &manifest.grade_limits {
+        push_field(&mut preimage, "grade_limit", limit);
+    }
+    for item in &manifest.counterevidence {
+        push_field(&mut preimage, "counterevidence", item);
+    }
+    for item in &manifest.conflicts {
+        push_field(&mut preimage, "conflict", item);
+    }
+    for item in &manifest.unknowns {
+        push_field(&mut preimage, "unknown", item);
+    }
+    for handle in &manifest.allowlist {
+        push_field(&mut preimage, "allowed", handle);
+    }
+    for handle in &manifest.revoked {
+        push_field(&mut preimage, "revoked", handle);
+    }
+    push_field(
+        &mut preimage,
+        "disclosure",
+        &format!("{:?}", manifest.disclosure),
+    );
+    push_field(
+        &mut preimage,
+        "expires_ms",
+        &manifest.expires_ms.to_string(),
+    );
+    push_field(&mut preimage, "revision", &manifest.revision.to_string());
+    preimage
 }
 
 /// Audits one already-structured claim against the frozen portfolio and
@@ -2566,21 +2602,31 @@ pub fn audit_claim(
     let mut evidence_map: Vec<String> = Vec::new();
     let mut unsupported_precision: Vec<UnsupportedPrecisionItem> = Vec::new();
     let mut stale_hit = false;
+    // These three are recorded where the condition is actually known rather
+    // than recovered later from the rendered residue prose. A residue line is
+    // diagnostic text, and matching a substring of it let an unrelated line
+    // (a counterclaim outside the manifest, say) flip a citation verdict.
+    let mut outside_citation = false;
+    let mut lineage_gap = false;
+    let mut support_gap = false;
     if claim.material && claim.citations.is_empty() {
         residue.push("claim: material claim records no citations".to_owned());
     }
     for handle in &claim.citations {
         if !manifest.allows(handle) {
+            outside_citation = true;
             residue.push(format!("claim: citation {handle} outside frozen manifest"));
             continue;
         }
         let Some(record) = portfolio.records.get(handle) else {
+            lineage_gap = true;
             residue.push(format!(
                 "claim: citation {handle} has no authoritative lineage"
             ));
             continue;
         };
         if !record.covers_domain(&claim.domain) {
+            lineage_gap = true;
             residue.push(format!(
                 "claim: source {handle} outside claim domain {}",
                 claim.domain
@@ -2601,6 +2647,7 @@ pub fn audit_claim(
                 residue.push(format!("claim: source {handle} stale carries no weight"));
             }
             _ => {
+                support_gap = true;
                 residue.push(format!(
                     "claim: source {handle} disposition {} carries no weight",
                     record.acquisition.wire_name()
@@ -2620,20 +2667,57 @@ pub fn audit_claim(
             ));
         }
     }
+    // Contradiction is determined from RELEVANT counterevidence under compatible
+    // conditions, never from the mere presence of an attached counterclaim
+    // identity. An attached identity is preserved either way; it contradicts only
+    // when it resolves to an in-manifest record that covers this claim's domain
+    // and carries evidentiary weight. One that cannot be resolved that way stays
+    // explicit as `NotVerifiableInScope` instead of being silently smoothed into
+    // support or silently dropped.
+    let mut contradicting: Vec<String> = Vec::new();
+    let mut unverifiable: Vec<String> = Vec::new();
+    for counterclaim_id in &claim.counterclaim_ids {
+        if !manifest.allows(counterclaim_id) {
+            unverifiable.push(counterclaim_id.clone());
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} outside frozen manifest"
+            ));
+            continue;
+        }
+        let Some(record) = portfolio.records.get(counterclaim_id) else {
+            unverifiable.push(counterclaim_id.clone());
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} has no authoritative lineage"
+            ));
+            continue;
+        };
+        if !record.covers_domain(&claim.domain) {
+            unverifiable.push(counterclaim_id.clone());
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} outside claim domain {}",
+                claim.domain
+            ));
+            continue;
+        }
+        if !record.acquisition.may_support() {
+            unverifiable.push(counterclaim_id.clone());
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} disposition {} carries no weight",
+                record.acquisition.wire_name()
+            ));
+            continue;
+        }
+        contradicting.push(counterclaim_id.clone());
+    }
     let counterevidence: Vec<String> = claim.counterclaim_ids.clone();
     let unknowns: Vec<String> = claim.unknown_refs.clone();
-    let outside = residue
-        .iter()
-        .any(|r| r.contains("outside frozen manifest"));
     let precision_gap = !unsupported_precision.is_empty();
-    let lineage_gap = residue
-        .iter()
-        .any(|r| r.contains("no authoritative lineage") || r.contains("outside claim domain"));
-    let support_gap = residue.iter().any(|r| r.contains("carries no weight"));
-    let outcome = if outside {
+    let outcome = if outside_citation {
         ClaimOutcome::OutsideManifest
-    } else if !counterevidence.is_empty() {
+    } else if !contradicting.is_empty() {
         ClaimOutcome::Contradicted
+    } else if !unverifiable.is_empty() {
+        ClaimOutcome::NotVerifiableInScope
     } else if !unknowns.is_empty()
         || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
     {
