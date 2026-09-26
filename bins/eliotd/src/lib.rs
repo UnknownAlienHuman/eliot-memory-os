@@ -123,6 +123,10 @@ pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
 };
+pub use controlboard_adapters::{
+    CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
+    controlboard_result_body, is_controlboard_read_tool, serve_controlboard_view,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
@@ -455,9 +459,14 @@ pub struct DaemonComposition {
     ///
     /// Volatile fast path only, never durability: a newly created board
     /// replays an already-admitted operation without a second effecting-port
-    /// call while the process lives. Durable operator identity lives in
-    /// Kernel ORS through the async Governor operator borrow; post-commit
-    /// refreshes retain this handle without ever clearing it.
+    /// call while the process lives. Cross-restart durability is NOT owned by
+    /// Kernel ORS through an async Governor operator borrow: the borrow reaches
+    /// only `KernelTransitionPort::receipt`, whose `eliot_store_api::WriteReceipt`
+    /// carries neither the `session_id` nor the `access_digest` a reconciled
+    /// board receipt must carry, so the contract this would need is a
+    /// command-receipt projection read for the exact `OperationId` that no
+    /// reachable port returns. Post-commit refreshes retain this handle without
+    /// ever clearing it.
     operator_replay: SharedOperatorReplay,
     /// Set when a post-commit refresh fails after the write receipt was
     /// already durable. The dependent view is stale/pending until the caller
@@ -1222,14 +1231,23 @@ impl DaemonComposition {
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
+    /// This is the one production composition owner of the `ControlBoard` ports
+    /// (Implements #1187 W1/A1). Its production caller is
+    /// [`serve_controlboard_view`](crate::serve_controlboard_view), which the
+    /// daemon runtime's local-read poller serves for one Kernel-admitted
+    /// claimed pair; no other site builds a board.
+    ///
     /// The board reads one immutable snapshot taken here; every port call in
-    /// the returned value observes the same revision and fence. Callers take
-    /// a fresh board per operation so a Governor refresh surfaces as an
-    /// exact-view mismatch instead of silent divergence. The board shares the
-    /// retained volatile replay handle, so a newly created board replays an
-    /// already-admitted operation instead of admitting it twice; durable
-    /// operator identity stays in Kernel ORS through the async Governor
-    /// operator borrow. Access resolution admits exactly the one live
+    /// the returned value observes the same revision and fence, so one served
+    /// read cannot mix two of either. Callers take a fresh board per operation,
+    /// which means a Governor refresh is not observed by the board in flight:
+    /// it appears at the next read as a newer, still internally consistent view,
+    /// not as a mismatch. The board shares the retained volatile replay handle,
+    /// so a newly created board replays an already-admitted operation instead
+    /// of admitting it twice; cross-restart durability is not owned here — it
+    /// needs the command-receipt projection read for the exact `OperationId`
+    /// that the `operator_replay` field contract names and that no reachable
+    /// port provides. Access resolution admits exactly the one live
     /// Kernel-issued owner session when the runtime threaded validated facts
     /// (AUD-C02-B), else the typed provider gap; the Swarm projection remains
     /// a typed provider gap until its owning slice lands. Reads serve a

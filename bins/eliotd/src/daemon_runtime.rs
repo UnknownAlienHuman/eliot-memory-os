@@ -2222,6 +2222,58 @@ async fn run_local_read_poll(
         };
         return Ok(step(outcome, delta));
     }
+    // #1187 W1/A1: a claimed pair naming the broker-owned operator read
+    // capability is served here, not forwarded on the Kernel `local_read` leg,
+    // because that leg serves store reads only. The branch builds one board
+    // over one immutable Governor snapshot and performs exactly one
+    // authenticated role-filtered read on it, so the canonical role-filtered
+    // view — or the board's exact typed refusal, including a `PlanGap` naming
+    // the missing owner — is served from the live daemon path instead of being
+    // composed into a board nobody reads. Every claimed pair, refusal included,
+    // settles through the same idempotent submit leg below, so a ControlBoard
+    // read can never poison the poller or drop a pair. The composition guard is
+    // held only around the read; it never crosses the submit leg.
+    //
+    // NOT REACHABLE AT RUNTIME (#1187 piece C, verified against the current
+    // Kernel source). No claimed pair can carry `controlboard.read`, so the
+    // predicate below is always false and this branch is source-reachable only.
+    // The Kernel queues a host request for this outbound poller exactly when
+    // `host_request_route::check_local_read_admission` resolves selectors, and
+    // `host_request_route::local_read_selectors_from_tool` returns selectors
+    // only for `tool.name == "eliot.query"` whose `envelope.identity.capability`
+    // equals it; `host_request_route::KernelComposition::claim_local_read_pair`
+    // then independently skips every candidate whose
+    // `envelope.identity.capability != "eliot.query"`. Both gates are in
+    // `bins/eliot-kernel/src/host_request_route.rs`, cited by symbol rather than
+    // by line, because a line number in a comment is wrong the next time the
+    // file moves. No host request naming the broker-admitted
+    // `controlboard.read` or `operator.command` capability is ever queued for, or
+    // claimed by, this poller, so neither reaches a daemon branch here. The same
+    // two gates make the `is_skill_tool` branches above unreachable as well; that
+    // is recorded for root, not claimed here.
+    //
+    // Consequence for the operator command: adding an `operator.command` branch
+    // here would NOT create a production caller, and claiming one would be false.
+    // The missing owner act is the Kernel's poller routing for that
+    // broker-admitted capability, which is outside `bins/eliotd` and outside this
+    // issue's mutable scope.
+    if eliotd::is_controlboard_read_tool(&tool) {
+        let body = {
+            let guard = composition.lock().await;
+            eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+        };
+        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+        };
+        // #2647: this leg builds a board over the composition and reads it; it
+        // attaches no startup capability and re-evaluates no readiness, so the
+        // flight observed nothing and carries no delta. Settling it therefore
+        // cannot overwrite owner observations the loop recorded meanwhile, the
+        // same contract the ordinary forwarded read below settles under.
+        return Ok(step(outcome, None));
+    }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;

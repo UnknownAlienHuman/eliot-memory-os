@@ -27,10 +27,17 @@
 //! - Operator submission admits one exact-view intent against the live
 //!   snapshot fence and returns a candidate-only receipt. Acceptance is
 //!   transport acknowledgement, never task completion or a canonical write:
-//!   there is no commit path in this module. Boards built from one daemon
-//!   composition share one volatile replay handle
-//!   ([`SharedOperatorReplay`]); durable operator identity lives in Kernel
-//!   ORS through the async Governor operator borrow.
+//!   there is no commit path in this module, so nothing here reaches Kernel
+//!   ORS. Boards built from one daemon composition share one volatile replay
+//!   handle ([`SharedOperatorReplay`]) and nothing else.
+//! - The same port reconciles an already-issued operation
+//!   ([`GovernorOperatorCommand::reconcile`], #1187 piece B). It answers only
+//!   what the process-retained handle can prove — the exact original receipt
+//!   for an operation this process admitted — and refuses with the exact named
+//!   missing read contract ([`MISSING_OPERATOR_RECEIPT_READ`]) for anything
+//!   else, so a possibly submitted command stays `UNKNOWN_OUTCOME`/
+//!   `RECONCILING` and is never blindly repeated. It never resubmits, never
+//!   mints a new identity, and never invents a disposition.
 //! - Action digests, ceilings, capabilities, and targets are enforced by
 //!   `ControlBoard` before and after the port call; the adapters enforce the
 //!   bindings only the live snapshot can check (revision/fence currency and
@@ -41,6 +48,17 @@
 //! never touch I/O, so they cannot block the single-thread async reactor. The
 //! current Kernel binding is observed through the composition snapshot, never
 //! through a second client.
+//!
+//! Production edges out of this module (Implements #1187 W1/A1):
+//! [`is_controlboard_read_tool`] routes one Kernel-admitted claimed
+//! `eliot.query` pair naming the broker-owned operator read capability, and
+//! [`serve_controlboard_view`] builds one board over one immutable snapshot
+//! through [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard),
+//! performs exactly one authenticated role-filtered read on it, and binds the
+//! canonical view — or the board's exact typed refusal, including a
+//! `PlanGap` naming the missing owner — into the existing submit-leg result
+//! body. The composition is the single production owner of these ports; no
+//! other caller builds a board.
 
 #![forbid(unsafe_code)]
 
@@ -49,35 +67,39 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{RequestMetadata, SessionId, sha256_hex};
+use eliot_contracts::{RequestMetadata, SessionId, canonical_json_bytes, sha256_hex};
 use eliot_controlboard::{
     AccessBinding, AccessResolverPort, ActionCapability, CanonicalState, CanonicalStatePort,
-    CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, OperatorCommandPort,
-    PortError, PrivacyClass, ProjectionBinding, ProjectionProvider, ProposeSkillRequest,
-    ProviderCompleteness, ReadRequest, Role, SkillLifecyclePort, SwarmProjectionEnvelope,
-    SwarmProjectionPort, ViewRevision,
+    CommandDisposition, CommandQuery, CommandReceipt, CommandRequest, ControlBoard,
+    ControlBoardError, ControlBoardView, OperatorCommandPort, PortError, PrivacyClass,
+    ProjectionBinding, ProjectionProvider, ProposeSkillRequest, ProviderCompleteness, ReadRequest,
+    Role, SkillLifecyclePort, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
 use eliot_kernel_core::Notification;
+use eliot_protocol::{
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+};
 use eliot_skill::{SkillCandidate, SkillError, SkillLifecycleView};
+use serde::{Deserialize, Serialize};
 
 use super::daemon_kernel_client::OwnerSessionFacts;
 
 /// Builds one [`ControlBoard`] over a fresh Governor projection snapshot.
 ///
 /// The snapshot is immutable: every port call in the returned board observes
-/// the same fence and revision, so a mid-read Governor refresh surfaces as an
-/// exact-view mismatch at the next call rather than silent divergence.
+/// the same fence and revision, so one served read cannot mix two of either. A
+/// Governor refresh is not observed by that board; it appears at the next read,
+/// which serves a newer but still internally consistent view.
 ///
 /// The board shares the caller-retained [`SharedOperatorReplay`] handle, so a
 /// newly created board replays an already-admitted operation instead of
-/// admitting it twice. `admitted` carries owner-issued session bindings for
-/// the access resolver; production passes none (the session owner is
-/// deferred), which keeps the unadmitted typed gap. `notifications` carries
-/// pre-fetched canonical notification records (issue #1780) from an
-/// authenticated `GetNotificationState` read at the snapshot fence;
-/// production passes none until the daemon wires that read, which keeps the
-/// inbox empty rather than fabricated.
+/// admitting it twice. `admitted` carries the owner-issued session bindings
+/// for the access resolver: the daemon's own single live Kernel session is
+/// admitted from the facts the runtime threaded, and every other session stays
+/// unadmitted with the fail-closed typed gap. `notifications` carries the
+/// canonical notification records hydrated at the snapshot fence; an absent
+/// attach keeps the inbox empty rather than fabricated.
 pub(crate) fn controlboard_over_snapshot(
     snapshot: ControlBoardGovernorSnapshot,
     shared: &SharedOperatorReplay,
@@ -85,9 +107,9 @@ pub(crate) fn controlboard_over_snapshot(
     notifications: Vec<Notification>,
 ) -> ControlBoard {
     let snapshot = Arc::new(snapshot);
-    // Production passes no sessions, which cannot fail. An invalid test
-    // admission degrades to the empty resolver so submission stays fail-closed
-    // downstream instead of inventing rights.
+    // The empty admission cannot fail; an invalid admission degrades to the
+    // empty resolver so submission stays fail-closed downstream instead of
+    // inventing rights.
     let access = if admitted.is_empty() {
         GovernorAccessResolver::new(Arc::clone(&snapshot))
     } else {
@@ -111,10 +133,398 @@ pub(crate) fn controlboard_over_snapshot(
     .with_skill_lifecycle(Box::new(GovernorSkillSnapshot::new(snapshot)))
 }
 
-/// Rejects bindings that are not current at the snapshot fence and revision.
+/// The broker-admitted operator read capability the composed board serves.
 ///
-/// A refresh between the access resolution and this call fails closed here
-/// instead of serving a cross-fence view.
+/// Pinned as a wire literal in this runtime root rather than imported:
+/// `crates/surfaces/eliot-user-broker-core/src/lib.rs` (`OPERATOR_CAPABILITIES`)
+/// is the admission owner that issues it and
+/// `crates/meta/eliot-runtime-status/src/controlboard_projection.rs` names it as
+/// the `capability` binding example. The daemon is neither: it routes one
+/// already-admitted claimed pair on the capability identity the Kernel itself
+/// validated, and mints no capability of its own. A third import edge would add
+/// a dependency without changing a byte on the wire or widening any authority.
+pub const CONTROLBOARD_READ_CAPABILITY: &str = "controlboard.read";
+
+/// Routes one claimed pair tool to the composed `ControlBoard` read.
+///
+/// Thin predicate in the same shape as
+/// [`is_skill_tool`](super::skill_dispatch::is_skill_tool): the local-read
+/// poller serves such pairs locally through
+/// [`serve_controlboard_view`] instead of forwarding them on the Kernel
+/// `local_read` leg, which serves store reads only. Anything else keeps the
+/// existing forward path byte-identical.
+#[must_use]
+pub fn is_controlboard_read_tool(tool: &serde_json::Value) -> bool {
+    tool.as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name == CONTROLBOARD_READ_CAPABILITY)
+}
+
+/// Builds the inert board read intent for one claimed pair.
+///
+/// Every field is a Kernel-issued owner value, never a default, a derived
+/// constant, or anything read from a file, PID, or port:
+///
+/// * `session_id` and `generation` come from the Kernel-issued
+///   [`LocalReadAttempt`] — the admitted session binding and the monotonic
+///   fencing generation that only the current generation may complete;
+/// * `connection_id` and `request_id` come from the admitted
+///   [`HostRequestEnvelope`], the Kernel-created transport correlation and the
+///   exact request identity;
+/// * `credential_binding` is the digest of the exact immutable admission
+///   descriptor and `challenge` is the digest of the exact Kernel-produced
+///   transport admission receipt — the two admission digests the Kernel issued
+///   for this very request, carried as opaque references and never as secret
+///   material.
+///
+/// The attempt's session must be the session the envelope admitted; a mismatch
+/// is refused as an exact typed board error rather than resolved toward
+/// either side. Nothing is pinned to an expected revision or fence: the caller
+/// declared no view, so the read serves the one snapshot taken here.
+pub(crate) fn controlboard_read_intent(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+) -> Result<ReadRequest, ControlBoardError> {
+    if attempt.fencing_generation == 0 {
+        return Err(ControlBoardError::InvalidField("generation"));
+    }
+    if envelope.identity.session_id.as_deref() != Some(attempt.session_id.as_str()) {
+        return Err(ControlBoardError::Unauthorized);
+    }
+    ReadRequest::new(
+        attempt.session_id.clone(),
+        envelope.connection_id.clone(),
+        envelope.descriptor_sha256.clone(),
+        envelope.peer_admission_receipt_sha256.clone(),
+        envelope.identity.request_id.as_str().to_owned(),
+        attempt.fencing_generation,
+    )
+}
+
+/// The board's closed refusal vocabulary, crossed onto the wire unchanged.
+///
+/// `ControlBoardError` is a `thiserror` type with no serde representation, so a
+/// refusal cannot be serialised as the board's own enum. Carrying only its
+/// `Display` text would collapse a typed failure into a string at this
+/// boundary, and `PLAN_GAP` would then be indistinguishable from
+/// `STALE_VIEW`/`UNAUTHORIZED` to any consumer that has to branch on it. This
+/// enum therefore keeps every refusal variant distinguishable by TYPE while
+/// `detail` keeps the board's own verbatim `Display` as the human-readable
+/// half.
+///
+/// It is a 1:1 cross of the board's existing variants, not a second
+/// vocabulary: no variant is added, renamed, merged or reordered, and no
+/// message text is invented here. The one extra variant,
+/// [`ControlBoardRefusal::CompositionUnavailable`], is the daemon composition's
+/// own lifecycle failure and is deliberately distinct from every board refusal
+/// so a lifecycle gap is never reported as a provider gap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBoardRefusal {
+    /// A required provider adapter is absent; the detail names it.
+    PlanGap,
+    /// The caller's pinned view revision/fence diverged from the snapshot.
+    StaleView,
+    /// The access binding is stale or expired.
+    StaleAccess,
+    /// The state fence does not match its revision.
+    FenceMismatch,
+    /// The revision must be non-zero.
+    InvalidRevision,
+    /// A request field failed validation; the detail names the field.
+    InvalidField,
+    /// A projection identity is duplicated; the detail carries it.
+    DuplicateId,
+    /// An admitted privacy class is duplicated.
+    DuplicatePrivacyClass,
+    /// An action capability is duplicated.
+    DuplicateCapability,
+    /// A reference is duplicated.
+    DuplicateReference,
+    /// The action binding does not match the canonical action bytes.
+    ActionBindingMismatch,
+    /// The Swarm projection source digest does not match canonical bytes.
+    SwarmSourceDigestMismatch,
+    /// The action target is hidden or missing from the filtered view.
+    HiddenOrMissingTarget,
+    /// The action target has the wrong entity kind.
+    WrongTargetKind,
+    /// The review lifecycle transition is not permitted.
+    InvalidReviewTransition,
+    /// The command receipt binding or fence mismatched.
+    ReceiptBindingMismatch,
+    /// The command receipt exceeds the requested ceiling.
+    ReceiptOverclaim,
+    /// The same operation identity presented changed bytes.
+    IdentityConflict,
+    /// The provider denied the operation.
+    Unauthorized,
+    /// The provider outcome is unknown.
+    UnknownOutcome,
+    /// The provider reported a contract failure; the detail carries it.
+    Provider,
+    /// The daemon composition could not produce a board at this fence. This is
+    /// the daemon's own lifecycle observation, not a board refusal.
+    CompositionUnavailable,
+}
+
+impl ControlBoardRefusal {
+    /// Crosses one board refusal into its wire counterpart, total over the
+    /// board's closed `ControlBoardError` variants.
+    fn from_board_error(error: &ControlBoardError) -> Self {
+        match error {
+            ControlBoardError::PlanGap(_) => Self::PlanGap,
+            ControlBoardError::StaleView => Self::StaleView,
+            ControlBoardError::StaleAccess => Self::StaleAccess,
+            ControlBoardError::FenceMismatch => Self::FenceMismatch,
+            ControlBoardError::InvalidRevision => Self::InvalidRevision,
+            ControlBoardError::InvalidField(_) => Self::InvalidField,
+            ControlBoardError::DuplicateId(_) => Self::DuplicateId,
+            ControlBoardError::DuplicatePrivacyClass => Self::DuplicatePrivacyClass,
+            ControlBoardError::DuplicateCapability => Self::DuplicateCapability,
+            ControlBoardError::DuplicateReference => Self::DuplicateReference,
+            ControlBoardError::ActionBindingMismatch => Self::ActionBindingMismatch,
+            ControlBoardError::SwarmSourceDigestMismatch => Self::SwarmSourceDigestMismatch,
+            ControlBoardError::HiddenOrMissingTarget => Self::HiddenOrMissingTarget,
+            ControlBoardError::WrongTargetKind => Self::WrongTargetKind,
+            ControlBoardError::InvalidReviewTransition => Self::InvalidReviewTransition,
+            ControlBoardError::ReceiptBindingMismatch => Self::ReceiptBindingMismatch,
+            ControlBoardError::ReceiptOverclaim => Self::ReceiptOverclaim,
+            ControlBoardError::IdentityConflict => Self::IdentityConflict,
+            ControlBoardError::Unauthorized => Self::Unauthorized,
+            ControlBoardError::UnknownOutcome => Self::UnknownOutcome,
+            ControlBoardError::Provider(_) => Self::Provider,
+        }
+    }
+}
+
+/// One served `ControlBoard` read outcome, exactly as the board produced it.
+///
+/// `View` is the canonical role-filtered [`ControlBoardView`] from the single
+/// snapshot the seam read, encoded 1:1: no row is added, dropped, re-projected,
+/// merged, or health-synthesised, and no hidden-row count, identifier, summary,
+/// or ordering side channel is introduced here. `Refused` reproduces the
+/// board's own exact typed failure, so a `PLAN_GAP` naming the missing owner
+/// reaches the caller as that same typed refusal instead of an empty current
+/// view. The two shapes are exhaustive and never interchangeable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlBoardReadOutcome {
+    /// The exact role-filtered immutable view at one declared boundary.
+    View {
+        /// The canonical view the board returned, crossed unchanged.
+        view: Box<ControlBoardView>,
+    },
+    /// The board refused the read.
+    Refused {
+        /// Which board refusal this is, kept typed on the wire.
+        refusal: ControlBoardRefusal,
+        /// The board's own refusal text, never a re-worded or generic code.
+        detail: String,
+    },
+}
+
+/// Serves one claimed `ControlBoard` read pair and returns its submit-leg result
+/// body.
+///
+/// The production composition owner of the existing `ControlBoard` ports
+/// (Implements #1187 W1/A1): it builds one board over one immutable Governor
+/// projection snapshot through
+/// [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard)
+/// and performs exactly one authenticated, role-filtered read on it.
+///
+/// What that one snapshot buys is *per-read internal consistency*: every port
+/// call inside this board — access resolution, canonical state, Swarm
+/// projection — reads the same `Arc<ControlBoardGovernorSnapshot>`, so one
+/// served read can never mix two revisions or two fences. A Governor refresh is
+/// not observed at all: this read answers from the snapshot it took, and the
+/// refreshed snapshot appears at the *next* read as a newer, still internally
+/// consistent view. It never surfaces here as a mismatch, and nothing in this
+/// module watches for one.
+///
+/// `access_currency` is a defensive consistency assertion, not drift
+/// detection: `GovernorAccessResolver::resolve` fills `access_revision` and
+/// `access_fence` from the very snapshot that assertion compares against, so
+/// through the current wiring the comparison holds by construction and its
+/// `Denied` arm is unreachable. It stays so a future port handing this module a
+/// binding from another snapshot is caught instead of serving a cross-fence view.
+///
+/// The read either returns the canonical view under the session owner that
+/// issued the binding, or the exact typed refusal — currently
+/// `PlanGap(AccessResolver)` while the User Broker session owner has issued no
+/// role/privacy/capability binding for an operator session. No default-zero
+/// stub, in-memory stand-in, empty adapter, or success is synthesised on either
+/// branch, and the composition's own failure stays distinct from a board
+/// refusal so a lifecycle gap is never reported as a `ControlBoard` provider gap.
+///
+/// Every claimed pair settles through the existing idempotent submit leg,
+/// including refusals, so a `ControlBoard` read can never poison the poller.
+pub fn serve_controlboard_view(
+    composition: &super::DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+) -> HostRequestResultBody {
+    let outcome = controlboard_read_outcome(composition, envelope, attempt);
+    controlboard_result_body(envelope, attempt, &outcome)
+        .unwrap_or_else(|error| controlboard_refusal_body(envelope, attempt, &error))
+}
+
+/// Performs exactly one authenticated role-filtered read and returns the
+/// board's own typed result, unchanged.
+fn controlboard_read_outcome(
+    composition: &super::DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+) -> ControlBoardReadOutcome {
+    // The composition is the lifecycle observation; a board refusal is the
+    // ControlBoard typed vocabulary. They stay distinct, so a composition that
+    // cannot produce a board at this fence is never reported as a provider gap.
+    let mut controlboard = match composition.controlboard() {
+        Ok(controlboard) => controlboard,
+        Err(error) => {
+            return ControlBoardReadOutcome::Refused {
+                refusal: ControlBoardRefusal::CompositionUnavailable,
+                detail: format!("daemon controlboard composition unavailable: {error}"),
+            };
+        }
+    };
+    match controlboard_read_intent(envelope, attempt) {
+        Ok(read) => match controlboard.view(&read) {
+            Ok(view) => ControlBoardReadOutcome::View {
+                view: Box::new(view),
+            },
+            Err(error) => ControlBoardReadOutcome::Refused {
+                refusal: ControlBoardRefusal::from_board_error(&error),
+                detail: error.to_string(),
+            },
+        },
+        Err(error) => ControlBoardReadOutcome::Refused {
+            refusal: ControlBoardRefusal::from_board_error(&error),
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Binds one `ControlBoard` read outcome into the submit-leg result body.
+///
+/// The typed [`ControlBoardError`] crosses this boundary intact: it is never
+/// flattened to display text before the wire refusal is chosen, and the wire
+/// variant is always the total typed cross of that error
+/// (`ControlBoardRefusal::from_board_error`), so a consumer tells refusals
+/// apart by variant and never by matching message text. `detail` remains the
+/// bounded verbatim `Display`, the human-readable half only.
+///
+/// A local construction failure is reported through the board's own `Provider`
+/// variant, which is the one variant the board already defines for a
+/// detail-only port-level refusal; it is never re-labelled as a `PlanGap`, a
+/// stale view, or a success.
+pub fn controlboard_result_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    outcome: &ControlBoardReadOutcome,
+) -> Result<HostRequestResultBody, ControlBoardError> {
+    let response = serde_json::to_value(outcome).map_err(|error| {
+        ControlBoardError::Provider(format!("controlboard outcome encoding: {error}"))
+    })?;
+    if !response.is_object() {
+        return Err(ControlBoardError::Provider(
+            "controlboard outcome must encode as a JSON object".to_owned(),
+        ));
+    }
+    let bytes = canonical_json_bytes(&response).map_err(|error| {
+        ControlBoardError::Provider(format!("controlboard outcome digest: {error}"))
+    })?;
+    let body = HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: sha256_hex(&bytes),
+        response,
+        attempt: Some(attempt.clone()),
+    };
+    body.validate().map_err(|error| {
+        ControlBoardError::Provider(format!("controlboard result body shape: {error}"))
+    })?;
+    Ok(body)
+}
+
+/// Settles one claimed pair whose outcome could not be bound to a result body.
+///
+/// The refusal is an ordinary [`ControlBoardReadOutcome::Refused`] and is bound
+/// by [`controlboard_result_body`], the same owner every other body in this
+/// module goes through: it is encoded from the typed outcome, its
+/// `result_digest` is computed over the [`canonical_json_bytes`] of that exact
+/// response, and [`HostRequestResultBody::validate`] gates the result. The
+/// reason is the typed cross of the failure that got here
+/// (`ControlBoardRefusal::from_board_error`) with the bounded verbatim
+/// `Display` as the human half, never a message-only body and never a variant
+/// asserted in place of the failure.
+fn controlboard_refusal_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    error: &ControlBoardError,
+) -> HostRequestResultBody {
+    let outcome = ControlBoardReadOutcome::Refused {
+        refusal: ControlBoardRefusal::from_board_error(error),
+        detail: error.to_string().chars().take(512).collect::<String>(),
+    };
+    controlboard_result_body(envelope, attempt, &outcome)
+        .unwrap_or_else(|_| controlboard_unbound_refusal_body(envelope, attempt, &outcome))
+}
+
+/// Emits the refused outcome when even that refusal cannot be bound.
+///
+/// The arm exists for one case, and the case is not the response: the refusal is
+/// bounded, already encoded, and digested, so a refusal here is over the
+/// Kernel-minted envelope and attempt this body copies verbatim. No response
+/// shape can change that verdict, no field here may be invented to change it,
+/// and a claimed pair must still settle, so the same refused bytes are emitted
+/// once more — with `result_digest` again taken over the exact canonical bytes
+/// of the exact response emitted, so a consumer recomputing that digest
+/// canonically still matches — and the same shape gate is run on the body that
+/// actually leaves. The Kernel submit leg
+/// (`host_request_route::KernelComposition::submit_local_read_result`) runs
+/// [`HostRequestResultBody::validate`] as its first act and is the final
+/// authority over a result body, so this arm settles the pair with the honest
+/// refusal instead of dropping it or forging a valid one.
+fn controlboard_unbound_refusal_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    outcome: &ControlBoardReadOutcome,
+) -> HostRequestResultBody {
+    // Total over a `Refused` outcome, which is a unit-variant enum plus one
+    // bounded string: neither the encode nor the canonical-bytes step can fail
+    // here, so the digest below always binds the exact response emitted.
+    let response = serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null);
+    let result_digest =
+        sha256_hex(&canonical_json_bytes(&response).unwrap_or_else(|_| b"null".to_vec()));
+    let body = HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest,
+        response,
+        attempt: Some(attempt.clone()),
+    };
+    // The gate is run, not assumed; its verdict is the one already observed
+    // above and is adjudicated by the submit leg, not by this arm.
+    let _shape_gate = body.validate();
+    body
+}
+
+/// Asserts that an access binding is the one this snapshot issued.
+///
+/// Defensive consistency assertion, not drift detection, and it is not evidence
+/// that a Governor refresh was seen: [`GovernorAccessResolver::resolve`] sets
+/// `access_revision` and `access_fence` from the same snapshot this compares
+/// them against, so through the wiring [`controlboard_over_snapshot`] builds,
+/// the comparison holds by construction and this arm cannot be reached. The
+/// check is kept because a future port that hands this module a binding taken at
+/// another snapshot would then fail closed here instead of serving a
+/// cross-fence view.
 fn access_currency(
     snapshot: &ControlBoardGovernorSnapshot,
     access: &AccessBinding,
@@ -170,10 +580,10 @@ pub(crate) struct AdmittedSessionAccess {
     expires_at_unix_ms: u64,
 }
 
-// AUD-C02: composition admission seam for the future session owner (User
-// Broker role issuance is deferred to #23/#1135). Production wiring stays on
-// `new` (empty map) until that owner exists.
-#[allow(dead_code)]
+// AUD-C02: composition admission seam for the session owner (User Broker role
+// issuance is deferred to #23/#1135). Production wiring reaches
+// `from_kernel_owner_facts` through `DaemonComposition::controlboard`, which
+// the daemon's own claimed-pair read path now serves.
 impl AdmittedSessionAccess {
     /// Admits one owner-issued session binding after fail-closed validation.
     /// The full owner-issued fact set travels in one validated step so no
@@ -355,9 +765,9 @@ impl GovernorAccessResolver {
     /// binding is an idempotent replay, while a changed binding under an
     /// already-admitted session id is an identity conflict that mutates
     /// nothing.
-    // AUD-C02: composition admission point for the future session owner;
-    // production wiring stays on `new` (empty map) until that owner exists.
-    #[allow(dead_code)]
+    // AUD-C02: composition admission point for the session owner. Production
+    // wiring reaches this through `DaemonComposition::controlboard`, which the
+    // daemon's own claimed-pair read path now serves.
     pub(crate) fn with_admitted_sessions(
         snapshot: Arc<ControlBoardGovernorSnapshot>,
         admitted: Vec<AdmittedSessionAccess>,
@@ -491,11 +901,10 @@ impl CanonicalStatePort for GovernorCanonicalState {
             items: Vec::new(),
             reviews: Vec::new(),
             provenance: Vec::new(),
-            // Canonical notification records supplied pre-fetched by the
-            // board constructor (issue #1780). The daemon does not yet read
-            // notification state into its snapshot composition, so production
-            // passes none here; an empty supply reads as an empty inbox,
-            // never as resolved or suppressed state.
+            // Canonical notification records hydrated by the daemon runtime
+            // attach (issue #1780) at the board construction site. An attach
+            // that did not bind leaves the vector empty, which reads as an
+            // empty inbox, never as resolved or suppressed state.
             notifications: self.notifications.clone(),
         };
         state
@@ -511,10 +920,14 @@ impl CanonicalStatePort for GovernorCanonicalState {
 ///
 /// Volatile fast path only, never the durability story: it lets a newly
 /// created board replay an admission without a second effecting-port call
-/// while the process lives. Durable operator identity lives in Kernel ORS and
-/// is reconciled through the async Governor operator borrow
-/// (`GovernorComposition::operator_reconciliation`); a restart drops this map
-/// and replays resolve through that receipt route instead.
+/// while the process lives, and it is what
+/// [`GovernorOperatorCommand::reconcile`] reads to answer the reconnect case
+/// with the original command receipt. A restart drops this map, and no other
+/// port can answer for a dropped operation: the Governor's operator borrow
+/// reaches only `KernelTransitionPort::receipt`, whose `WriteReceipt` carries
+/// neither the `session_id` nor the `access_digest` a reconciled board receipt
+/// must carry (see [`MISSING_OPERATOR_RECEIPT_READ`]). So the adapter refuses
+/// with that exact named contract instead of guessing.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SharedOperatorReplay {
     inner: Arc<Mutex<HashMap<String, (CommandRequest, CommandReceipt)>>>,
@@ -538,7 +951,9 @@ impl SharedOperatorReplay {
 /// Admits one exact-view intent after verifying the owner-issued identity
 /// binding against the live snapshot fence. The receipt is candidate-only:
 /// it acknowledges admission, never execution, completion, or a canonical
-/// write.
+/// write. It also owns the reconcile read of one already-issued operation
+/// ([`Self::reconcile`], #1187 piece B), which is the only way a caller learns
+/// an operation's current known disposition without sending it again.
 struct GovernorOperatorCommand {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
     // #1187: exact-replay record keyed by operation_id text, shared through
@@ -647,7 +1062,95 @@ impl OperatorCommandPort for GovernorOperatorCommand {
         replay.insert(operation_key, (command.clone(), receipt.clone()));
         Ok(receipt)
     }
+
+    /// Reconciles one already-issued operation to the disposition this owner
+    /// can actually prove (#1187 piece B).
+    ///
+    /// Two outcomes exist here and nothing else is synthesised:
+    ///
+    /// * **Known** — an operation this process admitted is answered from the
+    ///   same process-retained [`SharedOperatorReplay`] record
+    ///   [`Self::submit`] writes, returning the stored receipt unchanged. That
+    ///   is the exact-replay requirement: same operation identity, same command
+    ///   receipt, no second admission, no re-execution, no new identity. This is
+    ///   precisely the reconnect case — the daemon builds a *fresh* board per
+    ///   operation while the composition retains the handle, so a reconnecting
+    ///   caller reaches the original record instead of resubmitting.
+    /// * **Unresolvable** — an operation this owner holds no record of has no
+    ///   establishable disposition here, so it is refused with
+    ///   [`PortError::Invalid`] carrying [`MISSING_OPERATOR_RECEIPT_READ`]. The
+    ///   command stays `UNKNOWN_OUTCOME`/`RECONCILING`; it is never reported as
+    ///   `Accepted` or `Rejected` and never repeated.
+    fn reconcile(&mut self, query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+        let operation_key = query.operation_id.as_str();
+        // A poisoned replay lock leaves the disposition unknown rather than
+        // inventing an admission or a denial.
+        let replay = self.replay.inner.lock().map_err(|_| PortError::Unknown)?;
+        match replay.get(operation_key) {
+            // The stored binding is read, never compared and never overwritten:
+            // the query carries no action to compare, and a reconcile must not
+            // mutate the record it is reading.
+            Some((_, receipt)) => Ok(receipt.clone()),
+            None => Err(PortError::Invalid(MISSING_OPERATOR_RECEIPT_READ.to_owned())),
+        }
+    }
 }
+
+/// The exact durable read contract this owner cannot reach for a possibly
+/// submitted operator command (#1187 piece B, corrected by piece C).
+///
+/// The Governor *does* own a typed query-by-operation-identity read:
+/// `eliot_governor`'s `KernelTransitionPort::receipt(OperationId)`, documented
+/// there as "Reconciles one operation by its exact canonical identity", and
+/// borrowed by `GovernorOperatorReconciliation`. It is unreachable from this
+/// adapter: [`GovernorOperatorCommand`] is built from one immutable
+/// [`ControlBoardGovernorSnapshot`], which carries the fence, read revision,
+/// coordination sequence, and the G-11/I-12 bindings only — no command state,
+/// no canonical admission owner, and no Kernel port. Nothing in
+/// [`ControlBoardGovernorSnapshot`] can answer "what is the current disposition
+/// of operation X", and this module never invents a second client to ask.
+///
+/// **Forwarding the Governor operator borrow is NOT sufficient, and must not be
+/// attempted as the fix.** `KernelTransitionPort::receipt` answers with an
+/// `eliot_store_api::WriteReceipt`. Its closed field set is `operation_id`,
+/// `idempotency_key`, `canonical_request_hash`, `transition_class`, `status`,
+/// `commit_id`, `state_fence`, `ordering_sequences`, `revision_before_after`,
+/// the applied/emitted/projection/outbox refs, the manifest, admission and
+/// mutation-plan digests, `semantic_source_revisions`, `error_code`,
+/// `resubmission`, `committed_at`, and `envelope`. It carries **no**
+/// `session_id` and **no** `access_digest`, and those two are precisely what
+/// `eliot_controlboard`'s `validate_reconciled_receipt` requires of any answer:
+/// it shape-checks `receipt_ref`, `session_id`, and `access_digest`, and
+/// refuses `ReceiptBindingMismatch` when `receipt.session_id` is not the
+/// session the access resolver just admitted. (`action_digest`, both ceilings,
+/// and the observed revision are deliberately *not* re-checked there, because a
+/// query does not carry them — so the blocker is exactly these two fields, not
+/// the whole set.) A `WriteReceipt` therefore cannot be projected onto the
+/// board's `CommandReceipt` at all, whatever borrow reaches it, and inventing
+/// those two values locally would be inventing a receipt.
+///
+/// What is actually missing is a *command-receipt projection read* owned by the
+/// Governor/Kernel slice: one read of the exact `OperationId` that returns the
+/// command-bound fields this port must echo. The `AppendAuditEvent` parameters
+/// `operator_command_envelope` writes do carry `session_id`, `access_digest`,
+/// `action_digest`, and `expected_revision`, but no port the operator adapter
+/// can reach returns them: `KernelTransitionPort` exposes only `apply_prepared`,
+/// `receipt`, and `health`, and `RecoveryOwner` has no `Operator` member, so no
+/// recovered owner image carries an operator command row. Reading them back
+/// instead would mean giving this adapter a store client, which is exactly the
+/// second owner `AGENTS.md` forbids. Until the projection read exists, the
+/// operation stays `UNKNOWN_OUTCOME`/`RECONCILING`.
+///
+/// The refusal is therefore exact and typed, and names this contract, instead
+/// of a fabricated success, a zero, or a stringly-typed "unknown".
+const MISSING_OPERATOR_RECEIPT_READ: &str = "no owner publishes an operator command-receipt read for the exact \
+     OperationId. eliot_governor's KernelTransitionPort::receipt answers with an \
+     eliot_store_api::WriteReceipt, which carries no session_id and no \
+     access_digest, so it cannot be projected onto the board's CommandReceipt, \
+     whose reconciled form must name the admitting session, even though \
+     GovernorOperatorReconciliation borrows it. GovernorOperatorCommand holds no \
+     such record; the operation stays UNKNOWN_OUTCOME/RECONCILING and must not be \
+     resubmitted.";
 
 /// Governor-backed Swarm projection reader.
 ///
@@ -1036,6 +1539,10 @@ mod tests {
                 observed_fence: command.expected_fence.clone(),
             })
         }
+
+        fn reconcile(&mut self, _query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            Err(PortError::Unknown)
+        }
     }
 
     fn board_with_counting_command(
@@ -1265,6 +1772,10 @@ mod tests {
         fn submit(&mut self, command: &CommandRequest) -> Result<CommandReceipt, PortError> {
             *self.calls.lock().expect("call count") += 1;
             self.inner.submit(command)
+        }
+
+        fn reconcile(&mut self, query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            self.inner.reconcile(query)
         }
     }
 
