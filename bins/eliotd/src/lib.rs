@@ -509,6 +509,16 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Governor-owned durable learning-closure owner (issue #1863, I12.24).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`] and owned by the
+    /// single [`eliot_governor::LearningClosureService`]. The live finish
+    /// ceremony commits one durable `AttemptLearningDelta` edge per
+    /// consequential attempt through it (see
+    /// [`DaemonComposition::close_attempt_learning`]). It holds no authority,
+    /// performs no transport, and is never read on the readiness path: closure
+    /// must not block or fail the finish ceremony.
+    learning_closure: eliot_governor::LearningClosureService,
 }
 
 impl DaemonComposition {
@@ -572,6 +582,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            learning_closure: eliot_governor::LearningClosureService::new(),
         })
     }
 
@@ -871,6 +882,50 @@ impl DaemonComposition {
     #[must_use]
     pub fn kernel_snapshot(&self) -> &eliot_governor::KernelGenerationSnapshot {
         self.governor.kernel_snapshot()
+    }
+
+    /// Commits the durable learning-closure edge for one consequential attempt.
+    ///
+    /// This is the production caller of
+    /// [`eliot_governor::GovernorComposition::close_attempt_learning`] on the
+    /// live `TestD` terminal finish ceremony
+    /// (`testd_terminal_completion::commit_testd_terminal_owner_fact`, phase 6).
+    ///
+    /// `activity_name` is the activity/tool identity the durable terminal job
+    /// row recorded for the observed step, and it is the value the ordinary-read
+    /// exclusion is applied to: a recorded `read_file`/`read`/`grep` derives no
+    /// boundary and commits no record.
+    ///
+    /// `receipt` is the admission receipt presented for the stored record. No
+    /// admission-receipt owner issues one at this seam, so the live caller
+    /// presents `None` and the durable receipt records the gate refusal: an
+    /// unadmitted proposed behavioral change is not delivered to the subsequent
+    /// attempt.
+    ///
+    /// The edge is non-blocking by construction: it reads retained owner
+    /// images, performs no transport, and its result is returned to the caller
+    /// instead of being propagated into the finish decision (I12.24 line 293).
+    pub fn close_attempt_learning(
+        &self,
+        evidence: &eliot_testd_core::TestdTerminalCompletionEvidence,
+        decision: &eliot_governor::FinishDecisionReceipt,
+        activity_name: &str,
+        receipt: Option<&eliot_governor::AdmissionReceipt>,
+    ) -> Result<eliot_governor::LearningClosureOutcome, eliot_governor::LearningClosureError> {
+        self.governor.close_attempt_learning(
+            &self.learning_closure,
+            evidence,
+            decision,
+            activity_name,
+            None,
+            receipt,
+        )
+    }
+
+    /// Borrows the single Governor-owned durable learning-closure owner.
+    #[must_use]
+    pub const fn learning_closure(&self) -> &eliot_governor::LearningClosureService {
+        &self.learning_closure
     }
 
     /// Returns the retained protected config path, for diagnostics only.
