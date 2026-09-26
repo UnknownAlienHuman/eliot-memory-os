@@ -25,7 +25,7 @@ use std::fmt;
 
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, ReceiptId,
-    ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+    ResourceGeneration, StateFence, canonical_json_bytes, fences_match_exact, sha256_hex,
 };
 use eliot_receipts::{AuthorityBinding, WorkScopeBinding};
 use schemars::JsonSchema;
@@ -117,6 +117,44 @@ pub const BACKUP_ARCHIVE_VALIDITY_ATTESTATION_WIRE_VERSION: u16 = 1;
 pub const BACKUP_CUTOVER_RECEIPT_WIRE_ID: &str = "eliot.protocol.backup.cutover-receipt";
 /// Current cutover receipt wire version.
 pub const BACKUP_CUTOVER_RECEIPT_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for the closed cutover payload contract.
+pub const BACKUP_CUTOVER_PAYLOAD_WIRE_ID: &str = "eliot.protocol.backup.cutover-payload";
+/// Current cutover payload wire version.
+pub const BACKUP_CUTOVER_PAYLOAD_WIRE_VERSION: u16 = 1;
+/// Exact payload-schema identity that an admitted cutover
+/// [`crate::HostRequestEnvelope`] must carry in
+/// [`crate::HostRequestIdentity::payload_schema_id`].
+///
+/// The admitted envelope's `payload_sha256` is a digest over the opaque
+/// payload bytes. This constant names the one schema identity for which those
+/// bytes are a [`BackupCutoverPayload`],
+/// [`BackupCutoverPayload::validate_admitted_payload`] is the only check that
+/// compares an admitted envelope against that constant and against a body,
+/// and it refuses an envelope admitted under any other schema. It is a schema
+/// identity only: naming it is not admission, and admission of an envelope is
+/// resolved through the authenticated owner/readback path, never by this
+/// string alone. It is deliberately distinct from
+/// [`BACKUP_CUTOVER_PAYLOAD_WIRE_ID`], which is the in-payload wire identity,
+/// and from the operation request digest domain.
+pub const BACKUP_CUTOVER_PAYLOAD_SCHEMA_ID: &str = "eliot.protocol.backup.cutover-payload.v1";
+/// Domain of the cutover payload content digest.
+///
+/// This is a domain name, not a digest input: the content digest is taken over
+/// canonical payload bytes only, so the domain travels as the payload's
+/// `wire_id` field rather than as an extra hashed prefix. The value is
+/// distinct from [`BACKUP_CUTOVER_OPERATION_REQUEST_DOMAIN`], so a
+/// payload-content digest and an operation-identity request digest are never
+/// the same digest and are never compared as if they were.
+pub const BACKUP_CUTOVER_PAYLOAD_CONTENT_DOMAIN: &str = "eliot.backup.cutover-content.v1";
+/// Domain separator of the cutover operation-identity request digest.
+///
+/// The operation request digest is the idempotency domain of the semantic
+/// cutover operation ([`crate::HostRequestKind::Invocation`] request
+/// correlation, the operation's own mutation identity, and the journal's
+/// per-phase mutation identities are distinct). It is derived under this
+/// separator and never equals a content digest; sharing a SHA-256 alphabet
+/// does not make two digest domains interchangeable.
+pub const BACKUP_CUTOVER_OPERATION_REQUEST_DOMAIN: &str = "eliot.backup.cutover-operation.v1";
 
 /// Returns the deterministic identity of the backup control family.
 pub fn contract_identity() -> Result<ContractIdentity, BackupError> {
@@ -1841,6 +1879,404 @@ impl BackupCutoverAdmission {
         }
         if self.installation_admission.scope.state_fence != request.fence {
             return Err(BackupError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Binds an admitted cutover to the exact payload body it admits.
+    ///
+    /// [`BackupCutoverAdmission::cutover_plan_digest`] is otherwise only
+    /// shape-validated. This is the single check that gives that field
+    /// meaning: the admitted plan digest must equal the canonical content
+    /// digest of the presented body. A changed body carrying the old claimed
+    /// digest, a receipt that is internally self-consistent but describes a
+    /// different body, and a body that never passed admission all refuse here
+    /// with [`BackupError::Mismatch`] on
+    /// `backup_cutover_admission.cutover_plan_digest`, before any journal
+    /// mutation, effect, or CAS. The admission is validated first, so an
+    /// unvalidated admission never reaches the comparison.
+    pub fn validate_against_payload(
+        &self,
+        payload: &BackupCutoverPayload,
+    ) -> Result<(), BackupError> {
+        self.validate()?;
+        payload.validate()?;
+        if self.cutover_plan_digest != payload.compute_digest()? {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_admission.cutover_plan_digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Closed cutover payload contract.
+// ---------------------------------------------------------------------------
+
+/// Closed, versioned cutover payload: the body an admitted cutover commits to.
+///
+/// This is the effect-relevant body of an installation cutover and the only
+/// schema in this family whose content is admitted by digest. Every field
+/// that can change an effect is bound here, so a body cannot be edited after
+/// admission without changing its content digest.
+///
+/// # Three identities, three domains
+///
+/// ```text
+/// HostRequestIdentity::payload_sha256      envelope payload domain
+/// BackupCutoverPayload::content_digest      payload content domain
+/// BackupCutoverPayload::operation_request_digest  operation identity domain
+/// ```
+///
+/// The first is a digest over opaque bytes the host request carried. The
+/// second is a digest over this contract's canonical bytes. The third is
+/// derived from the second under
+/// [`BACKUP_CUTOVER_OPERATION_REQUEST_DOMAIN`], so it can never equal the
+/// content digest, and the first is never assumed equal to either: a SHA-256
+/// string is not a shared domain. The journal's per-phase mutation identities
+/// ([`BackupMutationBinding::canonical_request_hash`]) remain a further,
+/// distinct set; a phase mutation binds the phase, not this body, and nothing
+/// here requires those identities to be equal to one another. I5.27 keeps
+/// database idempotency and external-effect idempotency separate; this type
+/// keeps payload content, envelope payload, operation identity, and per-phase
+/// mutation identity separate in the same way. Retries and request
+/// correlations that legitimately repeat a body keep the same content digest
+/// and the same derived operation request digest.
+///
+/// # Non-circular encoding
+///
+/// [`BackupCutoverPayload::canonical_unsigned_bytes`] clears `content_digest`
+/// before encoding, so the digest never covers itself. The bytes cover no
+/// [`BackupCutoverAdmission`], no receipt, and no admission reference: the
+/// admission refers to the body, never the reverse, so the content digest
+/// cannot be defined in terms of the admission that admits it.
+///
+/// # Class vocabulary
+///
+/// The class is this module's closed [`BackupClassWire`] vocabulary. The real
+/// `eliot_backup::BackupClass` owner lives in the backup storage crate, which
+/// this protocol crate deliberately does not depend on; an owner readback maps
+/// between them, and this contract never carries a parallel class
+/// vocabulary of its own.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCutoverPayload {
+    /// Must equal [`BACKUP_CUTOVER_PAYLOAD_WIRE_ID`].
+    pub wire_id: String,
+    /// Must equal [`BACKUP_CUTOVER_PAYLOAD_WIRE_VERSION`].
+    pub wire_version: u16,
+    /// Installation identity the cutover runs under.
+    pub installation_id: String,
+    /// Source installation identity; never equal to the destination.
+    pub source_installation: String,
+    /// Destination installation identity; isolated from the source.
+    pub dest_installation: String,
+    /// Semantic cutover operation identity.
+    pub operation_id: String,
+    /// Canonical digest of the archive under cutover.
+    pub archive_digest: String,
+    /// Declared archive class; cannot silently change.
+    pub archive_class: BackupClassWire,
+    /// Explicit canonical-only/degraded policy reference; required when the
+    /// class is [`BackupClassWire::CanonicalOnlyDegraded`].
+    pub canonical_only_policy: Option<String>,
+    /// Exact approved target generation to activate.
+    pub target_generation: String,
+    /// Canonical digest of the approved target build.
+    pub target_build_digest: String,
+    /// Canonical digest of the approved target configuration.
+    pub target_config_digest: String,
+    /// Exact active predecessor generation expected at commit time.
+    pub expected_predecessor: String,
+    /// Owner-issued activation fence for the target generation.
+    pub activation_fence: StateFence,
+    /// Owner-issued `UserBroker` reference for the destination generation.
+    pub user_broker_ref: String,
+    /// Canonical digest over every field except this field.
+    pub content_digest: String,
+}
+
+impl BackupCutoverPayload {
+    /// Current cutover payload contract version.
+    pub const CONTRACT_VERSION: u16 = BACKUP_CUTOVER_PAYLOAD_WIRE_VERSION;
+
+    /// Returns deterministic bytes covered by `content_digest`.
+    ///
+    /// `content_digest` is cleared before canonical encoding, so the digest
+    /// never covers itself. The bytes carry no admission and no receipt.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, BackupError> {
+        let mut unsigned = self.clone();
+        unsigned.content_digest.clear();
+        canonical_json_bytes(&unsigned)
+            .map_err(|error| BackupError::Serialization(error.to_string()))
+    }
+
+    /// Computes the canonical payload content digest.
+    ///
+    /// This digest belongs to the payload content domain. It is the value
+    /// [`BackupCutoverPayload::validate_admitted_payload`] compares with an
+    /// admitted [`crate::HostRequestIdentity::payload_sha256`] for the
+    /// [`BACKUP_CUTOVER_PAYLOAD_SCHEMA_ID`] schema, and the value a
+    /// [`BackupCutoverAdmission::cutover_plan_digest`] must equal. Computing
+    /// it proves nothing on its own; it is not an operation request digest,
+    /// not a per-phase mutation identity, and not evidence of issuance.
+    pub fn compute_digest(&self) -> Result<String, BackupError> {
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
+    }
+
+    /// Populates the canonical payload content digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, BackupError> {
+        self.content_digest = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Returns the claimed payload content digest after checking the body.
+    ///
+    /// Returns the stored `content_digest` once [`BackupCutoverPayload::validate`]
+    /// has proved it equals [`BackupCutoverPayload::compute_digest`], so the
+    /// returned value is always the checked content digest of the retained
+    /// body. This is a self-consistency check of one record only: it proves
+    /// the digest matches the body beside it, never that any other record
+    /// admitted that body. Use
+    /// [`BackupCutoverPayload::validate_admitted_payload`] to join this body
+    /// to an admitted [`crate::HostRequestEnvelope`], and
+    /// [`BackupCutoverPayload::operation_request_digest`] for the operation
+    /// identity domain.
+    pub fn checked_content_digest(&self) -> Result<String, BackupError> {
+        self.validate()?;
+        Ok(self.content_digest.clone())
+    }
+
+    /// Derives the operation-identity request digest from the content digest.
+    ///
+    /// This is the only construction of the operation identity domain: the
+    /// canonical bytes of this payload, the payload content domain, and
+    /// [`BACKUP_CUTOVER_OPERATION_REQUEST_DOMAIN`] are hashed together. It is
+    /// therefore a function of the body and never equal to a content digest.
+    /// The result is the semantic cutover operation identity; it is not the
+    /// host request correlation and not a per-phase journal mutation
+    /// identity.
+    pub fn operation_request_digest(&self) -> Result<String, BackupError> {
+        let unsigned = self.canonical_unsigned_bytes()?;
+        let mut framed = Vec::new();
+        framed.extend_from_slice(BACKUP_CUTOVER_PAYLOAD_CONTENT_DOMAIN.as_bytes());
+        framed.push(0);
+        framed.extend_from_slice(BACKUP_CUTOVER_OPERATION_REQUEST_DOMAIN.as_bytes());
+        framed.push(0);
+        framed.extend_from_slice(&unsigned);
+        Ok(sha256_hex(&framed))
+    }
+
+    /// Validates wire identity, bounds, class policy, fence, and digest.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cutover-payload validator keeps the wire-to-semantic check order in one auditable sequence"
+    )]
+    pub fn validate(&self) -> Result<(), BackupError> {
+        check_wire(
+            &self.wire_id,
+            self.wire_version,
+            BACKUP_CUTOVER_PAYLOAD_WIRE_ID,
+            Self::CONTRACT_VERSION,
+            "backup_cutover_payload.wire",
+        )?;
+        for (value, field) in [
+            (
+                self.installation_id.as_str(),
+                "backup_cutover_payload.installation_id",
+            ),
+            (
+                self.source_installation.as_str(),
+                "backup_cutover_payload.source_installation",
+            ),
+            (
+                self.dest_installation.as_str(),
+                "backup_cutover_payload.dest_installation",
+            ),
+            (
+                self.operation_id.as_str(),
+                "backup_cutover_payload.operation_id",
+            ),
+            (
+                self.target_generation.as_str(),
+                "backup_cutover_payload.target_generation",
+            ),
+            (
+                self.expected_predecessor.as_str(),
+                "backup_cutover_payload.expected_predecessor",
+            ),
+            (
+                self.user_broker_ref.as_str(),
+                "backup_cutover_payload.user_broker_ref",
+            ),
+        ] {
+            bounded_text(value, field, MAX_BACKUP_TEXT_BYTES)?;
+        }
+        if let Some(policy) = &self.canonical_only_policy {
+            bounded_text(
+                policy,
+                "backup_cutover_payload.canonical_only_policy",
+                MAX_BACKUP_TEXT_BYTES,
+            )?;
+        }
+        for (value, field) in [
+            (
+                self.archive_digest.as_str(),
+                "backup_cutover_payload.archive_digest",
+            ),
+            (
+                self.target_build_digest.as_str(),
+                "backup_cutover_payload.target_build_digest",
+            ),
+            (
+                self.target_config_digest.as_str(),
+                "backup_cutover_payload.target_config_digest",
+            ),
+            (
+                self.content_digest.as_str(),
+                "backup_cutover_payload.content_digest",
+            ),
+        ] {
+            lowercase_sha256(value, field)?;
+        }
+        if self.source_installation == self.dest_installation {
+            return Err(BackupError::InvalidField {
+                field: "backup_cutover_payload.dest_installation",
+                reason: "destination must be isolated from the source",
+            });
+        }
+        if self.target_generation == self.expected_predecessor {
+            return Err(BackupError::InvalidField {
+                field: "backup_cutover_payload.target_generation",
+                reason: "target generation must differ from the expected predecessor",
+            });
+        }
+        if matches!(self.archive_class, BackupClassWire::ScopeExport) {
+            return Err(BackupError::InvalidField {
+                field: "backup_cutover_payload.archive_class",
+                reason: "a scope export is not an installation cutover body",
+            });
+        }
+        if matches!(self.archive_class, BackupClassWire::CanonicalOnlyDegraded)
+            && self.canonical_only_policy.is_none()
+        {
+            return Err(BackupError::InvalidField {
+                field: "backup_cutover_payload.canonical_only_policy",
+                reason: "canonical-only class requires an explicit degraded policy reference",
+            });
+        }
+        self.activation_fence
+            .validate()
+            .map_err(BackupError::Foundation)?;
+        if self.content_digest != self.compute_digest()? {
+            return Err(BackupError::InvalidField {
+                field: "backup_cutover_payload.content_digest",
+                reason: "content digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Joins this body to the [`BackupRequestIdentity`] that carries it.
+    ///
+    /// Source installation, destination installation, class, fence, archive
+    /// digest, and admitted build digest are joined here, because a cutover
+    /// body that names a different archive, class, fence, or build than the
+    /// identity admitting it is not the admitted body. `Mismatch` names the
+    /// exact diverging field instead of reporting one generic identity
+    /// mismatch.
+    pub fn validate_against_identity(
+        &self,
+        identity: &BackupRequestIdentity,
+    ) -> Result<(), BackupError> {
+        self.validate()?;
+        identity.validate()?;
+        if self.source_installation != identity.source_installation {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_payload.source_installation",
+            });
+        }
+        if self.dest_installation != identity.dest_installation {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_payload.dest_installation",
+            });
+        }
+        if self.archive_class != identity.class {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_payload.archive_class",
+            });
+        }
+        if !fences_match_exact(&self.activation_fence, &identity.fence) {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_payload.activation_fence",
+            });
+        }
+        if self.archive_digest != identity.archive_digest {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_payload.archive_digest",
+            });
+        }
+        if self.target_build_digest != identity.build_digest {
+            return Err(BackupError::Mismatch {
+                field: "backup_cutover_payload.target_build_digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Joins this body to the admitted [`crate::HostRequestEnvelope`] that
+    /// commits to it.
+    ///
+    /// This is the cross-record comparison the cutover boundary needs: the
+    /// left side is this body, the right side is
+    /// `envelope.identity.payload_sha256`, the opaque commitment the owner
+    /// admitted for payload bytes this process never re-reads. It is never a
+    /// self-comparison, and it is not a comparison of two fields of the same
+    /// record. The envelope is validated by its own owner validator first, so
+    /// the commitment compared against is itself a checked record rather than
+    /// a self-consistent serialized claim.
+    ///
+    /// # Why the schema id, not a new `HostRequestKind`, is the discriminator
+    ///
+    /// [`crate::HostRequestKind`] is a closed five-value wire vocabulary
+    /// (`ACTIVATION`, `INVOCATION`, `CANCELLATION`, `STATUS`,
+    /// `RECONCILIATION`) with no cutover kind, and that wire is closed, so a
+    /// cutover cannot acquire a kind of its own. What separates a cutover body
+    /// from `eliot.query` or `eliot.state` is therefore not the kind but the
+    /// exact payload schema the owner admitted, which is
+    /// [`BACKUP_CUTOVER_PAYLOAD_SCHEMA_ID`]. An unrelated but perfectly valid
+    /// admitted `INVOCATION` under any other schema refuses here. The kind
+    /// check that follows uses only the existing closed vocabulary: a cutover
+    /// body is executed as an `INVOCATION`, so a `CANCELLATION`, `STATUS`,
+    /// `RECONCILIATION`, or `ACTIVATION` envelope that happens to carry the
+    /// cutover schema id still refuses.
+    ///
+    /// # Order
+    ///
+    /// Fail-closed at the first divergence: this body, then the envelope,
+    /// then the admitted schema, then the admitted content commitment, then
+    /// the kind.
+    pub fn validate_admitted_payload(
+        &self,
+        envelope: &crate::HostRequestEnvelope,
+    ) -> Result<(), BackupError> {
+        self.validate()?;
+        envelope.validate()?;
+        if envelope.identity.payload_schema_id != BACKUP_CUTOVER_PAYLOAD_SCHEMA_ID {
+            return Err(BackupError::Mismatch {
+                field: "host_request.payload_schema_id",
+            });
+        }
+        if self.compute_digest()? != envelope.identity.payload_sha256 {
+            return Err(BackupError::Mismatch {
+                field: "host_request.payload_sha256",
+            });
+        }
+        if envelope.kind != crate::HostRequestKind::Invocation {
+            return Err(BackupError::Mismatch {
+                field: "host_request.kind",
+            });
         }
         Ok(())
     }

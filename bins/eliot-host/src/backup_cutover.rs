@@ -17,6 +17,18 @@
 //!   command travels as an `Invocation` of the exact admitted envelope, and a
 //!   restore-test/rehearsal envelope derives a different digest-bound
 //!   `hostreq:` operation handle, so it can never satisfy this admission.
+//! - Cutover body: `eliot_protocol::BackupCutoverPayload`
+//!   (`crates/foundation/eliot-protocol/src/backup.rs`, the closed, versioned
+//!   body owned by #954). `validate_cutover_request_inner` builds that body
+//!   from the presented request — no caller ever supplies its own bytes — and
+//!   proves it against the admitted envelope with the owner's own
+//!   `BackupCutoverPayload::validate_admitted_payload`, which compares the
+//!   body's canonical content digest with the envelope's
+//!   `identity.payload_sha256` under `BACKUP_CUTOVER_PAYLOAD_SCHEMA_ID` and
+//!   requires an `Invocation`. `BackupCutoverPayload::operation_request_digest`
+//!   supplies the operation-identity domain, so the payload content domain, the
+//!   envelope payload domain and the operation domain stay three explicit
+//!   domains and are never equated merely because all are SHA-256 strings.
 //! - Recovery receipts: `eliot_backup::{RestorePlan::execute_with_journal,
 //!   RestoreTarget::{apply_restore_effect, reconcile_restore_effect},
 //!   RestoreJournalPort::{load, compare_and_swap}, BackupBundle::validate,
@@ -151,7 +163,9 @@ use eliot_installation::{
 use eliot_ors::{CapabilityIntroductionProjection, OperationalPhase};
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
-    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestKind, host_request_operation_id,
+    BACKUP_CUTOVER_PAYLOAD_WIRE_ID, BACKUP_CUTOVER_PAYLOAD_WIRE_VERSION, BackupClassWire,
+    BackupCutoverPayload, BackupOperationKind, HostRequestAdmissionReceipt, HostRequestEnvelope,
+    HostRequestKind, host_request_operation_id,
 };
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use serde::Deserialize;
@@ -318,10 +332,110 @@ pub struct IsolatedRecoveryEvidence {
 
 /// Validated cutover: all fail-closed gates passed, ready for the
 /// barrier-gated durable path.
+///
+/// The fields are private and the only constructor is
+/// [`ValidatedCutover::seal`], which re-proves the retained body against the
+/// admitted envelope. A `ValidatedCutover` therefore cannot be produced by a
+/// struct literal from this module, from a sibling module, or from another
+/// crate, and no caller-controlled boolean stands in for the owner check: the
+/// value exists only where the owner's own cross-record join succeeded
+/// (#2738).
 #[derive(Clone, Debug)]
 pub struct ValidatedCutover {
-    pub request: CutoverRequest,
-    pub evidence: IsolatedRecoveryEvidence,
+    request: CutoverRequest,
+    evidence: IsolatedRecoveryEvidence,
+    /// The retained, content-checked cutover body. Its `content_digest` is the
+    /// canonical digest of these exact bytes, and those bytes are the body the
+    /// admitted envelope committed to.
+    body: BackupCutoverPayload,
+    /// The checked content digest captured at seal time. Never a caller value.
+    content_digest: String,
+}
+
+impl ValidatedCutover {
+    /// Seals a presented request and its recovery evidence behind the retained
+    /// validated cutover body.
+    ///
+    /// The body is proved again here rather than trusted from its builder: the
+    /// seal is only created when the body's own canonical content digest equals
+    /// the digest the admitted envelope committed to, so a body that was edited
+    /// after the payload binding cannot be sealed and no struct literal can
+    /// stand in for the check.
+    fn seal(
+        request: &CutoverRequest,
+        evidence: &IsolatedRecoveryEvidence,
+        body: BackupCutoverPayload,
+    ) -> Result<Self, CutoverError> {
+        prove_admitted_cutover_body(&request.envelope, &body)?;
+        let content_digest = body
+            .checked_content_digest()
+            .map_err(|_error| CutoverError::BindingMismatch)?;
+        Ok(Self {
+            request: request.clone(),
+            evidence: evidence.clone(),
+            body,
+            content_digest,
+        })
+    }
+
+    /// The exact admitted request this seal retains.
+    ///
+    /// `pub(crate)` only because the composition root reads the retained
+    /// target generation from the seal when it projects the post-commit owner
+    /// readback. It is a read accessor, not a constructor: the fields stay
+    /// private to this module, so no caller can build or reshape a
+    /// `ValidatedCutover` through it.
+    pub(crate) fn request(&self) -> &CutoverRequest {
+        &self.request
+    }
+
+    /// The owner recovery evidence this seal retains.
+    fn evidence(&self) -> &IsolatedRecoveryEvidence {
+        &self.evidence
+    }
+
+    /// The checked canonical content digest of the retained body, carried as
+    /// durable evidence so reconciliation reads the same body commitment from
+    /// the journal owner instead of recomputing it from console bytes.
+    fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    /// Re-runs the authoritative body/admitted-envelope join at an effect
+    /// boundary.
+    ///
+    /// The seal already proved this at construction; repeating it immediately
+    /// before a journal mutation or a registry CAS means the effect runs only
+    /// against a body that is still the admitted one, with no `verified` flag
+    /// and no second source of truth.
+    fn recheck_admitted_body(&self) -> Result<(), CutoverError> {
+        prove_admitted_cutover_body(&self.request.envelope, &self.body)
+    }
+
+    /// The cutover operation identity derived from the retained body.
+    ///
+    /// Installation and operation id are read from the body itself, and the
+    /// request digest is the body's own operation-identity domain — never the
+    /// presented text. The seal proved that presentation already equals this
+    /// derivation, so the intent, the registry binding, the replay comparison
+    /// and the returned outcome all name the same body-derived identity.
+    fn sealed_operation(&self) -> Result<CutoverOperationIdentity, CutoverError> {
+        let installation = PlatformHandle::new(self.body.installation_id.clone())
+            .map_err(|_error| CutoverError::BindingMismatch)?;
+        let operation_id = PlatformHandle::new(self.body.operation_id.clone())
+            .map_err(|_error| CutoverError::BindingMismatch)?;
+        let request_digest = PlatformHandle::new(
+            self.body
+                .operation_request_digest()
+                .map_err(|_error| CutoverError::BindingMismatch)?,
+        )
+        .map_err(|_error| CutoverError::BindingMismatch)?;
+        Ok(CutoverOperationIdentity {
+            installation,
+            operation_id,
+            request_digest,
+        })
+    }
 }
 
 /// Exact cutover disposition. `Unknown` is the bounded reconciliation state
@@ -539,8 +653,10 @@ pub enum CutoverError {
 // `bind_approved_target`/`read_and_verify_prior_authority`/
 // `commit_with_durable_intent`/`append_cutover_intent`/`bounded_evidence`/
 // `admission_handle`/`receipt_handle`/`owner_approved_build_digests`/
-// `cutover_intent_state_spelling` (private steps whose outcome surfaces with
-// its exact category at the validate/execute/retire boundary).
+// `cutover_intent_state_spelling`/`cutover_class_wire`/`cutover_payload`/
+// `prove_admitted_cutover_body`/`bind_admitted_cutover_body` (private steps
+// whose outcome surfaces with its exact category at the validate/execute/retire
+// boundary).
 
 /// Notes the facade's actual Event Log seam status (typed-unavailable).
 fn backup_cutover_note_event_log_unavailable() {
@@ -801,6 +917,150 @@ pub fn resolve_cutover_activation(
     CutoverActivationResolution::Unresolved
 }
 
+/// Reads the backup owner's real archive class as the protocol owner's closed
+/// wire class.
+///
+/// `eliot_backup::BackupClass` is the class owner (`crates/storage/
+/// eliot-backup/src/lib.rs:120`) and `eliot_protocol::backup::BackupClassWire`
+/// is the wire vocabulary; the protocol crate deliberately does not depend on
+/// the backup crate, so this total readback is the join between them. It
+/// invents no third vocabulary: every class maps to exactly one wire class, and
+/// an unrecognised class is impossible because both sets are closed.
+fn cutover_class_wire(class: BackupClass) -> BackupClassWire {
+    match class {
+        BackupClass::FullRecovery => BackupClassWire::FullRecovery,
+        BackupClass::CanonicalOnlyDegraded => BackupClassWire::CanonicalOnlyDegraded,
+        BackupClass::ScopeExport => BackupClassWire::ScopeExport,
+    }
+}
+
+/// Builds the closed, versioned cutover body from the presented request.
+///
+/// The body is derived here, never received: a caller cannot present its own
+/// payload bytes, so there is no path on which a body and a claimed digest can
+/// be edited independently. The content digest is computed by the protocol
+/// owner's own canonical encoding owner through `with_computed_digest`, which
+/// clears `content_digest` before encoding, so the digest never covers itself
+/// and the bytes carry no admission receipt and no journal record.
+///
+/// The two class gates move here from the ordered gate set so they keep their
+/// exact dispositions: a scope export is not an installation cutover body, and
+/// a canonical-only class can never reach a body without an explicit degraded
+/// policy reference. The body contract refuses both structurally as well; this
+/// only preserves which cutover disposition names the refusal.
+fn cutover_payload(request: &CutoverRequest) -> Result<BackupCutoverPayload, CutoverError> {
+    if request.archive_class == BackupClass::ScopeExport {
+        return Err(CutoverError::ScopeExportForbidden);
+    }
+    if request.archive_class.is_canonical_only() && request.archive_canonical_only_policy.is_none()
+    {
+        return Err(CutoverError::DegradedPolicyViolation);
+    }
+    BackupCutoverPayload {
+        wire_id: BACKUP_CUTOVER_PAYLOAD_WIRE_ID.to_owned(),
+        wire_version: BACKUP_CUTOVER_PAYLOAD_WIRE_VERSION,
+        // The cutover runs under the destination installation; the ordered gate
+        // set below proves the operation's installation is that same identity.
+        installation_id: request.destination_installation.as_str().to_owned(),
+        source_installation: request.source_installation.as_str().to_owned(),
+        dest_installation: request.destination_installation.as_str().to_owned(),
+        operation_id: request.operation.operation_id.as_str().to_owned(),
+        archive_digest: request.archive_digest.as_str().to_owned(),
+        archive_class: cutover_class_wire(request.archive_class),
+        canonical_only_policy: request
+            .archive_canonical_only_policy
+            .as_ref()
+            .map(|policy| policy.as_str().to_owned()),
+        target_generation: request.target_generation.as_str().to_owned(),
+        target_build_digest: request.target_build_digest.as_str().to_owned(),
+        target_config_digest: request.target_config_digest.as_str().to_owned(),
+        expected_predecessor: request.expected_predecessor.as_str().to_owned(),
+        activation_fence: request.activation_fence.clone(),
+        user_broker_ref: request.user_broker_ref.as_str().to_owned(),
+        content_digest: String::new(),
+    }
+    .with_computed_digest()
+    .map_err(|_error| CutoverError::BindingMismatch)
+}
+
+/// Proves that one cutover body is exactly the body its admitted envelope
+/// commits to.
+///
+/// Two distinct fail-closed joins, in order. First the body must be
+/// self-consistent: its claimed content digest must equal its own canonical
+/// bytes, which is a fact about one record only. Then, and only then, the
+/// cross-record join: the recomputed content digest must equal the ADMITTED
+/// envelope's `identity.payload_sha256`, the envelope must carry the
+/// [`eliot_protocol::BACKUP_CUTOVER_PAYLOAD_SCHEMA_ID`] payload-schema identity,
+/// and it must be an `Invocation`. That is a comparison between two different
+/// records, not a self-comparison, so an unrelated but perfectly valid admitted
+/// `Invocation` — `eliot.query`, `eliot.state`, any other schema — refuses here
+/// and can never authorize this body. A self-consistent serialized receipt is
+/// not proof of issuance: the envelope compared against is the one the owner
+/// admitted, and its admission is resolved through the authenticated
+/// owner/readback path, not by any string comparison here.
+fn prove_admitted_cutover_body(
+    envelope: &HostRequestEnvelope,
+    body: &BackupCutoverPayload,
+) -> Result<(), CutoverError> {
+    body.validate()
+        .map_err(|_error| CutoverError::BindingMismatch)?;
+    body.validate_admitted_payload(envelope)
+        .map_err(|error| CutoverError::NotSeparatelyAdmitted(error.to_string()))?;
+    Ok(())
+}
+
+/// Binds the presented request to its admitted cutover body and to the
+/// operation identity that body implies.
+///
+/// This is the binding that did not exist before: the request body is proved to
+/// be the body the owner admitted, and the operation request digest stops being
+/// caller-chosen text. The claimed
+/// [`CutoverOperationIdentity::request_digest`] must equal the body's own
+/// operation-identity domain, which is derived from the body's canonical bytes
+/// under the operation separator and can never equal a content digest. A body
+/// whose source, destination, archive, class, target generation, build, config,
+/// predecessor, authority, `UserBroker` or fence changed while the old claimed
+/// digest is retained therefore refuses here as `IDENTITY_CONFLICT`, before any
+/// journal mutation, registry CAS, or effect (I5.27). The same body replayed
+/// under the same operation derives the same digest, so an exact authorized
+/// replay still preserves the original content and operation.
+fn bind_admitted_cutover_body(
+    request: &CutoverRequest,
+) -> Result<BackupCutoverPayload, CutoverError> {
+    let body = cutover_payload(request)?;
+    prove_admitted_cutover_body(&request.envelope, &body)?;
+    let operation_request_digest = body
+        .operation_request_digest()
+        .map_err(|_error| CutoverError::BindingMismatch)?;
+    if request.operation.request_digest.as_str() != operation_request_digest {
+        return Err(CutoverError::IdentityConflict);
+    }
+    Ok(body)
+}
+
+/// Resolves the backup operation an admitted cutover payload authorizes.
+///
+/// The Host dispatch arms resolve their operation from this, not from a
+/// routing table: the closed [`BackupOperationKind`] vocabulary has exactly one
+/// member a cutover body can authorize, and this returns it only after the
+/// presented body has been proved to be the body the admitted envelope commits
+/// to. A separately supplied selector therefore authorizes nothing — it can
+/// only agree with, or disagree with, what the admitted payload proves, and a
+/// valid selector can never override an unrelated admitted body.
+///
+/// # Errors
+///
+/// Returns [`CutoverError`] when the presented request is not a cutover body
+/// the admitted envelope committed to, or when the claimed operation request
+/// digest is not the one that body derives.
+pub fn admitted_cutover_operation(
+    request: &CutoverRequest,
+) -> Result<BackupOperationKind, CutoverError> {
+    bind_admitted_cutover_body(request)?;
+    Ok(BackupOperationKind::AdmitCutover)
+}
+
 /// Validates the authenticated identity of one cutover request, and nothing else.
 ///
 /// This is the FIRST gate on every cutover path, deliberately separated from
@@ -815,28 +1075,27 @@ pub fn validate_cutover_identity(request: &CutoverRequest) -> Result<(), Cutover
         .envelope
         .validate()
         .map_err(|error| CutoverError::NotSeparatelyAdmitted(error.to_string()))?;
-    request
-        .admission
-        .validate()
-        .map_err(|error| CutoverError::NotSeparatelyAdmitted(error.to_string()))?;
     if request.envelope.kind != HostRequestKind::Invocation {
         return Err(CutoverError::NotSeparatelyAdmitted(
             "cutover requires an Invocation-kind admitted envelope".to_owned(),
         ));
     }
-    if request.admission.kind != request.envelope.kind {
-        return Err(CutoverError::BindingMismatch);
-    }
-    if request.admission.request_sha256 != request.envelope.envelope_sha256 {
-        return Err(CutoverError::BindingMismatch);
-    }
-    let expected_operation = host_request_operation_id(&request.envelope);
-    if request.admission.operation_id != expected_operation {
+    if request.admission.operation_id != host_request_operation_id(&request.envelope) {
         // A restore-test/rehearsal envelope (or any changed envelope)
         // derives a different digest-bound handle: it can never present
         // this cutover admission.
         return Err(CutoverError::RehearsalCannotCutover);
     }
+    // The owner's own receipt-to-envelope binding replaces the hand-rolled
+    // field-by-field comparison: `validate_envelope` validates the receipt and
+    // the envelope and then requires the receipt to name exactly this envelope
+    // (operation handle, request id, kind, connection, request digest and
+    // deadline), so a receipt that is internally self-consistent but was issued
+    // for a different envelope cannot be substituted here.
+    request
+        .admission
+        .validate_envelope(&request.envelope)
+        .map_err(|error| CutoverError::NotSeparatelyAdmitted(error.to_string()))?;
     Ok(())
 }
 
@@ -913,21 +1172,27 @@ pub fn plan_cutover_attempt(
 ///
 /// Validates one exact cutover request against current owner evidence.
 ///
-/// Real owner calls: `envelope.validate()`, `admission.validate()`, the
-/// digest binding through `host_request_operation_id` (a rehearsal envelope
-/// derives a different `hostreq:` handle and fails here, never as cutover),
-/// `RestoreReceipt::validate` (which itself rejects `cutover_performed`
-/// with `CutoverNotAuthorized`), `OperationalValidationEvidence::validate`,
-/// and the class ceiling through `BackupClass::evidence_level`.
-/// Fail-closed gates: separately admitted `Invocation` envelope whose fence
-/// exactly matches the activation fence; bindings exact, including the
-/// receipt's bundle digest, restored fence, and class ceiling against the
-/// request; scope transfers rejected; degraded policy explicit, never
-/// upgraded; every mandatory phase receipt current; complete denominators;
-/// fresh purge/key/reference plus external-source revalidation; every prior
-/// introduction row fenced (lease quiescence proven separately by the
-/// barrier); observed operational-validation fence exact; expected
-/// predecessor and approved target match the registry projection.
+/// Real owner calls: `envelope.validate()`,
+/// `admission.validate_envelope(&envelope)` (the owner's own receipt-to-envelope
+/// binding, which also proves a rehearsal envelope's different `hostreq:` handle
+/// can never present this admission, never as cutover),
+/// `BackupCutoverPayload::validate` plus
+/// `BackupCutoverPayload::validate_admitted_payload(&envelope)` for the content
+/// commitment of the whole body, `BackupCutoverPayload::operation_request_digest`
+/// for the operation identity domain, `RestoreReceipt::validate` (which itself
+/// rejects `cutover_performed` with `CutoverNotAuthorized`),
+/// `OperationalValidationEvidence::validate`, and the class ceiling through
+/// `BackupClass::evidence_level`.
+/// Fail-closed gates: the complete cutover body bound to the admitted envelope
+/// and to its claimed operation digest before any other gate; separately
+/// admitted `Invocation` envelope whose fence exactly matches the activation
+/// fence; bindings exact, including the receipt's bundle digest, restored fence,
+/// and class ceiling against the request; scope transfers rejected; degraded
+/// policy explicit, never upgraded; every mandatory phase receipt current;
+/// complete denominators; fresh purge/key/reference plus external-source
+/// revalidation; every prior introduction row fenced (lease quiescence proven
+/// separately by the barrier); observed operational-validation fence exact;
+/// expected predecessor and approved target match the registry projection.
 ///
 /// # Errors
 ///
@@ -953,7 +1218,7 @@ pub fn validate_cutover_request(
                 "validate",
                 "validated",
                 "validated",
-                backup_cutover_count(validated.evidence.fenced_introductions.len()),
+                backup_cutover_count(validated.evidence().fenced_introductions.len()),
             );
             Ok(validated)
         }
@@ -973,15 +1238,16 @@ fn validate_cutover_request_inner(
     predecessor_gate: PredecessorGate,
 ) -> Result<ValidatedCutover, CutoverError> {
     validate_cutover_identity(request)?;
+    // The complete cutover body is built and bound to the admitted envelope
+    // before every other gate. Nothing below can be reached with a body the
+    // owner did not admit: an unrelated but valid admitted `Invocation`, a
+    // changed body carrying the old envelope commitment, and a changed body
+    // carrying the old claimed operation digest all refuse here, before the
+    // fence, class, receipt, evidence, registry, and predecessor gates and
+    // therefore long before any journal mutation or CAS.
+    let body = bind_admitted_cutover_body(request)?;
     if !fences_match_exact(&request.envelope.state_fence, &request.activation_fence) {
         return Err(CutoverError::BindingMismatch);
-    }
-    if request.archive_class == BackupClass::ScopeExport {
-        return Err(CutoverError::ScopeExportForbidden);
-    }
-    if request.archive_class.is_canonical_only() && request.archive_canonical_only_policy.is_none()
-    {
-        return Err(CutoverError::DegradedPolicyViolation);
     }
     evidence
         .restore_receipt
@@ -1131,10 +1397,7 @@ fn validate_cutover_request_inner(
             Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
         }
     }
-    Ok(ValidatedCutover {
-        request: request.clone(),
-        evidence: evidence.clone(),
-    })
+    ValidatedCutover::seal(request, evidence, body)
 }
 
 /// Exact replay guard (I5.27): the same operation identity with the same
@@ -1178,7 +1441,10 @@ pub fn check_replay_identity(
 /// Executes the cutover lifecycle against the Host owner.
 ///
 /// Real owner calls, in order: `HostComposition::ensure_admission_open`;
-/// fresh registry readback through `super::open_registry_store_at` plus
+/// `BackupCutoverPayload::validate_admitted_payload` against the admitted
+/// envelope again, at this effect boundary, so the activation runs only
+/// against the exact body the owner admitted; fresh registry readback through
+/// `super::open_registry_store_at` plus
 /// `RedbInstallationRegistry::load` with the expected-predecessor and
 /// target-approval rechecks (TOCTOU fence: the cached projection check in
 /// validation is not enough); exact barrier-fence bindings; then the
@@ -1190,6 +1456,12 @@ pub fn check_replay_identity(
 /// through `mutate_atomic` onto the existing `ApprovedGenerationRegistry::
 /// activate`, expected revision + predecessor fenced, exact replay safe).
 /// The handle is dropped immediately after the CAS, never retained.
+///
+/// The intent record, the registry operation binding and the returned outcome
+/// are all built from the retained validated body, so the per-phase journal
+/// mutation identities remain distinct from the operation identity they key
+/// (`<operation>:<disposition>`) and both are derived from that body rather
+/// than from presented text.
 ///
 /// Lost response, failure between registry/authority/route transitions, or
 /// cancellation after possible activation is resolved under the attempt's
@@ -1239,7 +1511,12 @@ fn execute_cutover_inner(
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(CutoverOutcome, GenerationRetirementBarrier), CutoverError> {
-    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)?;
+    // Effect boundary: the retained body is proved against the admitted envelope
+    // again before any journal mutation or registry CAS, so the activation runs
+    // only against the exact body the owner admitted. This is the owner's own
+    // cross-record join, not a caller-controlled trusted flag.
+    validated.recheck_admitted_body()?;
+    host.ensure_material_admission_open_for_target(&validated.request().target_generation, false)?;
     let store = super::open_registry_store_at(&host.registry_host_root)?;
     let fresh = store
         .load()
@@ -1251,7 +1528,7 @@ fn execute_cutover_inner(
     // bindings: the fresh owner readback, not the cached projection check, is
     // what the effect runs against. `bind_approved_target` also refuses an
     // unapproved target, so it replaces the previous inline approval probe.
-    bind_approved_target(&validated.request, &fresh)?;
+    bind_approved_target(validated.request(), &fresh)?;
     // The retained operation and the registry's operation-bound outcome are
     // resolved BEFORE any fresh-activation gate, under this attempt's original
     // operation identity. The predecessor gate below then governs only the
@@ -1259,10 +1536,10 @@ fn execute_cutover_inner(
     // possibly-applied Pending intent are both reachable under their own
     // identity instead of being refused by a gate that can only be true before
     // the activation happened.
-    let plan = plan_cutover_attempt(host, &validated.request, &fresh)?;
+    let plan = plan_cutover_attempt(host, validated.request(), &fresh)?;
     if plan.requires_active_predecessor() {
         match fresh.active_generation() {
-            Some(active) if *active == validated.request.expected_predecessor => {}
+            Some(active) if *active == validated.request().expected_predecessor => {}
             Some(_) | None => return Err(CutoverError::ExpectedPredecessorConflict),
         }
     }
@@ -1300,7 +1577,8 @@ fn execute_cutover_inner(
         .fenced_introductions
         .iter()
         .any(|introduction| {
-            introduction.record().subject_id.as_str() == validated.request.user_broker_ref.as_str()
+            introduction.record().subject_id.as_str()
+                == validated.request().user_broker_ref.as_str()
         })
     {
         return Err(CutoverError::PriorAuthorityStillActive);
@@ -1311,7 +1589,10 @@ fn execute_cutover_inner(
     if retirement.activation_generation != *activation_generation {
         return Err(CutoverError::BindingMismatch);
     }
-    if !fences_match_exact(&retirement.state_fence, &validated.request.activation_fence) {
+    if !fences_match_exact(
+        &retirement.state_fence,
+        &validated.request().activation_fence,
+    ) {
         return Err(CutoverError::BindingMismatch);
     }
     let barrier = host
@@ -1390,7 +1671,7 @@ fn recover_retained_cutover(
             let committed = retained_intent
                 .ok_or_else(|| note_cutover_error("execute", CutoverError::IdentityConflict))?;
             let evidence_refs = bounded_evidence(vec![
-                admission_handle(&validated.request.admission)?,
+                admission_handle(&validated.request().admission)?,
                 committed.target_generation.clone(),
             ]);
             observe_cutover_progress(
@@ -1401,7 +1682,7 @@ fn recover_retained_cutover(
             );
             CutoverOutcome {
                 disposition: CutoverDisposition::Committed,
-                operation: validated.request.operation.clone(),
+                operation: validated.sealed_operation()?,
                 evidence_refs,
             }
         }
@@ -1432,7 +1713,7 @@ fn recover_retained_cutover(
             // and no new operation is created to escape it (I14.21).
             let intent = retained_intent
                 .ok_or_else(|| note_cutover_error("execute", CutoverError::IdentityConflict))?;
-            let outcome = unresolved_cutover_outcome(validated, intent);
+            let outcome = unresolved_cutover_outcome(validated, intent)?;
             observe_cutover_progress(
                 "execute",
                 "retained_unknown",
@@ -1471,13 +1752,13 @@ fn settle_committed_pending_activation(
         validated,
         retirement,
         CutoverIntentState::Committed,
-        &validated.request.admission,
+        &validated.request().admission,
     )?;
     Ok(CutoverOutcome {
         disposition: CutoverDisposition::Committed,
-        operation: validated.request.operation.clone(),
+        operation: validated.sealed_operation()?,
         evidence_refs: bounded_evidence(vec![
-            admission_handle(&validated.request.admission)?,
+            admission_handle(&validated.request().admission)?,
             intent.target_generation.clone(),
             terminal,
         ]),
@@ -1496,16 +1777,16 @@ fn settle_committed_pending_activation(
 fn unresolved_cutover_outcome(
     validated: &ValidatedCutover,
     intent: &CutoverIntentRecord,
-) -> CutoverOutcome {
-    CutoverOutcome {
+) -> Result<CutoverOutcome, CutoverError> {
+    Ok(CutoverOutcome {
         disposition: CutoverDisposition::Unknown,
-        operation: validated.request.operation.clone(),
+        operation: validated.sealed_operation()?,
         evidence_refs: bounded_evidence(vec![
             intent.cutover_operation.clone(),
             intent.expected_predecessor.clone(),
             intent.target_generation.clone(),
         ]),
-    }
+    })
 }
 
 /// Reloads the COMPLETE live ORS introduction set and requires exact
@@ -1537,10 +1818,10 @@ fn read_and_verify_prior_authority(
     host: &HostComposition,
     validated: &ValidatedCutover,
 ) -> Result<Vec<eliot_kernel_service::IntroductionRow>, CutoverError> {
-    let presented = &validated.evidence.fenced_introductions;
+    let presented = &validated.evidence().fenced_introductions;
     let live = super::introduction_readback::read_live_introductions(
         host,
-        &validated.request.activation_fence,
+        &validated.request().activation_fence,
         eliot_ors::MAX_RECOVERY_PAGE,
     )
     .map_err(|_| CutoverError::AuthorityOrReadinessMissing)?;
@@ -1601,7 +1882,7 @@ fn commit_with_durable_intent(
         validated,
         retirement,
         CutoverIntentState::Pending,
-        &validated.request.admission,
+        &validated.request().admission,
     )?;
     // The registry owner is re-opened here, after the durable intent, so the
     // handle is held only across the single bounded CAS. The operation binding
@@ -1611,17 +1892,21 @@ fn commit_with_durable_intent(
     // active-generation pointer alone attributes the flip to nobody.
     let store = host.open_registry_store()?;
     let capability = host.owner_lease.activation_capability();
+    // The registry's operation binding is the sealed body's own identity, so a
+    // recovery readback attributes the flip to this body and never to presented
+    // text that a later attempt could restate.
+    let operation = validated.sealed_operation()?;
     let committed = store.commit_cutover_activation(
         &capability,
         expected_revision,
-        &validated.request.expected_predecessor,
-        &validated.request.target_generation,
+        &validated.request().expected_predecessor,
+        &validated.request().target_generation,
         &CommittedCutoverActivation {
-            installation: validated.request.operation.installation.clone(),
-            operation_id: validated.request.operation.operation_id.clone(),
-            request_digest: validated.request.operation.request_digest.clone(),
-            expected_predecessor: validated.request.expected_predecessor.clone(),
-            target_generation: validated.request.target_generation.clone(),
+            installation: operation.installation.clone(),
+            operation_id: operation.operation_id.clone(),
+            request_digest: operation.request_digest.clone(),
+            expected_predecessor: validated.request().expected_predecessor.clone(),
+            target_generation: validated.request().target_generation.clone(),
         },
     );
     drop(store);
@@ -1640,7 +1925,7 @@ fn commit_with_durable_intent(
         validated,
         retirement,
         terminal,
-        &validated.request.admission,
+        &validated.request().admission,
     );
     if let Some(refusal) = refusal {
         return Err(CutoverError::Registry(refusal));
@@ -1648,11 +1933,11 @@ fn commit_with_durable_intent(
     terminal_receipt?;
     Ok(CutoverOutcome {
         disposition: CutoverDisposition::Committed,
-        operation: validated.request.operation.clone(),
+        operation,
         evidence_refs: bounded_evidence(vec![
-            admission_handle(&validated.request.admission)?,
+            admission_handle(&validated.request().admission)?,
             activation_id.clone(),
-            validated.request.target_generation.clone(),
+            validated.request().target_generation.clone(),
             intent,
         ]),
     })
@@ -1725,12 +2010,23 @@ pub fn read_cutover_disposition(
 /// registry readback by the owner surface; this function refuses rather than
 /// inferring.
 ///
+/// The presented request is **sealed** before any of that runs, and the seal
+/// runs the authoritative admitted-payload check again: the body's canonical
+/// content digest must equal the admitted envelope's `payload_sha256` under the
+/// cutover payload schema, and the claimed operation request digest must be the
+/// one that body derives. The durable intent is then matched against the sealed
+/// body's own operation identity, not against presented text. A changed body
+/// carrying the old admission or the old claimed digest is therefore refused
+/// before the retirement record is read or appended, and no `ValidatedCutover`
+/// can be built here or anywhere else without that check having succeeded.
+///
 /// # Errors
 ///
-/// Returns [`CutoverError`] when this operation has no durable cutover intent,
-/// when the intent has not committed (or was refused), when the presented
-/// barrier does not belong to this cutover's activation, or when the journal
-/// owner refuses the retirement record.
+/// Returns [`CutoverError`] when the presented body is not the body the
+/// admitted envelope committed to, when this operation has no durable cutover
+/// intent, when the intent has not committed (or was refused), when the
+/// presented barrier does not belong to this cutover's activation, or when the
+/// journal owner refuses the retirement record.
 pub fn retire_authorized_generation(
     host: &HostComposition,
     request: &CutoverRequest,
@@ -1739,6 +2035,18 @@ pub fn retire_authorized_generation(
     prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
+    // Retirement is a protected transition, so it runs against a sealed body,
+    // never against presented text. The seal re-proves the authoritative
+    // admitted-payload join for the exact body presented here, so a changed
+    // body carrying the old admission or the old claimed operation digest is
+    // refused before the durable record is read and before the retirement
+    // authorization is honoured. This replaces the previous fabrication of a
+    // `ValidatedCutover` straight from unvalidated parameters: that value could
+    // be built anywhere, and nothing in it had been checked against the owner's
+    // admitted payload.
+    let validated =
+        ValidatedCutover::seal(request, evidence, bind_admitted_cutover_body(request)?)?;
+    let operation = validated.sealed_operation()?;
     let journal = host.journal.snapshot().map_err(|error| {
         note_cutover_error(
             "retire_authorize",
@@ -1749,9 +2057,9 @@ pub fn retire_authorized_generation(
         .pending_cutover
         .as_ref()
         .filter(|intent| {
-            intent.cutover_operation == request.operation.operation_id
-                && intent.installation == request.operation.installation
-                && intent.request_digest == request.operation.request_digest
+            intent.cutover_operation == operation.operation_id
+                && intent.installation == operation.installation
+                && intent.request_digest == operation.request_digest
         })
         .ok_or_else(|| {
             note_cutover_error(
@@ -1812,10 +2120,7 @@ pub fn retire_authorized_generation(
     // propagation of its failure to the authorization boundary.
     retire_prior_generation(
         host,
-        &ValidatedCutover {
-            request: request.clone(),
-            evidence: evidence.clone(),
-        },
+        &validated,
         barrier,
         prior_host,
         retirement_authorization,
@@ -1838,10 +2143,12 @@ const fn cutover_intent_state_spelling(state: CutoverIntentState) -> &'static st
 /// owner and returns its bounded transaction identity.
 ///
 /// `Pending` is written before the activation CAS, `Committed` or `Failed`
-/// after it, all under the same operation identity. The record carries the
-/// exact admitted build/config/`UserBroker` bindings and the bounded owner
-/// receipt set, so a later reconciliation reads the identities from the
-/// durable owner instead of trusting a console-presented value.
+/// after it, all under the same operation identity. The record is built from
+/// the retained validated body: its operation identity, idempotency key, and
+/// carried bindings are the sealed body's own, and the evidence set includes
+/// the body's checked canonical content digest, so a later reconciliation reads
+/// the same body commitment from the durable owner instead of trusting a
+/// console-presented value.
 fn append_cutover_intent(
     host: &HostComposition,
     validated: &ValidatedCutover,
@@ -1849,20 +2156,22 @@ fn append_cutover_intent(
     state: CutoverIntentState,
     admission: &HostRequestAdmissionReceipt,
 ) -> Result<PlatformHandle, CutoverError> {
+    let cutover_operation = validated.sealed_operation()?;
     // One journal mutation identity per disposition. The journal keys
     // `applied_operations` on this identity, so the intent and its terminal
     // record must not share one; a retry of the *same* disposition reuses it
     // and therefore replays byte-identically instead of forking a second
-    // transaction (the same convention the Store-rebind seam uses).
+    // transaction (the same convention the Store-rebind seam uses). The base is
+    // the body's own operation id, not a presented string.
     let mutation = PlatformHandle::new(format!(
         "{}:{}",
-        validated.request.operation.operation_id.as_str(),
+        cutover_operation.operation_id.as_str(),
         cutover_intent_state_spelling(state)
     ))
     .map_err(|_| CutoverError::BindingMismatch)?;
     let operation = IdempotencyIdentity {
         operation_id: mutation,
-        idempotency_key: validated.request.operation.request_digest.clone(),
+        idempotency_key: cutover_operation.request_digest.clone(),
     };
     let record = CutoverIntentRecord {
         fence: RecordFence {
@@ -1871,20 +2180,26 @@ fn append_cutover_intent(
             activation_generation: retirement.activation_generation.clone(),
         },
         operation,
-        installation: validated.request.operation.installation.clone(),
-        cutover_operation: validated.request.operation.operation_id.clone(),
-        request_digest: validated.request.operation.request_digest.clone(),
-        expected_predecessor: validated.request.expected_predecessor.clone(),
-        target_generation: validated.request.target_generation.clone(),
-        target_build_digest: validated.request.target_build_digest.clone(),
-        target_config_digest: validated.request.target_config_digest.clone(),
-        user_broker_ref: validated.request.user_broker_ref.clone(),
+        installation: cutover_operation.installation.clone(),
+        cutover_operation: cutover_operation.operation_id.clone(),
+        request_digest: cutover_operation.request_digest.clone(),
+        expected_predecessor: validated.request().expected_predecessor.clone(),
+        target_generation: validated.request().target_generation.clone(),
+        target_build_digest: validated.request().target_build_digest.clone(),
+        target_config_digest: validated.request().target_config_digest.clone(),
+        user_broker_ref: validated.request().user_broker_ref.clone(),
         intent_evidence_refs: bounded_evidence(vec![
             admission_handle(admission)?,
-            validated.request.archive_digest.clone(),
-            receipt_handle(&validated.evidence.restore_receipt.receipt_id)?,
-            receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)?,
-            receipt_handle(&validated.evidence.operational_validation.validation_digest)?,
+            receipt_handle(validated.content_digest())?,
+            validated.request().archive_digest.clone(),
+            receipt_handle(&validated.evidence().restore_receipt.receipt_id)?,
+            receipt_handle(&validated.evidence().restore_receipt.effect_receipt_sha256)?,
+            receipt_handle(
+                &validated
+                    .evidence()
+                    .operational_validation
+                    .validation_digest,
+            )?,
         ]),
         state,
     };
@@ -1927,7 +2242,13 @@ pub fn retire_prior_generation(
     prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
-    host.ensure_material_admission_open_for_target(&validated.request.target_generation, false)
+    // Effect boundary: re-prove the retained body against the admitted envelope
+    // immediately before the durable retirement record is appended, so the
+    // effect runs only against a body the owner admitted. There is no
+    // caller-controlled trusted flag; the check is the owner's own
+    // cross-record join, repeated here rather than inferred from the seal.
+    validated.recheck_admitted_body()?;
+    host.ensure_material_admission_open_for_target(&validated.request().target_generation, false)
         .map_err(|error| note_cutover_error("retire", CutoverError::from(error)))?;
     if retirement_authorization.as_str().trim().is_empty() {
         return Err(note_cutover_error(
@@ -1941,20 +2262,23 @@ pub fn retire_prior_generation(
     if prior_host.epoch == host.host.epoch {
         return Err(note_cutover_error("retire", CutoverError::BindingMismatch));
     }
+    let cutover_operation = validated.sealed_operation()?;
     let operation = IdempotencyIdentity {
-        operation_id: validated.request.operation.operation_id.clone(),
-        idempotency_key: validated.request.operation.request_digest.clone(),
+        operation_id: cutover_operation.operation_id.clone(),
+        idempotency_key: cutover_operation.request_digest.clone(),
     };
     // Deterministic per cutover operation and prior epoch: the journal
     // transaction id binds operation identity, Host epoch, and the full
     // record checksum (`journal.rs:126-145`), so a retry after
     // `OutcomeUnknown` must append byte-identical record bytes to replay
     // (`Replayed`) instead of duplicating the retirement. A fresh random
-    // identity here would fork a second transaction on every retry.
+    // identity here would fork a second transaction on every retry. The
+    // operation identity is the retained body's own, so the retirement can
+    // only ever be bound to the cutover body that was actually admitted.
     let retired_digest = super::sha256_json(&(
         "cutover-retired-at-v1",
-        &validated.request.operation.operation_id,
-        &validated.request.operation.request_digest,
+        &cutover_operation.operation_id,
+        &cutover_operation.request_digest,
         &prior_host.installation,
         &prior_host.epoch,
     ))?;
@@ -1977,22 +2301,29 @@ pub fn retire_prior_generation(
         operation,
         retired_host: prior_host.clone(),
         retirement_evidence_refs: bounded_evidence(vec![
-            admission_handle(&validated.request.admission)
+            admission_handle(&validated.request().admission)
                 .map_err(|error| note_cutover_error("retire", error))?,
-            validated.request.archive_digest.clone(),
-            validated.request.target_generation.clone(),
+            receipt_handle(validated.content_digest())
+                .map_err(|error| note_cutover_error("retire", error))?,
+            validated.request().archive_digest.clone(),
+            validated.request().target_generation.clone(),
             // The exact new authority this retirement completes: without it
             // the durable record would not name which `UserBroker` identity and
             // which approved build/config the surviving generation runs under.
-            validated.request.user_broker_ref.clone(),
-            validated.request.target_build_digest.clone(),
-            validated.request.target_config_digest.clone(),
-            receipt_handle(&validated.evidence.restore_receipt.receipt_id)
+            validated.request().user_broker_ref.clone(),
+            validated.request().target_build_digest.clone(),
+            validated.request().target_config_digest.clone(),
+            receipt_handle(&validated.evidence().restore_receipt.receipt_id)
                 .map_err(|error| note_cutover_error("retire", error))?,
-            receipt_handle(&validated.evidence.restore_receipt.effect_receipt_sha256)
+            receipt_handle(&validated.evidence().restore_receipt.effect_receipt_sha256)
                 .map_err(|error| note_cutover_error("retire", error))?,
-            receipt_handle(&validated.evidence.operational_validation.validation_digest)
-                .map_err(|error| note_cutover_error("retire", error))?,
+            receipt_handle(
+                &validated
+                    .evidence()
+                    .operational_validation
+                    .validation_digest,
+            )
+            .map_err(|error| note_cutover_error("retire", error))?,
             retirement_authorization.clone(),
         ]),
         retired_at,
@@ -2001,10 +2332,10 @@ pub fn retire_prior_generation(
         .map_err(|error| note_cutover_error("retire", CutoverError::from(error)))?;
     let outcome = CutoverOutcome {
         disposition: CutoverDisposition::Reconciled,
-        operation: validated.request.operation.clone(),
+        operation: cutover_operation,
         evidence_refs: bounded_evidence(vec![
             receipt.transaction_id().clone(),
-            admission_handle(&validated.request.admission)
+            admission_handle(&validated.request().admission)
                 .map_err(|error| note_cutover_error("retire", error))?,
             retirement_authorization.clone(),
         ]),

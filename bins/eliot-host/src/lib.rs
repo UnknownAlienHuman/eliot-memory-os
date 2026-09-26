@@ -4326,11 +4326,14 @@ impl HostComposition {
     /// [`crate::backup_cutover::execute_cutover`], which is the owner path
     /// the registration marker names.
     ///
-    /// Real owner calls, in order: the type-checked
-    /// [`HostComposition::backup_dispatch_target`] resolution (a
-    /// non-`Cutover` operation, including `COMPLETE_REHEARSAL`, refuses
-    /// before any owner call, so a rehearsal completion can never reach
-    /// cutover); the shared
+    /// Real owner calls, in order: the operation resolved from the admitted
+    /// cutover payload through
+    /// [`crate::backup_cutover::admitted_cutover_operation`], which proves the
+    /// presented body is the body the admitted envelope committed to and then
+    /// requires the separately supplied selector to agree with the operation
+    /// that body authorizes (a rehearsal completion, or any other selector,
+    /// authorizes nothing and a valid selector can never override an unrelated
+    /// admitted body); the shared
     /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pin; a
     /// fresh short-lived registry readback through
     /// [`Self::open_registry_store`] plus
@@ -4341,9 +4344,10 @@ impl HostComposition {
     /// activation bound by the cutover is the Host's own committed
     /// generation and not a caller-supplied copy; then
     /// [`crate::backup_cutover::execute_cutover`], which re-reads the
-    /// registry owner (TOCTOU fence), live-verifies the prior
-    /// capability-introduction set through the authenticated Kernel front
-    /// door, requires the exact-fence
+    /// registry owner (TOCTOU fence), re-proves the retained cutover body
+    /// against the admitted envelope at the effect boundary, live-verifies
+    /// the prior capability-introduction set through the authenticated Kernel
+    /// front door, requires the exact-fence
     /// [`GenerationRetirementBarrier`], and only then performs the
     /// activation CAS. Finally the bounded reconciliation is closed by
     /// re-reading the real registry owner and projecting it through
@@ -4363,10 +4367,11 @@ impl HostComposition {
     /// # Errors
     ///
     /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
-    /// operation does not resolve to the cutover dispatch target, the Host
-    /// activation is absent, the owner gate set, retirement barrier, or
-    /// registry CAS refuses, or the post-commit owner readback does not show
-    /// the committed target generation.
+    /// separately supplied operation does not match the operation the admitted
+    /// cutover payload authorizes, the Host activation is absent, the owner
+    /// gate set, retirement barrier, or registry CAS refuses, or the
+    /// post-commit owner readback does not show the committed target
+    /// generation.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -4386,15 +4391,21 @@ impl HostComposition {
         crate::backup_cutover::CutoverError,
     > {
         use crate::backup_cutover::{
-            CutoverDisposition, CutoverError, execute_cutover, plan_cutover_attempt,
-            reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
+            CutoverDisposition, CutoverError, admitted_cutover_operation, execute_cutover,
+            plan_cutover_attempt, reconcile_cutover_outcome, validate_cutover_identity,
+            validate_cutover_request,
         };
-        // Real dispatch decision: only the separately admitted cutover
-        // operation resolves `Cutover`. Rehearsal completion and preparation
-        // refuse here, before any owner call.
-        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+        // Real dispatch decision, resolved from the admitted cutover payload
+        // itself rather than from the routing table: the presented body must
+        // first prove it is the body the owner admitted, and only then does the
+        // separately supplied selector have to agree with the operation that
+        // body authorizes. A selector is therefore never the thing that
+        // authorizes a cutover, and it cannot override an admitted body.
+        let admitted = admitted_cutover_operation(request)?;
+        if operation != admitted {
             return Err(CutoverError::NotSeparatelyAdmitted(format!(
-                "backup operation {operation:?} is not the admitted cutover dispatch"
+                "separately supplied backup operation {operation:?} does not match the \
+                 admitted cutover operation {admitted:?}"
             )));
         }
         // Route through the shared dispatch validation before delegating,
@@ -4472,7 +4483,7 @@ impl HostComposition {
                 .as_ref(),
             readback.committed_cutover_activation(),
             readback.active_generation(),
-            &validated.request.target_generation,
+            &validated.request().target_generation,
             None,
         );
         if reconciled.disposition != CutoverDisposition::RetirementPending {
@@ -4534,9 +4545,10 @@ impl HostComposition {
     /// # Errors
     ///
     /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
-    /// operation does not resolve to the cutover dispatch target, the
-    /// authorization is empty, the prior epoch is not a retained epoch of this
-    /// installation, or the journal owner refuses the retirement record.
+    /// separately supplied operation does not match the operation the admitted
+    /// cutover payload authorizes, the authorization is empty, the prior epoch
+    /// is not a retained epoch of this installation, or the journal owner
+    /// refuses the retirement record.
     #[cfg(windows)]
     pub fn backup_dispatch_cutover_retire(
         &self,
@@ -4547,10 +4559,18 @@ impl HostComposition {
         prior_host: &eliot_host_state::HostInstallationEpoch,
         retirement_authorization: &PlatformHandle,
     ) -> Result<crate::backup_cutover::CutoverOutcome, crate::backup_cutover::CutoverError> {
-        use crate::backup_cutover::{CutoverError, retire_authorized_generation};
-        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+        use crate::backup_cutover::{
+            CutoverError, admitted_cutover_operation, retire_authorized_generation,
+        };
+        // Same admitted-payload resolution as the activation port: the body
+        // must prove it is the body the owner admitted, and the separately
+        // supplied selector must then agree with the operation that body
+        // authorizes. Retirement never runs on a selector's word alone.
+        let admitted = admitted_cutover_operation(request)?;
+        if operation != admitted {
             return Err(CutoverError::NotSeparatelyAdmitted(format!(
-                "backup operation {operation:?} is not the admitted cutover dispatch"
+                "separately supplied backup operation {operation:?} does not match the \
+                 admitted cutover operation {admitted:?}"
             )));
         }
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
