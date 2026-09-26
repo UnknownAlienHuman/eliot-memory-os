@@ -30,7 +30,6 @@ use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-#[cfg(test)]
 use uuid::Uuid;
 
 pub const CONTRACT_NAME: &str = "eliot.surfaces.user-broker-core/v1";
@@ -103,7 +102,8 @@ pub struct OperatorHandoffRequest {
     pub capabilities: Vec<String>,
 }
 
-#[cfg(test)]
+/// One issued handoff: the exact endpoint bytes it authenticates, its absolute
+/// expiry, and whether it has already been redeemed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HandoffState {
     endpoint: OperatorEndpoint,
@@ -111,9 +111,23 @@ struct HandoffState {
     consumed: bool,
 }
 
+/// Owner binding an [`OperatorHandoffAuthority`] to the exact registration
+/// revision and installation-approved artifact it was built for.
+///
+/// The binding is compared on every admission. When the broker's registration
+/// epoch or interactive Session moves, or the protected installation
+/// declaration names a different Operator image, the authority is rebuilt
+/// rather than reused: the previous nonces are then not in the live ledger, so
+/// an endpoint minted for the old revision cannot be redeemed at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperatorHandoffBinding {
+    broker_epoch: u64,
+    interactive_session_id: String,
+    artifact: OperatorArtifact,
+}
+
 /// One-shot broker handoff authority.  The nonce is an authenticator for one
 /// inherited endpoint parse, not a reconnect token or durable credential.
-#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct OperatorHandoffAuthority {
     artifact: OperatorArtifact,
@@ -123,9 +137,8 @@ pub struct OperatorHandoffAuthority {
     handoffs: BTreeMap<String, HandoffState>,
 }
 
-#[cfg(test)]
 impl OperatorHandoffAuthority {
-    pub(crate) fn new(
+    pub fn new(
         artifact: OperatorArtifact,
         pipe_name: String,
         broker_epoch: u64,
@@ -145,7 +158,14 @@ impl OperatorHandoffAuthority {
         })
     }
 
-    pub(crate) fn issue(
+    /// Mints one owner-issued, generation-bound, expiring, single-use
+    /// [`OperatorEndpoint`].
+    ///
+    /// The nonce is minted here, never taken from `request`: the request shape
+    /// carries no nonce, pipe name, expiry or timestamp field, so a caller
+    /// cannot choose the authenticator or pre-claim an expiry. Role and
+    /// capability widening fails closed through [`BrokerError::Denied`].
+    pub fn issue(
         &mut self,
         request: &OperatorHandoffRequest,
         observed_at: u64,
@@ -187,7 +207,15 @@ impl OperatorHandoffAuthority {
         Ok(endpoint)
     }
 
-    pub(crate) fn consume(
+    /// Redeems one handoff exactly once and returns the installation-approved
+    /// artifact it was issued for.
+    ///
+    /// A second presentation of a consumed nonce, an endpoint whose bound
+    /// session/epoch/nonce does not match the issued row, and an endpoint past
+    /// its expiry are three distinct refusals — [`BrokerError::ReplayConflict`]
+    /// and [`BrokerError::StaleLease`] — so a reconnect can never be inferred
+    /// from replaying the previous endpoint.
+    pub fn consume(
         &mut self,
         endpoint: &OperatorEndpoint,
         now: u64,
@@ -1247,6 +1275,11 @@ pub struct UserBroker {
     retired_operations: BTreeMap<String, RetiredOperationIdentity>,
     issued_operations: BTreeMap<String, IssuedOperationIdentity>,
     lost_operation: Option<LostOperation>,
+    /// The live one-shot Operator handoff authority, bound to the registration
+    /// revision and installation-approved artifact it was built for. `None`
+    /// until the first admission, and reset on every recovery so a restarted
+    /// broker can never redeem an endpoint a previous process issued.
+    operator_handoff: Option<(OperatorHandoffBinding, OperatorHandoffAuthority)>,
 }
 
 impl UserBroker {
@@ -1268,6 +1301,7 @@ impl UserBroker {
             retired_operations: BTreeMap::new(),
             issued_operations: BTreeMap::new(),
             lost_operation: None,
+            operator_handoff: None,
         }
     }
 
@@ -1336,6 +1370,12 @@ impl UserBroker {
     }
 
     pub fn recover(&mut self) -> Result<(), BrokerError> {
+        // A one-shot handoff is process-local and non-durable by construction:
+        // a restarted broker holds no memory of the nonces its previous
+        // incarnation issued, so continuity is never inferred from a cached
+        // endpoint. Recovery therefore starts with no handoff authority, and
+        // an endpoint from the previous process is refused as an unknown nonce.
+        self.operator_handoff = None;
         let snapshot = self
             .durable
             .as_mut()
@@ -1430,6 +1470,95 @@ impl UserBroker {
 
     pub fn broker_epoch(&self) -> u64 {
         self.broker_epoch
+    }
+
+    /// Admits one owner-issued, generation-bound, expiring, single-use Operator
+    /// handoff and returns the endpoint the one-shot child parses.
+    ///
+    /// The binding is taken from this broker's own live registration, never
+    /// from the request: `broker_epoch` is the registration epoch (the endpoint
+    /// generation) and `interactive_session_id` is the logon Session the
+    /// registration was admitted for. A broker that is not admitted, is not
+    /// `Active`, or whose registration epoch disagrees with its own broker-local
+    /// epoch is refused, so no handoff can exist without a live registration to
+    /// bind it to. Reconnect is a *new* call here: nothing in this signature
+    /// accepts a previous nonce, pipe name, endpoint, or expiry.
+    pub fn issue_operator_handoff(
+        &mut self,
+        request: &OperatorHandoffRequest,
+        artifact: &OperatorArtifact,
+        observed_at: u64,
+    ) -> Result<OperatorEndpoint, BrokerError> {
+        self.operator_handoff_authority(artifact)?
+            .issue(request, observed_at)
+    }
+
+    /// Redeems one previously issued Operator handoff exactly once and returns
+    /// the installation-approved artifact it authenticates.
+    ///
+    /// A consumed nonce, an endpoint bound to another session/epoch, and an
+    /// endpoint past its expiry are refused with their own distinct
+    /// [`BrokerError`] rather than accepted as continuity.
+    pub fn consume_operator_handoff(
+        &mut self,
+        endpoint: &OperatorEndpoint,
+        artifact: &OperatorArtifact,
+        now: u64,
+    ) -> Result<OperatorArtifact, BrokerError> {
+        self.operator_handoff_authority(artifact)?
+            .consume(endpoint, now)
+            .cloned()
+    }
+
+    /// Returns the live handoff authority, rebuilding it when the registration
+    /// revision, the logon Session, or the installation-approved artifact moved.
+    ///
+    /// Rebuilding rather than carrying the old ledger forward is what makes a
+    /// stale endpoint fail: a nonce minted under a previous registration epoch
+    /// is simply absent from the new authority, so it is an unknown nonce
+    /// ([`BrokerError::ReplayConflict`]) rather than a still-valid handoff.
+    fn operator_handoff_authority(
+        &mut self,
+        artifact: &OperatorArtifact,
+    ) -> Result<&mut OperatorHandoffAuthority, BrokerError> {
+        let registration = self
+            .registration
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        if registration.status != RegistrationStatus::Active {
+            return Err(BrokerError::LeaseExpired);
+        }
+        let broker_epoch = registration.user_broker_epoch;
+        if broker_epoch == 0 || broker_epoch != self.broker_epoch {
+            return Err(BrokerError::StaleEpoch);
+        }
+        let interactive_session_id = registration.interactive_session_id.clone();
+        let retained = self.operator_handoff.as_ref().map(|(binding, _)| binding);
+        if !retained.is_some_and(|binding| {
+            binding.broker_epoch == broker_epoch
+                && binding.interactive_session_id == interactive_session_id
+                && binding.artifact == *artifact
+        }) {
+            let authority = OperatorHandoffAuthority::new(
+                artifact.clone(),
+                OPERATOR_PIPE_NAME.to_owned(),
+                broker_epoch,
+                interactive_session_id.clone(),
+            )?;
+            self.operator_handoff = Some((
+                OperatorHandoffBinding {
+                    broker_epoch,
+                    interactive_session_id,
+                    artifact: artifact.clone(),
+                },
+                authority,
+            ));
+        }
+        Ok(&mut self
+            .operator_handoff
+            .as_mut()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?
+            .1)
     }
 
     #[allow(clippy::needless_pass_by_value)]
