@@ -103,6 +103,52 @@ impl OrsGenerationCoordinator {
         outcome
     }
 
+    /// Runs the accepted ORS restore-journal retention policy over every stream
+    /// this store has actually bound.
+    ///
+    /// `apply_restore_journal_retention` is documented in the product's own words
+    /// as an INDEPENDENTLY AUTHORIZED maintenance operation: it runs in its own
+    /// write transaction and returns its own report, never folded into an append
+    /// receipt. This is that operation's authorized owner, and it is deliberately
+    /// NOT placed on the append path — doing so would both self-deadlock redb's
+    /// single live write transaction and re-introduce the separate
+    /// commit-before-binding-validation ordering the retention contract forbids.
+    /// Startup reconciliation is the existing protected path for such an
+    /// obligation, so this needs no new authority, scheduler, timer or thread.
+    ///
+    /// Stream names are ENUMERATED from the store's own durable index, never
+    /// invented, guessed or remembered here, so a store with no bound stream
+    /// performs no pass rather than a fabricated one. Each pass keeps its own
+    /// outcome: a refusal on one stream is reported and does not stop the others,
+    /// and a refusal is never downgraded to a success-shaped outcome.
+    pub(crate) fn recover_restore_journal_retention(&self) -> Result<(), String> {
+        observe_recovery("kernel.recovery.journal_retention_requested", "attempt");
+        let outcome = (|| {
+            let streams = self
+                .ors
+                .list_restore_journal_streams()
+                .map_err(|error| error.to_string())?;
+            if streams.is_empty() {
+                observe_recovery("kernel.recovery.journal_retention_absent", "empty");
+                return Ok(());
+            }
+            for stream in &streams {
+                if self.ors.apply_restore_journal_retention(stream).is_err() {
+                    // A per-stream refusal degrades only the reclamation it names.
+                    // The error text is deliberately not observed: this seam carries
+                    // no owner error strings (I15.4, I07.20).
+                    observe_recovery("kernel.recovery.journal_retention_refused", "rejected");
+                }
+            }
+            observe_recovery("kernel.recovery.journal_retention_completed", "success");
+            Ok(())
+        })();
+        if outcome.is_err() {
+            observe_recovery("kernel.recovery.journal_retention_failed", "rejected");
+        }
+        outcome
+    }
+
     pub(crate) fn recover(
         &self,
         generations: &mut GenerationRouter,

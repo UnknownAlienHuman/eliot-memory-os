@@ -280,9 +280,9 @@ fn validate_journal_table_names(read: &redb::ReadTransaction) -> Result<(), OrsE
 
 /// Classifies an enumerated table-name set against the declared journal family.
 ///
-/// `allow_absent` is set only by the write-side initializer, which is allowed to
-/// create the family on a store that has none yet. Read paths always require the
-/// full family.
+/// `allow_absent` is set only by the write-side initializer and by the
+/// maintenance-side stream enumeration, which are allowed to observe a store
+/// that has no family yet. Every other read path requires the full family.
 fn classify_journal_table_family(
     discovered: &BTreeSet<String>,
     allow_absent: bool,
@@ -391,12 +391,34 @@ fn bounded_table_names(write: &WriteTransaction) -> Result<BTreeSet<String>, Ors
     Ok(discovered)
 }
 
+/// Read-side twin of [`bounded_table_names`], so the maintenance-side stream
+/// enumeration and the ordinary read paths bound the table scan identically
+/// instead of each open-coding the cap.
+fn bounded_read_table_names(read: &redb::ReadTransaction) -> Result<BTreeSet<String>, OrsError> {
+    let mut discovered = BTreeSet::new();
+    for table in read.list_tables().map_err(storage)? {
+        discovered.insert(bound_table_name(table.name())?);
+        if discovered.len() > MAX_JOURNAL_TABLES_SCANNED {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+    }
+    Ok(discovered)
+}
+
 /// Schema identity the store records once it has adopted a v2 journal family.
 pub(super) const RESTORE_JOURNAL_ADOPTION_IDENTITY: &str = "ors-restore-journal-schema-v2";
 
 /// Reads the base-`META` adoption marker, byte-bounded before it is cloned.
 fn read_adoption_marker(write: &WriteTransaction) -> Result<Option<String>, OrsError> {
     let meta = write.open_table(super::META).map_err(storage)?;
+    read_marker(&meta, super::RESTORE_JOURNAL_ADOPTION_KEY)
+}
+
+/// Read-side twin of [`read_adoption_marker`]. `WriteTransaction` does not
+/// implement `ReadableDatabase`, so the two call sites cannot share one
+/// signature; both narrow to the same byte-bounded marker read.
+fn read_adoption_marker_from(read: &redb::ReadTransaction) -> Result<Option<String>, OrsError> {
+    let meta = read.open_table(super::META).map_err(storage)?;
     read_marker(&meta, super::RESTORE_JOURNAL_ADOPTION_KEY)
 }
 
@@ -1570,6 +1592,42 @@ impl RedbRecoveryStore {
             surviving_unresolved_members: frontier.unresolved_members,
             oldest_surviving_unresolved: frontier.oldest_unresolved_sequence,
         })
+    }
+
+    /// Names the durable journal streams this store has actually bound.
+    ///
+    /// A maintenance owner holds the STORE, not a list of stream names, so the
+    /// streams are enumerated from the store's own durable journal index. They
+    /// are never configured, guessed or remembered at a call site: only a
+    /// stream carrying a persisted binding row is returned, because
+    /// `run_restore_journal_retention` refuses an unbound stream and
+    /// `validate_stream_closures` refuses to retain one.
+    ///
+    /// The base-`META` adoption marker is read BEFORE the family is classified,
+    /// exactly as `initialize_restore_journal_schema` does, and that marker
+    /// lives outside the journal family so it survives deletion of those tables.
+    /// A store that never adopted a family genuinely has no streams and reports
+    /// an empty list; a store that adopted one and then lost it is a migration
+    /// error, never a healthy empty result. A present family is read back
+    /// through the ordinary strict read path, so a partial family cannot be
+    /// laundered into a shorter list of streams.
+    pub fn list_restore_journal_streams(&self) -> Result<Vec<String>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let already_adopted = read_adoption_marker_from(&read)?.is_some();
+        let discovered = bounded_read_table_names(&read)?;
+        classify_journal_table_family(&discovered, true)?;
+        let family_absent = !discovered.contains(RESTORE_JOURNAL_INTENTS.name());
+        if family_absent && already_adopted {
+            return Err(migration(
+                "restore journal tables are absent from a store that already adopted them",
+            ));
+        }
+        drop(read);
+        if family_absent {
+            return Ok(Vec::new());
+        }
+        let state = self.read_restore_journal_state()?;
+        Ok(state.streams.keys().cloned().collect())
     }
 
     /// Runs exactly one retention pass in its own write transaction and returns

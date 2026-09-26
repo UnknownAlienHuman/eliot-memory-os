@@ -1314,6 +1314,21 @@ impl KernelComposition {
                 );
                 KernelBuildError::Ors(error)
             })?;
+        // The restore-journal retention pass is the authorized owner of an
+        // independently authorized ORS maintenance operation, and startup
+        // reconciliation is its existing protected path. It is deliberately NOT
+        // mapped to `KernelBuildError`: a retention refusal degrades only the
+        // reclamation it names and must not withhold daemon readiness for a store
+        // whose journal family is healthy but has nothing reclaimable yet.
+        if generation_gateway
+            .recover_restore_journal_retention()
+            .is_err()
+        {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.journal_retention_recovery_degraded",
+            );
+        }
         startup_coordinator
             .record_live_evidence(3)
             .map_err(KernelBuildError::Service)?;
