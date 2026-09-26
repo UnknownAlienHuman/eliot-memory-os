@@ -8676,6 +8676,14 @@ impl HostComposition {
         host_lifecycle_observe_requested(BOUNDARY_RECONCILE_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_RECONCILE_TERMINAL);
         self.ensure_admission_open()?;
+        // #983: the outstanding installation-cutover disposition this Host
+        // journal owner currently retains, observed on the live approved
+        // contour reconcile. Observation only — the read appends nothing,
+        // activates nothing and retires nothing, and a failed read keeps the
+        // reconcile's own outcome rather than becoming one: this contour is a
+        // process/readiness reconcile, not a cutover gate, so a cutover
+        // disposition is never allowed to steer it.
+        let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
         let active =
             self.registry.active().cloned().ok_or_else(|| {
                 HostError::ProcessContour("no approved active generation".to_owned())
