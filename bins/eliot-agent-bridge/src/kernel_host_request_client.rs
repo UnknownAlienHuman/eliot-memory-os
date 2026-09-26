@@ -396,6 +396,20 @@ fn resource_source_refused() -> PortFailure {
     }
 }
 
+fn reject_kernel_operational_correlation(
+    projection: &HostCorrelationProjection,
+) -> Result<(), PortFailure> {
+    if matches!(
+        projection,
+        HostCorrelationProjection::KernelOperational { .. }
+    ) {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "Kernel operational correlation is not admitted on host transport".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn plan_gap_bind(detail: &str) -> PortFailure {
     PortFailure::PlanGap {
         missing_capability: "kernel.host-request.bind-dispatch".to_owned(),
@@ -674,6 +688,9 @@ impl KernelHostRequestClient {
         payload_digest: &str,
         now_ms: u64,
     ) -> Result<InvocationPreparation, PortFailure> {
+        if let Some(projection) = request.correlation_projection.as_ref() {
+            reject_kernel_operational_correlation(projection)?;
+        }
         let cached = {
             let owner = self.shared.try_borrow().map_err(|_| request_failure())?;
             owner.replay_cache.get(correlation).cloned()
@@ -800,6 +817,9 @@ impl KernelHostRequestClient {
                 ..
             } => vec![value.to_string(), format!("int:{value}")],
             HostCorrelationProjection::Opaque { occurrence, .. } => vec![occurrence.clone()],
+            HostCorrelationProjection::KernelOperational { .. } => {
+                return reject_kernel_operational_correlation(projection);
+            }
         };
         let capability = request.tool.canonical_name();
         for occurrence in candidates {
@@ -1025,6 +1045,7 @@ impl KernelHostRequestClient {
             .correlation_projection
             .as_ref()
             .ok_or_else(|| unknown_cancel_outcome(&parent.handle))?;
+        reject_kernel_operational_correlation(projection)?;
         let logical_key =
             logical_cancellation_key(cancel_correlation, projection, parent, session_id)
                 .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
@@ -1118,6 +1139,9 @@ impl KernelHostRequestClient {
             } => vec![format!("cancel:{value}"), format!("cancel:int:{value}")],
             HostCorrelationProjection::Opaque { occurrence, .. } => {
                 vec![occurrence.clone(), format!("cancel:{occurrence}")]
+            }
+            HostCorrelationProjection::KernelOperational { .. } => {
+                return reject_kernel_operational_correlation(projection);
             }
         };
         for occurrence in candidates {
