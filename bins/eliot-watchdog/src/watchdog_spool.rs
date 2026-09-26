@@ -1047,33 +1047,29 @@ impl WatchdogSpool {
             evidence_refs.push(observation_digest.clone());
             if evidence_refs.len() > intent::MAX_INTENT_EVIDENCE_REFS {
                 return Err(SpoolError::Corrupt(
-                    "watchdog intent episode threshold evidence exceeds the bounded frame".to_owned(),
+                    "watchdog intent episode threshold evidence exceeds the bounded frame"
+                        .to_owned(),
                 ));
             }
             let payload = match intent_class {
-                intent::WatchdogIntentClass::Problem => {
-                    intent::ProblemIntentRecord::new(
-                        proof,
-                        SERVICE_NAME.to_owned(),
-                        evidence_refs,
-                        lineage,
-                        observed_at_ms,
-                    )?
-                    .to_payload()
-                }
-                intent::WatchdogIntentClass::Incident => {
-                    intent::IncidentIntentRecord::new(
-                        proof,
-                        SERVICE_NAME.to_owned(),
-                        evidence_refs,
-                        lineage,
-                        observed_at_ms,
-                    )?
-                    .to_payload()
-                }
+                intent::WatchdogIntentClass::Problem => intent::ProblemIntentRecord::new(
+                    proof,
+                    SERVICE_NAME.to_owned(),
+                    evidence_refs,
+                    lineage,
+                    observed_at_ms,
+                )?
+                .to_payload(),
+                intent::WatchdogIntentClass::Incident => intent::IncidentIntentRecord::new(
+                    proof,
+                    SERVICE_NAME.to_owned(),
+                    evidence_refs,
+                    lineage,
+                    observed_at_ms,
+                )?
+                .to_payload(),
             };
-            let (_outcome, created) =
-                Self::append_in_transaction(&write, observed_at_ms, payload)?;
+            let (_outcome, created) = Self::append_in_transaction(&write, observed_at_ms, payload)?;
             // The identity of the record this transaction just created, bound the
             // same way an export batch binds it. A retention-pressure gap record
             // written ahead of it can never be mistaken for the intent, and an
@@ -1834,7 +1830,7 @@ struct WatchdogIntentRuleStateLegacyRecord {
 /// The row also carries the state itself, so this deliberately does not deny
 /// unknown fields: it exists solely to choose the strict decoder for the exact
 /// revision that was written, before any state is interpreted.
-#[serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct WatchdogIntentRuleStateRevision {
     schema_version: u16,
 }
@@ -1857,18 +1853,15 @@ fn encode_intent_rule_state(
 /// decode, fails closed as corruption: neither becomes fresh empty state, and a
 /// rule whose history cannot be read never silently restarts its escalation.
 fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleState, SpoolError> {
-    let revision: WatchdogIntentRuleStateRevision = serde_json::from_slice(bytes).map_err(|error| {
-        SpoolError::Corrupt(format!(
-            "watchdog intent rule state is invalid: {error}"
-        ))
-    })?;
+    let revision: WatchdogIntentRuleStateRevision =
+        serde_json::from_slice(bytes).map_err(|error| {
+            SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
+        })?;
     match revision.schema_version {
         intent::INTENT_RULE_SCHEMA_VERSION => {
             let record: WatchdogIntentRuleStateRecord =
                 serde_json::from_slice(bytes).map_err(|error| {
-                    SpoolError::Corrupt(format!(
-                        "watchdog intent rule state is invalid: {error}"
-                    ))
+                    SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
                 })?;
             if record.state.schema_version != record.schema_version {
                 return Err(SpoolError::Corrupt(
@@ -1879,11 +1872,9 @@ fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleSt
             Ok(record.state)
         }
         intent::INTENT_RULE_LEGACY_SCHEMA_VERSION => {
-            let record: WatchdogIntentRuleStateLegacyRecord =
-                serde_json::from_slice(bytes).map_err(|error| {
-                    SpoolError::Corrupt(format!(
-                        "watchdog intent rule state is invalid: {error}"
-                    ))
+            let record: WatchdogIntentRuleStateLegacyRecord = serde_json::from_slice(bytes)
+                .map_err(|error| {
+                    SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
                 })?;
             if record.state.schema_version != record.schema_version {
                 return Err(SpoolError::Corrupt(

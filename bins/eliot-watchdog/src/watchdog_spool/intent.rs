@@ -882,7 +882,8 @@ impl GovernorIntentRuleState {
                 || self.incident_intent_emission.is_some()
             {
                 return Err(SpoolError::Corrupt(
-                    "watchdog intent rule retains episode state while no episode is open".to_owned(),
+                    "watchdog intent rule retains episode state while no episode is open"
+                        .to_owned(),
                 ));
             }
         } else {
@@ -893,7 +894,8 @@ impl GovernorIntentRuleState {
             };
             if !is_sha256_hex_shape(episode_id) {
                 return Err(SpoolError::Corrupt(
-                    "watchdog intent rule episode identity is not a 64-character hex digest".to_owned(),
+                    "watchdog intent rule episode identity is not a 64-character hex digest"
+                        .to_owned(),
                 ));
             }
             match (
@@ -949,8 +951,7 @@ impl GovernorIntentRuleState {
             }
             GovernorIntentEpisodePhase::ProblemEmitted => {
                 if self.threshold_progress_observations < PROBLEM_INTENT_OBSERVATION_THRESHOLD
-                    || self.threshold_progress_observations
-                        >= INCIDENT_INTENT_OBSERVATION_THRESHOLD
+                    || self.threshold_progress_observations >= INCIDENT_INTENT_OBSERVATION_THRESHOLD
                 {
                     return Err(SpoolError::Corrupt(
                         "watchdog intent rule problem-emitted episode is not between the configured thresholds"
@@ -959,8 +960,7 @@ impl GovernorIntentRuleState {
                 }
             }
             GovernorIntentEpisodePhase::IncidentEmitted => {
-                if self.threshold_progress_observations != INCIDENT_INTENT_OBSERVATION_THRESHOLD
-                {
+                if self.threshold_progress_observations != INCIDENT_INTENT_OBSERVATION_THRESHOLD {
                     return Err(SpoolError::Corrupt(
                         "watchdog intent rule escalated episode is not at the configured incident threshold"
                             .to_owned(),
@@ -986,14 +986,18 @@ impl GovernorIntentRuleState {
             );
             if problem_expected != self.problem_intent_emission.is_some() {
                 return Err(SpoolError::Corrupt(
-                    "watchdog intent rule problem emission does not match its episode phase".to_owned(),
+                    "watchdog intent rule problem emission does not match its episode phase"
+                        .to_owned(),
                 ));
             }
-            let incident_expected =
-                matches!(self.episode_phase, GovernorIntentEpisodePhase::IncidentEmitted);
+            let incident_expected = matches!(
+                self.episode_phase,
+                GovernorIntentEpisodePhase::IncidentEmitted
+            );
             if incident_expected != self.incident_intent_emission.is_some() {
                 return Err(SpoolError::Corrupt(
-                    "watchdog intent rule incident emission does not match its episode phase".to_owned(),
+                    "watchdog intent rule incident emission does not match its episode phase"
+                        .to_owned(),
                 ));
             }
         }
@@ -1062,7 +1066,8 @@ impl GovernorIntentRuleState {
                 intent_class: WatchdogIntentClass::Problem,
             };
         }
-        if next == INCIDENT_INTENT_OBSERVATION_THRESHOLD && self.incident_intent_emission.is_none() {
+        if next == INCIDENT_INTENT_OBSERVATION_THRESHOLD && self.incident_intent_emission.is_none()
+        {
             return GovernorIntentObservationClass::ThresholdCrossing {
                 intent_class: WatchdogIntentClass::Incident,
             };
@@ -1162,9 +1167,8 @@ impl GovernorIntentRuleState {
         let saturated =
             self.threshold_progress_observations >= INCIDENT_INTENT_OBSERVATION_THRESHOLD;
         if !saturated {
-            self.threshold_progress_observations = self
-                .threshold_progress_observations
-                .saturating_add(1);
+            self.threshold_progress_observations =
+                self.threshold_progress_observations.saturating_add(1);
             self.threshold_evidence.push(observation_digest);
         }
         if let Some((intent_class, committed)) = emission {
@@ -1176,8 +1180,7 @@ impl GovernorIntentRuleState {
                                 .to_owned(),
                         ));
                     }
-                    if self.threshold_progress_observations
-                        != PROBLEM_INTENT_OBSERVATION_THRESHOLD
+                    if self.threshold_progress_observations != PROBLEM_INTENT_OBSERVATION_THRESHOLD
                     {
                         return Err(SpoolError::Corrupt(
                             "watchdog intent rule problem emission does not sit on the configured problem threshold"
@@ -1195,8 +1198,7 @@ impl GovernorIntentRuleState {
                                 .to_owned(),
                         ));
                     }
-                    if self.threshold_progress_observations
-                        != INCIDENT_INTENT_OBSERVATION_THRESHOLD
+                    if self.threshold_progress_observations != INCIDENT_INTENT_OBSERVATION_THRESHOLD
                     {
                         return Err(SpoolError::Corrupt(
                             "watchdog intent rule incident emission does not sit on the configured incident threshold"
