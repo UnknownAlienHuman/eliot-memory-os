@@ -12,7 +12,8 @@
 
 use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
-    NOTIFICATION_STATE_READ_OPERATION,
+    NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
+    USER_AUTOMATION_RUNTIME_OPERATION,
 };
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
@@ -27,9 +28,9 @@ use super::wasm_runtime_port_grant::{
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
     GovernanceProfile, KernelComposition, KernelFrameAction, KernelServiceState, MessageType,
-    PeerIdentity, ProcessExecutionRequest, ProtocolPayload, Session, TESTD_ADMISSION_WIRE_ID,
-    TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
-    route_doctor_repair, route_testd_admission, status_frame, unix_ms,
+    PeerIdentity, ProcessExecutionRequest, ProtocolPayload, RequestIdentity, Session,
+    TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest, TransportError, caller_binding,
+    probe_ready_state_admitted, route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
@@ -607,12 +608,15 @@ impl KernelComposition {
                 ProtocolPayload::Json(payload) => payload.clone(),
                 _ => return Err(TransportError::SessionFenced),
             };
+            // The closed selector is owned here so the exact payload can still be
+            // moved into the dispatched frame action below.
             let operation = payload
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
                 .ok_or(TransportError::SessionFenced)?;
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
-                && is_daemon_operation(operation)
+                && is_daemon_operation(&operation)
             {
                 if !probe_ready_state_admitted(
                     self.service_state()
@@ -634,8 +638,42 @@ impl KernelComposition {
                 return Ok(KernelFrameAction::Daemon {
                     request_id,
                     identity: identity.clone(),
-                    operation: operation.to_owned(),
-                    payload,
+                    operation: operation.clone(),
+                    payload: route_payload_for_daemon_operation(&operation, payload, identity)?,
+                });
+            }
+            if is_user_automation_operator_operation(&operation) {
+                // The authenticated `UserAutomation` operator selector is not a
+                // daemon-module operation: the closed
+                // create/list/status/history/pause/resume/edit/run-now/remove/
+                // inspect-last-failure vocabulary arrives over the same admitted
+                // front-door transport from the operator surface. Only the
+                // selector string selects this route; the typed operation, the
+                // peer-bound principal, and the canonical request hash are
+                // proved by the route owner before any Store IO. `Ready` admits
+                // it and a missing or stale identity fences the session.
+                if !probe_ready_state_admitted(
+                    self.service_state()
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let identity = frame
+                    .request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                if !session
+                    .module_generation
+                    .state_fence
+                    .is_compatible_with(&identity.request.state_fence)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::Daemon {
+                    request_id,
+                    identity: identity.clone(),
+                    operation,
+                    payload: with_user_automation_request_identity(payload, identity)?,
                 });
             }
         }
@@ -1105,6 +1143,16 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "origin_control_decide"
             | ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
+            // Issue #1779: the authenticated `UserAutomation` runtime route.
+            // The marker is the closed daemon operation name the retained
+            // `UserAutomation` admission path already serves, so this entry
+            // only lets the closed front-door frame reach that arm; the arm
+            // still proves the module binding, the peer principal, the session
+            // State Fence and the exact retained request identity before any
+            // Store, Durable Job or Wake effect. It is the one admitted arm
+            // for this operation: the same constant is also imported above for
+            // the `UserAutomation` runtime dispatch, and admitting it twice in
+            // this matcher would make the second arm unreachable.
             | super::daemon_request_dispatch::USER_AUTOMATION_RUNTIME_OPERATION
             | "health"
             | "daemon_degraded"
@@ -1161,6 +1209,64 @@ fn is_daemon_operation(operation: &str) -> bool {
             | NOTIFICATION_STATE_MUTATION_OPERATION
             | NOTIFICATION_STATE_READ_OPERATION
     )
+}
+
+/// Returns whether the operation string selects the authenticated
+/// `UserAutomation` operator route.
+///
+/// The operation string is the stable wire identity published as
+/// `USER_AUTOMATION_ROUTE` in `crates/surfaces/eliot-mcp/src/contract.rs` and
+/// used by `crates/surfaces/eliot-cli/src/lib.rs`. It is the only selector for
+/// this route: there is no second dispatch vocabulary and no generic JSON
+/// command routing. The route owner still decodes the exact closed
+/// `UserAutomationOperation` payload and proves the authenticated principal and
+/// session State Fence before any Store IO.
+fn is_user_automation_operator_operation(operation: &str) -> bool {
+    operation == USER_AUTOMATION_OPERATOR_OPERATION
+}
+
+/// Carries the front-door-authenticated `RequestIdentity` into one
+/// `UserAutomation` daemon-route payload.
+///
+/// The daemon frame action deliberately keeps its payload free of Kernel
+/// routing evidence, and both closed `UserAutomation` envelopes decode with
+/// `deny_unknown_fields`. Both routes need the exact identity the front door
+/// already bound to this session, so it is copied verbatim under the reserved
+/// `request_identity` key. This preserves existing authenticated evidence: no
+/// identity is minted, widened, or re-fenced here, and every route
+/// re-validates the copy against the session State Fence and the request id
+/// before any effect.
+fn with_user_automation_request_identity(
+    payload: serde_json::Value,
+    identity: &RequestIdentity,
+) -> Result<serde_json::Value, TransportError> {
+    let serde_json::Value::Object(mut object) = payload else {
+        return Err(TransportError::SessionFenced);
+    };
+    if object.contains_key("request_identity") {
+        return Err(TransportError::SessionFenced);
+    }
+    object.insert(
+        "request_identity".to_owned(),
+        serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?,
+    );
+    Ok(serde_json::Value::Object(object))
+}
+
+/// Returns the payload one admitted daemon operation is dispatched with.
+///
+/// Only the `UserAutomation` runtime route receives the front-door
+/// `RequestIdentity`; every other closed daemon envelope keeps its exact
+/// payload bytes.
+fn route_payload_for_daemon_operation(
+    operation: &str,
+    payload: serde_json::Value,
+    identity: &RequestIdentity,
+) -> Result<serde_json::Value, TransportError> {
+    if operation == USER_AUTOMATION_RUNTIME_OPERATION {
+        return with_user_automation_request_identity(payload, identity);
+    }
+    Ok(payload)
 }
 
 /// Returns whether the operation string selects the #1780 D3 WASM port-grant

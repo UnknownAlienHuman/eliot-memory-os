@@ -111,6 +111,16 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+/// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
+///
+/// This is the exact string published as `USER_AUTOMATION_ROUTE` in
+/// `crates/surfaces/eliot-mcp/src/contract.rs` and used by
+/// `crates/surfaces/eliot-cli/src/lib.rs`. It carries the closed I11.12
+/// vocabulary `create; list/status/history; pause/resume; edit; run-now;
+/// remove; inspect last failure`. The Kernel derives the principal, State
+/// Fence, operation identity, and canonical request hash from authenticated
+/// evidence, so the selector itself grants no authority.
+pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -919,6 +929,46 @@ struct UserAutomationRuntimeOperation {
     request: Option<UserAutomationHostExecutionOperation>,
     #[serde(default)]
     trigger: Option<UserAutomationDaemonTrigger>,
+    /// Front-door-authenticated request identity copied by the frame router.
+    ///
+    /// The daemon frame action carries no separate identity argument, so the
+    /// exact identity the front door already bound to this session travels
+    /// here and is re-validated against the session State Fence and request id
+    /// before any owner effect.
+    #[serde(default)]
+    request_identity: Option<RequestIdentity>,
+}
+
+#[cfg(windows)]
+/// Routing envelope read only to recover the front-door request identity.
+///
+/// The closed `UserAutomationRuntimeOperation` envelope owns the full shape
+/// check, so this envelope neither widens nor narrows it.
+#[derive(Deserialize)]
+struct UserAutomationRouteIdentity {
+    operation: String,
+    #[serde(default)]
+    request_identity: Option<RequestIdentity>,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationOperatorRoute {
+    operation: String,
+    /// Front-door-authenticated request identity copied by the frame router.
+    request_identity: RequestIdentity,
+    payload: UserAutomationOperatorIntent,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationOperatorIntent {
+    /// Closed operator operation selected by the authenticated surface.
+    operation: eliot_kernel_core::UserAutomationOperation,
+    /// Retry-stable idempotency key contributed by the caller.
+    idempotency_key: String,
 }
 
 #[cfg(windows)]
@@ -1074,6 +1124,29 @@ impl KernelComposition {
         payload: &serde_json::Value,
         request_identity: Option<&RequestIdentity>,
     ) -> Result<Frame, TransportError> {
+        #[cfg(windows)]
+        if operation == USER_AUTOMATION_OPERATOR_OPERATION {
+            // The closed UserAutomation operator vocabulary is authenticated by
+            // the front-door session, not by the daemon module binding: the
+            // principal comes from the authenticated peer, the State Fence from
+            // the session, and the canonical request hash is sealed by the
+            // canonical Store owner over the exact prepared transition. No
+            // other daemon operation is reachable from this branch.
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let value = Box::pin(self.user_automation_operator_operation(
+                session,
+                request_id.clone(),
+                payload,
+            ))
+            .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
         if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err(TransportError::SessionFenced);
         }
@@ -1187,10 +1260,18 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             USER_AUTOMATION_RUNTIME_OPERATION => {
+                let route: UserAutomationRouteIdentity = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if route.operation != USER_AUTOMATION_RUNTIME_OPERATION {
+                    return Err(TransportError::SessionFenced);
+                }
+                let Some(identity) = request_identity.cloned().or(route.request_identity) else {
+                    return Err(TransportError::SessionFenced);
+                };
                 Box::pin(self.user_automation_runtime_operation(
                     session,
                     payload.clone(),
-                    request_identity.ok_or(TransportError::SessionFenced)?,
+                    &identity,
                 ))
                 .await
             }
@@ -2130,6 +2211,16 @@ impl KernelComposition {
         if envelope.operation != USER_AUTOMATION_RUNTIME_OPERATION {
             return Err(TransportError::SessionFenced);
         }
+        // The payload copy of the front-door identity and the identity this
+        // route was invoked with must be the same value. A caller cannot
+        // substitute one, and neither copy widens the session authority.
+        if envelope
+            .request_identity
+            .as_ref()
+            .is_some_and(|embedded| embedded != request_identity)
+        {
+            return Err(TransportError::SessionFenced);
+        }
         if envelope.request.is_some() == envelope.trigger.is_some() {
             return Err(TransportError::SessionFenced);
         }
@@ -2281,6 +2372,175 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    /// Serves the authenticated `eliot_user_automation` operator route.
+    ///
+    /// The route implements the I11.12 operations `create;
+    /// list/status/history; pause/resume; edit; run-now; remove; inspect last
+    /// failure`. The selector carries only the closed operation plus the
+    /// caller's retry-stable idempotency key; the principal comes from the
+    /// authenticated peer, the State Fence and `RequestMetadata` from the
+    /// front-door identity, and the canonical Store operation identity and
+    /// canonical request hash are sealed by the canonical Store owner over the
+    /// exact prepared transition. The route therefore creates no authority, no
+    /// principal, and no second canonical writer.
+    pub(crate) async fn user_automation_operator_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let route: UserAutomationOperatorRoute =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        let identity = route.request_identity;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+            || route.payload.idempotency_key != identity.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
+        let principal = authenticated_user_automation_principal(session)?;
+        let operation_id = eliot_contracts::OperationId::new(format!(
+            "user-automation-operation:{}",
+            route.payload.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let intent = eliot_kernel_core::UserAutomationOperatorIntent {
+            intent_id: format!("user-automation-intent:{}", route.payload.idempotency_key),
+            principal_ref: principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+            operation: route.payload.operation,
+        };
+        let request = eliot_kernel_service::UserAutomationServiceRequest {
+            context: identity.request.metadata.clone(),
+            authenticated_principal: principal,
+            identity: OperationIdentity {
+                operation_id,
+                idempotency_key: route.payload.idempotency_key,
+                canonical_request_hash: String::new(),
+            },
+            intent,
+        };
+        let gateway = self.retained_store_gateway()?;
+        let response = Box::pin(gateway.execute_user_automation_operation(request))
+            .await
+            .map_err(|_error| {
+                super::kernel_diagnostics::observe_terminal_error(
+                    "daemon_user_automation_operator_store",
+                );
+                TransportError::SessionFenced
+            })?;
+        let outcome = match &response.outcome {
+            eliot_kernel_service::UserAutomationStoreOutcome::Read { .. } => "read",
+            eliot_kernel_service::UserAutomationStoreOutcome::Committed { .. } => "committed",
+            eliot_kernel_service::UserAutomationStoreOutcome::Replayed { .. } => "replayed",
+        };
+        // The Human inspect surface shows the deterministic schedule
+        // projection before activation: the same normalized occurrence set the
+        // trigger contract uses, compiled here into the immutable
+        // revision-bound occurrence identities. A schedule the compiler cannot
+        // compile fails closed instead of projecting a guessed occurrence.
+        let occurrences =
+            Self::user_automation_inspection_occurrences(&response.outcome).map_err(|_error| {
+                super::kernel_diagnostics::observe_terminal_error(
+                    "daemon_user_automation_occurrence_projection",
+                );
+                TransportError::SessionFenced
+            })?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "outcome": outcome,
+                "state_fence": response.state_fence,
+                "result": response.outcome,
+                "occurrences": occurrences,
+            },
+            "recovery": null,
+        }))
+    }
+
+    /// Compiles the deterministic next-occurrence projection of every revision
+    /// a read operation returned.
+    ///
+    /// A mutation answer carries no schedule projection, so it yields an empty
+    /// list rather than re-deriving a revision the caller did not ask for.
+    #[cfg(windows)]
+    fn user_automation_inspection_occurrences(
+        outcome: &eliot_kernel_service::UserAutomationStoreOutcome,
+    ) -> Result<Vec<serde_json::Value>, UserAutomationRuntimeError> {
+        use eliot_kernel_service::UserAutomationReadResult;
+        let eliot_kernel_service::UserAutomationStoreOutcome::Read { result } = outcome else {
+            return Ok(Vec::new());
+        };
+        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result {
+            UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
+            UserAutomationReadResult::Status { revision, .. }
+            | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
+            UserAutomationReadResult::History { .. } => Vec::new(),
+        };
+        let mut projections = Vec::with_capacity(revisions.len());
+        for revision in revisions {
+            let identities = revision
+                .compile_occurrence_identities()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+            // Each compiled identity is projected together with the
+            // deterministic successor the same revision compiler resolves. The
+            // Human surface therefore sees the whole next-occurrence chain,
+            // including the terminal occurrence whose successor is `None`,
+            // instead of an unlabelled list it would have to re-derive.
+            let mut occurrences = Vec::with_capacity(identities.len());
+            for identity in &identities {
+                let occurrence_key = match &identity.trigger {
+                    eliot_kernel_core::user_automation::UserAutomationTrigger::Scheduled {
+                        occurrence_key,
+                    } => occurrence_key.as_str(),
+                    eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
+                        ..
+                    } => {
+                        return Err(UserAutomationRuntimeError::Rejected(
+                            "compiled UserAutomation occurrence is not a calendar occurrence"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                let next_occurrence = revision
+                    .next_occurrence_after(occurrence_key)
+                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+                occurrences.push(serde_json::json!({
+                    "identity": identity,
+                    "next_occurrence": next_occurrence,
+                }));
+            }
+            projections.push(
+                serde_json::to_value(serde_json::json!({
+                    "automation_id": revision.automation_id,
+                    "revision": revision.revision,
+                    "kind": revision.schedule.kind,
+                    "expression": revision.schedule.expression,
+                    "calendar": revision.schedule.calendar,
+                    "timezone": revision.schedule.timezone,
+                    "dst_fold": revision.schedule.dst_fold,
+                    "dst_gap": revision.schedule.dst_gap,
+                    "configuration_state": revision.configuration_state,
+                    "occurrences": occurrences,
+                }))
+                .map_err(|error| {
+                    UserAutomationRuntimeError::Rejected(format!(
+                        "UserAutomation occurrence projection encoding failed: {error}"
+                    ))
+                })?,
+            );
+        }
+        Ok(projections)
+    }
+
+    #[cfg(windows)]
     /// Acquires the canonical owner material for a daemon/operator trigger.
     ///
     /// The wire carrier is only `(automation_id, requested_revision,
@@ -2333,16 +2593,28 @@ impl KernelComposition {
                 ),
             ));
         }
-        let manual_trigger = eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
-            nonce: manual_nonce.clone(),
+        // The run-now trigger is compiled by the same immutable revision
+        // compiler that compiles a calendar occurrence, so the explicit manual
+        // nonce is validated against the stored revision and receives a
+        // distinct, stable, revision-bound identity instead of a value built
+        // here beside the schedule. A nonce the revision cannot compile is a
+        // typed rejection, not a second trigger vocabulary.
+        let manual_trigger = match owner.revision.manual_trigger(&manual_nonce) {
+            Ok(trigger) => trigger,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
         };
-        let occurrence_id =
-            eliot_kernel_core::user_automation::UserAutomationInvocation::occurrence_identity_for(
-                &owner.revision.automation_id,
-                &owner.revision.revision,
-                &manual_trigger,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+        let occurrence_id = match owner.revision.occurrence_identity_for(&manual_trigger) {
+            Ok(occurrence_id) => occurrence_id,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
+        };
         let invocation = gateway
             .read_user_automation_invocation(
                 &lookup.state_fence,

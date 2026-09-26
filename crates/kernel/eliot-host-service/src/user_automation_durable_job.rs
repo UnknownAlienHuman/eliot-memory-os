@@ -57,8 +57,9 @@ impl<O: HostDurableJobOwner + ?Sized> UserAutomationDurableJobPort
 {
     async fn admit_occurrence(
         &self,
-        request: UserAutomationRuntimeAdmission,
+        request: impl Into<Box<UserAutomationRuntimeAdmission>>,
     ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationRuntimeAdmission> = request.into();
         request
             .validate()
             .map_err(|error| rejected(format!("Durable Job admission: {error}")))?;

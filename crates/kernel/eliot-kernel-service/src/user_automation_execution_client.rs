@@ -409,23 +409,30 @@ impl UserAutomationHostExecutionFailure {
 
 /// One typed UserAutomation execution operation sent over the authenticated
 /// Host channel.
+///
+/// The three operation payloads differ by more than 2 KiB, so each one is held
+/// indirectly and every variant costs the same single pointer. `Box<T>` is a
+/// newtype over `T` for serde and schemars, so the externally tagged
+/// `tag = "operation"` shape, the `request` member name, the closed
+/// `deny_unknown_fields` surface and the canonical digest bytes are unchanged
+/// by the indirection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "operation", deny_unknown_fields)]
 pub enum UserAutomationHostExecutionOperation {
     /// Admit one owner-issued occurrence to the existing Durable Job owner.
     AdmitOccurrence {
         /// Authenticated, preflight-approved occurrence admission.
-        request: UserAutomationRuntimeAdmission,
+        request: Box<UserAutomationRuntimeAdmission>,
     },
     /// Cancel exact owner-issued future wake targets.
     CancelPendingWakes {
         /// Same-fence, unadmitted-only cancellation request.
-        request: UserAutomationWakeCancellation,
+        request: Box<UserAutomationWakeCancellation>,
     },
     /// Read one exact retained Pending wake from the Host journal.
     ReadPendingWake {
         /// Original Human RunNow identity and owner-issued invocation.
-        request: UserAutomationWakeReadRequest,
+        request: Box<UserAutomationWakeReadRequest>,
     },
 }
 
@@ -450,33 +457,39 @@ impl UserAutomationHostExecutionRequest {
     /// Builds and hashes one typed admission carrier.
     pub fn admit_occurrence(
         channel: UserAutomationHostChannelBinding,
-        request: UserAutomationRuntimeAdmission,
+        request: impl Into<Box<UserAutomationRuntimeAdmission>>,
     ) -> Result<Self, UserAutomationRuntimeError> {
         Self::new(
             channel,
-            UserAutomationHostExecutionOperation::AdmitOccurrence { request },
+            UserAutomationHostExecutionOperation::AdmitOccurrence {
+                request: request.into(),
+            },
         )
     }
 
     /// Builds and hashes one typed wake-cancellation carrier.
     pub fn cancel_pending_wakes(
         channel: UserAutomationHostChannelBinding,
-        request: UserAutomationWakeCancellation,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Self, UserAutomationRuntimeError> {
         Self::new(
             channel,
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request },
+            UserAutomationHostExecutionOperation::CancelPendingWakes {
+                request: request.into(),
+            },
         )
     }
 
     /// Builds and hashes one exact pending-wake readback carrier.
     pub fn read_pending_wake(
         channel: UserAutomationHostChannelBinding,
-        request: UserAutomationWakeReadRequest,
+        request: impl Into<Box<UserAutomationWakeReadRequest>>,
     ) -> Result<Self, UserAutomationRuntimeError> {
         Self::new(
             channel,
-            UserAutomationHostExecutionOperation::ReadPendingWake { request },
+            UserAutomationHostExecutionOperation::ReadPendingWake {
+                request: request.into(),
+            },
         )
     }
 
@@ -1249,7 +1262,7 @@ where
     /// here.
     pub async fn read_pending_wake(
         &self,
-        request: UserAutomationWakeReadRequest,
+        request: impl Into<Box<UserAutomationWakeReadRequest>>,
     ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
         let carrier = UserAutomationHostExecutionRequest::read_pending_wake(
             self.transport.channel_binding().clone(),
@@ -1274,7 +1287,7 @@ where
 {
     async fn admit_occurrence(
         &self,
-        request: UserAutomationRuntimeAdmission,
+        request: impl Into<Box<UserAutomationRuntimeAdmission>>,
     ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError> {
         let carrier = UserAutomationHostExecutionRequest::admit_occurrence(
             self.transport.channel_binding().clone(),
@@ -1299,7 +1312,7 @@ where
 {
     async fn cancel_pending_wakes(
         &self,
-        request: UserAutomationWakeCancellation,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError> {
         let carrier = UserAutomationHostExecutionRequest::cancel_pending_wakes(
             self.transport.channel_binding().clone(),

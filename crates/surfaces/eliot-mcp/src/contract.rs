@@ -65,10 +65,13 @@ pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
 /// Closed typed requests used by the MCP hot surface and the authenticated
 /// Host/operator bridge.
 ///
-/// `UserAutomation` is deliberately a cold/operator route. It remains typed
-/// here so the Host bridge and CLI share one payload contract, but it is not
-/// admitted by [`ADMITTED_TOOL_NAMES`], published by the canonical MCP schema,
-/// or assigned a semantic hot-tool profile.
+/// `UserAutomation` is deliberately a cold/operator route. It stays typed here
+/// so the Host bridge, the operator CLI, and the Kernel front door share one
+/// payload contract, and it is dispatched only through the authenticated
+/// [`USER_AUTOMATION_ROUTE`] selector. It is not admitted by
+/// [`ADMITTED_TOOL_NAMES`], published by the canonical MCP schema, or assigned a
+/// semantic hot-tool profile: MCP clients reach it through the operator front
+/// door, not through the hot tool surface.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments", deny_unknown_fields)]
 pub enum ToolRequest {
