@@ -1,15 +1,17 @@
 //! Authenticated A-08 command-candidate edge for the zero-model Swarm projection.
 //!
-//! This module compiles the four operator swarm intents
+//! This module compiles the operator swarm intents
 //! ([`OperatorAction::RefreshSwarmCatalogue`],
 //! [`OperatorAction::ReplaceSwarmPolicy`],
 //! [`OperatorAction::RequestSwarmLaunch`],
-//! [`OperatorAction::CancelSwarmAttempt`]) into candidate-only
+//! [`OperatorAction::CancelSwarmAttempt`], and
+//! [`OperatorAction::BoundedMonitorSwarm`]) into candidate-only
 //! [`SwarmCommandCandidate`] values following
 //! [`ControlBoard::swarm_view`](super::ControlBoard::swarm_view). It performs
 //! no provider or model call, persists nothing, refreshes no provider, admits
-//! no route, issues no [`StateFence`](super::StateFence), launches or cancels
-//! no process, redispatches no work, and completes no task.
+//! no route, issues no [`StateFence`](super::StateFence), starts no monitor or
+//! polling, launches or cancels no process, redispatches no work, and completes
+//! no task.
 //!
 //! Authentication order mirrors the read edge: the inert request is validated,
 //! access is resolved into provider-owned facts, the caller role is gated to
@@ -54,12 +56,12 @@
 //! `AUTHENTICATED_SWARM_COMMAND_CANDIDATE_PACKAGE_PROOF_ONLY`.
 
 use eliot_agent_coordinator::{
-    CancelAttemptRequest, LaunchSwarmRequest, RefreshCatalogueRequest,
-    ReplacePreferencePolicyRequest, SWARM_CONTROLBOARD_PROJECTION_VERSION,
+    BoundedMonitorRequest, CancelAttemptRequest, LaunchSwarmRequest, ProviderAccountCommand,
+    RefreshCatalogueRequest, ReplacePreferencePolicyRequest, SWARM_CONTROLBOARD_PROJECTION_VERSION,
     SwarmCommandCallerBinding, SwarmCommandCandidate, SwarmCommandCandidateError,
-    SwarmProjectionAuthorityCeiling, ZeroModelExecutionCounters, compile_cancel_attempt_candidate,
-    compile_launch_swarm_candidate, compile_refresh_catalogue_candidate,
-    compile_replace_policy_candidate,
+    SwarmProjectionAuthorityCeiling, ZeroModelExecutionCounters, compile_bounded_monitor_candidate,
+    compile_cancel_attempt_candidate, compile_launch_swarm_candidate,
+    compile_refresh_catalogue_candidate, compile_replace_policy_candidate,
 };
 
 use super::{
@@ -191,7 +193,7 @@ impl ControlBoard {
     /// Compiles one authenticated swarm command candidate against the exact
     /// current projection view.
     ///
-    /// Only the four swarm [`OperatorAction`] variants are accepted; any other
+    /// Only the five swarm [`OperatorAction`] variants are accepted; any other
     /// action fails closed as [`ControlBoardError::InvalidField`]. The caller
     /// capability is enforced with `ResolvedAccess::can` before the projection
     /// is read, the envelope is pinned at the exact `(revision, fence)` pair,
@@ -214,7 +216,8 @@ impl ControlBoard {
             OperatorAction::RefreshSwarmCatalogue { .. }
             | OperatorAction::ReplaceSwarmPolicy { .. }
             | OperatorAction::RequestSwarmLaunch { .. }
-            | OperatorAction::CancelSwarmAttempt { .. } => action.required_capability(),
+            | OperatorAction::CancelSwarmAttempt { .. }
+            | OperatorAction::BoundedMonitorSwarm { .. } => action.required_capability(),
             _ => return Err(ControlBoardError::InvalidField("action.kind")),
         };
         if !access.can(capability) {
@@ -322,6 +325,24 @@ impl ControlBoard {
                     visible_attempts,
                     attempt_id: target_id,
                     reason: reason.clone(),
+                })
+                .map_err(map_swarm_command_error)?;
+                seal_candidate(candidate)
+            }
+            OperatorAction::BoundedMonitorSwarm {
+                watch_id,
+                account_scope,
+                bound_unix_ms,
+                reason,
+            } => {
+                let candidate = compile_bounded_monitor_candidate(&BoundedMonitorRequest {
+                    binding: binding.clone(),
+                    command: ProviderAccountCommand::BoundedMonitor {
+                        watch_id: watch_id.clone(),
+                        account_scope: account_scope.clone(),
+                        bound_unix_ms: *bound_unix_ms,
+                        reason: reason.clone(),
+                    },
                 })
                 .map_err(map_swarm_command_error)?;
                 seal_candidate(candidate)
