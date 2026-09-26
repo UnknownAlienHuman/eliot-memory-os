@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Final
 
 SCHEMA: Final = "eliot.integration.ignored-test-inventory.v1"
-TOOL_VERSION: Final = "0.1.0"
+TOOL_VERSION: Final = "0.2.0"
 OUTPUT_ROOT: Final = ".eliot"
 
 
@@ -192,7 +192,7 @@ def _repo_path(root: Path, path: Path) -> Path:
         resolved = candidate.resolve(strict=True)
         resolved.relative_to(resolved_root)
     except (OSError, ValueError) as exc:
-        raise InventoryError("PATH_ESCAPE", f"path is outside repository root: {path}") from exc
+        raise InventoryError("PATH_ESCAPE", _redact_detail(f"path is outside repository root: {path}")) from exc
     return resolved
 
 
@@ -207,18 +207,18 @@ def _safe_output(root: Path, output: Path, overwrite: bool = False) -> Path:
         resolved_candidate = candidate.resolve(strict=False)
         relative = resolved_candidate.relative_to(root)
     except (OSError, ValueError) as exc:
-        raise InventoryError("UNSAFE_OUTPUT", f"output parent is outside repository root: {output}") from exc
+        raise InventoryError("UNSAFE_OUTPUT", _redact_detail(f"output parent is outside repository root: {output}")) from exc
     if not relative.parts or relative.parts[0] != OUTPUT_ROOT:
         raise InventoryError("UNSAFE_OUTPUT", "output must be below the repository .eliot directory")
     if candidate.exists() and not overwrite:
-        raise InventoryError("OUTPUT_EXISTS", f"refusing to overwrite {candidate}")
+        raise InventoryError("OUTPUT_EXISTS", _redact_detail(f"refusing to overwrite {candidate}"))
     return candidate
 
 
 def _bounded_read(path: Path) -> bytes:
     size = path.stat().st_size
     if size > BOUNDS.max_file_bytes:
-        raise InventoryError("SOURCE_FILE_TOO_LARGE", f"{path} exceeds {BOUNDS.max_file_bytes} bytes")
+        raise InventoryError("SOURCE_FILE_TOO_LARGE", _redact_detail(f"{path} exceeds {BOUNDS.max_file_bytes} bytes"))
     return path.read_bytes()
 
 
@@ -231,12 +231,13 @@ def _validate_command(argv: Sequence[str]) -> None:
         ("cargo", "test", "--workspace", "--all-targets", "--locked", "--no-run", "--message-format=json"),
         ("git", "rev-parse", "HEAD"),
         ("git", "status", "--porcelain=v1", "--untracked-files=no"),
+        ("rustc", "--version"),
     }:
         return
     if len(argv) == 5 and tuple(argv[1:]) == ("--list", "--ignored", "--format", "terse"):
         if argv[0] and not argv[0].startswith("-"):
             return
-    raise InventoryError("COMMAND_NOT_ALLOWED", f"command is not fixed/allowed: {argv!r}")
+    raise InventoryError("COMMAND_NOT_ALLOWED", _redact_detail(f"command is not fixed/allowed: {argv!r}"))
 
 
 # Redaction for fixed-command failure details (issue #905: "Redact
@@ -260,8 +261,11 @@ _REDACT_PRIVATE_KEY: Final = re.compile(
 _REDACT_OPAQUE_CREDENTIAL: Final = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]+)\b"
 )
+# The doubled-backslash alternative covers repr/JSON-escaped paths (e.g. the
+# `{argv!r}` echo in COMMAND_NOT_ALLOWED or escaped cargo stderr tails).
 _REDACT_USER_HOME: Final = re.compile(
-    r"(?i)(?:[A-Za-z]:\\Users\\[^\\/:*?\"<>|\s]+|/home/[^/\s]+|/Users/[^/\s]+)"
+    r"(?i)(?:[A-Za-z]:\\\\Users\\\\[^\\\\/:*?\"<>|\s]+|[A-Za-z]:\\Users\\[^\\/:*?\"<>|\s]+"
+    r"|/home/[^/\s]+|/Users/[^/\s]+)"
 )
 _REDACTED_SECRET: Final = "<redacted-secret>"
 _REDACTED_USER_PATH: Final = "<redacted-user-path>"
@@ -515,7 +519,7 @@ def _unescape_rust_str(s: str) -> str:
 
 
 def _decode_reason(raw: str) -> str | None:
-    # First look for strings specifically attached to ignore or disabled attributes
+    # Only strings attached to ignore or disabled attributes carry a reason.
     targeted = re.findall(
         r'(?:ignore|disabled[a-z_]*|test_disabled)\b[^(="]*[=(]\s*(?:(?:note|reason)\s*=\s*)?(?:(?:b|c)?r(#{0,16})"(.*?)"\1|(?:b|c)?"((?:\\.|[^"\\])*)")',
         raw,
@@ -526,12 +530,10 @@ def _decode_reason(raw: str) -> str | None:
         if value.strip():
             return value.strip()[:1024]
 
-    # Fallback to any string in the attribute
-    general = re.findall(r'(?:b|c)?r(#{0,16})"(.*?)"\1|(?:b|c)?"((?:\\.|[^"\\])*)"', raw, re.DOTALL)
-    for _h, raw_val, esc_val in general:
-        value = raw_val if raw_val else _unescape_rust_str(esc_val)
-        if value.strip():
-            return value.strip()[:1024]
+    # No fallback: only reason-bearing attributes (ignore/disabled*/test_disabled
+    # per the targeted rule above) may contribute a reason. Configuration strings
+    # on sibling attributes (e.g. tokio::test flavor) must never become the row
+    # reason; bare ignore/missing reason stays unclassified, never guessed.
     return None
 
 
@@ -569,6 +571,14 @@ def _file_module_prefix(target: PackageTarget, path: Path) -> tuple[str, ...]:
 
 _SRC_ROOTED_KINDS: Final = frozenset({"lib", "rlib", "dylib", "cdylib", "staticlib", "bin", "proc-macro"})
 _FILE_ROOTED_KINDS: Final = frozenset({"test", "bench", "example", "custom-build"})
+
+
+# `cargo test` compiles no `--test` harness for these kinds, so they can never
+# yield a compiler-artifact with profile.test=true. Every other declared kind
+# must produce at least one test executable, or the compiled denominator is
+# incomplete over the complete declared target set (issue #905: an unavailable
+# target is nonzero/incomplete, never invisible).
+_TEST_ARTIFACT_EXEMPT_KINDS: Final = frozenset({"example", "custom-build"})
 
 
 def _candidate_source_files(
@@ -609,18 +619,18 @@ def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest
         admitted = candidate.resolve(strict=False)
         admitted.relative_to(resolved_root)
     except (OSError, ValueError) as exc:
-        raise InventoryError("PATH_ESCAPE", f"path is outside repository root: {path}") from exc
+        raise InventoryError("PATH_ESCAPE", _redact_detail(f"path is outside repository root: {path}")) from exc
     if not admitted.is_file():
-        raise InventoryError("SOURCE_NOT_FOUND", f"Rust source is not a readable file: {path}")
+        raise InventoryError("SOURCE_NOT_FOUND", _redact_detail(f"Rust source is not a readable file: {path}"))
     try:
         data = _bounded_read(admitted)
     except OSError as exc:
-        raise InventoryError("SOURCE_READ_FAILED", f"cannot read Rust source: {path}") from exc
+        raise InventoryError("SOURCE_READ_FAILED", _redact_detail(f"cannot read Rust source: {path}")) from exc
     path = admitted
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise InventoryError("INVALID_SOURCE_ENCODING", f"Rust source is not UTF-8: {path}") from exc
+        raise InventoryError("INVALID_SOURCE_ENCODING", _redact_detail(f"Rust source is not UTF-8: {path}")) from exc
     tokens = _lex_rust(text)
     module_stack: list[tuple[str, int]] = [(part, 0) for part in _file_module_prefix(target, path)]
     brace_depth = 0
@@ -645,9 +655,9 @@ def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest
                         break
                 cursor += 1
             else:
-                raise InventoryError("MALFORMED_SOURCE", f"unterminated attribute in {path}")
+                raise InventoryError("MALFORMED_SOURCE", _redact_detail(f"unterminated attribute in {path}"))
             if end - start > BOUNDS.max_attribute_bytes:
-                raise InventoryError("ATTRIBUTE_TOO_LARGE", f"attribute exceeds bound in {path}")
+                raise InventoryError("ATTRIBUTE_TOO_LARGE", _redact_detail(f"attribute exceeds bound in {path}"))
             pending_attributes.append(text[start:end])
             index = cursor + 1
             continue
@@ -661,7 +671,9 @@ def _scan_file(root: Path, target: PackageTarget, path: Path) -> list[SourceTest
             if is_test and is_ignored:
                 modules = [name for name, _ in module_stack]
                 test_name = "::".join((*modules, name_token.value)) if modules else name_token.value
-                reason = next((item[3] for item in flags if item[3]), None)
+                # Only ignore-bearing attributes contribute a reason; a config
+                # string on a sibling test attribute must never win by position.
+                reason = next((item[3] for item in flags if item[1] and item[3]), None)
                 cfg = tuple(item[4] for item in flags if item[4])
                 attributes = "\n".join(pending_attributes)
                 requirements = _requirements(attributes + "\n" + (reason or ""))
@@ -753,6 +765,23 @@ _GIT_MATCHER: Final = re.compile("|".join(_GIT_PATTERNS))
 _EXTERNAL_MATCHER: Final = re.compile("|".join(_EXTERNAL_PATTERNS))
 
 
+# Versioned finite rule-table identity (issue #905: "versioned finite rule
+# table"). RULE_TABLE_VERSION is the human identity; RULE_TABLE_SHA256 binds the
+# exact pattern literals, so any rule edit changes the emitted header and
+# aggregate digest even when no row's composed requirement set changes.
+RULE_TABLE_VERSION: Final = "1.0.0"
+RULE_TABLE_SHA256: Final = _sha256(
+    _canonical_bytes(
+        {
+            "store": _STORE_PATTERNS,
+            "runtime": _RUNTIME_PATTERNS,
+            "git": _GIT_PATTERNS,
+            "external": _EXTERNAL_PATTERNS,
+        }
+    )
+)
+
+
 def _requirements(text: str) -> tuple[str, ...]:
     value = text.casefold()
     result: set[Requirement] = set()
@@ -825,7 +854,7 @@ def _build_test_artifacts(root: Path, runner: Any = None) -> list[Artifact]:
         try:
             executable_path = Path(executable).resolve(strict=True)
         except OSError as exc:
-            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"compiled test binary not found: {executable}") from exc
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", _redact_detail(f"compiled test binary not found: {executable}")) from exc
         artifacts.append(
             Artifact(
                 package_id=package_id,
@@ -845,29 +874,46 @@ def _build_test_artifacts(root: Path, runner: Any = None) -> list[Artifact]:
 def discover_compiled(root: Path, targets: Sequence[PackageTarget], runner: Any = None) -> list[CompiledTest]:
     target_map = {(item.package_id, item.target_kind, item.target_name): item for item in targets}
     result: list[CompiledTest] = []
-    for artifact in _build_test_artifacts(root, runner=runner):
+    artifacts = _build_test_artifacts(root, runner=runner)
+    covered = {(item.package_id, item.target_kind, item.target_name) for item in artifacts}
+    missing = sorted(
+        f"{target.package_id} [{target.target_kind}] {target.target_name}"
+        for target in targets
+        if (target.package_id, target.target_kind, target.target_name) not in covered
+        and set(target.target_kind.split("+")) - _TEST_ARTIFACT_EXEMPT_KINDS
+    )
+    if missing:
+        raise InventoryError(
+            "COMPILED_GRAPH_UNAVAILABLE",
+            _redact_detail("declared test targets produced no test executable: " + "; ".join(missing)),
+        )
+    for artifact in artifacts:
         target = target_map.get((artifact.package_id, artifact.target_kind, artifact.target_name))
         if target is None:
-            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"compiled artifact has no metadata target: {artifact}")
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", _redact_detail(f"compiled artifact has no metadata target: {artifact}"))
         try:
             executable_digest = _sha256(artifact.executable.read_bytes())
         except OSError as exc:
-            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"cannot read compiled test binary: {artifact.executable}") from exc
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", _redact_detail(f"cannot read compiled test binary: {artifact.executable}")) from exc
         listing = _run_cmd(
             runner,
             root,
             (str(artifact.executable), "--list", "--ignored", "--format", "terse"),
         )
         if listing.stdout and not listing.stdout.endswith(b"\n"):
-            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"truncated test listing: {artifact.executable}")
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", _redact_detail(f"truncated test listing: {artifact.executable}"))
         try:
             text = listing.stdout.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"invalid test listing encoding: {artifact.executable}") from exc
+            raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", _redact_detail(f"invalid test listing encoding: {artifact.executable}")) from exc
         for line in text.splitlines():
-            match = re.fullmatch(r"(.+?):\s+(?:test|benchmark)", line.strip())
+            stripped = line.strip()
+            match = re.fullmatch(r"(.+?):\s+(?:test|benchmark)", stripped)
             if match is None:
-                continue
+                raise InventoryError(
+                    "COMPILED_GRAPH_UNAVAILABLE",
+                    _redact_detail(f"unparseable test listing line from {artifact.executable}: {stripped[:200]}"),
+                )
             name = match.group(1)
             if not name or any(ord(char) < 32 for char in name):
                 raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", "compiled test name is invalid")
@@ -941,6 +987,47 @@ def reconcile(source: Sequence[SourceTest], compiled: Sequence[CompiledTest]) ->
     return sorted(rows, key=lambda item: (item.package_id, item.target_kind, item.target_name, item.test_name, item.row_digest))
 
 
+_TOOLCHAIN_CHANNEL: Final = re.compile(r'(?m)^\s*channel\s*=\s*"([^"\n]+)"')
+
+
+def _toolchain_identity(root: Path, runner: Any = None) -> dict[str, Any]:
+    """Bind the committed toolchain identity (I2.18 BuildFingerprint direction).
+
+    Records the live `rustc --version` line plus the `rust-toolchain.toml`
+    channel and full-file digest, so two different toolchain states yield
+    distinguishable artifacts. A failed `rustc` probe degrades to an explicit
+    null rather than breaking the inventory: under an injected transport the
+    double may not implement the probe, and in a real run cargo already proved
+    the toolchain by producing the compiled graph above.
+    """
+    channel: str | None = None
+    toolchain_file_sha256: str | None = None
+    try:
+        pin_file = root / "rust-toolchain.toml"
+        if pin_file.is_file():
+            raw = _bounded_read(pin_file)
+            toolchain_file_sha256 = _sha256(raw)
+            match = _TOOLCHAIN_CHANNEL.search(raw.decode("utf-8", errors="replace"))
+            if match is not None:
+                channel = match.group(1)[:128]
+    except OSError:
+        channel = None
+        toolchain_file_sha256 = None
+    rustc_version: str | None = None
+    try:
+        probe = _run_cmd(runner, root, ("rustc", "--version"))
+        first = probe.stdout.decode("utf-8", errors="replace").splitlines()
+        if first and "rustc" in first[0]:
+            rustc_version = _redact_detail(first[0][:256])
+    except Exception:
+        rustc_version = None
+    return {
+        "rustc_version": rustc_version,
+        "channel": channel,
+        "toolchain_file_sha256": toolchain_file_sha256,
+    }
+
+
 def _git_identity(root: Path, runner: Any = None) -> dict[str, Any]:
     head = _run_cmd(runner, root, ("git", "rev-parse", "HEAD")).stdout.decode("ascii", errors="strict").strip()
     status = _run_cmd(runner, root, ("git", "status", "--porcelain=v1", "--untracked-files=no")).stdout
@@ -965,6 +1052,8 @@ def build_inventory(root: Path, runner: Any = None) -> dict[str, Any]:
     header = {
         "schema": SCHEMA,
         "tool_version": TOOL_VERSION,
+        "toolchain": _toolchain_identity(root, runner=runner),
+        "rule_table": {"version": RULE_TABLE_VERSION, "sha256": RULE_TABLE_SHA256},
         "source_identity": _git_identity(root, runner=runner),
         "cargo_lock_sha256": cargo_lock_sha256,
         "source_count": len(source),
@@ -972,7 +1061,7 @@ def build_inventory(root: Path, runner: Any = None) -> dict[str, Any]:
         "row_count": len(rows),
         "counts_by_state": dict(sorted(counts.items())),
         "proof_ceiling": "IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY",
-        "complete": all(row.state == RowState.CLASSIFIED.value for row in rows),
+        "complete": bool(rows) and all(row.state == RowState.CLASSIFIED.value for row in rows),
     }
     aggregate_input = {"header": header, "rows": denominator}
     header["aggregate_sha256"] = _sha256(_canonical_bytes(aggregate_input))
