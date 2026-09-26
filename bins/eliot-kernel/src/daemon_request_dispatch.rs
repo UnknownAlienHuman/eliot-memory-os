@@ -633,6 +633,21 @@ fn owner_bundle_agrees_with_session(
     })
 }
 
+/// The exact P-07 lifecycle target whose authority identity must exist in the
+/// current `GrantGraph` snapshot.
+///
+/// The two variants are the two disjoint owner-projected identity classes
+/// (`I6.15` "grant and introduction identities must be disjoint" in
+/// `eliot-kernel-core::governor_closure_source`): a grant is resolved against
+/// the admitted member/root projection, an introduction against the admitted
+/// introduction projection. There is no generic operation string and no
+/// third identity class.
+#[derive(Clone, Copy, Debug)]
+enum P07LifecycleTarget<'a> {
+    Grant(&'a str),
+    Introduction(&'a str),
+}
+
 /// Rechecks one presented P-07 binding and subject against the authenticated
 /// session before the dispatcher touches the retained owner, and therefore
 /// before any authority mutation.
@@ -720,6 +735,107 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(guard)
+    }
+
+    /// Resolves the CURRENT `GrantGraph` snapshot from the live retained P-07
+    /// owner and admits one presented P-07 target against it (`#1110` A4,
+    /// `I6.15` "Kernel enforces current grant/introduction/epoch snapshots",
+    /// `I14.20` "Graph revision changes invalidate derived effective
+    /// snapshots").
+    ///
+    /// This is the front-door half of the pre-mutation validation the four
+    /// P-07 arms owe. It is deliberately separate from
+    /// [`Self::retained_p07_owner`] so a request that does not describe the
+    /// current snapshot is refused BEFORE the owner is locked for the
+    /// mutation, exactly like [`p07_binding_agrees_with_session`] and
+    /// [`Self::admit_material_authority_for_fence`]. The owner port re-proves
+    /// the same admitted material under the port ledger lock immediately
+    /// before it mutates, so this gate is the fail-fast half and the port
+    /// stays the authoritative atomic one; nothing here weakens it.
+    ///
+    /// The current snapshot is the retained binding's exact durable
+    /// grant-graph revision, and it is only a snapshot when the binding and
+    /// its admitted projection agree on that one nonzero revision. A target is
+    /// in the current snapshot only when the owner's own admitted projection
+    /// carries it: the two projections below are the same ones the P-07 port
+    /// resolves each thin request from, so the dispatcher introduces no second
+    /// membership or lineage rule and no second grant-graph owner.
+    ///
+    /// Typed refusal, reusing the two dispositions this dispatcher already
+    /// projects and never collapsing either into a string:
+    ///
+    /// - no bound owner, no nonzero self-consistent revision, an unreadable
+    ///   projection, or a target that is absent from the current snapshot →
+    ///   [`TransportError::SessionFenced`]. This is the same typed refusal the
+    ///   retained port raises for absent owner material (`Unavailable`), and
+    ///   it stops the caller from retrying an identity the current graph does
+    ///   not contain.
+    /// - a target that IS in the current snapshot but was presented under a
+    ///   different snapshot id, or under material bound to another revision →
+    ///   [`TransportError::IdentityConflict`]. This is the same typed refusal
+    ///   the retained port raises when admitted material disagrees with a thin
+    ///   request under a known identity (`InvalidBinding`): the caller re-serves
+    ///   fresh state instead of retrying a superseded projection.
+    ///
+    /// Both presented identities are compared exactly. The admitted identities
+    /// are already owner-validated, so exact textual equality is the whole
+    /// condition: a presented value that matches them is well formed, and any
+    /// other value is refused. Well-formedness of the `SnapshotId` the port
+    /// finally receives stays where it already is, in the arm's own
+    /// `SnapshotId::new`.
+    fn admit_p07_target_against_current_grant_graph(
+        &self,
+        target: P07LifecycleTarget<'_>,
+        snapshot_id: &str,
+    ) -> Result<(), TransportError> {
+        use eliot_kernel_core::RootGrantHydrationSource as _;
+
+        let guard = self
+            .p07_owner
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let Some(bound) = guard.as_ref() else {
+            // No retained owner is no current GrantGraph snapshot. Authority is
+            // never validated against a source this composition does not own.
+            return Err(TransportError::SessionFenced);
+        };
+        let current_revision = bound.bound_revision();
+        if current_revision == 0 || bound.source().revision() != current_revision {
+            return Err(TransportError::SessionFenced);
+        }
+        let admitted = match target {
+            P07LifecycleTarget::Grant(grant_id) => bound
+                .source()
+                .admitted_grant_hydrations()
+                .map_err(|_| TransportError::SessionFenced)?
+                .into_iter()
+                .find(|hydration| hydration.intent.grant_id == grant_id)
+                .map(|hydration| {
+                    (
+                        hydration.intent.snapshot_id,
+                        hydration.intent.grant_graph_revision,
+                    )
+                }),
+            P07LifecycleTarget::Introduction(introduction_id) => bound
+                .source()
+                .admitted_introductions()
+                .map_err(|_| TransportError::SessionFenced)?
+                .into_iter()
+                .find(|hydration| hydration.intent.introduction_id == introduction_id)
+                .map(|hydration| {
+                    (
+                        hydration.intent.snapshot_id,
+                        hydration.intent.grant_graph_revision,
+                    )
+                }),
+        };
+        let Some((admitted_snapshot_id, admitted_revision)) = admitted else {
+            return Err(TransportError::SessionFenced);
+        };
+        if admitted_snapshot_id != snapshot_id || admitted_revision != current_revision {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
     }
 }
 #[derive(Deserialize)]
@@ -1612,6 +1728,13 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                // Current GrantGraph snapshot gate (`#1110` A4): the presented
+                // snapshot must be the current one and the grant must exist in
+                // it, refused before the owner lock and before the port call.
+                self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Grant(&operation.grant_id),
+                    &operation.snapshot_id,
+                )?;
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -1644,6 +1767,15 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                // Current GrantGraph snapshot gate (`#1110` A4): revocation
+                // changes live authority exactly as activation does, so the
+                // presented snapshot must be the current one and the revoked
+                // grant must exist in it — before the owner lock and the port
+                // call, not after them.
+                self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Grant(&operation.grant_id),
+                    &operation.snapshot_id,
+                )?;
                 let request = eliot_authority::GrantRevocationRequest {
                     grant_id: eliot_authority::GrantId::new(operation.grant_id)
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -1673,6 +1805,14 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                // Current GrantGraph snapshot gate (`#1110` A4): the presented
+                // snapshot must be the current one and the introduction must
+                // exist in it, refused before the owner lock and before the
+                // port call.
+                self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Introduction(&operation.introduction_id),
+                    &operation.snapshot_id,
+                )?;
                 self.admit_material_authority_for_fence(
                     GovernanceProfile::full(),
                     &session.module_generation.state_fence,
@@ -1711,6 +1851,15 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                // Current GrantGraph snapshot gate (`#1110` A4): revocation
+                // fences dependent grants, introductions, leases/tokens and
+                // pending effects, so it is validated against the current
+                // snapshot on exactly the same footing as activation — before
+                // the owner lock and before the port call.
+                self.admit_p07_target_against_current_grant_graph(
+                    P07LifecycleTarget::Introduction(&operation.introduction_id),
+                    &operation.snapshot_id,
+                )?;
                 let request = eliot_authority::IntroductionRevocationRequest {
                     introduction_id: eliot_authority::IntroductionId::new(
                         operation.introduction_id,
