@@ -790,7 +790,7 @@ impl OrsBackupSnapshot {
         }
         sha256_hex(material.as_bytes())
     }
-    /// Validate digest shapes, page continuity, denominator, and completeness.
+    /// Validate digest shapes, page continuity and finality, denominator, and completeness.
     ///
     /// A `Complete` snapshot must carry a frozen process-stream recovery family
     /// identity and no outstanding continuation. That is the compatibility rule
@@ -861,8 +861,10 @@ impl OrsBackupSnapshot {
             });
         }
         let mut counted: u64 = 0;
+        let mut previous_page_was_final = false;
         for (index, page) in self.pages.iter().enumerate() {
-            check_page_shape(page, index)?;
+            check_page_shape(page, index, previous_page_was_final)?;
+            previous_page_was_final = page.is_last;
             counted =
                 counted
                     .checked_add(page.entries.len() as u64)
@@ -880,9 +882,19 @@ impl OrsBackupSnapshot {
         check_completeness(&self.completeness, counted, &self.pages)
     }
 }
-/// Validate one page's index continuity, digest, entry bound, and family
-/// continuation.
-fn check_page_shape(page: &OrsBackupPage, index: usize) -> Result<(), OrsError> {
+/// Validate one page's index continuity, finality, digest, entry bound, and
+/// family continuation.
+fn check_page_shape(
+    page: &OrsBackupPage,
+    index: usize,
+    previous_page_was_final: bool,
+) -> Result<(), OrsError> {
+    if previous_page_was_final {
+        return Err(OrsError::InvalidField {
+            field: "backup_page_is_last",
+            reason: "a page must not follow an earlier final page",
+        });
+    }
     let expected = u32::try_from(index).map_err(|_| OrsError::InvalidField {
         field: "backup_page_index",
         reason: "page index exceeds u32 range",
@@ -908,7 +920,8 @@ fn check_page_shape(page: &OrsBackupPage, index: usize) -> Result<(), OrsError> 
     }
     Ok(())
 }
-/// Enforce completeness rules: `Complete` needs entries and valid digests.
+/// Enforce completeness rules: `Complete` needs entries, valid digests, and a
+/// final last page.
 fn check_completeness(
     completeness: &BackupCompleteness,
     counted: u64,
@@ -920,6 +933,12 @@ fn check_completeness(
                 return Err(OrsError::InvalidField {
                     field: "backup_completeness",
                     reason: "complete snapshot must carry entries",
+                });
+            }
+            if !matches!(pages.last(), Some(page) if page.is_last) {
+                return Err(OrsError::InvalidField {
+                    field: "backup_completeness",
+                    reason: "complete snapshot must end with a final page",
                 });
             }
             for page in pages {
