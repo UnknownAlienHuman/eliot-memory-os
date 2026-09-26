@@ -866,6 +866,11 @@ impl DaemonComposition {
         identity: &eliot_protocol::RequestIdentity,
         envelope: eliot_governor::CanonicalWriteEnvelope,
         readiness: &eliot_workscope::MaterialReadinessInputs<'_>,
+        observed_work_scope: &eliot_governor::ScopeBinding,
+        source_closure: Option<(
+            &eliot_governor::GoverningSourceSet,
+            &eliot_governor::PrivacyProfile,
+        )>,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
         // #740: request/result span over the neutral handoff boundary. The
         // handoff (prepared envelope submitted) and the commitment (validated
@@ -923,12 +928,16 @@ impl DaemonComposition {
             );
         }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
-        // any commit. When a WorkScope binding is retained, a write addressing
-        // another scope quarantines here instead of committing against the
-        // wrong workspace; with no retained binding there is nothing to
-        // revalidate and the write proceeds unchanged.
+        // any commit. The caller must supply the actual observed `WorkScope` and
+        // source closure; the Governor never reconstructs identity from the
+        // retained binding or the write's claimed scope label. A missing
+        // binding or MATCHED receipt withholds the write.
         self.governor
-            .check_canonical_write_work_scope(envelope.scope_id.as_str())
+            .check_canonical_write_work_scope(
+                envelope.scope_id.as_str(),
+                observed_work_scope,
+                source_closure,
+            )
             .map_err(DaemonError::Composition)?;
         let receipt = self
             .governor

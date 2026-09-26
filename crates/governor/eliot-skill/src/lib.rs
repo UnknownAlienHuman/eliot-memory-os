@@ -130,6 +130,8 @@ pub enum SkillError {
     NotFound,
     #[error("Skill lifecycle identity mismatch")]
     IdentityMismatch,
+    #[error("Skill lifecycle canonical write withheld by WorkScope guard")]
+    ScopeGuardWithheld(Box<SkillScopeGuardFailure>),
     #[error("Skill lifecycle requires independent route evidence")]
     IndependentEvidenceRequired,
     #[error("Skill lifecycle promotion is not reversible")]
@@ -140,6 +142,24 @@ pub enum SkillError {
     Surface(String),
     #[error("Skill lifecycle store failure: {0:?}")]
     Store(eliot_store_api::StoreFailure),
+}
+
+/// Typed evidence for a canonical write withheld by the `WorkScope` guard.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillScopeGuardFailure {
+    /// Scope claimed by the canonical write caller.
+    pub claimed_scope: String,
+    /// Scope in the actual observed binding.
+    pub observed_scope: String,
+    /// Mandatory guard trigger that evaluated this observation.
+    pub trigger: eliot_workscope::GuardTrigger,
+    /// Identity-leg classification from the guard.
+    pub identity: eliot_workscope::IdentityLegOutcome,
+    /// Guard disposition for this write.
+    pub verdict: eliot_workscope::GuardVerdict,
+    /// Complete typed guard report, including any owner-issued receipt.
+    pub report: Box<eliot_workscope::TriggerReport>,
 }
 
 /// Stable identity of a generated Skill revision and its materialized package.

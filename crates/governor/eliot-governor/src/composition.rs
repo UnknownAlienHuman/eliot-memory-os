@@ -852,6 +852,17 @@ pub enum CompositionError {
     /// Durable recovery did not prove the complete owner set.
     #[error("Governor recovery failed: {0}")]
     Recovery(String),
+    /// A canonical write failed its observed `WorkScope` guard; the structured
+    /// report preserves the exact identity legs and any owner-issued receipt.
+    #[error("scope guard withheld canonical write ({identity:?}, {verdict:?}) at {trigger:?}")]
+    ScopeGuardWithheld {
+        claimed_scope: String,
+        observed_scope: String,
+        trigger: GuardTrigger,
+        identity: IdentityLegOutcome,
+        verdict: GuardVerdict,
+        report: Box<TriggerReport>,
+    },
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
     StartupOrder { expected: String, observed: String },
@@ -3501,10 +3512,9 @@ pub struct GovernorComposition<P: ?Sized> {
     /// cold-start legs below coalesces on exact workspace identity, privacy
     /// boundary and governing-source generation.
     cold_start: OnboardingSingleFlight,
-    /// Latest quarantined/withheld scope-identity observation (issue #1787).
-    /// A `CanonicalWrite` mismatch retains its conflicting evidence here while
-    /// the binding, task state, and project memory stay preserved; a later
-    /// authorized rebind reconciles against it. Read with
+    /// Latest in-process diagnostic projection of a scope-identity mismatch
+    /// (issue #1787). It is overwritten by a later mismatch and is not durable,
+    /// rehydrated, or an authority for rebind. Read with
     /// [`Self::last_scope_quarantine`].
     scope_quarantine: Option<QuarantinedScopeRecord>,
 }
@@ -4142,12 +4152,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self.owners
     }
 
-    /// Returns the latest quarantined/withheld scope-identity observation
-    /// (issue #1787).
+    /// Returns the latest process-local scope-identity mismatch projection
+    /// (issue #1787). It is not durable and is lost when this composition is
+    /// dropped or restarted.
     ///
-    /// The `CanonicalWrite` guard retains the conflicting evidence here when
-    /// it withholds a write; `None` means no mismatch has been observed since
-    /// construction. The retained binding is never replaced by this record.
+    /// `None` means no mismatch has been observed since construction. The
+    /// retained binding is never replaced by this record.
     #[must_use]
     pub const fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
         self.scope_quarantine.as_ref()
@@ -4771,11 +4781,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .read_current(&fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let report = check_at_trigger(&snapshot.binding, observed, source_closure, trigger);
-        match report.verdict {
-            GuardVerdict::Allow => Ok(snapshot),
-            GuardVerdict::Withhold | GuardVerdict::Quarantine => {
-                Err(guard_recovery_error(&report, "scope guard withheld"))
-            }
+        if report.is_matched() {
+            Ok(snapshot)
+        } else {
+            Err(guard_recovery_error(&report, "scope guard withheld"))
         }
     }
 
@@ -4969,79 +4978,65 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(snapshot)
     }
 
-    /// Guards one scope-sensitive canonical write with the `ScopeBindingGuard`
-    /// (issue #1787, `CanonicalWrite` trigger production caller).
-    ///
-    /// When a `WorkScope` binding is retained, the write's own scope claim is
-    /// tested against it through [`check_at_trigger`] at
-    /// [`GuardTrigger::CanonicalWrite`]: the observed binding carries the
-    /// write-claimed scope reference over the retained instance, root,
-    /// generation, privacy, and source-generation facts, so the guard can
-    /// prove a scope mismatch without ever minting authority from the claim.
-    /// A quarantined or non-identity-clear report fails the write before any
-    /// canonical commit and retains the conflicting evidence as the
-    /// [`QuarantinedScopeRecord`] returned by [`Self::last_scope_quarantine`];
-    /// an identity-clear observation proceeds because the guard proved no
-    /// mismatch (source-closure enforcement lives at issuance and admission,
-    /// where sources exist). With no retained binding there is nothing to
-    /// revalidate and the write proceeds unchanged, so pre-bootstrap genesis
-    /// writes keep working.
+    /// Checks the canonical write against the caller-supplied, actual observed
+    /// `WorkScope` at the current Kernel fence (issue #1787, W5). The write's
+    /// claimed scope must match that observation, and it proceeds only when
+    /// the guard returns `Allow` with a fresh `MATCHED` source-closure receipt.
+    /// The observed binding is never derived from the retained binding or the
+    /// write claim. Missing binding or source closure fails closed. Identity
+    /// mismatches are retained only as a process-local diagnostic projection;
+    /// durable quarantine and restart recovery remain partial (W6).
     pub fn check_canonical_write_work_scope(
         &mut self,
         scope_id: &str,
-    ) -> Result<Option<TriggerReport>, CompositionError> {
-        let Some(owner) = self.owners.work_scope.as_ref() else {
-            return Ok(None);
-        };
+        observed: &ScopeBinding,
+        source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
+    ) -> Result<TriggerReport, CompositionError> {
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "canonical write has no retained WorkScope binding; write withheld".to_owned(),
+            )
+        })?;
         let fence = self.snapshot.state_fence();
         let snapshot = owner
             .read_current(&fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let mut observed_scope = snapshot.binding.scope.clone();
-        scope_id.clone_into(&mut observed_scope.scope_ref);
-        let observed = ScopeBinding {
-            scope: observed_scope,
-            privacy_class: snapshot.binding.privacy_class,
-            governing_source_generation: snapshot.binding.governing_source_generation,
-        };
+        ensure_snapshot_fresh(&snapshot, "canonical-write WorkScope is not fresh")?;
+        observed
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let report = check_at_trigger(
             &snapshot.binding,
-            &observed,
-            None,
+            observed,
+            source_closure,
             GuardTrigger::CanonicalWrite,
         );
-        if report.verdict == GuardVerdict::Quarantine
-            || report.identity != IdentityLegOutcome::IdentityClear
-        {
-            // Issue #1787: the mismatch carries its withholding proof instead
-            // of a bare error — trigger, identity legs, verdict, and the
-            // expected/observed instance pair — while the retained binding,
-            // task state, and project memory stay preserved. The conflicting
-            // evidence is additionally retained as a durable
-            // [`QuarantinedScopeRecord`] (no source closure exists on this
-            // edge, so no receipt is minted here; source closure is enforced
-            // at issuance and admission). Record retention never fails the
-            // withhold: when the record itself is malformed the original
-            // proof-carrying error still returns.
-            if let Ok(record) = QuarantinedScopeRecord::for_report(
-                &snapshot.binding,
-                &observed,
-                &report,
-                fence.resource_generation.value(),
-            ) {
+        let claimed_scope_matches_observation = scope_id == observed.scope.scope_ref.as_str();
+        if !claimed_scope_matches_observation || !report.is_matched() {
+            if report.identity != IdentityLegOutcome::IdentityClear {
+                let record = QuarantinedScopeRecord::for_report(
+                    &snapshot.binding,
+                    observed,
+                    &report,
+                    fence.resource_generation.value(),
+                )
+                .map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "canonical write withheld after scope mismatch, but its process-local diagnostic could not be retained: {error}"
+                    ))
+                })?;
                 self.scope_quarantine = Some(record);
             }
-            return Err(CompositionError::Recovery(format!(
-                "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard withheld at trigger {:?} (identity {:?}, verdict {:?}; expected instance {} observed instance {}); retained binding preserved, write withheld",
-                snapshot.binding.scope.scope_ref,
-                report.trigger,
-                report.identity,
-                report.verdict,
-                snapshot.binding.scope.instance_ref,
-                observed.scope.instance_ref,
-            )));
+            return Err(CompositionError::ScopeGuardWithheld {
+                claimed_scope: scope_id.to_owned(),
+                observed_scope: observed.scope.scope_ref.clone(),
+                trigger: report.trigger,
+                identity: report.identity,
+                verdict: report.verdict,
+                report: Box::new(report),
+            });
         }
-        Ok(Some(report))
+        Ok(report)
     }
 
     /// Admits governing sources for one scope generation (issue #1791,

@@ -13,8 +13,8 @@
 //! reconcile unknown effects before retry (issue #1191).
 //! Every claimed pair settles through a result body — including refusals,
 //! which persist as typed refusal outcomes — so no skill pair can poison the
-//! poller into a crash loop. Only transport and submit-leg failures fail the
-//! daemon closed.
+//! poller into a crash loop. `WorkScope` guard withholding retains typed identity
+//! evidence. Only transport and submit-leg failures fail the daemon closed.
 //!
 //! The pair arrives Kernel-admitted (capability linkage proven at intake);
 //! the tool/capability coherence is re-checked here defensively, and the
@@ -516,7 +516,7 @@ mod tests {
                 session_id: Some("kernel-session-1".to_owned()),
                 task_id: None,
                 work_scope_id: None,
-                payload_schema_id: "eliot.skill.transport/v2".to_owned(),
+                payload_schema_id: eliot_agent_bridge_core::SKILL_TRANSPORT_CONTRACT_ID.to_owned(),
                 payload_sha256: "d".repeat(64),
             },
             state_fence: fence(),

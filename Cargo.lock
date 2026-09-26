@@ -3045,6 +3045,7 @@ dependencies = [
  "eliot-rules",
  "eliot-skills",
  "eliot-store-api",
+ "eliot-workscope",
  "serde",
  "sha2 0.10.9",
  "thiserror",
