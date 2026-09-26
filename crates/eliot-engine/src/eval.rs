@@ -912,7 +912,9 @@ const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
 /// comparing across identities. `EVALUATOR_PATH` is compiler-provided
 /// (`module_path!`), so a module move re-identifies automatically;
 /// descriptive strings below it name review-verified behavior, not
-/// observed runtime effects.
+/// observed runtime effects. The oracle version and the Product Identity
+/// additionally flow from their real sources (`ORACLE_VERSION` and
+/// [`eval_product_identity`).
 const HARNESS_FINGERPRINT: &str = "eliot-engine-eval-case-schema";
 const EVALUATOR_PATH: &str = concat!(module_path!(), "::EvalMeasurementService");
 const ENVIRONMENT_FINGERPRINT: &str = "not-captured:structural-evaluator-process";
@@ -920,11 +922,22 @@ const ACTUAL_ROUTE: &str = concat!(module_path!(), "::evaluate_case");
 const REQUESTED_ROUTE: &str = "runtime artifact/effect observation";
 const ACCEPTANCE_RELATION: &str = "required criterion matches a measurement result";
 const ORACLE_OWNER: &str = concat!(module_path!(), "::EvalMeasurementService");
+/// Version of the deciding oracle (issue #1922 W6b): the owning crate's real
+/// version, so an oracle release automatically stale-marks previously recorded
+/// fingerprint sets through [`EvalIntegrityFingerprintSet::is_stale_against`].
+const ORACLE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Product Identity for eval integrity (issue #1922): single source shared by
+/// the receipt builder and [`current_eval_fingerprints`], so the compared
+/// fingerprint can never diverge from the recorded receipt identity.
+pub fn eval_product_identity(project_id: &ProjectId) -> String {
+    format!("eliot-memory-os/eliot-engine-eval:product:{project_id}")
+}
 
 /// Capture the current evaluator identity as a comparable set.
-/// Pure snapshot of the constants above; performs no observation and
-/// grants no validity.
-pub fn current_eval_fingerprints() -> EvalIntegrityFingerprintSet {
+/// Pure snapshot of the oracle identity above plus the live product context;
+/// performs no observation and grants no validity.
+pub fn current_eval_fingerprints(project_id: &ProjectId) -> EvalIntegrityFingerprintSet {
     EvalIntegrityFingerprintSet {
         harness_fingerprint: HARNESS_FINGERPRINT.to_owned(),
         evaluator_fingerprint: EVALUATOR_PATH.to_owned(),
@@ -933,6 +946,8 @@ pub fn current_eval_fingerprints() -> EvalIntegrityFingerprintSet {
         requested_route: REQUESTED_ROUTE.to_owned(),
         acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
         oracle_owner: ORACLE_OWNER.to_owned(),
+        oracle_version: ORACLE_VERSION.to_owned(),
+        product_identity: eval_product_identity(project_id),
     }
 }
 
@@ -1020,7 +1035,7 @@ impl EvalMeasurementService {
             produced_refs: vec![format!("eval:{}:report", family_slug(case.family))],
             errors,
             duration_ms: 0,
-            integrity_fingerprints: Some(current_eval_fingerprints()),
+            integrity_fingerprints: Some(current_eval_fingerprints(&case.project_id)),
         }
     }
 
@@ -1076,10 +1091,7 @@ impl EvalMeasurementService {
         EvaluationIntegrityReceipt {
             receipt_id,
             property: case.description.clone(),
-            product_identity: format!(
-                "eliot-memory-os/eliot-engine-eval:product:{}",
-                case.project_id
-            ),
+            product_identity: eval_product_identity(&case.project_id),
             oracle_owner: ORACLE_OWNER.to_owned(),
             acceptance_relation: ACCEPTANCE_RELATION.to_owned(),
             task_subset: vec![case.eval_case_id.to_string()],
@@ -1583,24 +1595,49 @@ impl EvalComparisonService {
             .map(|result| result.eval_case_id.to_string())
             .collect::<Vec<_>>();
         let verdict = {
-            // Automatic stale invalidation (issue #1922): a candidate run
-            // whose retained fingerprint sets predate current evaluator
-            // identity — or predate retention entirely (unknown
-            // provenance is non-evidence per contract) — cannot support a
-            // fresh comparison verdict, so the comparison is Inconclusive
-            // and gates block it unless they allow inconclusive. Fresh
-            // runs always carry current fingerprints and flow unchanged;
-            // the baseline side's unanimously retained set is not yet
-            // compared here, so baseline-side staleness remains a
-            // documented future interface.
-            let current = current_eval_fingerprints();
-            let stale_inputs = candidate_run.case_results.iter().any(|result| {
-                match &result.integrity_fingerprints {
-                    None => true,
-                    Some(recorded) => recorded.is_stale_against(&current),
-                }
+            // Automatic stale marking (issue #1922 W6b): the comparison
+            // depends on BOTH the baseline's unanimously retained identity
+            // and every candidate result's retained set. Proven drift on
+            // either side (recorded fingerprints differ from current
+            // identity, including oracle version and Product Identity)
+            // marks the comparison `Stale`, and gates always block stale
+            // dependents. Unknown provenance (`None` on either side) stays
+            // `Inconclusive` per the accepted contract: pre-retention,
+            // empty, or mixed-product inputs are non-evidence, gated by
+            // `allow_inconclusive`. Fresh inputs flow unchanged.
+            // Re-execution clears staleness operationally: a baseline or
+            // candidate re-executed under current identity matches
+            // `current` and is not stale. No declared-equivalence proof
+            // mechanism exists in the current contract, so drift without
+            // re-execution is never honored as equivalent: honoring an
+            // unproved declaration would fabricate validity.
+            let current = current_eval_fingerprints(&candidate_run.project_id);
+            let candidate_drifted = candidate_run.case_results.iter().any(|result| {
+                matches!(
+                    &result.integrity_fingerprints,
+                    Some(recorded) if recorded.is_stale_against(&current)
+                )
             });
-            if stale_inputs {
+            let candidate_unknown = candidate_run
+                .case_results
+                .iter()
+                .any(|result| result.integrity_fingerprints.is_none());
+            let baseline_drifted = matches!(
+                &baseline.integrity_fingerprints,
+                Some(recorded) if recorded.is_stale_against(&current)
+            );
+            let baseline_unknown = baseline.integrity_fingerprints.is_none();
+            // The comparison's I18.47 validity state, projected onto the
+            // comparison verdict below: fresh-but-unmeasured inputs stay
+            // `Inconclusive`, exactly like a freshly built receipt.
+            let integrity_status = if candidate_drifted || baseline_drifted {
+                EvaluationIntegrityStatus::Stale
+            } else {
+                EvaluationIntegrityStatus::Inconclusive
+            };
+            if integrity_status == EvaluationIntegrityStatus::Stale {
+                EvalComparisonVerdict::Stale
+            } else if candidate_unknown || baseline_unknown {
                 EvalComparisonVerdict::Inconclusive
             } else {
                 comparison_verdict(&family_deltas, candidate_run.status)
@@ -1838,6 +1875,15 @@ impl EvalRegressionGateService {
         if comparison.verdict == EvalComparisonVerdict::Inconclusive && !profile.allow_inconclusive
         {
             blocking_reasons.push("eval comparison is inconclusive".to_owned());
+        }
+        // Proven identity drift (issue #1922 W6b): a stale comparison can
+        // never promote, regardless of `allow_inconclusive`. Only
+        // re-execution under current identity clears the stale marking.
+        if comparison.verdict == EvalComparisonVerdict::Stale {
+            blocking_reasons.push(
+                "eval comparison inputs predate current evaluator identity; stale dependents cannot promote"
+                    .to_owned(),
+            );
         }
         for delta in &comparison.family_deltas {
             if delta.delta < 0.0 {
