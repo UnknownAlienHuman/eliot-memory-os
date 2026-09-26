@@ -178,6 +178,18 @@ pub struct EvalIntegrityFingerprintSet {
     pub requested_route: String,
     pub acceptance_relation: String,
     pub oracle_owner: String,
+    /// Version of the deciding oracle (issue #1922 W6b): the owning crate's
+    /// real version. Records predating this dimension deserialize as `""`,
+    /// which never equals a real version, so they compare stale (fail-closed).
+    #[serde(default)]
+    pub oracle_version: String,
+    /// Product Identity under evaluation (issue #1922 W6b): per-case product
+    /// from the same source as the receipt's `product_identity`. Records
+    /// predating this dimension deserialize as `""` and compare stale
+    /// (fail-closed); a suite re-declared under another Product Identity
+    /// compares unequal.
+    #[serde(default)]
+    pub product_identity: String,
 }
 
 impl EvalIntegrityFingerprintSet {
@@ -735,6 +747,11 @@ pub enum EvalComparisonVerdict {
     RegressedBlocking,
     RegressedCritical,
     Inconclusive,
+    /// Proven identity drift (issue #1922 W6b): baseline or candidate inputs
+    /// predate current evaluator identity. Gates always block `Stale`,
+    /// regardless of `allow_inconclusive`; only re-execution under current
+    /// identity clears it.
+    Stale,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
