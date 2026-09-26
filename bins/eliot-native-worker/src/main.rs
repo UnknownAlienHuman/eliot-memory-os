@@ -62,6 +62,8 @@ fn main() {
 /// - transport open but nothing delivered → 78 `PROVIDER_RUNTIME_DEFERRED`
 ///   (preserved fail-closed);
 /// - delivered but invalid → 78 typed `KERNEL_ADMISSION_REQUIRED` denial;
+/// - validated with a generation catalog-revision or cell mismatch → 78 typed
+///   denial before factory resolution, permit issuance, or any drive submit;
 /// - validated but resolving to no factory (no v2 join, route/nonce/factory
 ///   mismatch) → 78 typed `KERNEL_ADMISSION_REQUIRED` denial, never the
 ///   deferred line;
@@ -90,6 +92,22 @@ fn run() -> i32 {
         Ok(None) => return deny_absent_material(),
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
+    // Issue #22 W1/W7: the presenting generation is bound to one admitted
+    // Module Catalog revision and one capability cell (issue #13 family). A
+    // rewired registration or join refuses fail-closed here, before factory
+    // resolution, permit issuance, or any drive submit.
+    if let Err(error) = eliot_native_worker::require_module_catalog_revision_match(
+        material.admission.registration(),
+        material.admission.claim(),
+    ) {
+        return deny_invalid_material(&error.to_string());
+    }
+    if let Err(error) = eliot_native_worker::require_worker_cell_match(
+        material.admission.registration(),
+        material.admission.claim(),
+    ) {
+        return deny_invalid_material(&error.to_string());
+    }
     // T9-07: the validated route resolves to exactly one factory through
     // the registry seam. An unresolvable route is a refused presentation:
     // typed 78 denial, never the deferred line and never a drive. The
@@ -973,6 +991,8 @@ mod tests {
             worker_config_digest: "b".repeat(64),
             protocol_version: PROTOCOL_VERSION.to_owned(),
             worker_generation: 1,
+            module_catalog_revision: 7,
+            capability_cell: load(eliot_contracts::CapabilityCellId::new("cell-test-1")),
             process_id: 4242,
             process_start_100ns: 120,
             process_image_digest: "c".repeat(64),
@@ -1008,7 +1028,9 @@ mod tests {
             adapter_revision: eliot_native_worker::adapter_registry::FACTORY_REVISION,
             config_digest: registration.worker_config_digest.clone(),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
+            capability_cell: load(eliot_contracts::CapabilityCellId::new("cell-test-1")),
             grant_graph_revision: 5,
+            module_catalog_revision: 7,
             replay_stream_id: "claim-1/gen-1".to_owned(),
             launch_nonce: hello_value.launch_nonce.clone(),
             process_invocation_digest: process.invocation_digest().to_owned(),
@@ -1783,7 +1805,9 @@ mod tests {
             "adapter_revision": eliot_native_worker::adapter_registry::FACTORY_REVISION,
             "config_digest": "c".repeat(64),
             "facet_manifest_ref": "facet-manifest-kernel-drive-1",
+            "capability_cell": "cell-test-1",
             "grant_graph_revision": 5,
+            "module_catalog_revision": 7,
             "replay_stream_id": "claim-kernel-drive-1/gen-1",
             "launch_nonce": join_nonce,
             "process_invocation_digest": invocation_digest.clone(),
