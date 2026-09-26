@@ -478,9 +478,15 @@ impl ContinuityObservation {
     }
 }
 
-/// Rejects silent filename/similarity merges: weak-basis hypotheses may
-/// compete side by side but can never be the sole proof, and no
-/// kind/subject/basis triple may be recorded twice.
+/// Rejects silent filename/similarity merges: no kind/subject/basis triple
+/// may be recorded twice, and for every subject the recorded hypotheses must
+/// include a basis that can actually prove identity.
+///
+/// Weak-basis hypotheses may compete side by side, but they can never be the
+/// sole proof for the subject they identify, and a strong hypothesis about a
+/// *different* subject is no proof about this one. Identity is type-relative
+/// and every `subject_ref` may name a different object, so the decision is
+/// per subject and never per set.
 fn check_no_silent_merge(hypotheses: &[IdentityHypothesis]) -> Result<(), ContinuityError> {
     let mut seen = std::collections::BTreeSet::new();
     for hypothesis in hypotheses {
@@ -495,10 +501,23 @@ fn check_no_silent_merge(hypotheses: &[IdentityHypothesis]) -> Result<(), Contin
             });
         }
     }
-    if hypotheses
-        .iter()
-        .all(|hypothesis| hypothesis.basis.is_weak())
-    {
+    // Fold the admitted bases into one verdict per subject. A set-level
+    // `all()` was the wrong quantifier: one strong hypothesis about
+    // `object:a` proved nothing about `object:b`, so a filename-only
+    // identity for a second subject was admitted on its own. A
+    // `BTreeMap` also fixes which subject the refusal is decided on, so the
+    // outcome does not depend on the caller's hypothesis order.
+    let mut proven_by_subject = std::collections::BTreeMap::new();
+    for hypothesis in hypotheses {
+        let proven = proven_by_subject
+            .entry(hypothesis.subject_ref.as_str())
+            .or_insert(false);
+        *proven |= !hypothesis.basis.is_weak();
+    }
+    // `ContinuityObservation::validate` already refuses an empty hypothesis
+    // set; the explicit emptiness refusal keeps this guard fail-closed on
+    // its own rather than silently inheriting that caller's bound.
+    if proven_by_subject.is_empty() || proven_by_subject.values().any(|proven| !*proven) {
         return Err(ContinuityError::FilenameOrSimilarityMerge);
     }
     Ok(())
