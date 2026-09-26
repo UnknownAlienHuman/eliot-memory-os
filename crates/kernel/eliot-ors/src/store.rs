@@ -729,6 +729,33 @@ fn bridge_generation(value: &serde_json::Value, field: &'static str) -> Result<u
     }
     Ok(generation)
 }
+/// Transport-independent logical host-request index (issue #2571).
+///
+/// Maps one canonical logical key — the SHA-256 of the owner-namespaced
+/// (session continuity, client occurrence, parent/task/scope binding,
+/// capability, payload commitment) tuple — to the exact winning operation
+/// (`operation_id`, `request_digest`). Written atomically in the same `RedDB`
+/// write transaction as the winning operation row, never updated, never
+/// deleted: an expired or terminal operation keeps its key bound forever, so
+/// an old key can never be reused as a new effect. Rows staged before this
+/// index existed simply have no entry and are never inferred; they stay
+/// reachable only by exact operation/request identity.
+const HOST_REQUEST_LOGICAL_KEYS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_host_request_logical_keys_v1");
+/// Authenticated owner namespace for every logical host-request key
+/// (issue #2571).
+///
+/// The namespace names the Kernel-admitted application-continuity domain:
+/// keys are only ever derived from Kernel-issued session continuity plus the
+/// client occurrence and commitment, never from bare text, a principal
+/// alone, or a connection/deadline. The Bridge carries the identical literal
+/// as its key-domain contract; the two must change together.
+const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
+/// Explicit admitted-unbound marker for parent/task/scope key components.
+///
+/// A real component value equal to this marker is rejected at derivation so
+/// bindings can never collide with admitted unbound-capture state.
+const HOST_REQUEST_UNBOUND_MARKER: &str = "-";
 const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
 const ACTIVATION_LIFECYCLES: TableDefinition<&str, &str> =
@@ -1292,6 +1319,37 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically claims one logical host-request key or returns its winner
+    /// (issue #2571: cross-restart replay without double execution).
+    ///
+    /// In a single owner write transaction the logical key derived from the
+    /// candidate is looked up: an absent key stages the candidate `Requested`
+    /// row and claims the key for it; a present key loads the durable winner
+    /// and returns it unchanged when the logical commitment matches. A
+    /// present key with a different tool, payload, or incompatible
+    /// semantic binding fails with
+    /// [`OrsError::HostRequestIdentityConflict`] carrying the winner's
+    /// identity. The caller distinguishes the two `Ok` cases by comparing
+    /// the returned `(operation_id, request_digest)` with its candidate: an
+    /// equal identity staged (or exactly replays) this candidate and may
+    /// advance it; a different identity is another transport's winner and
+    /// must be returned without dispatch. Storage failure is `Err` and never
+    /// absence.
+    fn resolve_or_stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError>;
+    /// Loads one host-request operation by logical key (issue #2571).
+    ///
+    /// `Ok(None)` means no operation was ever staged under this key in this
+    /// store — including pre-index legacy rows, which are never inferred and
+    /// stay reachable only by exact operation/request identity. Any storage
+    /// or integrity failure is `Err` and can never become absence or
+    /// authorize a fresh operation.
+    fn load_host_request_by_logical_key(
+        &self,
+        logical_key: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Durably stages one pending activation ticket before in-memory
     /// publication or daemon claim. A successor is admitted only through the
     /// exact durable `NotReady` predecessor and due-time gate.
@@ -1568,6 +1626,30 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+/// Durable pointer from one logical host-request key to its winning
+/// operation (issue #2571).
+///
+/// The link carries identity only: the commitment lives in the operation
+/// row and is re-checked on every resolve and load, so a divergent link can
+/// never silently adopt another operation's result. Links are written once
+/// with their row, never updated, never deleted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostRequestLogicalLink {
+    operation_id: OperationIdentity,
+    request_digest: String,
+}
+
+impl persistence_codec::PersistedValue for HostRequestLogicalLink {
+    const RECORD_TYPE: &'static str = "host_request_logical_link";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        crate::model::validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        crate::model::validate_digest(&self.request_digest, "host_request_request_digest")?;
+        Ok(())
     }
 }
 
@@ -2593,29 +2675,42 @@ impl RedbRecoveryStore {
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
-        let existing = {
-            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
-            let key = record.record_key();
-            if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
-                let existing: crate::HostRequestRecord = decode(existing.value())?;
-                existing.validate()?;
-                if !existing.same_binding(record) {
-                    return Err(OrsError::HostRequestIdentityConflict {
-                        operation_id: record.operation_id.as_str().to_owned(),
-                        request_digest: record.request_digest.clone(),
-                    });
-                }
-                Some(existing)
-            } else {
-                let payload = encode(record)?;
-                table
-                    .insert(key.as_str(), payload.as_str())
-                    .map_err(storage)?;
-                None
-            }
-        };
+        let staged = Self::stage_host_request_in(&write, record)?;
         write.commit().map_err(storage)?;
-        Ok(existing.unwrap_or_else(|| record.clone()))
+        Ok(staged)
+    }
+
+    /// Stages one validated `Requested` host-request row inside the caller's
+    /// write transaction and returns the durable winner: the existing row on
+    /// an exact replay, the candidate on a first stage. A changed binding
+    /// under the same operation/request identity fails with
+    /// [`OrsError::HostRequestIdentityConflict`]. Shared by
+    /// [`Self::stage_host_request`] and
+    /// [`Self::resolve_or_stage_host_request`] so the logical-key claim and
+    /// the operation row always commit atomically.
+    fn stage_host_request_in(
+        write: &redb::WriteTransaction,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        let key = record.record_key();
+        if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
+            let existing: crate::HostRequestRecord = decode(existing.value())?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: record.operation_id.as_str().to_owned(),
+                    request_digest: record.request_digest.clone(),
+                });
+            }
+            Ok(existing)
+        } else {
+            let payload = encode(record)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+            Ok(record.clone())
+        }
     }
 
     /// Loads one host-request operation by exact operation/request identity.
@@ -2636,6 +2731,329 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Derives the canonical logical key for one host-request record
+    /// (issue #2571: the admitted correlation namespace).
+    ///
+    /// The key binds, in order: the fixed owner namespace
+    /// (`eliot.host-request.logical.v1`), the closed request kind, the
+    /// Kernel-issued session continuity, the stable client occurrence, the
+    /// parent operation (or the explicit unbound marker), the task/scope
+    /// binding (or the explicit admitted-unbound marker — recovery preserves
+    /// an old task binding but never silently rebinds it), the capability,
+    /// and the payload commitment. Connection, deadline, fence, epoch, and
+    /// generation are transport/era binding and are never key material: the
+    /// recovery transport carries its own current identity while the
+    /// recovered operation keeps its original one. Only `Invocation` and
+    /// `Cancellation` kinds are indexable; every other kind, and any record
+    /// without a Kernel-issued session, yields `Ok(None)` and fails closed
+    /// at the resolve entry instead of staging anonymously.
+    ///
+    /// The Bridge derives the identical key from its envelope fields; the
+    /// canonical component order, separator, markers, and digest are part of
+    /// the shared recovery contract and must change on both sides together.
+    pub fn host_request_logical_key_for_record(
+        record: &crate::HostRequestRecord,
+    ) -> Result<Option<String>, OrsError> {
+        if !matches!(
+            record.kind,
+            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+        ) {
+            return Ok(None);
+        }
+        let Some(session) = record.session_ref.as_ref() else {
+            return Ok(None);
+        };
+        record.validate()?;
+        Self::host_request_logical_key(
+            record.kind,
+            session.as_str(),
+            record.request_id.as_str(),
+            record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
+            record.task_ref.as_ref().map(OpaqueLabel::as_str),
+            record.scope_ref.as_ref().map(OpaqueLabel::as_str),
+            record.capability_ref.as_str(),
+            record.payload_digest.as_str(),
+        )
+        .map(Some)
+    }
+
+    /// Atomically claims one logical host-request key or returns its durable
+    /// winner (issue #2571).
+    ///
+    /// One owner write transaction holds both the logical-key claim and the
+    /// operation row: concurrent Bridges resolving a missing key converge on
+    /// one record because the second writer observes the first writer's
+    /// commit — a read-then-insert sequence without this transaction would be
+    /// insufficient. Same key and same logical commitment returns the winner
+    /// unchanged; a different tool, payload, or incompatible semantic
+    /// binding fails with [`OrsError::HostRequestIdentityConflict`] carrying
+    /// the winner's identity. The candidate keeps its own current transport
+    /// binding; only the winner's original identity is ever returned. Failed
+    /// or uncertain persistence is `Err`, never absence.
+    pub fn resolve_or_stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        record.validate()?;
+        if record.state != crate::HostRequestState::Requested {
+            return Err(OrsError::InvalidField {
+                field: "host_request_state",
+                reason: "logical resolution stages the requested state",
+            });
+        }
+        let logical_key =
+            Self::host_request_logical_key_for_record(record)?.ok_or(OrsError::InvalidField {
+                field: "host_request_logical_key",
+                reason: "only session-bound invocation and cancellation records carry a logical key",
+            })?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let mut links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
+                let link: HostRequestLogicalLink = decode(link_value.value())?;
+                let winner = {
+                    let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                    let row_key =
+                        format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+                    operations
+                        .get(row_key.as_str())
+                        .map_err(storage)?
+                        .map(|value| {
+                            let winner: crate::HostRequestRecord = decode(value.value())?;
+                            winner.validate()?;
+                            Ok(winner)
+                        })
+                        .transpose()?
+                        .ok_or_else(|| OrsError::IntegrityProblem {
+                            record_type: "host_request_logical_link",
+                            reason: "logical link points at a missing host-request row".to_owned(),
+                        })?
+                };
+                let winner_key =
+                    Self::host_request_logical_key_for_record(&winner)?.ok_or_else(|| {
+                        OrsError::IntegrityProblem {
+                            record_type: "host_request_logical_link",
+                            reason: "linked host-request row carries no logical key".to_owned(),
+                        }
+                    })?;
+                if winner_key != logical_key
+                    || !Self::host_requests_share_logical_commitment(&winner, record)
+                {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: winner.operation_id.as_str().to_owned(),
+                        request_digest: winner.request_digest.clone(),
+                    });
+                }
+                winner
+            } else {
+                let staged = Self::stage_host_request_in(&write, record)?;
+                let link = HostRequestLogicalLink {
+                    operation_id: staged.operation_id.clone(),
+                    request_digest: staged.request_digest.clone(),
+                };
+                let payload = encode(&link)?;
+                links
+                    .insert(logical_key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                staged
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Loads one host-request operation by logical key (issue #2571).
+    ///
+    /// `Ok(None)` is authoritatively absent: no operation was ever staged
+    /// under this key in this store. Pre-index legacy rows are never
+    /// inferred and stay reachable only by exact operation/request identity.
+    /// A dangling or divergent link fails closed as an integrity problem;
+    /// storage failure fails closed as storage — neither can become absence
+    /// or authorize a fresh operation.
+    pub fn load_host_request_by_logical_key(
+        &self,
+        logical_key: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(logical_key, "host_request_logical_key")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let link: Option<HostRequestLogicalLink> = {
+            let links = read
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            links
+                .get(logical_key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(link) = link else {
+            return Ok(None);
+        };
+        let operations = read.open_table(HOST_REQUESTS).map_err(storage)?;
+        let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+        let record: crate::HostRequestRecord = operations
+            .get(row_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "logical link points at a missing host-request row".to_owned(),
+            })?;
+        record.validate()?;
+        let recomputed = Self::host_request_logical_key_for_record(&record)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "linked host-request row carries no logical key".to_owned(),
+            }
+        })?;
+        if recomputed != logical_key {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "logical link diverges from its host-request row".to_owned(),
+            });
+        }
+        Ok(Some(record))
+    }
+
+    /// Returns the closed kind marker carried in every logical key.
+    const fn host_request_kind_marker(kind: crate::HostRequestKind) -> &'static str {
+        match kind {
+            crate::HostRequestKind::Activation => "activation",
+            crate::HostRequestKind::Invocation => "invocation",
+            crate::HostRequestKind::Cancellation => "cancellation",
+            crate::HostRequestKind::Status => "status",
+            crate::HostRequestKind::Reconciliation => "reconciliation",
+        }
+    }
+
+    /// Encodes one canonical logical key and returns its SHA-256.
+    ///
+    /// Components are joined with a control separator that validated text
+    /// can never contain, then digested to a fixed-size key: no separator
+    /// injection is possible, and the digest reveals no task or payload
+    /// content. A presented `-` value is rejected so real bindings can never
+    /// collide with the explicit unbound marker.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the logical key binds every commitment component explicitly so no binding is implicit at the call site"
+    )]
+    fn host_request_logical_key(
+        kind: crate::HostRequestKind,
+        session: &str,
+        occurrence: &str,
+        parent: Option<&str>,
+        task: Option<&str>,
+        scope: Option<&str>,
+        capability: &str,
+        payload_digest: &str,
+    ) -> Result<String, OrsError> {
+        const FIELD: &str = "host_request_logical_key";
+        for component in [session, occurrence, capability] {
+            crate::model::validate_text(component, FIELD)?;
+        }
+        for component in [parent, task, scope].into_iter().flatten() {
+            crate::model::validate_text(component, FIELD)?;
+        }
+        crate::model::validate_digest(payload_digest, FIELD)?;
+        for component in [session, occurrence, capability]
+            .into_iter()
+            .chain([parent, task, scope].into_iter().flatten())
+        {
+            if component == HOST_REQUEST_UNBOUND_MARKER {
+                return Err(OrsError::InvalidField {
+                    field: FIELD,
+                    reason: "logical key components must not equal the unbound marker",
+                });
+            }
+        }
+        let unbound = HOST_REQUEST_UNBOUND_MARKER;
+        let text = format!(
+            "{namespace}\x1fkind={kind}\x1fsession={session}\x1foccurrence={occurrence}\x1fparent={parent}\x1ftask={task}\x1fscope={scope}\x1fcapability={capability}\x1fpayload={payload_digest}",
+            namespace = HOST_REQUEST_LOGICAL_NAMESPACE,
+            kind = Self::host_request_kind_marker(kind),
+            parent = parent.unwrap_or(unbound),
+            task = task.unwrap_or(unbound),
+            scope = scope.unwrap_or(unbound),
+        );
+        Ok(crate::model::sha256_hex(text.as_bytes()))
+    }
+
+    /// Returns whether two records carry the same logical commitment.
+    ///
+    /// Compared: kind, occurrence, idempotency and cancellation derivation,
+    /// parent, session/task/scope binding, capability, and payload digest.
+    /// Excluded: the envelope digest, connection, absolute deadline, fence,
+    /// epoch, and generation (transport/era binding that legitimately
+    /// changes across restart — authority stays with the admission gate),
+    /// plus ORS-owned progression (state, result, commit order).
+    fn host_requests_share_logical_commitment(
+        left: &crate::HostRequestRecord,
+        right: &crate::HostRequestRecord,
+    ) -> bool {
+        left.kind == right.kind
+            && left.request_id == right.request_id
+            && left.idempotency_key == right.idempotency_key
+            && left.cancellation_id == right.cancellation_id
+            && left.parent_operation_id == right.parent_operation_id
+            && left.session_ref == right.session_ref
+            && left.task_ref == right.task_ref
+            && left.scope_ref == right.scope_ref
+            && left.capability_ref == right.capability_ref
+            && left.payload_digest == right.payload_digest
+    }
+
+    /// Validates every logical link against its operation row (issue #2571).
+    ///
+    /// Each index entry must decode, point at an existing validated row, and
+    /// recompute to its own index key. A dangling, divergent, or
+    /// unindexable link fails closed as an integrity problem: links are
+    /// never repaired by choosing a latest row, and pre-index rows without
+    /// links are legacy, not damage, so they are skipped rather than
+    /// backfilled — migration never infers namespace or continuity.
+    fn validate_host_request_logical_index(write: &redb::WriteTransaction) -> Result<(), OrsError> {
+        let links = write
+            .open_table(HOST_REQUEST_LOGICAL_KEYS)
+            .map_err(storage)?;
+        let mut pending = Vec::new();
+        for entry in links.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let link: HostRequestLogicalLink = decode(value.value())?;
+            pending.push((key.value().to_owned(), link));
+        }
+        drop(links);
+        let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        for (key, link) in pending {
+            let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+            let record: crate::HostRequestRecord = operations
+                .get(row_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link points at a missing host-request row".to_owned(),
+                })?;
+            record.validate()?;
+            let recomputed =
+                Self::host_request_logical_key_for_record(&record)?.ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "host_request_logical_link",
+                        reason: "linked host-request row carries no logical key".to_owned(),
+                    }
+                })?;
+            if recomputed != key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request_logical_link",
+                    reason: "logical link diverges from its host-request row".to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Durably stages one pending activation ticket before it is published in
@@ -7744,6 +8162,9 @@ impl RedbRecoveryStore {
         Self::validate_activation_lifecycle_table(&write)?;
         Self::validate_activation_result_retention_table(&write)?;
         Self::validate_activation_cross_table_bindings(&write)?;
+        // #2571: every logical link must resolve to a row that recomputes
+        // to its own key. Links are never repaired or backfilled here.
+        Self::validate_host_request_logical_index(&write)?;
         write.commit().map_err(storage)
     }
 
@@ -7814,6 +8235,15 @@ impl RedbRecoveryStore {
         drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
         drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
         drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
+        // #2571: the logical host-request index is part of the base family,
+        // materialized empty on every open like every other base table, so a
+        // lookup on a pre-index store reads authoritatively absent instead
+        // of failing on a missing table. Rows are never backfilled here.
+        drop(
+            write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?,
+        );
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write
@@ -12426,6 +12856,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
     }
 
+    fn resolve_or_stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        RedbRecoveryStore::resolve_or_stage_host_request(self, record)
+    }
+
+    fn load_host_request_by_logical_key(
+        &self,
+        logical_key: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_host_request_by_logical_key(self, logical_key)
+    }
+
     fn stage_activation_ticket(
         &self,
         record: &ActivationLifecycleRecord,
@@ -12847,6 +13291,30 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request(operation_id, request_digest)
+    }
+
+    /// Atomically claims one logical host-request key or returns its winner.
+    ///
+    /// See [`OperationalRecoveryStore::resolve_or_stage_host_request`]: the
+    /// caller compares the returned identity with its candidate to tell a
+    /// fresh stage (equal identity, may advance) from another transport's
+    /// winner (different identity, return without dispatch).
+    pub fn resolve_or_stage_host_request(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<HostRequestRecord, OrsError> {
+        self.store.resolve_or_stage_host_request(record)
+    }
+
+    /// Loads one host-request operation by logical key.
+    ///
+    /// See [`OperationalRecoveryStore::load_host_request_by_logical_key`]:
+    /// `Ok(None)` is authoritatively absent, `Err` is never absence.
+    pub fn load_host_request_by_logical_key(
+        &self,
+        logical_key: &str,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.load_host_request_by_logical_key(logical_key)
     }
 
     /// Durably stages one pending activation ticket before publication.
