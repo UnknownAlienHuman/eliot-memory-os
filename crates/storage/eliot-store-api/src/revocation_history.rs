@@ -15,8 +15,6 @@
 //! attesting zero revocations; a missing history is not representable here
 //! and refuses upstream, never as an empty closure.
 
-use std::collections::BTreeSet;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,11 +43,11 @@ pub const REVOCATION_HISTORY_MAX_RECORDS: u32 = 32;
 /// One durably recorded revocation served by the history read.
 ///
 /// This is the recorded form of one `eliot-influence` revocation closure:
-/// the revoked origin, its exact affected set (origin plus dependents, in
-/// affected order), the terminal invalidation reason, and the durable
-/// history revision the record was committed at. `current_influence` is
-/// implied `Revoked` by construction: only committed revocations are
-/// recorded, so unknown or partial outcomes can never appear here.
+/// the revoked origin, its exact sorted affected set (origin plus dependents),
+/// the terminal invalidation reason, and the durable history revision the
+/// record was committed at. `current_influence` is implied `Revoked` by
+/// construction: only committed revocations are recorded, so unknown or
+/// partial outcomes can never appear here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedRevocation {
@@ -57,7 +55,7 @@ pub struct RecordedRevocation {
     pub closure_id: String,
     /// Revoked origin named by the closure.
     pub root_ref: String,
-    /// Exact affected references: the origin plus every dependent.
+    /// Exact sorted affected references: the origin plus every dependent.
     pub dependent_refs: Vec<String>,
     /// Terminal reason the origin was invalidated.
     pub invalidation_reason: RevocationReason,
@@ -72,17 +70,18 @@ impl RecordedRevocation {
     /// `affected_digest` commitment used by `RecordAuthorityRevocation`.
     /// Backends and the Governor must call this function instead of
     /// independently choosing serialization, sorting, or delimiter rules.
-    /// Reference order is significant: the owner supplies parent-before-child
-    /// closure order and the Store records exactly that order.
+    /// The input must already be the strictly sorted complete set returned by
+    /// the grant-closure owner; this function never silently reorders caller
+    /// bytes before hashing.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the affected set is empty, contains a blank
-    /// or control-bearing reference, contains a duplicate, or cannot be
-    /// canonicalized.
+    /// or control-bearing reference, is not strictly sorted and unique, or
+    /// cannot be canonicalized.
     pub fn affected_set_digest(affected_refs: &[String]) -> Result<String, StoreError> {
         validate_affected_refs(affected_refs)?;
-        let bytes = canonical_json_bytes(affected_refs)
+        let bytes = canonical_json_bytes(&affected_refs)
             .map_err(|error| StoreError::Serialization(error.to_string()))?;
         Ok(sha256_hex(&bytes))
     }
@@ -91,18 +90,19 @@ impl RecordedRevocation {
     ///
     /// The function closes the missing common handler step for both Store
     /// backends. It verifies the presented affected-set count and digest over
-    /// the exact ordered references, requires the revoked root as the first
-    /// member, refuses duplicates, and then constructs the typed record at the
-    /// Store-assigned durable history revision. It performs no persistence and
-    /// does not activate the named operations; backend handlers call it only
-    /// after their existing catalogue, fence, ordering and compare-and-swap
-    /// gates admit the mutation.
+    /// the exact sorted references, requires the revoked root to occur in that
+    /// set, and then constructs the typed record at the Store-assigned durable
+    /// history revision. It performs no persistence and does not activate the
+    /// named operations; backend handlers call it only after their existing
+    /// catalogue, fence, ordering and compare-and-swap gates admit the
+    /// mutation.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when any identity is malformed, the history
-    /// revision is zero, the affected set is empty or not root-first, or the
-    /// presented count/digest does not bind the exact affected references.
+    /// revision is zero, the affected set is empty, unsorted, duplicated or
+    /// missing the root, or the presented count/digest does not bind the exact
+    /// affected references.
     pub fn from_recording_parts(
         closure_id: impl Into<String>,
         root_ref: impl Into<String>,
@@ -142,16 +142,19 @@ impl RecordedRevocation {
             });
         }
         validate_affected_refs(&affected_refs)?;
-        if affected_refs.first().map(String::as_str) != Some(root_ref.as_str()) {
+        if affected_refs
+            .binary_search_by(|reference| reference.as_str().cmp(root_ref.as_str()))
+            .is_err()
+        {
             return Err(StoreError::InvalidField {
                 field: "dependent_refs",
-                reason: "affected set must begin with the revoked origin",
+                reason: "affected set must contain the revoked origin",
             });
         }
         if Self::affected_set_digest(&affected_refs)? != expected_affected_digest {
             return Err(StoreError::InvalidField {
                 field: "affected_digest",
-                reason: "does not bind the exact ordered affected-reference set",
+                reason: "does not bind the exact sorted affected-reference set",
             });
         }
         let record = Self {
@@ -170,10 +173,14 @@ impl RecordedRevocation {
         validate_reference(&self.closure_id, "closure_id")?;
         validate_reference(&self.root_ref, "root_ref")?;
         validate_affected_refs(&self.dependent_refs)?;
-        if self.dependent_refs.first().map(String::as_str) != Some(self.root_ref.as_str()) {
+        if self
+            .dependent_refs
+            .binary_search_by(|reference| reference.as_str().cmp(self.root_ref.as_str()))
+            .is_err()
+        {
             return Err(StoreError::InvalidField {
                 field: "dependent_refs",
-                reason: "recorded revocation must begin with its root_ref",
+                reason: "recorded revocation must contain its root_ref",
             });
         }
         if self.revision == 0 {
@@ -256,14 +263,17 @@ fn validate_affected_refs(affected_refs: &[String]) -> Result<(), StoreError> {
             reason: "recorded revocation must name its affected set",
         });
     }
-    let mut seen = BTreeSet::new();
     for reference in affected_refs {
         validate_reference(reference, "dependent_ref")?;
-        if !seen.insert(reference.as_str()) {
-            return Err(StoreError::Duplicate {
-                field: "dependent_refs",
-            });
-        }
+    }
+    if affected_refs
+        .windows(2)
+        .any(|pair| pair[0].as_str() >= pair[1].as_str())
+    {
+        return Err(StoreError::InvalidField {
+            field: "dependent_refs",
+            reason: "affected references must be strictly sorted and unique",
+        });
     }
     Ok(())
 }
