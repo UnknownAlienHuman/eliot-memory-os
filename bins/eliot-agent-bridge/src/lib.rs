@@ -730,6 +730,36 @@ fn decode_recovery_stream(
     live_generation: u64,
     budget: &mut RecoveryDecodeBudget,
 ) -> Result<(RecoveredStreamFacts, u64), ProviderFailure> {
+    let (stream_id, durable_cursor, acked_cursor, page) =
+        decode_stream_snapshot(stream, live_generation)?;
+    let events = decode_page_events(&stream_id, page, live_generation, budget)?;
+    let gaps = decode_stream_gaps(stream, &stream_id, budget)?;
+    let page_continuation = decode_page_continuation(page, durable_cursor)?;
+    let page_complete = page_continuation.is_none();
+    let facts = RecoveredStreamFacts::checked(
+        stream_id,
+        durable_cursor,
+        acked_cursor,
+        events,
+        gaps,
+        page_continuation,
+        page_complete,
+    )
+    .map_err(|_| {
+        event_shape_failure(
+            "reconciliation refused: page identities, ordering, or continuation are incoherent",
+        )
+    })?;
+    Ok((facts, acked_cursor))
+}
+
+/// Decodes the stream fact header and binds the pending page to the same
+/// snapshot: identities, cursors, provenance generation, and staging
+/// provenance must all agree before any item is materialized.
+fn decode_stream_snapshot(
+    stream: &serde_json::Value,
+    live_generation: u64,
+) -> Result<(String, u64, u64, &serde_json::Value), ProviderFailure> {
     let stream_id = recovery_identity(stream, "stream_id")?;
     let durable_cursor = recovery_cursor(stream, "durable_cursor")?;
     let acked_cursor = recovery_cursor(stream, "acked_cursor")?;
@@ -772,6 +802,18 @@ fn decode_recovery_stream(
             "reconciliation refused: page cursors disagree with the stream fact snapshot",
         ));
     }
+    Ok((stream_id, durable_cursor, acked_cursor, page))
+}
+
+/// Decodes the page item array into checked event facts within the
+/// negotiated per-page and total budgets. No envelope is fabricated here:
+/// digest-only legs travel as named digests for the owner-redelivery path.
+fn decode_page_events(
+    stream_id: &str,
+    page: &serde_json::Value,
+    live_generation: u64,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<Vec<RecoveredEventFact>, ProviderFailure> {
     let items = page
         .get("items")
         .and_then(serde_json::Value::as_array)
@@ -821,7 +863,7 @@ fn decode_recovery_stream(
         let staging_connection = recovery_text(item, "staging_connection")?;
         events.push(
             RecoveredEventFact::checked(
-                stream_id.clone(),
+                stream_id.to_owned(),
                 event_id,
                 sequence,
                 phase,
@@ -833,6 +875,15 @@ fn decode_recovery_stream(
             .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?,
         );
     }
+    Ok(events)
+}
+
+/// Decodes the stream-scoped gap array within the negotiated gap budget.
+fn decode_stream_gaps(
+    stream: &serde_json::Value,
+    stream_id: &str,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<Vec<RecoveredGapFact>, ProviderFailure> {
     let gaps_value = stream.get("gaps").ok_or_else(event_transport_failure)?;
     let gaps_array = gaps_value.as_array().ok_or_else(event_transport_failure)?;
     if gaps_array.len() > MAX_RECOVERY_GAPS_PER_STREAM {
@@ -848,10 +899,19 @@ fn decode_recovery_stream(
     }
     let mut gaps = Vec::with_capacity(gaps_array.len());
     for gap in gaps_array {
-        gaps.push(decode_recovery_gap(gap, &stream_id)?);
+        gaps.push(decode_recovery_gap(gap, stream_id)?);
     }
-    let page_continuation = match page.get("continuation") {
-        None | Some(serde_json::Value::Null) => None,
+    Ok(gaps)
+}
+
+/// Decodes the page continuation leg: absent or null means complete, a
+/// number must stay within the durable cursor, anything else refuses.
+fn decode_page_continuation(
+    page: &serde_json::Value,
+    durable_cursor: u64,
+) -> Result<Option<u64>, ProviderFailure> {
+    match page.get("continuation") {
+        None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::Number(_)) => {
             let continuation = recovery_sequence(page, "continuation")?;
             if continuation > durable_cursor {
@@ -859,30 +919,12 @@ fn decode_recovery_stream(
                     "reconciliation refused: page continuation exceeds the durable cursor",
                 ));
             }
-            Some(continuation)
+            Ok(Some(continuation))
         }
-        Some(_) => {
-            return Err(event_shape_failure(
-                "reconciliation refused: page continuation is not a sequence",
-            ));
-        }
-    };
-    let page_complete = page_continuation.is_none();
-    let facts = RecoveredStreamFacts::checked(
-        stream_id,
-        durable_cursor,
-        acked_cursor,
-        events,
-        gaps,
-        page_continuation,
-        page_complete,
-    )
-    .map_err(|_| {
-        event_shape_failure(
-            "reconciliation refused: page identities, ordering, or continuation are incoherent",
-        )
-    })?;
-    Ok((facts, acked_cursor))
+        Some(_) => Err(event_shape_failure(
+            "reconciliation refused: page continuation is not a sequence",
+        )),
+    }
 }
 
 /// Decodes one event-route reconcile reply into the port outcome (Implements
@@ -941,44 +983,10 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: live generation does not match the presenting attach",
         ));
     }
-    let streams = reconciliation
-        .get("streams")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(event_transport_failure)?;
-    if streams.len() > MAX_RECOVERY_STREAMS {
-        return Err(event_shape_failure(
-            "reconciliation refused: stream enumeration exceeds the negotiated budget",
-        ));
-    }
-    let stream_list_complete = streams.len() < MAX_RECOVERY_STREAMS;
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
-    let mut stream_facts = Vec::with_capacity(streams.len().min(64));
-    for stream in streams {
-        let (page, acked) = decode_recovery_stream(stream, live_generation, &mut budget)?;
-        port.note_owner_acked(page.stream_id(), acked);
-        stream_facts.push(page);
-    }
-    let unscoped_value = reconciliation
-        .get("unscoped_gaps")
-        .ok_or_else(event_transport_failure)?;
-    let unscoped_array = unscoped_value
-        .as_array()
-        .ok_or_else(event_transport_failure)?;
-    if unscoped_array.len() > MAX_RECOVERY_GAPS_PER_STREAM {
-        return Err(event_shape_failure(
-            "reconciliation refused: unscoped gaps exceed the negotiated gap budget",
-        ));
-    }
-    budget.gaps = budget.gaps.saturating_add(unscoped_array.len());
-    if budget.gaps > MAX_RECOVERY_TOTAL_GAPS {
-        return Err(event_shape_failure(
-            "reconciliation refused: answer exceeds the negotiated total gap budget",
-        ));
-    }
-    let mut unscoped_gaps = Vec::with_capacity(unscoped_array.len());
-    for gap in unscoped_array {
-        unscoped_gaps.push(decode_recovery_gap(gap, "")?);
-    }
+    let (stream_facts, stream_list_complete) =
+        decode_reconciliation_streams(reconciliation, live_generation, &mut budget, port)?;
+    let unscoped_gaps = decode_unscoped_gaps(reconciliation, &mut budget)?;
     let unproven_scope_present = reconciliation
         .get("unproven_scope_present")
         .and_then(serde_json::Value::as_bool)
@@ -992,24 +1000,7 @@ fn decode_reconciliation_outcome(
         .ok_or_else(|| {
             event_shape_failure("reconciliation refused: owner answer without handoff receipt")
         })?;
-    if let Some(request) = expected {
-        let page = stream_facts
-            .iter()
-            .find(|page| page.stream_id() == request.stream_id())
-            .ok_or_else(|| {
-                event_shape_failure(
-                    "recovery continuation refused: required stream scope absent from the answer",
-                )
-            })?;
-        if let Some(continuation) = page.page_continuation() {
-            if continuation <= request.after_sequence() {
-                return Err(event_shape_failure(
-                    "recovery continuation refused: answer continuation does not advance past \
-                     the requested predecessor",
-                ));
-            }
-        }
-    }
+    check_expected_continuation(&stream_facts, expected)?;
     let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
         .map_err(|_| {
             event_shape_failure(
@@ -1040,6 +1031,95 @@ fn decode_reconciliation_outcome(
         )
     })?;
     Ok(ReconciliationPortOutcome::Reconciled(result))
+}
+
+/// Decodes the stream enumeration of one owner answer within the
+/// negotiated stream budget, recording each page's owner-confirmed acked
+/// base on the port as it is decoded. The enumeration itself needs its
+/// own bound: without it the outer collection would be unbounded no
+/// matter how small each page is.
+fn decode_reconciliation_streams(
+    reconciliation: &serde_json::Value,
+    live_generation: u64,
+    budget: &mut RecoveryDecodeBudget,
+    port: &mut KernelMcpForwardingPort,
+) -> Result<(Vec<RecoveredStreamFacts>, bool), ProviderFailure> {
+    let streams = reconciliation
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    if streams.len() > MAX_RECOVERY_STREAMS {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream enumeration exceeds the negotiated budget",
+        ));
+    }
+    let stream_list_complete = streams.len() < MAX_RECOVERY_STREAMS;
+    let mut stream_facts = Vec::with_capacity(streams.len().min(64));
+    for stream in streams {
+        let (page, acked) = decode_recovery_stream(stream, live_generation, budget)?;
+        port.note_owner_acked(page.stream_id(), acked);
+        stream_facts.push(page);
+    }
+    Ok((stream_facts, stream_list_complete))
+}
+
+/// Decodes the top-level unscoped gaps within the negotiated gap budget.
+/// Unscoped coverage is accounted against the same cumulative total as
+/// stream-scoped gaps, so gap-heavy answers stay within budget.
+fn decode_unscoped_gaps(
+    reconciliation: &serde_json::Value,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<Vec<RecoveredGapFact>, ProviderFailure> {
+    let unscoped_value = reconciliation
+        .get("unscoped_gaps")
+        .ok_or_else(event_transport_failure)?;
+    let unscoped_array = unscoped_value
+        .as_array()
+        .ok_or_else(event_transport_failure)?;
+    if unscoped_array.len() > MAX_RECOVERY_GAPS_PER_STREAM {
+        return Err(event_shape_failure(
+            "reconciliation refused: unscoped gaps exceed the negotiated gap budget",
+        ));
+    }
+    budget.gaps = budget.gaps.saturating_add(unscoped_array.len());
+    if budget.gaps > MAX_RECOVERY_TOTAL_GAPS {
+        return Err(event_shape_failure(
+            "reconciliation refused: answer exceeds the negotiated total gap budget",
+        ));
+    }
+    let mut unscoped_gaps = Vec::with_capacity(unscoped_array.len());
+    for gap in unscoped_array {
+        unscoped_gaps.push(decode_recovery_gap(gap, "")?);
+    }
+    Ok(unscoped_gaps)
+}
+
+/// Requires the requested continuation scope to still be present in the
+/// answer with a continuation that still advances past the requested
+/// predecessor; otherwise the page is foreign or stale and refuses.
+fn check_expected_continuation(
+    stream_facts: &[RecoveredStreamFacts],
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<(), ProviderFailure> {
+    if let Some(request) = expected {
+        let page = stream_facts
+            .iter()
+            .find(|page| page.stream_id() == request.stream_id())
+            .ok_or_else(|| {
+                event_shape_failure(
+                    "recovery continuation refused: required stream scope absent from the answer",
+                )
+            })?;
+        if let Some(continuation) = page.page_continuation()
+            && continuation <= request.after_sequence()
+        {
+            return Err(event_shape_failure(
+                "recovery continuation refused: answer continuation does not advance past \
+                 the requested predecessor",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Admitted event-route face: durable event delivery and acknowledgement
@@ -1702,6 +1782,26 @@ pub fn kernel_ports_with_declaration(
             "receipt connection mismatch".to_owned(),
         ));
     }
+    Ok(kernel_faces_from_admission(
+        transport, runtime, loaded, limits, receipt,
+    ))
+}
+
+/// Wraps one admitted front-door connection in the single retained
+/// transport owner and splits it into the three kernel faces.
+///
+/// The owner (transport, runtime, lease, activation guard, replay cache and
+/// the phase-aware delivery/ack maps) is built here so the admission
+/// exchange in [`kernel_ports_with_declaration`] stays a straight-line
+/// handshake; the three faces share the one owner, never a second
+/// transport, runtime, or lease.
+fn kernel_faces_from_admission(
+    transport: eliot_ipc::NamedPipeTransport,
+    runtime: tokio::runtime::Runtime,
+    loaded: LoadedAgentBridgeDeclaration,
+    limits: eliot_ipc::TransportLimits,
+    receipt: AgentBridgePeerAdmissionReceipt,
+) -> KernelPorts {
     let owner: SharedTransport = Rc::new(RefCell::new(KernelTransportOwner {
         admitted: AdmittedConnection { transport, receipt },
         runtime,
@@ -1723,7 +1823,7 @@ pub fn kernel_ports_with_declaration(
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort {
         shared: owner.clone(),
     });
-    Ok((host, host_request, fwd))
+    (host, host_request, fwd)
 }
 
 /// Projects a reactive delivery-record failure onto the closed bridge error
@@ -1926,6 +2026,7 @@ impl BridgeRunner {
     /// Reachable while normal forwarding is gated: the walk restores
     /// checked receipt/accounting facts without performing ordinary
     /// effects, so recovery can satisfy the gate without bypassing it.
+    #[allow(clippy::result_large_err)]
     pub fn recover_next_page(&mut self) -> Result<RecoveryView, BridgeError> {
         self.core.recover_next_page()
     }

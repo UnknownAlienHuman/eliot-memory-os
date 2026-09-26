@@ -1074,7 +1074,7 @@ pub struct ReconciliationPortResult {
     state_fence: FencingToken,
     task_binding: Box<TaskBinding>,
     receipt_ref: ReconciliationReceiptRef,
-    window: Option<RecoveryWindowFacts>,
+    window: Option<Box<RecoveryWindowFacts>>,
 }
 
 impl ReconciliationPortResult {
@@ -1105,6 +1105,7 @@ impl ReconciliationPortResult {
     /// import; a late result for a replaced attach fails closed there and
     /// changes no recovery state.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     pub fn reconciled_with_pages(
         binding: &AttachBinding,
         receipt_ref: ReconciliationReceiptRef,
@@ -1138,7 +1139,7 @@ impl ReconciliationPortResult {
             state_fence: binding.state_fence.clone(),
             task_binding: Box::new(binding.task_binding.clone()),
             receipt_ref,
-            window: Some(window),
+            window: Some(Box::new(window)),
         })
     }
 
@@ -1146,8 +1147,8 @@ impl ReconciliationPortResult {
         &self.receipt_ref
     }
 
-    pub const fn window(&self) -> Option<&RecoveryWindowFacts> {
-        self.window.as_ref()
+    pub fn window(&self) -> Option<&RecoveryWindowFacts> {
+        self.window.as_deref()
     }
 }
 
@@ -1166,7 +1167,7 @@ struct ReconciliationPermit {
     state_fence: FencingToken,
     task_binding: TaskBinding,
     receipt_ref: ReconciliationReceiptRef,
-    window: Option<RecoveryWindowFacts>,
+    window: Option<Box<RecoveryWindowFacts>>,
 }
 
 impl ReconciliationPermit {
@@ -1243,6 +1244,7 @@ impl RecoveredEventFact {
     /// are required; the digest format itself is verified at the transport
     /// decode boundary.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     pub fn checked(
         stream_id: String,
         event_id: String,
@@ -1340,6 +1342,7 @@ impl RecoveredGapFact {
     /// refuses the whole page, never half of it. Gap identities are bare
     /// keys (never key-encoded with a separator), mirroring the owner's
     /// gap rule.
+    #[allow(clippy::result_large_err)]
     pub fn checked(
         gap_id: String,
         stream_id: String,
@@ -1430,6 +1433,7 @@ impl RecoveredStreamFacts {
     /// exceed the contiguous durable cursor; a continuation must name the
     /// page's last sequence and stay within the durable cursor; a complete
     /// page carries no continuation.
+    #[allow(clippy::result_large_err)]
     pub fn checked(
         stream_id: String,
         durable_cursor: u64,
@@ -1452,10 +1456,46 @@ impl RecoveredStreamFacts {
                 reason: "acknowledged cursor must not exceed the contiguous durable cursor",
             });
         }
+        Self::check_event_run(&stream_id, acked_cursor, &events)?;
+        Self::check_gap_scope(&stream_id, &gaps)?;
+        Self::check_continuation(
+            page_continuation,
+            page_complete,
+            acked_cursor,
+            durable_cursor,
+            events.last().map(|event| event.sequence),
+        )?;
+        let contiguous = Self::contiguous_run(acked_cursor, &events);
+        let highest = events
+            .last()
+            .map_or(acked_cursor, |event| event.sequence)
+            .max(page_continuation.unwrap_or(acked_cursor))
+            .max(durable_cursor);
+        Ok(Self {
+            stream_id,
+            durable_cursor,
+            acked_cursor,
+            contiguous_durable_frontier: contiguous,
+            highest_observed_sequence: highest,
+            events,
+            gaps,
+            page_continuation,
+            page_complete,
+        })
+    }
+
+    /// Rejects foreign-stream events, sequences at or below the acked base,
+    /// non-increasing order and duplicate sequences or identities.
+    #[allow(clippy::result_large_err)]
+    fn check_event_run(
+        stream_id: &str,
+        acked_cursor: u64,
+        events: &[RecoveredEventFact],
+    ) -> Result<(), BridgeError> {
         let mut seen_sequences = BTreeSet::new();
         let mut seen_identities = BTreeSet::new();
         let mut previous = acked_cursor;
-        for event in &events {
+        for event in events {
             if event.stream_id != stream_id {
                 return Err(BridgeError::InvalidContract {
                     field: "recovered_stream.event",
@@ -1488,7 +1528,13 @@ impl RecoveredStreamFacts {
                 });
             }
         }
-        for gap in &gaps {
+        Ok(())
+    }
+
+    /// Rejects scoped gaps that name a stream other than the page's own.
+    #[allow(clippy::result_large_err)]
+    fn check_gap_scope(stream_id: &str, gaps: &[RecoveredGapFact]) -> Result<(), BridgeError> {
+        for gap in gaps {
             if !gap.stream_id.is_empty() && gap.stream_id != stream_id {
                 return Err(BridgeError::InvalidContract {
                     field: "recovered_stream.gap",
@@ -1496,14 +1542,26 @@ impl RecoveredStreamFacts {
                 });
             }
         }
-        match (page_continuation, page_complete, events.last()) {
-            (None, _, _) => {}
-            (Some(_), true, _) => {
-                return Err(BridgeError::InvalidContract {
-                    field: "recovered_stream.continuation",
-                    reason: "a complete page carries no continuation",
-                });
-            }
+        Ok(())
+    }
+
+    /// Binds the continuation to the page tail and the durable cursor: a
+    /// complete page carries none, an empty page must still advance past the
+    /// base, and a non-empty page names its last sequence.
+    #[allow(clippy::result_large_err)]
+    fn check_continuation(
+        page_continuation: Option<u64>,
+        page_complete: bool,
+        acked_cursor: u64,
+        durable_cursor: u64,
+        tail_sequence: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        match (page_continuation, page_complete, tail_sequence) {
+            (None, _, _) => Ok(()),
+            (Some(_), true, _) => Err(BridgeError::InvalidContract {
+                field: "recovered_stream.continuation",
+                reason: "a complete page carries no continuation",
+            }),
             (Some(continuation), false, None) => {
                 if continuation <= acked_cursor || continuation > durable_cursor {
                     return Err(BridgeError::InvalidContract {
@@ -1511,18 +1569,27 @@ impl RecoveredStreamFacts {
                         reason: "continuation must advance past the base within the durable cursor",
                     });
                 }
+                Ok(())
             }
-            (Some(continuation), false, Some(last)) => {
-                if continuation != last.sequence || continuation > durable_cursor {
+            (Some(continuation), false, Some(tail)) => {
+                if continuation != tail || continuation > durable_cursor {
                     return Err(BridgeError::InvalidContract {
                         field: "recovered_stream.continuation",
                         reason: "continuation must name the page tail within the durable cursor",
                     });
                 }
+                Ok(())
             }
         }
+    }
+
+    /// Extends the acked base over the durable prefix of the page: only
+    /// contiguous DURABLE events advance the frontier, so out-of-order
+    /// receipts above it preserve their hole instead of moving
+    /// acknowledgement past unseen or unnormalized material.
+    fn contiguous_run(acked_cursor: u64, events: &[RecoveredEventFact]) -> u64 {
         let mut contiguous = acked_cursor;
-        for event in &events {
+        for event in events {
             if event.sequence == contiguous.saturating_add(1)
                 && phase_reaches(AckPhase::Durable, event.phase)
             {
@@ -1531,23 +1598,7 @@ impl RecoveredStreamFacts {
                 break;
             }
         }
-        let highest = events
-            .last()
-            .map(|event| event.sequence)
-            .unwrap_or(acked_cursor)
-            .max(page_continuation.unwrap_or(acked_cursor))
-            .max(durable_cursor);
-        Ok(Self {
-            stream_id,
-            durable_cursor,
-            acked_cursor,
-            contiguous_durable_frontier: contiguous,
-            highest_observed_sequence: highest,
-            events,
-            gaps,
-            page_continuation,
-            page_complete,
-        })
+        contiguous
     }
 
     pub fn stream_id(&self) -> &str {
@@ -1612,6 +1663,7 @@ impl RecoveryWindowFacts {
     /// Checks the window binding legs. Stream facts arrive pre-checked;
     /// duplicate stream scopes refuse the whole window.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     pub fn checked(
         window_key: String,
         live_generation: Generation,
@@ -1723,6 +1775,7 @@ impl RecoveryReadRequest {
     /// owner's page/gap caps; larger content travels behind admitted
     /// immutable handles, never behind higher frame ceilings.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     pub fn checked(
         window_key: String,
         stream_id: String,
@@ -1963,8 +2016,7 @@ impl RecoveryWindow {
             let complete = self
                 .streams
                 .get(stream_id)
-                .map(|progress| progress.page_complete)
-                .unwrap_or(false);
+                .is_some_and(|progress| progress.page_complete);
             if !complete {
                 return RecoveryDisposition::Partial {
                     reason: RECOVERY_PARTIAL_PAGE_CONTINUATION,
@@ -2192,7 +2244,7 @@ impl AgentBridgeCore {
         // reachable through `recover_next_page` below.
         if let Some(window) = permit.window {
             let disposition =
-                Self::apply_recovery_window(&active.binding, &mut active.recovery, window)?;
+                Self::apply_recovery_window(&active.binding, &mut active.recovery, &window)?;
             if disposition == RecoveryDisposition::Complete {
                 active.reconciliation_required = false;
             }
@@ -2213,6 +2265,7 @@ impl AgentBridgeCore {
     /// facts. Each call rechecks the live attach authority, including after
     /// a reconnect, and a late result for a replaced attach fails closed
     /// without touching current recovery state.
+    #[allow(clippy::result_large_err)]
     pub fn recover_next_page(&mut self) -> Result<RecoveryView, BridgeError> {
         self.ensure_contracts()?;
         let (binding, request) = {
@@ -2230,8 +2283,7 @@ impl AgentBridgeCore {
                     window
                         .streams
                         .get(*stream_id)
-                        .map(|progress| !progress.page_complete)
-                        .unwrap_or(false)
+                        .is_some_and(|progress| !progress.page_complete)
                 })
                 .ok_or(BridgeError::InvalidTransition(
                     "recovery window has no pending page; the walk is complete or unstarted",
@@ -2286,7 +2338,7 @@ impl AgentBridgeCore {
         // `apply_recovery_window`, never by key equality — while a bare
         // legacy answer carries no window at all and cannot continue a walk.
         let _disposition =
-            Self::apply_recovery_window(&active.binding, &mut active.recovery, window)?;
+            Self::apply_recovery_window(&active.binding, &mut active.recovery, &window)?;
         self.recovery_view().ok_or(BridgeError::NotAttached)
     }
 
@@ -2349,10 +2401,11 @@ impl AgentBridgeCore {
     /// normalization or application. Concurrent movement inside the window
     /// marks the stream incomplete with an explicit reason instead of
     /// stitching a silently complete view.
+    #[allow(clippy::result_large_err)]
     fn apply_recovery_window(
         binding: &AttachBinding,
         recovery: &mut Option<RecoveryWindow>,
-        facts: RecoveryWindowFacts,
+        facts: &RecoveryWindowFacts,
     ) -> Result<RecoveryDisposition, BridgeError> {
         if facts.presenting_connection != binding.connection_id {
             return Err(BridgeError::StaleAuthority);
@@ -2378,14 +2431,14 @@ impl AgentBridgeCore {
         };
         // A redeclared window never inherits the previous walk's key: the
         // fresh answer's key becomes the recovery identity from here on.
-        window.window_key = facts.window_key.clone();
+        window.window_key.clone_from(&facts.window_key);
         window.stream_list_complete = facts.stream_list_complete;
         window.unproven_scope_present = facts.unproven_scope_present;
         if !facts.stream_list_complete && window.incomplete_reason.is_none() {
             window.incomplete_reason = Some(RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED);
         }
         for stream_facts in &facts.stream_facts {
-            Self::apply_recovery_stream(&mut *window, stream_facts)?;
+            Self::apply_recovery_stream(&mut *window, stream_facts);
         }
         // Required scope that vanishes from the enumeration is unknown
         // coverage, not completion: a previously incomplete stream absent
@@ -2400,8 +2453,7 @@ impl AgentBridgeCore {
                 let incomplete = window
                     .streams
                     .get(&stream_id)
-                    .map(|progress| !progress.page_complete)
-                    .unwrap_or(false);
+                    .is_some_and(|progress| !progress.page_complete);
                 if missing && incomplete && window.incomplete_reason.is_none() {
                     window.incomplete_reason = Some(RECOVERY_UNAVAILABLE_FOREIGN_PAGE);
                 }
@@ -2430,10 +2482,7 @@ impl AgentBridgeCore {
     /// an already-applied sequence marks movement; new facts extend the
     /// retained set, including durable out-of-order events above the
     /// contiguous frontier.
-    fn apply_recovery_stream(
-        window: &mut RecoveryWindow,
-        facts: &RecoveredStreamFacts,
-    ) -> Result<(), BridgeError> {
+    fn apply_recovery_stream(window: &mut RecoveryWindow, facts: &RecoveredStreamFacts) {
         let progress = window
             .streams
             .entry(facts.stream_id.clone())
@@ -2458,7 +2507,7 @@ impl AgentBridgeCore {
             if window.incomplete_reason.is_none() {
                 window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
             }
-            return Ok(());
+            return;
         }
         progress.acked_high = progress.acked_high.max(facts.acked_cursor);
         let mut moved = false;
@@ -2491,7 +2540,7 @@ impl AgentBridgeCore {
             if window.incomplete_reason.is_none() {
                 window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
             }
-            return Ok(());
+            return;
         }
         progress.durable_cursor = progress.durable_cursor.max(facts.durable_cursor);
         let acked = progress.acked_base.max(facts.acked_cursor);
@@ -2511,11 +2560,11 @@ impl AgentBridgeCore {
         progress.next_after = progress
             .events
             .last_key_value()
-            .map(|(sequence, _)| sequence.saturating_add(1))
-            .unwrap_or(acked.saturating_add(1))
+            .map_or(acked.saturating_add(1), |(sequence, _)| {
+                sequence.saturating_add(1)
+            })
             .max(facts.page_continuation.unwrap_or(0));
         progress.page_complete = facts.page_complete;
-        Ok(())
     }
 
     pub fn attach_view(&self) -> Option<AttachView> {
