@@ -39,9 +39,6 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
-use std::path::PathBuf;
 
 /// Agent-facing code returned when no applicable privacy boundary exists.
 ///
@@ -579,17 +576,240 @@ impl ScanDisclosureReceipt {
     }
 }
 
+/// Versioned schema of the owner-bound scan disclosure write identity.
+///
+/// A changed privacy boundary, governing-source generation, root identity or
+/// scanner schema creates a new receipt under a new identity; historical
+/// evidence stays addressable under retention policy and is never mutated.
+pub const SCAN_DISCLOSURE_SCHEMA_VERSION: u32 = 1;
+
+/// Domain separator for scan disclosure operation identities (I5.27).
+pub const SCAN_DISCLOSURE_OPERATION_DOMAIN: &str = "eliot.scan-disclosure.v1";
+
+/// Filename prefix of the retired loose-file captures. A matching filename
+/// alone is never owner provenance: pre-created files are quarantined through
+/// [`quarantine_loose_scan_disclosure`] and never adopted as receipts.
+pub const LOOSE_SCAN_DISCLOSURE_PREFIX: &str = "scan-disclosure-";
+/// Filename suffix of the retired loose-file captures.
+pub const LOOSE_SCAN_DISCLOSURE_SUFFIX: &str = ".json";
+
+/// Owner-issued storage capability for one scan disclosure write.
+///
+/// The installation/session owner selects the permitted durable storage
+/// contour and issues this binding already bound to installation,
+/// principal/session, host generation, discovery lease, privacy boundary and
+/// `StateFence`/`AuthorityEpoch` (where available before `WorkScope`
+/// creation), plus the operation/idempotency key, policy revision and
+/// deadline. The capability carries no filesystem path: a caller cannot
+/// choose a directory, UNC target or reparse destination because the API has
+/// no path input at all. The durable owner admits the contour and performs
+/// the write; the scanner only constructs and validates the receipt
+/// candidate.
+///
+/// [`BootstrapScanner::scan`] admits the binding before any lease charge, so
+/// a rejected binding fails closed without consuming the discovery lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScanDisclosureOwnerBinding {
+    pub installation_id: String,
+    pub principal_ref: String,
+    pub session_ref: String,
+    pub host_generation_ref: String,
+    pub lease_ref: String,
+    pub candidate_root_ref: String,
+    pub privacy_boundary_ref: String,
+    pub state_fence_ref: Option<String>,
+    pub authority_epoch_ref: Option<String>,
+    pub operation_id: String,
+    pub idempotency_key: String,
+    pub policy_revision: u64,
+    pub deadline: u64,
+}
+
+impl ScanDisclosureOwnerBinding {
+    /// Admits an owner-issued binding without performing any durable work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required identity reference is blank or
+    /// carries control characters, an optional fence/epoch reference is
+    /// present but blank, or the policy revision or deadline is zero.
+    pub fn admit(&self) -> Result<(), WorkScopeError> {
+        text(&self.installation_id, "scan_binding.installation_id")?;
+        text(&self.principal_ref, "scan_binding.principal_ref")?;
+        text(&self.session_ref, "scan_binding.session_ref")?;
+        text(
+            &self.host_generation_ref,
+            "scan_binding.host_generation_ref",
+        )?;
+        text(&self.lease_ref, "scan_binding.lease_ref")?;
+        text(&self.candidate_root_ref, "scan_binding.candidate_root_ref")?;
+        text(
+            &self.privacy_boundary_ref,
+            "scan_binding.privacy_boundary_ref",
+        )?;
+        if let Some(fence) = &self.state_fence_ref {
+            text(fence, "scan_binding.state_fence_ref")?;
+        }
+        if let Some(epoch) = &self.authority_epoch_ref {
+            text(epoch, "scan_binding.authority_epoch_ref")?;
+        }
+        text(&self.operation_id, "scan_binding.operation_id")?;
+        text(&self.idempotency_key, "scan_binding.idempotency_key")?;
+        counter(self.policy_revision, "scan_binding.policy_revision")?;
+        counter(self.deadline, "scan_binding.deadline")?;
+        Ok(())
+    }
+
+    /// Owner/store identity this binding authorizes writes against.
+    ///
+    /// Derived from the installation identity alone: the durable owner, not
+    /// the caller, owns the storage contour behind it.
+    #[must_use]
+    pub fn owner_ref(&self) -> String {
+        format!("installation:{}:scan-disclosure", self.installation_id)
+    }
+
+    /// Immutable operation key for one write identity (I5.27 operation id).
+    #[must_use]
+    pub fn operation_key(&self) -> String {
+        format!(
+            "scan-disclosure:{}:{}",
+            self.installation_id, self.operation_id
+        )
+    }
+
+    /// Canonical request hash binding the exact receipt bytes to this write
+    /// identity (I5.27 canonical request hash).
+    ///
+    /// The encoding is deterministic and versioned: domain separator,
+    /// installation, idempotency namespace, encoding version, receipt digest,
+    /// principal/scope binding, operation identity and retention window all
+    /// feed the hash, so reusing an idempotency key with different content
+    /// conflicts instead of overwriting.
+    #[must_use]
+    pub fn request_hash(&self, receipt_digest: &str, schema_version: u32) -> String {
+        sha256_hex(
+            format!(
+                "{domain}\n{idempotency_namespace}\n{encoding_version}\n{installation}\n{receipt_digest}\n{principal}:{session}:{host}:{lease}:{root}:{boundary}\n{fence}:{epoch}\n{operation}:{idempotency}\n{policy}:{deadline}\n{schema_version}",
+                domain = SCAN_DISCLOSURE_OPERATION_DOMAIN,
+                idempotency_namespace = self.operation_key(),
+                encoding_version = SCAN_DISCLOSURE_SCHEMA_VERSION,
+                installation = self.installation_id,
+                principal = self.principal_ref,
+                session = self.session_ref,
+                host = self.host_generation_ref,
+                lease = self.lease_ref,
+                root = self.candidate_root_ref,
+                boundary = self.privacy_boundary_ref,
+                fence = self.state_fence_ref.as_deref().unwrap_or("-"),
+                epoch = self.authority_epoch_ref.as_deref().unwrap_or("-"),
+                operation = self.operation_id,
+                idempotency = self.idempotency_key,
+                policy = self.policy_revision,
+                deadline = self.deadline,
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// Immutable record commitment for one stored write: the operation key
+    /// plus its canonical request hash.
+    #[must_use]
+    pub fn record_commitment(&self, receipt_digest: &str) -> String {
+        format!(
+            "{}:{}",
+            self.operation_key(),
+            self.request_hash(receipt_digest, SCAN_DISCLOSURE_SCHEMA_VERSION)
+        )
+    }
+}
+
+/// Retention/invalidation state of one durable scan receipt.
+///
+/// New scans never mutate prior evidence: a changed privacy boundary,
+/// governing-source generation, root identity or scanner schema writes a new
+/// record (optionally linked through `Superseded`), and retirement only marks
+/// the record under an explicit policy revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanReceiptRetention {
+    Active,
+    Superseded { successor_ref: String },
+    Retired { policy_revision: u64 },
+}
+
+impl ScanReceiptRetention {
+    /// Validates the retention state without reading the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a successor reference is blank or a retirement
+    /// policy revision is zero.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        match self {
+            Self::Active => Ok(()),
+            Self::Superseded { successor_ref } => {
+                text(successor_ref, "scan_retention.successor_ref")
+            }
+            Self::Retired { policy_revision } => {
+                counter(*policy_revision, "scan_retention.policy_revision")
+            }
+        }
+    }
+}
+
+/// Explicit bounded retention policy retiring scan receipts.
+///
+/// Retirement is always explicit: records are marked, never deleted, and stay
+/// addressable as historical evidence under the policy revision that retired
+/// them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScanRetentionPolicy {
+    pub policy_revision: u64,
+    pub keep_generations: u64,
+}
+
+impl ScanRetentionPolicy {
+    /// Validates the retention policy shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy revision or the retained generation
+    /// bound is zero.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        counter(self.policy_revision, "scan_retention_policy.revision")?;
+        counter(
+            self.keep_generations,
+            "scan_retention_policy.keep_generations",
+        )
+    }
+}
+
 /// Durable-write handle for one stored disclosure receipt.
 ///
 /// `receipt_ref` names the scanned receipt (`ScanDisclosureReceipt::scan_ref`);
-/// `store_ref` is the durable location assigned by the store owner (sequence,
-/// key, or content address, owned by the store, opaque here). The scanner
-/// verifies the binding before reporting completion.
+/// `store_ref` is the owner-qualified record key assigned by the durable
+/// owner (opaque here). `owner_ref` carries the exact owner/store identity
+/// the installation owner admitted, `record_commitment` the immutable
+/// operation-key plus canonical-request-hash commitment,
+/// `receipt_digest` the digest of the exact canonical receipt bytes,
+/// `schema_version` the write-identity schema, `writer_receipt_ref` the
+/// owner write receipt, and `retention` the retention/invalidation state.
+/// The scanner verifies the full binding before reporting completion, and
+/// the owner revalidates it on authenticated readback after restart.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScanReceiptHandle {
     pub receipt_ref: String,
     pub store_ref: String,
+    pub owner_ref: String,
+    pub record_commitment: String,
+    pub receipt_digest: String,
+    pub schema_version: u32,
+    pub writer_receipt_ref: String,
+    pub retention: ScanReceiptRetention,
 }
 
 impl ScanReceiptHandle {
@@ -597,131 +817,195 @@ impl ScanReceiptHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error when either reference is blank.
+    /// Returns an error when any reference is blank or carries control
+    /// characters, the receipt digest is not a digest, the retention state is
+    /// malformed, or the schema version is stale for this binding.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.receipt_ref, "receipt_handle.receipt_ref")?;
-        text(&self.store_ref, "receipt_handle.store_ref")
+        text(&self.store_ref, "receipt_handle.store_ref")?;
+        text(&self.owner_ref, "receipt_handle.owner_ref")?;
+        text(&self.record_commitment, "receipt_handle.record_commitment")?;
+        digest(&self.receipt_digest, "receipt_handle.receipt_digest")?;
+        if self.schema_version != SCAN_DISCLOSURE_SCHEMA_VERSION {
+            return Err(WorkScopeError::ScanReceiptStale);
+        }
+        text(
+            &self.writer_receipt_ref,
+            "receipt_handle.writer_receipt_ref",
+        )?;
+        self.retention.validate()
     }
+}
+
+/// Bounded redacted diagnostic view of one stored receipt.
+///
+/// Carries opaque references and the immutable commitment only: no receipt
+/// content, no allowed-class lists, no paths. Storage, backup/export and
+/// diagnostics never let receipt references escape the admitted
+/// privacy/storage boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScanReceiptDiagnosticView {
+    pub receipt_ref: String,
+    pub owner_ref: String,
+    pub record_commitment: String,
+    pub schema_version: u32,
+    pub retention: ScanReceiptRetention,
+}
+
+impl ScanReceiptDiagnosticView {
+    /// Projects the bounded view from an admitted handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handle validation error when the handle is malformed.
+    pub fn project(handle: &ScanReceiptHandle) -> Result<Self, WorkScopeError> {
+        handle.validate()?;
+        Ok(Self {
+            receipt_ref: handle.receipt_ref.clone(),
+            owner_ref: handle.owner_ref.clone(),
+            record_commitment: handle.record_commitment.clone(),
+            schema_version: handle.schema_version,
+            retention: handle.retention.clone(),
+        })
+    }
+}
+
+/// Quarantine proof for one loose `scan-disclosure-*.json` capture.
+///
+/// Files produced by the retired caller-chosen directory implementation
+/// carry no owner provenance: a matching filename alone never adopts a file
+/// as a receipt. Quarantine records the decision and leaves the bytes
+/// untouched for the migration owner; it never returns a readable receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LooseScanQuarantine {
+    pub file_name: String,
+    pub reason: String,
+    pub quarantined_as: String,
+}
+
+impl LooseScanQuarantine {
+    /// Validates the quarantine proof shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any proof reference is blank.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.file_name, "loose_scan_quarantine.file_name")?;
+        text(&self.reason, "loose_scan_quarantine.reason")?;
+        text(&self.quarantined_as, "loose_scan_quarantine.quarantined_as")
+    }
+}
+
+/// Classifies one suspected loose scan disclosure capture.
+///
+/// A filename with the retired loose-capture shape is always quarantined and
+/// never adopted: filename shape is not owner provenance. Any other blank
+/// name fails closed.
+///
+/// # Errors
+///
+/// Returns an error when the filename is blank or does not carry the retired
+/// loose-capture shape.
+pub fn quarantine_loose_scan_disclosure(
+    file_name: &str,
+) -> Result<LooseScanQuarantine, WorkScopeError> {
+    text(file_name, "loose_scan_file")?;
+    if !file_name.starts_with(LOOSE_SCAN_DISCLOSURE_PREFIX)
+        || !file_name.ends_with(LOOSE_SCAN_DISCLOSURE_SUFFIX)
+    {
+        return Err(WorkScopeError::InvalidText {
+            field: "loose_scan_file",
+        });
+    }
+    // The digest segment stays opaque: quarantine never parses a filename
+    // into a receipt identity.
+    let quarantine = LooseScanQuarantine {
+        file_name: file_name.to_owned(),
+        reason: "matching filename alone is not owner provenance; pre-created loose captures are never adopted as scan receipts"
+            .to_owned(),
+        quarantined_as: format!("quarantined:{file_name}"),
+    };
+    quarantine.validate()?;
+    Ok(quarantine)
 }
 
 /// Durable-write port for scan disclosure receipts.
 ///
-/// The governor owns scan semantics but never owns store mechanics, so the
-/// durable write itself lives behind this port: the store owner implements
-/// the write (local durable capture under the scan privacy boundary), and
+/// The governor owns scan semantics but never owns store mechanics: the
+/// installation/session owner selects the permitted durable storage contour
+/// and issues the [`ScanDisclosureOwnerBinding`], the canonical Store/ORS
+/// owner writes, replays, reads and retires the record behind this port, and
+/// the cold-start/attach owner consumes only the retained owner receipt.
 /// [`BootstrapScanner::scan`] reports `Completed` only after the write
-/// succeeds and the returned handle binds the receipt. A scan whose receipt
-/// cannot be durably written is an error, never a completion without proof.
+/// succeeds and the returned handle binds the receipt and the binding. A
+/// scan whose receipt cannot be durably written is an error, never a
+/// completion without proof.
+///
+/// Implementations must publish atomically: a partial or crashed write stays
+/// `Prepared`/`Unknown` and reconciles the original operation through
+/// [`ScanDisclosureStore::reconcile`]; it never permanently occupies the
+/// final content address. Exact replay returns the same stored receipt;
+/// reusing an operation identity with changed bytes or bindings conflicts.
 pub trait ScanDisclosureStore {
-    /// Durably writes one disclosure receipt and returns its handle.
+    /// Durably writes one disclosure receipt under the owner binding and
+    /// returns its owner receipt handle.
     ///
     /// # Errors
     ///
-    /// Returns an error when the receipt cannot be durably written; the
-    /// scan then fails instead of completing without a persisted receipt.
+    /// Returns an error when the binding or receipt is malformed, the contour
+    /// is not admitted, the identity conflicts with retained state, or the
+    /// write cannot be durably published; the scan then fails instead of
+    /// completing without a persisted receipt.
     fn store_receipt(
         &mut self,
+        binding: &ScanDisclosureOwnerBinding,
         receipt: &ScanDisclosureReceipt,
     ) -> Result<ScanReceiptHandle, WorkScopeError>;
-}
 
-/// Production durable capture for scan disclosure receipts (issue #1788).
-///
-/// This is the non-test [`ScanDisclosureStore`]: the owner designates an
-/// absolute capture directory, and every validated receipt is captured there
-/// as canonical JSON under its content address
-/// (`scan-disclosure-<sha256>.json`, from [`canonical_json_bytes`] and
-/// [`sha256_hex`]). The write uses create-new so an existing capture is never
-/// truncated or overwritten, the file is synced before the handle is
-/// returned, and the stored bytes are read back and compared before
-/// completion is reported. Any capture failure — blank or relative directory,
-/// directory creation failure, serialization failure, write or sync failure,
-/// a differing receipt already captured under the same address, or a
-/// read-back mismatch — fails closed with
-/// [`WorkScopeError::DisclosureCaptureFailed`]; the scan then fails instead
-/// of completing without a persisted receipt.
-///
-/// The store performs only this port-assigned local durable capture of
-/// already-validated receipts under the scan privacy boundary. It never reads
-/// for discovery: no filesystem inspection, no neighboring-root reads, no
-/// credential reads. The scanner itself stays IO-free; the durable write
-/// lives behind the [`ScanDisclosureStore`] port exactly so scan semantics
-/// and store mechanics stay separate.
-#[derive(Debug)]
-pub struct DurableScanDisclosureStore {
-    store_dir: PathBuf,
-}
-
-impl DurableScanDisclosureStore {
-    /// Binds the store to the owner's absolute capture directory, creating it
-    /// when absent.
-    ///
-    /// The directory must be absolute so captures never resolve against an
-    /// ambient working directory.
+    /// Reads back and authenticates one stored receipt after restart:
+    /// recomputes the canonical bytes/digest and validates the request
+    /// binding. Never treats missing, inaccessible, corrupt, replaced,
+    /// stale, invalidated or unknown-commit records as completed receipts.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkScopeError::InvalidText`] when the directory is blank or
-    /// not absolute, and [`WorkScopeError::DisclosureCaptureFailed`] when the
-    /// directory cannot be created.
-    pub fn new(store_dir: impl Into<PathBuf>) -> Result<Self, WorkScopeError> {
-        let store_dir = store_dir.into();
-        if store_dir.as_os_str().is_empty() || !store_dir.is_absolute() {
-            return Err(WorkScopeError::InvalidText { field: "store_dir" });
-        }
-        fs::create_dir_all(&store_dir).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
-        Ok(Self { store_dir })
-    }
-}
+    /// Returns the typed record cause instead of a completed receipt.
+    fn readback(
+        &self,
+        handle: &ScanReceiptHandle,
+        binding: &ScanDisclosureOwnerBinding,
+    ) -> Result<ScanDisclosureReceipt, WorkScopeError>;
 
-impl ScanDisclosureStore for DurableScanDisclosureStore {
-    /// Durably captures one validated disclosure receipt under its content
-    /// address and returns the handle naming that capture.
-    ///
-    /// A receipt already captured under the same address succeeds only when
-    /// the stored bytes equal this receipt exactly; a differing capture under
-    /// the same address fails closed and is never overwritten.
+    /// Reconciles a lost write response against the original operation: a
+    /// retained `Prepared` record commits, an exact `Committed` record
+    /// replays, and anything else reports its typed cause. Reconciliation
+    /// never blindly creates another record.
     ///
     /// # Errors
     ///
-    /// Returns the receipt validation error when the receipt is malformed,
-    /// and [`WorkScopeError::DisclosureCaptureFailed`] when the receipt
-    /// cannot be captured (see [`DurableScanDisclosureStore::new`]).
-    fn store_receipt(
+    /// Returns [`WorkScopeError::ScanReceiptUnknownCommit`] when no retained
+    /// operation exists for the binding, or the conflicting cause.
+    fn reconcile(
         &mut self,
-        receipt: &ScanDisclosureReceipt,
-    ) -> Result<ScanReceiptHandle, WorkScopeError> {
-        receipt.validate()?;
-        let bytes =
-            canonical_json_bytes(receipt).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
-        let file_name = format!("scan-disclosure-{}.json", sha256_hex(&bytes));
-        let path = self.store_dir.join(&file_name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(&bytes)
-                    .map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
-                file.sync_all()
-                    .map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
-                drop(file);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let existing =
-                    fs::read(&path).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
-                if existing != bytes {
-                    return Err(WorkScopeError::DisclosureCaptureFailed);
-                }
-            }
-            Err(_) => return Err(WorkScopeError::DisclosureCaptureFailed),
-        }
-        let stored = fs::read(&path).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
-        if stored != bytes {
-            return Err(WorkScopeError::DisclosureCaptureFailed);
-        }
-        Ok(ScanReceiptHandle {
-            receipt_ref: receipt.scan_ref.clone(),
-            store_ref: file_name,
-        })
-    }
+        binding: &ScanDisclosureOwnerBinding,
+    ) -> Result<ScanReceiptHandle, WorkScopeError>;
+
+    /// Retires one stored receipt under an explicit retention policy. The
+    /// record is marked, never deleted, and stays addressable as historical
+    /// evidence; new scans write new records and never mutate prior ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy, handle or binding is malformed, or
+    /// the retained record disagrees with the handle commitment.
+    fn retire(
+        &mut self,
+        handle: &ScanReceiptHandle,
+        binding: &ScanDisclosureOwnerBinding,
+        policy: &ScanRetentionPolicy,
+    ) -> Result<ScanReceiptHandle, WorkScopeError>;
 }
 
 /// Deterministic pre-scope profile emitted by a completed scan (I4.3 output).
@@ -914,10 +1198,13 @@ pub enum BootstrapScanOutcome {
 pub struct BootstrapScanner;
 
 impl BootstrapScanner {
-    /// Runs one privacy-bounded scan against the lease key, lease, boundary,
-    /// and store.
+    /// Runs one privacy-bounded scan against the lease key, lease, owner
+    /// binding, boundary, and store.
     ///
-    /// The lease must have been issued for `key`: the scanner re-derives the
+    /// The owner binding is admitted before any lease charge: a binding the
+    /// installation owner did not issue fails closed without consuming the
+    /// discovery lease. The lease must have been issued for `key`: the scanner
+    /// re-derives the
     /// lease reference through [`DiscoveryReadLease::key_matches`] before any
     /// other use, and a key mismatch fails closed without consumption. The
     /// forbidden-operation guard ([`deny_forbidden_operations`]) runs before
@@ -943,13 +1230,14 @@ impl BootstrapScanner {
     /// exhausted, or does not admit a collected class.
     #[allow(
         clippy::too_many_arguments,
-        reason = "scan joins key, lease, store, boundary, evidence, and profile inputs in one deterministic constructor"
+        reason = "scan joins key, lease, owner binding, store, boundary, evidence, and profile inputs in one deterministic constructor"
     )]
     pub fn scan(
         scan_ref: impl Into<String>,
         lease: &mut DiscoveryReadLease,
         key: &DiscoveryLeaseKey,
         store: &mut impl ScanDisclosureStore,
+        binding: &ScanDisclosureOwnerBinding,
         candidate_privacy: PrivacyClass,
         privacy_boundary: Option<&PrivacyBoundary>,
         evidence: &BootstrapScanEvidence,
@@ -964,6 +1252,7 @@ impl BootstrapScanner {
         text(&scan_ref, "scan_ref")?;
         text(&identity_fingerprint, "identity_fingerprint")?;
         key.validate()?;
+        binding.admit()?;
         lease
             .validate()
             .map_err(|_| WorkScopeError::InvalidCounter { field: "lease" })?;
@@ -1026,9 +1315,16 @@ impl BootstrapScanner {
             privacy_boundary_ref: Some(boundary.boundary_ref.clone()),
         };
         receipt.validate()?;
-        let persisted = store.store_receipt(&receipt)?;
+        let bytes =
+            canonical_json_bytes(&receipt).map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
+        let receipt_digest = sha256_hex(&bytes);
+        let persisted = store.store_receipt(binding, &receipt)?;
         persisted.validate()?;
-        if persisted.receipt_ref != receipt.scan_ref {
+        if persisted.receipt_ref != receipt.scan_ref
+            || persisted.owner_ref != binding.owner_ref()
+            || persisted.receipt_digest != receipt_digest
+            || persisted.record_commitment != binding.record_commitment(&receipt_digest)
+        {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
         let profile = Self::profile_for(
@@ -1185,19 +1481,22 @@ pub struct BootstrapDiscoveryInputs {
     pub now: u64,
 }
 
-/// Runs the production bootstrap discovery flow: keyed lease, guarded scan,
-/// durable receipt write.
+/// Runs the production bootstrap discovery flow: keyed lease, owner-bound
+/// store, guarded scan, durable receipt write.
 ///
 /// This is the non-test caller that wires the seams together. It validates
 /// the live observations and owner policy, binds the scan evidence to what
 /// was actually observed (the candidate root must be an observed root, the
 /// filesystem identity must be an observed instance identity, and carried
 /// VCS references must equal the observed generation exactly — arbitrary
-/// caller strings that name nothing observed fail closed), takes the
+/// caller strings that name nothing observed fail closed), checks the owner
+/// binding against the lease and the privacy boundary, takes the
 /// verifier candidates from the owner's registered verifier references, and
 /// runs [`BootstrapScanner::scan`], which verifies the lease key, runs the
 /// forbidden-operation guard, charges the lease, and durably writes the
-/// receipt through `store` before reporting completion.
+/// receipt through the installation-bound `store` before reporting
+/// completion. The caller never chooses storage: `store` is the injected
+/// owner port already bound to the installation contour.
 ///
 /// Exclusion holds by construction: the intake types have no fields for
 /// command lines, recent output, neighboring roots, or raw secret literals,
@@ -1205,11 +1504,13 @@ pub struct BootstrapDiscoveryInputs {
 ///
 /// # Errors
 ///
-/// Returns an error when observations, policy, evidence, or references are
+/// Returns an error when the owner binding disagrees with the lease or the
+/// privacy boundary, when observations, policy, evidence, or references are
 /// malformed, when evidence names nothing observed, or when the scan itself
 /// fails (see [`BootstrapScanner::scan`]).
 pub fn run_bootstrap_discovery(
     store: &mut impl ScanDisclosureStore,
+    binding: &ScanDisclosureOwnerBinding,
     lease: &mut DiscoveryReadLease,
     key: &DiscoveryLeaseKey,
     discovery: &BootstrapDiscoveryInputs,
@@ -1219,6 +1520,19 @@ pub fn run_bootstrap_discovery(
         &discovery.identity_fingerprint,
         "discovery.identity_fingerprint",
     )?;
+    binding.admit()?;
+    if binding.lease_ref != lease.lease_ref
+        || binding.candidate_root_ref != lease.candidate_root_ref
+    {
+        return Err(WorkScopeError::ScanContourNotAdmitted);
+    }
+    if discovery
+        .privacy_boundary
+        .as_ref()
+        .is_some_and(|boundary| binding.privacy_boundary_ref != boundary.boundary_ref)
+    {
+        return Err(WorkScopeError::ScanContourNotAdmitted);
+    }
     discovery.observed.validate()?;
     discovery.policy.validate()?;
     discovery.evidence.validate()?;
@@ -1252,6 +1566,7 @@ pub fn run_bootstrap_discovery(
         lease,
         key,
         store,
+        binding,
         discovery.candidate_privacy,
         discovery.privacy_boundary.as_ref(),
         &discovery.evidence,
@@ -1261,32 +1576,6 @@ pub fn run_bootstrap_discovery(
         discovery.governing_source_refs.clone(),
         discovery.now,
     )
-}
-
-/// Runs the production bootstrap discovery flow against the owner's durable
-/// receipt capture.
-///
-/// This is the production caller that needs no test double: it binds
-/// `store_dir` as the durable capture directory through
-/// [`DurableScanDisclosureStore`], then runs [`run_bootstrap_discovery`],
-/// which verifies the lease key, runs the forbidden-operation guard, charges
-/// the lease, binds evidence to live observations, and durably writes the
-/// receipt through [`BootstrapScanner::scan`] before reporting completion.
-///
-/// # Errors
-///
-/// Returns [`WorkScopeError::InvalidText`] when the capture directory is
-/// blank or not absolute, [`WorkScopeError::DisclosureCaptureFailed`] when
-/// the directory or receipt cannot be durably captured, and the same errors
-/// as [`run_bootstrap_discovery`] when the scan itself fails.
-pub fn run_bootstrap_discovery_durable(
-    store_dir: impl Into<PathBuf>,
-    lease: &mut DiscoveryReadLease,
-    key: &DiscoveryLeaseKey,
-    discovery: &BootstrapDiscoveryInputs,
-) -> Result<BootstrapScanOutcome, WorkScopeError> {
-    let mut store = DurableScanDisclosureStore::new(store_dir)?;
-    run_bootstrap_discovery(&mut store, lease, key, discovery)
 }
 
 /// Privacy boundary admitted for one scan: the privacy profile plus the
