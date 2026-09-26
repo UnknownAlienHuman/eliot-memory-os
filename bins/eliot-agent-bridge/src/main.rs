@@ -1595,10 +1595,14 @@ struct ReconnectClaim<'a> {
 /// shape up, the live Kernel binding is proven current through
 /// [`KernelHostRequestClient::check_kernel_binding`] — one observation-only
 /// reconcile probe over the shared admitted transport — before
-/// `Runner::reconnect` runs. A failed probe fails closed with
+/// `Runner::reconnect` runs. When no operation has been admitted yet the
+/// probe passes vacuously on the attach-time handshake, so a fence or epoch
+/// rotation inside that pre-first-exchange window is not detected here;
+/// owner-issued reconnect currency for that window stays open under
+/// issue #77. A failed probe fails closed with
 /// `RECONNECT_STALE_AUTHORITY` without mutating the runner, so a fenced,
-/// rotated, or dead Kernel binding can never be papered over with a fresh
-/// local label. Cursors and replay inheritance survive only through that
+/// rotated, or dead Kernel binding proven stale by an admitted operation
+/// can never be papered over with a fresh local label. Cursors and replay inheritance survive only through that
 /// exact owner-authorized match; the kernel transport itself is untouched, so
 /// kernel envelopes keep riding the admitted receipt connection until a new
 /// process admission replaces it (the activation one-shot guard is preserved:
@@ -1670,7 +1674,10 @@ fn handle_reconnect(
     };
     // The bearer claims shaped up against the live local binding; the
     // binding itself is proven current against the Kernel before anything
-    // mutates. A failed probe leaves the runner untouched: the replacement
+    // mutates whenever an admitted operation exists to parent the probe to.
+    // With an empty replay cache the check passes vacuously on the
+    // attach-time handshake, so this comment claims currency only for the
+    // probed case. A failed probe leaves the runner untouched: the replacement
     // inherits only a Kernel-current binding, never a fresh label over a
     // fenced, rotated, or dead one.
     if let Err(error) = client.check_kernel_binding() {
