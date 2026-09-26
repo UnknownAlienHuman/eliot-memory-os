@@ -53,7 +53,8 @@ use crate::{
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
     AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
-    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, CanonicalDisposition,
+    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+    BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
     CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
     CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
@@ -135,6 +136,18 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
+/// Durable owner-backed `backup.verify` results (issue #2802; I5.27, I14.21).
+///
+/// One row per public request operation identity, so an exact replay of the same
+/// operation reads back the same owner-proved result after a Kernel restart or
+/// an Authority Epoch rotation, and a changed archive under the same identity is
+/// a conflict rather than a second answer. It is a new table in the existing ORS
+/// family with the single Kernel verify route as its one writer; it never reuses
+/// [`UNKNOWN_COMMIT_RECOVERY`], because a read-only verification is not a
+/// canonical write attempt and that table's own contract is one staged row per
+/// admitted write attempt.
+const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_backup_verification_results_v1");
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -2651,6 +2664,26 @@ impl persistence_codec::PersistedValue for crate::DoctorBudgetLedger {
     }
 }
 
+/// Binds the durable backup-verification result to the ORS codec, so its row is
+/// encoded, decoded and re-validated exactly like every other record family in
+/// this store: the same JSON codec, the same `IntegrityProblem` record-type
+/// envelope on a bad decode, and the same fail-closed `validate()` gate on
+/// every read. The record type is the published
+/// [`BACKUP_VERIFICATION_RESULT_RECORD_TYPE`] so the Kernel verify route can
+/// name the identity-conflict signal by contract instead of by a copied
+/// literal.
+///
+/// The impl is declared in this file rather than beside its siblings in the
+/// codec module because the record's type and `validate()` live in `model.rs`
+/// and the whole of its persisted contract is exactly that `validate()`.
+impl persistence_codec::PersistedValue for BackupVerificationResultRecord {
+    const RECORD_TYPE: &'static str = BACKUP_VERIFICATION_RESULT_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
 fn doctor_storage(error: impl std::fmt::Display) -> crate::DoctorLedgerError {
     crate::DoctorLedgerError::Storage(error.to_string())
 }
@@ -3394,6 +3427,79 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(Some(resolved))
+    }
+
+    /// Loads one durable `backup.verify` result by exact idempotency key
+    /// (I14.21 readback, issue #2802).
+    ///
+    /// The stored row is re-validated through the same ORS codec every sibling
+    /// reader uses, so a row whose own digests or owner spellings no longer hold
+    /// is an integrity failure rather than a replayable answer. `Ok(None)` means
+    /// this operation identity was never recorded; it is not an unknown answer,
+    /// and a caller must not treat it as one.
+    pub fn load_backup_verification_result(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<BackupVerificationResultRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        table
+            .get(idempotency_key)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BackupVerificationResultRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Stages one durable `backup.verify` result under its operation identity.
+    ///
+    /// Persist-before-answer: the row is committed before the route answers, so
+    /// a lost response reconciles to this same persisted result instead of
+    /// re-deriving a differently-fenced one. An exact replay under the same key
+    /// returns [`BackupVerificationDisposition::AlreadyBound`] with the durable
+    /// winner; a different request digest under the same key fails with
+    /// [`OrsError::IntegrityProblem`] and never overwrites the bound row.
+    pub fn stage_backup_verification_result(
+        &self,
+        record: &BackupVerificationResultRecord,
+    ) -> Result<BackupVerificationDisposition, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let disposition = {
+            let mut table = write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?;
+            let staged_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(BackupVerificationDisposition::Stored);
+            };
+            let existing: BackupVerificationResultRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                    reason: "existing backup-verification binding conflicts".to_owned(),
+                });
+            }
+            BackupVerificationDisposition::AlreadyBound(Box::new(existing))
+        };
+        write.commit().map_err(storage)?;
+        Ok(disposition)
     }
 
     /// Stages one P-04 host-request operation before any acknowledgement.
@@ -13144,6 +13250,24 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)
     }
 
+    /// Materializes the durable `backup.verify` result table (issue #2802).
+    ///
+    /// It is part of the base family and is created empty on every open exactly
+    /// like every other base table, so a lookup on a store that never verified an
+    /// archive reads authoritatively absent instead of failing on a missing
+    /// table. No row is ever backfilled, inferred or migrated here: a
+    /// verification result exists only once the Kernel verify route recorded one.
+    fn materialize_backup_verification_table(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        drop(
+            write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?,
+        );
+        Ok(())
+    }
+
     /// Materializes the base ORS table family and, when the store is new or
     /// already carries the exact v1 stage-resolution provenance, the
     /// stage-resolution schema marker.
@@ -13205,6 +13329,10 @@ impl RedbRecoveryStore {
         );
         drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
         drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
+        // #2802: part of the base family, materialized empty on every open like
+        // every other base table, so a lookup on a store that never verified an
+        // archive reads authoritatively absent. No row is backfilled or inferred.
+        Self::materialize_backup_verification_table(write)?;
         drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
         drop(
             write
