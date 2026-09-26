@@ -3757,6 +3757,114 @@ pub(crate) fn classify_backup_verification_key(
     LegacyUnscopedBackupVerificationClass::Unreadable
 }
 
+/// What a durable key holds when the row there was written under the PRE-#2863
+/// two-value archived-fence vocabulary (#2863).
+///
+/// This is a SEPARATE type from [`LegacyUnscopedBackupVerificationClass`] on
+/// purpose. The pre-#2883 class is about a row keyed by CALLER TEXT; this one is
+/// about a row correctly keyed by its scoped namespace digest under verify
+/// profile `v1`, which is a materially better row that this change must still
+/// refuse to reinterpret. Collapsing the two would make a well-formed v1 row
+/// indistinguishable from a pre-#2883 text-keyed one and would lose the fact
+/// that the v1 row is addressable, isolated and readable — just not under the new
+/// semantics.
+///
+/// Three-valued for the same reason its sibling is: only the first may lead to a
+/// new row. `Unreadable` means bytes are present that decode as neither shape,
+/// which is an unreadable durable row and must fail CLOSED rather than read as
+/// "absent" and be staged over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyTwoValueRelationBackupVerificationClass {
+    /// No bytes at all under the probed `v1` key. The pre-#2863 key is free, and
+    /// the current profile's own key was already found empty by the caller, so
+    /// nothing is quarantined here.
+    Absent,
+    /// Bytes are present and decode as a `v1`-profile row: a properly scoped,
+    /// isolated, replayable verification result whose archived-fence answer is
+    /// `current-session` or `historical-authority`. It is LEGACY UNQUALIFIED
+    /// EVIDENCE: replayable as a legacy answer, never upgraded, never
+    /// reinterpreted under the new vocabulary, and never a source of a
+    /// current-profile answer.
+    LegacyUnqualified,
+    /// Bytes are present and decode as neither the current record nor the `v1`
+    /// shape. The durable row is unreadable, so no verification result may be
+    /// answered at all.
+    Unreadable,
+}
+
+/// Pre-#2863 `v1`-profile row shape, read only far enough to recognise it.
+///
+/// It is deliberately NOT a full second copy of the old record, for the same
+/// reason [`LegacyUnscopedBackupVerificationRow`] is not: its only job is to
+/// recognise a shape the current record cannot decode, and a partial shape cannot
+/// drift into a second source of truth for old fields. The discriminator is the
+/// pair (`profile_version == 1`, a `target_compatibility` value in the legacy
+/// two-value vocabulary) together with the `v1` idempotency namespace, which no
+/// current row carries.
+///
+/// Unknown fields are TOLERATED on purpose. The `v1` row carried more fields than
+/// these three, and denying them would reject a genuine legacy row and turn it
+/// into `Unreadable`, which is the fail-CLOSED-but-wrong answer: it would report
+/// corruption for evidence that is perfectly intact and merely old.
+#[derive(Deserialize)]
+struct LegacyTwoValueRelationBackupVerificationRow {
+    /// The `v1` profile version the row was written under.
+    profile_version: u16,
+    /// The `v1` row's idempotency namespace, which pins the row to the old
+    /// vocabulary independently of the profile version number.
+    idempotency_namespace: String,
+    /// The legacy two-value answer, present in both legacy spellings.
+    target_compatibility: String,
+}
+
+/// Returns whether stored bytes are a pre-#2863 two-value scoped row.
+///
+/// It is the recogniser half of
+/// [`classify_backup_verification_two_value_key`], which is its only caller, so
+/// there is exactly one place that decides the legacy shape. See
+/// [`LegacyTwoValueRelationBackupVerificationClass`] for why the surrounding
+/// classification is three-valued.
+fn is_legacy_two_value_backup_verification_row(bytes: &str) -> bool {
+    let Ok(row) = serde_json::from_str::<LegacyTwoValueRelationBackupVerificationRow>(bytes) else {
+        return false;
+    };
+    row.profile_version == 1
+        && row.idempotency_namespace == LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE
+        && matches!(
+            row.target_compatibility.as_str(),
+            LEGACY_TWO_VALUE_FENCE_RELATION_CURRENT_SESSION
+                | LEGACY_TWO_VALUE_FENCE_RELATION_HISTORICAL_AUTHORITY
+        )
+}
+
+/// `current-session`: the pre-#2863 spelling that the current profile no longer
+/// emits, because that vocabulary reported an authority-epoch-only relation as if
+/// it were target compatibility.
+pub const LEGACY_TWO_VALUE_FENCE_RELATION_CURRENT_SESSION: &str = "current-session";
+/// `historical-authority`: the other pre-#2863 spelling. See
+/// [`LEGACY_TWO_VALUE_FENCE_RELATION_CURRENT_SESSION`].
+pub const LEGACY_TWO_VALUE_FENCE_RELATION_HISTORICAL_AUTHORITY: &str = "historical-authority";
+
+/// Classifies stored bytes at a probed pre-#2863 key as absent, a recognised
+/// legacy two-value row, or bytes that are neither shape (#2863).
+///
+/// A current-contract row cannot appear at a `v1` key, and a `v1` row cannot
+/// decode as a current record (its `target_compatibility` field is unknown to the
+/// current shape and its two new fence-digest fields are absent, both of which
+/// `deny_unknown_fields`/required-field decoding reject), so this classifier is
+/// disjoint from the current one by construction rather than by convention.
+pub(crate) fn classify_backup_verification_two_value_key(
+    bytes: &str,
+) -> LegacyTwoValueRelationBackupVerificationClass {
+    if serde_json::from_str::<BackupVerificationResultRecord>(bytes).is_ok() {
+        return LegacyTwoValueRelationBackupVerificationClass::Unreadable;
+    }
+    if is_legacy_two_value_backup_verification_row(bytes) {
+        return LegacyTwoValueRelationBackupVerificationClass::LegacyUnqualified;
+    }
+    LegacyTwoValueRelationBackupVerificationClass::Unreadable
+}
+
 /// Returns whether stored bytes are a pre-#2883 unscoped row occupying `raw_key`.
 ///
 /// It is the recogniser half of [`classify_backup_verification_key`], which is its
@@ -3872,13 +3980,46 @@ pub struct BackupVerificationResultRecord {
     pub class_ceiling: String,
     /// Evidence level the owner proved for this archive, in its own spelling.
     pub verification_level: String,
-    /// Relation of the archive's own fence to the verifying target, in the
-    /// owner's own spelling. It is retained verbatim so a replay after an epoch
-    /// rotation reports the historical relation instead of re-deriving one
-    /// against whatever generation happens to be live. Instruction 7 of #2883:
-    /// this is the HISTORICAL archive-fence evidence and stays separate from
-    /// `identity.authority_epoch`, which is the CURRENT request authority.
-    pub target_compatibility: String,
+    /// STRUCTURAL relation of the archive's own COMPLETE fence value to the
+    /// verifying target, in the owner's own spelling. Retained verbatim so a
+    /// replay after an epoch rotation reports the relation that was observed
+    /// instead of re-deriving one against whatever generation happens to be live.
+    /// Instruction 7 of #2883 and #2863: this is HISTORICAL archive-fence
+    /// evidence and stays separate from `identity.authority_epoch`, which is the
+    /// CURRENT request authority.
+    ///
+    /// #2863 renamed this field from `target_compatibility` and widened its
+    /// vocabulary. It is a relation over fence VALUES, and it is NOT target
+    /// compatibility: no schema/build/key/purge/import/epoch compatibility check
+    /// runs on the verify path, so the old name was a category error that the
+    /// front door then rendered to an operator as a compatibility verdict.
+    pub archive_fence_relation: String,
+    /// PROVENANCE qualifier for [`Self::archive_fence_relation`], in the owner's
+    /// own spelling, and a SEPARATE axis from the relation. `structural-only` is
+    /// the only value a verify answer can carry until an owner issues a capture
+    /// receipt, and it is what keeps an exact or same-lineage structural match
+    /// from being described as proven installation history.
+    pub archive_fence_proof: String,
+    /// Bounded tokens naming the claims this stored answer does NOT make, from
+    /// the owner's [`archive_fence_restrictions`]. Retained beside the relation
+    /// so a replayed row carries the same ceiling the fresh answer did, and so a
+    /// reader cannot read a relation as compatibility, currentness or readiness.
+    pub archive_fence_restrictions: Vec<String>,
+    /// Contract version of the relation vocabulary and classifier that produced
+    /// [`Self::archive_fence_relation`]. ORS stores and validates it without
+    /// interpreting it, exactly as it stores the class ceiling and the evidence
+    /// level; it exists so a vocabulary change is a NEW row contract rather than a
+    /// silent reinterpretation of a retained one.
+    pub archive_fence_relation_contract_version: u16,
+    /// TARGET COMPATIBILITY IS ABSENT, NOT UNKNOWN-AND-FILLED-IN. This field is
+    /// `None` on every row this owner writes, because A13.7 keeps schema/build/
+    /// key/purge/import/epoch compatibility, Authority Epoch monotonicity and
+    /// cutover with the isolated restore owner and no such owner issues a typed
+    /// result on the verify path. It is retained as an explicit `Option` rather
+    /// than deleted so the absence is a recorded field, not a gap a later reader
+    /// could fill in by inference. There is no `serde(default)`: a row that
+    /// omits it is unreadable rather than silently upgraded to "absent".
+    pub target_compatibility: Option<String>,
     /// Canonical-member denominator in the owner's own dispositions.
     pub event_count: u64,
     /// Receipt-obligation member denominator in the owner's own dispositions.
@@ -4043,9 +4184,29 @@ impl BackupVerificationResultRecord {
             "backup_verification_verification_level",
         )?;
         validate_text(
-            &self.target_compatibility,
-            "backup_verification_target_compatibility",
+            &self.archive_fence_relation,
+            "backup_verification_archive_fence_relation",
         )?;
+        validate_text(
+            &self.archive_fence_proof,
+            "backup_verification_archive_fence_proof",
+        )?;
+        // The restriction tokens are a CLOSED set the owner emits and ORS does not
+        // interpret, so each is shape-checked. The list may be empty only if the
+        // owner emitted none, which is its own answer; the field itself is
+        // required, so a row that omits the list does not decode.
+        for restriction in &self.archive_fence_restrictions {
+            validate_text(restriction, "backup_verification_archive_fence_restriction")?;
+        }
+        if self.archive_fence_relation_contract_version == 0 {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_archive_fence_relation_contract_version",
+                reason: "relation contract version must be a declared non-zero version",
+            });
+        }
+        if let Some(compatibility) = &self.target_compatibility {
+            validate_text(compatibility, "backup_verification_target_compatibility")?;
+        }
         if let Some(receipt) = &self.capture_receipt {
             validate_text(receipt, "backup_verification_capture_receipt")?;
         }
@@ -4075,7 +4236,27 @@ pub const BACKUP_VERIFY_PROFILE_ID: &str = "eliot.kernel.backup-verify.read-only
 /// two versions can never share a key; what the old version does not get is a
 /// read path. Retention and any migration of old rows belong to the ORS
 /// operational retention owner, not here.
-pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 1;
+pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 2;
+/// I5.27 `idempotency_namespace` the PRE-#2863 (`v1`) verify profile used, and
+/// the ONLY thing #2863 changed about the durable key preimage.
+///
+/// #2863 bumped [`BACKUP_VERIFY_PROFILE_VERSION`] to 2 because the identity
+/// gained `archived_fence_digest` and `observed_fence_digest` and the stored
+/// answer gained the closed relation/proof/restriction vocabulary. A bump is a
+/// new namespace by construction, so a `v1` row is neither re-keyed nor
+/// reinterpreted. It is also, on its own, not enough: a new namespace means a
+/// `v1` row simply becomes unreachable, and an unreachable row read as "absent"
+/// would be the fail-OPEN outcome (a caller would re-run a key that already has
+/// an answer and stage a second row beside it).
+///
+/// This constant is what lets the route ADDRESS the row a pre-#2863 install
+/// actually wrote, so it can be recognised and reported as legacy UNQUALIFIED
+/// evidence instead. See
+/// [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`] for the
+/// probe and
+/// [`LegacyTwoValueRelationBackupVerificationClass`] for the three-valued answer.
+pub const LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE: &str =
+    "eliot.kernel.backup-verify.read-only/v1";
 /// Retention/collision window this durable table is now a member of (I5.27
 /// `retention_and_collision_window`).
 ///
@@ -4362,6 +4543,36 @@ pub struct BackupVerifyRequestIdentity {
     /// not the same value as `authority_epoch`, which is the current request
     /// authority.
     pub archive_export_fence_digest: String,
+    /// Digest over the COMPLETE archived `StateFence` VALUE, computed by the
+    /// capture owner from the fence it decoded out of the archive. It is a
+    /// dedicated digest over that value's canonical encoding, so it is NOT the
+    /// manifest's `archive_export_fence_digest` and not any plan or approval
+    /// digest: reusing one of those as a fence identity would make an unrelated
+    /// contract's change move this identity.
+    ///
+    /// #2863 added it and it is DIGEST-BOUND. The archived fence is evidence the
+    /// caller presented, and it is half of what the relation is a relation
+    /// BETWEEN, so a different complete fence value under one operation identity
+    /// must be an I5.27 identity conflict, not a second answer.
+    pub archived_fence_digest: String,
+    /// AMBIENT observation context: digest over the COMPLETE CURRENT
+    /// `StateFence` the relation was observed against — the live session's own
+    /// fence. It is recorded and shape-validated, and it is DELIBERATELY NOT in
+    /// the canonical request hash and NOT in the durable key, for the same reason
+    /// `resource_generation` and the epoch sequence are ambient: a retry after a
+    /// lost response, a module re-registration and an Authority Epoch rotation
+    /// all change the current fence while remaining the SAME operation, and
+    /// binding it would turn every I14.21 reconcile-by-key and every
+    /// post-rotation replay into an identity conflict instead of a replay.
+    ///
+    /// #2863 disclosed consequence, stated rather than left implicit: because the
+    /// observed fence is ambient, the same operation replayed after the live
+    /// fence moved CAN derive a different relation than the stored one, and that
+    /// is answered from the STORED relation, not re-derived — the row is the
+    /// record of the answer that was produced under the fence recorded in
+    /// `observed_fence_digest`. Re-deriving on replay is the drift this durable
+    /// row exists to prevent.
+    pub observed_fence_digest: String,
     /// ARCHIVE-DECLARED evidenced class, in the ROUTE's closed wire spelling
     /// (`full_recovery` / `canonical_only_degraded` / `scope_export`) read through
     /// the owner's typed `BackupClass` by the route's own `class_name` mapping. The
@@ -4561,6 +4772,44 @@ impl BackupVerifyRequestIdentity {
         Ok(sha256_hex(&bytes))
     }
 
+    /// Computes the durable key a PRE-#2863 install would have written for this
+    /// same operation (#2863).
+    ///
+    /// It reuses this identity's own key preimage verbatim — the same eight
+    /// entries, in the same order, over the same components — and changes exactly
+    /// ONE of them: `idempotency_namespace`, forced to
+    /// [`LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE`]. That is sound because
+    /// #2863 changed no other key component: `domain_separator`,
+    /// `canonical_encoding_version`, `semantic_command_kind`, `principal`, the
+    /// authority LINEAGE, `operation_id` and `retention_and_collision_window` are
+    /// byte-identical across the two profile versions, and the two new fence
+    /// digests are answers/evidence rather than key components. So this is a
+    /// reconstruction of the exact key the old row occupies, not a guess at one.
+    ///
+    /// It exists so the route can ask a scoped question about a legacy row rather
+    /// than letting the version bump quietly turn it into "absent". What it may
+    /// be used for is bounded: it locates a row to be CLASSIFIED as legacy
+    /// unqualified evidence. Nothing here re-keys, rewrites, upgrades or projects
+    /// a legacy row — the answer is a refusal naming the version, and a new
+    /// verification operation is what produces a row under the current profile.
+    pub fn legacy_two_value_namespace_digest(&self) -> Result<String, OrsError> {
+        let preimage = serde_json::json!({
+            "authority_lineage_id": self.authority_epoch.lineage_id.as_str(),
+            "canonical_encoding_version": self.canonical_encoding_version,
+            "domain_separator": self.domain_separator.as_str(),
+            "idempotency_namespace": LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE,
+            "operation_id": self.operation_id.as_str(),
+            "principal": self.principal.as_str(),
+            "retention_and_collision_window": self.retention_and_collision_window.as_str(),
+            "semantic_command_kind": self.semantic_command_kind.as_str(),
+        });
+        let bytes = canonical_json_bytes(&preimage).map_err(|_| OrsError::InvalidField {
+            field: "backup_verify_legacy_namespace",
+            reason: "canonical legacy namespace bytes are not serializable",
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Validates the profile pins, the owner/authenticated text shapes, the
     /// digest shapes and the self-consistent digest.
     ///
@@ -4643,6 +4892,18 @@ impl BackupVerifyRequestIdentity {
                 self.archive_export_fence_digest.as_str(),
                 "backup_verify_identity_archive_export_fence_digest",
             ),
+            // Digest-bound (#2863): the archived complete fence value.
+            (
+                self.archived_fence_digest.as_str(),
+                "backup_verify_identity_archived_fence_digest",
+            ),
+            // Ambient: shape-checked because it is a real observed fence, and
+            // deliberately not part of the digest, for the I14.21 reason its own
+            // field doc states.
+            (
+                self.observed_fence_digest.as_str(),
+                "backup_verify_identity_observed_fence_digest",
+            ),
             (
                 self.identity_digest.as_str(),
                 "backup_verify_identity_identity_digest",
@@ -4701,6 +4962,7 @@ struct BackupVerifyIdentityPreimage<'a> {
     archive_owner_contract: &'a str,
     archive_source_installation: &'a str,
     archive_export_fence_digest: &'a str,
+    archived_fence_digest: &'a str,
     evidenced_class: &'a str,
     capture_receipt: &'a Option<String>,
     retention_and_collision_window: &'a str,
@@ -4724,6 +4986,11 @@ impl<'a> From<&'a BackupVerifyRequestIdentity> for BackupVerifyIdentityPreimage<
             archive_owner_contract: identity.archive_owner_contract.as_str(),
             archive_source_installation: identity.archive_source_installation.as_str(),
             archive_export_fence_digest: identity.archive_export_fence_digest.as_str(),
+            // #2863: the archived complete fence is caller-presented evidence and
+            // is digest-bound. `observed_fence_digest` is deliberately NOT here —
+            // it is ambient with `resource_generation` and `authority_epoch`, and
+            // the field's own doc states that consequence.
+            archived_fence_digest: identity.archived_fence_digest.as_str(),
             evidenced_class: identity.evidenced_class.as_str(),
             capture_receipt: &identity.capture_receipt,
             retention_and_collision_window: identity.retention_and_collision_window.as_str(),

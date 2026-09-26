@@ -65,23 +65,23 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission,
-    NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
-    OperationIdentity, OperationalMutationReceipt, OperationalPhase, OperationalRecordContext,
-    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
-    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
-    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRevalidation,
-    ProcessStreamRecoveryStatusProjection, ProcessStreamRecoveryWriteOutcome,
-    ProcessStreamRetirementProof, ProcessStreamSourceResolver, RecoveredAuthoritySnapshot,
-    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
-    RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, ReservationRecord,
-    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
-    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    KernelAuthoritySnapshot, LegacyTwoValueRelationBackupVerificationClass,
+    LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
+    OperationalMutationReceipt, OperationalPhase, OperationalRecordContext, OperationalRecordInput,
+    OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
+    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
+    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
+    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
+    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
+    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
+    RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
+    StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
+    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
+    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
+    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
@@ -4217,6 +4217,50 @@ impl RedbRecoveryStore {
             idempotency_key,
         ))
     }
+    /// Classifies the PRE-#2863 `v1` durable key for this operation
+    /// (issue #2863).
+    ///
+    /// #2863 bumped the verify profile to `v2`, which is a new
+    /// `idempotency_namespace` and therefore a different key. That alone is not
+    /// enough: a `v1` row simply becomes unreachable, and the caller would read
+    /// that as `Absent` and stage a SECOND row for an operation that already has
+    /// a stored answer — the fail-open outcome. So the route addresses the `v1`
+    /// key explicitly, through
+    /// [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`], and
+    /// asks this question about it.
+    ///
+    /// The three classes must be honoured differently, which is what makes the
+    /// probe fail CLOSED: `Absent` means the `v1` key is free and nothing is
+    /// quarantined; `LegacyUnqualified` means intact pre-#2863 evidence whose
+    /// archived-fence answer is `current-session` or `historical-authority`, which
+    /// is replayable as LEGACY evidence and must never be upgraded, re-keyed,
+    /// backfilled or projected as a current-profile answer; and `Unreadable`
+    /// means bytes that are neither shape, for which NO verification result may be
+    /// answered at all.
+    ///
+    /// Nothing is migrated, re-keyed, backfilled or returned. The `v1` row keeps
+    /// its own key and its own bytes, and a new verification operation is what
+    /// produces a row under the current profile — which is the alternative the
+    /// issue explicitly permits, chosen here because it is the only one that needs
+    /// no invented authority over old evidence.
+    pub fn legacy_two_value_backup_verification_class(
+        &self,
+        legacy_record_key: &str,
+    ) -> Result<LegacyTwoValueRelationBackupVerificationClass, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        let Some(bytes) = table
+            .get(legacy_record_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(LegacyTwoValueRelationBackupVerificationClass::Absent);
+        };
+        Ok(crate::classify_backup_verification_two_value_key(&bytes))
+    }
+
     /// Stages one durable `backup.verify` result under its scoped namespace key.
     ///
     /// Persist-before-answer: the row is committed before the route answers, so a
