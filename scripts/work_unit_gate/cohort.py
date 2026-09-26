@@ -654,6 +654,20 @@ def validate_snapshot_completeness(snapshot: dict) -> None:
         )
 
 
+def is_real_repository_root(candidate: Path) -> bool:
+    """True when `candidate` is a real repository checkout, not a temp fixture root.
+
+    Pure (no network I/O, subprocess execution, or repository mutation):
+    resolves `candidate` and reports whether it carries the `.git` identity
+    entry (a directory in a main checkout, a gitdir-pointer file in a linked
+    worktree). Temp fixture roots created for tests never carry one. The
+    marker is deliberately independent of leaf-router presence: a missing
+    router on a real tree is a mutation and must fail, never evidence that
+    the tree is "not real" so the check may be skipped.
+    """
+    return (Path(candidate).resolve() / ".git").exists()
+
+
 def verify_leaf_routers_unchanged(
     repo_root: Path,
     frozen_router_sha256: Dict[str, str],
