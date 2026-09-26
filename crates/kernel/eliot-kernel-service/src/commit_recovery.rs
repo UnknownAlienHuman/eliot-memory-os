@@ -514,7 +514,9 @@ impl PausedScopeMirror {
         let Some(store) = ors else {
             return self.record_unavailable(
                 binding,
-                "no durable recovery owner is bound to this gateway, so the pause ledger was never read",
+                "no durable recovery owner is bound to this gateway, so the pause ledger was \
+                 never read"
+                    .to_owned(),
             );
         };
         let records = match store.list_open_unknown_commits() {
@@ -717,13 +719,10 @@ impl PausedScopeMirror {
         let retained: Vec<String> = scopes
             .iter()
             .filter(|scope| {
-                observation
-                    .records()
-                    .iter()
-                    .any(|record| {
-                        record.idempotency_key != resolved_key
-                            && record.ordering_scopes.iter().any(|open| open == *scope)
-                    })
+                observation.records().iter().any(|record| {
+                    record.idempotency_key != resolved_key
+                        && record.ordering_scopes.iter().any(|open| open == *scope)
+                })
             })
             .cloned()
             .collect();
@@ -925,6 +924,14 @@ pub(crate) fn resolve_open_record(
                     {
                         Ok(ResolutionOutcome::AlreadyResolved { record })
                     }
+                    // The record is reloaded and still open, so the resolve
+                    // itself failed and no concurrent reconciliation reached a
+                    // terminal state. That is the owner failure below, not a
+                    // contradiction of recorded evidence: this arm must precede
+                    // the catch-all below, or a still-open record would be
+                    // reported as a conflict against a terminal state it does
+                    // not hold.
+                    (None, _) => Err(ors_error(error)),
                     (recorded, digest) => Err(CommitRecoveryError::RetainedRecordConflict {
                         idempotency_key: key.to_owned(),
                         detail: format!(
@@ -934,7 +941,6 @@ pub(crate) fn resolve_open_record(
                              recorded history is preserved and later evidence never replaces it"
                         ),
                     }),
-                    (None, _) => Err(ors_error(error)),
                 },
                 None => Err(ors_error(error)),
             }
@@ -1317,7 +1323,9 @@ pub(crate) fn classify_retained_commit(
             ),
         });
     };
-    let Some(record) = ors.load_unknown_commit(&identity.idempotency_key).map_err(ors_error)?
+    let Some(record) = ors
+        .load_unknown_commit(&identity.idempotency_key)
+        .map_err(ors_error)?
     else {
         return Ok(RetainedCommitState::Absent);
     };

@@ -32,8 +32,8 @@ use eliot_store_api::{
 };
 
 use crate::commit_recovery::{
-    CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, PausedScopeMirror,
-    PauseReleaseOutcome, PauseScopeView, RetainedCommitState, classify_commit_receipt,
+    CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, PauseReleaseOutcome,
+    PauseScopeView, PausedScopeMirror, RetainedCommitState, classify_commit_receipt,
     classify_retained_commit, open_record_for, receipt_evidence_digest, recover_commit,
     resolve_open_record, verify_receipt_binding, verify_retained_binding, verify_terminal_evidence,
 };
@@ -186,19 +186,15 @@ fn dreamer_pause_refusal(
         }
         return None;
     }
-    ordering_scopes
-        .iter()
-        .find_map(|scope| {
-            observed
-                .pausing_key_for(scope, key)
-                .map(|pausing_key| {
-                    CommitRecoveryError::ScopePaused {
-                        scope: scope.clone(),
-                        paused_by_key: pausing_key.to_owned(),
-                    }
-                    .to_string()
-                })
+    ordering_scopes.iter().find_map(|scope| {
+        observed.pausing_key_for(scope, key).map(|pausing_key| {
+            CommitRecoveryError::ScopePaused {
+                scope: scope.clone(),
+                paused_by_key: pausing_key.to_owned(),
+            }
+            .to_string()
         })
+    })
 }
 
 /// Renders an ORS failure as the fail-closed recovery refusal (I14.24).
@@ -1552,15 +1548,15 @@ impl KernelStoreGateway {
             });
         };
         let key = identity.idempotency_key.as_str();
-        let staged = ors
-            .load_unknown_commit(key)
-            .map_err(|error| CommitRecoveryError::OrsUnavailable {
+        let staged = ors.load_unknown_commit(key).map_err(|error| {
+            CommitRecoveryError::OrsUnavailable {
                 detail: format!(
                     "the same-identity retry for Dreamer operation {key} returned a ledger answer, \
                      but its retained record could not be re-read to bind receipt evidence: \
                      {error}; the record stays open"
                 ),
-            })?;
+            }
+        })?;
         let Some(record) = staged else {
             // The record is gone: nothing is retained to settle.
             return Ok(());
@@ -1605,13 +1601,28 @@ impl KernelStoreGateway {
             CommitRecoveryClass::NeedsNewIdentity(outcome) => outcome,
         };
         let evidence_receipt_digest = receipt_evidence_digest(&receipt);
-        self.commit_dreamer_disposition(
+        let disposition = self.commit_dreamer_disposition(
             identity,
             ordering_scopes,
             outcome,
             &evidence_receipt_digest,
-        )
-        .map(|_| ())
+        );
+        // This leg reports only that the durable disposition succeeded; a
+        // refresh limitation a successful release still carries is reported on
+        // the answer the gateway returns, not here. The disposition path
+        // renders its own typed variant, so that rendering is carried verbatim
+        // as the cause of this typed failure: no blanket `From<String>`
+        // conversion is introduced for this seam.
+        if let Err(error) = disposition {
+            return Err(CommitRecoveryError::OrsUnavailable {
+                detail: format!(
+                    "the same-identity retry for Dreamer operation {key} reached exact receipt \
+                     evidence, but its durable disposition could not be recorded: {error}; the \
+                     record stays open and its Ordering Scopes stay paused"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Reaches exact receipt evidence for one retained Dreamer operation
@@ -1664,9 +1675,10 @@ impl KernelStoreGateway {
                 .service
                 .lock()
                 .map_err(|_| CommitRecoveryError::OrsUnavailable {
-                    detail: "Kernel service lock poisoned, so the protected recovery lane for this \
+                    detail:
+                        "Kernel service lock poisoned, so the protected recovery lane for this \
                              retained operation cannot be acquired"
-                        .to_owned(),
+                            .to_owned(),
                 })?;
             service
                 .acquire_protected_control(&format!("reconciliation:{key}"))
@@ -1771,12 +1783,25 @@ impl KernelStoreGateway {
                 Ok(DreamerRetainedOutcome::SameIdentityRetryPermitted)
             }
             _ => {
-                self.commit_dreamer_disposition(
+                let disposition = self.commit_dreamer_disposition(
                     identity,
                     ordering_scopes,
                     outcome,
                     &evidence_receipt_digest,
-                )?;
+                );
+                // Converted at this typed seam for the same reason as the
+                // same-identity settle path above: the disposition path renders
+                // its own typed variant, and that exact rendering becomes the
+                // cause here rather than a blanket string-to-typed collapse.
+                if let Err(error) = disposition {
+                    return Err(CommitRecoveryError::OrsUnavailable {
+                        detail: format!(
+                            "the retained operation {key} reached receipt evidence, but its \
+                             durable disposition could not be recorded: {error}; the record stays \
+                             open and its Ordering Scopes stay paused"
+                        ),
+                    });
+                }
                 Ok(DreamerRetainedOutcome::Settled(
                     DreamerCommitUncertain::Reconciled {
                         idempotency_key: key.to_owned(),
@@ -1851,7 +1876,8 @@ impl KernelStoreGateway {
                     // incomplete, and that is stated rather than hidden.
                     PauseReleaseOutcome::RefreshUnavailable { detail, .. } => {
                         let (recorded_outcome, recorded_digest) =
-                            retained_terminal_evidence(key, &record)?;
+                            retained_terminal_evidence(key, &record)
+                                .map_err(|error| error.to_string())?;
                         Ok(DreamerCommitUncertain::ReconciledWithRefreshLimitation {
                             idempotency_key: key.to_owned(),
                             outcome: recorded_outcome,
@@ -1909,9 +1935,8 @@ impl KernelStoreGateway {
         let record =
             open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
-        let resolution =
-            resolve_open_record(ors, key, outcome, evidence_receipt_digest)
-                .map_err(|error| error.to_string())?;
+        let resolution = resolve_open_record(ors, key, outcome, evidence_receipt_digest)
+            .map_err(|error| error.to_string())?;
         // The durable record is read back through the resolution so the report
         // below is backed by what ORS actually holds, not by what this leg
         // intended to write.
@@ -1998,8 +2023,7 @@ impl KernelStoreGateway {
         ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
         // Only a durably staged record marks a scope paused, and the mirror
         // keeps the pausing key with the entry.
-        self.paused_scopes
-            .record_paused(ordering_scopes, key);
+        self.paused_scopes.record_paused(ordering_scopes, key);
         Ok(DreamerCommitUncertain::UnknownCommitOpen {
             idempotency_key: key.to_owned(),
             paused_scopes: ordering_scopes.to_owned(),

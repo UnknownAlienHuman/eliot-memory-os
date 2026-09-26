@@ -17,14 +17,14 @@
 //!    receipt evidence arrives;
 //! 3. a known rollback retries exactly once under the identical identity.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use eliot_kernel_service::{
-    CommitRecoveryError, classify_commit_receipt, paused_ordering_scope_view,
+    CommitRecoveryError, PausedScopeMirror, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, recover_commit,
 };
 use eliot_ors::RedbRecoveryStore;
@@ -159,7 +159,7 @@ fn never_send() -> impl FnMut() -> BoxSend {
 #[tokio::test]
 async fn committed_receipt_returns_after_exactly_one_send() {
     let (ors, dir) = temp_ors("committed");
-    let paused = Mutex::new(BTreeSet::new());
+    let paused = PausedScopeMirror::new();
     let identity = test_identity("committed");
     let committed = test_receipt(&identity, WriteReceiptStatus::Committed, Resubmission::None);
     let sends = Arc::new(Mutex::new(0_usize));
@@ -193,7 +193,7 @@ async fn committed_receipt_returns_after_exactly_one_send() {
 #[tokio::test]
 async fn unknown_commit_pauses_scope_and_disposes_on_evidence() {
     let (ors, dir) = temp_ors("unknown");
-    let paused = Mutex::new(BTreeSet::new());
+    let paused = PausedScopeMirror::new();
     let identity = test_identity("unknown");
     let scopes = vec!["scope-1690-b".to_owned()];
     let sends = Arc::new(Mutex::new(0_usize));
@@ -219,9 +219,9 @@ async fn unknown_commit_pauses_scope_and_disposes_on_evidence() {
         .expect("unknown commit staged");
     assert!(open.is_open());
     assert_eq!(open.ordering_scopes, scopes);
-    assert_eq!(paused_scopes_snapshot(&paused), scopes);
+    assert_eq!(paused_scopes_snapshot(&paused, Some(&ors)).scopes, scopes);
     assert_eq!(
-        paused_ordering_scope_view(&paused, Some(&ors)),
+        paused_ordering_scope_view(&paused, Some(&ors)).scopes,
         vec![(scopes[0].clone(), identity.idempotency_key.clone())],
         "the visible problem state names the pausing key"
     );
@@ -295,7 +295,7 @@ async fn unknown_commit_pauses_scope_and_disposes_on_evidence() {
 #[tokio::test]
 async fn rollback_disposition_proceeds_without_self_pause() {
     let (ors, dir) = temp_ors("rollback-dispose");
-    let paused = Mutex::new(BTreeSet::new());
+    let paused = PausedScopeMirror::new();
     let identity = test_identity("rollback-dispose");
     let scopes = vec!["scope-1690-d".to_owned()];
     let sends = Arc::new(Mutex::new(0_usize));
@@ -328,7 +328,7 @@ async fn rollback_disposition_proceeds_without_self_pause() {
         .expect("record kept as terminal evidence");
     assert!(!resolved.is_open());
     assert!(
-        paused_scopes_snapshot(&paused).is_empty(),
+        paused_scopes_snapshot(&paused, Some(&ors)).scopes.is_empty(),
         "scopes released"
     );
     remove_temp(&dir);
@@ -339,7 +339,7 @@ async fn rollback_disposition_proceeds_without_self_pause() {
 #[tokio::test]
 async fn known_rollback_retries_once_under_the_same_identity() {
     let (ors, dir) = temp_ors("rollback");
-    let paused = Mutex::new(BTreeSet::new());
+    let paused = PausedScopeMirror::new();
     let identity = test_identity("rollback");
     let scopes = vec!["scope-1690-c".to_owned()];
     let rejected = test_receipt(&identity, WriteReceiptStatus::Rejected, Resubmission::None);

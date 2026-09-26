@@ -21,8 +21,8 @@ mod commit_recovery;
 #[cfg(windows)]
 pub use commit_recovery::{
     CheckedPauseObservation, CommitRecoveryClass, CommitRecoveryError, MAX_OBSERVED_OPEN_COMMITS,
-    PausedScopeEntry, PausedScopeMirror, PausedScopeSnapshot, PauseLedgerBinding,
-    PauseReleaseOutcome, PauseScopeView, classify_commit_receipt, paused_ordering_scope_view,
+    PauseLedgerBinding, PauseReleaseOutcome, PauseScopeView, PausedScopeEntry, PausedScopeMirror,
+    PausedScopeSnapshot, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
 mod capacity_evidence;
