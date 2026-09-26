@@ -372,18 +372,31 @@ pub struct ProfileAggregate {
 impl ProfileAggregate {
     /// Assembles the aggregate over observed runs in plan order.
     ///
-    /// Runs are matched to declared stages by durable stage identity; extra
-    /// runs for undeclared stages are ignored, and declared stages without a
-    /// run become explicit missing proofs.
+    /// Runs are matched to declared stages by the full durable stage
+    /// identity (`profile`, `profile_revision`, `stage_id`): a run recorded
+    /// for another profile or revision never satisfies this plan, even when
+    /// the stage identities coincide. Extra runs for undeclared stages are
+    /// ignored, and declared stages without a run become explicit missing
+    /// proofs.
     pub fn assemble(plan: &StagePlan, runs: Vec<InstrumentRun>) -> Self {
         let mut observed = BTreeMap::new();
         for run in runs {
-            observed.entry(run.stage.stage_id.clone()).or_insert(run);
+            observed
+                .entry((
+                    run.stage.profile.clone(),
+                    run.stage.profile_revision,
+                    run.stage.stage_id.clone(),
+                ))
+                .or_insert(run);
         }
         let mut ordered = Vec::with_capacity(plan.stages.len());
         for planned in &plan.stages {
-            let stage_id = planned.route.stage().stage_id.as_str();
-            match observed.remove(stage_id) {
+            let key = (
+                plan.profile.clone(),
+                plan.revision,
+                planned.route.stage().stage_id.clone(),
+            );
+            match observed.remove(&key) {
                 Some(run) => ordered.push(run),
                 None => ordered.push(InstrumentRun::missing(
                     &planned.route,
@@ -676,29 +689,49 @@ impl StageLauncher for MappedStageLauncher<'_> {
 /// [`TestdPortError::UnsupportedByTestd`] refusal instead of failing the plan.
 pub struct TestdPlaneAdmission;
 
+impl TestdPlaneAdmission {
+    /// Admits one admitted `(instrument, kind)` pair behind the test execution
+    /// plane without an invocation.
+    ///
+    /// This is the exact [`TestdAdmissionPort::admit`] decision over the
+    /// admitted stage identity instead of a full provider-neutral invocation,
+    /// so classification-only callers (issue #1813 W4: the governed describe
+    /// path records per-stage testd admission without execution provisions)
+    /// never fabricate invocation authority material such as a State Fence,
+    /// session, or lease. The receipt still binds the registry-selected
+    /// adapter and generation; only the invocation clone is absent, and no
+    /// governed claim may rest on that absence.
+    pub fn admit_parts(
+        instrument: &eliot_contracts::ContractId,
+        kind: InstrumentKind,
+        entry: &RegistryEntry,
+    ) -> Result<(String, u64), TestdPortError> {
+        if entry.instrument.as_str() != instrument.as_str() {
+            return Err(TestdPortError::Registry(RegistryError::Missing {
+                instrument: instrument.as_str().to_owned(),
+                kind,
+            }));
+        }
+        if !entry.supports(kind) {
+            return Err(TestdPortError::Registry(RegistryError::Unsupported {
+                adapter: entry.adapter.clone(),
+                kind,
+            }));
+        }
+        if !testd_dispatchable(kind) {
+            return Err(TestdPortError::UnsupportedByTestd { kind });
+        }
+        Ok((entry.adapter.clone(), entry.generation))
+    }
+}
+
 impl TestdAdmissionPort for TestdPlaneAdmission {
     fn admit(
         &self,
         invocation: &InstrumentInvocation,
         entry: &RegistryEntry,
     ) -> Result<TestdAdmission, TestdPortError> {
-        if entry.instrument.as_str() != invocation.instrument.as_str() {
-            return Err(TestdPortError::Registry(RegistryError::Missing {
-                instrument: invocation.instrument.as_str().to_owned(),
-                kind: invocation.kind,
-            }));
-        }
-        if !entry.supports(invocation.kind) {
-            return Err(TestdPortError::Registry(RegistryError::Unsupported {
-                adapter: entry.adapter.clone(),
-                kind: invocation.kind,
-            }));
-        }
-        if !testd_dispatchable(invocation.kind) {
-            return Err(TestdPortError::UnsupportedByTestd {
-                kind: invocation.kind,
-            });
-        }
+        Self::admit_parts(&invocation.instrument, invocation.kind, entry)?;
         Ok(TestdAdmission::new(invocation.clone(), entry))
     }
 }

@@ -959,6 +959,75 @@ pub(super) async fn run_cargo_workspace_check_verifier(
     .await
 }
 
+/// Compiler-backed quarantine attribution for a registered cargo verifier
+/// (issue #1813 W6).
+///
+/// Agent verifier requests are compiler-served (I10.8.4), but this legacy
+/// composition root carries no stage execution provisions, so the two cargo
+/// verifiers still execute through the quarantined legacy lane. The
+/// attribution records that quarantine visibly: the verifier identity is
+/// routed through the single profile compiler, the quarantine outcome is
+/// recorded, and the nearest governed profile admission is bound as the
+/// migration target. No governed revision, stage graph, or receipt rests on
+/// the legacy execution.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct VerifierProfileAttribution {
+    /// Registered verifier identity that executed the legacy lane.
+    pub verifier: String,
+    /// Always `quarantined-legacy`: no governed claim rests on this result.
+    pub classification: String,
+    /// Nearest governed profile name (migration target, not equivalence).
+    pub nearest_governed_profile: String,
+    /// Admitted revision of the nearest governed profile, when admitted.
+    pub nearest_revision: Option<u64>,
+    /// Stage DAG digest of the nearest governed profile, when admitted.
+    pub nearest_dag_digest: Option<String>,
+    /// Whether a governed claim rests on the legacy execution (never true).
+    pub governed_claim: bool,
+}
+
+/// Nearest governed profile for one registered cargo verifier.
+///
+/// The mapping names the migration target only: the workspace cargo check
+/// approximates the `compiler` profile shape and the dogfood blob check the
+/// `test` profile shape, but neither executes its admitted stage DAG here.
+fn nearest_governed_profile(verifier: RegisteredTaskVerifier) -> &'static str {
+    match verifier {
+        RegisteredTaskVerifier::DogfoodBlobIntegrity => "test",
+        RegisteredTaskVerifier::CargoWorkspaceCheck | RegisteredTaskVerifier::ReceiptResolution => {
+            "compiler"
+        }
+    }
+}
+
+/// Routes one registered cargo verifier through the single profile compiler
+/// and records its quarantine attribution.
+///
+/// The verifier identity itself must quarantine: a verifier identity that
+/// ever collides with a governed profile name refuses legacy execution
+/// fail-closed instead of forging a governed claim over it.
+fn quarantine_attribution(verifier: RegisteredTaskVerifier) -> Result<VerifierProfileAttribution> {
+    let verifier_id = verifier.id().to_owned();
+    if GovernedProfileService
+        .compile_governed(&verifier_id)?
+        .is_some()
+    {
+        anyhow::bail!(
+            "registered verifier '{verifier_id}' collides with a governed profile name; legacy execution is refused"
+        );
+    }
+    let nearest = nearest_governed_profile(verifier);
+    let admitted = GovernedProfileService.compile_governed(nearest)?;
+    Ok(VerifierProfileAttribution {
+        verifier: verifier_id,
+        classification: "quarantined-legacy".to_owned(),
+        nearest_governed_profile: nearest.to_owned(),
+        nearest_revision: admitted.as_ref().map(|profile| profile.revision),
+        nearest_dag_digest: admitted.map(|profile| profile.dag_digest),
+        governed_claim: false,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn resolve_verifier_artifact_scope(
     runtime_root: &Path,
@@ -968,7 +1037,7 @@ pub(super) async fn resolve_verifier_artifact_scope(
     observation_receipt: &eliot_types::WriteReceipt,
     verifier: RegisteredTaskVerifier,
     input: &TaskVerificationToolInput,
-) -> Result<VerifierArtifactScope> {
+) -> Result<(VerifierArtifactScope, Option<VerifierProfileAttribution>)> {
     let config_hash = verifier.config_hash();
     if input.verifier_ref != verifier.reference()
         || input.verifier_config_hash != config_hash
@@ -977,6 +1046,15 @@ pub(super) async fn resolve_verifier_artifact_scope(
         anyhow::bail!("verifier reference, config hash, or acceptance mapping is stale");
     }
     let observed_at = time::OffsetDateTime::now_utc();
+    // Route the cargo verifiers through the single profile compiler before
+    // any legacy execution (#1813 W6): the attribution records the quarantine
+    // visibly, and a verifier identity that ever collides with a governed
+    // profile name refuses execution fail-closed below.
+    let attribution = match verifier {
+        RegisteredTaskVerifier::ReceiptResolution => None,
+        RegisteredTaskVerifier::DogfoodBlobIntegrity
+        | RegisteredTaskVerifier::CargoWorkspaceCheck => Some(quarantine_attribution(verifier)?),
+    };
     let mut scope = match verifier {
         RegisteredTaskVerifier::ReceiptResolution => {
             if input.worktree_ref.is_some() || !input.artifact_paths.is_empty() {
@@ -1135,7 +1213,7 @@ pub(super) async fn resolve_verifier_artifact_scope(
         }
     };
     finalize_verifier_scope_hash(&mut scope)?;
-    Ok(scope)
+    Ok((scope, attribution))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1217,7 +1295,7 @@ pub(super) async fn dispatch_task_verification_run(
     if !observation_item_is_satisfied {
         anyhow::bail!("verifier requires a satisfied candidate observation in this task");
     }
-    let scope = match resolve_verifier_artifact_scope(
+    let (scope, attribution) = match resolve_verifier_artifact_scope(
         &state.root,
         project_id,
         &task,
@@ -1228,7 +1306,7 @@ pub(super) async fn dispatch_task_verification_run(
     )
     .await
     {
-        Ok(scope) => scope,
+        Ok(resolved) => resolved,
         Err(error) => {
             return Ok(json!({
                 "status": "denied_invalid_verifier_scope",
@@ -1255,17 +1333,26 @@ pub(super) async fn dispatch_task_verification_run(
     task.verification_scopes
         .retain(|existing| existing.verification_id != verification_id);
     task.verification_scopes.push(scope.clone());
+    let summary = match &attribution {
+        Some(attribution) => format!(
+            "registered verifier passed in daemon-resolved canonical artifact scope \
+             (quarantined legacy verifier lane: no governed profile receipt; \
+             nearest governed profile: {}; issue #1813 W6)",
+            attribution.nearest_governed_profile,
+        ),
+        None => "registered verifier passed in daemon-resolved canonical artifact scope".to_owned(),
+    };
     let verification = VerificationRunInput {
         verification_id,
         claim_id: None,
         verifier: verifier.id().to_owned(),
         result: VerificationResult::Passed,
-        summary: "registered verifier passed in daemon-resolved canonical artifact scope"
-            .to_owned(),
+        summary,
         payload: json!({
             "task_id": task_id,
             "verifier": verifier.id(),
             "artifact_scope": scope.clone(),
+            "profile_attribution": attribution,
             "observation_id": input.observation_id,
             "observation_receipt_id": observation_receipt.receipt_id,
             "task_revision": input.expected_revision,

@@ -745,18 +745,41 @@ impl ProviderRegistry {
         &'a self,
         invocation: &InstrumentInvocation,
     ) -> Result<&'a RegistryEntry, RegistryError> {
-        let instrument = invocation.instrument.as_str();
-        let mut candidate: Option<&'a RegistryEntry> = None;
+        self.resolve_parts(&invocation.instrument, invocation.kind)
+    }
+
+    /// Resolves one instrument identity and class without an invocation.
+    ///
+    /// This is the exact [`ProviderRegistry::resolve`] lookup over the
+    /// admitted `(instrument, kind)` pair instead of a full provider-neutral
+    /// invocation, so classification-only callers (issue #1813 W4: the
+    /// governed describe path records per-stage provider resolution without
+    /// execution provisions) never fabricate invocation authority material
+    /// such as a State Fence, session, or lease. It performs no freshness
+    /// attestation: callers that launch must use
+    /// [`ProviderRegistry::resolve_current`] with caller-attested
+    /// [`RegistryFreshness`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ProviderRegistry::resolve`] failures.
+    pub fn resolve_parts(
+        &self,
+        instrument: &ContractId,
+        kind: InstrumentKind,
+    ) -> Result<&RegistryEntry, RegistryError> {
+        let name = instrument.as_str();
+        let mut candidate: Option<&RegistryEntry> = None;
         let mut candidates = 0usize;
-        let mut claimant: Option<&'a RegistryEntry> = None;
+        let mut claimant: Option<&RegistryEntry> = None;
         for entry in self.entries.values() {
-            if entry.instrument.as_str() != instrument {
+            if entry.instrument.as_str() != name {
                 continue;
             }
             if claimant.is_none() {
                 claimant = Some(entry);
             }
-            if entry.supports(invocation.kind) {
+            if entry.supports(kind) {
                 candidates += 1;
                 if candidate.is_none() {
                     candidate = Some(entry);
@@ -767,7 +790,7 @@ impl ProviderRegistry {
             (Some(entry), _) if candidates == 1 => {
                 if entry.generation != self.generation {
                     return Err(RegistryError::Stale {
-                        instrument: instrument.to_owned(),
+                        instrument: name.to_owned(),
                         reason: StaleReason::Generation {
                             expected: self.generation,
                             found: entry.generation,
@@ -777,17 +800,17 @@ impl ProviderRegistry {
                 Ok(entry)
             }
             (Some(_), _) => Err(RegistryError::Ambiguous {
-                instrument: instrument.to_owned(),
-                kind: invocation.kind,
+                instrument: name.to_owned(),
+                kind,
                 candidates,
             }),
             (None, Some(entry)) => Err(RegistryError::Unsupported {
                 adapter: entry.adapter.clone(),
-                kind: invocation.kind,
+                kind,
             }),
             (None, None) => Err(RegistryError::Missing {
-                instrument: instrument.to_owned(),
-                kind: invocation.kind,
+                instrument: name.to_owned(),
+                kind,
             }),
         }
     }

@@ -5,12 +5,23 @@
 //! A governed name compiles through the single [`ProfileCompiler`], expands
 //! to its deterministic [`StagePlan`](eliot_instrument_runner::StagePlan),
 //! and assembles the total
-//! [`ProfileAggregate`](eliot_instrument_runner::ProfileAggregate) over zero
-//! observed runs: the verify entries carry no stage launcher provisions, so
-//! every stage becomes an explicit missing proof instead of a launch. One
-//! run record per stage plus the aggregate record persist to the configured
-//! [`BlobStore`](eliot_store::BlobStore); the returned handles are
+//! [`ProfileAggregate`](eliot_instrument_runner::ProfileAggregate) over the
+//! observed runs supplied by the executing composition root. The verify
+//! entries carry no stage launcher provisions, so
+//! [`GovernedProfileService::describe_execution`] assembles over zero
+//! observed runs and every stage becomes an explicit missing proof instead
+//! of a launch; [`GovernedProfileService::describe_execution_with_runs`]
+//! assembles over caller-observed runs once the W4 execution lane produces
+//! them. One run record per stage plus the aggregate record persist to the
+//! configured [`BlobStore`](eliot_store::BlobStore); the returned handles are
 //! content-addressed, so both entries observe the identical bytes.
+//!
+//! Every planned stage is also resolved through the ready provider registry
+//! and admitted behind the test execution plane by admitted identity only
+//! ([`ProviderRegistry::resolve_parts`](eliot_instrument_runner::registry::ProviderRegistry::resolve_parts)
+//! plus [`TestdPlaneAdmission::admit_parts`](eliot_instrument_runner::TestdPlaneAdmission::admit_parts)):
+//! classification without execution provisions, so no invocation authority
+//! material is ever fabricated here.
 //!
 //! No process is launched here and no task is declared complete: execution
 //! provisions (executor, request port, evidence sink) and finish authority
@@ -22,6 +33,8 @@ use eliot_instrument_runner::profile::{AdmittedProfile, InstrumentRegistry, Prof
 use eliot_instrument_runner::profile_run::{
     InstrumentRun, ProfileAggregate, StageEvidence, StageOrchestrator, StagePlan,
 };
+use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry};
+use eliot_instrument_runner::{RegistryError, TestdPlaneAdmission, TestdPortError};
 use eliot_store::BlobStore;
 use eliot_types::BlobRef;
 use serde::Serialize;
@@ -39,6 +52,10 @@ const GOVERNED_AGGREGATE_RECORD_SCHEMA: &str = "eliot-governed-aggregate-record-
 const BUILTIN_REGISTRY_GENERATION: u64 = 1;
 /// Exact missing proof recorded when no stage could launch.
 const NO_LAUNCH_PROVISIONS: &str = "no stage launcher provisions in this composition root: stages were planned but never launched, so every run is an explicit missing proof";
+/// Exact proof recorded when observed runs were supplied: supplied stages
+/// carry their recorded evidence, and stages without runs stay explicit
+/// missing proofs.
+const OBSERVED_RUNS_PRESENT: &str = "observed runs were supplied by the executing composition root; stages without a run remain explicit missing proofs";
 
 /// One planned stage with its durable run record and persist handle.
 #[derive(Clone, Debug, Serialize)]
@@ -59,6 +76,12 @@ pub struct GovernedStageReport {
     pub plane: String,
     /// Whether live `testd` can dispatch the stage class today.
     pub testd_dispatchable: bool,
+    /// Registry-selected adapter identity, when the stage spec resolves.
+    pub provider_adapter: Option<String>,
+    /// Testd admission decision over the admitted stage identity:
+    /// `admitted`, `refused:<typed reason>`, or `unresolved:<typed reason>`.
+    /// Classification only; no stage launches on this decision.
+    pub testd_admission: String,
     /// Execution axis only; never a semantic result.
     pub execution: String,
     /// Evidence state: `retained`, `omitted`, or `missing`.
@@ -144,6 +167,32 @@ impl GovernedProfileService {
         name: &str,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
+        self.describe_execution_with_runs(name, Vec::new(), blob_store)
+    }
+
+    /// Describes one governed profile execution over caller-observed runs.
+    ///
+    /// This is the [`GovernedProfileService::describe_execution`] shape for
+    /// the W4 execution lane (issue #1813 A1): observed
+    /// [`InstrumentRun`](eliot_instrument_runner::InstrumentRun) records
+    /// produced by the executing composition root assemble into the aggregate
+    /// with their executable identity, bound operation, and raw evidence
+    /// handle, so executable digests, governed stage receipts, and raw
+    /// evidence handles become producible instead of structurally absent.
+    /// Runs are matched to declared stages by the full durable stage
+    /// identity; foreign runs never satisfy the plan, and declared stages
+    /// without a run stay explicit missing proofs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the builtin registry is unavailable, the
+    /// name quarantines instead of governing, or blob persistence fails.
+    pub fn describe_execution_with_runs(
+        &self,
+        name: &str,
+        runs: Vec<InstrumentRun>,
+        blob_store: Option<&BlobStore>,
+    ) -> Result<GovernedProfileReport, EngineError> {
         let registry = builtin_registry()?;
         let compiled = ProfileCompiler::new(&registry).compile(name);
         let admitted = compiled.admitted().map_err(|error| {
@@ -153,23 +202,42 @@ impl GovernedProfileService {
             )
         })?;
         let plan = StageOrchestrator::plan(admitted);
-        let aggregate = ProfileAggregate::assemble(&plan, Vec::new());
+        let aggregate = ProfileAggregate::assemble(&plan, runs);
+        let providers = ProviderRegistry::ready(
+            BUILTIN_REGISTRY_GENERATION,
+            String::new(),
+            &unattested_fingerprints(),
+        )
+        .map_err(|error| {
+            rejected(
+                "governed-profile",
+                &format!("ready provider registry is unavailable: {error}"),
+            )
+        })?;
         let mut stages = Vec::with_capacity(plan.stages.len());
         for (planned, run) in plan.stages.iter().zip(aggregate.runs.iter()) {
+            let admission = admit_stage(&providers, planned);
             stages.push(persist_stage_report(
                 blob_store,
                 &plan.profile,
                 plan.revision,
                 planned,
                 run,
+                &admission,
             )?);
         }
-        let aggregate_blob = persist_aggregate_record(blob_store, &plan, &aggregate, &stages)?;
         let observed_runs = aggregate
             .runs
             .iter()
             .filter(|run| !run.evidence.is_missing())
             .count();
+        let missing_proof = if observed_runs == 0 {
+            NO_LAUNCH_PROVISIONS
+        } else {
+            OBSERVED_RUNS_PRESENT
+        };
+        let aggregate_blob =
+            persist_aggregate_record(blob_store, &plan, &aggregate, &stages, missing_proof)?;
         Ok(GovernedProfileReport {
             schema_version: GOVERNED_PROFILE_REPORT_SCHEMA.to_owned(),
             profile: plan.profile.clone(),
@@ -188,7 +256,7 @@ impl GovernedProfileService {
             success: aggregate.is_success(),
             observed_runs,
             aggregate_blob,
-            missing_proof: NO_LAUNCH_PROVISIONS.to_owned(),
+            missing_proof: missing_proof.to_owned(),
         })
     }
 
@@ -224,6 +292,90 @@ fn builtin_registry() -> Result<InstrumentRegistry, EngineError> {
     })
 }
 
+/// Per-stage provider resolution plus testd admission (classification only).
+struct StageAdmission {
+    /// Registry-selected adapter identity, when the stage spec resolves.
+    adapter: Option<String>,
+    /// Admission decision: `admitted`, `refused:<typed reason>`, or
+    /// `unresolved:<typed reason>`.
+    decision: String,
+}
+
+/// Admits one planned stage by admitted identity only (issue #1813 W4).
+///
+/// The stage spec and class resolve through the ready provider registry and
+/// admit behind the test execution plane without any invocation authority
+/// material: no State Fence, session, or lease is fabricated, and no stage
+/// launches on this decision. Callers match on the typed variants, never on
+/// message text.
+fn admit_stage(
+    providers: &ProviderRegistry,
+    planned: &eliot_instrument_runner::PlannedStage,
+) -> StageAdmission {
+    match providers.resolve_parts(&planned.stage.spec, planned.stage.kind) {
+        Ok(entry) => {
+            let adapter = entry.adapter.clone();
+            match TestdPlaneAdmission::admit_parts(&planned.stage.spec, planned.stage.kind, entry) {
+                Ok(_) => StageAdmission {
+                    adapter: Some(adapter),
+                    decision: "admitted".to_owned(),
+                },
+                Err(error) => StageAdmission {
+                    adapter: Some(adapter),
+                    decision: format!("refused:{}", testd_port_error_name(&error)),
+                },
+            }
+        }
+        Err(error) => StageAdmission {
+            adapter: None,
+            decision: format!("unresolved:{}", registry_error_name(&error)),
+        },
+    }
+}
+
+/// Names one registry failure variant for the stage admission record.
+fn registry_error_name(error: &RegistryError) -> &'static str {
+    match error {
+        RegistryError::Missing { .. } => "missing",
+        RegistryError::Duplicate { .. } => "duplicate",
+        RegistryError::Stale { .. } => "stale",
+        RegistryError::Ambiguous { .. } => "ambiguous",
+        RegistryError::Unsupported { .. } => "unsupported",
+        RegistryError::Contract(_) => "contract",
+        RegistryError::UnresolvedExecutable { .. } => "unresolved-executable",
+        RegistryError::ExecutableMismatch { .. } => "executable-mismatch",
+    }
+}
+
+/// Names one testd admission failure for the stage admission record.
+fn testd_port_error_name(error: &TestdPortError) -> String {
+    match error {
+        TestdPortError::UnsupportedByTestd { .. } => "unsupported-by-testd".to_owned(),
+        TestdPortError::Registry(error) => format!("registry-{}", registry_error_name(error)),
+    }
+}
+
+/// Empty fingerprints for static provider resolution.
+///
+/// The describe path performs classification only via
+/// [`ProviderRegistry::resolve_parts`](eliot_instrument_runner::registry::ProviderRegistry::resolve_parts),
+/// which never consults fingerprints: empty slots attest nothing and make no
+/// freshness claim. Launching callers must supply caller-attested
+/// fingerprints with
+/// [`ProviderRegistry::resolve_current`](eliot_instrument_runner::registry::ProviderRegistry::resolve_current)
+/// instead.
+fn unattested_fingerprints() -> InvalidationSet {
+    InvalidationSet {
+        source: String::new(),
+        lock: String::new(),
+        toolchain: String::new(),
+        env: String::new(),
+        exe: String::new(),
+        profile: String::new(),
+        parser: String::new(),
+    }
+}
+
 /// Projects one evidence state to its report pair.
 fn project_evidence(evidence: &StageEvidence) -> (&'static str, String) {
     match evidence {
@@ -242,6 +394,7 @@ fn persist_stage_report(
     revision: u64,
     planned: &eliot_instrument_runner::PlannedStage,
     run: &InstrumentRun,
+    admission: &StageAdmission,
 ) -> Result<GovernedStageReport, EngineError> {
     let (evidence_state, evidence_detail) = project_evidence(&run.evidence);
     let record = serde_json::json!({
@@ -256,6 +409,8 @@ fn persist_stage_report(
         "depends_on": planned.stage.depends_on,
         "plane": format!("{:?}", run.plane),
         "testd_dispatchable": run.testd_dispatchable,
+        "provider_adapter": admission.adapter,
+        "testd_admission": admission.decision,
         "execution": format!("{:?}", run.execution),
         "evidence_state": evidence_state,
         "evidence_detail": evidence_detail,
@@ -275,6 +430,8 @@ fn persist_stage_report(
         depends_on: planned.stage.depends_on.clone(),
         plane: format!("{:?}", run.plane),
         testd_dispatchable: run.testd_dispatchable,
+        provider_adapter: admission.adapter.clone(),
+        testd_admission: admission.decision.clone(),
         execution: format!("{:?}", run.execution),
         evidence_state: evidence_state.to_owned(),
         evidence_detail,
@@ -290,6 +447,7 @@ fn persist_aggregate_record(
     plan: &StagePlan,
     aggregate: &ProfileAggregate,
     stages: &[GovernedStageReport],
+    missing_proof: &str,
 ) -> Result<Option<BlobRef>, EngineError> {
     let Some(store) = blob_store else {
         return Ok(None);
@@ -300,6 +458,7 @@ fn persist_aggregate_record(
             serde_json::json!({
                 "stage_id": stage.stage_id,
                 "evidence_state": stage.evidence_state,
+                "testd_admission": stage.testd_admission,
                 "run_blob": stage.run_blob,
             })
         })
@@ -314,7 +473,7 @@ fn persist_aggregate_record(
         "aggregate_status": format!("{:?}", aggregate.status),
         "success": aggregate.is_success(),
         "observed_runs": aggregate.runs.iter().filter(|run| !run.evidence.is_missing()).count(),
-        "missing_proof": NO_LAUNCH_PROVISIONS,
+        "missing_proof": missing_proof,
         "stage_blobs": stage_blobs,
     });
     Ok(Some(store.put_bytes(&serde_json::to_vec(&record)?)?))

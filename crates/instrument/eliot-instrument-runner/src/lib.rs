@@ -28,7 +28,7 @@ pub mod testd_port;
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
-    KernelInstrumentRequestPort,
+    KernelInstrumentRequestPort, UnprovisionedKernelAdmission,
 };
 pub use profile::{
     AdmittedProfile, AdmittedStage, BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION,

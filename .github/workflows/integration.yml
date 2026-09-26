@@ -202,6 +202,9 @@ jobs:
         run: |
           python scripts/integration/ignored_test_inventory.py --repo-root . --output .eliot/inventory.json
 
+      # Quarantined legacy lane (issue #1813 W6): the Review gates execute cargo
+      # directly with no governed profile receipt. Thin-invoker migration awaits W4
+      # stage-execution provisions.
       - name: Run canonical locked Review gate with the single #750 owner
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
