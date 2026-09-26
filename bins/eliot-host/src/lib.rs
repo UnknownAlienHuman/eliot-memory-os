@@ -60,9 +60,11 @@ pub mod windows_event_log;
 // F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
 //
 // Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
-// `observe_entrypoint_with_detail`, `observe_terminal_error`); the Event Log
-// seam stays typed-Unavailable (`windows_event_log::event_log_sink_status`),
-// never implemented here (#984 still open).
+// `observe_entrypoint_with_detail`, `observe_terminal_error`); sink status is
+// the live `windows_event_log::event_log_sink_status` answer: `Ok` where
+// #984's accepted safe port is live (Windows), typed `EventLogUnavailable`
+// elsewhere. Delivery goes through `report_local_event` (landed `bf37d3e1` /
+// #1706; synchronous, per-call handle, receipt proves OS acceptance only).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals or borrows of
@@ -72,12 +74,10 @@ pub mod windows_event_log;
 // mutable global dedup cache: one terminal emission per failed public
 // operation is enforced by the single outermost guard per operation, while
 // inner phase observations share correlation by stage order only.
-fn host_lifecycle_note_event_log_unavailable() {
-    let _ = windows_event_log::event_log_sink_status();
-}
+pub use host_diagnostics::note_event_log_sink_status;
 
 fn host_lifecycle_observe_requested(detail: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::Startup,
         host_lifecycle_frozen_event(detail),
@@ -85,7 +85,7 @@ fn host_lifecycle_observe_requested(detail: &str) {
 }
 
 fn host_lifecycle_observe_scm(detail: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ScmDispatch,
         host_lifecycle_frozen_event(detail),
@@ -93,7 +93,7 @@ fn host_lifecycle_observe_scm(detail: &str) {
 }
 
 fn host_lifecycle_observe_drain(detail: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ShutdownDrain,
         host_lifecycle_frozen_event(detail),
@@ -101,7 +101,7 @@ fn host_lifecycle_observe_drain(detail: &str) {
 }
 
 fn host_lifecycle_observe_terminal(code: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(code));
 }
 
