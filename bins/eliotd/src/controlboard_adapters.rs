@@ -88,8 +88,9 @@ use super::daemon_kernel_client::OwnerSessionFacts;
 /// Builds one [`ControlBoard`] over a fresh Governor projection snapshot.
 ///
 /// The snapshot is immutable: every port call in the returned board observes
-/// the same fence and revision, so a mid-read Governor refresh surfaces as an
-/// exact-view mismatch at the next call rather than silent divergence.
+/// the same fence and revision, so one served read cannot mix two of either. A
+/// Governor refresh is not observed by that board; it appears at the next read,
+/// which serves a newer but still internally consistent view.
 ///
 /// The board shares the caller-retained [`SharedOperatorReplay`] handle, so a
 /// newly created board replays an already-admitted operation instead of
@@ -331,10 +332,23 @@ pub enum ControlBoardReadOutcome {
 /// (Implements #1187 W1/A1): it builds one board over one immutable Governor
 /// projection snapshot through
 /// [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard)
-/// and performs exactly one authenticated, role-filtered read on it. Every
-/// port call in that board observes the same revision and fence, so a Governor
-/// refresh between reads surfaces as an exact-view mismatch rather than silent
-/// divergence.
+/// and performs exactly one authenticated, role-filtered read on it.
+///
+/// What that one snapshot buys is *per-read internal consistency*: every port
+/// call inside this board — access resolution, canonical state, Swarm
+/// projection — reads the same `Arc<ControlBoardGovernorSnapshot>`, so one
+/// served read can never mix two revisions or two fences. A Governor refresh is
+/// not observed at all: this read answers from the snapshot it took, and the
+/// refreshed snapshot appears at the *next* read as a newer, still internally
+/// consistent view. It never surfaces here as a mismatch, and nothing in this
+/// module watches for one.
+///
+/// `access_currency` is a defensive consistency assertion, not drift
+/// detection: `GovernorAccessResolver::resolve` fills `access_revision` and
+/// `access_fence` from the very snapshot that assertion compares against, so
+/// through the current wiring the comparison holds by construction and its
+/// `Denied` arm is unreachable. It stays so a future port handing this module a
+/// binding from another snapshot is caught instead of serving a cross-fence view.
 ///
 /// The read either returns the canonical view under the session owner that
 /// issued the binding, or the exact typed refusal — currently
@@ -353,7 +367,7 @@ pub fn serve_controlboard_view(
 ) -> HostRequestResultBody {
     let outcome = controlboard_read_outcome(composition, envelope, attempt);
     controlboard_result_body(envelope, attempt, &outcome)
-        .unwrap_or_else(|error| controlboard_refusal_body(envelope, attempt, &error.to_string()))
+        .unwrap_or_else(|error| controlboard_refusal_body(envelope, attempt, &error))
 }
 
 /// Performs exactly one authenticated role-filtered read and returns the
@@ -394,10 +408,17 @@ fn controlboard_read_outcome(
 
 /// Binds one `ControlBoard` read outcome into the submit-leg result body.
 ///
-/// A local construction failure is reported through the board's own
-/// `Provider` variant, which is the one variant the board already defines for
-/// a detail-only port-level refusal; it is never re-labelled as a `PlanGap`,
-/// a stale view, or a success.
+/// The typed [`ControlBoardError`] crosses this boundary intact: it is never
+/// flattened to display text before the wire refusal is chosen, and the wire
+/// variant is always the total typed cross of that error
+/// (`ControlBoardRefusal::from_board_error`), so a consumer tells refusals
+/// apart by variant and never by matching message text. `detail` remains the
+/// bounded verbatim `Display`, the human-readable half only.
+///
+/// A local construction failure is reported through the board's own `Provider`
+/// variant, which is the one variant the board already defines for a
+/// detail-only port-level refusal; it is never re-labelled as a `PlanGap`, a
+/// stale view, or a success.
 pub fn controlboard_result_body(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
@@ -429,44 +450,81 @@ pub fn controlboard_result_body(
     Ok(body)
 }
 
+/// Settles one claimed pair whose outcome could not be bound to a result body.
+///
+/// The refusal is an ordinary [`ControlBoardReadOutcome::Refused`] and is bound
+/// by [`controlboard_result_body`], the same owner every other body in this
+/// module goes through: it is encoded from the typed outcome, its
+/// `result_digest` is computed over the [`canonical_json_bytes`] of that exact
+/// response, and [`HostRequestResultBody::validate`] gates the result. The
+/// reason is the typed cross of the failure that got here
+/// (`ControlBoardRefusal::from_board_error`) with the bounded verbatim
+/// `Display` as the human half, never a message-only body and never a variant
+/// asserted in place of the failure.
 fn controlboard_refusal_body(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
-    detail: &str,
+    error: &ControlBoardError,
 ) -> HostRequestResultBody {
-    // Last-resort body for local construction failures: the same refused
-    // shape, bounded detail, and digest binding as every other refusal, so a
-    // malformed outcome still settles through the submit leg instead of
-    // dropping the claimed pair. The variant is the board's own detail-only
-    // `Provider` refusal, because a local construction failure is exactly what
-    // that variant already means.
     let outcome = ControlBoardReadOutcome::Refused {
-        refusal: ControlBoardRefusal::Provider,
-        detail: detail.chars().take(512).collect::<String>(),
+        refusal: ControlBoardRefusal::from_board_error(error),
+        detail: error.to_string().chars().take(512).collect::<String>(),
     };
-    controlboard_result_body(envelope, attempt, &outcome).unwrap_or_else(|_| {
-        let response = serde_json::json!({
-            "refused": {
-                "refusal": "provider",
-                "detail": detail.chars().take(512).collect::<String>(),
-            }
-        });
-        HostRequestResultBody {
-            wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
-            wire_version: HostRequestResultBody::CONTRACT_VERSION,
-            operation_id: attempt.operation_id.clone(),
-            request_sha256: envelope.envelope_sha256.clone(),
-            result_digest: sha256_hex(response.to_string().as_bytes()),
-            response,
-            attempt: Some(attempt.clone()),
-        }
-    })
+    controlboard_result_body(envelope, attempt, &outcome)
+        .unwrap_or_else(|_| controlboard_unbound_refusal_body(envelope, attempt, &outcome))
 }
 
-/// Rejects bindings that are not current at the snapshot fence and revision.
+/// Emits the refused outcome when even that refusal cannot be bound.
 ///
-/// A refresh between the access resolution and this call fails closed here
-/// instead of serving a cross-fence view.
+/// The arm exists for one case, and the case is not the response: the refusal is
+/// bounded, already encoded, and digested, so a refusal here is over the
+/// Kernel-minted envelope and attempt this body copies verbatim. No response
+/// shape can change that verdict, no field here may be invented to change it,
+/// and a claimed pair must still settle, so the same refused bytes are emitted
+/// once more — with `result_digest` again taken over the exact canonical bytes
+/// of the exact response emitted, so a consumer recomputing that digest
+/// canonically still matches — and the same shape gate is run on the body that
+/// actually leaves. The Kernel submit leg
+/// (`host_request_route::KernelComposition::submit_local_read_result`) runs
+/// [`HostRequestResultBody::validate`] as its first act and is the final
+/// authority over a result body, so this arm settles the pair with the honest
+/// refusal instead of dropping it or forging a valid one.
+fn controlboard_unbound_refusal_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    outcome: &ControlBoardReadOutcome,
+) -> HostRequestResultBody {
+    // Total over a `Refused` outcome, which is a unit-variant enum plus one
+    // bounded string: neither the encode nor the canonical-bytes step can fail
+    // here, so the digest below always binds the exact response emitted.
+    let response = serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null);
+    let result_digest =
+        sha256_hex(&canonical_json_bytes(&response).unwrap_or_else(|_| Vec::from([b'null'])));
+    let body = HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest,
+        response,
+        attempt: Some(attempt.clone()),
+    };
+    // The gate is run, not assumed; its verdict is the one already observed
+    // above and is adjudicated by the submit leg, not by this arm.
+    let _shape_gate = body.validate();
+    body
+}
+
+/// Asserts that an access binding is the one this snapshot issued.
+///
+/// Defensive consistency assertion, not drift detection, and it is not evidence
+/// that a Governor refresh was seen: [`GovernorAccessResolver::resolve`] sets
+/// `access_revision` and `access_fence` from the same snapshot this compares
+/// them against, so through the wiring [`controlboard_over_snapshot`] builds,
+/// the comparison holds by construction and this arm cannot be reached. The
+/// check is kept because a future port that hands this module a binding taken at
+/// another snapshot would then fail closed here instead of serving a
+/// cross-fence view.
 fn access_currency(
     snapshot: &ControlBoardGovernorSnapshot,
     access: &AccessBinding,

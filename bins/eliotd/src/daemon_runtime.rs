@@ -2213,10 +2213,12 @@ async fn run_local_read_poll(
     // `host_request_route::check_local_read_admission` resolves selectors, and
     // `host_request_route::local_read_selectors_from_tool` returns selectors
     // only for `tool.name == "eliot.query"` whose `envelope.identity.capability`
-    // equals it; `host_request_route::claim_local_read_pair` then independently
-    // skips every candidate whose `envelope.identity.capability !=
-    // "eliot.query"`. Both gates are in `bins/eliot-kernel/src/host_request_route.rs`
-    // (lines 2336 and 1349). No host request naming the broker-admitted
+    // equals it; `host_request_route::KernelComposition::claim_local_read_pair`
+    // then independently skips every candidate whose
+    // `envelope.identity.capability != "eliot.query"`. Both gates are in
+    // `bins/eliot-kernel/src/host_request_route.rs`, cited by symbol rather than
+    // by line, because a line number in a comment is wrong the next time the
+    // file moves. No host request naming the broker-admitted
     // `controlboard.read` or `operator.command` capability is ever queued for, or
     // claimed by, this poller, so neither reaches a daemon branch here. The same
     // two gates make the `is_skill_tool` branches above unreachable as well; that
