@@ -447,11 +447,25 @@ impl AutomationPageCursor {
     /// The canonical encoding is deterministic and versioned: the same bindings
     /// always produce the same bytes on every contour, so a cursor survives a
     /// round trip through a request, a response and the next request unchanged.
-    fn to_wire(&self) -> String {
-        format!(
-            "{AUTOMATION_CURSOR_VERSION}:{}",
-            String::from_utf8_lossy(&canonical_json_bytes(self).unwrap_or_default())
-        )
+    ///
+    /// An encoding failure is a typed mint failure, never an empty body: a
+    /// versioned prefix carrying no bindings would be a well-formed-looking
+    /// wire that no echoed continuation can ever verify, so the owner would
+    /// publish a `TRUNCATED` page whose successor has no address. The mint
+    /// fails closed instead, and the read that needed the continuation fails
+    /// rather than reporting a page whose remainder cannot be resumed.
+    fn to_wire(&self) -> Result<String, StoreError> {
+        let body = canonical_json_bytes(self).map_err(|error| {
+            StoreError::Serialization(format!(
+                "automation page cursor canonical encoding failed: {error}"
+            ))
+        })?;
+        let body = String::from_utf8(body).map_err(|error| {
+            StoreError::Serialization(format!(
+                "automation page cursor canonical encoding is not UTF-8: {error}"
+            ))
+        })?;
+        Ok(format!("{AUTOMATION_CURSOR_VERSION}:{body}"))
     }
 }
 
@@ -481,7 +495,7 @@ pub fn automation_cursor_mint(
     cursor
         .validate()
         .map_err(AutomationContractError::into_store_error)?;
-    let wire = cursor.to_wire();
+    let wire = cursor.to_wire()?;
     if wire.len() > MAX_AUTOMATION_CURSOR_BYTES {
         return Err(StoreError::PayloadTooLarge);
     }
