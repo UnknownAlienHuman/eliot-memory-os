@@ -33,12 +33,13 @@ mod installed_binary;
 mod parent_authority;
 mod parent_dispatch;
 mod parent_runtime;
+mod request_loop;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
 mod wasmtime_provider;
 
-pub use admission::{PortGrantError, resolve_kernel_port_grant};
+pub use admission::{LiveAuthority, PortGrantError, ResolvedPortGrant, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
@@ -78,7 +79,14 @@ pub use installed_binary::{
 };
 pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
-pub use parent_runtime::{GovernorPorts, drive_parent_runtime};
+pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime};
+pub use request_loop::{
+    AdmittedBinding, DeliverySetChannel, LoopError, MAX_RESULT_FRAME_BYTES, OP_CANCEL, OP_INVOKE,
+    OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError, OrdinaryOutcome, WASM_HOST_REQUEST_WIRE_ID,
+    WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID, WasmHostRequest,
+    WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame, run_ordinary_request_loop,
+    run_request_loop,
+};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
