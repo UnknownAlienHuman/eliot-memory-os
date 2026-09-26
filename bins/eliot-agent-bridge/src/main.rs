@@ -2861,12 +2861,21 @@ fn bridge_error_code(error: &BridgeError) -> (&'static str, String) {
 
 /// Bounds one wire control name echoed in diagnostics so diagnostics never
 /// echo unbounded client text.
+///
+/// The budget covers at most `LIMIT` retained input bytes, floored to the
+/// last UTF-8 character boundary so the prefix stays valid UTF-8; the `…`
+/// truncation marker rides outside the budget. Only the bounded prefix is
+/// allocated, never the full unbounded input.
 fn bound_mcp_method(method: &str) -> String {
     const LIMIT: usize = 64;
     if method.len() <= LIMIT {
         method.to_owned()
     } else {
-        format!("{}…", &method[..LIMIT])
+        let mut end = LIMIT;
+        while !method.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &method[..end])
     }
 }
 

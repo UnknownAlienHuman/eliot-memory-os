@@ -2471,11 +2471,20 @@ pub fn gateway_error_to_wire(error: &HostGatewayError) -> (i64, &'static str) {
 
 /// Bounds one control name echoed in diagnostics; longer names truncate so
 /// diagnostics never echo protected bodies.
+///
+/// The budget covers at most `MAX_WIRE_METHOD_CHARS` retained input bytes,
+/// floored to the last UTF-8 character boundary so the prefix stays valid
+/// UTF-8; the `…` truncation marker rides outside the budget. Only the bounded
+/// prefix is allocated, never the full unbounded input.
 fn bound_wire_text(value: &str) -> String {
     if value.len() <= MAX_WIRE_METHOD_CHARS {
         value.to_owned()
     } else {
-        format!("{}…", &value[..MAX_WIRE_METHOD_CHARS])
+        let mut end = MAX_WIRE_METHOD_CHARS;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &value[..end])
     }
 }
 
