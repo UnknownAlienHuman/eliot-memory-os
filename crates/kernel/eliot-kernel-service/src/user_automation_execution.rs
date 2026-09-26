@@ -569,6 +569,33 @@ impl UserAutomationWakeCancellation {
         }
         Ok(())
     }
+
+    /// Checks the atomic Host answer against the exact ordered target batch.
+    /// Host applies the batch in request order; a subset, extra wake, or
+    /// reordered answer is not evidence that this request was completed.
+    pub fn validate_cancelled_wake_ids(
+        &self,
+        cancelled_wake_ids: &[String],
+    ) -> Result<(), UserAutomationExecutionError> {
+        self.validate()?;
+        if self.targets.is_empty() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation has no owner-issued targets",
+            ));
+        }
+        validate_unique_text_list(cancelled_wake_ids, "cancelled_wake_ids")?;
+        if cancelled_wake_ids.len() != self.targets.len()
+            || cancelled_wake_ids
+                .iter()
+                .zip(&self.targets)
+                .any(|(wake_id, target)| wake_id != &target.wake_id)
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancelled wakes do not match the exact owner-issued target batch",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Exact authenticated lookup for one persisted UserAutomation wake.
@@ -2122,9 +2149,12 @@ where
         request
             .validate()
             .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-        let cancelled = self.wake.cancel_pending_wakes(request).await?;
-        validate_unique_text_list(&cancelled, "cancelled_wake_ids")
-            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let cancelled = self.wake.cancel_pending_wakes(request.clone()).await?;
+        request.validate_cancelled_wake_ids(&cancelled).map_err(|error| {
+            UserAutomationRuntimeError::UnknownOutcome(format!(
+                "wake owner returned a conflicting answer after cancellation was issued: {error}"
+            ))
+        })?;
         Ok(cancelled)
     }
 
@@ -2482,8 +2512,25 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             targets,
         };
         cancellation.validate()?;
-        let cancelled_wake_ids = runtime.cancel_pending_wakes(cancellation).await?;
-        validate_unique_text_list(&cancelled_wake_ids, "cancelled_wake_ids")?;
+        let cancelled_wake_ids = runtime
+            .cancel_pending_wakes(cancellation.clone())
+            .await
+            .map_err(|error| match error {
+                UserAutomationRuntimeError::IdentityConflict => {
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "wake owner returned a foreign cancellation answer after the request was issued"
+                            .to_owned(),
+                    )
+                }
+                other => other,
+            })?;
+        cancellation
+            .validate_cancelled_wake_ids(&cancelled_wake_ids)
+            .map_err(|error| {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "wake owner returned a conflicting answer after cancellation was issued: {error}"
+                ))
+            })?;
         Ok(UserAutomationRemovalResult {
             revision,
             receipt,
