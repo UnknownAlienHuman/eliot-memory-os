@@ -3185,6 +3185,12 @@ impl KernelComposition {
                 "configuration": transition.configuration,
                 "wake": transition.wake,
                 "horizon": transition.horizon,
+                // The one post-commit orchestration record of this parent
+                // operation: the runtime obligations retained durably before any
+                // owner effect was issued, each with its original owner
+                // operation identity and its durable disposition. It is absent
+                // exactly when the operation owns no runtime obligation.
+                "orchestration": transition.orchestration,
                 "execution": transition.execution,
                 "occurrences": occurrences,
             },

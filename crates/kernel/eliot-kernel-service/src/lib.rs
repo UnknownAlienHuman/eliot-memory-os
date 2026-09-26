@@ -57,6 +57,7 @@ mod user_automation_execution_client;
 mod user_automation_failure_history;
 #[cfg(test)]
 mod user_automation_failure_history_tests;
+mod user_automation_orchestration;
 mod user_automation_runtime_handoff;
 mod user_automation_store;
 #[cfg(test)]
@@ -241,6 +242,14 @@ pub use user_automation_execution_client::{
 };
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
+};
+pub use user_automation_orchestration::{
+    USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationError,
+    UserAutomationOrchestrationRecord, UserAutomationRuntimeObligation,
+    UserAutomationRuntimeObligationAnswer, UserAutomationRuntimeObligationDisposition,
+    UserAutomationRuntimeObligationKind, retained_user_automation_obligation,
+    runtime_obligation_operation_id, runtime_obligation_payload_digest,
+    runtime_obligation_request_digest,
 };
 pub use user_automation_runtime_handoff::{
     USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
