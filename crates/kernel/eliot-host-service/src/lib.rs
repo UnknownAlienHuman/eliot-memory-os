@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 
 pub mod reactive_context_delivery;
+pub mod reactive_context_runtime_receipt;
 pub mod runtime_control;
 pub mod user_automation_durable_job;
 pub mod user_automation_execution;
@@ -37,6 +38,11 @@ pub use reactive_context_delivery::{
     ReactiveContextResolveRequest, ReactiveContextResolvedEndpoint, ReactiveContextSendOutcome,
     ReactiveContextSendRequest, ReactiveContextTransportError, ReactiveContextTransportPort,
     ReactiveContextTransportReceipt, RestartReconciliation, SystemReactiveContextClock,
+};
+pub use reactive_context_runtime_receipt::{
+    REACTIVE_CONTEXT_RUNTIME_RECEIPT_WIRE_ID, REACTIVE_CONTEXT_RUNTIME_RECEIPT_WIRE_VERSION,
+    ReactiveContextRuntimeDisposition, ReactiveContextRuntimeReceipt,
+    ReactiveContextRuntimeReceiptError, project_reactive_context_runtime_receipt,
 };
 
 pub use eliot_kernel_service::{
