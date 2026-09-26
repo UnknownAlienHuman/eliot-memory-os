@@ -7038,8 +7038,9 @@ impl RedbRecoveryStore {
 
     /// Loads one retained replay commitment inside a write transaction:
     /// `None` when the identity has no post-compaction evidence. A live row
-    /// and a commitment never coexist; the stage entry checks the live row
-    /// first, so this is consulted only after the live row is gone.
+    /// and a commitment never coexist; [`Self::check_bridge_retained_replay_in`]
+    /// checks the live row first, so this is consulted only after the live
+    /// row is gone.
     fn load_bridge_commitment_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -7341,6 +7342,14 @@ impl RedbRecoveryStore {
     /// conflicting pending handoff fails here instead of surfacing later.
     /// Identical payload bytes at two genuinely distinct event identities
     /// and positions remain legitimate stage requests.
+    ///
+    /// The retained-history decision itself lives in
+    /// [`Self::check_bridge_retained_replay_in`]: live rows, retained
+    /// replay commitments, and the compacted/retired boundary are
+    /// consulted before anything fresh is allocated, and an existing
+    /// disposition returns with `fresh: false`. Only a genuinely new
+    /// identity falls through to
+    /// [`Self::stage_fresh_bridge_event_checked`].
     pub fn stage_bridge_event_checked(
         &self,
         staged: &serde_json::Value,
@@ -7362,56 +7371,64 @@ impl RedbRecoveryStore {
                 BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
                 BridgeStreamRight::Append,
             )?;
-            let existing: Option<BridgeEventRow> =
-                Self::load_bridge_event_row_in(&write, &stage.key)?;
-            if let Some(row) = existing {
-                row.validate()?;
-                Self::replay_bridge_event_outcome_checked(&write, &access, &row, &stage, &staging)?
-            } else {
-                Self::stage_fresh_bridge_event_checked(&write, &access, &stage, &staging, now_ms)?
+            match Self::check_bridge_retained_replay_in(&write, &access, &stage, &staging)? {
+                Some(outcome) => outcome,
+                None => Self::stage_fresh_bridge_event_checked(
+                    &write, &access, &stage, &staging, now_ms,
+                )?,
             }
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
     }
 
-    /// Stages an identity with no live row (issue #2730, items 1-2, 5):
-    /// retained history is consulted before anything fresh is decided.
-    /// Exact commitment evidence returns the existing disposition with
-    /// `fresh: false`, and changed content under a committed identity
-    /// fails with [`OrsError::DuplicateConflict`]. A position admitted
-    /// under a different event rejects the request before any mutation;
-    /// a request below the retained compacted boundary without exact
-    /// evidence returns the explicit retired disposition with `fresh:
-    /// false` and no mutation; a conflicting pending handoff fails before
-    /// any record/cursor mutation. Only a genuinely new identity at a
-    /// free position above the boundary inserts.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "fresh-identity staging keeps the commitment, position, boundary, and handoff checks in one auditable order"
-    )]
-    fn stage_fresh_bridge_event_checked(
+    /// Decides one owner-checked stage request against retained history
+    /// (issue #2730, item 2): live rows, retained replay commitments, and
+    /// the stream's compacted/retired boundary are consulted before
+    /// anything fresh is allocated, inside the authorized stream
+    /// incarnation the caller already bound. Performs no mutation itself.
+    ///
+    /// Where exact identity/content evidence remains, the existing
+    /// disposition returns with `fresh: false` — the live row's duplicate
+    /// outcome, or the retained commitment's duplicate outcome after
+    /// payload compaction. A frontier alone proves neither a particular
+    /// event ID nor its bytes: when the request names a position at or
+    /// below the retained compacted boundary with no exact evidence left,
+    /// the explicit retired/unverifiable recovery disposition returns with
+    /// `fresh: false`, never a fabricated duplicate or fresh insertion.
+    /// Changed content under a live or committed identity, a position
+    /// admitted under a different event, or a torn position binding with
+    /// no retained evidence fails closed. Returns `Ok(None)` only for a
+    /// genuinely new identity at a free position above the boundary; the
+    /// caller still runs the pending-handoff compatibility check before
+    /// any record/cursor mutation.
+    fn check_bridge_retained_replay_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
-        now_ms: u64,
-    ) -> Result<serde_json::Value, OrsError> {
-        access.require(BridgeStreamRight::Append)?;
-        let commitment = Self::load_bridge_commitment_in(write, &stage.namespace, &stage.event_id)?;
-        if let Some(commitment) = commitment {
+    ) -> Result<Option<serde_json::Value>, OrsError> {
+        if let Some(row) = Self::load_bridge_event_row_in(write, &stage.key)? {
+            row.validate()?;
+            return Ok(Some(Self::replay_bridge_event_outcome_checked(
+                write, access, &row, stage, staging,
+            )?));
+        }
+        if let Some(commitment) =
+            Self::load_bridge_commitment_in(write, &stage.namespace, &stage.event_id)?
+        {
             if !Self::bridge_commitment_matches(&commitment, stage, staging) {
                 return Err(OrsError::DuplicateConflict);
             }
             let (durable, acked) = Self::bridge_cursors_in_checked(write, access)?;
             let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
-            return Ok(Self::bridge_event_outcome_from_commitment(
+            return Ok(Some(Self::bridge_event_outcome_from_commitment(
                 &commitment,
                 "duplicate",
                 durable,
                 acked,
                 handoff.as_deref(),
-            ));
+            )));
         }
         let cursor = Self::load_bridge_cursor_row_in(write, &access.namespace)?;
         let (durable, acked, compacted) = cursor.as_ref().map_or((0, 0, 0), |row| {
@@ -7439,14 +7456,14 @@ impl RedbRecoveryStore {
             // position index still names this same identity (its
             // commitment may have expired under bound pressure).
             let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
-            return Ok(Self::bridge_event_retired_outcome(
+            return Ok(Some(Self::bridge_event_retired_outcome(
                 stage,
                 staging,
                 durable,
                 acked,
                 compacted,
                 handoff.as_deref(),
-            ));
+            )));
         }
         if torn_position {
             // Above the boundary the position must resolve to retained
@@ -7458,6 +7475,25 @@ impl RedbRecoveryStore {
                     .to_owned(),
             });
         }
+        Ok(None)
+    }
+
+    /// Stages an identity with no retained evidence (issue #2730, items
+    /// 1-2, 5): [`Self::check_bridge_retained_replay_in`] already
+    /// established that no live row, no retained commitment, no occupant
+    /// position, and no retired boundary blocks this identity. A
+    /// conflicting pending handoff still fails before any record/cursor
+    /// mutation; otherwise the row, its ordered position binding, its
+    /// cursor advance, and its pending handoff commit in this one short
+    /// ORS transaction.
+    fn stage_fresh_bridge_event_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        stage: &BridgeCheckedStage,
+        staging: &BridgeEventPrivacyStaging,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        access.require(BridgeStreamRight::Append)?;
         Self::check_bridge_handoff_compatible_in(write, access, stage)?;
         Self::insert_bridge_event_row_checked(write, access, stage, staging, now_ms)
     }
