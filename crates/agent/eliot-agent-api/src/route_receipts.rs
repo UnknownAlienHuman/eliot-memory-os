@@ -93,6 +93,29 @@ const FORBIDDEN_PUBLIC_ERROR_MARKERS: &[&str] = &[
 /// publishable after sanitization.
 const REDACTED_PUBLIC_ERROR: &str = "redacted-provider-error";
 
+/// Closed adapter-boundary registry of permitted public diagnostics (issue
+/// #2641): exact fixed strings authored by ELIOT trusted caller code, never
+/// provider prose. An arbitrary marker-free provider string is not certified
+/// safe and never qualifies, so [`sanitize_adapter_error`] admits a message
+/// verbatim only on exact equality with one of these entries and discards
+/// everything else to [`REDACTED_PUBLIC_ERROR`]. Entries are added only
+/// together with the real production caller that issues them; the wire
+/// message of a provider error is untrusted input and never an entry.
+pub const PERMITTED_PUBLIC_ERROR_DIAGNOSTICS: &[&str] = &[
+    // Issued by the ACP production terminal assembly for a non-terminal
+    // envelope (`AcpResultEnvelope::assemble_candidate_result`): the only
+    // caller-owned fixed reason flowing through the adapter-error boundary.
+    "acp result envelope is not terminal; outcome unreconciled",
+];
+
+/// Reports whether a trimmed adapter-error message is an admitted public
+/// diagnostic: exact equality with one entry of
+/// [`PERMITTED_PUBLIC_ERROR_DIAGNOSTICS`]. Exact comparison performs no
+/// slicing, so it is UTF-8 safe by construction for any non-ASCII input.
+fn is_permitted_public_diagnostic(trimmed: &str) -> bool {
+    PERMITTED_PUBLIC_ERROR_DIAGNOSTICS.contains(&trimmed)
+}
+
 /// Byte-preserving ASCII case-insensitive credential-marker screen (issue
 /// #2641). Markers are ASCII, so stepping over the original string's char
 /// boundaries keeps every compared slice boundary valid in both views. The
@@ -119,8 +142,11 @@ fn contains_forbidden_marker(text: &str) -> bool {
 /// fallback whenever it is credential-bearing, oversized, control-bearing,
 /// or otherwise not an establishable permitted public diagnostic: label-only
 /// redaction would retain values such as `password=DEMO_VALUE_123` while
-/// defeating the validator's keyword check, and parsing a credential grammar
-/// to keep surrounding prose is rejected in favor of discarding. Control
+/// defeating the validator's keyword check, parsing a credential grammar
+/// to keep surrounding prose is rejected in favor of discarding, and an
+/// arbitrary marker-free string is not certified safe, so only an exact
+/// [`PERMITTED_PUBLIC_ERROR_DIAGNOSTICS`] entry passes verbatim while every
+/// other unestablished content takes the explicit fallback. Control
 /// filtering happens by rejection before any marker scan, so tokens are never
 /// joined across removed controls into a forbidden sequence after the last
 /// scan (e.g. `bea\nrer DEMO_VALUE_123`). The input bound is checked before
@@ -147,6 +173,13 @@ pub fn sanitize_adapter_error(raw: &str) -> String {
         return REDACTED_PUBLIC_ERROR.to_owned();
     }
     if contains_forbidden_marker(trimmed) {
+        return REDACTED_PUBLIC_ERROR.to_owned();
+    }
+    // Unestablished content is never certified safe: only an exact
+    // caller-owned permitted diagnostic passes verbatim (exact equality, no
+    // slicing, so non-ASCII input stays panic-free); unknown free-form prose
+    // takes the explicit fallback.
+    if !is_permitted_public_diagnostic(trimmed) {
         return REDACTED_PUBLIC_ERROR.to_owned();
     }
     // Truncation only removes a suffix, so it cannot introduce markers or

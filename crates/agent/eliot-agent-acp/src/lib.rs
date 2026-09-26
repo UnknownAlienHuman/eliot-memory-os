@@ -34,11 +34,11 @@ use eliot_agent_api::{
     CONTRACT_VERSION, CancellationState, ClockReading, EffectKind, EventCursor, EventId,
     ExecutionOutcome, HostEventDeliveryDisposition, HostEventKind, HostEventNormalizationReceipt,
     HostEventPrivacyClass, LowercaseSha256, MAX_TEXT_REF_CHARS, NormalizationCoverage,
-    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ProviderObservationLineage, QuotaKnowledge,
-    RestrictedRawSourceHandle, ResultDisposition, RouteFingerprint, RouteObservationState, TaskId,
-    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
-    sanitize_adapter_error,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PERMITTED_PUBLIC_ERROR_DIAGNOSTICS,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
+    QuotaKnowledge, RestrictedRawSourceHandle, ResultDisposition, RouteFingerprint,
+    RouteObservationState, TaskId, UnsupportedDisposition, UnsupportedEventObservation,
+    UnsupportedEventReason, UsageReceipt, sanitize_adapter_error,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -1614,6 +1614,29 @@ impl AcpResultEnvelope {
         format!("{PREFIX}{operation}")
     }
 
+    /// Narrow caller-side trusted-code mapping for ACP failure reasons
+    /// (issue #2641): admits a caller-supplied reason verbatim only when it
+    /// exactly equals one entry of the shared
+    /// [`PERMITTED_PUBLIC_ERROR_DIAGNOSTICS`] registry, returning the
+    /// canonical registry entry. The match is exact equality on the trimmed
+    /// input (no slicing, no case folding, no prefix or code-shape pattern),
+    /// so unknown free-form provider prose never qualifies and the protocol's
+    /// open reason-code registry stays open: no JSON-RPC/ACP numeric code is
+    /// assigned public meaning here. Wire error codes keep their meaning
+    /// through their existing trusted contract instead — the typed
+    /// [`AcpRpcError`] object (including its numeric `code`) is retained
+    /// whole in the envelope payload as restricted evidence, never rendered
+    /// into a public field. A miss returns `None` so the caller falls through
+    /// to [`sanitize_adapter_error`], which yields the explicit
+    /// `redacted-provider-error` fallback for unestablished content.
+    fn acp_trusted_public_diagnostic(reason: &str) -> Option<&'static str> {
+        let trimmed = reason.trim();
+        PERMITTED_PUBLIC_ERROR_DIAGNOSTICS
+            .iter()
+            .find(|permitted| **permitted == trimmed)
+            .copied()
+    }
+
     fn acp_result_execution_parts(
         disposition: ResultDisposition,
         unknown_reason: Option<&String>,
@@ -1662,13 +1685,19 @@ impl AcpResultEnvelope {
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
         // Adapter-boundary sanitization (issue #369 W20/A21, hardened by
-        // issue #2641): the provider failure reason is untrusted text. It is
-        // sanitized once here so the unknown reason and the public error below
-        // never carry secrets or credentials, and the quarantine/recovery
+        // issue #2641): the provider failure reason is untrusted text. A
+        // caller-owned trusted diagnostic (exact registry match via
+        // `acp_trusted_public_diagnostic`) keeps its meaning verbatim;
+        // everything else is sanitized once here so the unknown reason and
+        // the public error below never carry secrets or credentials, and
+        // unknown free-form prose takes the explicit
+        // `redacted-provider-error` fallback. The quarantine/recovery
         // handle below carries only the owner-issued operation reference, so
-        // all three emitted fields stay bounded public diagnostics. Plain
-        // operational reasons pass through verbatim.
-        let unknown_reason = unknown_reason.map(|reason| sanitize_adapter_error(&reason));
+        // all three emitted fields stay bounded public diagnostics.
+        let unknown_reason = unknown_reason.map(|reason| {
+            Self::acp_trusted_public_diagnostic(&reason)
+                .map_or_else(|| sanitize_adapter_error(&reason), str::to_owned)
+        });
         let usage = UsageReceipt {
             input_tokens: None,
             output_tokens: None,

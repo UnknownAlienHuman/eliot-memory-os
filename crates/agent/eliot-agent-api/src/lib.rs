@@ -46,8 +46,8 @@ pub use route_receipts::{
     LEGACY_CANDIDATE_SCHEMA_V5, LegacyCandidateMigration, LegacyCapabilityRouteDecisionV5,
     LegacyQuarantineReason, LegacyRouteQuarantine, MAX_EVIDENCE_REFS, MAX_REJECTED_CANDIDATES,
     MAX_ROUTE_CANDIDATES, MAX_SAFE_ERROR_CHARS, MAX_TEXT_REF_CHARS, NoRouteDisposition,
-    PhysicalRouteObservationReceipt, RejectedRouteCandidate, RouteObservationState,
-    RouteSelectionCandidate, candidate_digest_for, route_divergence_fields,
+    PERMITTED_PUBLIC_ERROR_DIAGNOSTICS, PhysicalRouteObservationReceipt, RejectedRouteCandidate,
+    RouteObservationState, RouteSelectionCandidate, candidate_digest_for, route_divergence_fields,
     route_fingerprint_digest_for, sanitize_adapter_error, validate_safe_public_error,
 };
 
