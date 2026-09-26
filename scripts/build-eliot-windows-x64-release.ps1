@@ -406,7 +406,8 @@ function Resolve-GovernorRetirementTrustPolicy([string]$Repo, [string]$SourceCom
     $policyPath = Join-Path $Repo $script:GovernorRetirementTrustPolicyPath
     $evidence = Read-VerifiedResidentFile $policyPath 'root-owned retirement approval trust policy'
     $expectedBlob = Get-GitBlobHash $Repo $SourceCommit $script:GovernorRetirementTrustPolicyPath
-    if ([string]$evidence.sha256 -cne $expectedBlob) {
+    $actualBlob = Get-FilteredFileHash $Repo $script:GovernorRetirementTrustPolicyPath $policyPath
+    if ($actualBlob -cne $expectedBlob) {
         throw 'the retirement approval trust policy differs from the pinned source commit'
     }
     $policy = Read-GovernorRetirementJsonFile $policyPath 'root-owned retirement approval trust policy'
@@ -448,7 +449,7 @@ function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$
         if ([string]$cargo.status -ceq 'present') {
             $retainedEvidence = New-RetainedGovernorEvidence $SourceCommit $pinned $cargo
             $retainedEvidence.retirement_approval = New-GovernorRetirementAbsentApprovalEvidence $SourceCommit $pinned
-            return [pscustomobject]@{ Kind = 'Retained'; Reason = [null]; Identity = $cargo; Evidence = $retainedEvidence; Disposition = $script:GovernorRetainedDisposition; ApprovalReference = $null }
+            return [pscustomobject]@{ Kind = 'Retained'; Reason = $null; Identity = $cargo; Evidence = $retainedEvidence; Disposition = $script:GovernorRetainedDisposition; ApprovalReference = $null }
         }
         return [pscustomobject]@{ Kind = 'MalformedOrAmbiguous'; Reason = 'package eliot-app is absent from cargo metadata and no detached owner retirement approval was supplied for this candidate (source absence is not authority to retire)'; Identity = $null; Evidence = $null; Disposition = $null; ApprovalReference = $null }
     }
