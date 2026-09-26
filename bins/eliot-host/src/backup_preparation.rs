@@ -31,8 +31,67 @@
 //! [`DestinationAdmission::audit_fence_note`]; the note stays evidence text
 //! with its non-authoritative ceiling and is never a lease, grant, or
 //! current-state assertion.
+//!
+//! # Staging parent, generation and sweep bounds
+//!
+//! Three admissions carry the guarantees issue #958 requires, and each one is
+//! decided before any effect:
+//!
+//! - **The staging parent is owner-proved, never client-named.**
+//!   [`admit_staging_parent`] keeps its structural checks and then proves the
+//!   parent through [`verify_staging_parent_lease`], which
+//!   containment-checks it against the real ELIOT protected contour and pins
+//!   the directory chain by retained handle. A client-supplied arbitrary path
+//!   is refused with [`PreparationError::ArbitraryPath`], and the parent this
+//!   module proceeds with is the owner-resolved canonical path rather than a
+//!   name-based canonicalise. That is also what makes removal reachable:
+//!   [`reverify_recorded_destination`] requires the same containment, so a
+//!   root created here is by construction one whose removal path
+//!   ([`remove_reverified_destination`]) can be reached. The proof is taken at
+//!   admission; the recorded root is proved again through the same owner
+//!   immediately before any removal, and preserved when that proof fails.
+//! - **The generation comparison is an owner comparison on the delegated
+//!   path.**
+//!   [`DelegatedPreparation::prepare`] sources
+//!   [`DestinationAdmission::authority_generation`] from the committed
+//!   activation fence ([`OwnerEvidence::authority_generation`]) and never from
+//!   the presented request, so the `approved_generation != authority_generation`
+//!   arm in [`validate_admission`] compares a caller-presented value against
+//!   owner-issued evidence instead of comparing two values the same caller
+//!   supplied. A caller can no longer make the pair agree by agreement **through
+//!   this path**. It is stated at the narrower scope the code actually has:
+//!   [`prepare_isolated_destination`] and [`DestinationAdmission`] remain
+//!   `pub` with all-public fields, so a caller that builds an admission itself can
+//!   still present two agreeing values, and the arm cannot tell. The
+//!   owner-sourced construction is what makes the check real, and only
+//!   `DelegatedPreparation::prepare` performs it.
+//! - **The cleanup sweep is budgeted.** [`cleanup_preparations`] is bounded by
+//!   [`MAX_CLEANUP_REQUESTED_IDS`], [`MAX_CLEANUP_SWEEP_OPERATIONS`] and
+//!   [`CLEANUP_SWEEP_BUDGET`], and refuses with
+//!   [`PreparationError::SweepBudget`] instead of letting an unbounded journal
+//!   drive unbounded reconciles and `remove_dir_all` calls (A13.9: a Durable
+//!   Job carries a budget).
+//!
+//! # Target build and profile are presented scope, not approved names
+//!
+//! [`DestinationAdmission::target_build`] and
+//! [`DestinationAdmission::target_profile`] stay caller-presented bounded text,
+//! and are hashed into the admission digest as exactly that. The owner records
+//! reachable from this module ([`OwnerEvidence`], [`ApprovedBuildBinding`])
+//! carry approved artifact *digests* plus a generation handle, and have no
+//! build-name or profile-name field, so no owner source exists here against
+//! which a presented name could be approved; no name-level approval list and
+//! no always-passing comparison is invented in its place. The owner-approval
+//! check that genuinely exists is the presented `build_digests` subset check
+//! against the owner artifact set, in
+//! [`DelegatedPreparation::prepare`] and again in
+//! [`OwnerEvidence::project_backup_configuration`]. Nothing here claims more:
+//! the owner-issued facts in the receipt are the manifest digest and the
+//! configuration projection digest, and the build/profile strings are scope
+//! text the owner has not approved by name.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::backup_config_projection::{
     ApprovedBuildBinding, AuditFenceNote, BackupConfigProjection, BackupConfigRequest,
@@ -66,6 +125,49 @@ pub const MAX_IDENTITY_LEN: usize = 256;
 /// let preparation refuse a note the projector had already accepted, which
 /// would report a receipt-size limit as an evidence failure.
 pub const MAX_AUDIT_NOTE_LEN: usize = 16615;
+/// Maximum number of caller-presented operation ids one cleanup sweep may be
+/// narrowed to.
+///
+/// The narrowing list is caller input, so it is bounded before the sweep does
+/// any work: the membership test against the journal-owned set is quadratic in
+/// the two list lengths, and an unbounded presented list would make one cleanup
+/// call cost more than the sweep it narrows. 256 is two orders of magnitude
+/// above any plausible single narrowing request (a cancel batch, one
+/// maintenance pass) while still refusing a list that is trying to be a dump.
+pub const MAX_CLEANUP_REQUESTED_IDS: usize = 256;
+/// Maximum number of journal-owned operations one cleanup sweep may sweep.
+///
+/// Each swept operation costs one journal load, one protected-root lease open
+/// (which pins the whole directory contour by retained handle) and at most one
+/// `remove_dir_all`, so the swept key set is the sweep's real work bound. 256
+/// covers every realistic leftover of one Host's preparation history while
+/// staying far below the handle and time pressure of an unbounded journal; a
+/// larger set is refused whole and swept in bounded passes, never truncated
+/// silently (truncation would hide owned roots that still exist).
+///
+/// The bound applies to the set the call will actually sweep — the journal's own
+/// operations intersected with the caller's narrowing list, or the whole owned
+/// set when no list is given. It deliberately does NOT bound the journal's total
+/// history: a journal grows by one operation per preparation, so bounding the
+/// owned set would refuse every later cleanup forever, including a caller that
+/// named one specific operation, and there would be no way to make progress
+/// again. A non-empty narrowing list is separately capped by
+/// [`MAX_CLEANUP_REQUESTED_IDS`].
+pub const MAX_CLEANUP_SWEEP_OPERATIONS: usize = 256;
+/// Wall-clock budget for one cleanup sweep (A13.9: a Durable Job has a
+/// budget).
+///
+/// The clock starts before the owned set is listed and is checked after the
+/// listing returns and again before every swept operation, so the bound caps the
+/// number of *subsequent* reconciles and removals rather than interrupting one in
+/// flight (`remove_dir_all` cannot be cancelled once issued) and the listing's
+/// own unbounded cost still falls inside the window even though the call itself
+/// cannot be interrupted. 30 s is generous headroom for 256 individually
+/// re-proven owned roots on a loaded volume and still far below any caller wait
+/// that a runaway sweep could justify; exhaustion refuses with
+/// [`PreparationError::SweepBudget`], names any roots already removed in the same
+/// call, and preserves everything not yet swept.
+pub const CLEANUP_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// Domain separator for owner-minted destination identities.
 pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
 
@@ -78,7 +180,8 @@ pub enum PreparationError {
     /// Approved generation disagrees with the authority generation input.
     #[error("unapproved generation: approved {approved} != authority {authority}")]
     UnapprovedGeneration { approved: u64, authority: u64 },
-    /// Staging parent is the source, nested under it, missing, or not a directory.
+    /// Staging parent is the source, nested under it, missing, not a directory,
+    /// or outside the ELIOT protected contour (cases 958/5-6, 958/7).
     #[error("staging parent not admitted: {reason}")]
     ArbitraryPath { reason: String },
     /// The active/source installation itself was targeted.
@@ -115,6 +218,39 @@ pub enum PreparationError {
     /// Filesystem effect failed after admission (message only).
     #[error("filesystem effect failed at {path}: {reason}")]
     FilesystemEffect { path: String, reason: String },
+    /// The cleanup sweep exceeded its explicit count or time budget
+    /// (case 958/16).
+    ///
+    /// A refused sweep stops before the next operation: nothing further is
+    /// deleted and nothing is deleted by truncation, so every root this module
+    /// created stays individually re-provable on the next bounded pass. When
+    /// the refusal follows removals already performed in the same call, `reason`
+    /// additionally names those completed operation ids — a budget error raised
+    /// after an irreversible effect must never hide which effects occurred.
+    #[error("cleanup sweep budget exceeded on {field}: {reason}")]
+    SweepBudget { field: &'static str, reason: String },
+}
+
+impl PreparationError {
+    /// Names the operations this call already removed, so a refusal raised after
+    /// an irreversible effect still carries the evidence of that effect.
+    ///
+    /// Appended to the static reason, never replacing it, and bounded to the
+    /// number of ids the sweep can have completed under
+    /// [`MAX_CLEANUP_SWEEP_OPERATIONS`]. An empty set leaves the reason exactly
+    /// as it was.
+    fn with_removed(self, removed: &[String]) -> Self {
+        if removed.is_empty() {
+            return self;
+        }
+        match self {
+            Self::SweepBudget { field, reason } => Self::SweepBudget {
+                field,
+                reason: format!("{reason}; already removed in this call: {removed:?}"),
+            },
+            other => other,
+        }
+    }
 }
 
 // F-LOG-HOST-8 (#983) backup preparation diagnostics: observation-only helpers.
@@ -193,6 +329,7 @@ fn preparation_error_category(error: &PreparationError) -> (&'static str, &'stat
         PreparationError::JournalFault(_) => ("journal_fault", "journal"),
         PreparationError::PlatformUnsupported => ("platform_unsupported", "platform"),
         PreparationError::FilesystemEffect { .. } => ("filesystem_effect", "path"),
+        PreparationError::SweepBudget { field, .. } => ("sweep_budget", field),
     }
 }
 
@@ -279,7 +416,8 @@ impl PreparationClass {
 ///
 /// Every authority input is presented evidence. `staging_parent` is an
 /// explicitly admitted isolated-prep parent directory — never the source, never
-/// an arbitrary client path (verified, not trusted).
+/// an arbitrary client path (verified by the protected-root owner, not
+/// trusted), and never outside the ELIOT protected contour.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DestinationAdmission {
     /// Operation identity (bounded text, unique per preparation).
@@ -290,16 +428,36 @@ pub struct DestinationAdmission {
     pub source_installation_id: String,
     /// Source installation root (observed read-only; never modified).
     pub source_root: PathBuf,
-    /// Explicitly admitted staging parent (must exist, be a directory, and not
-    /// be or contain the source; reparse-free).
+    /// Explicitly admitted staging parent (must exist, be a directory, not be
+    /// or contain the source, be reparse-free, and lie inside the ELIOT
+    /// protected contour; verified by the protected-root owner, never
+    /// trusted as a name).
     pub staging_parent: PathBuf,
-    /// Approved target build identity (bounded text).
+    /// Target build identity for the destination (bounded caller-presented
+    /// text).
+    ///
+    /// Not owner-approved by name: the owner records reachable here carry
+    /// approved artifact digests and no build-name field, so this stays the
+    /// presented scope of the operation and is hashed into the admission
+    /// digest as such. What is genuinely owner-approved for the build is the
+    /// presented `build_digests` subset check against the owner artifact set.
     pub target_build: String,
-    /// Approved target profile (bounded text).
+    /// Target profile for the destination (bounded caller-presented text).
+    ///
+    /// Not owner-approved by name, for the same reason as
+    /// [`DestinationAdmission::target_build`]: no owner source carries a
+    /// profile name, and none is invented here.
     pub target_profile: String,
-    /// Generation approved for the destination.
+    /// Generation the caller claims as approved for the destination.
     pub approved_generation: u64,
-    /// Live authority generation presented by the caller; must equal approved.
+    /// Authority generation the admission is checked against; must equal
+    /// `approved_generation`.
+    ///
+    /// Owner-issued on the production path:
+    /// [`DelegatedPreparation::prepare`] fills it from the committed
+    /// activation fence ([`OwnerEvidence::authority_generation`]), so the
+    /// comparison is against owner evidence rather than against a second
+    /// value the same caller presented.
     pub authority_generation: u64,
     /// Config manifest digest the destination must match (hex64). On the
     /// delegated path this is the projected owner-issued configuration digest,
@@ -691,7 +849,10 @@ fn file_identity_text(identity: FileIdentity) -> String {
 /// Every owner variant maps to an existing [`PreparationError`]; none is
 /// stringified into a generic code and no variant is invented. Owner internals
 /// are not echoed: each reason is a static sentence naming the refused
-/// property.
+/// property. Both protected-root callers share this mapping — the recorded
+/// destination re-proof ([`reverify_recorded_destination`]) and the presented
+/// staging parent ([`verify_staging_parent_lease`]) — so the sentences are
+/// worded for a path rather than for a recorded one.
 fn protected_path_to_preparation(
     operation_id: &str,
     path: &Path,
@@ -703,7 +864,7 @@ fn protected_path_to_preparation(
             reason: "protected contour root is not resolvable".to_owned(),
         },
         ProtectedPathError::InvalidPath => PreparationError::ArbitraryPath {
-            reason: "recorded path is outside the protected contour".to_owned(),
+            reason: "path is outside the protected contour".to_owned(),
         },
         ProtectedPathError::ReparsePoint => PreparationError::AliasSubstitution { path: refused },
         ProtectedPathError::AclMismatch => PreparationError::FilesystemEffect {
@@ -771,6 +932,16 @@ fn reverify_recorded_destination(
 }
 
 /// Validates one admission without effects (cases 958/5-7).
+///
+/// The generation arm compares [`DestinationAdmission::approved_generation`]
+/// against [`DestinationAdmission::authority_generation`], and that is only a
+/// real check when the second value came from owner evidence:
+/// [`DelegatedPreparation::prepare`] fills it from
+/// [`OwnerEvidence::authority_generation`], so the production path refuses an
+/// unapproved generation (case 958/7). The shape checks here are unchanged and
+/// stay shape checks: `target_build` and `target_profile` are bounded text with
+/// no name-level owner approval, and the presented `build_digests` subset check
+/// is what approves a build (see the module documentation).
 fn validate_admission(admission: &DestinationAdmission) -> Result<(), PreparationError> {
     check_identity(&admission.operation_id, "operation_id")?;
     check_identity(&admission.source_installation_id, "source_installation_id")?;
@@ -801,8 +972,21 @@ fn validate_admission(admission: &DestinationAdmission) -> Result<(), Preparatio
     Ok(())
 }
 
-/// Admits a staging parent: exists, directory, reparse-free, and neither the
-/// source root nor nested under it (cases 958/5-6, 958/8).
+/// Admits a staging parent: exists, directory, reparse-free, neither the
+/// source root nor nested under it, and proved by the protected-root owner
+/// (cases 958/5-6, 958/7, 958/8).
+///
+/// The structural checks alone admit any existing unrelated directory, so they
+/// are not the whole admission. After they pass, the parent is proved through
+/// [`verify_staging_parent_lease`]: the real
+/// [`ProtectedRootLease::open_existing`] containment-checks it against the
+/// ELIOT protected contour and pins the whole directory chain by retained
+/// handle, and the returned parent is that owner-resolved canonical path. A
+/// client-supplied arbitrary path is therefore refused (case 958/7) instead of
+/// becoming a destination parent, and the parent every root is created under
+/// is one that [`reverify_recorded_destination`] can re-prove before removal, so
+/// the cleanup removal path is reachable for every root created here (case
+/// 958/15).
 fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, PreparationError> {
     let parent = &admission.staging_parent;
     let metadata =
@@ -834,7 +1018,10 @@ fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, Pre
             reason: "staging parent nested under the active source is refused".to_owned(),
         });
     }
-    Ok(canonical_parent)
+    // Owner proof last, so the structural refusals above keep their exact
+    // category and a name that never resolved the protected contour is refused
+    // as the arbitrary path it is.
+    verify_staging_parent_lease(&admission.operation_id, parent)
 }
 
 fn intent_json(admission: &DestinationAdmission, digest: &str, root: &Path) -> serde_json::Value {
@@ -1204,15 +1391,64 @@ pub fn cancel_preparation<J: PreparationJournal>(
 /// source-related is preserved with its reason. Never deletes by bare path
 /// name: every removal is keyed by operation id through the journal, and
 /// `ARCH-RES-03` (A13.7) holds — recovery preserves what it cannot prove it
-/// owns.
+/// owns. That removal is reachable at all because
+/// [`admit_staging_parent`] proved every parent through the same protected
+/// contour this re-proof requires.
+///
+/// The sweep is budgeted (case 958/16, A13.9): the presented narrowing list is
+/// bounded by [`MAX_CLEANUP_REQUESTED_IDS`], the journal-owned set by
+/// [`MAX_CLEANUP_SWEEP_OPERATIONS`], and elapsed time by
+/// [`CLEANUP_SWEEP_BUDGET`]. A bound that is reached refuses the sweep with
+/// [`PreparationError::SweepBudget`] — it never truncates the set, because a
+/// silent truncation would report a partial sweep as complete and strand owned
+/// roots that still exist. Every operation already swept in that call had been
+/// individually re-proven owned before its removal, and the remainder stays
+/// reconcilable by the next bounded pass.
 pub fn cleanup_preparations<J: PreparationJournal>(
     journal: &J,
     operation_ids: &[String],
 ) -> Result<CleanupReport, PreparationError> {
+    let budget_start = Instant::now();
+    if operation_ids.len() > MAX_CLEANUP_REQUESTED_IDS {
+        return Err(sweep_budget_refusal(
+            "requested_operation_ids",
+            "presented narrowing list exceeds the bounded sweep size",
+        ));
+    }
     let mut report = CleanupReport::default();
     let owned = journal
         .list_operations()
         .map_err(|error| note_prepare_error(OP_CLEANUP, "list", error, 0))?;
+    // The count bound applies to the set this call will actually SWEEP, not to
+    // the journal's whole history. A journal grows by one operation per
+    // preparation, so bounding the full owned set would refuse every future
+    // cleanup once the count was passed — including a caller that named one
+    // specific operation — with no way to make progress again. A non-empty
+    // narrowing list is already capped by MAX_CLEANUP_REQUESTED_IDS above, so
+    // the effective set needs no second bound.
+    let effective = if operation_ids.is_empty() {
+        owned.len()
+    } else {
+        owned
+            .iter()
+            .filter(|operation_id| operation_ids.contains(operation_id))
+            .count()
+    };
+    if effective > MAX_CLEANUP_SWEEP_OPERATIONS {
+        return Err(sweep_budget_refusal(
+            "swept_operations",
+            "the effective sweep set exceeds the bounded sweep size",
+        ));
+    }
+    // The clock starts before the owned set is listed, because that listing is
+    // the journal's own cost and an implementor's is unbounded; the first check
+    // is after it returns, since the call itself cannot be interrupted.
+    if budget_start.elapsed() >= CLEANUP_SWEEP_BUDGET {
+        return Err(sweep_budget_refusal(
+            "sweep_elapsed",
+            "sweep budget exhausted before any operation was swept",
+        ));
+    }
     for requested in operation_ids {
         if !owned.contains(requested) {
             // Refused, never deleted: a caller can never nominate a deletion.
@@ -1227,6 +1463,17 @@ pub fn cleanup_preparations<J: PreparationJournal>(
     for operation_id in &owned {
         if !operation_ids.is_empty() && !operation_ids.contains(operation_id) {
             continue;
+        }
+        if budget_start.elapsed() >= CLEANUP_SWEEP_BUDGET {
+            // Removals already performed in THIS call are named in the refusal.
+            // Returning a bare error here would discard the only record of roots
+            // this module already deleted, which is evidence loss immediately
+            // after an irreversible effect.
+            return Err(sweep_budget_refusal(
+                "sweep_elapsed",
+                "sweep budget exhausted; the remainder is preserved for a later pass",
+            )
+            .with_removed(&report.removed));
         }
         match reconcile_preparation(journal, operation_id)
             .map_err(|error| note_prepare_error(OP_CLEANUP, "reconcile", error, 0))?
@@ -1247,6 +1494,32 @@ pub fn cleanup_preparations<J: PreparationJournal>(
         }
     }
     Ok(report)
+}
+
+/// One typed refusal for a cleanup sweep that reached an explicit bound.
+///
+/// Bound exhaustion is a refusal, not a partial success: the sweep stops, the
+/// operation after the last completed one is never reconciled or removed, and
+/// the static reason names the bound without naming a path, identity, or count.
+/// The budget facts are not observed numerically because the observation
+/// contract admits only validated generation/epoch facts, so a count or a
+/// duration is reported as this stable category plus its static field only.
+///
+/// When the refusal follows removals that already happened in the same call, the
+/// caller appends those operation ids to the reason through `with_removed`. A
+/// budget error that arrived after irreversible effects must never hide which
+/// effects occurred, so the removed set travels with the refusal instead of
+/// being dropped with the local report.
+fn sweep_budget_refusal(field: &'static str, reason: &'static str) -> PreparationError {
+    note_prepare_error(
+        OP_CLEANUP,
+        "budget",
+        PreparationError::SweepBudget {
+            field,
+            reason: reason.to_owned(),
+        },
+        0,
+    )
 }
 
 /// Removes one re-proven owned root, or preserves it with the reason.
@@ -1331,7 +1604,11 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
 /// artifact set by that same projection. Numeric generation, lease, purge, and
 /// target build/profile stay caller-presented pending #954 control contracts
 /// and `HostComposition` delegation, which authenticate the caller; the
-/// projection binds them and never invents currency for them.
+/// projection binds them and never invents currency for them. The one
+/// presented generation that is nevertheless decided against owner evidence is
+/// `approved_generation`, compared by
+/// [`DelegatedPreparation::prepare`] against
+/// [`OwnerEvidence::authority_generation`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PresentedPreparationRequest {
     /// Operation identity (bounded text, unique per preparation).
@@ -1340,15 +1617,31 @@ pub struct PresentedPreparationRequest {
     pub class: PreparationClass,
     /// Source installation identity (bounded text).
     pub source_installation_id: String,
-    /// Explicitly admitted staging parent (verified, never trusted).
+    /// Explicitly admitted staging parent (verified through the
+    /// protected-root owner, never trusted as a name).
     pub staging_parent: PathBuf,
-    /// Approved target build identity (bounded text).
+    /// Target build identity for the destination (bounded presented text; not
+    /// owner-approved by name, see
+    /// [`DestinationAdmission::target_build`]).
     pub target_build: String,
-    /// Approved target profile (bounded text).
+    /// Target profile for the destination (bounded presented text; not
+    /// owner-approved by name, see
+    /// [`DestinationAdmission::target_profile`]).
     pub target_profile: String,
-    /// Generation approved for the destination (presented).
+    /// Generation the caller claims as approved (presented, and checked
+    /// against owner-issued authority evidence).
     pub approved_generation: u64,
-    /// Live authority generation presented by the caller (presented).
+    /// Authority generation the caller presents (presented evidence only).
+    ///
+    /// Deliberately not an input to the generation decision:
+    /// [`DelegatedPreparation::prepare`] admits
+    /// [`OwnerEvidence::authority_generation`] instead, so this value cannot
+    /// make an unapproved generation pass. It is read nowhere on this path —
+    /// the #954 control contract presents it and this lane grants it nothing —
+    /// and it is not the value bound into the admission digest, which carries
+    /// the owner-issued one. It is kept on the request rather than deleted
+    /// because it is part of the presented contract surface, and removing a
+    /// contract field from under #954 is not this lane's decision.
     pub authority_generation: u64,
     /// Owner lease reference the requester presents (bounded text; projected
     /// and bound into the projection digest, never a secret value).
@@ -1404,6 +1697,16 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// prepared-destination receipt binds the exact configuration evidence
     /// that was proved. The caller never chooses the manifest digest, the
     /// projection digest, or the owner lease.
+    ///
+    /// The admitted `authority_generation` is the owner-issued one from
+    /// [`OwnerEvidence::authority_generation`], so the presented
+    /// `approved_generation` is admitted only if it matches committed owner
+    /// evidence, and the presented `request.authority_generation` is not an
+    /// input to that decision at all. The presented `staging_parent` is proved
+    /// by the protected-root owner inside the preparation, so a
+    /// client-supplied arbitrary path is refused. Target build and profile
+    /// stay presented text with no name-level owner approval: see the module
+    /// documentation.
     pub fn prepare(
         &mut self,
         evidence: &OwnerEvidence,
@@ -1452,7 +1755,15 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
             target_build: request.target_build.clone(),
             target_profile: request.target_profile.clone(),
             approved_generation: request.approved_generation,
-            authority_generation: request.authority_generation,
+            // Owner-issued, never presented: the presented
+            // `request.authority_generation` is deliberately NOT used here.
+            // It was two caller values compared against each other, so any
+            // caller could satisfy it by making its two values agree; sourcing
+            // it from the committed activation fence makes
+            // `validate_admission` compare the caller-presented approved
+            // generation against owner-issued evidence, and an unapproved
+            // generation is refused before any effect (case 958/7).
+            authority_generation: evidence.authority_generation(),
             manifest_digest: projection.manifest_digest.clone(),
             config_projection_digest: projection.projection_digest.clone(),
             // The forensic note reaches the receipt only as rendered evidence
@@ -1740,6 +2051,20 @@ impl OwnerEvidence {
     /// stay presented until #954 control contracts land. No secret-typed field
     /// exists on this path, and a credential-shaped value fails digest or
     /// identity shape rather than being projected.
+    ///
+    /// `manifest_digest` is the one field that is NOT caller-presented on this
+    /// path, and it is stated here rather than left to look like a check: the
+    /// presented request carries no configuration digest of its own, so the
+    /// value handed to the projector is the owner-issued
+    /// `binding.config_digest` and the projector's `manifest_digest` arm
+    /// compares the owner against itself. That arm is retained because the
+    /// projector's contract is presented-vs-owner and other callers may supply
+    /// a presented digest, but on THIS path it is a shape guard, not evidence.
+    /// The configuration binding that is real evidence here comes from
+    /// `bind_approved_build` over an owner-validated record plus the presented
+    /// `build_digests` subset check, both of which compare against owner-issued
+    /// values. Nothing downstream may cite the `manifest_digest` comparison as
+    /// an owner proof for a production preparation.
     pub fn project_backup_configuration(
         &self,
         request: &PresentedPreparationRequest,
@@ -1749,6 +2074,7 @@ impl OwnerEvidence {
             installation_id: request.source_installation_id.clone(),
             owner_lease_ref: request.owner_lease_ref.clone(),
             generation: request.approved_generation,
+            // Owner-issued, not presented: see the note above.
             manifest_digest: binding.config_digest.clone(),
             build_digests: request.build_digests.clone(),
             purge_ledger_revision: request.purge_ledger_revision,
@@ -1767,30 +2093,59 @@ impl OwnerEvidence {
     pub fn revision(&self) -> u64 {
         self.registry.revision()
     }
+
+    /// Returns the owner-issued runtime authority resource generation.
+    ///
+    /// This is the value [`ActivationCommitFence::authority_generation`] the
+    /// committed activation fence carries, and it is the only numeric
+    /// generation the owner record exposes. It was already proved against the
+    /// active manifest during [`OwnerEvidence::inspect`] (the fence's
+    /// authority generation must equal the manifest runtime launch's, the fence
+    /// itself must validate, and a zero authority generation is rejected), so
+    /// this is owner-issued, non-zero and manifest-agreed by construction.
+    ///
+    /// [`DelegatedPreparation::prepare`] admits it as
+    /// [`DestinationAdmission::authority_generation`], which is what turns
+    /// `validate_admission`'s generation comparison into a comparison against
+    /// owner evidence rather than between two values the same caller presented.
+    /// The approved generation identity itself is a
+    /// [`crate::backup_config_projection::ApprovedBuildBinding::generation_handle`]
+    /// and is not numeric, so no numeric owner handle is invented here.
+    pub fn authority_generation(&self) -> u64 {
+        self.fence.authority_generation.value()
+    }
 }
 
 /// Verifies one staging parent against the protected-root owner.
 ///
-/// Opens the existing protected-root lease (containment-checked,
-/// identity-pinned) and returns the re-verified canonical path. This is the
-/// production-only lease gate: fixture or explicitly admitted non-protected
-/// parents bypass it by not calling it, while [`prepare_isolated_destination`]
-/// always re-applies the structural admission checks. Fail-closed with
-/// static reasons; lease error internals are echoed only inside
-/// [`PreparationError::FilesystemEffect`], matching file precedent.
-pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, PreparationError> {
+/// Opens the existing protected-root lease — which containment-checks the path
+/// against the real ELIOT protected contour, rejects a reparse chain, and pins
+/// the whole directory chain plus its identity by retained handle — proves that
+/// retained identity is still stable, and returns the owner-resolved canonical
+/// path. This is the production protected-root gate for destination
+/// preparation: [`admit_staging_parent`] calls it for every prepared
+/// destination, so no caller-nominated path outside the contour is ever used as
+/// a destination parent (case 958/7) and every root created is inside the
+/// contour [`reverify_recorded_destination`] re-proves before removal (case
+/// 958/15). There is no bypass: an unproved parent is refused.
+///
+/// Fail-closed and static: every owner failure maps through
+/// [`protected_path_to_preparation`] to a typed [`PreparationError`] with a
+/// static reason, and owner internals are never echoed into it.
+pub fn verify_staging_parent_lease(
+    operation_id: &str,
+    parent: &Path,
+) -> Result<PathBuf, PreparationError> {
     let lease = ProtectedRootLease::open_existing(parent)
-        .map_err(|error| PreparationError::FilesystemEffect {
-            path: parent.to_string_lossy().into_owned(),
-            reason: format!("staging parent is not a protected root: {error}"),
-        })
+        .map_err(|error| protected_path_to_preparation(operation_id, parent, error))
+        .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
+    lease
+        .verify_stable_identity()
+        .map_err(|error| protected_path_to_preparation(operation_id, parent, error))
         .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
     let verified = lease
         .canonical_path()
-        .map_err(|error| PreparationError::FilesystemEffect {
-            path: parent.to_string_lossy().into_owned(),
-            reason: format!("staging parent identity changed during admission: {error}"),
-        })
+        .map_err(|error| protected_path_to_preparation(operation_id, parent, error))
         .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
     observe_prepare_progress(OP_STAGING_LEASE, "verify", "verified", 0, 0);
     Ok(verified)
