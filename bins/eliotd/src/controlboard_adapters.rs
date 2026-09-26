@@ -499,7 +499,7 @@ fn controlboard_unbound_refusal_body(
     // here, so the digest below always binds the exact response emitted.
     let response = serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null);
     let result_digest =
-        sha256_hex(&canonical_json_bytes(&response).unwrap_or_else(|_| Vec::from([b'null'])));
+        sha256_hex(&canonical_json_bytes(&response).unwrap_or_else(|_| b"null".to_vec()));
     let body = HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
