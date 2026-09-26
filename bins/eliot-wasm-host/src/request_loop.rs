@@ -1070,6 +1070,23 @@ impl BoundedRequestLoop {
         }
     }
 
+    /// Single-gate intake (#2785): new demand is taken only while `Running`
+    /// with admission open, nothing outstanding, and nothing already queued.
+    /// The bound-1 command channel admits exactly one outstanding command,
+    /// so `in_flight` is the capacity signal — sending while a command is
+    /// outstanding would stack a second command behind it.
+    fn intake_open(&self) -> bool {
+        self.phase == LoopPhase::Running
+            && !self.lifecycle.in_flight
+            && self.queued.is_none()
+            && self.admission_open()
+    }
+
+    /// Drain-complete predicate: no command outstanding and none queued.
+    fn drain_complete(&self) -> bool {
+        !self.lifecycle.in_flight && self.queued.is_none()
+    }
+
     /// Control phase: refresh the observed clock and close admission on a
     /// revoked or expired binding. A trap in one bounded instance never
     /// reaches this state; it is classified and the loop keeps its contract.
@@ -1088,6 +1105,13 @@ impl BoundedRequestLoop {
     /// loop has one admission path rather than two.
     fn admit(&mut self, frame: &WasmHostRequestFrame) -> Result<(), LoopError> {
         let request = WasmHostRequestFrame::parse(frame)?;
+        // Drain gate (#2785): once draining, new invoke demand is refused
+        // with the typed drain-closed denial; pre-drain admitted demand —
+        // the control follow-ups settling the admitted attempt — keeps its
+        // exact scope through the unchanged arms below.
+        if self.phase != LoopPhase::Running && matches!(request, WasmHostRequest::Invoke(_)) {
+            return Err(denied("drain-closed"));
+        }
         self.queued = None;
         self.replay = None;
         match &request {
@@ -1200,7 +1224,13 @@ impl BoundedRequestLoop {
     /// guest; this delivers the owner's containment to the runtime owner at
     /// the first point it can accept it.
     fn containment_step(&mut self) -> Result<(), LoopError> {
-        if self.lifecycle.follow_up != FollowUp::None || self.live.is_live() {
+        // Never queue containment behind an outstanding command: the bound-1
+        // channel admits exactly one, so the uncertain attempt settles after
+        // its own outcome arrives, through the follow-up taxonomy.
+        if self.lifecycle.in_flight
+            || self.lifecycle.follow_up != FollowUp::None
+            || self.live.is_live()
+        {
             return Ok(());
         }
         self.queue_control(OP_CANCEL)
@@ -1245,10 +1275,17 @@ pub fn run_request_loop(
     );
     let worker = spawn_worker(runtime, state.max_in_flight);
     let outcome = drive_loop(&mut state, &mut channel, &worker.commands, &worker.outcomes);
-    // Typed shutdown: close admission, ask the worker to stop, and join it so
-    // no guest work is left untracked.
+    // Join-after-drain (#2785 trigger 1): intake returns on close or
+    // exhaustion with a command possibly outstanding, so keep polling
+    // outcomes until the worker idles and only then shut down and join.
+    // Joining with `in_flight` set or an outcome unconsumed wedges the
+    // worker's Shutdown reply behind the unread outcome on the bound-1
+    // channel and the join never returns.
     state.begin_drain();
+    let drained = drain_outstanding(&mut state, &mut channel, &worker.commands, &worker.outcomes);
     state.mark_drained();
+    // Typed shutdown: close admission, ask the idled worker to stop, and
+    // join it so no guest work is left untracked.
     state.live.revoke();
     let _ = worker.commands.try_send(WorkerCommand::Shutdown);
     drop(worker.commands);
@@ -1260,6 +1297,7 @@ pub fn run_request_loop(
         return Err(error);
     }
     outcome?;
+    drained?;
     state.published().cloned().ok_or(denied("no-request"))
 }
 
@@ -1306,14 +1344,24 @@ fn drive_loop(
             poll_pending(state, channel, commands, outcomes)?;
             continue;
         }
+        // Single-gate intake (#2785 trigger 2): `tick` may have closed
+        // admission after the loop-top check, so recheck before touching
+        // the delivery set — no Execute lands after close.
+        if !state.intake_open() {
+            state.begin_drain();
+            break;
+        }
         // External control stays processable while the loop is idle too: a
         // Kernel Cancel racing the delivery set is admitted before the
-        // invoke is pulled, never after it executed.
+        // invoke is pulled, never after it executed. Intake is provably
+        // open here (nothing outstanding or queued), so no second command
+        // stacks behind an outstanding one.
         if admit_external_control(state, channel)? {
             if let Some(command) = state.queued {
                 state.send(command, commands)?;
             }
             continue;
+        }
         }
         let Some(frame) = channel.next_frame()? else {
             state.begin_drain();
@@ -1362,6 +1410,14 @@ fn poll_pending(
             Ok(())
         }
         Err(RecvTimeoutError::Timeout) => {
+            // Single-gate intake (#2785 trigger 2): while a command is
+            // outstanding on the bound-1 channel — or admission has
+            // closed — never queue a second command behind it. An
+            // uncertain attempt settles after its own outcome arrives,
+            // through the existing follow-up taxonomy.
+            if !state.intake_open() {
+                return Ok(());
+            }
             state.containment_step()?;
             // External control intake while guest work is pending: the
             // control poll never blocks, so the outstanding command keeps
@@ -1377,6 +1433,28 @@ fn poll_pending(
         }
         Err(RecvTimeoutError::Disconnected) => Err(LoopError::ChannelUnavailable),
     }
+}
+
+/// Join-after-drain (#2785): after intake closes, keep polling worker
+/// outcomes until the worker idles, so the join never meets an outstanding
+/// command or an unconsumed outcome. Pre-drain admitted demand keeps its
+/// exact scope — a queued follow-up is handed over once the worker is idle
+/// — and control outcomes settle through the existing taxonomy.
+fn drain_outstanding(
+    state: &mut BoundedRequestLoop,
+    channel: &mut DeliverySetChannel,
+    commands: &SyncSender<WorkerCommand>,
+    outcomes: &Receiver<WorkerOutcome>,
+) -> Result<(), LoopError> {
+    while !state.drain_complete() {
+        if state.lifecycle.in_flight {
+            poll_pending(state, channel, commands, outcomes)?;
+        } else if let Some(command) = state.queued {
+            state.send(command, commands)?;
+        }
+        state.tick();
+    }
+    Ok(())
 }
 
 /// Outcome of the ordinary governed path: the canonical correlated frame.
