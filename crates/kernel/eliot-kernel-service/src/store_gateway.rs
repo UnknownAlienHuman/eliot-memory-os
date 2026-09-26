@@ -1870,7 +1870,7 @@ impl KernelStoreGateway {
                 // the record: it is rejected and the recorded history stands.
                 verify_terminal_evidence(&record, outcome, &evidence_receipt_digest)
                     .map_err(|error| error.to_string())?;
-                match self.release_dreamer_scopes(&record) {
+                return match self.release_dreamer_scopes(&record) {
                     // The terminal disposition stands and the recorded
                     // outcome is preserved; only the pause release is
                     // incomplete, and that is stated rather than hidden.
@@ -1886,7 +1886,7 @@ impl KernelStoreGateway {
                         })
                     }
                     _ => dreamer_dispositioned(key, record),
-                }
+                };
             }
         }
         let outcome = match classify_commit_receipt(receipt) {

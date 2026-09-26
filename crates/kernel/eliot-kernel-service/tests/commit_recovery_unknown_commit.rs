@@ -328,7 +328,9 @@ async fn rollback_disposition_proceeds_without_self_pause() {
         .expect("record kept as terminal evidence");
     assert!(!resolved.is_open());
     assert!(
-        paused_scopes_snapshot(&paused, Some(&ors)).scopes.is_empty(),
+        paused_scopes_snapshot(&paused, Some(&ors))
+            .scopes
+            .is_empty(),
         "scopes released"
     );
     remove_temp(&dir);
