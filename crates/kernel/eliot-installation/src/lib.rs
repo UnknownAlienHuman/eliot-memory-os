@@ -8650,6 +8650,13 @@ where
             transaction.validate()?;
             self.store.compare_and_save(expected, &transaction)?;
         }
+        // Issue #1352: an effect whose committed intent survived a typed
+        // service-registration unknown is unresolved for the reason the
+        // transaction durably recorded, so the `unreconciled` scan reports that
+        // exact request-correlated cause rather than the intent digest and
+        // `persist_quarantined` keeps the stage, Win32 code and SCM sample.
+        // Every other committed intent keeps the digest: a bare crash window
+        // records no cause to report.
         let unreconciled = transaction
             .effect_progress
             .iter()
@@ -8658,7 +8665,17 @@ where
                     Some(pending_ref.clone())
                 }
                 InstallationEffectProgressState::IntentCommitted { intent_digest, .. } => {
-                    Some(intent_digest.clone())
+                    transaction
+                        .pending_external_changes
+                        .iter()
+                        .find(|pending| {
+                            is_request_correlated_service_registration_unknown(
+                                pending.as_str(),
+                                intent_digest,
+                            )
+                        })
+                        .cloned()
+                        .or_else(|| Some(intent_digest.clone()))
                 }
                 InstallationEffectProgressState::Pending
                 | InstallationEffectProgressState::Applied { .. } => None,
@@ -9123,6 +9140,26 @@ where
         })
     }
 
+    /// Records one unclassified observation against `index` and holds the
+    /// transaction at `RollbackRequired`.
+    ///
+    /// Issue #1352: an observation that could not be classified must not destroy
+    /// the identity of an operation that already committed its intent. When
+    /// [`has_reconcilable_service_registration_intent`] proves that this exact
+    /// observation is the request-correlated service-registration unknown of
+    /// that committed intent, the intent is preserved: the typed cause is
+    /// recorded in `pending_external_changes`, the transaction stays
+    /// `RollbackRequired`, and the effect keeps the `attempt`/`intent_digest`
+    /// that authorized the external object, so re-driving this transaction
+    /// re-enters [`Self::drive_effect_at`]'s `IntentCommitted` branch and
+    /// issues `port.reconcile` for the same reconstructed request. I3.15 keeps
+    /// such a stage at `UNKNOWN_OUTCOME`/`ROLLBACK_REQUIRED` "until read-back
+    /// reconciliation", which requires exactly this retained identity.
+    ///
+    /// Every other contour — a pre-intent observation, an intent this
+    /// transaction can no longer reconstruct, a different post-intent cause and
+    /// every non-service effect — keeps the existing terminal
+    /// [`InstallationEffectProgressState::Unknown`] disposition unchanged.
     fn persist_unknown(
         &mut self,
         mut transaction: InstallationTransaction,
@@ -9130,9 +9167,11 @@ where
         pending_ref: PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
-        transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
-            pending_ref: pending_ref.clone(),
-        };
+        if !has_reconcilable_service_registration_intent(&transaction, index, &pending_ref) {
+            transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
+                pending_ref: pending_ref.clone(),
+            };
+        }
         transaction.pending_external_changes = vec![pending_ref.clone()];
         transaction.stage = InstallationStage::RollbackRequired;
         increment_revision(&mut transaction)?;
@@ -10017,6 +10056,83 @@ fn is_typed_service_registration_unknown_reference(value: &str) -> bool {
     is_service_registration_unknown_sample_stage(read_stage)
         && is_lowercase_hex8(state)
         && is_lowercase_hex8(pid)
+}
+
+/// Whether `reference` is the typed service-registration unknown reference that
+/// was published for exactly `intent_digest`.
+///
+/// The grammar check alone proves only that the text is well formed. This
+/// additionally binds the request-identity field of the reference to the intent
+/// digest the durable transaction actually holds, so a well-formed reference
+/// minted for a different — or for no — operation can never be read as this
+/// operation's own cause. The digest is compared, never recomputed, and the
+/// comparison is exact: a reference whose identity field differs is not this
+/// operation's cause.
+fn is_request_correlated_service_registration_unknown(
+    reference: &str,
+    intent_digest: &PlatformHandle,
+) -> bool {
+    is_typed_service_registration_unknown_reference(reference)
+        && reference
+            .strip_prefix(SERVICE_REGISTRATION_UNKNOWN_REFERENCE_PREFIX)
+            .and_then(|rest| rest.split(':').next())
+            == Some(intent_digest.as_str())
+}
+
+/// Whether `index` still holds the committed intent that `pending_ref` names as
+/// unresolved, and therefore still has to be reconciled under that intent.
+///
+/// Issue #1352: the owner audit requires that a post-effect unknown stay
+/// "reconcilable under its original operation", and I3.15 keeps such a stage
+/// unresolved "until read-back reconciliation". Reconciliation is only possible
+/// if the exact `attempt` that produced the `intent_digest` survives, because
+/// [`effect_request`] rebuilds the request with that attempt and the request's
+/// normalized digest — not the plan, not the service name and not a fresh
+/// attempt — is what authorized the external object. All of the following must
+/// therefore hold, and each one fails closed to the existing terminal
+/// [`InstallationEffectProgressState::Unknown`]:
+///
+/// 1. the effect is in `IntentCommitted` with a non-zero attempt (any other
+///    state has no committed operation to preserve);
+/// 2. `pending_ref` is a well-formed service-registration unknown reference
+///    whose embedded request identity equals that `intent_digest`, so the
+///    observation is provably this operation's own cause and not a sibling
+///    effect's or a bare crash window's;
+/// 3. [`effect_request`] still rebuilds a request for the persisted attempt
+///    whose own [`InstallationEffectRequest::intent_digest`] equals the recorded
+///    one, so the transaction still reproduces the intent verbatim.
+///
+/// Nothing is synthesized here: the digest is recomputed from the reconstructed
+/// request or the check fails, and no attempt, digest or reference is invented.
+fn has_reconcilable_service_registration_intent(
+    transaction: &InstallationTransaction,
+    index: usize,
+    pending_ref: &PlatformHandle,
+) -> bool {
+    let Some(progress) = transaction.effect_progress.get(index) else {
+        return false;
+    };
+    let InstallationEffectProgressState::IntentCommitted {
+        attempt,
+        intent_digest,
+    } = &progress.state
+    else {
+        return false;
+    };
+    if *attempt == 0
+        || !is_request_correlated_service_registration_unknown(pending_ref.as_str(), intent_digest)
+    {
+        return false;
+    }
+    effect_request(
+        transaction,
+        index,
+        *attempt,
+        InstallationEffectAction::Apply,
+        None,
+    )
+    .and_then(|request| request.intent_digest())
+    .is_ok_and(|digest| digest == *intent_digest)
 }
 
 /// Projects one observed typed detail into the bounded reference.
