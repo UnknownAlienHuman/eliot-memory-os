@@ -39,8 +39,9 @@ pub use dispatch_authority::{
     ResearchDispatchAuthority,
 };
 pub use evidence::{
-    CancellationEvidence, ProviderEvidenceRecord, ProviderExecutionReceipt, RawProviderEvidence,
-    RedactedEvidence, RedactionReceipt, StreamOmission, StreamRecord, sha256_hex,
+    CancellationEvidence, OwnerReconciliationAttempt, ProviderEvidenceRecord,
+    ProviderExecutionReceipt, RawProviderEvidence, ReconciliationEvidence, RedactedEvidence,
+    RedactionReceipt, StreamOmission, StreamRecord, sha256_hex,
 };
 pub use execution::{
     BOUND_RUN_DEADLINE, ProviderBridge, ProviderExecution, ProviderOutcome, RequestPortError,
