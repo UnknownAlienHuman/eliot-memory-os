@@ -95,18 +95,18 @@ use eliot_workscope::{
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
-    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
-    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
-    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
-    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
-    WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
-    evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt,
+    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
+    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
+    ResolutionRequest, ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle,
+    ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity,
+    ScopeKind, ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest,
+    TaskBindingInput, TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired,
+    TriggerAdmission, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor, WorkScopeError,
+    WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity, admit_at_trigger,
+    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
+    produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -863,6 +863,9 @@ pub enum CompositionError {
         verdict: GuardVerdict,
         report: Box<TriggerReport>,
     },
+    /// WorkScope readiness or authenticated scan readback failed.
+    #[error("WorkScope readiness failed: {0}")]
+    WorkScope(#[from] WorkScopeError),
     /// A startup transition was attempted out of order.
     #[error("startup order violation: expected {expected}, observed {observed}")]
     StartupOrder { expected: String, observed: String },
@@ -4072,6 +4075,32 @@ fn cold_start_readiness_token(lifecycle: ReadinessLifecycle) -> &'static str {
     }
 }
 
+fn verify_ready_scan_readback(
+    receipt: &OnboardingReadinessReceipt,
+    scan_readback: Option<(
+        &dyn ScanDisclosureStore,
+        &ScanReceiptHandle,
+        &ScanDisclosureOwnerBinding,
+    )>,
+) -> Result<(), CompositionError> {
+    if !matches!(
+        receipt.readiness,
+        ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+    ) {
+        return Ok(());
+    }
+    let (store, handle, binding) = scan_readback.ok_or(WorkScopeError::ScanReceiptMissing)?;
+    if receipt.scan_receipt_ref.as_deref() != Some(handle.record_commitment.as_str()) {
+        return Err(WorkScopeError::ScanReceiptReplaced.into());
+    }
+    if binding.principal_ref != receipt.principal_ref || binding.session_ref != receipt.session_ref
+    {
+        return Err(WorkScopeError::ScanContourNotAdmitted.into());
+    }
+    store.readback(handle, binding)?;
+    Ok(())
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
@@ -5215,7 +5244,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// authorizes the trigger's scanner pass, so a trigger can never ride on
     /// unattested reads. Joining never creates a `WorkScope` and never infers
     /// a latest task; `JoinedTerminal` carries the shared terminal surface
-    /// every waiter of the lease receives.
+    /// every waiter of the lease receives. A ready terminal is returned only
+    /// after the exact owner handle is read back against its retained binding;
+    /// incomplete terminal states need no scan readback.
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the lease inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
@@ -5232,12 +5263,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         candidate: &WorkScopeCandidate,
         sources: &GoverningSourceSet,
         scan: &BootstrapScanEvidence,
+        scan_readback: Option<(
+            &dyn ScanDisclosureStore,
+            &ScanReceiptHandle,
+            &ScanDisclosureOwnerBinding,
+        )>,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        self.cold_start
+        let joined = self
+            .cold_start
             .join_with_evidence(
                 trigger,
                 discovery_lease,
@@ -5249,7 +5286,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             )
             .map_err(|error| {
                 CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
-            })
+            })?;
+        if let LeaseJoin::JoinedTerminal { receipt, .. } = &joined {
+            verify_ready_scan_readback(receipt, scan_readback)?;
+        }
+        Ok(joined)
     }
 
     /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
@@ -5263,9 +5304,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// attaches receive the same receipt and no worker independently creates
     /// a second `WorkScope` or "latest task" while the lease is active. A
     /// supplied scan handle binds the terminal receipt to the exact durable
-    /// scan receipt that fed the compilation; without one the scan evidence
-    /// reference stays explicitly empty, never an in-memory or loose-file
-    /// fallback. An
+    /// scan receipt that fed the compilation. Ready terminal receipts are
+    /// published only after authenticated owner readback of that handle;
+    /// incomplete readiness can still publish without scan evidence. An
     /// already-terminal lease returns its `JoinedTerminal` surface without
     /// recompiling; a lease owned by an in-flight trigger returns `Joined`
     /// without a second compilation.
@@ -5305,6 +5346,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
+        scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -5338,9 +5380,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 privacy,
                 task,
                 scan_receipt,
+                scan_readback,
                 now,
             )
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+            .map_err(|error| match error {
+                eliot_workscope::CompileDriverError::Compile(error) => {
+                    CompositionError::WorkScope(error)
+                }
+                eliot_workscope::CompileDriverError::Lease(error) => {
+                    CompositionError::Recovery(error.to_string())
+                }
+            })
     }
 
     /// Projects the retained terminal cold-start surface for one exact lease
@@ -5354,7 +5404,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// and projection identity the receipt was compiled for. Agent and Human
     /// callers receive this compiled surface instead of a buried setup state;
     /// a key with no published terminal fails closed here instead of
-    /// projecting an uncompiled disposition.
+    /// projecting an uncompiled disposition. Ready receipts require the exact
+    /// durable scan handle and authenticated owner readback before projection.
     /// Live status: owning thin entry for the bridge delivery path; the live
     /// bridge note path consumes no governor surface yet (BLOCKED-BY
     /// bridge-transport: `bins/eliot-agent-bridge` `BootstrapContext`
@@ -5365,6 +5416,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         workspace_instance_candidate_ref: &str,
         privacy_class: PrivacyClass,
         governing_source_generation: u64,
+        scan_readback: Option<(
+            &dyn ScanDisclosureStore,
+            &ScanReceiptHandle,
+            &ScanDisclosureOwnerBinding,
+        )>,
     ) -> Result<ColdStartSurfaceView, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -5382,6 +5438,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "no terminal cold-start receipt for lease key".to_owned(),
                 )
             })?;
+        if matches!(
+            receipt.readiness,
+            ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+        ) {
+            verify_ready_scan_readback(receipt, scan_readback)?;
+        }
         let surface = receipt
             .surface(&lease)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;

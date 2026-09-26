@@ -1248,10 +1248,19 @@ impl OnboardingReadinessReceipt {
     ///
     /// # Errors
     ///
-    /// Returns an error when a present scan receipt reference is blank.
+    /// Returns an error when a present scan receipt reference is blank or a
+    /// ready receipt lacks the durable scan commitment.
     fn validate_scan_evidence(&self) -> Result<(), WorkScopeError> {
-        if let Some(scan_receipt) = &self.scan_receipt_ref {
-            text(scan_receipt, "scan_receipt_ref")?;
+        match &self.scan_receipt_ref {
+            Some(scan_receipt) => text(scan_receipt, "scan_receipt_ref")?,
+            None if matches!(
+                self.readiness,
+                ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+            ) =>
+            {
+                return Err(WorkScopeError::ScanReceiptMissing);
+            }
+            None => (),
         }
         Ok(())
     }
@@ -2579,6 +2588,36 @@ pub enum CompileDriverError {
     Compile(#[from] WorkScopeError),
 }
 
+fn verify_ready_scan_receipt(
+    receipt: &OnboardingReadinessReceipt,
+    scan_receipt: Option<&ScanReceiptHandle>,
+    scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
+    discovery_lease: Option<&DiscoveryReadLease>,
+) -> Result<(), WorkScopeError> {
+    if !matches!(
+        receipt.readiness,
+        ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+    ) {
+        return Ok(());
+    }
+    let handle = scan_receipt.ok_or(WorkScopeError::ScanReceiptMissing)?;
+    let (store, binding) = scan_readback.ok_or(WorkScopeError::ScanReceiptMissing)?;
+    if binding.principal_ref != receipt.principal_ref
+        || binding.session_ref != receipt.session_ref
+        || discovery_lease.is_some_and(|lease| {
+            binding.lease_ref != lease.lease_ref
+                || binding.candidate_root_ref != lease.candidate_root_ref
+        })
+    {
+        return Err(WorkScopeError::ScanContourNotAdmitted);
+    }
+    if receipt.scan_receipt_ref.as_deref() != Some(handle.record_commitment.as_str()) {
+        return Err(WorkScopeError::ScanReceiptReplaced);
+    }
+    store.readback(handle, binding)?;
+    Ok(())
+}
+
 impl OnboardingSingleFlight {
     /// Drives one live attach trigger end to end: join, compile, publish.
     ///
@@ -2612,8 +2651,10 @@ impl OnboardingSingleFlight {
     ///
     /// Returns [`CompileDriverError::Lease`] when the trigger's scanner pass
     /// is not admitted by the discovery lease, or
-    /// [`CompileDriverError::Compile`] when compilation, surface projection,
-    /// or terminal publish fails closed.
+    /// [`CompileDriverError::Compile`] when compilation, authenticated scan
+    /// readback, surface projection, or terminal publish fails closed. Ready
+    /// receipts require an owner handle and readback port; incomplete receipts
+    /// may publish without scan evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_and_publish(
         &mut self,
@@ -2643,13 +2684,17 @@ impl OnboardingSingleFlight {
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
+        scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
         now: u64,
     ) -> Result<LeaseJoin, CompileDriverError> {
         let created_ref = proposed.lease_ref.clone();
-        match self
+        let joined = self
             .join(trigger, discovery_lease, proposed, now)
-            .map_err(CompileDriverError::Lease)?
-        {
+            .map_err(CompileDriverError::Lease)?;
+        if let LeaseJoin::JoinedTerminal { receipt, .. } = &joined {
+            verify_ready_scan_receipt(receipt, scan_receipt, scan_readback, None)?;
+        }
+        match joined {
             already @ (LeaseJoin::JoinedTerminal { .. } | LeaseJoin::Joined { .. }) => Ok(already),
             LeaseJoin::Created { .. } => {
                 let lease = self
@@ -2684,6 +2729,12 @@ impl OnboardingSingleFlight {
                     task,
                     scan_receipt,
                     now,
+                )?;
+                verify_ready_scan_receipt(
+                    &receipt,
+                    scan_receipt,
+                    scan_readback,
+                    Some(discovery_lease),
                 )?;
                 if let Some(entry) = self
                     .entries
@@ -2791,6 +2842,7 @@ impl OnboardingSingleFlight {
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
+        scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
         now: u64,
     ) -> Result<LeaseJoin, CompileDriverError> {
         match self.invalidate(lease_ref, observed, now)? {
@@ -2804,6 +2856,7 @@ impl OnboardingSingleFlight {
                     .terminal
                     .clone()
                     .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                verify_ready_scan_receipt(&terminal, scan_receipt, scan_readback, None)?;
                 let surface = terminal.surface(&entry.lease)?;
                 Ok(LeaseJoin::JoinedTerminal {
                     lease_ref,
@@ -2866,6 +2919,12 @@ impl OnboardingSingleFlight {
                     task,
                     scan_receipt,
                     now,
+                )?;
+                verify_ready_scan_receipt(
+                    &receipt,
+                    scan_receipt,
+                    scan_readback,
+                    Some(discovery_lease),
                 )?;
                 self.publish_fresh(&created_ref, receipt, now)
             }
