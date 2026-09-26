@@ -18,7 +18,8 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+import tomllib
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import contracts as c
 from . import descriptor_runner as dr
@@ -31,6 +32,8 @@ MAX_MATRIX_CASES = 1000
 _RE_ABSOLUTE_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 _RE_UNC = re.compile(r"^\\\\")
 _RE_HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+_RE_NUMERIC_STEM = re.compile(r"[0-9]+")
+_RE_GIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 # Restricted paths: ordinary leaves cannot claim root or shared configuration
 RESTRICTED_ROOT_PATHS = frozenset({
@@ -254,6 +257,18 @@ def materialize_catalogue(
         elif r.disposition is c.CatalogueDisposition.PLANNED:
             if r.descriptor is not None:
                 validate_descriptor_scope(r.descriptor)
+        elif r.disposition is c.CatalogueDisposition.SUPERSEDED and r.descriptor is not None:
+            # A superseded historical row is a terminal record: #843 accepts no
+            # implementation evidence ("Superseded source donor only") and #859
+            # is closed unmerged ("not merged or accepted verification"). A
+            # descriptor attached to one smuggles the historical candidate in
+            # as current acceptance authority instead of migrating its data
+            # into gate-owned descriptors, so migration is still required.
+            raise CohortError(
+                CohortProblem.HISTORICAL_MIGRATION_REQUIRED,
+                f"superseded historical row #{r.issue.number} carries an executable descriptor; "
+                "a historical candidate is not current acceptance authority",
+            )
 
     # Check concurrent write scope overlap among assigned descriptors
     # Overlap is permitted only if one is explicitly declared as a prerequisite of the other
@@ -341,6 +356,287 @@ def materialize_cohort_receipt(
     except c.ContractViolation as e:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(e)) from e
 
+    return receipt
+
+
+def discover_numeric_descriptor_files(work_units_dir: Path | str) -> Tuple[Tuple[int, str], ...]:
+    """Discover the exact numeric descriptor class under .github/work-units.
+
+    Closed rule, single owner (#852): only regular files named <number>.toml
+    whose stem is all digits decoding to a positive issue number are members.
+    Named inventory artifacts and any other spelling are never members.
+    Returns (issue_number, filename) pairs sorted by filename.
+
+    A missing or unreadable directory yields the empty class; discovery alone
+    claims no integrity. The verdict always comes from comparing this class
+    (and the recomputed aggregate digest) against the committed lock in
+    verify_cohort_lock, which fails closed on any mismatch.
+    """
+    try:
+        base = work_units_dir if isinstance(work_units_dir, Path) else Path(work_units_dir)
+        if not base.is_dir():
+            return ()
+        found: List[Tuple[int, str]] = []
+        for child in sorted(base.iterdir(), key=lambda p: p.name):
+            if not child.is_file() or child.suffix != ".toml":
+                continue
+            stem = child.stem
+            if _RE_NUMERIC_STEM.fullmatch(stem) is None:
+                continue
+            try:
+                num = int(stem)
+            except Exception:
+                continue
+            if num <= 0:
+                continue
+            found.append((num, child.name))
+        return tuple(found)
+    except Exception:
+        return ()
+
+
+# Closed lock shape (.github/work-unit-cohort.toml). Unknown tables or keys
+# are rejected: the lock is the immutable aggregate commitment, not an
+# extensible document.
+_LOCK_TOP_LEVEL_KEYS = frozenset({"schema_version", "repository", "row", "aggregate", "provenance"})
+_LOCK_REPOSITORY_KEYS = frozenset({"owner", "name"})
+_LOCK_ROW_KEYS = frozenset({"issue", "unit", "body_sha256", "disposition", "prerequisites"})
+_LOCK_AGGREGATE_KEYS = frozenset({
+    "issues", "numeric_descriptors", "matrix_cases", "assigned", "blocked",
+    "planned", "nonexecutable", "superseded", "accepted_historical", "sha256",
+})
+_LOCK_PROVENANCE_KEYS = frozenset({
+    "base_commit", "acquired_at", "acquisition", "note",
+    "acquired_at_historical", "acquisition_historical",
+})
+_LOCK_DISPOSITIONS = frozenset({
+    "assigned", "planned", "blocked", "nonexecutable", "superseded", "accepted-historical",
+})
+
+
+@dataclass(frozen=True)
+class CohortLockRow:
+    issue: int
+    unit: str
+    body_sha256: str
+    disposition: str
+    prerequisites: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CohortLockAggregate:
+    issues: Tuple[int, ...]
+    numeric_descriptors: Tuple[int, ...]
+    matrix_cases: int
+    assigned: int
+    blocked: int
+    planned: int
+    nonexecutable: int
+    superseded: int
+    accepted_historical: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class CohortLock:
+    schema_version: str
+    repository_owner: str
+    repository_name: str
+    rows: Tuple[CohortLockRow, ...]
+    aggregate: CohortLockAggregate
+
+
+def _lock_int(value: object, field: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, f"lock field {field} is not a valid integer")
+    return value
+
+
+def _lock_text(value: object, field: str) -> str:
+    if type(value) is not str or not value:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, f"lock field {field} is not valid text")
+    return value
+
+
+def _lock_digest(value: object, field: str) -> str:
+    if type(value) is not str or _RE_HEX_SHA256.fullmatch(value) is None:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, f"lock field {field} is not a sha256 hex digest")
+    return value
+
+
+def read_cohort_lock(lock_path: Path | str) -> CohortLock:
+    """Read and closed-validate the committed aggregate lock TOML.
+
+    Rejects unknown tables/keys, mistyped fields, non-canonical row order,
+    and malformed digests with INVALID_AGGREGATE_LOCK. Digest comparison
+    against recomputed bytes happens in verify_cohort_lock.
+    """
+    path = lock_path if isinstance(lock_path, Path) else Path(lock_path)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock unreadable") from None
+    if not raw or len(raw) > MAX_DESCRIPTOR_BYTES:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock size out of bounds")
+    try:
+        doc = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock is not valid TOML") from None
+    if type(doc) is not dict or set(doc) - _LOCK_TOP_LEVEL_KEYS:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock has unknown tables")
+    for required in ("schema_version", "repository", "row", "aggregate", "provenance"):
+        if required not in doc:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, f"cohort lock missing {required}")
+    schema_version = _lock_text(doc["schema_version"], "schema_version")
+
+    repository = doc["repository"]
+    if type(repository) is not dict or set(repository) - _LOCK_REPOSITORY_KEYS:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock repository is not closed")
+    try:
+        repo = c.RepositoryIdentity(
+            _lock_text(repository["owner"], "repository.owner"),
+            _lock_text(repository["name"], "repository.name"),
+        )
+    except (KeyError, c.ContractViolation):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock repository identity invalid") from None
+
+    raw_rows = doc["row"]
+    if type(raw_rows) is not list or not raw_rows:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock has no rows")
+    rows: List[CohortLockRow] = []
+    for entry in raw_rows:
+        if type(entry) is not dict or set(entry) - _LOCK_ROW_KEYS or set(entry) != _LOCK_ROW_KEYS:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock row is not closed")
+        prereqs = entry["prerequisites"]
+        if type(prereqs) is not list:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock prerequisites not a list")
+        try:
+            c.WorkUnitIdentity(_lock_text(entry["unit"], "row.unit"))
+        except c.ContractViolation:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock row unit invalid") from None
+        disposition = _lock_text(entry["disposition"], "row.disposition")
+        if disposition not in _LOCK_DISPOSITIONS:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock row disposition unknown")
+        rows.append(CohortLockRow(
+            issue=_lock_int(entry["issue"], "row.issue", minimum=1),
+            unit=entry["unit"],
+            body_sha256=_lock_digest(entry["body_sha256"], "row.body_sha256"),
+            disposition=disposition,
+            prerequisites=tuple(_lock_int(n, "row.prerequisites", minimum=1) for n in prereqs),
+        ))
+    row_issues = [r.issue for r in rows]
+    if any(b <= a for a, b in zip(row_issues, row_issues[1:])):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock rows are not canonical sorted")
+
+    aggregate = doc["aggregate"]
+    if type(aggregate) is not dict or set(aggregate) != _LOCK_AGGREGATE_KEYS:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate is not closed")
+    issues = aggregate["issues"]
+    numeric = aggregate["numeric_descriptors"]
+    if type(issues) is not list or type(numeric) is not list:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate lists mistyped")
+    issues_t = tuple(_lock_int(n, "aggregate.issues", minimum=1) for n in issues)
+    numeric_t = tuple(_lock_int(n, "aggregate.numeric_descriptors", minimum=1) for n in numeric)
+    if any(b <= a for a, b in zip(numeric_t, numeric_t[1:])):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock numeric class not canonical sorted")
+    if issues_t != tuple(row_issues):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate issues mismatch rows")
+
+    provenance = doc["provenance"]
+    if type(provenance) is not dict or set(provenance) - _LOCK_PROVENANCE_KEYS:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock provenance is not closed")
+    for required in ("base_commit", "acquired_at", "acquisition", "note"):
+        if required not in provenance:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, f"cohort lock provenance missing {required}")
+    base_commit = _lock_text(provenance["base_commit"], "provenance.base_commit")
+    if _RE_GIT_SHA.fullmatch(base_commit) is None:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock base commit is not a git SHA")
+    for key in ("acquired_at", "acquisition", "note", "acquired_at_historical", "acquisition_historical"):
+        if key in provenance:
+            _lock_text(provenance[key], f"provenance.{key}")
+
+    return CohortLock(
+        schema_version=schema_version,
+        repository_owner=repo.owner,
+        repository_name=repo.name,
+        rows=tuple(rows),
+        aggregate=CohortLockAggregate(
+            issues=issues_t,
+            numeric_descriptors=numeric_t,
+            matrix_cases=_lock_int(aggregate["matrix_cases"], "aggregate.matrix_cases"),
+            assigned=_lock_int(aggregate["assigned"], "aggregate.assigned"),
+            blocked=_lock_int(aggregate["blocked"], "aggregate.blocked"),
+            planned=_lock_int(aggregate["planned"], "aggregate.planned"),
+            nonexecutable=_lock_int(aggregate["nonexecutable"], "aggregate.nonexecutable"),
+            superseded=_lock_int(aggregate["superseded"], "aggregate.superseded"),
+            accepted_historical=_lock_int(aggregate["accepted_historical"], "aggregate.accepted_historical"),
+            sha256=_lock_digest(aggregate["sha256"], "aggregate.sha256"),
+        ),
+    )
+
+
+def verify_cohort_lock(
+    lock_path: Path | str,
+    work_units_dir: Path | str,
+    assigned_descriptors: Optional[Mapping[int, c.WorkUnitDescriptor]] = None,
+) -> c.CatalogueIntegrityReceipt:
+    """Verify the committed aggregate lock against freshly discovered state.
+
+    Re-discovers the exact numeric descriptor class from the work-units
+    directory, rebuilds every catalogue row (assigned rows bound to the
+    caller-supplied typed descriptors), re-materializes the catalogue, and
+    compares the recomputed aggregate sha256 against the lock's [aggregate]
+    sha256. Any mismatch fails closed with INVALID_AGGREGATE_LOCK (or the
+    precise structural problem); the lock is never trusted on its own bytes.
+    """
+    lock = read_cohort_lock(lock_path)
+    if lock.schema_version != SCHEMA_REVISION:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock schema revision mismatch")
+    discovered = sorted(num for num, _ in discover_numeric_descriptor_files(work_units_dir))
+    if discovered != list(lock.aggregate.numeric_descriptors):
+        raise CohortError(
+            CohortProblem.INVALID_AGGREGATE_LOCK,
+            "discovered numeric descriptor class does not match the lock",
+        )
+    supplied = dict(assigned_descriptors) if assigned_descriptors else {}
+    try:
+        repo = c.RepositoryIdentity(lock.repository_owner, lock.repository_name)
+        rows: List[c.CatalogueRow] = []
+        for entry in lock.rows:
+            issue = c.IssueIdentity(repo, entry.issue)
+            unit = c.WorkUnitIdentity(entry.unit)
+            disposition = c.CatalogueDisposition(entry.disposition)
+            prereqs = tuple(c.IssueIdentity(repo, n) for n in entry.prerequisites)
+            descriptor = supplied.get(entry.issue)
+            if descriptor is not None and type(descriptor) is not c.WorkUnitDescriptor:
+                raise CohortError(CohortProblem.INTERNAL_ERROR, "supplied assigned descriptor mistyped")
+            rows.append(c.CatalogueRow(
+                issue=issue,
+                unit=unit,
+                body_sha256=entry.body_sha256,
+                disposition=disposition,
+                descriptor=descriptor,
+                prerequisites=prereqs,
+            ))
+        expected = tuple(c.IssueIdentity(repo, n) for n in lock.aggregate.issues)
+    except CohortError:
+        raise
+    except c.ContractViolation as exc:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    receipt = materialize_catalogue(rows, expected, expected_cases=lock.aggregate.matrix_cases)
+
+    counted = {"assigned": 0, "blocked": 0, "planned": 0, "nonexecutable": 0,
+               "superseded": 0, "accepted-historical": 0}
+    for row in rows:
+        counted[row.disposition.value] += 1
+    claimed = {"assigned": lock.aggregate.assigned, "blocked": lock.aggregate.blocked,
+               "planned": lock.aggregate.planned, "nonexecutable": lock.aggregate.nonexecutable,
+               "superseded": lock.aggregate.superseded,
+               "accepted-historical": lock.aggregate.accepted_historical}
+    if counted != claimed:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock disposition arithmetic mismatch")
+    if receipt.sha256 != lock.aggregate.sha256:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate digest mismatch")
     return receipt
 
 
