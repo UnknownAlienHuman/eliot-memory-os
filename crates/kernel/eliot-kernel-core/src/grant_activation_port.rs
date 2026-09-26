@@ -6753,7 +6753,8 @@ mod tests {
         let mut tampered = hydration.clone();
         let key = match &tampered.durable_record.record().payload {
             eliot_ors::RecoveryPayload::Encrypted { key, .. } => key.clone(),
-            eliot_ors::RecoveryPayload::ImmutableLocator { .. } => {
+            eliot_ors::RecoveryPayload::ImmutableLocator { .. }
+            | eliot_ors::RecoveryPayload::CanonicalRequest { .. } => {
                 return Err("fixture must use an encrypted root-grant payload".into());
             }
         };
@@ -6993,7 +6994,8 @@ mod tests {
         let mut changed_record = changed_payload.durable_record.record().clone();
         let key = match &changed_record.payload {
             eliot_ors::RecoveryPayload::Encrypted { key, .. } => key.clone(),
-            eliot_ors::RecoveryPayload::ImmutableLocator { .. } => {
+            eliot_ors::RecoveryPayload::ImmutableLocator { .. }
+            | eliot_ors::RecoveryPayload::CanonicalRequest { .. } => {
                 return Err("fixture must use an encrypted root-grant payload".into());
             }
         };

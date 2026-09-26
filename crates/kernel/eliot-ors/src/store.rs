@@ -77,11 +77,12 @@ use crate::{
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
     RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
     RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
-    RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
-    StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
-    SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest, SupervisionLeaseProjection,
-    SupervisionLeaseReceipt, SupervisionLeaseReceiptInput, SupervisionLeaseRecord,
-    SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    RetryState, RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt,
+    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
+    StateFenceSnapshot, StreamRecoveryActivation, SupervisionLeaseCommitTicket,
+    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
+    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
+    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
     UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
@@ -2051,6 +2052,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         subject_id: &crate::OperationIdentity,
     ) -> Result<Option<CapabilityGrantProjection>, OrsError>;
+    /// Commits one immutable root-transition request under its operation
+    /// identity, then returns a fresh owner readback of the retained bytes.
+    /// Exact replay returns the same projection; changed content under the
+    /// same identity fails with [`OrsError::DuplicateConflict`]. ORS receipt
+    /// evidence does not grant transition authority.
+    fn commit_root_transition(
+        &self,
+        commit: RootTransitionCommit,
+    ) -> Result<RootTransitionCommitProjection, OrsError>;
+    /// Reads one retained root-transition commit by stable operation identity
+    /// from a fresh ORS read transaction. The projection is non-semantic.
+    fn load_root_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RootTransitionCommitProjection>, OrsError>;
     /// Commits one grant-closure row binding a closure operation identity to
     /// its target, lineage root, exact graph revision, canonical digest,
     /// complete affected set, and survivor set (issue #2100).
@@ -18044,6 +18060,17 @@ impl RedbRecoveryStore {
         next_phase: OperationalPhase,
     ) -> Result<OperationalMutationReceipt, OrsError> {
         input.validate()?;
+        if kind == OperationalKind::RootTransition
+            || matches!(
+                &input.payload,
+                crate::RecoveryPayload::CanonicalRequest { .. }
+            )
+        {
+            return Err(OrsError::InvalidField {
+                field: "operational_payload",
+                reason: "root transitions require the immutable commit operation",
+            });
+        }
         let key = Self::operational_key(kind, &input.subject_id);
         let write = self.database.begin_write().map_err(storage)?;
         let existing = {
@@ -20048,6 +20075,131 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             record.input,
             record.phase,
             record.operation_order,
+            receipt,
+        )))
+    }
+
+    fn commit_root_transition(
+        &self,
+        commit: RootTransitionCommit,
+    ) -> Result<RootTransitionCommitProjection, OrsError> {
+        commit.validate()?;
+        let operation_id = commit.operation_id().clone();
+        let key = Self::operational_key(OperationalKind::RootTransition, &operation_id);
+        let input = commit.record().clone();
+        {
+            let write = self.database.begin_write().map_err(storage)?;
+            let existing = {
+                let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+                current
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| {
+                        decode_named::<DurableOperationalRecord>(
+                            value.value(),
+                            "operational_current",
+                        )
+                    })
+                    .transpose()?
+            };
+            if let Some(existing) = existing {
+                if existing.kind != OperationalKind::RootTransition
+                    || existing.input.record_id != operation_id
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "root_transition",
+                        reason: "current root-transition key, kind, or operation identity mismatch"
+                            .to_owned(),
+                    });
+                }
+                let retained =
+                    RootTransitionCommit::from_record(existing.input.clone()).map_err(|error| {
+                        OrsError::IntegrityProblem {
+                            record_type: "root_transition",
+                            reason: format!("retained root-transition record is invalid: {error}"),
+                        }
+                    })?;
+                if retained != commit {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                if existing.phase != OperationalPhase::Active {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "root_transition",
+                        reason: "immutable root-transition commit has a non-active phase"
+                            .to_owned(),
+                    });
+                }
+                drop(write);
+            } else {
+                let record = DurableOperationalRecord {
+                    kind: OperationalKind::RootTransition,
+                    input,
+                    phase: OperationalPhase::Active,
+                    operation_order: Self::next_operational_order(&write)?,
+                    terminal_receipt_id: None,
+                    terminal_receipt_sha256: None,
+                    admission_reservation: None,
+                    generation_cutover: None,
+                };
+                Self::persist_operational_record(&write, &key, &record)?;
+                write.commit().map_err(storage)?;
+            }
+        }
+
+        let readback = self.load_root_transition(&operation_id)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: "committed root-transition row is absent from owner readback".to_owned(),
+            }
+        })?;
+        if readback.commit() != &commit {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: "owner readback differs from the committed request".to_owned(),
+            });
+        }
+        Ok(readback)
+    }
+
+    fn load_root_transition(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RootTransitionCommitProjection>, OrsError> {
+        let key = Self::operational_key(OperationalKind::RootTransition, operation_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if record.kind != OperationalKind::RootTransition
+            || record.input.record_id != *operation_id
+            || record.phase != OperationalPhase::Active
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: "current root-transition key, kind, operation identity, or phase mismatch"
+                    .to_owned(),
+            });
+        }
+        record
+            .input
+            .validate()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: format!("retained root-transition input is invalid: {error}"),
+            })?;
+        let receipt = Self::receipt_for(&record)?;
+        let operation_order = record.operation_order;
+        let commit = RootTransitionCommit::from_record(record.input).map_err(|error| {
+            OrsError::IntegrityProblem {
+                record_type: "root_transition",
+                reason: format!("retained root-transition request is invalid: {error}"),
+            }
+        })?;
+        Ok(Some(RootTransitionCommitProjection::from_store(
+            commit,
+            operation_order,
             receipt,
         )))
     }
