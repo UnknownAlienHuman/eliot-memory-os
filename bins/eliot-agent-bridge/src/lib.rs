@@ -1906,16 +1906,16 @@ impl BootstrapSnapshot {
         Ok(())
     }
 
-    /// Requires a composed task selection to agree with the sealed activation task.
+    /// Requires a composed task selection to agree with the sealed activation task and revision.
     ///
     /// The sealed attach binding carries the activation-resolved task; a
-    /// `BOUND`/`UNIQUE` selection that names any other task is a forged or
-    /// stale packet (host-authored readiness naming a task the activation
-    /// never resolved) and is refused here, so it can never compose to
-    /// `READY`. A selection that claims a bound task but carries none is
-    /// refused the same way. `AMBIGUOUS`/`NONE` selections never project
-    /// readiness and need no agreement: they stay available as honest typed
-    /// non-ready outcomes.
+    /// `BOUND`/`UNIQUE` selection that names any other task or revision is a
+    /// forged or stale packet (host-authored readiness naming a task binding
+    /// the activation never resolved) and is refused here, so it can never
+    /// compose to `READY`. A selection that claims a bound task but carries
+    /// none is refused the same way. `AMBIGUOUS`/`NONE` selections never
+    /// project readiness and need no agreement: they stay available as honest
+    /// typed non-ready outcomes.
     fn selection_matches_sealed_task(
         bootstrap: &UnderstandingBootstrap,
         seal: &AttachBinding,
@@ -1936,11 +1936,15 @@ impl BootstrapSnapshot {
             }
             TaskSelectionDisposition::Ambiguous | TaskSelectionDisposition::None => return Ok(()),
         };
-        if selected.task_ref != seal.task_binding().task_id().as_str() {
+        // The activation owner seals revisions in canonical decimal form;
+        // compare that exact representation without parsing the opaque seal.
+        if selected.task_ref != seal.task_binding().task_id().as_str()
+            || selected.task_revision.to_string() != seal.task_binding().task_revision()
+        {
             return Err(BootstrapError {
                 code: "BOOTSTRAP_TASK_MISMATCH",
                 detail:
-                    "composed task selection disagrees with the sealed attach task binding; refusing to project"
+                    "composed task selection disagrees with the sealed attach task identity or revision; refusing to project"
                         .to_owned(),
             });
         }
