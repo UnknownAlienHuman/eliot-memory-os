@@ -53,11 +53,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BranchEnvironmentScope, CONTRACT_NAME, CONTRACT_VERSION, DeclaredPageSelector,
-    DeclaredResultSelector, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, ReadCoverage,
-    ReadError, ReadOutcome, ReadSchemaIdentity, ReadSourceIdentity, RequiredAssurance,
-    StoreReadFailure, TimeScope, contract_identity, context_reconstruction_operations,
-    declares_store_coverage_statement, is_state_operation, operation_matches_intent, requires_scope,
+    BoundRead, BranchEnvironmentScope, CONTRACT_NAME, CONTRACT_VERSION, CurrentStateView,
+    DeclaredPageSelector, DeclaredResultSelector, EliotResourceUri, FreshnessPolicy, NamedParameters,
+    ProvenanceDisposition, ProvenanceHandle, QueryIntent, QueryMode, QueryRequest, QueryResult,
+    ReadCoverage, ReadError, ReadIdentity, ReadInvalidationSet, ReadOrderingBinding, ReadOutcome,
+    ReadPrincipal, ReadProvenance, ReadSchemaIdentity, ReadSourceIdentity, RequiredAssurance,
+    ResourceContent, ResourceRequest, StateRequest, StoreReadFailure, TimeScope, contract_identity,
+    context_reconstruction_operations, declares_store_coverage_statement, is_state_operation,
+    operation_matches_intent, requires_scope,
 };
 
 /// How one inventory row was established.
@@ -92,10 +95,16 @@ pub enum InventoryEvidenceClass {
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicApiKind {
+    /// A public module of this package.
+    Module,
     /// A public trait a consumer implements or calls.
     Trait,
     /// The read service type over a caller-owned store client.
     Service,
+    /// A public contract constant.
+    ContractConstant,
+    /// A public contract function.
+    ContractFunction,
     /// A JSON data object on the read wire.
     WireObject,
     /// A closed JSON enum on the read wire.
@@ -304,9 +313,11 @@ impl OperationReadModelComparison {
             .is_some()
         {
             return Ok(ReadCoverage::PagedByDeclaredCursor {
+                // The closed page-bound vocabulary has exactly one selector, so
+                // the presence of the Store declaration is the whole decision.
                 selector: self
                     .declared_role(OwnerParameterRole::PageBound)
-                    .map(|page| DeclaredPageSelector::PageLimit),
+                    .map(|_| DeclaredPageSelector::PageLimit),
             });
         }
         Ok(ReadCoverage::NotApplicable)
@@ -604,14 +615,94 @@ struct PublicTypeDeclaration {
     witness: Option<fn() -> &'static str>,
 }
 
+/// Builds the declared public-type table from real type names.
+///
+/// Each expansion names the type twice: once as the identifier the row is
+/// reported under, and once inside the witness body, where the compiler has to
+/// resolve it. A renamed, moved or removed public type therefore breaks this
+/// crate instead of leaving a stale row behind, and the reported name cannot
+/// drift from the type it describes because it is that type's own identifier.
+macro_rules! public_type_rows {
+    ($($name:ident => $kind:ident),* $(,)?) => {
+        [$(
+            PublicTypeDeclaration {
+                name: stringify!($name),
+                kind: PublicApiKind::$kind,
+                witness: Some(|| std::any::type_name::<$name>()),
+            },
+        )*]
+    };
+}
+
 /// Declared public surface of this package.
 ///
-/// Every concrete row below names its real public type in the witness body, so
-/// this table cannot outlive the item it describes. The two trait rows and the
-/// service row have no single concrete type path and are declared instead: their
-/// presence is still a compile-time fact of this crate, because both traits and
-/// the service are implemented and constructed here.
-const PUBLIC_TYPE_DECLARATIONS: [PublicTypeDeclaration; 27] = [
+/// Every concrete row names its real public type in the witness body, so this
+/// table cannot outlive the item it describes. Rows for the module, the two
+/// traits, the generic service, the contract constants and the contract
+/// functions have no single concrete type path and are declared instead: their
+/// presence is still a compile-time fact of this crate, because the traits and
+/// the service are implemented here, the constants and the contract functions
+/// are read while this inventory is resolved, and the module is the file these
+/// tables live in.
+const PUBLIC_TYPE_DECLARATIONS: &[PublicTypeDeclaration] = &public_type_rows![
+    QueryMode => WireEnum,
+    TimeScope => WireEnum,
+    BranchEnvironmentScope => WireEnum,
+    FreshnessPolicy => WireEnum,
+    RequiredAssurance => WireEnum,
+    ProvenanceDisposition => WireEnum,
+    ReadOutcome => WireEnum,
+    ReadCoverage => WireEnum,
+    DeclaredResultSelector => WireEnum,
+    DeclaredPageSelector => WireEnum,
+    ReadError => WireEnum,
+    StoreReadFailure => WireEnum,
+    QueryIntent => WireObject,
+    EliotResourceUri => WireObject,
+    ProvenanceHandle => WireObject,
+    ReadProvenance => WireObject,
+    NamedParameters => WireObject,
+    ReadPrincipal => WireObject,
+    ReadSourceIdentity => WireObject,
+    ReadSchemaIdentity => WireObject,
+    ReadOrderingBinding => WireObject,
+    ReadInvalidationSet => WireObject,
+    ReadIdentity => WireObject,
+    StateRequest => WireObject,
+    QueryRequest => WireObject,
+    ResourceRequest => WireObject,
+    CurrentStateView => WireObject,
+    QueryResult => WireObject,
+    ResourceContent => WireObject,
+    InventoryProvenance => WireEnum,
+    InventoryEvidenceClass => WireEnum,
+    PublicApiKind => WireEnum,
+    OwnerMutableState => WireEnum,
+    OwnerParameterRole => WireEnum,
+    OwnerAdmission => WireEnum,
+    OwnerScopeDeclaration => WireEnum,
+    StoreScopeDeclaration => WireEnum,
+    ScopeDeclarationComparison => WireEnum,
+    StoreCoverageStatement => WireEnum,
+    ContextReconstructionMembership => WireEnum,
+    LocalReadPortMethod => WireEnum,
+    PortSelectorRole => WireEnum,
+    PublicApiRow => WireObject,
+    DeclaredParameterRow => WireObject,
+    OperationReadModelComparison => WireObject,
+    LocalReadPortBinding => WireObject,
+    OwnerContractIdentity => WireObject,
+    StoreDependencyRow => WireObject,
+    TestTargetRow => WireObject,
+    ReadOwnerInventory => WireObject,
+];
+
+/// Declared public items of this package that have no concrete type path.const PUBLIC_ITEM_DECLARATIONS: &[PublicTypeDeclaration] = &[
+    PublicTypeDeclaration {
+        name: "owner_inventory",
+        kind: PublicApiKind::Module,
+        witness: None,
+    },
     PublicTypeDeclaration {
         name: "ReadApi",
         kind: PublicApiKind::Trait,
@@ -628,119 +719,34 @@ const PUBLIC_TYPE_DECLARATIONS: [PublicTypeDeclaration; 27] = [
         witness: None,
     },
     PublicTypeDeclaration {
-        name: "QueryMode",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::QueryMode>()),
+        name: "CONTRACT_NAME",
+        kind: PublicApiKind::ContractConstant,
+        witness: None,
     },
     PublicTypeDeclaration {
-        name: "TimeScope",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::TimeScope>()),
+        name: "CONTRACT_VERSION",
+        kind: PublicApiKind::ContractConstant,
+        witness: None,
     },
     PublicTypeDeclaration {
-        name: "BranchEnvironmentScope",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::BranchEnvironmentScope>()),
+        name: "contract_identity",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
     },
     PublicTypeDeclaration {
-        name: "FreshnessPolicy",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::FreshnessPolicy>()),
+        name: "context_reconstruction_operations",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
     },
     PublicTypeDeclaration {
-        name: "RequiredAssurance",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::RequiredAssurance>()),
+        name: "read_owner_inventory",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
     },
     PublicTypeDeclaration {
-        name: "QueryIntent",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::QueryIntent>()),
-    },
-    PublicTypeDeclaration {
-        name: "EliotResourceUri",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::EliotResourceUri>()),
-    },
-    PublicTypeDeclaration {
-        name: "ProvenanceHandle",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ProvenanceHandle>()),
-    },
-    PublicTypeDeclaration {
-        name: "ProvenanceDisposition",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::ProvenanceDisposition>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadProvenance",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadProvenance>()),
-    },
-    PublicTypeDeclaration {
-        name: "NamedParameters",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::NamedParameters>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadOutcome",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::ReadOutcome>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadPrincipal",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadPrincipal>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadSourceIdentity",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadSourceIdentity>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadSchemaIdentity",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadSchemaIdentity>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadCoverage",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::ReadCoverage>()),
-    },
-    PublicTypeDeclaration {
-        name: "DeclaredResultSelector",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::DeclaredResultSelector>()),
-    },
-    PublicTypeDeclaration {
-        name: "DeclaredPageSelector",
-        kind: PublicApiKind::WireEnum,
-        witness: Some(|| std::any::type_name::<super::DeclaredPageSelector>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadOrderingBinding",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadOrderingBinding>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadInvalidationSet",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadInvalidationSet>()),
-    },
-    PublicTypeDeclaration {
-        name: "ReadIdentity",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::ReadIdentity>()),
-    },
-    PublicTypeDeclaration {
-        name: "StateRequest",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::StateRequest>()),
-    },
-    PublicTypeDeclaration {
-        name: "QueryRequest",
-        kind: PublicApiKind::WireObject,
-        witness: Some(|| std::any::type_name::<super::QueryRequest>()),
+        name: "compare_operation_with_store_read_model",
+        kind: PublicApiKind::ContractFunction,
+        witness: None,
     },
 ];
 
@@ -810,11 +816,11 @@ fn resolve_contract_identity() -> Result<OwnerContractIdentity, ReadError> {
 }
 
 /// Resolves every declared public item, checking each witness against its
-/// declared name.
+/// declared name and against this crate's own module path.
 fn resolve_public_api_rows() -> Result<Vec<PublicApiRow>, ReadError> {
     let mut seen = BTreeSet::new();
-    let mut rows = Vec::with_capacity(PUBLIC_TYPE_DECLARATIONS.len());
-    for declaration in &PUBLIC_TYPE_DECLARATIONS {
+    let mut rows = Vec::with_capacity(PUBLIC_TYPE_DECLARATIONS.len() + PUBLIC_ITEM_DECLARATIONS.len());
+    for declaration in PUBLIC_TYPE_DECLARATIONS.iter().chain(PUBLIC_ITEM_DECLARATIONS) {
         if !seen.insert(declaration.name) {
             return Err(ReadError::DuplicateField("public_api".to_owned()));
         }
@@ -828,32 +834,41 @@ fn resolve_public_api_rows() -> Result<Vec<PublicApiRow>, ReadError> {
     Ok(rows)
 }
 
-/// Returns the compiler-reported type path of one declared row, refusing a row
-/// whose witness no longer reports the declared name.
-fn observed_type_path(
-    declaration: &PublicTypeDeclaration,
-) -> Result<Option<String>, ReadError> {
+/// Returns the compiler-reported type path of one declared row.
+///
+/// The row is refused unless the compiler reports the declared name inside this
+/// crate's own module path, so a row can never quietly end up describing a type
+/// that arrived from somewhere else.
+fn observed_type_path(declaration: &PublicTypeDeclaration) -> Result<Option<String>, ReadError> {
     let Some(witness) = declaration.witness else {
         return Ok(None);
     };
     let observed = witness();
     let reported = observed.rsplit("::").next().unwrap_or(observed);
-    if reported != declaration.name {
+    let generic = observed.contains(&format!("::{}<", declaration.name));
+    if (reported != declaration.name && !generic) || !observed.starts_with(CRATE_TYPE_PATH) {
         return Err(ReadError::InvalidField {
             field: format!("public_api.{}", declaration.name),
-            reason: format!("witness reports {observed} instead of the declared type"),
+            reason: format!("witness reports {observed}, not this crate's declared type"),
         });
     }
     Ok(Some(observed.to_owned()))
 }
 
+/// Module path prefix every public type of this crate is reported under.
+const CRATE_TYPE_PATH: &str = "eliot_read::";
+
 /// Returns how one declared public row was established.
 const fn provenance_for(kind: PublicApiKind) -> InventoryProvenance {
     match kind {
-        PublicApiKind::Trait | PublicApiKind::Service => InventoryProvenance::DeclaredByOwner,
         PublicApiKind::WireObject | PublicApiKind::WireEnum => {
             InventoryProvenance::CompileTimeWitness
         }
+        PublicApiKind::Module
+        | PublicApiKind::Trait
+        | PublicApiKind::Service
+        | PublicApiKind::ContractConstant
+        | PublicApiKind::ContractFunction => InventoryProvenance::DeclaredByOwner,
     }
 }
 

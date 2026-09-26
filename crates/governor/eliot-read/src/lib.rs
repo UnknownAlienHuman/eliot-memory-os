@@ -95,9 +95,7 @@ use eliot_contracts::{
 };
 use eliot_store_api::{
     CanonicalReadClient, ExperienceRangePage, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
-    StoreError, activated_read_operations, declared_read_parameters, named_read_operation_name,
-    parameter_schema_digest, project_parameter_schema,
+    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1433,7 +1431,7 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         subject: String,
         max_records: u32,
     ) -> Result<QueryResult, ReadError> {
-        let binding = self.evidence_query_binding()?;
+        let binding = Self::evidence_query_binding()?;
         let subject_selector = binding
             .subject_selector
             .as_deref()
@@ -1499,7 +1497,7 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
                 }
             }
         }
-        let binding = self.projection_inputs_binding()?;
+        let binding = Self::projection_inputs_binding()?;
         // Facade-valid shape today (scope-bound, admitted intent/operation).
         // `packet_ref` / `material_refs` are validated above but map to no
         // selector yet: no `packet_ref` / `material_refs` parameter mapping
@@ -1533,9 +1531,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
     /// port's intent, operation, consistency and selector names come from one
     /// audited place and are checked against the Store declaration table rather
     /// than written as literals at this call site.
-    fn evidence_query_binding(
-        &self,
-    ) -> Result<LocalReadPortBinding, ReadError> {
+    fn evidence_query_binding() -> Result<LocalReadPortBinding, ReadError> {
         Ok(owner_inventory::read_owner_inventory()?
             .port_binding(LocalReadPortMethod::EvidenceQuery)?
             .clone())
@@ -1543,7 +1539,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
 
     /// Resolves the declared, store-validated binding of the
     /// projection-inputs port method.
-    fn projection_inputs_binding(&self) -> Result<LocalReadPortBinding, ReadError> {
+    fn projection_inputs_binding() -> Result<LocalReadPortBinding, ReadError> {
         Ok(owner_inventory::read_owner_inventory()?
             .port_binding(LocalReadPortMethod::ProjectionInputs)?
             .clone())
