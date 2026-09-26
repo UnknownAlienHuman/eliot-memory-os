@@ -448,6 +448,7 @@ fn daemon_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownRequest => "daemon_unknown_request",
         TransportError::UnknownOutcome => "daemon_unknown_outcome",
         TransportError::IdentityConflict => "daemon_identity_conflict",
+        TransportError::LegacyCorrelationUnresolved => "daemon_legacy_correlation_unresolved",
         TransportError::Cancelled => "daemon_cancelled",
         TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
             "daemon_backpressure"
