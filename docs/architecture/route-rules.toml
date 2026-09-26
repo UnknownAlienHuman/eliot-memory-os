@@ -142,6 +142,20 @@ required_files = []
 optional_files = []
 
 [[route]]
+id = "improvement-learning"
+description = "Improvement candidate intake, bounds, and learning closure, plus the exact maintenance pipeline and daemon candidate route that consume them (I12.24)."
+path_globs = [
+  "crates/meta/eliot-improvement/**",
+  "crates/governor/eliot-maintenance/src/improvement_pipeline.rs",
+  "bins/eliotd/src/improvement_candidate_route.rs",
+]
+topic_keywords = []
+required_handles = ["I12.24"]
+optional_handles = ["I12.*", "I13"]
+required_files = []
+optional_files = []
+
+[[route]]
 id = "dreamer"
 description = "Dreamer orientation, reflection, hypotheses, sleep-like processing, and bounded cognitive improvement."
 path_globs = ["bins/eliot-dreamer/**", "crates/**/*dream*/**"]
@@ -302,3 +316,51 @@ expect_routes = ["documentation-authority", "doctor-operations"]
 path = "README.md"
 topic = "repository root"
 expect_routes = ["repository-root"]
+
+# I12.24 improvement coverage. Each path is exercised independently with an empty
+# topic, so one correct consumer rule cannot mask a missing package rule. The
+# required-handle expectation is enforced against the merged payload, not the
+# route name.
+[[coverage.example]]
+path = "crates/meta/eliot-improvement"
+topic = ""
+expect_routes = ["generic-source", "improvement-learning"]
+expect_required_handles = ["I12.24"]
+
+[[coverage.example]]
+path = "crates/meta/eliot-improvement/Cargo.toml"
+topic = ""
+expect_routes = ["generic-source", "workspace-governance", "improvement-learning"]
+expect_required_handles = ["I12.24"]
+
+[[coverage.example]]
+path = "crates/meta/eliot-improvement/src/intake.rs"
+topic = ""
+expect_routes = ["generic-source", "improvement-learning"]
+expect_required_handles = ["I12.24"]
+
+[[coverage.example]]
+path = "crates/meta/eliot-improvement/src/candidate_bounds.rs"
+topic = ""
+expect_routes = ["generic-source", "improvement-learning"]
+expect_required_handles = ["I12.24"]
+
+[[coverage.example]]
+path = "crates/governor/eliot-maintenance/src/improvement_pipeline.rs"
+topic = ""
+expect_routes = ["generic-source", "improvement-learning"]
+expect_required_handles = ["I12.24"]
+
+[[coverage.example]]
+path = "bins/eliotd/src/improvement_candidate_route.rs"
+topic = ""
+expect_routes = ["generic-source", "improvement-learning"]
+expect_required_handles = ["I12.24"]
+
+# Negative: a path outside the improvement families keeps its old required set
+# and must not acquire `improvement-learning` by proximity.
+[[coverage.example]]
+path = "crates/foundation/eliot-contracts/src/lib.rs"
+topic = ""
+expect_routes = ["generic-source"]
+expect_absent_routes = ["improvement-learning"]
