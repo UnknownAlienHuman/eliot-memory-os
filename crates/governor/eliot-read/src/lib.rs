@@ -1,14 +1,12 @@
 //! G-06 Governor read/query contracts and named-read facade.
 //!
-//! DISPOSITION (#1144, WIRE): this crate is the declared Governor read owner.
-//! It is a stateless projection over the store-neutral named read port
+//! DISPOSITION (#1144, WIRE): this crate declares itself the Governor read
+//! owner. It is a stateless projection over the store-neutral named read port
 //! ([`CanonicalReadClient`]): it owns no cache, no freshness state, and no
 //! second consistency algorithm. Every read binds the caller request identity,
 //! scope, consistency, dependency revisions, current [`StateFence`], and exact
 //! source/evidence handles, and returns revision heads with provenance
-//! disposition so callers can revalidate. Real consumers: `eliot-governor`
-//! (`ReadApi` for context/input reconstruction) and `eliotd` (`LocalReadPort`
-//! for `eliot.query` / `eliot.packet` answers).
+//! disposition so callers can revalidate.
 //!
 //! Requests carry explicit intent, scope, consistency and fence
 //! dependencies. The facade never accepts raw database query text, writes
@@ -21,65 +19,38 @@
 //!
 //! # Owner inventory (W1)
 //!
-//! Owned mutable state: **none**. [`ReadService`] holds exactly one field, the
-//! caller-owned store client; every read re-dispatches to that client under the
-//! caller fence, so no cache, freshness state, or second consistency algorithm
-//! exists in this package (ARCH-MOD-03 explicit statelessness).
+//! The inventory is [`owner_inventory::read_owner_inventory`], resolved from
+//! the registries this crate already reads rather than restated as prose. It
+//! reports the exact contract identity, the closed mutable-state vocabulary,
+//! every declared public item with a compile-time witness of its type, every
+//! Store item the read path calls with the value that call returned, and the
+//! declared test targets. Each row carries its own
+//! [`owner_inventory::InventoryProvenance`], so a consumer can tell a derived
+//! value from a declared one, and the whole inventory carries
+//! [`owner_inventory::InventoryEvidenceClass::NotExecuted`].
 //!
-//! ```text
-//! public API:        ReadApi, LocalReadPort, ReadService,
-//!                    contract_identity, CONTRACT_NAME, CONTRACT_VERSION,
-//!                    context_reconstruction_operations,
-//!                    ReadOutcome, ReadPrincipal, ReadSchemaIdentity,
-//!                    ReadSourceIdentity, ReadCoverage, ReadOrderingBinding,
-//!                    ReadIdentity, ReadInvalidationSet, BoundRead,
-//!                    QueryMode, TimeScope, BranchEnvironmentScope,
-//!                    FreshnessPolicy, RequiredAssurance, QueryIntent,
-//!                    NamedParameters, EliotResourceUri, ProvenanceHandle,
-//!                    ProvenanceDisposition, ReadProvenance,
-//!                    StateRequest, QueryRequest, ResourceRequest,
-//!                    CurrentStateView, QueryResult, ResourceContent,
-//!                    ReadError, StoreReadFailure;
-//! store dependency:   CanonicalReadClient (read-only), the Store operation
-//!                    catalogue (generated_operation_manifests,
-//!                    activated_read_operations, declared_read_parameters,
-//!                    project_parameter_schema, parameter_schema_digest) and
-//!                    the Store-owned experience page coverage statement
-//!                    (ExperienceRangePage). No SurrealDB SDK, no credentials,
-//!                    no write capability, no raw query text;
-//! serialization:      every public type is `deny_unknown_fields` JSON with
-//!                    closed enum dimensions; intents reject unknown future
-//!                    prose instead of widening the read;
-//! tests:             crates/governor/eliot-read/tests/read_owner_proof.rs,
-//!                    crates/governor/eliot-read/tests/context_reconstruction.rs,
-//!                    in-crate `evidence_pack_read_tests`.
-//! ```
+//! What that inventory deliberately does **not** claim: which other packages
+//! import this one, whether such an importer is reachable from a process entry
+//! point, and whether any read currently executes. Those are repository-level
+//! facts a package cannot observe at runtime, and no row here asserts them.
 //!
 //! # Comparison with the current read owner, Store read model and runtime
 //! # status consumers (W2)
 //!
-//! ```text
-//! semantic read owner:      this crate (G-06). The Governor read *policy*
-//!                            (intent, coverage, provenance, freshness refusal)
-//!                            lives here; it is the only place that decides
-//!                            whether a payload may be called current.
-//! physical data access:      CanonicalReadClient only. `bins/eliotd` supplies
-//!                            KernelContextReadClient (Kernel transport) and
-//!                            the store adapters supply the memory/Surreal
-//!                            handlers. Neither owns a read decision.
-//! Store read model:          `eliot_store_api::NamedReadRequest` /
-//!                            `NamedReadResponse` / `ReadConsistency` /
-//!                            `RevisionHead` / `OrderingHead` /
-//!                            `ScopeRevisionView` and the generated operation
-//!                            catalogue. This crate consumes those identities
-//!                            read-only and never re-declares them.
-//! runtime-status consumers:  `crates/governor/eliot-governor/src/
-//!                            context_inputs.rs` retains seven role reads with
-//!                            `ProjectionState` dispositions; `bins/eliotd`
-//!                            retains one bounded evidence read per admitted
-//!                            `eliot.query` pair. Both consume the resolved
-//!                            [`ReadIdentity`] instead of re-deriving freshness.
-//! ```
+//! The owner/Store part of the comparison is
+//! [`owner_inventory::compare_operation_with_store_read_model`], which the
+//! single read engine runs for every read: it resolves the activated source and
+//! projection schema from the Store catalogue, sweeps this crate's own
+//! admission predicates, and reports where the two surfaces differ. A read
+//! this owner would dispatch unscoped against a scope-bound catalogue row is
+//! refused with a typed [`ReadError::OperationNotAllowed`] rather than sent.
+//!
+//! The runtime-status consumer part is a repository-level observation and is
+//! stated as such: the entry points a consumer can bind to are the two
+//! [`LocalReadPort`] methods, and both are declared in
+//! [`owner_inventory::PORT_DECLARATIONS`] rather than written as literals at
+//! the call site, so a port cannot drift from the Store's declaration table
+//! without a typed error.
 //!
 //! # Retained-read binding (W5, A3)
 //!
@@ -114,6 +85,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod owner_inventory;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
@@ -130,6 +103,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::owner_inventory::{LocalReadPortBinding, LocalReadPortMethod};
 
 /// Stable wire name for the Governor read contract.
 pub const CONTRACT_NAME: &str = "eliot.governor.read";
@@ -1458,32 +1433,37 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         subject: String,
         max_records: u32,
     ) -> Result<QueryResult, ReadError> {
-        text(&subject, "subject")?;
+        let binding = self.evidence_query_binding()?;
+        let subject_selector = binding
+            .subject_selector
+            .as_deref()
+            .ok_or_else(|| ReadError::InvalidField {
+                field: "local_read_port.EvidenceQuery.Subject".to_owned(),
+                reason: "the store declares no required discriminator selector".to_owned(),
+            })?;
+        let bound_selector = binding
+            .result_set_bound_selector
+            .as_deref()
+            .ok_or_else(|| ReadError::InvalidField {
+                field: "local_read_port.EvidenceQuery.ResultSetBound".to_owned(),
+                reason: "the store declares no required result-set bound selector".to_owned(),
+            })?;
+        text(&subject, subject_selector)?;
         if max_records == 0 {
             return Err(ReadError::InvalidField {
-                field: "max_records".to_owned(),
+                field: bound_selector.to_owned(),
                 reason: "must be a positive decimal bound".to_owned(),
             });
         }
-        let intent = QueryIntent {
-            mode: QueryMode::Verification,
-            time_scope: TimeScope::EvidenceWindow,
-            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
-            freshness_policy: FreshnessPolicy::ExactCapturedRecords,
-            required_assurance: RequiredAssurance::VerifierEvidence,
-        };
         let parameters = NamedParameters::from_map(BTreeMap::from([
-            ("subject".to_owned(), Value::String(subject)),
-            (
-                "max_records".to_owned(),
-                Value::String(max_records.to_string()),
-            ),
+            (subject_selector.to_owned(), Value::String(subject)),
+            (bound_selector.to_owned(), Value::String(max_records.to_string())),
         ]))?;
         let request = QueryRequest {
-            intent,
-            operation: NamedReadOperation::GetEvidencePack,
+            intent: binding.intent,
+            operation: binding.operation,
             scope_id: Some(scope),
-            consistency: ReadConsistency::Eventual,
+            consistency: binding.consistency,
             dependency_revisions: BTreeMap::new(),
             // This port declares no conflict-serialization head dependency: its
             // coherence is proven by the scope-bound evidence projection under
@@ -1519,23 +1499,17 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
                 }
             }
         }
-        let intent = QueryIntent {
-            mode: QueryMode::ContextReconstruction,
-            time_scope: TimeScope::ProjectionWindow,
-            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
-            freshness_policy: FreshnessPolicy::ProjectionInputsOnly,
-            required_assurance: RequiredAssurance::ReconstructionInputs,
-        };
+        let binding = self.projection_inputs_binding()?;
         // Facade-valid shape today (scope-bound, admitted intent/operation).
         // `packet_ref` / `material_refs` are validated above but map to no
         // selector yet: no `packet_ref` / `material_refs` parameter mapping
         // exists until MGR04 (#19) declares the storage schema, so no
         // selectors cross and no free text enters the request.
         let request = QueryRequest {
-            intent,
-            operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+            intent: binding.intent,
+            operation: binding.operation,
             scope_id: Some(scope),
-            consistency: ReadConsistency::Eventual,
+            consistency: binding.consistency,
             dependency_revisions: BTreeMap::new(),
             // Explicit no-order-dependency declaration, for the same reason as
             // `evidence_query`: the resolved identity states it rather than
@@ -1545,9 +1519,34 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
             provenance_handles: Vec::new(),
         };
         request.validate()?;
-        // Storage has no catalogue row, parameter schema, or adapter handler
-        // for this operation on base: fail closed, never `Ok`-empty.
+        // Storage has no adapter handler for this operation on base: fail
+        // closed, never `Ok`-empty.
         Err(ReadError::Store(StoreReadFailure::Unavailable))
+    }
+}
+
+impl<C: CanonicalReadClient> ReadService<C> {
+    /// Resolves the declared, store-validated binding of the evidence-query
+    /// port method.
+    ///
+    /// The binding is a section of this owner's resolved inventory, so the
+    /// port's intent, operation, consistency and selector names come from one
+    /// audited place and are checked against the Store declaration table rather
+    /// than written as literals at this call site.
+    fn evidence_query_binding(
+        &self,
+    ) -> Result<LocalReadPortBinding, ReadError> {
+        Ok(owner_inventory::read_owner_inventory()?
+            .port_binding(LocalReadPortMethod::EvidenceQuery)?
+            .clone())
+    }
+
+    /// Resolves the declared, store-validated binding of the
+    /// projection-inputs port method.
+    fn projection_inputs_binding(&self) -> Result<LocalReadPortBinding, ReadError> {
+        Ok(owner_inventory::read_owner_inventory()?
+            .port_binding(LocalReadPortMethod::ProjectionInputs)?
+            .clone())
     }
 }
 
@@ -1590,8 +1589,12 @@ impl<C: CanonicalReadClient> ReadService<C> {
             field: "request_metadata".to_owned(),
             reason: error.to_string(),
         })?;
-        let (source, schema) = resolve_source_and_schema(operation)?;
-        let coverage = resolve_coverage(operation, parameters)?;
+        let comparison =
+            owner_inventory::compare_operation_with_store_read_model(operation)?;
+        comparison.refuse_scope_divergence()?;
+        let source = comparison.source.clone();
+        let schema = comparison.schema.clone();
+        let coverage = comparison.coverage(parameters)?;
         ordering.validate_against(&ctx.state_fence)?;
         if matches!(
             consistency,
@@ -1799,130 +1802,6 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
             identity: bound.identity,
         })
     }
-}
-
-/// Resolves the exact activated Store source and projection schema of one
-/// named read.
-///
-/// The Store operation catalogue is the single authority for which source is
-/// activated, and it is read here without re-declaring anything. An operation
-/// with no activated entry has no running source, so it is refused as
-/// [`ReadOutcome::NotRunning`] instead of being dispatched and answered by an
-/// unknown-operation error that a consumer could mistake for a refusal of the
-/// caller rather than of the source.
-///
-/// Both schema witnesses come from the Store: the catalogue entry's own schema
-/// digest and the digest over the owner-approved typed read-parameter schema the
-/// request is admitted against. Neither is read from the payload, so a payload
-/// can never restate or widen the schema it was read under.
-fn resolve_source_and_schema(
-    operation: NamedReadOperation,
-) -> Result<(ReadSourceIdentity, ReadSchemaIdentity), ReadError> {
-    let operation_name = named_read_operation_name(operation);
-    if !activated_read_operations().contains(&operation) {
-        return Err(ReadError::Outcome(ReadOutcome::NotRunning));
-    }
-    let entries = generated_manifests()?;
-    let entry = entries
-        .iter()
-        .find(|entry| entry.name == operation_name)
-        .ok_or(ReadError::Outcome(ReadOutcome::NotRunning))?;
-    let source = ReadSourceIdentity {
-        operation,
-        operation_name: operation_name.to_owned(),
-        manifest_name: entry.name.clone(),
-        manifest_digest: entry.digest.as_str().to_owned(),
-    };
-    let schema = ReadSchemaIdentity {
-        manifest_name: entry.name.clone(),
-        manifest_version: entry.version,
-        manifest_schema_digest: entry.schema_digest.clone(),
-        parameter_schema_digest: parameter_schema_digest(&project_parameter_schema(operation))?,
-    };
-    Ok((source, schema))
-}
-
-/// Returns the generated Store operation catalogue.
-///
-/// The catalogue is a pure function of the Store's own declaration table, so
-/// resolving it here introduces no second source of truth; a catalogue that
-/// cannot be generated is a store contract failure, not an empty read.
-fn generated_manifests() -> Result<Vec<eliot_store_api::NamedOperationManifest>, ReadError> {
-    eliot_store_api::generated_operation_manifests()
-        .map_err(StoreReadFailure::from)
-        .map_err(ReadError::Store)
-}
-
-/// Resolves the exact coverage identity of one named read from the Store's own
-/// declared read-parameter table plus the caller's declared selectors.
-///
-/// A result-set bound, a cursor continuation, or the absence of any coverage
-/// dimension is read from the declaration table rather than assumed, and the
-/// caller's declared bound is echoed exactly. No percentage or completeness
-/// estimate is derived here: coverage is a statement about which bound was in
-/// force, never about how much of the source a read happened to see.
-fn resolve_coverage(
-    operation: NamedReadOperation,
-    parameters: &NamedParameters,
-) -> Result<ReadCoverage, ReadError> {
-    let declarations = declared_read_parameters(operation);
-    let mut result_bound = None;
-    let mut page_bound = None;
-    let mut cursor = false;
-    for declaration in declarations {
-        match declaration.name {
-            "max_records" => result_bound = Some(DeclaredResultSelector::MaxRecords),
-            "page_limit" => page_bound = Some(DeclaredPageSelector::PageLimit),
-            "cursor" => cursor = true,
-            _ => {}
-        }
-    }
-    if let Some(selector) = result_bound {
-        return Ok(
-            match declared_bound(parameters, declaration_name(selector))? {
-                Some(declared_bound) => ReadCoverage::BoundedByDeclaredSelector {
-                    selector,
-                    declared_bound,
-                },
-                None => ReadCoverage::BoundByStore { selector },
-            },
-        );
-    }
-    if cursor {
-        return Ok(ReadCoverage::PagedByDeclaredCursor {
-            selector: page_bound,
-        });
-    }
-    Ok(ReadCoverage::NotApplicable)
-}
-
-/// Returns the exact Store selector name for one declared coverage selector.
-const fn declaration_name(selector: DeclaredResultSelector) -> &'static str {
-    match selector {
-        DeclaredResultSelector::MaxRecords => "max_records",
-    }
-}
-
-/// Reads one caller-declared positive decimal bound out of the closed selectors.
-fn declared_bound(parameters: &NamedParameters, selector: &str) -> Result<Option<u32>, ReadError> {
-    let Some(raw) = parameters.as_map().get(selector) else {
-        return Ok(None);
-    };
-    let text = raw.as_str().ok_or_else(|| ReadError::InvalidField {
-        field: format!("coverage.{selector}"),
-        reason: "declared bound must be a decimal string".to_owned(),
-    })?;
-    let bound: u32 = text.parse().map_err(|_| ReadError::InvalidField {
-        field: format!("coverage.{selector}"),
-        reason: "declared bound must be a positive decimal".to_owned(),
-    })?;
-    if bound == 0 {
-        return Err(ReadError::InvalidField {
-            field: format!("coverage.{selector}"),
-            reason: "declared bound must be a positive decimal".to_owned(),
-        });
-    }
-    Ok(Some(bound))
 }
 
 /// Refuses a successful response that does not observe its own bound identity.
@@ -2172,7 +2051,7 @@ fn same_dependency_heads(
     })
 }
 
-fn text(value: &str, field: &'static str) -> Result<(), ReadError> {
+fn text(value: &str, field: &str) -> Result<(), ReadError> {
     if value.trim().is_empty() {
         return Err(ReadError::EmptyField(field.to_owned()));
     }
