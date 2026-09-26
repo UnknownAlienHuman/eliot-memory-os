@@ -76,6 +76,87 @@
            Text="The committed C# UserAutomation schedule contract mirror is stale against the Kernel owner contract (scripts/gen_operator_schedule_contract.py --check exited $(_OperatorScheduleContractExitCode)). Run 'python scripts/gen_operator_schedule_contract.py' from the repository root, review the diff, and commit the regenerated mirror. Do not hand-edit apps/Eliot.Operator/Protocol/Generated/OperatorScheduleContract.g.cs." />
   </Target>
 
+  <!--
+    Dependency-lock identity gate (#1137).
+
+    The Operator pins its Windows App SDK identity in two committed files: the
+    PackageReference in this project file, and the resolved graph in
+    packages.lock.json. Nothing in the release path compared those two values.
+    scripts/write-operator-build-receipt.ps1 records the version this project
+    requests, and Get-VerifiedOperatorBuildReceipt in
+    scripts/build-eliot-windows-x64-release.ps1 re-reads that same requested
+    version and compares the receipt against it; packages.lock.json itself is
+    bound there by SHA-256 alone. A lock that was never regenerated for a version
+    bump, or that was hand-edited, therefore satisfied every receipt check while
+    the published binary carried a different Windows App SDK runtime than the
+    project, the README and the receipt all named.
+
+    This target value-compares the two committed files on every build, offline
+    and after restore, so that drift fails `dotnet build` instead of the release.
+    The requested version comes from this project's own PackageReference item and
+    the resolved version from that package's own "resolved" member in the lock;
+    package identity is matched exactly, so same-prefixed siblings
+    (Microsoft.WindowsAppSDK.WinUI, .Base, .Foundation, ...) can neither satisfy
+    nor fail the gate. The lock's section key, target-framework moniker and
+    runtime-identifier suffix are read from the committed bytes rather than
+    assumed, and the lock is only read: it is never regenerated, rewritten or
+    reformatted by this target. The checker writes its one-line comparison record
+    under $(IntermediateOutputPath) and this target reads it back, because the
+    Exec task does not surface child stdout as a task output; the record is
+    logged on every agreeing build and repeated inside the build error below.
+
+    Disclosure: this makes the C# build require `python` on PATH, the same
+    requirement CheckOperatorScheduleContractMirror already imposes. Set
+    OperatorDependencyLockCheck=false to skip the gate for a bounded local
+    compile; the committed `just operator-check` recipe skips neither gate, and a
+    skipped build is not evidence of toolchain identity parity.
+  -->
+  <PropertyGroup>
+    <OperatorDependencyLockCheck Condition="'$(OperatorDependencyLockCheck)' == ''">true</OperatorDependencyLockCheck>
+  </PropertyGroup>
+
+  <Target Name="CheckOperatorWindowsAppSdkLockIdentity"
+          BeforeTargets="CoreCompile"
+          Condition="'$(OperatorDependencyLockCheck)' == 'true'">
+    <PropertyGroup>
+      <_OperatorDependencyLockPath>$(MSBuildProjectDirectory)/packages.lock.json</_OperatorDependencyLockPath>
+      <_OperatorDependencyLockChecker>$(MSBuildProjectDirectory)/check_dependency_lock_identity.py</_OperatorDependencyLockChecker>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_OperatorDependencyLockPath)')"
+           Text="The committed dependency lock apps/Eliot.Operator/packages.lock.json is missing. RestorePackagesWithLockFile is true, so that lock is part of the pinned Operator toolchain evidence: run 'dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj' and commit the generated lock." />
+    <Error Condition="!Exists('$(_OperatorDependencyLockChecker)')"
+           Text="The Operator dependency-lock identity checker apps/Eliot.Operator/check_dependency_lock_identity.py is missing. Do not delete or relocate it: CheckOperatorWindowsAppSdkLockIdentity is the only value comparison between the requested Windows App SDK version and the committed dependency lock." />
+    <ItemGroup>
+      <_OperatorWindowsAppSdkRequest Include="@(PackageReference)"
+                                    Condition="'%(Identity)' == 'Microsoft.WindowsAppSDK'" />
+    </ItemGroup>
+    <Error Condition="'@(_OperatorWindowsAppSdkRequest)' == ''"
+           Text="apps/Eliot.Operator/Eliot.Operator.csproj declares no PackageReference for Microsoft.WindowsAppSDK, so there is no requested version to value-compare with the committed dependency lock." />
+    <Error Condition="'@(_OperatorWindowsAppSdkRequest->'%(Version)')' == ''"
+           Text="The Microsoft.WindowsAppSDK PackageReference in apps/Eliot.Operator/Eliot.Operator.csproj carries no Version, so the requested Windows App SDK version cannot be value-compared with the committed dependency lock. Pin one exact version." />
+    <PropertyGroup>
+      <_OperatorWindowsAppSdkRequestedVersion>@(_OperatorWindowsAppSdkRequest->'%(Version)')</_OperatorWindowsAppSdkRequestedVersion>
+      <_OperatorDependencyLockRecord>$(IntermediateOutputPath)dependency-lock-identity.txt</_OperatorDependencyLockRecord>
+    </PropertyGroup>
+    <Delete Files="$(_OperatorDependencyLockRecord)" />
+    <Exec Command="python &quot;$(_OperatorDependencyLockChecker)&quot; --lock &quot;$(_OperatorDependencyLockPath)&quot; --package Microsoft.WindowsAppSDK --requested &quot;$(_OperatorWindowsAppSdkRequestedVersion)&quot; &gt; &quot;$(_OperatorDependencyLockRecord)&quot;"
+          ContinueOnError="true"
+          StandardErrorImportance="high">
+      <Output TaskParameter="ExitCode" PropertyName="_OperatorDependencyLockExitCode" />
+    </Exec>
+    <ReadLinesFromFile Condition="Exists('$(_OperatorDependencyLockRecord)')"
+                       File="$(_OperatorDependencyLockRecord)">
+      <Output TaskParameter="Lines" ItemName="_OperatorDependencyLockSummary" />
+    </ReadLinesFromFile>
+    <Error Condition="'$(_OperatorDependencyLockExitCode)' == '0' and '@(_OperatorDependencyLockSummary)' == ''"
+           Text="The Operator dependency-lock identity check produced no comparison record for $(_OperatorDependencyLockRecord) while exiting 0. apps/Eliot.Operator/check_dependency_lock_identity.py must state the requested and locked versions it compared, so that a silent pass is impossible." />
+    <Message Condition="'$(_OperatorDependencyLockExitCode)' == '0' and '@(_OperatorDependencyLockSummary)' != ''"
+             Importance="High"
+             Text="@(_OperatorDependencyLockSummary)" />
+    <Error Condition="'$(_OperatorDependencyLockExitCode)' != '0'"
+           Text="The committed apps/Eliot.Operator/packages.lock.json does not agree with the Windows App SDK version that apps/Eliot.Operator/Eliot.Operator.csproj requests. @(_OperatorDependencyLockSummary) Re-run the check for its full report: python apps/Eliot.Operator/check_dependency_lock_identity.py --lock apps/Eliot.Operator/packages.lock.json --package Microsoft.WindowsAppSDK --requested $(_OperatorWindowsAppSdkRequestedVersion). Repair it by running 'dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj' so NuGet rewrites the lock from the requested version, reviewing the lock diff and committing it together with the project change. Never hand-edit packages.lock.json, and do not skip or weaken this target." />
+  </Target>
+
   <Target Name="WriteOperatorBuildReceipt"
           AfterTargets="Publish"
           DependsOnTargets="CopyGeneratedWinUiResourcesToPublishDirectory"

@@ -13,11 +13,57 @@ Pinned toolchain, taken from `Eliot.Operator.csproj` and
 - Target framework `net10.0-windows10.0.19041.0`, minimum platform
   `10.0.17763.0`, `PlatformTarget`/`Platforms` `x64`;
 - .NET 10 SDK — the resolved SDK is whatever `dotnet --version` reports for the
-  machine; the project does not pin an SDK patch release and no README claim
-  substitutes for `dotnet --version`;
-- `Microsoft.WindowsAppSDK` `2.3.1` — `PackageReference` in
-  `Eliot.Operator.csproj` and the `resolved` version in `packages.lock.json`;
+  machine; the project does not pin an SDK patch release (there is no
+  `global.json` in this repository) and no README claim substitutes for
+  `dotnet --version`;
+- `Microsoft.WindowsAppSDK` `2.3.1` — the `PackageReference` `Version` in
+  `Eliot.Operator.csproj`, and the `resolved` member of that package id's
+  `"type": "Direct"` entry in the `dependencies` section of
+  `packages.lock.json`;
 - unpackaged (`WindowsPackageType=None`), self-contained `win-x64`.
+
+`config/dependency-policy.toml` records the same `2.3.1` under
+`[direct_dependencies."Microsoft.WindowsAppSDK"]`.
+
+That Windows App SDK version is one identity recorded in two committed files,
+and the build refuses to let them disagree. The
+`CheckOperatorWindowsAppSdkLockIdentity` target in `Eliot.Operator.csproj` runs
+before `CoreCompile` and value-compares the MSBuild-evaluated `PackageReference`
+version against the version the committed lock resolves for that exact package
+id. It is offline and read-only: `check_dependency_lock_identity.py`, in this
+directory, reads the committed lock, reads whatever section and target-framework
+keys NuGet actually wrote, and reports one `condition=` line naming the
+requested and resolved values. Same-prefixed siblings
+(`Microsoft.WindowsAppSDK.WinUI`, `.Base`, `.Runtime`, ...) are not that package
+and can neither satisfy nor fail the gate. A disagreement, a missing entry, a
+lock that records two versions for the package, or an unreadable lock fails
+`dotnet build` rather than the release. The lock is never regenerated here:
+NuGet owns it, and the only repair is
+`dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj` with the reviewed
+lock diff committed — never a hand edit.
+
+Publish evidence names the same pair, by value and by digest.
+`scripts/write-operator-build-receipt.ps1` records `windows_app_sdk_version`
+from the project and `packages_lock_sha256` over the lock into
+`OPERATOR_BUILD_RECEIPT.json`, and `Get-VerifiedOperatorBuildReceipt` in
+`scripts/build-eliot-windows-x64-release.ps1` re-reads both against the source
+commit. That receipt binds the lock by SHA-256 only, so the build-time value
+comparison above is what keeps the receipt, this README and the project speaking
+about one Windows App SDK. The locked release publish passes
+`-p:RestoreLockedMode=true` and no gate-skipping property, so the publish that
+produces the receipt runs both build gates.
+
+Both build gates run `python`, so the C# build requires `python` on PATH. The
+committed `just operator-check` recipe skips neither gate. A bounded local
+compile that skips only the schedule-contract mirror gate is:
+
+```powershell
+dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 -p:OperatorScheduleContractCheck=false
+```
+
+`OperatorScheduleContractCheck=false` disables the mirror gate alone;
+`OperatorDependencyLockCheck=false` disables the lock gate above. A build that
+skipped either gate is not evidence of contract or toolchain parity.
 
 Build and publish with an installed x64 .NET 10 SDK:
 
