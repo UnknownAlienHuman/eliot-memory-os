@@ -11,7 +11,8 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, SessionId,
+    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
+    RecoveryView, SessionId,
 };
 use eliot_contracts::EpochId;
 use eliot_mcp::{
@@ -196,6 +197,18 @@ enum Request {
     /// owner (I7.19 persist step; the attach-time restore already imports).
     ReactiveSnapshot,
     ReconcileExternal {},
+    /// Reads one bounded recovery page inside the declared window (issue
+    /// #2732).
+    ///
+    /// Recovery-only entry: it carries no caller-supplied continuation, so
+    /// possession of this request authorizes nothing. [`BridgeRunner::recover_next_page`]
+    /// derives the next bounded read from the live window and the live attach
+    /// binding, rechecks the scoped rights (including after a reconnect),
+    /// and threads the read through the real reconcile route
+    /// (`KernelMcpForwardingPort::reconcile_continue`). The read changes no
+    /// producer/consumer cursor, performs no ordinary effect, and never
+    /// clears the reconciliation gate by itself.
+    RecoverNextPage {},
     Bootstrap {
         context: Option<BootstrapContext>,
         tasks: BootstrapTaskInputs,
@@ -354,6 +367,23 @@ enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
+    /// Typed projection of one bounded recovery page (issue #2732).
+    ///
+    /// Read-only progress of the declared finite window after importing the
+    /// page: per-stream cursors and recovered counts, the unscoped-gap
+    /// count, scope provenance, and the walk disposition. Carries no event
+    /// payloads, no fabricated envelopes, and no completion claim — a
+    /// `partial`/`unavailable` disposition holds the reconciliation gate and
+    /// names the exact reason, while `complete` still leaves pending events
+    /// and blind intervals visible as pending work, never as APPLIED
+    /// streams. Deliberately distinct from [`Response::Reconciled`]: reusing
+    /// that shape would imply the gate cleared, which a single page never
+    /// does by itself.
+    RecoveryPage {
+        page: RecoveryPageProjection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
     Bootstrap {
         bootstrap: UnderstandingBootstrap,
     },
@@ -422,6 +452,89 @@ struct ReactiveStatusView {
 #[serde(deny_unknown_fields)]
 struct ResourceRegistryView {
     entries: usize,
+}
+
+/// Read-only projection of one bounded recovery page for the `RecoveryPage`
+/// frame (issue #2732).
+///
+/// Projects only the walk progress the core already holds: the live
+/// generation, per-stream cursor facts and recovered counts, the
+/// unscoped-gap count, scope provenance, and the disposition with its exact
+/// reason. No event payloads cross here; recovered obligations stay
+/// available through the pending view while forwarding is interrupted.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPageProjection {
+    live_generation: u64,
+    streams: Vec<RecoveryStreamProjection>,
+    unscoped_gaps: u64,
+    unproven_scope_present: bool,
+    stream_list_complete: bool,
+    disposition: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disposition_reason: Option<&'static str>,
+}
+
+/// Per-stream cursor facts and recovered counts inside one recovery page.
+///
+/// `next_after` is the replay-safe continuation the next bounded read must
+/// advance past; `page_complete` marks this stream's page drained. Facts
+/// come from the core's declared window; nothing here admits, delivers, or
+/// acknowledges.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryStreamProjection {
+    stream_id: String,
+    acked_base: u64,
+    durable_cursor: u64,
+    contiguous_frontier: u64,
+    highest_observed: u64,
+    next_after: u64,
+    recovered_events: u64,
+    recovered_gaps: u64,
+    page_complete: bool,
+}
+
+/// Shapes one imported recovery page into its typed response frame.
+///
+/// The disposition is projected losslessly: `complete` carries no reason,
+/// `partial`/`unavailable` carry the exact core reason the gate is held
+/// under. The window key itself never crosses: it is the verified
+/// reconciliation hash that already names the receipt, not host-driving
+/// state — pagination is driven by repeating the operation, with the bridge
+/// deriving each bounded read from its own live window.
+fn recovery_page_response(view: &RecoveryView) -> Response {
+    let (disposition, disposition_reason) = match view.disposition() {
+        RecoveryDisposition::Complete => ("complete", None),
+        RecoveryDisposition::Partial { reason } => ("partial", Some(reason)),
+        RecoveryDisposition::Unavailable { reason } => ("unavailable", Some(reason)),
+    };
+    Response::RecoveryPage {
+        page: RecoveryPageProjection {
+            live_generation: view.live_generation(),
+            streams: view
+                .streams()
+                .iter()
+                .map(|stream| RecoveryStreamProjection {
+                    stream_id: stream.stream_id().to_owned(),
+                    acked_base: stream.acked_base(),
+                    durable_cursor: stream.durable_cursor(),
+                    contiguous_frontier: stream.contiguous_frontier(),
+                    highest_observed: stream.highest_observed(),
+                    next_after: stream.next_after(),
+                    recovered_events: stream.recovered_events(),
+                    recovered_gaps: stream.recovered_gaps(),
+                    page_complete: stream.page_complete(),
+                })
+                .collect(),
+            unscoped_gaps: view.unscoped_gaps(),
+            unproven_scope_present: view.unproven_scope_present(),
+            stream_list_complete: view.stream_list_complete(),
+            disposition,
+            disposition_reason,
+        },
+        bootstrap: None,
+    }
 }
 
 /// Original identity of one durable in-flight delivery pending at Stop.
@@ -794,6 +907,13 @@ fn main() {
                     bridge_error(&error)
                 }
             },
+            Ok(Request::RecoverNextPage {}) => match runner.recover_next_page() {
+                Ok(view) => recovery_page_response(&view),
+                Err(error) => {
+                    provider_failure |= is_provider_failure(&error);
+                    bridge_error(&error)
+                }
+            },
             Ok(Request::Bootstrap {
                 context,
                 tasks,
@@ -940,6 +1060,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::ReactiveRecorded { bootstrap, .. }
         | Response::ReactiveLedger { bootstrap, .. }
         | Response::Reconciled { bootstrap }
+        | Response::RecoveryPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => bootstrap,
         Response::Bootstrap { .. }
         | Response::Error { .. }
@@ -3657,6 +3778,7 @@ mod tests {
                         Request::ReactiveRecordDisposition { .. } => "reactive_record_disposition",
                         Request::ReactiveSnapshot => "reactive_snapshot",
                         Request::ReconcileExternal {} => "reconcile_external",
+                        Request::RecoverNextPage {} => "recover_next_page",
                         Request::Reconnect { .. } => "reconnect",
                         Request::Detach { .. } => "detach",
                         Request::Status => "status",

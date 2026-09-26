@@ -664,9 +664,9 @@ fn recovery_sequence(
 /// Verifies the versioned reconciliation-key preimage explicitly.
 ///
 /// The owner hashes the reconciliation object BEFORE attaching
-/// `reconcile_key` and BEFORE reconciling Governor-intake handoffs under
-/// that key, so the preimage is the answer minus exactly those two legs:
-/// observation facts in, its own key and later mutation receipts out. A
+/// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`, so the
+/// preimage is the answer minus exactly those three legs: observation facts
+/// in, its own key and later mutation receipts out. A
 /// mismatch is an unknown outcome — the consumed frontier may already have
 /// applied owner-side, and the monotonic server application makes a retry
 /// safe — never an attack claim and never completion proof.
@@ -678,6 +678,7 @@ fn verify_reconcile_key(reconciliation: &serde_json::Value) -> Result<String, Pr
     })?;
     object.remove("reconcile_key");
     object.remove("handoffs_reconciled");
+    object.remove("handoff_maintenance");
     let bytes = canonical_json_bytes(&preimage).map_err(|_| event_transport_failure())?;
     if sha256_hex(&bytes) != key {
         return Err(event_shape_failure(
