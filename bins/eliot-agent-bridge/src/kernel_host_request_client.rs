@@ -7,11 +7,11 @@
 //! Kernel, Governor, or Store authority of its own.
 //!
 //! Implementation: I7.1/I7.2 (typed frames over the admitted front-door transport, never raw
-//! frame ingress) and I7.20 (typed outcomes only; no prose drives routing) — envelopes ride
-//! `Request`/`Execute` frames whose payload selects the closed kernel entry
+//! frame ingress) and I7.20 (typed outcomes only; no prose drives routing) — host-request
+//! envelopes ride `Request`/`Execute` frames whose payload selects the closed kernel entry
 //! (`agent_host_request_submit`, `agent_host_request_cancel`,
-//! `agent_host_request_reconcile`, or `agent_host_request_rehydrate`) and
-//! replies are decoded with the same
+//! `agent_host_request_reconcile`, or `agent_host_request_rehydrate`). Live binding status uses
+//! the existing `Heartbeat`/`Health` frame. Host-request replies are decoded with the same
 //! connection/digest/fence joins as the activation path.
 //!
 //! Ownership: this module is the sole owner of the invocation/cancellation/reconciliation/
@@ -28,6 +28,7 @@ use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
     canonical_json_bytes, sha256_hex,
 };
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
     HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
@@ -1220,6 +1221,75 @@ fn finish_envelope(
     .map_err(|_| request_failure())?;
     envelope.validate().map_err(|_| request_failure())?;
     Ok(envelope)
+}
+
+/// Builds the shared-transport liveness request without a request identity or
+/// operation envelope. The Kernel Health route is a control observation, not
+/// a durable host request.
+fn kernel_health_probe_frame(facts: &TransportFacts) -> Result<Frame, PortFailure> {
+    if facts.session.is_none() {
+        return Err(plan_gap_no_session());
+    }
+    let frame = Frame {
+        protocol_version: ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: facts.connection_id.clone(),
+        request_id: None,
+        kind: FrameKind::Heartbeat,
+        message_type: MessageType::Health,
+        request_identity: None,
+        payload: ProtocolPayload::Json(serde_json::json!({ "status": "probe" })),
+        trace_context: BTreeMap::new(),
+    };
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+/// Accepts only the uncorrelated Heartbeat/Health reply shape emitted by the
+/// Kernel's current-session status path and validates its owner-typed evidence
+/// against the retained admission fence.
+fn decode_kernel_health_reply(
+    reply: &Frame,
+    request: &Frame,
+    facts: &TransportFacts,
+) -> Option<()> {
+    if request.protocol_version != ProtocolVersion::CURRENT
+        || request.encoding_profile != EncodingProfile::JsonV1
+        || request.connection_id != facts.connection_id
+        || request.kind != FrameKind::Heartbeat
+        || request.message_type != MessageType::Health
+        || request.request_id.is_some()
+        || request.request_identity.is_some()
+        || !request.trace_context.is_empty()
+    {
+        return None;
+    }
+    reply.validate().ok()?;
+    if reply.protocol_version != request.protocol_version
+        || reply.encoding_profile != request.encoding_profile
+        || reply.connection_id != request.connection_id
+        || reply.kind != FrameKind::Heartbeat
+        || reply.message_type != MessageType::Health
+        || reply.request_id.is_some()
+        || reply.request_identity.is_some()
+        || !reply.trace_context.is_empty()
+    {
+        return None;
+    }
+    let ProtocolPayload::Json(payload) = &reply.payload else {
+        return None;
+    };
+    let evidence: KernelRuntimeHealthEvidence = serde_json::from_value(payload.clone()).ok()?;
+    evidence.validate().ok()?;
+    if evidence.status != "OPEN"
+        || !evidence
+            .authority_epoch
+            .is_same_authority(&facts.state_fence.authority_epoch)
+        || evidence.module_generation != facts.state_fence.resource_generation
+    {
+        return None;
+    }
+    Some(())
 }
 
 #[allow(
@@ -2552,60 +2622,34 @@ impl KernelHostRequestClient {
         decode_rehydrated_reply(&reply, envelope).ok_or_else(|| unknown_outcome(&digest))
     }
 
-    /// Proves the live Kernel binding is still current before a reconnect
-    /// mutates local attach state.
+    /// Proves the retained Kernel binding is still current before Status
+    /// reports it as current or reconnect mutates local attach state.
     ///
-    /// Sends one observation-only reconcile probe parented to a retained
-    /// replay-cache entry over the shared admitted transport: success proves
-    /// the Kernel still admits this bridge under the current descriptor,
-    /// generation, fence, and authority epoch, so the replacement connection
-    /// inherits exactly that binding and nothing inferred. Any exchange or
-    /// admission failure fails closed as
-    /// [`PortFailure::TransportBindingRejected`] without touching the replay
-    /// cache, staging no dispatch and reviving no authority: the caller keeps
-    /// the live local binding and reports stale authority.
+    /// Sends one observation-only Heartbeat/Health exchange over the shared
+    /// admitted transport. Kernel health is produced only after the Kernel
+    /// joins the retained Session against its current front-door generation,
+    /// artifact, `StateFence`, and authority epoch. This probe creates no
+    /// operation identity, replay-cache entry, or durable operation, so it is
+    /// also non-vacuous before the first host invocation.
     ///
-    /// When no invocation has been admitted yet the cache holds no parent and
-    /// there is no Kernel-side operation binding that could have gone stale,
-    /// so the check passes vacuously and the attach-time Kernel handshake
-    /// stands until the first exchange. The probe stages one observation-only
-    /// reconciliation record kernel-side (the existing unknown-delivery probe
-    /// semantics); it never resubmits an operation and never writes the
-    /// replay cache: there is exactly one ledger, kernel-side.
+    /// A failed exchange, malformed health reply, or epoch/generation mismatch
+    /// fails closed as [`PortFailure::TransportBindingRejected`].
     pub fn check_kernel_binding(&mut self) -> Result<(), PortFailure> {
-        let now_ms = unix_ms()?;
         let facts = self
             .shared
             .try_borrow()
             .map_err(|_| request_failure())?
             .snapshot();
-        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
-        let parent = self
-            .shared
-            .try_borrow()
-            .map_err(|_| request_failure())?
-            .replay_cache
-            .values()
-            .next()
-            .map(|entry| ParentLink::of(&entry.envelope));
-        let Some(parent) = parent else {
-            return Ok(());
-        };
-        let probe = build_reconciliation_envelope(&facts, &session, &parent, now_ms)?;
-        let frame = host_request_frame_for_envelope(
-            AGENT_HOST_REQUEST_RECONCILE_OPERATION,
-            &probe,
-            &facts,
-        )?;
+        let frame = kernel_health_probe_frame(&facts)?;
         let reply = self.exchange(&frame).map_err(|_| PortFailure::TransportBindingRejected {
-            reason: "kernel binding check failed: the admitted transport rejected the probe; re-attach and activate for a new admission".to_owned(),
+            reason: "live Kernel Health probe failed over the admitted transport; re-attach and activate for a new admission".to_owned(),
         })?;
-        match decode_admitted_reply(&reply, &probe) {
-            Some(_) => Ok(()),
-            None => Err(PortFailure::TransportBindingRejected {
-                reason: "kernel binding check failed: the Kernel no longer admits this binding under the current generation, fence, or epoch; re-attach and activate for a new admission".to_owned(),
-            }),
-        }
+        decode_kernel_health_reply(&reply, &frame, &facts).ok_or_else(|| {
+            PortFailure::TransportBindingRejected {
+                reason: "live Kernel Health reply did not prove the retained connection, protocol, generation, and authority epoch; re-attach and activate for a new admission".to_owned(),
+            }
+        })?;
+        Ok(())
     }
 
     /// Sends one observation-only reconcile probe for an invocation whose

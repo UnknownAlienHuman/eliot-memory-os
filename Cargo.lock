@@ -704,6 +704,7 @@ dependencies = [
  "eliot-governor",
  "eliot-integration-coverage",
  "eliot-ipc",
+ "eliot-kernel-core",
  "eliot-mcp",
  "eliot-platform-windows",
  "eliot-protocol",

@@ -24,6 +24,7 @@ eliot-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-integration-coverage.workspace = true
 eliot-ipc.workspace = true
+eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
