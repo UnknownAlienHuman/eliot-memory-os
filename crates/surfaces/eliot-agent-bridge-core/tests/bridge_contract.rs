@@ -136,6 +136,13 @@ impl McpForwardingPort for FakeForwarder {
             .pop_front()
             .ok_or_else(|| ProviderFailure::new("mcp", "missing reconciliation result"))
     }
+
+    fn reconciliation_imported(
+        &mut self,
+        _binding: &AttachBinding,
+        _result: &ReconciliationPortResult,
+    ) {
+    }
 }
 
 fn generation(value: u64) -> Result<Generation, Box<dyn std::error::Error>> {

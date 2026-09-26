@@ -15,8 +15,8 @@ use eliot_agent_bridge_core::{
     AttemptState, BridgeError, ConnectionId, CoverageGap, CursorPolicy, DemandId, EventEnvelope,
     EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
     HostEventKind, McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, RecoveryDirective, RecoveryDirectiveKind, RouteFingerprint,
-    SessionId, TaskId, TerminalReductionInputs, WorkUnitId,
+    ReconciliationPortOutcome, ReconciliationPortResult, RecoveryDirective, RecoveryDirectiveKind,
+    RouteFingerprint, SessionId, TaskId, TerminalReductionInputs, WorkUnitId,
 };
 use eliot_agent_bridge_core::{TransportEdge, TransportEdgeKind};
 use eliot_contracts::{EpochId, EpochLineageId};
@@ -125,6 +125,13 @@ impl McpForwardingPort for ForwardingFixture {
             "mcp",
             "reconciliation not part of this fixture",
         ))
+    }
+
+    fn reconciliation_imported(
+        &mut self,
+        _binding: &AttachBinding,
+        _result: &ReconciliationPortResult,
+    ) {
     }
 }
 
