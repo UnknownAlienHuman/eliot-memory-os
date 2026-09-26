@@ -2484,7 +2484,7 @@ pub(super) fn install_claude_global(
         &marketplace_root,
         MARKETPLACE_NAME,
         PLUGIN_ID,
-        &artifact.version,
+        &artifact,
         governor,
     )?;
     let legacy_direct_backup =
@@ -2515,6 +2515,16 @@ pub(super) fn install_claude_global(
     outcome
         .installed_paths
         .push(installed.path.to_string_lossy().into_owned());
+    // Report MCP-only front-door coverage honestly: the installed plugin
+    // carries the flagged route exactly when the approved artifacts resolved.
+    for staged in [&installed.bridge, &installed.declaration]
+        .into_iter()
+        .flatten()
+    {
+        outcome
+            .installed_paths
+            .push(staged.to_string_lossy().into_owned());
+    }
     outcome
         .modified_files
         .push(marketplace_root.to_string_lossy().into_owned());
@@ -2528,6 +2538,66 @@ struct InstalledClaudePlugin {
     path: PathBuf,
     governor: PathBuf,
     governor_sha256: String,
+    bridge: Option<PathBuf>,
+    declaration: Option<PathBuf>,
+}
+
+/// Verifies the staged front-door artifacts inside the officially installed
+/// plugin (issue #2562, item I6): when the marketplace staging carried the
+/// Bridge artifact and/or the installation-owned client declaration, the
+/// installed `bin` tree must carry the exact same bytes at the exact paths
+/// the flagged delegation resolves, otherwise the install fails closed. A
+/// legacy-only staging verifies nothing here and keeps the legacy path.
+fn verify_installed_claude_front_door(
+    plugin: &Path,
+    artifact: &ClaudeMarketplaceArtifact,
+) -> Result<InstalledClaudeFrontDoor> {
+    let bin = plugin.join("bin");
+    let bridge = bin.join("eliot-agent-bridge.exe");
+    let bridge_sha256 = match artifact.bridge_sha256.as_deref() {
+        None => None,
+        Some(expected) => {
+            let actual = sha256_file(&bridge).with_context(|| {
+                format!(
+                    "official Claude Eliot plugin is missing its staged front-door Bridge: {}",
+                    bridge.display()
+                )
+            })?;
+            if actual != expected {
+                bail!(
+                    "official Claude Eliot plugin front-door Bridge differs from the staged artifact"
+                );
+            }
+            Some(actual)
+        }
+    };
+    let declaration = bin.join("agent-bridge").join("client-declaration-v2.json");
+    let declaration_sha256 = match artifact.declaration_sha256.as_deref() {
+        None => None,
+        Some(expected) => {
+            let actual = sha256_file(&declaration).with_context(|| {
+                format!(
+                    "official Claude Eliot plugin is missing its staged front-door declaration: {}",
+                    declaration.display()
+                )
+            })?;
+            if actual != expected {
+                bail!(
+                    "official Claude Eliot plugin front-door declaration differs from the staged artifact"
+                );
+            }
+            Some(actual)
+        }
+    };
+    Ok(InstalledClaudeFrontDoor {
+        bridge: bridge_sha256.is_some().then_some(bridge),
+        declaration: declaration_sha256.is_some().then_some(declaration),
+    })
+}
+
+struct InstalledClaudeFrontDoor {
+    bridge: Option<PathBuf>,
+    declaration: Option<PathBuf>,
 }
 
 fn install_official_claude_plugin(
@@ -2535,7 +2605,7 @@ fn install_official_claude_plugin(
     marketplace_root: &Path,
     marketplace_name: &str,
     plugin_id: &str,
-    expected_version: &str,
+    artifact: &ClaudeMarketplaceArtifact,
     governor: &Path,
 ) -> Result<InstalledClaudePlugin> {
     claude_cli_checked(
@@ -2580,9 +2650,10 @@ fn install_official_claude_plugin(
         .get("version")
         .and_then(Value::as_str)
         .context("installed Claude Eliot plugin has no version")?;
-    if installed_version != expected_version {
+    if installed_version != artifact.version {
         bail!(
-            "installed Claude Eliot plugin version {installed_version} differs from generated {expected_version}"
+            "installed Claude Eliot plugin version {installed_version} differs from generated {}",
+            artifact.version
         );
     }
     if installed.get("enabled").and_then(Value::as_bool) != Some(true) {
@@ -2601,10 +2672,13 @@ fn install_official_claude_plugin(
     if installed_governor_sha256 != governor_sha256 {
         bail!("official Claude Eliot plugin Governor differs from the current binary");
     }
+    let front_door = verify_installed_claude_front_door(&path, artifact)?;
     Ok(InstalledClaudePlugin {
         path,
         governor: installed_governor,
         governor_sha256,
+        bridge: front_door.bridge,
+        declaration: front_door.declaration,
     })
 }
 
@@ -2642,6 +2716,71 @@ struct ClaudeMarketplaceArtifact {
     version: String,
     hash: String,
     source_commit: String,
+    bridge_sha256: Option<String>,
+    declaration_sha256: Option<String>,
+}
+
+/// Flagged Claude MCP front-door artifacts staged into the generated plugin
+/// (issue #2562, item I6).
+///
+/// `delegate_claude_mcp_to_agent_bridge` (crate root) resolves
+/// `eliot-agent-bridge.exe` and `agent-bridge/client-declaration-v2.json`
+/// beside the launched Governor and fails closed when either is absent, so
+/// the installed plugin must carry the same sibling layout in its `bin`
+/// directory. Both sources resolve beside the approved source Governor binary
+/// — never PATH, never the working directory — and the declaration is copied
+/// from the installation-owned file, never generated. Symlinks are refused
+/// like the rest of the integration bundle.
+///
+/// A legacy source layout without the approved Bridge artifact still installs
+/// the legacy-only plugin (absent flag stays legacy); the flagged launch then
+/// fails closed with its explicit diagnostic instead of falling back.
+struct ClaudeFrontDoorStaging {
+    bridge_sha256: Option<String>,
+    declaration_sha256: Option<String>,
+}
+
+fn stage_claude_front_door_artifacts(
+    governor: &Path,
+    plugin_bin: &Path,
+) -> Result<ClaudeFrontDoorStaging> {
+    const BRIDGE_BINARY: &str = "eliot-agent-bridge.exe";
+    const DECLARATION_DIR: &str = "agent-bridge";
+    const DECLARATION_FILE: &str = "client-declaration-v2.json";
+
+    let source_dir = governor
+        .parent()
+        .context("source Governor binary has no parent directory")?;
+    let stage_resolved = |source: PathBuf, staged: PathBuf, what: &str| -> Result<Option<String>> {
+        if !source.is_file() {
+            return Ok(None);
+        }
+        if std::fs::symlink_metadata(&source)?.file_type().is_symlink() {
+            bail!(
+                "refuse Claude plugin front-door {what} symlink: {}",
+                source.display()
+            );
+        }
+        if let Some(parent) = staged.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&source, &staged)?;
+        Ok(Some(sha256_file(&staged)?))
+    };
+    let bridge_sha256 = stage_resolved(
+        source_dir.join(BRIDGE_BINARY),
+        plugin_bin.join(BRIDGE_BINARY),
+        "Bridge artifact",
+    )?;
+    let declaration_sha256 = stage_resolved(
+        source_dir.join(DECLARATION_DIR).join(DECLARATION_FILE),
+        plugin_bin.join(DECLARATION_DIR).join(DECLARATION_FILE),
+        "client declaration",
+    )?;
+    Ok(ClaudeFrontDoorStaging {
+        bridge_sha256,
+        declaration_sha256,
+    })
 }
 
 fn build_claude_marketplace(
@@ -2661,8 +2800,14 @@ fn build_claude_marketplace(
     ensure_child(&package_root, &staging)?;
     let plugin = staging.join("plugins").join("eliot");
     copy_tree(source, &plugin, AgentHostId::Claude)?;
-    std::fs::create_dir_all(plugin.join("bin"))?;
-    std::fs::copy(governor, plugin.join("bin").join("eliot-governor.exe"))?;
+    let plugin_bin = plugin.join("bin");
+    std::fs::create_dir_all(&plugin_bin)?;
+    std::fs::copy(governor, plugin_bin.join("eliot-governor.exe"))?;
+    // #2562 (I6/A1): the flagged installed-plugin route resolves the Bridge
+    // artifact and the installation-owned client declaration beside the
+    // launched Governor, so the same sibling layout is staged here from the
+    // approved source Governor before hashing.
+    let front_door = stage_claude_front_door_artifacts(governor, &plugin_bin)?;
 
     let plugin_manifest_path = plugin.join(".claude-plugin").join("plugin.json");
     let mut plugin_manifest: Value =
@@ -2673,11 +2818,25 @@ fn build_claude_marketplace(
         .context("Claude plugin source version is missing")?;
     let source_hash = bundle_hash(source, AgentHostId::Claude)?;
     let governor_hash = sha256_file(governor)?;
-    let version = format!(
-        "{base_version}+{}.{}",
-        short_hash(&source_hash),
-        short_hash(&governor_hash)
-    );
+    // The generated plugin version already binds source + Governor content;
+    // bind the staged Bridge digest too so a Bridge change reinstalls the
+    // plugin through the existing installed-vs-expected version check. The
+    // installation-owned declaration rotates outside this package and is
+    // verified by content equality at install plus digest and Kernel challenge
+    // at launch, never by version.
+    let version = match front_door.bridge_sha256.as_deref() {
+        Some(bridge_hash) => format!(
+            "{base_version}+{}.{}.{}",
+            short_hash(&source_hash),
+            short_hash(&governor_hash),
+            short_hash(bridge_hash)
+        ),
+        None => format!(
+            "{base_version}+{}.{}",
+            short_hash(&source_hash),
+            short_hash(&governor_hash)
+        ),
+    };
     plugin_manifest["version"] = Value::String(version.clone());
     atomic_write_json(&plugin_manifest_path, &plugin_manifest)?;
 
@@ -2712,6 +2871,10 @@ fn build_claude_marketplace(
             "source_commit": source_commit,
             "source_bundle_hash": source_hash,
             "governor_sha256": governor_hash,
+            "front_door_bridge_staged": front_door.bridge_sha256.is_some(),
+            "front_door_bridge_sha256": front_door.bridge_sha256.clone(),
+            "front_door_declaration_staged": front_door.declaration_sha256.is_some(),
+            "front_door_declaration_sha256": front_door.declaration_sha256.clone(),
             "artifact_hash": hash,
             "generated_at": OffsetDateTime::now_utc()
         }),
@@ -2732,6 +2895,8 @@ fn build_claude_marketplace(
         version,
         hash,
         source_commit,
+        bridge_sha256: front_door.bridge_sha256,
+        declaration_sha256: front_door.declaration_sha256,
     })
 }
 
