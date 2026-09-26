@@ -1377,10 +1377,14 @@ async fn note_idle_maintenance_trigger(composition: &SharedComposition, flight: 
 /// I11.5 makes the persistent record the durable obligation and delivery only
 /// the presentation, so a refused emission is an explicit typed gap recorded
 /// through the existing minimal operational diagnostics — never a silent drop
-/// and never a daemon-killing error. The heartbeat's own liveness obligations
-/// (the Kernel health poll and the supervision submit below) are unaffected by
-/// it, which is exactly the A13.8 visible-degradation contract: the daemon
-/// stays alive and observable while the operator can see the refusal.
+/// and never a daemon-killing error. The Kernel health poll has already
+/// completed by this point, so a refused emission never rolls the daemon back
+/// to a failed poll; it is awaited before the supervision submit below, so it
+/// does delay that one submit for the length of one bounded exchange. A
+/// notification exchange is bounded by the transport's own operation deadline
+/// and normally never runs at all, because a recorded decision is skipped
+/// without any write. That is the A13.8 visible-degradation contract: the
+/// daemon stays alive and observable while the operator can see the refusal.
 async fn note_blocked_automation_notification(
     kernel: &Arc<DaemonKernelClient>,
     fence: eliot_contracts::StateFence,
@@ -1485,10 +1489,16 @@ async fn run_health_heartbeat_tick(
             activation_in_flight,
         )) {
             Ok(decision) if decision.admits_job => None,
-            Ok(decision) => guard
-                .notification_state_admission_fence()
-                .ok()
-                .map(|fence| (fence, decision)),
+            Ok(decision) => match guard.notification_state_admission_fence() {
+                Ok(fence) => Some((fence, decision)),
+                // A not-ready composition is a typed refusal, not a reason to
+                // pretend there is no blocked automation: it is recorded with
+                // the same minimal diagnostics the evaluation refusal uses.
+                Err(error) => {
+                    let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                    None
+                }
+            },
             Err(error) => {
                 let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
                 None

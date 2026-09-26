@@ -24,16 +24,32 @@
 //!
 //! I11.12 is explicit: "A repeated failure class updates one persistent
 //! notification keyed by automation revision and failure fingerprint. It does
-//! not emit one alert per occurrence." [`AutomationFailureKey`] is therefore
-//! the decision's *own* stable identity — `family`, `scope_ref`, `reason`,
-//! `decision`, `trigger_id` — and nothing else. No clock, counter, or
+//! not emit one alert per occurrence; a material revision, verified recovery or
+//! Human disposition reopens that notification key." [`AutomationFailureKey`] is
+//! therefore the decision's *own* stable identity — `family`, `scope_ref`,
+//! `reason`, `decision`, `trigger_id` — and nothing else. No clock, counter, or
 //! per-observation value enters the key, so a repeat of the same failure under
-//! the same admitted fence yields the same `dedup_key`, and the store's
-//! in-transaction revision compare-and-set then UPDATEs that one record (its
-//! `occurrences` grows) instead of creating a second one. `scope_ref` carries
-//! the authority lineage, epoch sequence, and resource generation, so a new
-//! generation is I11.12's own "material revision" and correctly opens its own
-//! key instead of mutating a record bound to a superseded fence.
+//! the same admitted fence yields the same `dedup_key`.
+//!
+//! Read that sentence against the store's own upsert, because it decides what
+//! this emitter may do. `NotificationStore::upsert` refuses a draft that does
+//! not `matches_draft` the stored record (`IdentityConflict`; the comparison
+//! includes `state_fence`) and otherwise does exactly one thing, increments
+//! `occurrences`. So a re-submitted unchanged decision writes a canonical
+//! transition per heartbeat, grows `occurrences` without bound, and is refused
+//! outright once the fence moves under an unchanged key. "Updates one persistent
+//! notification" is therefore satisfied by recording the record once and leaving
+//! it standing: [`notification_already_recorded`] asks the store and the
+//! emitter submits only an absent record. Nothing here invents a cadence.
+//!
+//! `scope_ref` carries the authority lineage, epoch sequence, and resource
+//! generation, so a new generation is a different key and correctly gets its
+//! own record rather than mutating one bound to a superseded fence. Note the
+//! direction of I11.12's last clause: a material revision "reopens that
+//! notification key" — the *same* key, after a Human disposition or verified
+//! recovery. Reopening under the same key is the resolve leg's concern
+//! (`upsert` refuses `AlreadyResolved` while `resolution_ref` is set) and is
+//! **not** claimed here.
 //!
 //! # The ordering head is read, never synthesized
 //!
@@ -54,43 +70,61 @@
 //! `GovernorComposition::commit_canonical` reaches the store through
 //! `CanonicalTransitionOwner::commit`, which hardcodes the `apply_prepared`
 //! operation name. That route runs the generic `store_apply_operation` checks,
-//! which do not include the canonical notification re-checks. The admitted
-//! `ApplyNotificationState` route adds exactly what issue #1780 requires: the
-//! fixed `NotificationState` class, the fixed `notification-state` scope and
-//! its single ordering scope, exactly one named operation, a decodable leg,
-//! and a same-fence record read-back after the commit. The submitted payload is
-//! the same flat four-field contract `apply_prepared` uses (`context`,
+//! which do not include the canonical notification re-checks, so a notification
+//! submitted through it would skip exactly the validation this issue is about.
+//! The admitted `ApplyNotificationState` route adds it: the fixed
+//! `NotificationState` class, the fixed `notification-state` scope and its
+//! single ordering scope, exactly one named operation, a decodable leg, and a
+//! same-fence record read-back after the commit. The submitted payload is the
+//! same flat four-field contract `apply_prepared` uses (`context`,
 //! `transition`, `expected_revision_heads`, `expected_ordering_heads`) over the
 //! same single authenticated daemon transport, so this is the one write path,
 //! not a second one.
+//!
+//! That choice is also why this leg does not run through
+//! [`DaemonComposition::commit_canonical_and_refresh`], and the reason is the
+//! operation name, not convenience:
+//!
+//! * that entry's only store route is `apply_prepared`, which — as above —
+//!   never calls `validate_notification_state_transition`;
+//! * its `check_canonical_write_work_scope` gate (#1787) is a *quarantine* that
+//!   engages only "when a `WorkScope` binding is retained"; with no retained
+//!   binding there is nothing to revalidate and the write proceeds, so the gate
+//!   is not what this leg would be escaping;
+//! * `admit_canonical_write` (#1929) resolves the caller's compiled readiness
+//!   receipt, and this observation carries none — there is no `TaskSelection`
+//!   to bind, and `task_id` is `None` on the envelope.
+//!
+//! What that entry would additionally do — `refresh_from_kernel()` and the #18
+//! W6/A5 cached-revision-fence recheck — is deliberately absent and is stated
+//! rather than skipped silently: a notification record is not part of any
+//! Governor projection this composition caches, and the write does not move a
+//! fence, so there is no dependent view to refresh and no cache key to
+//! invalidate. The admitted route's own same-fence record read-back is the
+//! proof this leg owes.
 //!
 //! Forbidden authority: no Store or provider client, no retry or default
 //! synthesis, no alternative transport, no second notification model, and no
 //! decision this module did not receive from its owner.
 //!
-//! # Source-level observation the integration owner must resolve first
+//! # The daemon transport's routing key, and why this leg is Windows-live
 //!
 //! Both exchanges this module makes travel the retained daemon transport, which
 //! inserts a routing key named `operation` into the JSON body
-//! (`daemon_kernel_client/handshake.rs::operation_payload`), while the Kernel
-//! routes that decode the **whole** body with `#[serde(deny_unknown_fields)]`
-//! reject that key as unknown. Read by source, the affected carriers are
-//! `StoreNamedOperation` (the `GetOrderingHeads` read),
-//! `NotificationStateApplyOperation` (this write), `StoreApplyOperation`,
-//! `StoreRecoveryOperation`, `StoreInitializeGenesisOperation`,
-//! `LocalReadOperation`, `GrantActivationOperation`, and the other whole-body
-//! carriers in `bins/eliot-kernel/src/daemon_request_dispatch.rs`; each answers
-//! `SessionFenced` on its first line. `OwnerPublishOperation` in the same file
-//! is the counterexample that fixes the shape: it declares `operation: String`,
-//! and its daemon feeder (`owner_feed.rs::publish_owner_bundle`) omits the key
-//! from its own body. `daemon_supervision_progress_operation` in the same
-//! dispatcher is the other established shape: it removes the routing key before
-//! decoding.
+//! (`daemon_kernel_client/handshake.rs::operation_payload`). The Kernel routes
+//! that decode the **whole** body with `#[serde(deny_unknown_fields)]` reject
+//! that key as unknown, and the daemon frame loop propagates the resulting
+//! `SessionFenced` with `?` (`front_door_driver.rs`, `KernelFrameAction::Daemon`),
+//! so a mismatch here fences the Kernel connection, not just one request.
+//! `daemon_request_dispatch.rs` therefore strips the routing key from exactly
+//! the two whole-body carriers this module uses — the notification write and
+//! the `GetOrderingHeads` read — through one shared helper, and leaves every
+//! other carrier of that frame alone.
 //!
-//! Both ends are outside this piece's mutable path scope, so this module does
-//! not work around them: it is written against the admitted routes exactly as
-//! the store contract and the Kernel's own re-checks specify, and it becomes
-//! live when the routing key is honored on the carriers above.
+//! Both Kernel routes are `#[cfg(windows)]`. On a non-Windows build this
+//! emitter still evaluates and still derives its key, but the exchange resolves
+//! to the transport's own typed `Unsupported` refusal, which the caller records
+//! as a typed diagnostics gap rather than as a committed notification.
 //!
 //! Governed by `AGENTS.md`, `bins/AGENTS.md`, and
 //! `docs/architecture/READING_PROTOCOL.md`. Implementation: I1.8, I11.2, I11.5,
@@ -126,7 +160,7 @@ use eliot_store_api::{
     NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NamedReadOperation, NamedReadRequest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
     RevisionHeadExpectation, ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt,
-    WriteReceiptStatus,
+    WriteReceiptStatus, notification_read_request,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -272,8 +306,16 @@ pub fn automation_failure_key(
              and admits no job; trigger identity {}",
             decision.scope_ref, decision.trigger_id
         ),
+        // Named after the decision's OWN closed reason, never after a cause the
+        // decision does not carry: `DecisionReason` is the closed set that
+        // states what actually blocked the job (policy off, outside schedule,
+        // route unavailable, budget unavailable, user session required,
+        // duplicate active job, expired, ...), and a fixed sentence about
+        // "absent Durable Job admission" would name a cause the Governor may
+        // not have decided at all.
         required_action: format!(
-            "restore the absent maintenance Durable Job admission for {family}"
+            "resolve the maintenance automation blocker for {family} reported as {reason} at {}",
+            decision.scope_ref
         ),
         fingerprint,
         owner: MAINTENANCE_AUTHORITY_OWNER.to_owned(),
@@ -340,26 +382,86 @@ pub async fn read_notification_ordering_head(
     })
 }
 
+/// Reports whether the canonical store already holds this failure's record.
+///
+/// I11.12 is explicit that a repeated failure "does not emit one alert per
+/// occurrence", and the store's own upsert proves why that is a hard rule and
+/// not a nicety: `NotificationStore::upsert` refuses any draft that does not
+/// `matches_draft` the stored record with `IdentityConflict` (the comparison
+/// includes `state_fence`), and otherwise does exactly one thing — increments
+/// `occurrences`. Re-submitting an unchanged decision every heartbeat would
+/// therefore write a canonical transition per tick, grow `occurrences` without
+/// bound, and be refused outright the moment the fence moves under an
+/// unchanged key. The store already holds the answer, so the emitter asks it
+/// through the admitted `GetNotificationState` read and submits only when the
+/// record is genuinely absent.
+///
+/// A record that is present but resolved is still present: the upsert leg
+/// refuses `AlreadyResolved`, and reopening a key after a Human disposition is
+/// the resolve leg's own concern, not this emitter's.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the closed read is not admitted, the transport
+/// refuses it, or the answer is not a decodable notification page.
+pub async fn notification_already_recorded(
+    reads: &KernelContextReadClient,
+    key: &AutomationFailureKey,
+    state_fence: &StateFence,
+) -> Result<bool, StoreError> {
+    // The store catalogue's own exact read selector for one record, built by
+    // the store's own request builder so the bound and the selector set stay
+    // the store contract's, not a second spelling of it.
+    let request = notification_read_request(
+        None,
+        Some(key.dedup_key.clone()),
+        None,
+        true,
+        1,
+        None,
+        state_fence.clone(),
+    )?;
+    let response = reads.execute_named(request).await?;
+    let records = response
+        .payload
+        .get(eliot_store_api::NOTIFY_PAGE_RECORDS)
+        .and_then(serde_json::Value::as_array)
+        .ok_or(StoreError::InvalidField {
+            field: "notification.records",
+            reason: "notification page payload must carry records",
+        })?;
+    if records.is_empty() {
+        return Ok(false);
+    }
+    let record: eliot_kernel_core::Notification = serde_json::from_value(records[0].clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    // A record from another fence is not this record at this fence: reporting
+    // it as present would suppress the notification the current fence owes.
+    Ok(record.state_fence == *state_fence)
+}
+
 /// Persists one persistent canonical notification for an admitted automation
 /// decision that could not start.
 ///
 /// The whole owner-side leg runs in the order I1.8 fixes: derive the decision's
-/// stable failure fingerprint, read the live ordering head, derive the admitted
-/// ingress identity and the source-verification receipt from those same
-/// observed facts, prepare the one canonical `PreparedTransition`, and submit
-/// it to the admitted `ApplyNotificationState` route — which rechecks the fixed
-/// scope, ordering scope, transition class, and closed leg parameters and
-/// requires a same-fence record read-back before it reports success.
+/// stable failure fingerprint, ask the canonical store whether that record
+/// already exists, read the live ordering head, derive the admitted ingress
+/// identity and the source-verification receipt from those same observed facts,
+/// prepare the one canonical `PreparedTransition`, and submit it to the admitted
+/// `ApplyNotificationState` route — which rechecks the fixed scope, ordering
+/// scope, transition class, and closed leg parameters and requires a same-fence
+/// record read-back before it reports success.
 ///
-/// A decision that admits a job is not a notification-worthy failure and
-/// returns `Ok(None)` without touching the store.
+/// A decision that admits a job is not a notification-worthy failure, and a
+/// decision whose record is already stored is I11.12's repeat rather than a
+/// new occurrence; both return `Ok(None)` without touching the store.
 ///
 /// # Errors
 ///
 /// Returns [`NotificationEmitError`] when the store contract refuses the
-/// envelope, the leg parameters, or the ordering-head read; when canonical
-/// admission refuses the prepared transition; or when the authenticated Kernel
-/// exchange refuses or cannot complete it.
+/// envelope, the leg parameters, or either read; when canonical admission
+/// refuses the prepared transition; or when the authenticated Kernel exchange
+/// refuses or cannot complete it.
 pub async fn emit_blocked_automation_notification(
     kernel: &Arc<DaemonKernelClient>,
     state_fence: StateFence,
@@ -370,6 +472,9 @@ pub async fn emit_blocked_automation_notification(
     }
     let key = automation_failure_key(decision)?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
+    if notification_already_recorded(&reads, &key, &state_fence).await? {
+        return Ok(None);
+    }
     let ordering_head = read_notification_ordering_head(&reads).await?;
     // The submission identity is derived from the exact compare-and-swap state
     // this transition observed: the same failure resubmitted against the same
@@ -632,10 +737,14 @@ fn source_receipt_json(
 ///
 /// Returns [`StoreError`] when the envelope inputs are refused, and
 /// [`CompositionError`] when canonical admission refuses the prepared
-/// transition — projected on the same owner channel
-/// `eliot_governor::commit_experience_bank` uses, because `eliot-canonical` is
-/// not a direct dependency of this composition root and no second canonical
-/// dependency path is added for one error type.
+/// transition. The projection is `CompositionError::Owner` because
+/// `CompositionError::Canonical(#[from] CanonicalError)` exists but is
+/// unnameable here: `eliot-canonical` is not a dependency of this composition
+/// root, and adding a second canonical dependency path for one error type would
+/// be the wider change. The same `Owner` projection is what the other ~25
+/// canonical-envelope sites in this composition root use — `owner_feed.rs` and
+/// `dreamer_admission.rs` — so this leg is the established shape, not a new
+/// one.
 fn notification_transition(
     identity: &RequestIdentity,
     operation_text: &str,
