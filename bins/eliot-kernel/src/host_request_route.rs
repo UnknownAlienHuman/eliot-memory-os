@@ -862,9 +862,18 @@ impl KernelComposition {
         };
         let _transition = self.agent_bridge_transition_read()?;
         let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
-        // A retained result is one closed digest/body pair in a result state.
-        // Refuse a half-pair or a result attached to a live state before any
-        // queue path can expose it for dispatch.
+        self.validate_invoke_read_result_pair(envelope, &record)?;
+        self.route_admitted_invoke_read(envelope, tool, carrier, &mut record)?;
+        self.validate_invoke_read_result_pair(envelope, &record)?;
+        Self::validate_retained_invoke_read_result(envelope, &receipt, &record)?;
+        Ok((receipt, record))
+    }
+
+    fn validate_invoke_read_result_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        record: &HostRequestRecord,
+    ) -> Result<(), TransportError> {
         let has_digest = record.result_digest.is_some();
         let has_body = record.result_response.is_some();
         if has_digest != has_body
@@ -880,7 +889,40 @@ impl KernelComposition {
             );
             return Err(TransportError::SessionFenced);
         }
+        Ok(())
+    }
 
+    fn validate_retained_invoke_read_result(
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+        record: &HostRequestRecord,
+    ) -> Result<(), TransportError> {
+        if let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) {
+            HostRequestResultBody {
+                wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+                wire_version: HostRequestResultBody::CONTRACT_VERSION,
+                operation_id: receipt.operation_id.clone(),
+                request_sha256: envelope.envelope_sha256.clone(),
+                result_digest: digest.clone(),
+                response: body.clone(),
+                // Coherence gate only: stored rows predate attempt ownership.
+                attempt: None,
+            }
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
+        Ok(())
+    }
+
+    fn route_admitted_invoke_read(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        carrier: Option<LocalReadCarrier>,
+        record: &mut HostRequestRecord,
+    ) -> Result<(), TransportError> {
+        let has_digest = record.result_digest.is_some();
+        let has_body = record.result_response.is_some();
         let dispatchable =
             !has_digest && !has_body && local_read_state_is_dispatchable(record.state);
         match carrier {
@@ -895,7 +937,7 @@ impl KernelComposition {
                         // successful query admission with no queued read.
                         let current = self.local_read_durable_record(envelope)?;
                         if current.result_digest.is_some() || current.result_response.is_some() {
-                            record = current;
+                            *record = current;
                         } else {
                             return Err(local_read_retired_error(
                                 current.state,
@@ -959,38 +1001,7 @@ impl KernelComposition {
             None if has_digest && has_body => {}
             None => return Err(TransportError::SessionFenced),
         }
-        let has_digest = record.result_digest.is_some();
-        let has_body = record.result_response.is_some();
-        if has_digest != has_body
-            || (has_digest
-                && !matches!(
-                    record.state,
-                    HostRequestState::ResultReceived | HostRequestState::Terminal
-                ))
-        {
-            self.retire_local_read_pair_under_transition(
-                &host_request_operation_id(envelope),
-                &envelope.envelope_sha256,
-            );
-            return Err(TransportError::SessionFenced);
-        }
-        // Coherence gate before serving: a resulted record must carry a
-        // digest-bound body, otherwise the row is never served as an answer.
-        if let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) {
-            HostRequestResultBody {
-                wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
-                wire_version: HostRequestResultBody::CONTRACT_VERSION,
-                operation_id: receipt.operation_id.clone(),
-                request_sha256: envelope.envelope_sha256.clone(),
-                result_digest: digest.clone(),
-                response: body.clone(),
-                // Coherence gate only: stored rows predate attempt ownership.
-                attempt: None,
-            }
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        }
-        Ok((receipt, record))
+        Ok(())
     }
 
     /// Rehydrates one previously admitted host request after restart or an
@@ -1683,6 +1694,7 @@ impl KernelComposition {
     /// deadline may be queued. Every other case retires the pair and returns
     /// [`LocalReadEnqueueDisposition::Retired`] so a caller can never mistake
     /// a fail-closed refusal for a queued dispatch.
+    #[cfg(test)]
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1720,6 +1732,14 @@ impl KernelComposition {
             );
             return Ok(LocalReadEnqueueDisposition::Retired);
         }
+        self.insert_local_read_pair_under_transition(envelope, tool)
+    }
+
+    fn insert_local_read_pair_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<LocalReadEnqueueDisposition, TransportError> {
         let mut index = self
             .host_request_connection_index
             .lock()
