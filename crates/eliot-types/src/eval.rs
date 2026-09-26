@@ -298,6 +298,102 @@ pub struct BenchmarkIntegrityReceipt {
     pub created_at: OffsetDateTime,
 }
 
+/// Sealed evaluation-integrity receipt for the replay-exact path (issue #1922 W6a).
+///
+/// I18.47 requires every load-bearing evaluation to produce an integrity
+/// receipt and states that the original receipt remains immutable: a post-hoc
+/// change cannot rewrite an observed outcome. This receipt is the sealed,
+/// carried form of that requirement for canonical sealed replay. The producer
+/// seals the body with `compute_seal`, the run report carries it, and the
+/// consumer fails closed when `verify_seal` or the run binding does not hold.
+/// Runs without canonical sealed inputs carry no receipt (`None`); absence is
+/// unknown provenance, never a validity claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayEvaluationIntegrityReceipt {
+    /// Seal-bound identifier: `replay-evaluation-integrity:{seal}`.
+    pub receipt_id: String,
+    /// Evaluated path kind. Always `replay-exact`: this receipt states a
+    /// replay/modelled-path result, never a live product observation.
+    pub path_kind: String,
+    /// Evidence class. Always `replay-only`: replay evidence calibrates an
+    /// oracle but cannot alone promote live product proof (I18.47).
+    pub evidence_origin: String,
+    /// Precise evaluated property: the replay-exact outcome of the sealed set.
+    pub property: String,
+    /// Product Identity under evaluation, per replay run project.
+    pub product_identity: String,
+    /// Owner of the deciding oracle: the sealed replay evaluator.
+    pub oracle_owner: String,
+    /// Acceptance relation between measurements and sealed evidence.
+    pub acceptance_relation: String,
+    /// Evidence family instance: `replay-exact:{sealed_input_hash}`.
+    pub evidence_family: String,
+    /// Shared lineage inputs this result depends on (evaluator, profile,
+    /// context, and observation evidence hashes).
+    pub shared_dependencies: Vec<String>,
+    /// Source artifact bindings: sealed set, case, and snapshot record ids.
+    pub artifact_binding: Vec<String>,
+    /// Route that produced this receipt (the canonical replay entrypoint).
+    pub actual_route: String,
+    /// Declared resource envelope of the producing run profile.
+    pub resource_fingerprint: String,
+    /// Non-product proof ceiling. Always `REPLAY_ONLY`.
+    pub proof_ceiling: String,
+    /// Measured-validity state. Always `INCONCLUSIVE`: no known-valid or
+    /// known-invalid runtime sets exist, and a missing denominator is never
+    /// zero error (I18.47).
+    pub status: String,
+    /// Deterministic creation time, derived from sealed execution content.
+    /// Rides outside the seal like sealed replay record timestamps.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Tamper-evident blake3 seal over the seal projection.
+    pub seal: String,
+}
+
+impl ReplayEvaluationIntegrityReceipt {
+    /// Seal-bound receipt identifier shared by producer and verifier.
+    pub fn receipt_id_for_seal(seal: &str) -> String {
+        format!("replay-evaluation-integrity:{seal}")
+    }
+
+    /// Canonical projection of the sealed body fields. Single source for both
+    /// sealing and verification; field order is fixed.
+    pub fn seal_projection(&self) -> Value {
+        serde_json::json!({
+            "path_kind": self.path_kind,
+            "evidence_origin": self.evidence_origin,
+            "property": self.property,
+            "product_identity": self.product_identity,
+            "oracle_owner": self.oracle_owner,
+            "acceptance_relation": self.acceptance_relation,
+            "evidence_family": self.evidence_family,
+            "shared_dependencies": self.shared_dependencies,
+            "artifact_binding": self.artifact_binding,
+            "actual_route": self.actual_route,
+            "resource_fingerprint": self.resource_fingerprint,
+            "proof_ceiling": self.proof_ceiling,
+            "status": self.status,
+        })
+    }
+
+    /// Compute the tamper-evident blake3 seal over the seal projection.
+    pub fn compute_seal(&self) -> Result<String, serde_json::Error> {
+        let bytes = serde_json::to_vec(&self.seal_projection())?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
+    /// True only when the seal matches the current body and the receipt id is
+    /// bound to that seal. Any post-hoc body mutation fails.
+    pub fn verify_seal(&self) -> bool {
+        match self.compute_seal() {
+            Ok(seal) => seal == self.seal && self.receipt_id == Self::receipt_id_for_seal(&seal),
+            Err(_) => false,
+        }
+    }
+}
+
 /// Decoder: derived and closed. The `#[serde(default)]` meta fields keep
 /// pre-meta harness records readable and decode as absent or explicitly
 /// uncertain (`InsufficientEvidence`); none of them can promote a candidate.
