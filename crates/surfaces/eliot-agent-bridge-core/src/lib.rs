@@ -1982,17 +1982,19 @@ impl RecoveryWindow {
                 .stream_order
                 .iter()
                 .filter_map(|stream_id| {
-                    self.streams.get(stream_id).map(|progress| RecoveryStreamView {
-                        stream_id: stream_id.clone(),
-                        acked_base: progress.acked_base,
-                        durable_cursor: progress.durable_cursor,
-                        contiguous_frontier: progress.contiguous_frontier,
-                        highest_observed: progress.highest_observed,
-                        next_after: progress.next_after,
-                        recovered_events: progress.events.len() as u64,
-                        recovered_gaps: progress.gaps.len() as u64,
-                        page_complete: progress.page_complete,
-                    })
+                    self.streams
+                        .get(stream_id)
+                        .map(|progress| RecoveryStreamView {
+                            stream_id: stream_id.clone(),
+                            acked_base: progress.acked_base,
+                            durable_cursor: progress.durable_cursor,
+                            contiguous_frontier: progress.contiguous_frontier,
+                            highest_observed: progress.highest_observed,
+                            next_after: progress.next_after,
+                            recovered_events: progress.events.len() as u64,
+                            recovered_gaps: progress.gaps.len() as u64,
+                            page_complete: progress.page_complete,
+                        })
                 })
                 .collect(),
             unscoped_gaps: self.unscoped_gaps.len() as u64,
@@ -2215,9 +2217,12 @@ impl AgentBridgeCore {
         self.ensure_contracts()?;
         let (binding, request) = {
             let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
-            let window = active.recovery.as_ref().ok_or(BridgeError::InvalidTransition(
-                "no declared recovery window; reconcile_external opens the walk",
-            ))?;
+            let window = active
+                .recovery
+                .as_ref()
+                .ok_or(BridgeError::InvalidTransition(
+                    "no declared recovery window; reconcile_external opens the walk",
+                ))?;
             let next = window
                 .stream_order
                 .iter()
@@ -2231,9 +2236,12 @@ impl AgentBridgeCore {
                 .ok_or(BridgeError::InvalidTransition(
                     "recovery window has no pending page; the walk is complete or unstarted",
                 ))?;
-            let progress = window.streams.get(next).ok_or(BridgeError::InvalidTransition(
-                "recovery window names a stream without progress",
-            ))?;
+            let progress = window
+                .streams
+                .get(next)
+                .ok_or(BridgeError::InvalidTransition(
+                    "recovery window names a stream without progress",
+                ))?;
             let request = RecoveryReadRequest::checked(
                 window.window_key.clone(),
                 next.clone(),

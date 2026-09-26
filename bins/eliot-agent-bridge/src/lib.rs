@@ -14,12 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_agent_bridge_core::{
     AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
     ConnectionId, CoverageGap, CursorPolicy, DeliveryClass, DemandId, EventDisposition,
-    EventForwardAck, EventForwardStatus, EventPortOutcome, Generation, HostActivationPort, HostEventEnvelope,
-    McpForwardingPort, OutstandingDeliveryView, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
-    ReconnectRequest, RecoveredEventFact, RecoveredGapFact, RecoveredPendingView,
-    RecoveredStreamFacts, RecoveryReadRequest, RecoveryView,
-    RecoveryDirective, TerminalReductionInputs, TransportEdge,
+    EventForwardAck, EventForwardStatus, EventPortOutcome, Generation, HostActivationPort,
+    HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
+    ProviderReadiness, ReconciliationPortOutcome, ReconciliationPortResult,
+    ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact, RecoveredGapFact,
+    RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective, RecoveryReadRequest,
+    RecoveryView, TerminalReductionInputs, TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -582,7 +582,10 @@ fn decode_best_effort_outcome(
 /// Extracts bounded owner text: non-blank, no control characters, within
 /// the retained-source text cap. Mirrors the owner's text rule without
 /// adding a store edge.
-fn recovery_text(value: &serde_json::Value, field: &'static str) -> Result<String, ProviderFailure> {
+fn recovery_text(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, ProviderFailure> {
     let text = value
         .get(field)
         .and_then(serde_json::Value::as_str)
@@ -675,8 +678,7 @@ fn verify_reconcile_key(reconciliation: &serde_json::Value) -> Result<String, Pr
     })?;
     object.remove("reconcile_key");
     object.remove("handoffs_reconciled");
-    let bytes =
-        canonical_json_bytes(&preimage).map_err(|_| event_transport_failure())?;
+    let bytes = canonical_json_bytes(&preimage).map_err(|_| event_transport_failure())?;
     if sha256_hex(&bytes) != key {
         return Err(event_shape_failure(
             "reconciliation refused: key does not bind the observed facts; \
@@ -705,9 +707,7 @@ fn decode_recovery_gap(
         end_sequence,
         reason_ref,
     )
-    .map_err(|_| {
-        event_shape_failure("reconciliation refused: malformed owner gap interval")
-    })
+    .map_err(|_| event_shape_failure("reconciliation refused: malformed owner gap interval"))
 }
 
 /// Running decode budget: array lengths are enforced before any fact is
@@ -762,7 +762,10 @@ fn decode_recovery_stream(
             "reconciliation refused: page stream does not match its stream fact",
         ));
     }
-    if page.get("durable_cursor").and_then(serde_json::Value::as_u64) != Some(durable_cursor)
+    if page
+        .get("durable_cursor")
+        .and_then(serde_json::Value::as_u64)
+        != Some(durable_cursor)
         || page.get("acked_cursor").and_then(serde_json::Value::as_u64) != Some(acked_cursor)
     {
         return Err(event_shape_failure(
@@ -827,9 +830,7 @@ fn decode_recovery_stream(
                 producer_generation,
                 staging_connection,
             )
-            .map_err(|_| {
-                event_shape_failure("reconciliation refused: malformed page event leg")
-            })?,
+            .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?,
         );
     }
     let gaps_value = stream.get("gaps").ok_or_else(event_transport_failure)?;
@@ -960,7 +961,9 @@ fn decode_reconciliation_outcome(
     let unscoped_value = reconciliation
         .get("unscoped_gaps")
         .ok_or_else(event_transport_failure)?;
-    let unscoped_array = unscoped_value.as_array().ok_or_else(event_transport_failure)?;
+    let unscoped_array = unscoped_value
+        .as_array()
+        .ok_or_else(event_transport_failure)?;
     if unscoped_array.len() > MAX_RECOVERY_GAPS_PER_STREAM {
         return Err(event_shape_failure(
             "reconciliation refused: unscoped gaps exceed the negotiated gap budget",
@@ -1013,10 +1016,9 @@ fn decode_reconciliation_outcome(
                 "reconciliation refused: owner key does not form a receipt reference",
             )
         })?;
-    let presenting_connection =
-        ConnectionId::new(connection_echo).map_err(|_| {
-            event_shape_failure("reconciliation refused: connection echo is not a valid identity")
-        })?;
+    let presenting_connection = ConnectionId::new(connection_echo).map_err(|_| {
+        event_shape_failure("reconciliation refused: connection echo is not a valid identity")
+    })?;
     let live = Generation::new(live_generation).map_err(|_| {
         event_shape_failure("reconciliation refused: live generation is not a valid generation")
     })?;
