@@ -3157,7 +3157,10 @@ impl KernelComposition {
                     // this failed operation is emitted by
                     // `execute_daemon_request_observed`; a second terminal
                     // here would inflate one store failure into two.
-                    observe_daemon_request("kernel.daemon_user_automation_operator_store", "fenced");
+                    observe_daemon_request(
+                        "kernel.daemon_user_automation_operator_store",
+                        "fenced",
+                    );
                     TransportError::SessionFenced
                 })?;
         // The Human inspect surface shows the deterministic schedule
