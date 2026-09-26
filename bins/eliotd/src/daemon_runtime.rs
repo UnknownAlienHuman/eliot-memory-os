@@ -2613,12 +2613,10 @@ async fn run_local_read_poll(
         outcome,
         delta,
     };
-    // Issue #2559: the composition guard is held only around the Skill
-    // drive, which borrows the Governor owner. Ordinary forwarded reads use
-    // no composition state, so no guard crosses the Kernel forward leg or
-    // either submit leg. The Skill borrow spans its IO inside this already
-    // polled flight; the loop keeps polling every other flight while it is
-    // outstanding instead of queueing behind it in a branch body.
+    // The Skill plan captures the admitted fence under a short guard, performs
+    // canonical acceptance I/O with no composition lock, then commits against
+    // a fresh guard only after rechecking that exact fence. Ordinary forwarded
+    // reads use no composition state and keep the existing path.
     //
     // #1862: an admitted `eliot.packet` is deliberately NOT served here. It is
     // claimed, compiled and settled by the dedicated campaign-packet flight, so
@@ -2661,10 +2659,21 @@ async fn run_local_read_poll(
             };
             return Ok(step(outcome, delta));
         }
+        let admitted_fence = {
+            let guard = composition.lock().await;
+            guard.kernel_snapshot().state_fence().clone()
+        };
+        let plan = Box::pin(eliotd::skill_dispatch::plan_skill_pair(
+            kernel,
+            admitted_fence,
+            &envelope,
+            &tool,
+            &attempt,
+        ))
+        .await;
         let body = {
             let guard = composition.lock().await;
-            eliotd::skill_dispatch::serve_skill_pair(&guard, kernel, &envelope, &tool, &attempt)
-                .await
+            eliotd::skill_dispatch::commit_skill_pair(&guard, &envelope, &attempt, plan)
         };
         let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
             LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,

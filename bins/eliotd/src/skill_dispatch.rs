@@ -24,7 +24,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_agent_bridge_core::{SkillResultEnvelope, SkillToolKind, skill_tool_kind};
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
 };
@@ -33,6 +33,7 @@ use thiserror::Error;
 
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
+use super::skill_acceptance_read::{AcceptanceRecord, AcceptanceVerdict};
 ///
 /// Driver refusals (stale, drift, unavailable, fence) are NOT errors here —
 /// they persist as typed refusal outcomes through [`SkillResultEnvelope`],
@@ -54,7 +55,8 @@ pub enum SkillDispatchError {
 ///
 /// Thin predicate over the shared routing table for the poller: returns
 /// `true` exactly when the tool JSON carries a Skill capability name. The
-/// poller serves such pairs locally through [`serve_skill_pair`]; anything
+/// poller serves such pairs locally through [`plan_skill_pair`] and
+/// [`commit_skill_pair`]; anything
 /// else keeps the existing forward path byte-identical.
 #[must_use]
 pub fn is_skill_tool(tool: &Value) -> bool {
@@ -64,51 +66,73 @@ pub fn is_skill_tool(tool: &Value) -> bool {
         .is_some_and(|name| skill_tool_kind(name).is_some())
 }
 
-/// Serves one claimed skill pair through the canonical acceptance drive and
-/// returns its submit-leg result body.
+/// Owned work planned for one claimed Skill pair. Its binding fields are
+/// private so only the planner can authorize a canonical acceptance result.
+pub struct SkillPairPlan {
+    envelope_sha256: String,
+    attempt: LocalReadAttempt,
+    admitted_fence: StateFence,
+    action: PlannedSkillPair,
+}
+
+enum PlannedSkillPair {
+    /// The request is fully resolved without further composition state.
+    Resolved(SkillResultEnvelope),
+    /// Display consumes the live composition owner synchronously.
+    Display(eliot_agent_bridge_core::SkillDisplayPayload),
+    /// The acceptance read returned an owner-backed record at this fence.
+    AcceptedIntake {
+        /// Decoded candidate the Skill owner will validate and ingest.
+        payload: Box<eliot_agent_bridge_core::SkillIntakePayload>,
+        /// Exact accepted canonical lifecycle row used by the read plan.
+        record: AcceptanceRecord,
+    },
+}
+
+/// Plans one claimed Skill pair, completing canonical acceptance reads without
+/// borrowing the daemon composition.
 ///
-/// Recognizes the tool name through the shared routing predicate, checks
-/// tool/capability coherence, decodes the versioned wire payload, resolves
-/// canonical procedure acceptance over the authenticated Kernel route for
-/// intake (driving install→receipt only for owner-accepted material) or
-/// ack→display for display requests, and binds the outcome — receipt,
-/// display, or typed refusal — into a digest-bound result body for the
-/// submit leg. Async only for the acceptance read; the composition drive
-/// itself stays synchronous with guards never crossing an await.
-pub async fn serve_skill_pair(
-    composition: &DaemonComposition,
+/// The caller snapshots `admitted_fence` under a short composition lock and
+/// commits the owned plan under a fresh lock after this async function ends.
+pub async fn plan_skill_pair(
     kernel: &DaemonKernelClient,
+    admitted_fence: StateFence,
     envelope: &HostRequestEnvelope,
     tool: &Value,
     attempt: &LocalReadAttempt,
-) -> HostRequestResultBody {
-    let outcome = drive_accepted_skill_request(composition, kernel, envelope, tool).await;
-    // Body construction is total over validated inputs; a failure here is a
-    // local defect, failed closed by the caller, never a silent accept.
-    skill_result_body(envelope, attempt, &outcome)
-        .unwrap_or_else(|error| skill_refusal_body(envelope, attempt, &error.to_string()))
-}
-
-async fn drive_accepted_skill_request(
-    composition: &DaemonComposition,
-    kernel: &DaemonKernelClient,
-    envelope: &HostRequestEnvelope,
-    tool: &Value,
-) -> SkillResultEnvelope {
+) -> SkillPairPlan {
+    let plan = |action| SkillPairPlan {
+        envelope_sha256: envelope.envelope_sha256.clone(),
+        attempt: attempt.clone(),
+        admitted_fence: admitted_fence.clone(),
+        action,
+    };
+    if attempt.validate().is_err()
+        || attempt.operation_id != eliot_protocol::host_request_operation_id(envelope)
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || admitted_fence != envelope.state_fence
+    {
+        return plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::FenceMismatch,
+        )));
+    }
     let name = tool
         .as_object()
         .and_then(|object| object.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let Some(kind) = skill_tool_kind(name) else {
-        return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
-            "not a Skill tool request".to_owned(),
-        ));
+        return plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::Surface("not a Skill tool request".to_owned()),
+        )));
     };
     if name != envelope.identity.capability {
-        return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(
-            "presented tool does not match the admitted capability".to_owned(),
-        ));
+        return plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::Surface(
+                "presented tool does not match the admitted capability".to_owned(),
+            ),
+        )));
     }
     let arguments = tool
         .as_object()
@@ -116,14 +140,26 @@ async fn drive_accepted_skill_request(
         .cloned()
         .unwrap_or(Value::Null);
     match kind {
-        SkillToolKind::Inject => drive_accepted_inject(composition, kernel, &arguments).await,
-        SkillToolKind::Display => drive_display(composition, &arguments),
-        SkillToolKind::Activate => drive_activation(&arguments),
-        SkillToolKind::Execute => drive_execution_evidence(&arguments),
+        SkillToolKind::Inject => {
+            let action = plan_accepted_inject(kernel, admitted_fence.clone(), &arguments).await;
+            plan(action)
+        }
+        SkillToolKind::Display => match decode_display(&arguments) {
+            Ok(payload) => plan(PlannedSkillPair::Display(payload)),
+            Err(error) => plan(PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                error.as_ref(),
+            ))),
+        },
+        SkillToolKind::Activate => plan(PlannedSkillPair::Resolved(drive_activation(&arguments))),
+        SkillToolKind::Execute => plan(PlannedSkillPair::Resolved(drive_execution_evidence(
+            &arguments,
+        ))),
     }
 }
 
-/// Drives one decoded intake through the canonical acceptance verdict.
+/// Resolves one decoded intake through the canonical acceptance verdict without
+/// holding the composition lock. An accepted result stays an owned plan until
+/// the runtime revalidates its fence and commits it.
 ///
 /// The wire intake entry decodes once here, the presented package digest
 /// resolves against the canonical committed lifecycle-policy rows, and the
@@ -135,17 +171,19 @@ async fn drive_accepted_skill_request(
 /// backing cannot bind material, provisional or otherwise — the intake
 /// remains a reversible candidate until governed promotion commits a row
 /// for it (I7.25).
-async fn drive_accepted_inject(
-    composition: &DaemonComposition,
+async fn plan_accepted_inject(
     kernel: &DaemonKernelClient,
+    admitted_fence: StateFence,
     arguments: &Value,
-) -> SkillResultEnvelope {
+) -> PlannedSkillPair {
     let bytes = match canonical_json_bytes(&arguments).map_err(|error| error.to_string()) {
         Ok(bytes) => bytes,
         Err(detail) => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
-                "intake arguments fail their shape: {detail}"
-            )));
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                &eliot_skill::SkillError::Surface(format!(
+                    "intake arguments fail their shape: {detail}"
+                )),
+            ));
         }
     };
     let payload = match eliot_agent_bridge_core::SkillIntakePayload::decode(&bytes)
@@ -153,45 +191,95 @@ async fn drive_accepted_inject(
     {
         Ok(payload) => payload,
         Err(detail) => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
-                "intake arguments fail their shape: {detail}"
-            )));
+            return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+                &eliot_skill::SkillError::Surface(format!(
+                    "intake arguments fail their shape: {detail}"
+                )),
+            ));
         }
     };
-    let admitted = composition.kernel_snapshot().state_fence().clone();
     match super::skill_acceptance_read::resolve_intake_acceptance(
         kernel,
-        &admitted,
+        &admitted_fence,
         &payload.package.registration.skill_id,
         &payload.package.digests.source_digest,
     )
     .await
     {
-        Ok(super::skill_acceptance_read::AcceptanceVerdict::Accepted(record)) => {
+        Ok(AcceptanceVerdict::Accepted(record)) => {
             if let Err(error) = bind_accepted_intake(&payload, &record) {
-                return SkillResultEnvelope::refused(&error);
+                return PlannedSkillPair::Resolved(SkillResultEnvelope::refused(&error));
             }
-            match composition.skill_ingest_accepted_intake(&payload, &record) {
-                Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
-                Err(error) => SkillResultEnvelope::refused(&error),
+            PlannedSkillPair::AcceptedIntake {
+                payload: Box::new(payload),
+                record,
             }
         }
-        Ok(super::skill_acceptance_read::AcceptanceVerdict::Unknown) => {
-            SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
+        Ok(AcceptanceVerdict::Unknown) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::InvalidField {
                 field: "procedure.acceptance",
                 reason: "no committed lifecycle row backs this package digest at the current revision; the intake remains a reversible candidate until governed promotion",
-            })
-        }
-        Ok(super::skill_acceptance_read::AcceptanceVerdict::Revoked(_)) => {
+            },
+        )),
+        Ok(AcceptanceVerdict::Revoked(_)) => PlannedSkillPair::Resolved(
             SkillResultEnvelope::refused(&eliot_skill::SkillError::InvalidField {
                 field: "procedure.acceptance",
                 reason: "canonical lifecycle revoked this package revision",
-            })
-        }
-        Err(error) => {
-            SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(error.to_string()))
-        }
+            }),
+        ),
+        Err(error) => PlannedSkillPair::Resolved(SkillResultEnvelope::refused(
+            &eliot_skill::SkillError::Surface(error.to_string()),
+        )),
     }
+}
+
+/// Commits the accepted intake against the current composition owner, then
+/// binds the final outcome to the exact local-read attempt.
+pub fn commit_skill_pair(
+    composition: &DaemonComposition,
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    plan: SkillPairPlan,
+) -> HostRequestResultBody {
+    let bound_to_current_claim = plan.envelope_sha256 == envelope.envelope_sha256
+        && plan.attempt == *attempt
+        && plan.admitted_fence == envelope.state_fence
+        && attempt.operation_id == eliot_protocol::host_request_operation_id(envelope)
+        && attempt.authority_epoch == envelope.state_fence.authority_epoch
+        && attempt.expires_at_unix_ms == envelope.identity.deadline_unix_ms;
+    let outcome = if bound_to_current_claim {
+        match plan.action {
+            PlannedSkillPair::Resolved(outcome) => outcome,
+            PlannedSkillPair::Display(payload) => {
+                if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
+                    match composition.skill_carry_receipt_to_display(
+                        &payload.skill_id,
+                        payload.receipt,
+                        payload.ack,
+                    ) {
+                        Ok(display) => SkillResultEnvelope::display(display),
+                        Err(error) => SkillResultEnvelope::refused(&error),
+                    }
+                } else {
+                    SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
+                }
+            }
+            PlannedSkillPair::AcceptedIntake { payload, record } => {
+                if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
+                    match composition.skill_ingest_accepted_intake(&payload, &record) {
+                        Ok((_, receipt)) => SkillResultEnvelope::receipt(receipt),
+                        Err(error) => SkillResultEnvelope::refused(&error),
+                    }
+                } else {
+                    SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
+                }
+            }
+        }
+    } else {
+        SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)
+    };
+    skill_result_body(envelope, attempt, &outcome)
+        .unwrap_or_else(|error| skill_refusal_body(envelope, attempt, &error.to_string()))
 }
 
 /// Binds one presented wire intake to its canonical committed acceptance row.
@@ -308,7 +396,9 @@ fn drive_execution_evidence(arguments: &Value) -> SkillResultEnvelope {
     }
 }
 
-fn drive_display(composition: &DaemonComposition, arguments: &Value) -> SkillResultEnvelope {
+fn decode_display(
+    arguments: &Value,
+) -> Result<eliot_agent_bridge_core::SkillDisplayPayload, Box<eliot_skill::SkillError>> {
     let payload = match canonical_json_bytes(&arguments)
         .map_err(|error| error.to_string())
         .and_then(|bytes| {
@@ -317,19 +407,12 @@ fn drive_display(composition: &DaemonComposition, arguments: &Value) -> SkillRes
         }) {
         Ok(payload) => payload,
         Err(detail) => {
-            return SkillResultEnvelope::refused(&eliot_skill::SkillError::Surface(format!(
+            return Err(Box::new(eliot_skill::SkillError::Surface(format!(
                 "display arguments fail their shape: {detail}"
-            )));
+            ))));
         }
     };
-    match composition.skill_carry_receipt_to_display(
-        &payload.skill_id,
-        payload.receipt,
-        payload.ack,
-    ) {
-        Ok(display) => SkillResultEnvelope::display(display),
-        Err(error) => SkillResultEnvelope::refused(&error),
-    }
+    Ok(payload)
 }
 
 /// Binds one skill outcome into the submit-leg result body.
