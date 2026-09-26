@@ -209,6 +209,15 @@ const MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY: usize = 64;
 /// Maximum recorded coverage gaps per stream. Breach fails with
 /// [`OrsError::ProjectionLimitExceeded`]; gaps never compact cursors.
 const MAX_BRIDGE_EVENT_GAPS_PER_STREAM: usize = 256;
+/// Maximum live position rows retained per owner namespace (issue #2885,
+/// item 2). One position exists only with its staged event, so this caps the
+/// un-compacted exact-replay window beside the already-capped record, handoff
+/// and commitment budgets. Position-prefix compaction drains the window over
+/// successive legitimate recovery entries; a fresh position is admitted only
+/// while the namespace holds fewer than this many position rows. Breach fails
+/// with [`OrsError::ProjectionLimitExceeded`] (typed backpressure), never
+/// with silent loss or an unbounded index.
+const MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE: usize = 4096;
 /// Committed-and-acknowledged bridge-event rows retained per stream for
 /// duplicate suppression. Compaction evicts only acked rows older than this
 /// window; cursors are never evicted.
@@ -7571,6 +7580,44 @@ impl RedbRecoveryStore {
         Ok(entry.map(|position| position.event_id))
     }
 
+    /// Bounds one namespace's position window before a fresh position is
+    /// admitted (issue #2885, item 2). The count is a key-ordered range scan
+    /// over the namespace's own `namespace::` keys — never a full-table scan —
+    /// so it stays proportional to the namespace's live window, which
+    /// position-prefix compaction drains. A namespace already at
+    /// [`MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE`] fails closed with typed
+    /// backpressure ([`OrsError::ProjectionLimitExceeded`]) instead of growing
+    /// the index without bound; the next legitimate compaction entry retires
+    /// the certified prefix and reopens the window.
+    fn check_bridge_position_budget_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+    ) -> Result<(), OrsError> {
+        let positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+        let prefix = format!("{}::", access.namespace);
+        let prefix_end = format!("{}\u{10ffff}", access.namespace);
+        let mut live = 0_u64;
+        for entry in positions
+            .range(prefix.as_str()..=prefix_end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let (namespace, _sequence) = Self::parse_bridge_position_key(key.value())?;
+            if namespace != access.namespace {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "position key escapes its namespace".to_owned(),
+                });
+            }
+            let _position: BridgeEventPosition = decode(value.value())?;
+            live += 1;
+            if live >= MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+        }
+        Ok(())
+    }
+
     /// Loads one per-namespace cursor row inside a write transaction without
     /// synthesizing anything: `None` when the namespace never staged.
     fn load_bridge_cursor_row_in(
@@ -8288,6 +8335,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         {
+            Self::check_bridge_position_budget_in(write, access)?;
             let position = BridgeEventPosition {
                 event_id: stage.event_id.clone(),
             };
