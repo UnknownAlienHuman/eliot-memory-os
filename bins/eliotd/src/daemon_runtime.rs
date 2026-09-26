@@ -84,10 +84,11 @@ use eliotd::{
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
-/// Shared daemon composition handle for the run loop. The loop holds no
-/// long-lived borrow: every flight future locks briefly (readers) or for
-/// one bounded drain (the TestD owner finish driver, the only writer), so
-/// health, shutdown, and concurrent readers stay pollable. A poisoned row
+/// Shared daemon composition handle for the run loop. Flight futures own any
+/// borrow they need, keeping lock-owning work pollable by the loop. The
+/// owner-feed exchange still holds this guard across bounded IO, and the
+/// heartbeat handler still awaits the same mutex inline; #2559 remains
+/// partial until that selected-handler wait is removed. A poisoned TestD row
 /// never fails the daemon closed; transport failures do, mirroring the
 /// local-read poller.
 type SharedComposition = Arc<tokio::sync::Mutex<DaemonComposition>>;
@@ -1139,7 +1140,9 @@ async fn run_loop(
     // full read->publish->readback exchange. Degradation never fails the
     // loop: pending grants stay pending until a later pass binds them.
     // Issue #2559: the trigger travels with its own polled flight below, so
-    // a stalled exchange never stalls health or shutdown polling.
+    // the exchange itself is polled independently. A selected heartbeat can
+    // still wait inline for its composition guard; that remains an explicit
+    // #2559 gap.
     let mut owner_feed = Some(eliotd::OwnerFeedTrigger::new());
     // Sole owner of owner-feed sync state. One bounded read->publish->readback
     // exchange is outstanding at most; the health tick starts it when idle
@@ -1152,11 +1155,16 @@ async fn run_loop(
     // submits finish candidates, and acknowledges terminals, all through
     // the Kernel owner routes.
     let mut testd_owner_flight = TestdOwnerFlight::Idle;
+    // Issue #2559: one cadence observation may wait for the composition lock,
+    // but its wait remains in this independently polled flight. A later tick
+    // cannot replace the observation already retained here.
+    let mut maintenance_flight = MaintenanceFlight::Idle;
     // Recovery re-presentation at loop start: rebind the Kernel P-07 owner
     // from live Governor state before any activation work is claimed. The
     // exchange starts as the owner-feed flight's first bounded step and is
     // polled by the loop below; it is never awaited here, so the loop stays
-    // pollable from its first pass.
+    // pollable from its first pass. The heartbeat handler's independent
+    // inline composition wait remains a separate #2559 gap.
     maybe_start_owner_feed_sync(
         &kernel,
         &composition,
@@ -1179,6 +1187,7 @@ async fn run_loop(
                     &mut testd_owner_flight,
                     &mut owner_feed_flight,
                     &mut owner_feed,
+                    &mut maintenance_flight,
                 )
                 .await?;
                 // #1862: the campaign-packet flight keeps its own queue, claim,
@@ -1221,7 +1230,11 @@ async fn run_loop(
                 // observation of admitted interactive work rather than a
                 // literal. Separate cadence and separate observation from the
                 // health-heartbeat admitted-observation trigger below.
-                note_idle_maintenance_trigger(&composition, &flight).await;
+                maybe_start_idle_maintenance_trigger(
+                    &composition,
+                    &flight,
+                    &mut maintenance_flight,
+                );
             }
             completion = next_activation_completion(&mut flight) => {
                 settle_activation_completion(
@@ -1266,6 +1279,9 @@ async fn run_loop(
                     &mut owner_feed,
                     &mut owner_feed_flight,
                 );
+            }
+            () = next_maintenance_completion(&mut maintenance_flight) => {
+                settle_maintenance_completion(&mut maintenance_flight);
             }
             _ = cadence.health_heartbeat.tick() => {
                 run_health_heartbeat_tick(
@@ -1329,8 +1345,8 @@ fn settle_activation_claim(
 /// resolve-wait installs the dispatch flight or idles on Kernel-owned
 /// expiry, and a completed dispatch idles after noting supervision work.
 /// Every arm installs synchronously and returns to `select!` (issue #2559):
-/// no lock wait and no other flight is awaited here, so activation,
-/// local-read, `TestD`, health and shutdown stay pollable throughout.
+/// no lock wait and no other flight is awaited here, so this completion branch
+/// returns control to `select!` immediately.
 fn settle_activation_completion(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -1476,22 +1492,55 @@ fn note_maintenance_trigger_at(
     ));
 }
 
-/// Evaluates the idle trigger from the activation-poll cadence branch.
+/// Captures the idle trigger from the activation-poll cadence observation.
 ///
 /// The evidence is the flight state the tick just decided from, so the
 /// decision and its evidence are the same observation. This is a periodic
 /// idle *observation*, not a busy-to-idle edge detector: the loop retains no
 /// previous-idle flag, and inventing one to manufacture a transition edge
 /// would be a fabricated event source.
-async fn note_idle_maintenance_trigger(composition: &SharedComposition, flight: &ActivationFlight) {
+fn idle_maintenance_observation(flight: &ActivationFlight) -> MaintenanceObservation {
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
-    let guard = composition.lock().await;
-    note_maintenance_trigger_at(
-        &guard,
+    maintenance_observation(
         MaintenanceTriggerOrigin::IdleTransition,
         vec![format!("activation_in_flight={activation_in_flight}")],
         activation_in_flight,
-    );
+    )
+}
+
+/// Starts one retained cadence maintenance evaluation when its flight is
+/// idle. Capturing the observation before creating the future preserves the
+/// actual activation state that triggered it; a busy flight is left untouched.
+fn maybe_start_idle_maintenance_trigger(
+    composition: &SharedComposition,
+    activation_flight: &ActivationFlight,
+    flight: &mut MaintenanceFlight,
+) {
+    if !matches!(flight, MaintenanceFlight::Idle) {
+        return;
+    }
+    let observation = idle_maintenance_observation(activation_flight);
+    let composition = Arc::clone(composition);
+    *flight = MaintenanceFlight::InFlight(MaintenanceFlightState {
+        future: Box::pin(async move {
+            let guard = composition.lock().await;
+            guard.note_maintenance_trigger(observation);
+        }),
+    });
+}
+
+/// Polls one retained maintenance evaluation, pending forever while idle.
+async fn next_maintenance_completion(flight: &mut MaintenanceFlight) {
+    match flight {
+        MaintenanceFlight::Idle => std::future::pending::<()>().await,
+        MaintenanceFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Releases a completed maintenance flight so a later cadence observation can
+/// start. Settlement itself is synchronous and cannot block the run loop.
+fn settle_maintenance_completion(flight: &mut MaintenanceFlight) {
+    *flight = MaintenanceFlight::Idle;
 }
 
 /// Submits one owner-side canonical notification for a blocked automation
@@ -1853,8 +1902,9 @@ fn start_activation_dispatch(
 
 /// Stage-aware shutdown drain for every already-started flight (issue
 /// #2559). No new claim starts here; already-started claim, resolve-wait,
-/// dispatch, local-read, observe, `TestD` owner and owner-feed steps keep
-/// being polled together inside one declared finite budget.
+/// dispatch, local-read, observe, `TestD` owner, owner-feed and retained
+/// cadence-maintenance steps keep being polled together inside one declared
+/// finite budget.
 ///
 /// A claimed/waiting ticket carries no result digest yet, so exhausting the
 /// budget while waiting or resolving settles as a clean shutdown: nothing
@@ -1862,7 +1912,7 @@ fn start_activation_dispatch(
 /// submitting result keeps its retained identity instead: an unknown
 /// acknowledgement or a budget exhausted mid-submit settles as a typed
 /// unknown carrying the original ticket/result verbatim, never a fabricated
-/// hash. Local-read, observe, `TestD` owner and owner-feed steps always
+/// hash. Local-read, observe, `TestD` owner, owner-feed and maintenance steps always
 /// settle as plain shutdown: an un-submitted pair's attempt capability is
 /// revoked on disconnect, an already-persisted `TestD` decision
 /// exact-replays, and a pending owner-feed publication leaves dependent
@@ -1882,6 +1932,7 @@ async fn drain_flights_on_shutdown(
     testd_owner_flight: &mut TestdOwnerFlight,
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
+    maintenance_flight: &mut MaintenanceFlight,
 ) -> Result<RunLoopExit, String> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -1895,6 +1946,7 @@ async fn drain_flights_on_shutdown(
             && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
+            && matches!(maintenance_flight, MaintenanceFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -1968,38 +2020,50 @@ async fn drain_flights_on_shutdown(
             owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
                 settle_owner_feed_completion(owner_feed_trigger, owner_feed, owner_feed_flight);
             }
+            () = next_maintenance_completion(maintenance_flight) => {
+                settle_maintenance_completion(maintenance_flight);
+            }
             () = tokio::time::sleep_until(deadline) => {
                 // Budget exhausted with work still outstanding: drop every
-                // flight without starting anything new. The activation phase
-                // decides the exit: a retained result means an uncertain
-                // submission, while a claim or resolve-wait in flight means
-                // no digest exists yet and shutdown stays clean.
-                let exit = match std::mem::replace(flight, ActivationFlight::Idle) {
-                    ActivationFlight::Idle => activation_exit,
-                    ActivationFlight::InFlight(state) => match state.retained {
-                        Some(identity) => {
-                            let _ = eliotd::diagnostics::emit_drain(
-                                eliotd::diagnostics::DrainOutcome::ActivationUnknown,
-                                &identity.ticket_id,
-                                &identity.result_sha256,
-                            );
-                            RunLoopExit::ShutdownActivationUnknown {
-                                ticket_id: identity.ticket_id,
-                                result_sha256: identity.result_sha256,
-                                detail: "daemon shutdown drain timed out with activation submit outstanding; original ticket/result identity retained, no recompute"
-                                    .to_owned(),
-                            }
-                        }
-                        None => activation_exit,
-                    },
-                };
+                // flight without starting anything new. Classify activation
+                // separately because only that stage can retain a result id.
+                let exit = activation_exit_after_drain_timeout(flight, activation_exit);
                 *local_read_flight = LocalReadFlight::Idle;
                 *observe_flight = ObserveFlight::Idle;
                 *testd_owner_flight = TestdOwnerFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
+                *maintenance_flight = MaintenanceFlight::Idle;
                 return Ok(exit);
             }
         }
+    }
+}
+
+/// Resolves the activation disposition when the shared shutdown budget ends.
+/// Only a dispatch flight owns a result identity; claim and resolve flights
+/// remain result-less and preserve the prior shutdown disposition.
+fn activation_exit_after_drain_timeout(
+    flight: &mut ActivationFlight,
+    activation_exit: RunLoopExit,
+) -> RunLoopExit {
+    match std::mem::replace(flight, ActivationFlight::Idle) {
+        ActivationFlight::Idle => activation_exit,
+        ActivationFlight::InFlight(state) => match state.retained {
+            Some(identity) => {
+                let _ = eliotd::diagnostics::emit_drain(
+                    eliotd::diagnostics::DrainOutcome::ActivationUnknown,
+                    &identity.ticket_id,
+                    &identity.result_sha256,
+                );
+                RunLoopExit::ShutdownActivationUnknown {
+                    ticket_id: identity.ticket_id,
+                    result_sha256: identity.result_sha256,
+                    detail: "daemon shutdown drain timed out with activation submit outstanding; original ticket/result identity retained, no recompute"
+                        .to_owned(),
+                }
+            }
+            None => activation_exit,
+        },
     }
 }
 
@@ -2017,6 +2081,21 @@ struct OwnerFeedFlightState {
 enum OwnerFeedFlight {
     Idle,
     InFlight(OwnerFeedFlightState),
+}
+
+/// Retains one idle-maintenance observation until its guarded evaluation
+/// completes. The observation is captured from the activation state at start
+/// time; no later tick replaces or mutates it while waiting for composition.
+struct MaintenanceFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = ()>>>,
+}
+
+/// Sole owner of the cadence maintenance observation currently being
+/// evaluated. Keeping its lock wait in a polled flight prevents a selected
+/// cadence handler from suspending polling of the owner-feed lock holder.
+enum MaintenanceFlight {
+    Idle,
+    InFlight(MaintenanceFlightState),
 }
 
 /// Starts one O1 owner-feed synchronization pass (issue #2100) on its own
