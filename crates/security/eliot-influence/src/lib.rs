@@ -450,10 +450,13 @@ pub struct QualifiedInfluenceEdge {
 /// - `max_nodes`: admitted nodes, including already expanded ones;
 /// - `max_edges`: examined edge positions;
 /// - `max_depth`: the depth of an admitted dependent;
-/// - `max_result`: the cardinality of the emitted result, checked when the
-///   page finishes against the emitted affected references and never against
-///   node admission — `max_nodes` alone bounds the admitted set, and no
-///   continuation counter re-applies this bound to the admitted length;
+/// - `max_result`: the cardinality of the emitted result. It is enforced
+///   against the affected references the outcome actually emits, and no
+///   admission decision reads it: `max_nodes` alone bounds the admitted set,
+///   and no continuation counter re-applies this bound to the admitted
+///   length. Emission stops at the ceiling, so the withheld reference is
+///   declared by a `BoundsExhausted` omission and retained in `frontier`
+///   rather than silently dropped;
 /// - `max_work`: cumulative work units (edge examinations plus admissions);
 /// - `max_frontier`: the width of outstanding work, i.e. the number of
 ///   admitted-but-unexpanded node references the traversal may hold at once;
@@ -558,6 +561,16 @@ impl BoundedRevocationPageLimits {
 }
 
 /// Why a qualified edge was omitted from a bounded revocation traversal.
+///
+/// Every variant is constructed on a live path, from a disposition the
+/// evaluator itself observes or derives: `Quarantined`, `NonPropagating`,
+/// `Stale` and `Invalidated` from an edge the caller declared with that
+/// disposition, `BoundsExhausted` from a bound this engine enforced, and
+/// `CrossScope` from an edge whose dependent is outside the revoked origin's
+/// authority root. `GrantGraph::transitive_revocation_closure` in
+/// `eliot-authority` derives that cross-scope disposition from the live grant
+/// graph and is reached by authority recovery, so a cross-root dependent is
+/// quarantined and reported rather than dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OmissionCause {
@@ -733,11 +746,15 @@ impl BoundedRevocationContinuationToken {
 /// edge position; it is never converted into a successful result merely
 /// because the page ended.
 ///
-/// An emitted result wider than [`RevocationBounds::max_result`] is the one
-/// incomplete outcome that carries no continuation: the exact admitted set,
-/// every omission, the exact frontier, and the cumulative work are all
-/// returned, `complete` is false, and no reference is dropped, because no
-/// further round can reduce the emitted set.
+/// An emitted result wider than [`RevocationBounds::max_result`] is a
+/// terminal exhaustion: emission stops at the ceiling, `complete` is false,
+/// the first reference that is not emitted is retained in `frontier` and
+/// named by a `BoundsExhausted` omission over the exact edge position that
+/// admitted it, every other omission and the cumulative `work_spent` are
+/// still returned, and no continuation is offered because the admitted set
+/// only grows and no further round can reduce it. A caller that needs the
+/// whole set must raise the bound; the engine never hands back a result
+/// wider than the bound it was given and calls it complete.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct BoundedRevocationOutcome {
     pub root_ref: String,
@@ -1520,28 +1537,10 @@ impl BoundedTraversal {
             .map(|node| node.node_ref.clone())
             .collect();
         let expanded_refs: Vec<String> = self.expanded.iter().cloned().collect();
-        let frontier: Vec<String> = self.frontier.iter().cloned().collect();
-        // `max_result` bounds the cardinality of the result this engine is
-        // willing to emit, not node admission: `max_nodes` already bounds the
-        // admitted set, so a closure wider than the caller's result ceiling
-        // cannot be reported as a bounded result. Nothing is truncated and no
-        // reference is dropped; the exact admitted set, every omission, the
-        // exact frontier, and the cumulative work are all returned with
-        // `complete` false, and no continuation is offered because no further
-        // round can reduce the emitted set.
-        let emitted = u64::try_from(affected_refs.len()).unwrap_or(u64::MAX);
-        if emitted > self.bounds.max_result {
-            return Ok(BoundedRevocationOutcome {
-                root_ref: request.root_ref.clone(),
-                affected_refs,
-                frontier,
-                omissions: self.omissions,
-                work_spent: self.work_spent,
-                complete: false,
-                continuation: None,
-                continuation_token: None,
-            });
+        if let Some(bounded) = self.bounded_result(request, &admitted_nodes, &affected_refs) {
+            return Ok(bounded);
         }
+        let frontier: Vec<String> = self.frontier.iter().cloned().collect();
         let has_pending = !self.queue.is_empty() || !self.pending_edges.is_empty();
         let complete = !self.exhausted && !has_pending && !self.unresolved_bound;
         let continuation = if self.exhausted || has_pending || self.unresolved_bound {
@@ -1589,6 +1588,88 @@ impl BoundedTraversal {
             complete,
             continuation,
             continuation_token,
+        })
+    }
+
+    /// Applies the declared result ceiling, or reports that it was not reached.
+    ///
+    /// `max_result` bounds the cardinality of the result this engine is willing
+    /// to emit, not node admission: `max_nodes` already bounds the admitted set,
+    /// so the ceiling is enforced here, once, by stopping emission instead of
+    /// returning a result wider than the bound. The admitted set only grows,
+    /// which makes the exhaustion terminal: no further round can reduce the
+    /// emitted set, so no continuation is offered and a caller that needs the
+    /// whole closure must raise the bound.
+    ///
+    /// Truncation is never silent. `complete` is false, the first reference
+    /// that is not emitted is retained in the frontier and named by a
+    /// `BoundsExhausted` omission over the exact edge position that admitted
+    /// it, every other omission is still returned, and the cumulative
+    /// `work_spent` still describes the whole operation. A short result is
+    /// therefore always visibly short rather than a partial answer that reads
+    /// as clear.
+    fn bounded_result(
+        &mut self,
+        request: &BoundedRevocationRequest,
+        admitted_nodes: &[BoundedRevocationPendingNode],
+        affected_refs: &[String],
+    ) -> Option<BoundedRevocationOutcome> {
+        let ceiling = usize::try_from(self.bounds.max_result)
+            .unwrap_or(usize::MAX)
+            // The root is emitted whatever the ceiling is, so the effective
+            // ceiling is one reference even if a caller declares zero.
+            .max(1);
+        if affected_refs.len() <= ceiling {
+            return None;
+        }
+        // `affected_refs` contains the root by contract, so a root that sorts
+        // past the ceiling displaces the last emitted reference, and that
+        // displaced reference is the withheld one. The withheld reference is
+        // therefore never the root and always has an admitting edge position.
+        let mut emitted: Vec<String> = affected_refs[..ceiling].to_vec();
+        let withheld_index = if emitted.iter().any(|node_ref| node_ref == &request.root_ref) {
+            ceiling
+        } else {
+            emitted[ceiling - 1].clone_from(&request.root_ref);
+            ceiling - 1
+        };
+        if let Some(withheld) = admitted_nodes.get(withheld_index) {
+            // Every admitted reference other than the root was admitted by one
+            // examined permitted-current edge whose source depth is exactly one
+            // below the admitted depth, so the edge position carrying the
+            // withheld evidence is derived from the traversal, never guessed or
+            // taken from a caller.
+            let admitting_edge = self
+                .examined_edges
+                .iter()
+                .find(|edge| {
+                    edge.disposition == InfluenceEdgeDisposition::PermittedCurrent
+                        && edge.dependent_ref == withheld.node_ref
+                        && edge.source_depth.checked_add(1) == Some(withheld.depth)
+                })
+                .map(|edge| RevocationOmission {
+                    edge_source: edge.source_ref.clone(),
+                    edge_dependent: edge.dependent_ref.clone(),
+                    cause: OmissionCause::BoundsExhausted,
+                });
+            // The withheld reference is retained in the frontier whether or not
+            // its edge position is still present, so the gap between the emitted
+            // set and the admitted closure is always visible and never has to be
+            // inferred from a short result.
+            self.frontier.insert(withheld.node_ref.clone());
+            if let Some(omission) = admitting_edge {
+                self.omissions.push(omission);
+            }
+        }
+        Some(BoundedRevocationOutcome {
+            root_ref: request.root_ref.clone(),
+            affected_refs: emitted,
+            frontier: self.frontier.iter().cloned().collect(),
+            omissions: self.omissions.clone(),
+            work_spent: self.work_spent,
+            complete: false,
+            continuation: None,
+            continuation_token: None,
         })
     }
 }
@@ -1797,13 +1878,14 @@ fn validate_continuation_counters(
     examined_len: u64,
 ) -> Result<(), InfluenceError> {
     // `max_result` is deliberately absent from this conjunction. It is the
-    // emitted-cardinality ceiling and is enforced once, in `finish`, against
-    // the affected references actually emitted. Re-applying it to the admitted
-    // length here made it a second node-admission bound under another name:
-    // `max_nodes` already bounds the admitted set, and a continuation whose
-    // admitted set exceeded `max_result` was refused as `InvalidContinuation`
-    // instead of reaching the incomplete outcome `finish` returns for it, so
-    // the two readings of the same bound disagreed.
+    // emitted-cardinality ceiling and is enforced once, in `finish`, by stopping
+    // emission at the ceiling against the affected references actually emitted.
+    // Re-applying it to the admitted length here made it a second
+    // node-admission bound under another name: `max_nodes` already bounds the
+    // admitted set, and a continuation whose admitted set exceeded `max_result`
+    // was refused as `InvalidContinuation` instead of reaching the incomplete
+    // outcome `finish` returns for it, so the two readings of the same bound
+    // disagreed.
     if continuation.edges_examined > bounds.max_edges
         || continuation.work_spent > bounds.max_work
         || continuation.rounds > bounds.max_time
@@ -2176,10 +2258,11 @@ pub fn revoke_bounded(
 /// remains exhausted.
 ///
 /// A `PARTIAL` denominator is refused, a result wider than
-/// [`RevocationBounds::max_result`] returns incomplete with every reference
-/// retained, and a nonempty legacy `resumed_visited` list is refused: a
-/// visited-only list cannot describe unexpanded edge positions and therefore
-/// cannot create authority.
+/// [`RevocationBounds::max_result`] returns incomplete with emission stopped at
+/// the ceiling, the withheld reference retained in `frontier` and named by a
+/// `BoundsExhausted` omission, and a nonempty legacy `resumed_visited` list is
+/// refused: a visited-only list cannot describe unexpanded edge positions and
+/// therefore cannot create authority.
 pub fn revoke_bounded_page(
     request: &BoundedRevocationRequest,
     bounds: &RevocationBounds,
