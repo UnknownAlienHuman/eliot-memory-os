@@ -51,7 +51,9 @@ use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
     ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
-    AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
+    AdmissionReservationDisposition, AdmissionReservationReceipt, AdmissionReservationRecord,
+    AdmissionReservationRelease, AdmissionReservationSnapshot, AdmissionReservationStage,
+    AdmissionReservationState, AdmissionReservationTransitionRequest, AuthorityActivationReceipt,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
     AuthorityRevocationReceipt, AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
     BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
@@ -1944,6 +1946,32 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         release: AdmissionReservationRelease,
     ) -> Result<AdmissionReservationReceipt, OrsError>;
+    /// Persists one typed `STAGED_INACTIVE` reservation with its complete
+    /// immutable claims. Exact replay returns the current same-identity receipt.
+    fn stage_kernel_admission_reservation(
+        &self,
+        stage: AdmissionReservationStage,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
+    /// Loads one typed reservation by its stable identity.
+    fn load_kernel_admission_reservation(
+        &self,
+        reservation_id: &OperationIdentity,
+    ) -> Result<Option<AdmissionReservationSnapshot>, OrsError>;
+    /// Marks an inactive reservation as reconciling with exact evidence.
+    fn reconcile_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
+    /// Releases an inactive reservation with receipt-backed evidence.
+    fn release_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
+    /// Expires an inactive reservation only after its declared expiry time.
+    fn expire_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
     fn apply_generation_transition(
         &self,
         transition: GenerationTransition,
@@ -17757,6 +17785,13 @@ impl RedbRecoveryStore {
                 })
                 .transpose()?
         };
+        if kind == OperationalKind::AdmissionReservation
+            && existing
+                .as_ref()
+                .is_some_and(|record| record.admission_reservation.is_some())
+        {
+            return Err(OrsError::InvalidTransition);
+        }
         if let Some(existing) = existing {
             if existing.input.subject_id == input.subject_id
                 && existing.input.record_id == input.record_id
@@ -17793,6 +17828,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: None,
         };
         Self::persist_operational_record(&write, &key, &record)?;
@@ -18074,6 +18110,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: Some(record),
         };
         Self::persist_operational_record(&write, &key, &durable)?;
@@ -18204,6 +18241,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: Some(committed),
         };
         Self::persist_operational_record(&write, &route_key, &durable)?;
@@ -18629,6 +18667,7 @@ impl RedbRecoveryStore {
             operation_order: Self::next_operational_order(&write)?,
             terminal_receipt_id: None,
             terminal_receipt_sha256: None,
+            admission_reservation: None,
             generation_cutover: None,
         };
         Self::persist_operational_record(&write, &key, &durable)?;
@@ -18955,6 +18994,220 @@ impl RedbRecoveryStore {
     }
 }
 
+impl RedbRecoveryStore {
+    pub(super) fn admission_reservation_input(
+        record: &AdmissionReservationRecord,
+    ) -> Result<OperationalRecordInput, OrsError> {
+        let payload =
+            serde_json::to_vec(record).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let payload_length = u64::try_from(payload.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let locator = PlatformHandle::new(format!(
+            "ors:admission-reservation:{}",
+            record.reservation_id.as_str()
+        ))
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        OperationalRecordInput::immutable_locator(
+            OperationalRecordContext {
+                record_id: record.operation_id.clone(),
+                subject_id: record.reservation_id.clone(),
+                authority_epoch: record.authority_epoch.clone(),
+                state_fence: record.state_fence.clone(),
+                created_at_ms: record.created_at_ms,
+                cleanup_after_ms: None,
+            },
+            locator,
+            crate::model::sha256_hex(&payload),
+            payload_length,
+        )
+    }
+
+    fn admission_reservation_snapshot(
+        durable: &DurableOperationalRecord,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        if durable.kind != OperationalKind::AdmissionReservation {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "operational row has the wrong kind".to_owned(),
+            });
+        }
+        let record =
+            durable
+                .admission_reservation
+                .clone()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "admission_reservation",
+                    reason: "operational row has no typed reservation".to_owned(),
+                })?;
+        record.validate()?;
+        if record.reservation_id != durable.input.subject_id
+            || record.operation_id != durable.input.record_id
+            || record.authority_epoch != durable.input.authority_epoch
+            || record.state_fence != durable.input.state_fence
+            || Self::admission_reservation_input(&record)? != durable.input
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "typed reservation does not match its operational binding".to_owned(),
+            });
+        }
+        let expected_phase = match record.state {
+            AdmissionReservationState::StagedInactive => OperationalPhase::Staged,
+            AdmissionReservationState::Reconciling => OperationalPhase::Reconciling,
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => {
+                OperationalPhase::Released
+            }
+            AdmissionReservationState::Active => OperationalPhase::Active,
+        };
+        if durable.phase != expected_phase {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "typed lifecycle and operational phase disagree".to_owned(),
+            });
+        }
+        Ok(AdmissionReservationSnapshot::from_store(
+            record,
+            Self::receipt_for(durable)?,
+        ))
+    }
+
+    fn prepare_admission_reservation_transition(
+        record: &mut AdmissionReservationRecord,
+        disposition: &AdmissionReservationDisposition,
+        target: AdmissionReservationState,
+        current_snapshot: &AdmissionReservationSnapshot,
+    ) -> Result<bool, OrsError> {
+        disposition.evidence.validate()?;
+        if disposition.now_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "admission_reservation_disposition.now_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        if record.reservation_id != disposition.reservation_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "reservation identity does not match its operational key".to_owned(),
+            });
+        }
+        if disposition.operation_id == record.stage_operation_id {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let request = AdmissionReservationTransitionRequest {
+            operation_id: disposition.operation_id.clone(),
+            target_state: target,
+            reason: disposition.reason.clone(),
+            evidence: disposition.evidence.clone(),
+            expected_current_receipt: disposition.expected_current_receipt.clone(),
+            authority_epoch: disposition.authority_epoch.clone(),
+            state_fence: disposition.state_fence.clone(),
+            now_ms: disposition.now_ms,
+        };
+        if record.operation_id == disposition.operation_id {
+            if record.last_transition.as_ref() == Some(&request) && record.state == target {
+                return Ok(false);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        if current_snapshot.receipt() != &disposition.expected_current_receipt {
+            return Err(OrsError::DuplicateConflict);
+        }
+        if record.authority_epoch != disposition.authority_epoch
+            || record.state_fence != disposition.state_fence
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if record.state == target
+            || !matches!(
+                record.state,
+                AdmissionReservationState::StagedInactive | AdmissionReservationState::Reconciling
+            )
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        if disposition.now_ms < record.updated_at_ms {
+            return Err(OrsError::InvalidField {
+                field: "admission_reservation_disposition.now_ms",
+                reason: "transition time cannot move backwards",
+            });
+        }
+        if target == AdmissionReservationState::Expired && disposition.now_ms < record.expires_at_ms
+        {
+            return Err(OrsError::InvalidExpiry);
+        }
+        if !matches!(
+            target,
+            AdmissionReservationState::Reconciling
+                | AdmissionReservationState::Released
+                | AdmissionReservationState::Expired
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        record.operation_id = disposition.operation_id.clone();
+        record.updated_at_ms = disposition.now_ms;
+        record.state = target;
+        record.disposition_reason = Some(disposition.reason.clone());
+        record.disposition_evidence = Some(disposition.evidence.clone());
+        record.last_transition = Some(request);
+        record.validate()?;
+        Ok(true)
+    }
+
+    fn transition_kernel_admission_reservation(
+        &self,
+        disposition: &AdmissionReservationDisposition,
+        target: AdmissionReservationState,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        let key = Self::operational_key(
+            OperationalKind::AdmissionReservation,
+            &disposition.reservation_id,
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut durable =
+            Self::decode_operational_current(&write, &key)?.ok_or(OrsError::ReservationNotFound)?;
+        let current_snapshot = Self::admission_reservation_snapshot(&durable)?;
+        let mut record =
+            durable
+                .admission_reservation
+                .clone()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "admission_reservation",
+                    reason: "operational row has no typed reservation".to_owned(),
+                })?;
+        record.validate()?;
+        if record.operation_id != durable.input.record_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "reservation identity does not match its operational key".to_owned(),
+            });
+        }
+        let should_commit = Self::prepare_admission_reservation_transition(
+            &mut record,
+            disposition,
+            target,
+            &current_snapshot,
+        )?;
+        if !should_commit {
+            return Ok(current_snapshot);
+        }
+
+        durable.input = Self::admission_reservation_input(&record)?;
+        durable.phase = match target {
+            AdmissionReservationState::StagedInactive => OperationalPhase::Staged,
+            AdmissionReservationState::Reconciling => OperationalPhase::Reconciling,
+            AdmissionReservationState::Released | AdmissionReservationState::Expired => {
+                OperationalPhase::Released
+            }
+            AdmissionReservationState::Active => return Err(OrsError::InvalidTransition),
+        };
+        durable.admission_reservation = Some(record);
+        durable.operation_order = Self::next_operational_order(&write)?;
+        Self::admission_reservation_snapshot(&durable)?;
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Self::admission_reservation_snapshot(&durable)
+    }
+}
+
 impl OperationalRecoveryStore for RedbRecoveryStore {
     fn stage_generation_cutover(
         &self,
@@ -19175,6 +19428,115 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Released,
         )
         .map(AdmissionReservationReceipt::from_receipt)
+    }
+
+    fn stage_kernel_admission_reservation(
+        &self,
+        stage: AdmissionReservationStage,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        let stage_operation_id = stage.operation_id.clone();
+        let record = AdmissionReservationRecord {
+            reservation_id: stage.reservation_id,
+            work_item_id: stage.work_item_id,
+            proposed_attempt_id: stage.proposed_attempt_id,
+            stage_operation_id,
+            operation_id: stage.operation_id,
+            claims: stage.claims,
+            authority_epoch: stage.authority_epoch,
+            state_fence: stage.state_fence,
+            canonical_admission_receipt: None,
+            activation_receipt: None,
+            expires_at_ms: stage.expires_at_ms,
+            state: AdmissionReservationState::StagedInactive,
+            disposition_reason: None,
+            disposition_evidence: None,
+            last_transition: None,
+            created_at_ms: stage.now_ms,
+            updated_at_ms: stage.now_ms,
+        };
+        record.validate()?;
+        let input = Self::admission_reservation_input(&record)?;
+        let key = Self::operational_key(
+            OperationalKind::AdmissionReservation,
+            &record.reservation_id,
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        if let Some(existing) = Self::decode_operational_current(&write, &key)? {
+            let Some(existing_record) = existing.admission_reservation.as_ref() else {
+                return Err(OrsError::DuplicateConflict);
+            };
+            existing_record.validate()?;
+            if existing_record != &record {
+                return Err(OrsError::DuplicateConflict);
+            }
+            let snapshot = Self::admission_reservation_snapshot(&existing)?;
+            drop(write);
+            return Ok(snapshot);
+        }
+        let durable = DurableOperationalRecord {
+            kind: OperationalKind::AdmissionReservation,
+            input,
+            phase: OperationalPhase::Staged,
+            operation_order: Self::next_operational_order(&write)?,
+            terminal_receipt_id: None,
+            terminal_receipt_sha256: None,
+            admission_reservation: Some(record),
+            generation_cutover: None,
+        };
+        Self::admission_reservation_snapshot(&durable)?;
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Self::admission_reservation_snapshot(&durable)
+    }
+
+    fn load_kernel_admission_reservation(
+        &self,
+        reservation_id: &OperationIdentity,
+    ) -> Result<Option<AdmissionReservationSnapshot>, OrsError> {
+        let key = Self::operational_key(OperationalKind::AdmissionReservation, reservation_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let durable: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if durable.input.subject_id != *reservation_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "admission_reservation",
+                reason: "reservation key does not match its subject".to_owned(),
+            });
+        }
+        Self::admission_reservation_snapshot(&durable).map(Some)
+    }
+
+    fn reconcile_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            &disposition,
+            AdmissionReservationState::Reconciling,
+        )
+    }
+
+    fn release_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            &disposition,
+            AdmissionReservationState::Released,
+        )
+    }
+
+    fn expire_kernel_admission_reservation(
+        &self,
+        disposition: AdmissionReservationDisposition,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            &disposition,
+            AdmissionReservationState::Expired,
+        )
     }
 
     fn apply_generation_transition(

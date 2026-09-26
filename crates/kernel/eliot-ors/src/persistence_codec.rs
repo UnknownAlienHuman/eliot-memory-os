@@ -646,6 +646,31 @@ impl PersistedValue for DurableOperationalRecord {
         if let Some(digest) = &self.terminal_receipt_sha256 {
             crate::model::validate_digest(digest, "terminal_receipt_sha256")?;
         }
+        if let Some(reservation) = &self.admission_reservation {
+            reservation.validate()?;
+            let expected_phase = match reservation.state {
+                crate::AdmissionReservationState::StagedInactive => crate::OperationalPhase::Staged,
+                crate::AdmissionReservationState::Reconciling => {
+                    crate::OperationalPhase::Reconciling
+                }
+                crate::AdmissionReservationState::Released
+                | crate::AdmissionReservationState::Expired => crate::OperationalPhase::Released,
+                crate::AdmissionReservationState::Active => crate::OperationalPhase::Active,
+            };
+            if self.kind != OperationalKind::AdmissionReservation
+                || reservation.reservation_id != self.input.subject_id
+                || reservation.operation_id != self.input.record_id
+                || reservation.authority_epoch != self.input.authority_epoch
+                || reservation.state_fence != self.input.state_fence
+                || self.phase != expected_phase
+                || super::RedbRecoveryStore::admission_reservation_input(reservation)? != self.input
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: Self::RECORD_TYPE,
+                    reason: "typed admission reservation binding is inconsistent".to_owned(),
+                });
+            }
+        }
         if let Some(record) = &self.generation_cutover {
             record
                 .validate()

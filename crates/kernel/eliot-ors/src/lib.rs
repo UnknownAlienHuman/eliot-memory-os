@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission_reservation;
 mod backup_snapshot;
 mod cutover_ownership;
 mod doctor;
@@ -23,6 +24,11 @@ mod versioned_artifact;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use admission_reservation::{
+    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationDisposition,
+    AdmissionReservationRecord, AdmissionReservationSnapshot, AdmissionReservationStage,
+    AdmissionReservationState, AdmissionReservationTransitionRequest,
+};
 pub use backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN,
     MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, ORS_FAMILY_CURSOR_VERSION, OrsBackupDestination,
