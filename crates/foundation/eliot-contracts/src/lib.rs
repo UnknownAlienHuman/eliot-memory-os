@@ -93,6 +93,7 @@ impl HostCorrelationProjection {
                 if occurrence.len() > MAX_HOST_CORRELATION_PROJECTION_BYTES {
                     return Err(ContractError::TooLong {
                         field: "host_correlation.occurrence",
+                        maximum_bytes: MAX_HOST_CORRELATION_PROJECTION_BYTES,
                     });
                 }
             }
@@ -108,6 +109,7 @@ impl HostCorrelationProjection {
                 if value.len() > MAX_HOST_CORRELATION_PROJECTION_BYTES {
                     return Err(ContractError::TooLong {
                         field: "host_correlation.json_rpc_string",
+                        maximum_bytes: MAX_HOST_CORRELATION_PROJECTION_BYTES,
                     });
                 }
             }
@@ -156,6 +158,12 @@ pub enum ContractError {
     /// A value contains a control character that cannot be part of an identity.
     #[error("{field} contains a control character")]
     ControlCharacter { field: &'static str },
+    /// A bounded text value exceeds its UTF-8 byte limit.
+    #[error("{field} exceeds the maximum UTF-8 byte length of {maximum_bytes}")]
+    TooLong {
+        field: &'static str,
+        maximum_bytes: usize,
+    },
     /// A value is outside the range admitted by a typed counter.
     #[error("{field} must be greater than zero")]
     Zero { field: &'static str },
