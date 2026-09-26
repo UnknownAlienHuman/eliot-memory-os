@@ -295,6 +295,10 @@ fn main() {
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
     // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
     let _ = eliot_host::host_diagnostics::install_host_diagnostics();
+    // One bounded Event Log worker owns the potentially blocking OS call.
+    // Start it before the first projected request; startup failure only
+    // degrades diagnostics and never changes Host control flow.
+    eliot_host::host_diagnostics::start_event_log_reporting();
     // F-LOG-HOST-7 B1 (issue #982): bootstrap capture observed after install
     // (earlier records would miss the subscriber) with a static word only;
     // the cached value may carry launch material (I15.4).
@@ -312,7 +316,10 @@ fn main() {
     );
     #[cfg(windows)]
     match run_as_scm_service() {
-        Ok(true) => return,
+        Ok(true) => {
+            eliot_host::host_diagnostics::shutdown_event_log_reporting();
+            return;
+        }
         Ok(false) => {
             // F-LOG-HOST-7 B3 (issue #982): supported interactive-console
             // fallback, recorded distinctly from dispatcher failure below.
@@ -341,6 +348,7 @@ fn main() {
                 &detail,
                 cached.as_ref(),
             );
+            eliot_host::host_diagnostics::shutdown_event_log_reporting();
             std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
         }
     }
@@ -371,8 +379,10 @@ fn main() {
             "console protocol failed before durable shutdown",
             cached.as_ref(),
         );
+        eliot_host::host_diagnostics::shutdown_event_log_reporting();
         std::process::exit(console_process_exit_code());
     }
+    eliot_host::host_diagnostics::shutdown_event_log_reporting();
 }
 
 /// #889 projection: launch-config parse outcome for the start operation.
