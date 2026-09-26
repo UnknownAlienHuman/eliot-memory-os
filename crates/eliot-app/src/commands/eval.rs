@@ -17,7 +17,7 @@ pub fn run_eval_case_create(config_path: &Path, family: &str, name: &str) -> Res
         generated_at: time::OffsetDateTime::now_utc(),
     });
     let case = EvalCaseService::create(EvalCaseInput {
-        project_id: project_id_from_label("eliot-governor"),
+        project_id: eval_project_id_from_label("eliot-governor"),
         task_id: Some(task_id_from_label("core-eval-cli")),
         family: parse_eval_family(family)?,
         name: name.to_owned(),
@@ -54,7 +54,7 @@ pub fn run_eval_suite_create(config_path: &Path, name: &str) -> Result<()> {
     let root = runtime_root(config_path);
     let cases = ensure_eval_cases(&root)?;
     let suite = EvalSuiteService::create(EvalSuiteInput {
-        project_id: project_id_from_label("eliot-governor"),
+        project_id: eval_project_id_from_label("eliot-governor"),
         name: name.to_owned(),
         purpose: "Deterministic no-mutation eval suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
@@ -395,7 +395,7 @@ pub(super) fn ensure_core_smoke_artifacts(
     } else {
         suite_name
     };
-    let project_id = project_id_from_label("eliot-governor");
+    let project_id = eval_project_id_from_label("eliot-governor");
     let task_id = task_id_from_label("core-eval-smoke");
     let cases = EvalCaseService::k0_core_cases(project_id, Some(task_id));
     let mut suite = EvalSuiteService::create(EvalSuiteInput {
@@ -541,16 +541,12 @@ pub(super) fn ensure_integration_smoke_artifacts(
     )?;
 
     let git_commit = git_head_blocking(&repo_root()).unwrap_or_else(|_| "unknown".to_owned());
-    let baseline = EvalBaselineService::create(
-        &core.suite,
-        &core.manifest,
-        &core.integrity_receipt,
-        &core.run,
-        &core.verdict,
-        &git_commit,
-        "provider-integration-smoke",
-    )?;
-    write_eval_baseline_registry(root, &core.suite, baseline.clone())?;
+    // Gate against the retained baseline (issue #1922 reachability): a
+    // baseline created fresh from this same run could never be stale, so
+    // identity drift would be undetectable on the gate path. The resolver
+    // reuses the registry's active baseline when one exists and bootstraps
+    // (create + register) only on first use.
+    let baseline = resolve_eval_baseline(root, &core, "latest")?;
 
     let candidate_run = core.run.clone();
     let comparison =
@@ -672,7 +668,7 @@ pub(super) fn eval_coverage_report(artifacts: &CoreSmokeArtifacts) -> EvalCovera
     EvalCoverageReport {
         component: "eval_coverage".to_owned(),
         coverage: EvalCoverageService::matrix(
-            project_id_from_label("eliot-governor"),
+            eval_project_id_from_label("eliot-governor"),
             std::slice::from_ref(&artifacts.suite),
             &artifacts.cases,
         ),
@@ -743,6 +739,26 @@ pub(super) fn ensure_eval_run_ref(run: &EvalRun, run_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deterministic project identity for the CLI eval surface (issue #1922
+/// reachability): the shared label helper mints a fresh random id per
+/// call, which would make the retained `product_identity` fingerprint
+/// differ on every invocation and every cross-invocation comparison
+/// stale by noise instead of by real drift. Same `eliot://project/`
+/// blake3 construction as the MCP canonical-key derivation, so both
+/// surfaces agree on the same label.
+fn eval_project_id_from_label(label: &str) -> ProjectId {
+    if let Ok(id) = ProjectId::from_str(label) {
+        return id;
+    }
+    let normalized = label.trim().trim_end_matches('/').to_ascii_lowercase();
+    let digest = blake3::hash(format!("eliot://project/{normalized}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ProjectId::from_uuid(uuid::Uuid::from_bytes(bytes))
+}
+
 pub(super) fn ensure_eval_cases(root: &Path) -> Result<Vec<EvalCase>> {
     match read_eval_cases_report(root) {
         Ok(report) if !report.cases.is_empty() => Ok(report.cases),
@@ -765,7 +781,7 @@ pub(super) fn ensure_eval_cases(root: &Path) -> Result<Vec<EvalCase>> {
 
 pub(super) fn k0_default_cases() -> Vec<EvalCase> {
     EvalCaseService::k0_core_cases(
-        project_id_from_label("eliot-governor"),
+        eval_project_id_from_label("eliot-governor"),
         Some(task_id_from_label("core-eval-smoke")),
     )
 }
