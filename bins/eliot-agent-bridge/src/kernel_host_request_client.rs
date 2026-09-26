@@ -723,7 +723,7 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => {
                 verify_resolved_key_commitment(
                     &record,
-                    ResolvedKeyCommitment {
+                    &ResolvedKeyCommitment {
                         key: &logical_key,
                         occurrence: correlation,
                         session: session_id,
@@ -1063,7 +1063,7 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => {
                 verify_resolved_key_commitment(
                     &record,
-                    ResolvedKeyCommitment {
+                    &ResolvedKeyCommitment {
                         key: &logical_key,
                         occurrence: cancel_correlation,
                         session: session_id,
@@ -2128,7 +2128,7 @@ struct ResolvedKeyCommitment<'a> {
 
 fn verify_resolved_key_commitment(
     record: &AdmittedReplyView,
-    expected: ResolvedKeyCommitment<'_>,
+    expected: &ResolvedKeyCommitment<'_>,
 ) -> Result<(), PortFailure> {
     let limitation = || unknown_resolve_outcome(expected.key);
     let Some(kind) = &record.kind else {
