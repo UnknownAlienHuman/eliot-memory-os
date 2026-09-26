@@ -28,9 +28,9 @@ use eliot_backup::{
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
-    CaptureBudgets, CaptureCallerAuth, CaptureRequest, CaptureState, FrozenCapturePlan,
-    KernelBackupCapture, KernelCaptureError, PublicationPort, PublicationReceipt, SnapshotRelation,
-    require_capture_admitted,
+    CaptureBudgets, CaptureCallerAuth, CaptureEvidenceLevel, CaptureRequest, CaptureState,
+    FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
+    PublicationReceipt, SnapshotRelation, require_capture_admitted,
 };
 use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
 use eliot_store_api::{
@@ -573,7 +573,7 @@ fn admitted_full_recovery_capture_completes_and_binds_archive() {
     assert_eq!(report.state, CaptureState::Complete);
     assert_eq!(report.class, BackupClass::FullRecovery);
     assert!(report.class.is_full_recovery());
-    assert_eq!(report.verification_level, "build-validate-publish");
+    assert_eq!(report.evidence_level, CaptureEvidenceLevel::ClassQualified);
     // The archive identity binds the canonical export identity, never the
     // caller-supplied input id.
     assert_eq!(report.backup_id, "export-959-full");
@@ -645,10 +645,18 @@ fn explicit_canonical_only_degraded_capture() {
     // archive verifies as degraded (Incomplete), while the capture that
     // produced it is Complete.
     let verified = coordinator()
-        .verify_only(&publisher.publishes[0].2, &admitted_caller(), &base_fence())
+        .verify_only(
+            &publisher.publishes[0].2,
+            &admitted_caller(),
+            &base_fence(),
+            "verify-degraded",
+        )
         .expect("degraded archive verifies");
     assert_eq!(verified.class, BackupClass::CanonicalOnlyDegraded);
-    assert_eq!(verified.verification_level, "decode-validate-relation");
+    assert_eq!(
+        verified.evidence_level,
+        CaptureEvidenceLevel::StructurallyValidCandidate
+    );
     assert!(matches!(verified.state, CaptureState::Incomplete { .. }));
 }
 
@@ -1285,21 +1293,25 @@ fn verify_only_never_restores_or_mutates() {
     // Verification-only takes no publisher at all: no publication is
     // representable here, and the report carries the verify-only identity.
     let verified = coordinator()
-        .verify_only(&publisher.publishes[0].2, &admitted_caller(), &base_fence())
+        .verify_only(
+            &publisher.publishes[0].2,
+            &admitted_caller(),
+            &base_fence(),
+            "verify-no-effects",
+        )
         .expect("verify-only passes");
     assert_eq!(verified.class, BackupClass::FullRecovery);
     assert_eq!(verified.state, CaptureState::Complete);
-    assert_eq!(verified.verification_level, "decode-validate-relation");
-    assert_eq!(verified.archive_sha256, report.archive_sha256);
-    assert!(
-        verified.operation_id.starts_with("verify-only-"),
-        "verify-only identity, got {}",
-        verified.operation_id
-    );
     assert_eq!(
-        verified.operation_id,
-        format!("verify-only-{}", verified.backup_id)
+        verified.evidence_level,
+        CaptureEvidenceLevel::StructurallyValidCandidate
     );
+    assert_eq!(verified.archive_sha256, report.archive_sha256);
+    // The owner no longer mints a verify-only identity: it reports back the
+    // operation identity its caller bound, because an identity derived from
+    // the archive id is caller spelling rather than a canonical operation
+    // identity and cannot be replayed.
+    assert_eq!(verified.operation_id, "verify-no-effects");
     assert!(verified.receipt_identity.is_none());
     // Static boundary: no restore/mutation/cutover vocabulary in the capture
     // coordinator. `cut_over`/`Finished` are matched case-sensitively so prose

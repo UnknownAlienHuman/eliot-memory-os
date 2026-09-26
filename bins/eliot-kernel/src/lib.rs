@@ -64,7 +64,8 @@ mod testd_terminal_completion_route;
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;
 
 pub use backup_capture::{
-    CaptureReport, CaptureRequest, CaptureState, KernelBackupCapture, request_from_ports,
+    ArchivedFenceRelation, CaptureEvidenceLevel, CaptureReport, CaptureRequest, CaptureState,
+    KernelBackupCapture, request_from_ports,
 };
 pub use backup_capture_ports::{
     CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,

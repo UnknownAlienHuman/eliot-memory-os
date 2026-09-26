@@ -17,16 +17,28 @@
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
 //!   and reachable through [`KernelComposition::backup_capture`]). The
-//!   manifest, every member disposition, the evidenced class and the
-//!   archive/kernel fence join are the owner's answers: a hex shape and a
-//!   self-reported checksum are never verification. What this proves is
-//!   STRUCTURAL validity plus a join to the live generation - recomputed
-//!   checksums, the class's own requirements and `export_fence.state_fence`
-//!   equality. It is NOT provenance: nothing in the path is signed, `StateFence`
-//!   is publicly observable through `ServerHello`, and no member denominator is
-//!   checked on the verify path. The `eliot-backup` edge this route needs is
-//!   already declared in `bins/eliot-kernel/Cargo.toml`, so no dependency is
-//!   added here. Verification publishes nothing and mutates nothing.
+//!   manifest, every member disposition, the evidenced class, the exact class
+//!   ceiling and the archived-fence relation are the owner's answers: a hex
+//!   shape and a self-reported checksum are never verification. What this
+//!   proves is STRUCTURAL validity plus the archived fence's own validation -
+//!   recomputed checksums, the class's own requirements, and a `StateFence`
+//!   that is either the live session fence or this installation's own earlier
+//!   authority epoch. Exact equality with the live generation is deliberately
+//!   not required: it made a genuine earlier-generation archive unverifiable
+//!   after the restart or epoch rotation at which verification matters most,
+//!   and current-target compatibility plus epoch monotonicity belong to the
+//!   isolated restore/cutover owners (A13.7 "Cutover requires separate
+//!   authority"). It is NOT provenance: nothing in the path is signed,
+//!   `StateFence` is publicly observable through `ServerHello`, and no member
+//!   denominator is checked on the verify path, so the owner answers at the
+//!   structurally-valid-candidate level with no capture receipt. A valid
+//!   degraded or scope class is a real archive with a lower ceiling (I5.13:
+//!   `canonical_only_degraded` "preserves semantic data only and is never
+//!   advertised as operational recovery"; `scope_export` is "not an
+//!   installation backup"), never `invalid`. The `eliot-backup` edge this route
+//!   needs is already declared in `bins/eliot-kernel/Cargo.toml`, so no
+//!   dependency is added here. Verification publishes nothing and mutates
+//!   nothing.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
 //!   admissibility, provisioning shape, store-level isolation inequality),
@@ -485,16 +497,25 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
     )
 }
 
-/// Projects a complete capture-owner verification report into the route's `ok`
+/// Projects a capture-owner verification report into the route's `ok`
 /// envelope.
 ///
 /// Every field is the owner's own answer: the archive identity (bounded to the
 /// same operator text limit the surface applies, so a structurally valid
 /// archive with an over-long identity cannot make the surface return a result
 /// mismatch), the evidenced class under the owner's single class-name spelling,
-/// the archive digest, the verify-only operation identity, the verification
-/// level the owner performed, and the per-domain member counts read from the
+/// the archive digest, the request's stable operation identity, the evidence
+/// level the owner proved, the exact class ceiling read from the owner's report
+/// through `RestoreEvidenceLevel`'s own `snake_case` spelling, the archived
+/// fence's current/historical relation, the capture receipt (explicitly null
+/// when the owner has none), and the per-domain member counts read from the
 /// owner's own dispositions through the owner's own count helper.
+///
+/// `operation_id` is the request's stable operation identity the route already
+/// bound (`idempotency_key`), never a minted `verify-only-{backup_id}`: I5.27
+/// defines idempotency over canonical bytes, "not over caller spelling or an
+/// unversioned hash", and the owner only ever reports back the identity its
+/// caller bound.
 fn verified_reply(report: &CaptureReport, idempotency_key: &str) -> Value {
     let event_count = member_domain_count(report, MEMBER_DOMAIN_CANONICAL);
     let receipt_count = member_domain_count(report, MEMBER_DOMAIN_RECEIPT);
@@ -511,6 +532,25 @@ fn verified_reply(report: &CaptureReport, idempotency_key: &str) -> Value {
             "archive identity exceeds the bounded operator text length",
         );
     }
+    // The ceiling is the owner's own `RestoreEvidenceLevel` value, so its exact
+    // `snake_case` spelling comes from that type's serialization instead of a
+    // second hand-written vocabulary here.
+    let Ok(class_ceiling) = serde_json::to_value(report.class_ceiling) else {
+        return invalid_reply(
+            BACKUP_VERIFY_OPERATION,
+            idempotency_key,
+            "backup.class_ceiling",
+            "class evidence ceiling is not serializable",
+        );
+    };
+    // Explicitly null, never omitted: no retained-artifact owner issues a
+    // capture receipt on this path. The missing symbol is a production
+    // `impl PublicationPort`; the only implementation is `MemPublisher` inside
+    // `bins/eliot-kernel/tests/backup_capture.rs`.
+    let capture_receipt = report
+        .receipt_identity
+        .clone()
+        .map_or(Value::Null, Value::String);
     backup_reply(
         BACKUP_VERIFY_OPERATION,
         "ok",
@@ -522,11 +562,17 @@ fn verified_reply(report: &CaptureReport, idempotency_key: &str) -> Value {
                 "integrity_sha256",
                 Value::String(report.archive_sha256.clone()),
             ),
-            ("operation_id", Value::String(report.operation_id.clone())),
+            ("operation_id", Value::String(idempotency_key.to_owned())),
             (
                 "verification_level",
-                Value::String(report.verification_level.to_owned()),
+                Value::String(report.evidence_level.as_wire_name().to_owned()),
             ),
+            ("class_ceiling", class_ceiling),
+            (
+                "target_compatibility",
+                Value::String(report.archived_fence_relation.as_wire_name().to_owned()),
+            ),
+            ("capture_receipt", capture_receipt),
             ("event_count", Value::from(event_count)),
             ("receipt_count", Value::from(receipt_count)),
             ("blob_count", Value::from(blob_count)),
@@ -541,11 +587,23 @@ impl KernelComposition {
     /// The owner is [`super::backup_capture::KernelBackupCapture`], already bound
     /// on the composition by #959; this route supplies only what a front door
     /// legitimately holds: the presented bytes, the session's own admission
-    /// projection, and the Kernel's live state fence. Manifest, member integrity,
-    /// the closed class rules and the archive/kernel fence join are the owner's
-    /// answers, so a corrupted archive refuses as a typed `invalid` carrying the
-    /// owner's own reason instead of a shape check passing. Shape failures refuse
-    /// as `invalid` before the owner is called at all.
+    /// projection, the Kernel's live state fence, and the request's stable
+    /// operation identity. Manifest, member integrity, the closed class rules
+    /// and the archived-fence relation are the owner's answers, so a corrupted
+    /// archive refuses as a typed `invalid` carrying the owner's own reason
+    /// instead of a shape check passing. Shape failures refuse as `invalid`
+    /// before the owner is called at all.
+    ///
+    /// `Complete` and `Incomplete` both answer `ok`: a structurally valid
+    /// archive of a degraded class is a real archive with a lower ceiling, not a
+    /// corrupt one. I5.13 gives each class its own explicit wording -
+    /// `canonical_only_degraded` "preserves semantic data only and is never
+    /// advertised as operational recovery" and `scope_export` is "not an
+    /// installation backup" - and the owner's `class_ceiling` and
+    /// `evidence_level` now carry that lower bound explicitly, so reporting it
+    /// as `invalid` would misstate a good archive. Only an undecided or
+    /// refused owner state (`Unknown`, `Cancelled`, `Unsupported`) keeps the
+    /// existing stable-prose refusal, and no other check is weakened.
     fn handle_backup_verify(
         &self,
         session: &Session,
@@ -603,26 +661,26 @@ impl KernelComposition {
             &bundle_raw,
             &caller,
             &session.module_generation.state_fence,
+            idempotency_key,
         ) {
             Ok(report) => report,
             Err(error) => return Ok(capture_error_reply(idempotency_key, &error)),
         };
-        // The owner reports class completeness, and the operator surface promotes
-        // an `ok` envelope to a verified archive. A degraded or scope class is
-        // structurally valid but cannot claim completeness, so it refuses with the
-        // owner's own reason instead of being promoted.
-        if !matches!(report.state, CaptureState::Complete) {
+        if !matches!(
+            report.state,
+            CaptureState::Complete | CaptureState::Incomplete { .. }
+        ) {
             let reason = match &report.state {
-                CaptureState::Incomplete { reason } | CaptureState::Unknown { reason } => {
+                CaptureState::Unknown { reason } | CaptureState::Unsupported { reason } => {
                     reason.clone()
                 }
                 // Every remaining terminal state is reported with stable prose
                 // rather than a Rust `Debug` name, so no owner state leaks an
                 // internal enum spelling onto the operator wire.
                 CaptureState::Cancelled => "capture owner cancelled the verification".to_owned(),
-                CaptureState::Unsupported { reason } => reason.clone(),
-                CaptureState::Complete => {
-                    "capture owner reported completeness after a completeness refusal".to_owned()
+                CaptureState::Complete | CaptureState::Incomplete { .. } => {
+                    "capture owner reported a decided state after a decided-state refusal"
+                        .to_owned()
                 }
             };
             return Ok(invalid_reply(
