@@ -8,6 +8,7 @@ use eliot_security_contracts::{
     IntegrityStatus, QuarantineState,
 };
 
+use crate::lifecycle::{DivergenceReport, classify_reference_divergence};
 use crate::replacement::{
     DrainSnapshot, GenerationCoordinator, GenerationRecord, PrepareRequest, PreparedSummary,
     ReadinessOracle, ReplacementError, RollbackArmed, RollbackReceipt, RollbackRequest,
@@ -178,6 +179,34 @@ impl WasmRuntime {
         let result = cached.result.clone();
         self.cache_insert(cached.request.invocation_id.clone(), cached);
         result
+    }
+
+    /// Explains a retained differential mismatch as an explicit divergence
+    /// report.
+    ///
+    /// Returns `Some` exactly when the cached outcome for `invocation_id` is
+    /// a sealed `DifferentialMismatch`: the derived evidence is recomputed
+    /// from the retained terminal report bytes and classified against the
+    /// retained sealed promotion reference, so the report describes the same
+    /// legs the differential branch enforced. Any other outcome — success,
+    /// another refusal, an uncached identity, or evidence that can no longer
+    /// be re-derived — yields `None` rather than a manufactured report.
+    #[must_use]
+    pub fn divergence_report(
+        &self,
+        invocation_id: &crate::InvocationId,
+    ) -> Option<DivergenceReport> {
+        let cached = self.cache.get(invocation_id)?;
+        if cached.result.receipt.error != Some(RuntimeError::DifferentialMismatch) {
+            return None;
+        }
+        let report = cached.terminal_report.as_ref()?;
+        let admission = cached.admission.as_ref()?;
+        let derived = derive_execution(report).ok()?;
+        Some(classify_reference_divergence(
+            &derived,
+            &admission.promotion,
+        ))
     }
 
     /// Cancels only an unknown in-flight result and preserves terminal replay.

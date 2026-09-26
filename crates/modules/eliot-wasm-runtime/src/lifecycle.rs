@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CapabilityId, ComponentEnginePort, EffectProposal, EngineInvocation, EngineReport,
-    EngineTermination, InvocationLimits, PortError, Sha256Digest, canonical_digest,
+    CapabilityId, ComponentEnginePort, DerivedExecutionEvidence, EffectProposal, EngineInvocation,
+    EngineReport, EngineTermination, InvocationLimits, PortError, PromotionVerification,
+    Sha256Digest, canonical_digest,
 };
 
 /// Lifecycle labels from I14.19. These are a projection of the canonical
@@ -471,17 +472,109 @@ pub fn build_activation_record(
     })
 }
 
-/// Divergence families persisted by the shadow comparator.
+/// Divergence families persisted by the shadow comparator and the
+/// reference-divergence classifier.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DivergenceKind {
     Semantic,
     Invariant,
     EffectProposal,
+    StateDelta,
     Latency,
     Memory,
     HostCall,
     Nondeterminism,
+}
+
+/// Canonical agent-facing reason code (I07-20) for an explicit component
+/// behavioral-divergence report. Emitted by the host result frame when the
+/// sealed execution disagrees with its declared reference; never minted for
+/// any other refusal.
+pub const DIVERGENCE_REASON_CODE: &str = "COMPONENT_DIVERGENCE";
+
+/// Explicit divergence report for one sealed execution that disagreed with
+/// its declared promotion reference.
+///
+/// This is the digest-level counterpart to [`ConformanceComparison`]: the
+/// admitted path retains the declared reference as digests only (the
+/// promotion verifier seals them; no full reference bytes exist to compare
+/// field by field), so each leg compares the runtime-derived digest against
+/// the sealed expected digest. A leg that holds contributes no kind; a leg
+/// that breaks contributes exactly one: result bytes break [`DivergenceKind::Semantic`]
+/// (the branch only fires on completed termination, so the error class is
+/// `Ok` by construction and the bytes are the semantic content),
+/// proposed effects break [`DivergenceKind::EffectProposal`], and the
+/// observed state delta breaks [`DivergenceKind::StateDelta`].
+///
+/// Determinism, host-call, memory, and latency legs are not evaluated here:
+/// the single-execution admitted path performs no same-seed repeat (the
+/// guest is never executed twice) and the sealed reference carries no
+/// resource observations. Absent legs stay absent; they are never reported
+/// as matching.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceReport {
+    /// The derived result digest equals the sealed expected result digest.
+    pub result_match: bool,
+    /// The derived effect digest equals the sealed expected effect digest.
+    pub effects_match: bool,
+    /// The derived state-delta digest equals the sealed expected digest.
+    pub state_delta_match: bool,
+    /// Divergence families of the broken legs, in leg order.
+    pub divergences: Vec<DivergenceKind>,
+    /// Runtime-derived result digest from the actual engine report bytes.
+    pub observed_result_digest: Sha256Digest,
+    /// Sealed expected result digest from the promotion verifier.
+    pub expected_result_digest: Sha256Digest,
+    /// Runtime-derived effect digest from the actual proposed effects.
+    pub observed_effect_digest: Sha256Digest,
+    /// Sealed expected effect digest from the promotion verifier.
+    pub expected_effect_digest: Sha256Digest,
+    /// Runtime-derived state-delta digest from the actual observed delta.
+    pub observed_state_delta_digest: Sha256Digest,
+    /// Sealed expected state-delta digest from the promotion verifier.
+    pub expected_state_delta_digest: Sha256Digest,
+}
+
+/// Classifies which sealed-reference legs a derived execution broke.
+///
+/// Pure digest comparison over the exact legs the neutral facade's
+/// differential branch enforces: result, effects, and state delta. The
+/// caller supplies the runtime-derived evidence (recomputed from the actual
+/// terminal report bytes, never supplied by the engine) and the sealed
+/// promotion reference; every leg flag and kind is derived here, so a
+/// forged report cannot claim agreement the digests contradict.
+#[must_use]
+pub fn classify_reference_divergence(
+    derived: &DerivedExecutionEvidence,
+    promotion: &PromotionVerification,
+) -> DivergenceReport {
+    let result_match = derived.result_digest == promotion.expected_result_digest;
+    let effects_match = derived.effect_digest == promotion.expected_effect_digest;
+    let state_delta_match = derived.state_delta_digest == promotion.expected_state_delta_digest;
+    let mut divergences = Vec::new();
+    if !result_match {
+        divergences.push(DivergenceKind::Semantic);
+    }
+    if !effects_match {
+        divergences.push(DivergenceKind::EffectProposal);
+    }
+    if !state_delta_match {
+        divergences.push(DivergenceKind::StateDelta);
+    }
+    DivergenceReport {
+        result_match,
+        effects_match,
+        state_delta_match,
+        divergences,
+        observed_result_digest: derived.result_digest.clone(),
+        expected_result_digest: promotion.expected_result_digest.clone(),
+        observed_effect_digest: derived.effect_digest.clone(),
+        expected_effect_digest: promotion.expected_effect_digest.clone(),
+        observed_state_delta_digest: derived.state_delta_digest.clone(),
+        expected_state_delta_digest: promotion.expected_state_delta_digest.clone(),
+    }
 }
 
 /// Persisted shadow comparator outcome covering semantic, invariant,

@@ -15,6 +15,7 @@ use std::time::Duration;
 #[cfg(test)]
 use eliot_runtime::RuntimeConfig;
 use eliot_runtime::{Runtime, ShutdownHandle, ShutdownOutcome};
+use eliot_wasm_runtime::lifecycle::DivergenceReport;
 use eliot_wasm_runtime::{
     ComponentEnginePort, InvocationId, InvocationRequest, InvocationResult, RuntimeError,
     RuntimePorts, WasmRuntime,
@@ -201,6 +202,17 @@ impl WasmHostRunner {
     ) -> Result<InvocationResult, ContourGateError> {
         check_admitted_request(admitted, &request)?;
         Ok(self.wasm_runtime.execute(request))
+    }
+
+    /// Explains a retained differential mismatch as an explicit divergence
+    /// report, or `None` when the cached outcome is not one.
+    ///
+    /// Pure readback over the injected A-12 surface: no execution, no
+    /// policy, no retry. The loop calls this after an executed outcome to
+    /// project the explicit report onto its correlated frame.
+    #[must_use]
+    pub fn divergence_report(&self, invocation_id: &InvocationId) -> Option<DivergenceReport> {
+        self.wasm_runtime.divergence_report(invocation_id)
     }
 
     /// Cancels an unknown A-12 invocation without changing its typed outcome.
