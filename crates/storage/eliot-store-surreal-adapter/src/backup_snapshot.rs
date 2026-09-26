@@ -2134,14 +2134,36 @@ fn prepare_page(
     Ok(incarnation)
 }
 
+/// Resolves a page/end claim against the live owner entry.
+///
+/// Returns the typed refusal when the claim no longer describes the entry that
+/// occupies the digest: the entry was replaced (a different incarnation), or the
+/// presented handle is not the one it was issued under.
+fn resolve_page_claim(
+    states: &HashMap<String, SnapshotState>,
+    digest: &str,
+    presented: &SnapshotHandle,
+    incarnation: u64,
+) -> Result<(), StoreError> {
+    let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+    if state.incarnation != incarnation {
+        return Err(StoreError::IdentityConflict);
+    }
+    require_retained_handle(state, presented)
+}
+
 /// Re-verifies the bound point after the provider await and serves the page, or
 /// records the exact partial evidence that ends the capture.
 ///
 /// The claim is re-resolved against owner state, not only against the provider:
 /// exact handle equality does not prove the entry was not replaced while the
 /// await was in flight, so the incarnation the pre-read claim was validated
-/// against is re-checked too. A successor that reused the digest is reported as
-/// the typed identity conflict it is and is not mutated.
+/// against is re-checked too.
+///
+/// A refusal here disarms the release guard first. The guard is armed across the
+/// provider await and releases BY DIGEST, so leaving it armed on a mismatch would
+/// delete whichever entry now occupies that digest — the successor this check
+/// exists to protect.
 fn finish_page(
     digest: &str,
     observed: &CapturePoint,
@@ -2151,12 +2173,12 @@ fn finish_page(
     guard: &mut CaptureRelease,
 ) -> Result<SnapshotPage, StoreError> {
     let mut states = lock_registry()?;
+    if let Err(error) = resolve_page_claim(&states, digest, presented, incarnation) {
+        guard.retain();
+        return Err(error);
+    }
     let (moved, retired, interrupted) = {
         let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
-        if state.incarnation != incarnation {
-            return Err(StoreError::IdentityConflict);
-        }
-        require_retained_handle(state, presented)?;
         (
             observed != &state.point,
             capture_is_retired(state, crate::write_execution::current_time_ms()),
@@ -2247,11 +2269,19 @@ pub(crate) async fn read_snapshot_page(
 /// The receipt's handle comes from the retained owner-issued handle, so the
 /// receipt and its operation identity describe the same capture by
 /// construction rather than by agreement between two caller-reachable values.
+///
+/// The claim is re-resolved after the provider await, exactly as the page path
+/// does. Without that, a close that began against one capture would clear a
+/// successor's recorded interruption, issue a receipt built from the successor's
+/// identity and counters, and then delete the successor's entry.
 fn close_capture(
     digest: &str,
     observed: Option<&CapturePoint>,
+    presented: &SnapshotHandle,
+    incarnation: u64,
 ) -> Result<SnapshotEndReceipt, StoreError> {
     let mut states = lock_registry()?;
+    resolve_page_claim(&states, digest, presented, incarnation)?;
     let (expired, moved) = {
         let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
         (
@@ -2302,11 +2332,12 @@ pub(crate) async fn end_snapshot(
     // same single-principal invariant is proved before it can be issued.
     bind_capture_principal(adapter, SNAPSHOT_END_OPERATION)?;
     let digest = handle.snapshot_digest.clone();
-    let retired = {
+    let (retired, incarnation) = {
         let mut states = lock_registry()?;
         // The target request is resolved against the retained owner-issued
         // handle before any maintenance runs, so a mismatched handle purges
-        // nothing, interrupts nothing and closes nothing.
+        // nothing, interrupts nothing and closes nothing. The incarnation this
+        // claim was validated against is carried across the provider await.
         {
             let state = states.get(&digest).ok_or_else(unknown_snapshot_handle)?;
             require_retained_handle(state, &handle)?;
@@ -2320,7 +2351,10 @@ pub(crate) async fn end_snapshot(
         if ctx.state_fence != state.begin.scope.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        capture_is_retired(state, crate::write_execution::current_time_ms())
+        (
+            capture_is_retired(state, crate::write_execution::current_time_ms()),
+            state.incarnation,
+        )
     };
     let observed = if retired {
         // A closed window still owes the caller an exact partial receipt.
@@ -2343,5 +2377,5 @@ pub(crate) async fn end_snapshot(
         };
         Some(observed)
     };
-    close_capture(&digest, observed.as_ref())
+    close_capture(&digest, observed.as_ref(), &handle, incarnation)
 }
