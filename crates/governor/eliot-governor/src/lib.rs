@@ -57,6 +57,7 @@ pub use finish_attempt::{
 };
 mod controlboard_projection;
 mod learning_admission;
+mod learning_closure;
 mod learning_delta_integration;
 mod observation_reconciliation;
 mod operator_reconciliation;
@@ -93,6 +94,10 @@ pub use controlboard_projection::{
 /// second canonical dependency path.
 pub use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, RequestedFinishOutcome};
 pub use eliot_finish::FinishDecisionReceipt;
+/// Admission-receipt type re-exported so the daemon composition root can name
+/// the exact delivery-gate receipt type without a second dependency path (same
+/// reason as the [`CanonicalWriteEnvelope`] re-export below).
+pub use eliot_learning_delta::AdmissionReceipt;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
@@ -103,10 +108,18 @@ pub use learning_admission::{
     LearningAdmissionPermit, VerifiedLearningAdmission, issue_learning_admission,
     issue_learning_ticket, verify_learning_admission, verify_learning_ticket,
 };
+pub use learning_closure::{
+    CanonicalLearningDeltaStore, CanonicalLearningDeltaStoreError, ClosureIdentityInput,
+    LEARNING_DELTA_ORDERING_SCOPE, LEARNING_DELTA_REVISION_KEY, LearningClosureError,
+    LearningClosureOutcome, LearningClosureReceipt, LearningClosureService, close_disposition_for,
+    retry_relation_from_prior,
+};
 pub use learning_delta_integration::{
-    AttemptCloseError, admission_claim_for_delta, close_attempt_with_activation_receipt,
-    delta_delivery_allowed, derive_delta_at_boundary, emit_activation_receipt_at_attempt_close,
-    issue_delta_admission, retry_lineage_for_delta, store_derived_delta, verify_delta_delivery,
+    AttemptCloseError, StoredDeltaIdentity, admission_claim_for_delta, attempt_status_for_activity,
+    close_attempt_with_activation_receipt, delta_delivery_allowed, delta_delivery_refusal,
+    derive_delta_at_boundary, emit_activation_receipt_at_attempt_close, issue_delta_admission,
+    retry_canonical_evidence_for_delta, retry_lineage_for_delta, store_attempt_close,
+    store_derived_delta, verify_delta_delivery,
 };
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,

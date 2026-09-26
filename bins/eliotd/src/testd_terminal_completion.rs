@@ -477,7 +477,12 @@ pub async fn exchange_testd_owner_finish_leg(
 /// (3) guard held  — revalidate the fact against the live owner fence, refresh,
 ///                   and derive the finish decision against that image;
 /// (4) no guard    — persist the finish decision over the Kernel port;
-/// (5) guard held  — revalidate the decision against the live owner fence.
+/// (5) guard held  — revalidate the decision against the live owner fence;
+/// (6) guard held  — commit the non-blocking learning-closure edge (phase 6,
+///                   issue #1863 / I12.24): one durable AttemptLearningDelta
+///                   edge per consequential attempt, read-only over the
+///                   retained owner images, no transport, and never able to
+///                   fail or gate the finish.
 /// ```
 ///
 /// Before the split the guard was taken once and held across every await in the
@@ -486,7 +491,7 @@ pub async fn exchange_testd_owner_finish_leg(
 /// bounded drain step could stall the activation feed and the local-read poller
 /// for the whole duration of a Kernel exchange. The mutual exclusion the guard
 /// does provide is unchanged — each phase still runs alone, and phases (1)/(3)/
-/// (5) still observe exactly the state the preceding exchange published,
+/// (5)/(6) still observe exactly the state the preceding exchange published,
 /// because (3) refreshes the owner before the decision is derived and (3)/(5)
 /// re-check the pre-commit fence before the receipt is admitted.
 ///
@@ -531,8 +536,56 @@ pub async fn commit_testd_terminal_owner_fact(
         let guard = composition.lock().await;
         guard.accept_testd_terminal_owner_fact(prepared)?;
     }
-    let _decision = decision.into_decision();
+    let decision = decision.into_decision();
+    // (6) guard held, no exchange: commit the learning-closure edge. The finish
+    // decision is already durable at this point, so this phase is a pure
+    // read of the retained owner images plus one in-process durable commit; it
+    // cannot fail the finish and its outcome is a diagnostic, not a receipt.
+    {
+        let guard = composition.lock().await;
+        close_terminal_attempt_learning(&guard, evidence, &decision);
+    }
     Ok(committed)
+}
+
+/// Commits one durable learning-closure edge for a settled terminal attempt.
+///
+/// The activity identity is the instrument contract the durable terminal job
+/// row recorded for the observed step, and it is the value the ordinary-read
+/// exclusion is applied to: a recorded `read_file`, `read` or `grep` derives no
+/// consequential boundary and commits no record.
+///
+/// No admission-receipt owner issues a receipt at this seam, so `None` is
+/// presented to the delivery gate. That is the required outcome rather than a
+/// stub: an unadmitted proposed behavioural change is not delivered to the
+/// subsequent attempt, and the durable receipt records the typed refusal.
+fn close_terminal_attempt_learning(
+    composition: &DaemonComposition,
+    evidence: &TestdTerminalCompletionEvidence,
+    decision: &eliot_governor::FinishDecisionReceipt,
+) {
+    let activity_name = evidence.job.invocation.instrument.as_str();
+    let detail = match composition.close_attempt_learning(evidence, decision, activity_name, None) {
+        Ok(eliot_governor::LearningClosureOutcome::Committed(receipt)) => if receipt.delivered {
+            "committed; admitted delivery surface is live"
+        } else {
+            "committed; unadmitted, behavioural effect withheld"
+        }
+        .to_owned(),
+        Ok(eliot_governor::LearningClosureOutcome::NonConsequential { .. }) => {
+            "no consequential boundary; no record committed".to_owned()
+        }
+        Err(error) => format!("closure refused: {error}"),
+    };
+    let _ = crate::diagnostics::ErrorRecord::of(
+        crate::diagnostics::OwningComponent::DaemonRuntime,
+        "learning-closure",
+        &format!(
+            "job {}: {detail}",
+            crate::diagnostics::sanitize_identity(&evidence.job.job_id)
+        ),
+    )
+    .emit();
 }
 
 /// Queries the Kernel-owned pending verifier dispatches for one bounded drain

@@ -68,46 +68,77 @@ impl AdmissionReceipt {
     }
 }
 
+/// Typed reason the delivery gate refused one proposed behavioural change.
+///
+/// A refusal is a durable, comparable outcome rather than a bare `false`: a
+/// consumer records *which* admission fact was missing or mismatched, so a
+/// stale or mismatched receipt can never be silently reinterpreted as an
+/// absent one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DeliveryRefusal {
+    /// No admission receipt was presented for this delta.
+    MissingReceipt,
+    /// The presented receipt is malformed and proves nothing.
+    InvalidReceipt,
+    /// The receipt binds a different delta identity or digest.
+    ReceiptMismatch,
+}
+
+/// Enforce the delivery gate and report the exact refusal reason.
+///
+/// Succeeds only when an admission receipt is present, validates, and binds
+/// the exact delta identity and digest. Route, context, tool, search,
+/// verifier-order, and overlay consumers must call this before applying any
+/// `next_behavior_delta` effect: an unadmitted proposed behavioural change is
+/// not delivered to the subsequent attempt.
+pub fn check_delivery_typed(
+    receipt: Option<&AdmissionReceipt>,
+    delta_id: &ArtifactId,
+    delta_digest: &str,
+) -> Result<(), DeliveryRefusal> {
+    let Some(receipt) = receipt else {
+        return Err(DeliveryRefusal::MissingReceipt);
+    };
+    receipt
+        .validate()
+        .map_err(|_| DeliveryRefusal::InvalidReceipt)?;
+    if receipt.delta_id != *delta_id || receipt.delta_digest != delta_digest {
+        return Err(DeliveryRefusal::ReceiptMismatch);
+    }
+    Ok(())
+}
+
 /// Report whether a receipt authorizes delivery of the given delta.
 ///
 /// Returns `false` when no receipt is present. When a receipt is present,
 /// returns `true` only when the receipt validates and its delta id and
 /// digest exactly match the candidate. Pure boolean check: no errors, no
 /// I/O. An unadmitted proposed behavioral change is not delivered to the
-/// subsequent attempt.
+/// subsequent attempt. Use [`check_delivery_typed`] when the refusal reason
+/// must be recorded.
 pub fn delivery_allowed(
     receipt: Option<&AdmissionReceipt>,
     delta_id: &ArtifactId,
     delta_digest: &str,
 ) -> bool {
-    match receipt {
-        None => false,
-        Some(receipt) => {
-            receipt.validate().is_ok()
-                && receipt.delta_id == *delta_id
-                && receipt.delta_digest == delta_digest
-        }
-    }
+    check_delivery_typed(receipt, delta_id, delta_digest).is_ok()
 }
 
 /// Enforce the delivery gate, returning an error when delivery is refused.
 ///
-/// Succeeds exactly when [`delivery_allowed`] reports `true`; otherwise
-/// returns `InvalidInput{field:"admission.delivery"}`. Route, context,
-/// tool, search, verifier-order, and overlay consumers must call this
-/// before applying any `next_behavior_delta` effect.
+/// Succeeds exactly when [`check_delivery_typed`] succeeds; otherwise returns
+/// `InvalidInput{field:"admission.delivery"}`.
 pub fn check_delivery(
     receipt: Option<&AdmissionReceipt>,
     delta_id: &ArtifactId,
     delta_digest: &str,
 ) -> Result<(), LearningDeltaError> {
-    if delivery_allowed(receipt, delta_id, delta_digest) {
-        Ok(())
-    } else {
-        Err(LearningDeltaError::InvalidInput {
+    check_delivery_typed(receipt, delta_id, delta_digest).map_err(|_| {
+        LearningDeltaError::InvalidInput {
             field: "admission.delivery",
-        })
-    }
+        }
+    })
 }
 
 /// Filter candidate deltas down to the indices admitted by some receipt.
