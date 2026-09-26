@@ -966,6 +966,14 @@ struct LifecycleFlags {
 /// Every transition is explicit: the control loop decides, the tracked
 /// worker executes, and nothing here constructs a second runner, a second
 /// engine, or a second effect for the same admitted operation.
+///
+/// Drain wedge (#2785), fixed by drain-before-join: trigger 1 joins the
+/// worker while a command is outstanding — the `Timeout` arm keeps
+/// `in_flight`, the intake loop returns on exhaustion, and the join then
+/// wedges behind the unconsumed outcome on the bound-1 channel; trigger 2
+/// admits after close — `tick` closes admission after the loop-top check
+/// yet intake still runs, and the `Timeout` arm stacks a second command
+/// behind the outstanding one against `max_in_flight = 1`.
 pub struct BoundedRequestLoop {
     binding: AdmittedBinding,
     engine: EngineBinding,
