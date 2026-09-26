@@ -47,6 +47,12 @@ use crate::evidence_portfolio::{
     check_precision, digest, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
     text,
 };
+use crate::inquiry_lanes::{
+    CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
+    INQUIRY_LANES_CONTRACT, LaneRegistration, LaneRegistrationError, LaneRegistrationParams,
+    OrderedSubjectKind, OwnerOrderingReceipt, OwnerOrderingReceiptParams, PrimaryOutcomeRule,
+    RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
+};
 use crate::inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationParams, InquiryObligationStatus,
     TaskGraphCompilationInputs,
@@ -152,6 +158,17 @@ pub enum InquiryError {
         /// Failing field path.
         field: &'static str,
     },
+    /// The confirmatory-lane registration discipline refused the material.
+    ///
+    /// I21.4's registration, its owner commit receipt and its exposure ordering
+    /// are owned by [`crate::inquiry_lanes`]. This domain keeps its own closed
+    /// vocabulary, so a lane refusal is carried here as the failing field path
+    /// the lane owner named; the two refusals that carry a foreign typed error
+    /// are converted to that domain's own error instead.
+    LaneRegistrationRefused {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// The recomputed digest of a record does not match its own content.
     IntegrityMismatch {
         /// Failing field path.
@@ -214,6 +231,10 @@ impl std::fmt::Display for InquiryError {
             Self::LaneRegistrationRequired { field } => {
                 write!(formatter, "{field} requires a frozen lane registration")
             }
+            Self::LaneRegistrationRefused { field } => write!(
+                formatter,
+                "{field} was refused by the confirmatory lane registration discipline"
+            ),
             Self::IntegrityMismatch { field } => {
                 write!(
                     formatter,
@@ -239,6 +260,24 @@ impl From<PortfolioError> for InquiryError {
 impl From<ResearchContractError> for InquiryError {
     fn from(error: ResearchContractError) -> Self {
         Self::Contract(error)
+    }
+}
+
+impl From<LaneRegistrationError> for InquiryError {
+    /// Converts one lane-discipline refusal into this domain's closed
+    /// vocabulary.
+    ///
+    /// The two lane variants that carry a foreign typed error convert to that
+    /// domain's own error, which is lossless; every other lane variant names
+    /// only a field path, and that path is what this domain keeps.
+    fn from(error: LaneRegistrationError) -> Self {
+        match error {
+            LaneRegistrationError::Portfolio(error) => Self::Portfolio(error),
+            LaneRegistrationError::Profile(error) => error,
+            error => Self::LaneRegistrationRefused {
+                field: error.field().unwrap_or("lane_registration"),
+            },
+        }
     }
 }
 
@@ -786,12 +825,17 @@ pub struct IndependenceBlindingPolicy {
 impl IndependenceBlindingPolicy {
     /// Resolves and freezes the policy for one grade and lane.
     ///
+    /// `committed_registration` is a [`CommittedLaneRegistration`], never a
+    /// digest: it is re-proved here, so a string a caller composed cannot
+    /// declare a confirmatory lane.
+    ///
     /// # Errors
     ///
     /// Returns [`InquiryError::GradeCeiling`] when a grade below
     /// `CORROBORATED` declares a non-zero independence requirement it cannot
     /// carry, [`InquiryError::LaneRegistrationRequired`] when a confirmatory
-    /// lane has no frozen registration, and a field error for blank or
+    /// lane has no committed registration, a lane-discipline refusal when the
+    /// presented registration does not re-prove, and a field error for blank or
     /// malformed input.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
@@ -802,7 +846,7 @@ impl IndependenceBlindingPolicy {
         blinded_fields: Vec<BlindedField>,
         shared_assumptions: Vec<String>,
         allowed_deviations: Vec<String>,
-        lane_registration_digest: Option<String>,
+        committed_registration: Option<&CommittedLaneRegistration>,
     ) -> Result<Self, InquiryError> {
         let corroborated_rank = EvidenceGrade::from_name("CORROBORATED")?.rank();
         if grade.rank() < corroborated_rank && minimum_independent_families > 0 {
@@ -810,12 +854,22 @@ impl IndependenceBlindingPolicy {
                 field: "profile.independence_policy.minimum_independent_families",
             });
         }
-        let registered_before_outcome_exposure = lane_registration_digest.is_some();
+        // The flag is a declaration, not the ordering proof: what it now says is
+        // that an owner-committed registration exists and re-proves itself here,
+        // not that any caller asserted an order. A confirmatory lane without one
+        // is still refused, and the actual order proof stays
+        // `crate::inquiry_lanes::LaneRegistration::require_commit_precedes`.
+        if let Some(registration) = committed_registration {
+            registration.validate_integrity()?;
+        }
+        let registered_before_outcome_exposure = committed_registration.is_some();
         if lane == InquiryLane::Confirmatory && !registered_before_outcome_exposure {
             return Err(InquiryError::LaneRegistrationRequired {
                 field: "profile.independence_policy.lane_registration_digest",
             });
         }
+        let lane_registration_digest =
+            committed_registration.map(|registration| registration.digest().to_owned());
         if let Some(registration) = &lane_registration_digest {
             require_digest(registration, "profile.lane_registration_digest")?;
         }
@@ -1336,8 +1390,14 @@ pub struct InquiryProfileParams {
     pub stop_rule: InquiryStopRule,
     /// State Fence this revision is frozen under.
     pub state_fence: StateFence,
-    /// Optional frozen lane registration digest.
-    pub lane_registration_digest: Option<String>,
+    /// Owner-committed lane registration this revision carries.
+    ///
+    /// A confirmatory lane requires one and an exploratory lane must carry none.
+    /// The value is a registration, not a digest: it is re-proved on
+    /// construction, so no caller can declare a confirmatory lane by supplying
+    /// 64 hex characters. `None` here is the honest "no registration was
+    /// committed", which the confirmatory arm below refuses.
+    pub committed_lane_registration: Option<CommittedLaneRegistration>,
 }
 
 /// Versioned inquiry protocol profile (I21.2/I21.3).
@@ -1400,6 +1460,20 @@ pub struct InquiryProtocolProfile {
     pub independence_and_blinding_policy: IndependenceBlindingPolicy,
     /// Digest of the independence and blinding policy.
     pub independence_and_blinding_policy_digest: String,
+    /// Digest a lane registration commits to, covering every field of this
+    /// revision except the one that names the registration.
+    ///
+    /// `integrity_digest` cannot serve that purpose: it covers the independence
+    /// and blinding policy, that policy's digest covers the committed
+    /// registration identity, and a registration that names
+    /// `integrity_digest` would have to be committed before the profile that
+    /// contains the digest of that commit. I21.4 needs the registration to name
+    /// the exact revision and I21.3 needs the profile to carry the committed
+    /// identity, so this second digest is what makes both true at once. It is
+    /// resolved from the same admitted material as `integrity_digest`, by the
+    /// same function the registration producer calls, so it is never a second
+    /// guess at the selection.
+    pub registration_binding_digest: String,
     /// Fidelity ceiling declared for this inquiry.
     pub fidelity_ceiling: String,
     /// Budget, deadline and stop rule.
@@ -1416,6 +1490,183 @@ pub struct InquiryProtocolProfile {
     pub integrity_digest: String,
 }
 
+/// The half of one profile revision that does not depend on the committed lane
+/// registration.
+///
+/// I21.4 requires the registration to name the exact profile revision it
+/// governs, and I21.3 requires the profile to carry the registration's committed
+/// identity, so one of those two facts has to be resolvable before the other
+/// exists. Holding the selection separately means
+/// [`InquiryProtocolProfile::select`] and the registration producer resolve the
+/// same selection through the same code, and the registration binding digest
+/// they agree on is not a second guess at it.
+struct ProfileSelection {
+    /// Resolved protocol.
+    protocol: InquiryProtocol,
+    /// Resolved coverage goal.
+    coverage_goal: CoverageGoal,
+    /// Whether the admitted coverage-goal text is exactly this resolved goal.
+    admitted_coverage_goal_resolved: bool,
+    /// Declared hypothesis policy.
+    hypothesis_policy: HypothesisPolicy,
+    /// Selected evidence grade.
+    evidence_grade: EvidenceGrade,
+    /// Declared lane.
+    lane: InquiryLane,
+    /// Dimensions independence is required on.
+    dimensions: Vec<IndependenceDimension>,
+    /// Minimum number of independent lineages the evidence set must reach.
+    minimum_independent_families: u64,
+    /// Digest of the structural selection inputs.
+    selection_features_digest: String,
+    /// Fidelity ceiling declared for this inquiry.
+    fidelity_ceiling: String,
+    /// Budget, deadline and stop rule.
+    stop_rule: InquiryStopRule,
+    /// Output contract and declared reopen conditions.
+    output_contract: InquiryOutputContract,
+    /// Privacy and disclosure ceiling for the whole inquiry.
+    disclosure_ceiling: DisclosureClass,
+}
+
+/// Digest a lane registration commits to for one profile revision.
+///
+/// This covers every field of the revision except the committed lane
+/// registration itself, and it is resolved from the admitted material through
+/// the same values [`InquiryProtocolProfile::build`] freezes into the revision.
+/// It is not a weaker identity than
+/// [`InquiryProtocolProfile::integrity_digest`] for the purpose I21.4 states:
+/// it names the same revision, and it is the only one of the two a
+/// registration can name without a SHA-256 fixed point (see
+/// [`InquiryProtocolProfile::registration_binding_digest`]).
+fn registration_binding_digest(
+    params: &InquiryProfileParams,
+    revision: u64,
+    supersedes: Option<&str>,
+    selection: &ProfileSelection,
+) -> String {
+    let mut preimage = String::from("inquiry-profile-registration-binding/v1;");
+    push_field(&mut preimage, "profile_id", &params.profile_id);
+    push_field(&mut preimage, "revision", &revision.to_string());
+    push_field(&mut preimage, "supersedes", supersedes.unwrap_or("none"));
+    push_field(&mut preimage, "inquiry_id", &params.inquiry_id);
+    push_field(&mut preimage, "operation_id", &params.operation_id);
+    push_field(&mut preimage, "exchange_id", &params.exchange_id);
+    push_field(&mut preimage, "question", &params.question);
+    push_field(
+        &mut preimage,
+        "intended_decision_or_artifact",
+        &params.intended_decision_or_artifact,
+    );
+    push_field(&mut preimage, "scope", &params.scope);
+    push_field(
+        &mut preimage,
+        "requester_principal",
+        &params.requester_principal,
+    );
+    push_field(
+        &mut preimage,
+        "admitted_inquiry_digest",
+        &params.admitted_inquiry_digest,
+    );
+    push_field(&mut preimage, "protocol", selection.protocol.wire_name());
+    push_field(
+        &mut preimage,
+        "selection_features_digest",
+        &selection.selection_features_digest,
+    );
+    push_field(
+        &mut preimage,
+        "evidence_grade",
+        &selection.evidence_grade.to_string(),
+    );
+    push_field(&mut preimage, "lane", selection.lane.wire_name());
+    push_field(
+        &mut preimage,
+        "coverage_goal",
+        selection.coverage_goal.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "admitted_coverage_goal",
+        &params.admitted_coverage_goal,
+    );
+    push_field(
+        &mut preimage,
+        "admitted_coverage_goal_resolved",
+        bool_text(selection.admitted_coverage_goal_resolved),
+    );
+    push_field(
+        &mut preimage,
+        "hypothesis_policy",
+        selection.hypothesis_policy.wire_name(),
+    );
+    push_binding_admission(&mut preimage, params);
+    push_binding_independence(&mut preimage, selection);
+    freeze(&preimage)
+}
+
+/// Appends the admitted material half of a registration binding: what the run
+/// was admitted under, and the contracts the revision is bound to.
+fn push_binding_admission(preimage: &mut String, params: &InquiryProfileParams) {
+    push_count(
+        preimage,
+        "truth_surfaces",
+        params.truth_surfaces_and_admissible_providers.len(),
+    );
+    for surface in &params.truth_surfaces_and_admissible_providers {
+        push_field(preimage, "truth_surface", surface);
+    }
+    push_count(
+        preimage,
+        "admissible_source_classes",
+        params.admissible_source_classes.len(),
+    );
+    for class in &params.admissible_source_classes {
+        push_field(preimage, "source_class", class_wire(*class));
+    }
+    push_field(
+        preimage,
+        "reference_manifest_digest",
+        &params.reference_manifest_digest,
+    );
+    push_field(
+        preimage,
+        "admitted_denominator_digest",
+        &params.admitted_denominator_digest,
+    );
+}
+
+/// Appends the independence, fidelity and contract half of a registration
+/// binding.
+fn push_binding_independence(preimage: &mut String, selection: &ProfileSelection) {
+    push_count(
+        preimage,
+        "independence_dimensions",
+        selection.dimensions.len(),
+    );
+    for dimension in &selection.dimensions {
+        push_field(preimage, "independence_dimension", dimension.wire_name());
+    }
+    push_field(
+        preimage,
+        "minimum_independent_families",
+        &selection.minimum_independent_families.to_string(),
+    );
+    push_field(preimage, "fidelity_ceiling", &selection.fidelity_ceiling);
+    push_field(preimage, "stop_rule_digest", &selection.stop_rule.digest);
+    push_field(
+        preimage,
+        "output_contract_digest",
+        &selection.output_contract.digest,
+    );
+    push_field(
+        preimage,
+        "disclosure_ceiling",
+        disclosure_wire(selection.disclosure_ceiling),
+    );
+}
+
 impl InquiryProtocolProfile {
     /// Resolves the first revision of one inquiry profile.
     ///
@@ -1426,7 +1677,14 @@ impl InquiryProtocolProfile {
     /// ladder, and [`InquiryError::LaneRegistrationRequired`] when a
     /// confirmatory lane has no frozen registration.
     pub fn resolve(params: InquiryProfileParams) -> Result<Self, InquiryError> {
-        Self::build(params, 1, None, "initial inquiry protocol resolution")
+        let selection = Self::select(&params)?;
+        Self::build(
+            params,
+            selection,
+            1,
+            None,
+            "initial inquiry protocol resolution",
+        )
     }
 
     /// Resolves the next revision of this profile with a recorded reason.
@@ -1450,7 +1708,14 @@ impl InquiryProtocolProfile {
             .ok_or(InquiryError::Duplicate {
                 field: "profile.revision",
             })?;
-        let mut revision = Self::build(params, next, Some(self.integrity_digest.clone()), reason)?;
+        let selection = Self::select(&params)?;
+        let mut revision = Self::build(
+            params,
+            selection,
+            next,
+            Some(self.integrity_digest.clone()),
+            reason,
+        )?;
         if revision.inquiry_id != self.inquiry_id
             || revision.profile_id != self.profile_id
             || revision.question != self.question
@@ -1512,14 +1777,15 @@ impl InquiryProtocolProfile {
         }
     }
 
-    fn build(
-        params: InquiryProfileParams,
-        revision: u64,
-        supersedes: Option<String>,
-        change_reason: &str,
-    ) -> Result<Self, InquiryError> {
-        validate_profile_params(&params, change_reason)?;
-
+    /// Resolves the selection half of one profile revision from admitted
+    /// material.
+    ///
+    /// This is separated from [`InquiryProtocolProfile::build`] because I21.4
+    /// needs the lane registration to name the profile revision before that
+    /// revision is frozen. The registration producer and the profile therefore
+    /// resolve the *same* selection through the *same* function, so the binding
+    /// digest they agree on cannot drift from the selection the profile carries.
+    fn select(params: &InquiryProfileParams) -> Result<ProfileSelection, InquiryError> {
         let protocol = select_protocol(&params.features);
         let coverage_goal = select_coverage_goal(&params.features);
         let lane = select_lane(protocol, &params.features);
@@ -1527,27 +1793,54 @@ impl InquiryProtocolProfile {
         let evidence_grade = select_evidence_grade(&params.features, lane)?;
         let (dimensions, minimum_independent_families) =
             select_independence_requirement(evidence_grade);
-        let independence_and_blinding_policy = IndependenceBlindingPolicy::resolve(
-            evidence_grade,
-            lane,
-            dimensions,
-            minimum_independent_families,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            params.lane_registration_digest.clone(),
-        )?;
         let output_contract = InquiryOutputContract::resolve(
             &params.required_schema,
             select_reopen_conditions(coverage_goal, hypothesis_policy),
         )?;
-        let fidelity_ceiling = format!(
-            "verifier_strength={} horizon={}",
-            params.features.verifier_strength.wire_name(),
-            params.features.horizon.wire_name()
-        );
-        let admitted_coverage_goal_resolved =
-            CoverageGoal::from_wire(&params.admitted_coverage_goal) == Some(coverage_goal);
+        Ok(ProfileSelection {
+            protocol,
+            coverage_goal,
+            admitted_coverage_goal_resolved: CoverageGoal::from_wire(
+                &params.admitted_coverage_goal,
+            ) == Some(coverage_goal),
+            hypothesis_policy,
+            evidence_grade,
+            lane,
+            dimensions,
+            minimum_independent_families,
+            selection_features_digest: selection_features_digest(&params.features),
+            fidelity_ceiling: format!(
+                "verifier_strength={} horizon={}",
+                params.features.verifier_strength.wire_name(),
+                params.features.horizon.wire_name()
+            ),
+            stop_rule: params.stop_rule.clone(),
+            output_contract,
+            disclosure_ceiling: params.disclosure_ceiling,
+        })
+    }
+
+    fn build(
+        params: InquiryProfileParams,
+        selection: ProfileSelection,
+        revision: u64,
+        supersedes: Option<String>,
+        change_reason: &str,
+    ) -> Result<Self, InquiryError> {
+        validate_profile_params(&params, change_reason)?;
+
+        let independence_and_blinding_policy = IndependenceBlindingPolicy::resolve(
+            selection.evidence_grade,
+            selection.lane,
+            selection.dimensions.clone(),
+            selection.minimum_independent_families,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            params.committed_lane_registration.as_ref(),
+        )?;
+        let binding =
+            registration_binding_digest(&params, revision, supersedes.as_deref(), &selection);
         let mut profile = Self {
             profile_id: params.profile_id,
             revision,
@@ -1560,14 +1853,14 @@ impl InquiryProtocolProfile {
             scope: params.scope,
             requester_principal: params.requester_principal,
             admitted_inquiry_digest: params.admitted_inquiry_digest,
-            protocol,
-            selection_features_digest: selection_features_digest(&params.features),
-            evidence_grade,
-            lane,
-            coverage_goal,
-            admitted_coverage_goal_resolved,
+            protocol: selection.protocol,
+            selection_features_digest: selection.selection_features_digest,
+            evidence_grade: selection.evidence_grade,
+            lane: selection.lane,
+            coverage_goal: selection.coverage_goal,
+            admitted_coverage_goal_resolved: selection.admitted_coverage_goal_resolved,
             admitted_coverage_goal: params.admitted_coverage_goal,
-            hypothesis_policy,
+            hypothesis_policy: selection.hypothesis_policy,
             truth_surfaces_and_admissible_providers: params.truth_surfaces_and_admissible_providers,
             admissible_source_classes: params.admissible_source_classes,
             reference_manifest_digest: params.reference_manifest_digest,
@@ -1576,10 +1869,11 @@ impl InquiryProtocolProfile {
                 .digest
                 .clone(),
             independence_and_blinding_policy,
-            fidelity_ceiling,
-            stop_rule: params.stop_rule,
-            output_contract,
-            disclosure_ceiling: params.disclosure_ceiling,
+            registration_binding_digest: binding,
+            fidelity_ceiling: selection.fidelity_ceiling,
+            stop_rule: selection.stop_rule,
+            output_contract: selection.output_contract,
+            disclosure_ceiling: selection.disclosure_ceiling,
             state_fence: params.state_fence,
             change_reason: change_reason.to_owned(),
             integrity_digest: String::new(),
@@ -1677,6 +1971,11 @@ impl InquiryProtocolProfile {
             &mut preimage,
             "independence_and_blinding_policy_digest",
             &self.independence_and_blinding_policy_digest,
+        );
+        push_field(
+            &mut preimage,
+            "registration_binding_digest",
+            &self.registration_binding_digest,
         );
         push_field(&mut preimage, "fidelity_ceiling", &self.fidelity_ceiling);
         push_field(&mut preimage, "stop_rule_digest", &self.stop_rule.digest);
@@ -3894,6 +4193,14 @@ impl std::fmt::Display for InquiryGovernance {
 }
 
 /// Resolves the profile revision for one observed inquiry.
+///
+/// This is on the live path of every run: `InquiryGovernance::record` calls it
+/// before anything else is assessed, and it is the only place a profile revision
+/// is produced. It resolves the selection, commits the lane registration the
+/// selection demands through [`commit_lane_registration`], and only then freezes
+/// the revision that carries it — so a confirmatory profile exists only where an
+/// owner-committed registration precedes it, and an exploratory one exists where
+/// none is needed.
 fn resolve_profile(
     observation: &InquiryObservation,
 ) -> Result<InquiryProtocolProfile, InquiryError> {
@@ -3907,7 +4214,7 @@ fn resolve_profile(
     truth_surfaces.push(observation.provider_generation.clone());
     truth_surfaces.sort();
     truth_surfaces.dedup();
-    InquiryProtocolProfile::resolve(InquiryProfileParams {
+    let mut params = InquiryProfileParams {
         profile_id: observation.profile_id.clone(),
         inquiry_id: observation.inquiry_id.clone(),
         operation_id: observation.operation_id.clone(),
@@ -3927,8 +4234,389 @@ fn resolve_profile(
         disclosure_ceiling: observation.disclosure,
         stop_rule,
         state_fence: observation.reference_manifest.state_fence.clone(),
-        lane_registration_digest: None,
-    })
+        committed_lane_registration: None,
+    };
+    // I21.4: the profile states the required rigour, and a confirmatory lane
+    // additionally requires a frozen registration committed before any outcome
+    // exposure. The selection is resolved first because the registration has to
+    // name the exact revision it governs, and the registration is committed
+    // before the revision that carries it is frozen.
+    let selection = InquiryProtocolProfile::select(&params)?;
+    params.committed_lane_registration =
+        commit_lane_registration(&params, &selection, observation.assessment_time_ms)?;
+    InquiryProtocolProfile::build(
+        params,
+        selection,
+        1,
+        None,
+        "initial inquiry protocol resolution",
+    )
+}
+
+/// The contract owner that commits lane registrations into the ordering journal
+/// of one inquiry.
+///
+/// I21.2 resolves the grade and the lane here, and I21.4 freezes the
+/// registration under the Researcher contract owner, so this is the owner whose
+/// commit receipt a confirmatory claim rests on. It is a named constant rather
+/// than a caller-supplied string: a caller that may name its own owner could
+/// also place its own exposure receipts in a journal of its own choosing and
+/// order them against a registration nobody committed.
+const LANE_JOURNAL_OWNER: &str = "eliot.research.inquiry-governance.contract-owner";
+
+/// Commits the lane registration one profile revision must carry.
+///
+/// This is the producer the issue was missing. It returns `None` for a purely
+/// exploratory selection, because I21.4 requires no registration for purely
+/// exploratory work and inventing one would let a confirmatory claim be
+/// manufactured for work that never had a confirmatory surface. For confirmatory
+/// content it freezes one [`LaneRegistration`] and admits it as a
+/// [`CommittedLaneRegistration`], which is the only value
+/// [`InquiryProfileParams::committed_lane_registration`] accepts.
+///
+/// # What the registration commits to, and where each part comes from
+///
+/// Every value below is derived from material the profile was already resolved
+/// from, so nothing here is asserted, guessed or supplied by a caller:
+///
+/// - `contract_digest` is the kernel-admitted `admitted_inquiry_digest`, i.e.
+///   the exact contract the run executes under;
+/// - `protocol_digest` is the resolved protocol/coverage/grade/lane selection
+///   this revision carries, so any later reader can recompute it from the
+///   published profile;
+/// - `hypothesis_digest` is the exact question, scope and intended decision the
+///   proposition consists of;
+/// - `evaluator_digest` is the admitted evaluation surface — result schema,
+///   verifier cost and strength, admitted routes and provider generation. The
+///   Researcher record carries no evaluator identity of its own, so this is the
+///   exact admitted surface the registration freezes; substituting any part of
+///   it after exposure is a content change and therefore a new revision;
+/// - the primary outcome and its decision rule are the admitted result schema
+///   and the admitted coverage goal plus the intended decision, frozen
+///   verbatim, so I21.4's "may not change the primary metric" has something
+///   concrete to compare against;
+/// - the stated exclusion rule and the quality controls are the run-bound
+///   reference allowlist and the declared denominator, i.e. the two controls the
+///   run is actually admitted under;
+/// - the blinded fields are the I21.4-named channels that carry the answer to
+///   the evaluator, and the sealed mapping over the concealed assignment is
+///   retained under this contract owner at the journal origin, before the
+///   registration that cites it is committed;
+/// - the only permitted deviation is an exclusion made under the stated rule.
+///   I21.4 forbids changing the metric, weakening the proposition, replacing the
+///   evaluator after seeing results or hiding failed attempts, so no allowance
+///   is registered for those facets and a deviation on any of them is refused by
+///   `LaneRegistration::classify_deviation`.
+///
+/// # Where the commit sits in the owner journal
+///
+/// Two owner acts happen here, in this order, and both are issued into one
+/// journal: the blinding mapping is sealed at the origin, and the registration
+/// that cites that mapping is committed immediately after it, chained to the
+/// seal. Positions are therefore the journal's own two positions rather than
+/// numbers chosen to order something, and the proof is
+/// `CommittedLaneRegistration::commit`'s hash-chain ancestry check — not a
+/// comparison of `recorded_at_ms` against anything.
+///
+/// `recorded_at_ms` is the instant the run itself reported. It is retained as a
+/// record of that fact only; this module never orders anything by it.
+///
+/// # Errors
+///
+/// Returns [`InquiryError::LaneRegistrationRefused`] carrying the lane owner's
+/// own field path for a malformed or unprovable registration, and
+/// [`InquiryError::UnknownVocabulary`] for a mixed-lane selection, which
+/// [`select_lane`] does not currently produce and for which the observation
+/// carries no frozen partition membership or deterministic assignment rule.
+fn commit_lane_registration(
+    params: &InquiryProfileParams,
+    selection: &ProfileSelection,
+    recorded_at_ms: i64,
+) -> Result<Option<CommittedLaneRegistration>, InquiryError> {
+    if selection.lane == InquiryLane::Exploratory {
+        return Ok(None);
+    }
+    if selection.lane != InquiryLane::Confirmatory {
+        // A mixed lane needs a partition frozen before outcomes are seen, and
+        // `InquiryObservation` carries neither explicit membership nor an
+        // assignment rule with its version and seed. Refusing is the honest
+        // reading: a partition cannot be invented, and a complete partition map
+        // with unknown leak history is not proof of uncontaminated confirmation.
+        return Err(InquiryError::UnknownVocabulary {
+            field: "profile.lane.mixed_partition",
+        });
+    }
+    let state_fence = params.state_fence.clone();
+    let journal = lane_journal_identity(params, selection.lane);
+    let sealed_blinding_mapping = seal_blinded_mapping(params, &journal, &state_fence)?;
+    let registration_params = LaneRegistrationParams {
+        registration_id: format!("lane-registration/{}", params.inquiry_id),
+        inquiry_id: params.inquiry_id.clone(),
+        profile_id: params.profile_id.clone(),
+        profile_revision: 1,
+        profile_digest: registration_binding_digest(params, 1, None, selection),
+        digests: RegistrationDigests::bind(
+            &params.admitted_inquiry_digest,
+            &lane_protocol_digest(selection),
+            &lane_hypothesis_digest(params),
+            &lane_evaluator_digest(params),
+        )?,
+        primary_outcome: PrimaryOutcomeRule::bind(
+            &format!("admitted_result_schema:{}", params.required_schema),
+            &format!(
+                "admitted_coverage_goal:{};intended_decision:{}",
+                params.admitted_coverage_goal, params.intended_decision_or_artifact
+            ),
+        )?,
+        exclusions_and_quality_controls: ExclusionAndQualityControl::bind(
+            vec![format!(
+                "no case may be excluded unless its handle is admitted by run_bound_reference_allowlist:{}",
+                params.reference_manifest_digest
+            )],
+            vec![
+                format!(
+                    "run_bound_reference_allowlist:{}",
+                    params.reference_manifest_digest
+                ),
+                format!(
+                    "declared_denominator:{}",
+                    params.admitted_denominator_digest
+                ),
+            ],
+        )?,
+        blinded_fields: lane_blinded_fields(),
+        allowed_deviations: lane_allowed_deviations()?,
+        evidence_partition: None,
+        // The commit receipt does not exist yet: it is issued *over* the frozen
+        // content, which is why `LaneRegistration::content_digest_of` exists.
+        // The mapping seal receipt stands in until the real commit receipt
+        // replaces it two steps below, and `freeze_content` never reads it.
+        owner_receipt: sealed_blinding_mapping.receipt.clone(),
+        sealed_blinding_mapping,
+        registered_at_ms: recorded_at_ms,
+        state_fence,
+    };
+    let content_digest = LaneRegistration::content_digest_of(&registration_params)?;
+    let mut registration_params = registration_params;
+    registration_params.owner_receipt = OwnerOrderingReceipt::issue(OwnerOrderingReceiptParams {
+        receipt_id: format!("{journal}#1"),
+        owner_principal: LANE_JOURNAL_OWNER.to_owned(),
+        journal_identity: journal,
+        position: 1,
+        predecessor_receipt_digest: Some(
+            registration_params
+                .sealed_blinding_mapping
+                .receipt
+                .receipt_digest
+                .clone(),
+        ),
+        subject: OrderedSubjectKind::LaneRegistrationCommit,
+        subject_id: registration_params.registration_id.clone(),
+        subject_digest: content_digest,
+        state_fence: registration_params.state_fence.clone(),
+    })?;
+    let registration = LaneRegistration::register(registration_params)?;
+    Ok(Some(CommittedLaneRegistration::commit(registration)?))
+}
+
+/// Identity of the one owner journal this inquiry's lane receipts order inside.
+///
+/// Positions are meaningful only together with the owner and the journal, so
+/// the journal is derived from exactly those admitted facts: the contract owner
+/// that issues the receipts, the inquiry and profile identity, and the State
+/// Fence everything is frozen under. A different fence is a different journal,
+/// which is what makes a receipt from a superseded fence order nothing.
+fn lane_journal_identity(params: &InquiryProfileParams, lane: InquiryLane) -> String {
+    let fence = &params.state_fence;
+    let mut preimage = String::from("inquiry-lane-journal/v1;");
+    push_field(&mut preimage, "owner_principal", LANE_JOURNAL_OWNER);
+    push_field(&mut preimage, "contract", INQUIRY_LANES_CONTRACT);
+    push_field(&mut preimage, "inquiry_id", &params.inquiry_id);
+    push_field(&mut preimage, "profile_id", &params.profile_id);
+    push_field(&mut preimage, "lane", lane.wire_name());
+    push_field(
+        &mut preimage,
+        "authority_lineage",
+        fence.authority_epoch.lineage_id.as_str(),
+    );
+    push_field(
+        &mut preimage,
+        "authority_sequence",
+        &fence.authority_epoch.sequence.to_string(),
+    );
+    push_field(
+        &mut preimage,
+        "resource_generation",
+        &fence.resource_generation.value().to_string(),
+    );
+    freeze(&preimage)
+}
+
+/// Seals the blinding mapping the declared channels conceal, at the journal
+/// origin.
+///
+/// I21.4 keeps the sealed mapping under the existing independence/disclosure
+/// owner and lets the registration carry only its handle and digest, so what is
+/// sealed here is a digest of the assignment the blinding conceals — the
+/// admitted source classes, the admitted truth surfaces and the admitted
+/// disclosure ceiling — and never the concealed values themselves. The receipt
+/// sits at position zero with no predecessor because it opens the journal: it
+/// is the first act of this owner for this inquiry, which is a structural fact
+/// and not a claim about a clock.
+fn seal_blinded_mapping(
+    params: &InquiryProfileParams,
+    journal: &str,
+    state_fence: &StateFence,
+) -> Result<SealedBlindingMapping, InquiryError> {
+    let mapping_handle = format!("blinded-mapping/{}", params.inquiry_id);
+    let mapping_digest = lane_blinded_mapping_digest(params);
+    let receipt = OwnerOrderingReceipt::issue(OwnerOrderingReceiptParams {
+        receipt_id: format!("{journal}#0"),
+        owner_principal: LANE_JOURNAL_OWNER.to_owned(),
+        journal_identity: journal.to_owned(),
+        position: 0,
+        predecessor_receipt_digest: None,
+        subject: OrderedSubjectKind::SealedBlindingMapping,
+        subject_id: mapping_handle.clone(),
+        subject_digest: mapping_digest.clone(),
+        state_fence: state_fence.clone(),
+    })?;
+    Ok(SealedBlindingMapping::seal(SealedBlindingMappingParams {
+        mapping_handle,
+        mapping_digest,
+        owner_principal: LANE_JOURNAL_OWNER.to_owned(),
+        receipt,
+    })?)
+}
+
+/// The exact protocol selection a registration freezes.
+fn lane_protocol_digest(selection: &ProfileSelection) -> String {
+    let mut preimage = String::from("inquiry-lane-protocol/v1;");
+    push_field(&mut preimage, "protocol", selection.protocol.wire_name());
+    push_field(
+        &mut preimage,
+        "coverage_goal",
+        selection.coverage_goal.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "hypothesis_policy",
+        selection.hypothesis_policy.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "evidence_grade",
+        &selection.evidence_grade.to_string(),
+    );
+    push_field(&mut preimage, "lane", selection.lane.wire_name());
+    push_field(
+        &mut preimage,
+        "selection_features_digest",
+        &selection.selection_features_digest,
+    );
+    freeze(&preimage)
+}
+
+/// The exact proposition a registration freezes.
+fn lane_hypothesis_digest(params: &InquiryProfileParams) -> String {
+    let mut preimage = String::from("inquiry-lane-hypothesis/v1;");
+    push_field(&mut preimage, "question", &params.question);
+    push_field(&mut preimage, "scope", &params.scope);
+    push_field(
+        &mut preimage,
+        "intended_decision_or_artifact",
+        &params.intended_decision_or_artifact,
+    );
+    freeze(&preimage)
+}
+
+/// The exact admitted evaluation surface a registration freezes as its
+/// evaluator.
+fn lane_evaluator_digest(params: &InquiryProfileParams) -> String {
+    let mut preimage = String::from("inquiry-lane-evaluator/v1;");
+    push_field(&mut preimage, "required_schema", &params.required_schema);
+    push_field(
+        &mut preimage,
+        "verifier_cost",
+        params.features.verifier_cost.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "verifier_strength",
+        params.features.verifier_strength.wire_name(),
+    );
+    push_count(
+        &mut preimage,
+        "admissible_routes",
+        params.truth_surfaces_and_admissible_providers.len(),
+    );
+    for surface in &params.truth_surfaces_and_admissible_providers {
+        push_field(&mut preimage, "truth_surface", surface);
+    }
+    freeze(&preimage)
+}
+
+/// The concealed assignment the sealed blinding mapping covers.
+fn lane_blinded_mapping_digest(params: &InquiryProfileParams) -> String {
+    let mut classes: Vec<&str> = params
+        .admissible_source_classes
+        .iter()
+        .map(|class| class_wire(*class))
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    let mut preimage = String::from("inquiry-lane-blinded-mapping/v1;");
+    push_field(
+        &mut preimage,
+        "disclosure_ceiling",
+        disclosure_wire(params.disclosure_ceiling),
+    );
+    push_count(&mut preimage, "source_classes", classes.len());
+    for class in classes {
+        push_field(&mut preimage, "source_class", class);
+    }
+    push_count(
+        &mut preimage,
+        "truth_surfaces",
+        params.truth_surfaces_and_admissible_providers.len(),
+    );
+    for surface in &params.truth_surfaces_and_admissible_providers {
+        push_field(&mut preimage, "truth_surface", surface);
+    }
+    freeze(&preimage)
+}
+
+/// The leakage channels a confirmatory run closes before outcome exposure.
+///
+/// I21.4 names these as the typical fields: "preferred hypothesis, condition
+/// labels, …, holdout expected score". Each one would otherwise hand the
+/// evaluator the answer the registration exists to keep from it, so a confirmatory
+/// lane declares all three. This is a policy definition, not an observed value,
+/// and `BlindingApplication::evaluate` is what later proves each one was actually
+/// delivered masked and that masking it did not remove essential task or safety
+/// information.
+fn lane_blinded_fields() -> Vec<BlindedField> {
+    vec![
+        BlindedField::PreferredHypothesis,
+        BlindedField::ConditionLabel,
+        BlindedField::HoldoutExpectedScore,
+    ]
+}
+
+/// The deviations a confirmatory run permits before outcome exposure.
+///
+/// Only `Exclusions` is permitted, and only under the stated rule the
+/// registration carries. I21.4 forbids changing the primary metric, weakening
+/// the proposition, replacing the evaluator after seeing results and hiding
+/// failed attempts, so those four facets get no allowance and a deviation on any
+/// of them is classified `OutsideDeclaredAllowance`, which invalidates the
+/// affected confirmation.
+fn lane_allowed_deviations() -> Result<Vec<DeviationAllowance>, InquiryError> {
+    Ok(vec![DeviationAllowance::allow(
+        "exclusion-under-stated-rule",
+        DeviationScope::Exclusions,
+        "a case may be excluded only under the exclusion rule stated in this registration",
+    )?])
 }
 
 /// Produces the source-admissibility disposition of every proposed source.

@@ -56,6 +56,11 @@ pub use inquiry_lanes::{
     OwnerOrderingReceiptParams, PartitionAssignment, PartitionSide, PrimaryOutcomeRule,
     RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
 };
+// The committed registration a profile revision is given. It is a read-only
+// value here: the only way to obtain one is this crate's own profile-resolution
+// path, which is what keeps a caller from declaring a confirmatory lane by
+// supplying a digest.
+pub use inquiry_lanes::CommittedLaneRegistration;
 pub use inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationStatus,
     TaskGraphCompilationInputs,
