@@ -190,6 +190,38 @@ pub enum RowFamilyKind {
     /// live state: backup/export preserves the family under policy, import
     /// never restores scan state.
     ScanDisclosure,
+    /// Durable owner-backed `backup.verify` results (issue #2883): one row per
+    /// distinct `(principal, authority lineage, operation id)` within one
+    /// installation's ORS file — the exact tuple the durable key is scoped to, and
+    /// structural rather than an in-band installation field, because a row is only
+    /// ever read out of the file that owns it — holding the accepted request
+    /// identity and the archive's own declared answers and nothing else.
+    ///
+    /// The family is now DECLARED in the EXISTING ORS operational retention/export
+    /// contract whose [`RowFamilyKind::disposition`] this enum already is, and
+    /// that contract is the existing owner of its lifecycle. Be precise about what
+    /// the declaration is worth: the denominator function that carries it has NO
+    /// production reader in this tree, so nothing yet COUNTS the family and nothing
+    /// bounds it. The real cardinality is one row per distinct
+    /// `(principal, authority lineage, operation id)` within one installation's ORS
+    /// file, plus one quarantined row per pre-#2883 caller key. #2883 therefore
+    /// adds no deletion, no eviction, no TTL and no cap here; the bounded-retirement
+    /// work stays with the separate ORS retention owner, and a second retention
+    /// rule beside that contract is exactly the unbounded growth instruction 10
+    /// forbids.
+    ///
+    /// The disposition follows the [`RowFamilyKind::UnknownCommitRecovery`]
+    /// sibling, i.e. `ForensicOnly`, not the
+    /// [`RowFamilyKind::ProcessStreamRecovery`] sibling's `Restorable`.
+    /// `Restorable` means "eligible for the family's own quarantined
+    /// `import_*_suspended` path", and that premise is false here: this family
+    /// has no import path at all, so `Restorable` would advertise a durable
+    /// re-import that does not exist. `ForensicOnly`'s premise is exactly the one
+    /// that holds — an owner-backed read-only result is evidence, never
+    /// authority — so an exported row lands as forensics and no restored
+    /// installation can read a prior installation's verification answer back as
+    /// its own.
+    BackupVerificationResults,
 }
 /// Backup disposition of one row family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -206,7 +238,17 @@ impl RowFamilyKind {
     /// Static disposition policy for one row family.
     pub const fn disposition(self) -> RowDisposition {
         match self {
-            Self::StoreRebindReplay | Self::StoreFailureRetention => RowDisposition::ForensicOnly,
+            // `BackupVerificationResults` is listed EXPLICITLY on the
+            // `ForensicOnly` arm, not left to the wildcard. It has no
+            // `import_*_suspended` path at all, so `Restorable` would advertise a
+            // durable re-import that does not exist; `ForensicOnly`'s premise —
+            // evidence, never authority — is the one that actually holds for a
+            // read-only owner-backed verification result. Listing it explicitly is
+            // what makes that true rather than merely stated: a new trailing
+            // variant would otherwise silently fall through to `Restorable`.
+            Self::StoreRebindReplay
+            | Self::StoreFailureRetention
+            | Self::BackupVerificationResults => RowDisposition::ForensicOnly,
             Self::AuthorityHandoffs
             | Self::HostRequests
             | Self::ActivationLifecycle

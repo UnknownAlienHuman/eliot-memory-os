@@ -40,13 +40,63 @@
 //!   dependency is added here. The archive itself is published nowhere and no
 //!   installation state is mutated, but the decided answer is recorded as one
 //!   durable readback row in the Kernel's existing ORS (issue #2802): keyed by
-//!   the request's own idempotency identity, committed before the reply, and
-//!   read back so an exact replay after a Kernel restart or an Authority Epoch
-//!   rotation returns the same owner-proved answer with its historical fence,
-//!   while a changed archive under the same identity is an `IDENTITY_CONFLICT`
-//!   that performs no transition (I5.27, I14.21). A store outage fails closed
+//!   the accepted request identity's namespace digest, committed before the
+//!   reply, and read back so an exact replay after a Kernel restart or an
+//!   Authority Epoch rotation returns the same owner-proved answer with its
+//!   historical fence, while a changed archive, source, class, scope, fence or
+//!   admission under the same identity is an `IDENTITY_CONFLICT` that performs
+//!   no transition (I5.27, I14.21). A store outage fails closed
 //!   instead of downgrading to a non-persisted answer, because that would be a
 //!   false proof claim under A0.3.
+//!
+//!   Since #2883 that durable key is the 64-hex namespace digest of the accepted
+//!   [`BackupVerifyRequestIdentity`] — a versioned read-only verify profile of the
+//!   protocol's `BackupRequestIdentity` — and never the caller's own idempotency
+//!   text. That is the difference between "two callers who happen to pick the same
+//!   string" and "two operations": the key is principal, authority lineage,
+//!   operation id and the four profile constants, so one principal can never read,
+//!   conflict with, or inherit another principal's verification result (I5.27,
+//!   I15.2, A12.2). "Within one installation" is structural, not an in-band field:
+//!   a row is only ever read out of the ORS file that owns it. Its exact preimage
+//!   is enumerated in exactly ONE place,
+//!   `eliot_ors::BackupVerifyRequestIdentity::namespace_digest`; nothing in this file
+//!   restates it, so a change to the key cannot leave a stale copy of the list
+//!   behind here.
+//!
+//!   The durable operation identity is the PRINCIPAL and its `WorkScope`, not the
+//!   session. A reconnect, or any new session, by the same principal in the same
+//!   scope with the same `operation_id` and the same archive is the SAME operation
+//!   and replays the stored answer, with no reconciliation evidence at all — that is
+//!   what acceptance clause 2 and I14.21's reconcile-by-key require, and it is why
+//!   `session_id` is ambient. Issue #2883's clause 1 says "principals OR SESSIONS",
+//!   which is genuinely ambiguous; this implementation reads it as per-PRINCIPAL and
+//!   discloses the reading on `BackupVerifyRequestIdentity` for the owner to settle.
+//!
+//!   Three consequences are load-bearing and are each a typed answer rather than a
+//!   silent one: a cross-principal or cross-scope hit on one key is refused with a
+//!   bounded typed refusal that projects nothing; a row written under the pre-#2883
+//!   raw text key is quarantined as unscoped legacy evidence and is never certified,
+//!   re-keyed or projected, while bytes under that key that decode as NEITHER shape
+//!   fail closed instead of being read as absent; and a caller that is NOT the
+//!   principal owning an operation may read that operation's stored answer only by
+//!   presenting the caller-presented evidence pair that names it exactly — the
+//!   predecessor's durable namespace digest plus its canonical request hash — and
+//!   only after the route has proved the caller is admitted for the front door in the
+//!   same `WorkScope` and on the same authority LINEAGE, the named predecessor is the
+//!   same principal's, and the presented archive is the predecessor's archive. That
+//!   is the ONLY case `successor_of` exists for: the key cannot otherwise separate a
+//!   non-owner from the operation it wants to read. The verify payload is therefore
+//!   `{bundle_hex}` or `{bundle_hex, successor_of}`.
+//!
+//!   The succession evidence is CALLER-PRESENTED, not owner-issued, and the route
+//!   does not pretend otherwise. It is scope-guarded, the authorization checks
+//!   answer with ONE static sentence that names no class, the integrity/no-row arms
+//!   answer with the fail-closed `verification_not_recorded_reply`, and the original
+//!   operation identity is preserved on the answer. What it cannot prove is
+//!   that the owner would authorise THIS caller to reconcile THAT operation, because
+//!   no owner issues a backup-verify succession or reconciliation receipt on this
+//!   product; that owner is `backup-capture-owner (#959)`, OPEN. Nothing here invents
+//!   a capability, a receipt type, or an owner value to paper over that.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
 //!   admissibility, provisioning shape, store-level isolation inequality),
@@ -78,8 +128,10 @@ use eliot_contracts::{
 };
 use eliot_ipc::{PeerIdentity, Session, TransportError};
 use eliot_ors::{
-    BACKUP_VERIFICATION_RESULT_RECORD_TYPE, BackupVerificationDisposition,
-    BackupVerificationResultRecord, CONTRACT_VERSION as ORS_CONTRACT_VERSION, OrsError,
+    BACKUP_VERIFICATION_RESULT_RECORD_TYPE, BACKUP_VERIFY_PROFILE_ID,
+    BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
+    BackupVerificationResultRecord, BackupVerifyRequestIdentity,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyUnscopedBackupVerificationClass, OrsError,
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -128,14 +180,19 @@ pub(crate) const BACKUP_INTRODUCTIONS_MAX: usize = 256;
 ///
 /// I5.27 binds idempotency to canonical bytes rather than to caller spelling, so
 /// the digest needs a named domain that cannot collide with another operation's
-/// digest over the same archive bytes.
+/// digest over the same archive bytes. It is now one field of the accepted
+/// [`BackupVerifyRequestIdentity`] rather than a preimage key, so a second
+/// operation that reused the same archive bytes could not produce the same
+/// durable key either.
 const BACKUP_VERIFY_REQUEST_DOMAIN: &str = "eliot.kernel.backup-verify.request";
 /// Canonical encoding version of the `backup.verify` request digest.
 ///
 /// This is I5.27's `canonical_encoding_version`: a move of the number is a new
 /// digest contract, never a silent reinterpretation of a retained one, and no
 /// field that affects authority, scope, ordering, privacy or effect is omitted
-/// or defaulted around it.
+/// or defaulted around it. It is one field of the accepted
+/// [`BackupVerifyRequestIdentity`], whose own `profile_version` is the second
+/// version a change to that field set must move.
 const BACKUP_VERIFY_REQUEST_ENCODING_VERSION: u16 = 1;
 
 /// Gates reported by the restore-test rehearsal, in pass order.
@@ -436,6 +493,39 @@ fn handle_backup_create(payload: &Value, idempotency_key: &str) -> Value {
     )
 }
 
+/// Returns the authenticated `(user_identity, session_identity)` pair of one
+/// session, or fences the session when the peer identity was never proved.
+///
+/// I15.2 binds principal identity to a launch nonce, pipe ACL/user/service SID,
+/// capability token and Authority Epoch, and A12.2 states identity "is not a
+/// model's self-declared string"; both values here come from
+/// [`PeerIdentity::Authenticated`], which the platform adapter produced from its
+/// SID/ACL/impersonation proof. Nothing is read from the payload, the archive or
+/// the caller, so no frame can declare its own principal.
+///
+/// This is the single reader of that pair, and both
+/// [`admit_backup_caller`] and [`backup_verify_identity`] call it. Be precise about
+/// what that guarantees, because the two consumers are STRUCTURALLY DIFFERENT
+/// values and the difference is load-bearing: `admit_backup_caller` hands the
+/// capture owner a COMPOSITE `CaptureCallerAuth::principal` of
+/// `format!("{user_identity}@{session_identity}")`, while the durable request
+/// identity binds the BARE `user_identity` as its `principal` and keeps
+/// `session_id` as a separate AMBIENT field. So they share one source and cannot
+/// disagree about who the peer is, and they deliberately do NOT produce the same
+/// string — and if they did, the durable key would have been per-session composite
+/// and every I14.21 reconnect would have re-keyed a committed operation.
+fn authenticated_backup_principal(session: &Session) -> Result<(&str, &str), TransportError> {
+    let PeerIdentity::Authenticated {
+        user_identity,
+        session_identity,
+        ..
+    } = &session.peer
+    else {
+        return Err(TransportError::SessionFenced);
+    };
+    Ok((user_identity.as_str(), session_identity.as_str()))
+}
+
 /// Projects this transport's own admission into the capture owner's
 /// caller-admission shape, or fences the session.
 ///
@@ -445,7 +535,8 @@ fn handle_backup_create(payload: &Value, idempotency_key: &str) -> Value {
 /// the archive or the caller:
 ///
 /// - the peer identity was proved by the platform adapter's SID/ACL/
-///   impersonation proof ([`PeerIdentity::Authenticated`]);
+///   impersonation proof ([`PeerIdentity::Authenticated`]), read through the one
+///   shared [`authenticated_backup_principal`] reader;
 /// - the session must carry exactly one capability, and it must be
 ///   [`DAEMON_FRONT_DOOR_CAPABILITY`] - this Kernel's own server-allowed
 ///   capability for the daemon/operator front-door class, read from the policy
@@ -462,14 +553,7 @@ fn handle_backup_create(payload: &Value, idempotency_key: &str) -> Value {
 /// [`crate::dreamer_job_dispatch`]'s exact module-and-capability admission and
 /// the `daemon_request_dispatch` module gate.
 fn admit_backup_caller(session: &Session) -> Result<CaptureCallerAuth, TransportError> {
-    let PeerIdentity::Authenticated {
-        user_identity,
-        session_identity,
-        ..
-    } = &session.peer
-    else {
-        return Err(TransportError::SessionFenced);
-    };
+    let (user_identity, session_identity) = authenticated_backup_principal(session)?;
     if session.capabilities.len() != 1 || session.capabilities[0] != DAEMON_FRONT_DOOR_CAPABILITY {
         return Err(TransportError::SessionFenced);
     }
@@ -530,19 +614,50 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
     )
 }
 
-/// Every owner-proved value one successful `backup.verify` answer projects.
+/// Every value one successful `backup.verify` answer projects.
 ///
-/// The live owner report and the durable ORS record are both projected into
-/// this one shape, so [`verified_reply`] stays the single wire projection and a
-/// replayed answer cannot drift from a freshly computed one. Every field is an
-/// owner answer: none is derived from the caller's `bundle_hex` spelling, none
-/// is defaulted, and none is inferred from a sibling field.
+/// The live owner report and the durable ORS record are both projected into this
+/// one shape, so [`verified_reply`] stays the single wire projection and a
+/// replayed answer cannot drift from a freshly computed one. `backup_id`, `class`,
+/// `archive_sha256`, `class_ceiling`, `verification_level`, `target_compatibility`,
+/// the three member counts and `capture_receipt` are answers the capture owner
+/// returned, read from the decoded archive.
+///
+/// Be precise about "the owner proved" for those, because it is not one uniform
+/// claim, and the surface's own evidence level is what keeps the difference
+/// visible. `verification_level`, `class_ceiling`, `target_compatibility` and the
+/// three member counts come from the owner's own TYPED values
+/// (`CaptureEvidenceLevel`, `BackupClass::evidence_level`, `ArchivedFenceRelation`,
+/// the per-domain dispositions), so their spellings really are the owner's.
+/// `backup_id` and `class` are text the archive declares about itself and the
+/// owner re-validates for internal consistency, and `archive_sha256` is computed by
+/// the archive format itself (`BackupBundle::bundle_sha256`) — none of the three is
+/// proved against a capture owner, because no production `impl PublicationPort`
+/// exists on this path and `verify_only` therefore always answers
+/// `StructurallyValidCandidate`. That is exactly why the surface reports a
+/// structurally valid archive as a `candidate` and never as `verified`.
+///
+/// The other three fields are DERIVED from the accepted request identity, not owner
+/// answers, and are called out as such in their own field docs: `request_digest` is
+/// that identity's canonical request hash, `operation_namespace` is the durable row
+/// key derived from it, and both are a function of the request rather than a claim
+/// about it. No field is derived from the caller's `bundle_hex` spelling, none is
+/// defaulted, and none is inferred from a sibling field.
 struct VerifiedProjection {
-    /// Archive identity the owner proved.
+    /// Archive identity, DECLARED by the archive and re-validated by the owner for
+    /// internal consistency. Not proved against a capture owner - see the type doc.
     backup_id: String,
-    /// Evidenced archive class in the owner's own class-name spelling.
+    /// Evidenced archive class in the ROUTE's closed wire spelling
+    /// (`full_recovery` / `canonical_only_degraded` / `scope_export`), read from
+    /// `identity.evidenced_class` — i.e. through the route's own `class_name`
+    /// mapping from the owner's typed class, not in the protocol enum's own serde
+    /// spelling. Read the class from the accepted identity rather than recomputing
+    /// it from the report, so the answer, the durable row and the request hash
+    /// cannot disagree about which class was presented.
     class: String,
-    /// The owner's digest of the complete encoded archive.
+    /// Digest of the complete encoded archive, COMPUTED by the archive format
+    /// itself (`BackupBundle::bundle_sha256`) and reported by the owner. Content
+    /// integrity, not a proved capture identity - see the type doc.
     archive_sha256: String,
     /// The owner's own class-ceiling spelling.
     class_ceiling: String,
@@ -561,34 +676,71 @@ struct VerifiedProjection {
     /// Owner-issued publication receipt, explicitly absent when the owner
     /// issued none.
     capture_receipt: Option<String>,
-    /// Digest of the canonical request bytes this operation was admitted with.
+    /// Derived, not an owner answer: the canonical request hash of the accepted
+    /// request identity, which since #2883 is a hash over the whole accepted
+    /// request and not over one archive field.
     request_digest: String,
+    /// Derived, not an owner answer: the 64-hex namespace digest of the request
+    /// identity that produced this answer, i.e. the exact durable row key it lives
+    /// under. Additive, so a frame-level consumer can correlate the answer to its
+    /// row without being able to name another caller's.
+    operation_namespace: String,
 }
 
 /// Projects one verification result into the route's `ok` envelope.
 ///
-/// Every field is an owner answer read from `projection`: the archive identity
-/// (bounded to the same operator text limit the surface applies, so a
-/// structurally valid archive with an over-long identity cannot make the surface
-/// return a result mismatch), the evidenced class under the owner's single
-/// class-name spelling, the archive digest, the request's stable operation
-/// identity, the evidence level the owner proved, the exact class ceiling and
-/// archived-fence relation in the owner's own spellings, the capture receipt
-/// (explicitly null when the owner has none), the per-domain member counts read
-/// from the owner's own dispositions, and the canonical request digest this
-/// operation was admitted under.
+/// `envelope_idempotency_key` and `answer_operation_id` are deliberately TWO
+/// parameters because they are two different facts, and the reply carries both:
 ///
-/// `operation_id` is the request's stable operation identity the route already
-/// bound (`idempotency_key`), never a minted `verify-only-{backup_id}`: I5.27
-/// defines idempotency over canonical bytes, "not over caller spelling or an
-/// unversioned hash", and the owner only ever reports back the identity its
-/// caller bound.
+/// - `envelope_idempotency_key` is ALWAYS the calling request's own
+///   `idempotency_key`. It is the transport correlation this frame must answer
+///   on, and the operator surface checks exactly that: it compares the envelope
+///   `idempotency_key` against the caller's own request identity and answers a
+///   `CorrelationMismatch` on any other value. No other route path may ever put a
+///   different value in the envelope.
+/// - `answer_operation_id` is the operation that PRODUCED the answer, i.e. the
+///   wire `operation_id` field. On every non-reconciliation path it is the same
+///   value as the envelope key, and both call sites pass it twice; it is never a
+///   minted `verify-only-{backup_id}`, because I5.27 defines idempotency over
+///   canonical bytes, "not over caller spelling or an unversioned hash", and the
+///   owner only ever reports back the identity its caller bound.
+///
+/// A reconciliation is the ONE route where the two differ, and it must: the
+/// reconciling session answers its own frame, but the stored answer it reads back
+/// was produced by the predecessor operation, so `operation_id` preserves the
+/// predecessor's identity rather than re-spelling it as the reconciling caller's.
+/// Collapsing the two would either break the correlation or lose the original
+/// operation identity, and the acceptance requires both.
 ///
 /// `request_digest` is additive. It binds this exact answer to the canonical
 /// request bytes that produced it, so a later replay under the same operation
 /// identity can return this same body and can tell a changed archive apart from
 /// it; no existing field is removed, renamed or re-spelled.
-fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Value {
+///
+/// `operation_namespace` is likewise additive (#2883) and carries the 64-hex
+/// namespace digest of the request identity that PRODUCED the answer, i.e. the
+/// exact durable row key that answer lives under. It is one field rather than a
+/// second "original namespace" field because on a reconciliation the producing
+/// row and the answer are the same row: the reconciling session reads the
+/// predecessor's answers and therefore the predecessor's namespace is the honest
+/// value, and adding a separate field would have to invent a namespace for an
+/// operation that is never stored.
+///
+/// It exists so a raw IPC consumer can correlate the answer to its durable row.
+/// Be precise about who reads it: NO operator surface reads it —
+/// `crates/surfaces/eliot-cli/src/backup.rs::verify_evidence` reads neither
+/// `operation_namespace`, nor `request_digest`, nor the wire `operation_id` — so
+/// it is available to a frame-level consumer and not to the current CLI. It is
+/// added because the durable key stopped being caller text: without it a
+/// frame-level consumer cannot tell two principals' rows apart when they share a
+/// human key. It is derived from values the caller already supplied or the archive
+/// already declares, so it discloses nothing a caller does not already know.
+/// Nothing else is added and nothing is removed, renamed or re-spelled.
+fn verified_reply(
+    projection: &VerifiedProjection,
+    envelope_idempotency_key: &str,
+    answer_operation_id: &str,
+) -> Value {
     // The operator surface applies its own bounded-text check to `bundle_id`
     // and would answer a result mismatch for an over-long identity, so the
     // route refuses with the owner's own class reason instead of emitting an
@@ -596,7 +748,7 @@ fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Val
     if projection.backup_id.len() > BACKUP_TEXT_MAX {
         return invalid_reply(
             BACKUP_VERIFY_OPERATION,
-            idempotency_key,
+            envelope_idempotency_key,
             "backup.archive",
             "archive identity exceeds the bounded operator text length",
         );
@@ -612,7 +764,7 @@ fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Val
     backup_reply(
         BACKUP_VERIFY_OPERATION,
         "ok",
-        idempotency_key,
+        envelope_idempotency_key,
         vec![
             ("bundle_id", Value::String(projection.backup_id.clone())),
             ("class", Value::String(projection.class.clone())),
@@ -620,7 +772,10 @@ fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Val
                 "integrity_sha256",
                 Value::String(projection.archive_sha256.clone()),
             ),
-            ("operation_id", Value::String(idempotency_key.to_owned())),
+            (
+                "operation_id",
+                Value::String(answer_operation_id.to_owned()),
+            ),
             (
                 "verification_level",
                 Value::String(projection.verification_level.clone()),
@@ -641,6 +796,10 @@ fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Val
                 "request_digest",
                 Value::String(projection.request_digest.clone()),
             ),
+            (
+                "operation_namespace",
+                Value::String(projection.operation_namespace.clone()),
+            ),
         ],
     )
 }
@@ -652,16 +811,23 @@ fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Val
 /// hand-written vocabulary here; a ceiling that does not serialize to a JSON
 /// string is a change in that type, and the route refuses rather than projecting
 /// a value the operator surface cannot bound.
+///
+/// The evidenced class is read from the *accepted request identity* rather than
+/// recomputed from the report, and the namespace digest is the `operation_namespace`
+/// PARAMETER — the caller already computed it as `identity.namespace_digest()` —
+/// so the answer, the durable key and the stored identity are one value read once.
 fn projection_from_report(
     report: &CaptureReport,
+    identity: &BackupVerifyRequestIdentity,
     request_digest: String,
+    operation_namespace: String,
 ) -> Result<VerifiedProjection, String> {
     let Ok(Value::String(class_ceiling)) = serde_json::to_value(report.class_ceiling) else {
         return Err("class evidence ceiling is not serializable".to_owned());
     };
     Ok(VerifiedProjection {
         backup_id: report.backup_id.clone(),
-        class: class_name(report.class).to_owned(),
+        class: identity.evidenced_class.clone(),
         archive_sha256: report.archive_sha256.clone(),
         class_ceiling,
         verification_level: report.evidence_level.as_wire_name().to_owned(),
@@ -671,6 +837,7 @@ fn projection_from_report(
         blob_count: member_domain_count(report, MEMBER_DOMAIN_BLOB),
         capture_receipt: report.receipt_identity.clone(),
         request_digest,
+        operation_namespace,
     })
 }
 
@@ -679,9 +846,18 @@ fn projection_from_report(
 /// The stored owner answers win over anything recomputed on this call: the
 /// persisted archived-fence relation is the historical one, and re-deriving it
 /// against whatever generation happens to be live now is exactly the drift this
-/// durable row exists to prevent.
-fn projection_from_record(record: &BackupVerificationResultRecord) -> VerifiedProjection {
-    VerifiedProjection {
+/// durable row exists to prevent. The same holds for the operation identity and
+/// the namespace digest: a replay answers from the *stored* identity, so the
+/// original operation identity is preserved rather than re-spelled as the
+/// caller's, and a reconciliation answers with exactly these values because the
+/// row it reads IS the operation that produced the answer. That is why
+/// `operation_namespace` needs no separate "original namespace" field on a
+/// reconciliation: the producing row and the answer are the same row.
+fn projection_from_record(
+    record: &BackupVerificationResultRecord,
+) -> Result<VerifiedProjection, String> {
+    let operation_namespace = record.record_key().map_err(|error| error.to_string())?;
+    Ok(VerifiedProjection {
         backup_id: record.backup_id.clone(),
         class: record.class.clone(),
         archive_sha256: record.archive_sha256.clone(),
@@ -693,23 +869,30 @@ fn projection_from_record(record: &BackupVerificationResultRecord) -> VerifiedPr
         blob_count: record.blob_count,
         capture_receipt: record.capture_receipt.clone(),
         request_digest: record.request_digest.clone(),
-    }
+        operation_namespace,
+    })
 }
 
-/// Binds one fresh owner-proved answer to its operation identity and to the
-/// digest of the exact reply body it projects.
+/// Binds one fresh owner-proved answer to its accepted request identity and to
+/// the digest of the exact reply body it projects.
 ///
-/// `contract_version` is ORS's own wire/storage version, so a row written under
-/// a different record contract fails its read closed instead of being read back
+/// The identity is stored nested and is never flattened into a second copy that is
+/// not cross-checked. Four fields ARE retained both flat and nested — the request
+/// digest, the archive digest, the class and the capture receipt — because they are
+/// what a reader indexes on; `BackupVerificationResultRecord::validate` re-derives
+/// and compares all four on every load, so the durable key, the request digest and
+/// the recorded identity cannot disagree about which request a stored answer belongs
+/// to (#2883). `contract_version` is ORS's own wire/storage version, so a row written
+/// under a different record contract fails its read closed instead of being read back
 /// as the same answer.
 fn record_from_projection(
-    idempotency_key: &str,
+    identity: &BackupVerifyRequestIdentity,
     projection: &VerifiedProjection,
     reply_digest: String,
 ) -> BackupVerificationResultRecord {
     BackupVerificationResultRecord {
         contract_version: ORS_CONTRACT_VERSION,
-        idempotency_key: idempotency_key.to_owned(),
+        identity: identity.clone(),
         request_digest: projection.request_digest.clone(),
         archive_sha256: projection.archive_sha256.clone(),
         backup_id: projection.backup_id.clone(),
@@ -725,26 +908,148 @@ fn record_from_projection(
     }
 }
 
+/// Constructs the accepted request identity of one read-only `backup.verify`
+/// operation from owner and authenticated sources only (#2883 instructions 1
+/// and 2).
+///
+/// Every value below has exactly one owner, and nothing here is read from the
+/// caller's spelling of anything:
+///
+/// - `principal` and `session_id` come from
+///   [`authenticated_backup_principal`], i.e. the authenticated peer's
+///   `user_identity` and `session_identity`. The full `BackupRequestIdentity`
+///   spells these as one `BackupAuthenticatedPrincipal` carrying a role and an
+///   epoch. No `BackupRole` is available on this frame at all — no owner issues
+///   one for a read-only verify — so nothing here constructs or compares a role,
+///   and the admitted single front-door capability is the only role evidence this
+///   route holds. The epoch is bound separately as `authority_epoch`.
+/// - `capability` is the one capability [`admit_backup_caller`] admitted, so the
+///   durable identity records the same capability the owner was called under.
+/// - `scope_id` and `resource_generation` are the admitted `WorkScope` owner value
+///   and generation of the session's module generation; `authority_epoch` is that
+///   generation's current State Fence epoch. `scope_id` is operation identity;
+///   the generation and the epoch's sequence are ambient observation context (see
+///   `BackupVerifyRequestIdentity`'s ambient note).
+/// - `archive_source_installation`, `archive_owner_contract`,
+///   `archive_export_fence_digest`, `archive_sha256`, `evidenced_class` and
+///   `capture_receipt` are read from the DECODED archive by the capture owner.
+///   They are not caller spelling — the caller contributes only bytes, and the
+///   owner decides what those bytes declare — but they are also not proved
+///   against a capture owner, because none exists on this path; the one value the
+///   archive format genuinely re-derives is `archive_export_fence_digest`, which
+///   `BackupBundle::validate` recomputes and re-checks on every decode.
+///   `archive_sha256` alone is content integrity, not the source/capture operation
+///   identity (I5.27), which is why the archive's own source installation, owner
+///   contract and export-fence digest travel with it.
+/// - `operation_id` is the caller-provided idempotency text. It is the only
+///   caller-authored value in the identity, and it is namespaced: it can never be
+///   a durable key on its own.
+/// - `profile_id`, `profile_version`, `idempotency_namespace`,
+///   `domain_separator`, `canonical_encoding_version`, `semantic_command_kind`
+///   and `retention_and_collision_window` are the versioned profile's own fixed
+///   constants. This is a list of the STRUCT's constant members, deliberately not
+///   a list of the durable KEY preimage: only four of them reach the key, and that
+///   preimage is enumerated in exactly one place,
+///   `eliot_ors::BackupVerifyRequestIdentity::namespace_digest`. The idempotency
+///   namespace is derived from the profile id and version, never from the caller,
+///   so it is the single place a profile change has to be declared.
+///
+/// The transport `launch_nonce` is deliberately NOT recorded here at all. The
+/// protocol calls it "correlation-only connection data … deliberately absent from
+/// this declaration and therefore cannot change its digest or act as an
+/// authority-bearing identity"
+/// (`crates/foundation/eliot-protocol/src/lib.rs`); putting it in a durable
+/// identity would let a per-connection value re-key a committed operation on
+/// every reconnect, which is instruction 4 inverted. Fresh transport correlation
+/// stays on the frame's own reply, where the operator surface checks it.
+///
+/// `installation_id` is deliberately NOT a field here, and that is a decision
+/// rather than a gap in coverage: the value this route used to bind was
+/// `report.source_installation`, which is the archive's own declared
+/// `export_fence.export_id` — free text inside the caller-presented `bundle_hex`,
+/// checked only for non-blank shape. A caller-movable KEY component is a
+/// caller-movable durable namespace, so two archives declaring different
+/// `export_id`s under one human key would land on two rows and both would be
+/// answered `ok` with no identity conflict. The archive's declared source is
+/// therefore an ANSWER and lives in `archive_source_installation`, bound in the
+/// canonical request hash, where a change is the identity conflict acceptance
+/// clause 4's `source` term requires. Cross-installation separation is structural
+/// instead: a durable row is only read out of the ORS file that owns it, so another
+/// installation's rows are not in this table and no digest pair can name them. The
+/// first real platform-independent verifying-installation identifier is where an
+/// in-band field check would belong; inventing one now would mean inventing an
+/// owner value.
+fn backup_verify_identity(
+    session: &Session,
+    caller: &CaptureCallerAuth,
+    report: &CaptureReport,
+    idempotency_key: &str,
+) -> Result<BackupVerifyRequestIdentity, String> {
+    let (principal, session_id) =
+        authenticated_backup_principal(session).map_err(|_| "unauthenticated peer".to_owned())?;
+    let identity = BackupVerifyRequestIdentity {
+        profile_id: BACKUP_VERIFY_PROFILE_ID.to_owned(),
+        profile_version: BACKUP_VERIFY_PROFILE_VERSION,
+        domain_separator: BACKUP_VERIFY_REQUEST_DOMAIN.to_owned(),
+        idempotency_namespace: format!(
+            "{BACKUP_VERIFY_PROFILE_ID}/v{BACKUP_VERIFY_PROFILE_VERSION}"
+        ),
+        canonical_encoding_version: BACKUP_VERIFY_REQUEST_ENCODING_VERSION,
+        semantic_command_kind: BACKUP_VERIFY_OPERATION.to_owned(),
+        principal: principal.to_owned(),
+        session_id: session_id.to_owned(),
+        capability: caller.capability.clone(),
+        scope_id: session.module_generation.module_id.as_str().to_owned(),
+        resource_generation: session.module_generation.generation,
+        authority_epoch: session
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .clone(),
+        operation_id: idempotency_key.to_owned(),
+        archive_sha256: report.archive_sha256.clone(),
+        archive_owner_contract: report.owner_contract.clone(),
+        archive_source_installation: report.source_installation.clone(),
+        archive_export_fence_digest: report.export_fence_digest.clone(),
+        evidenced_class: class_name(report.class).to_owned(),
+        capture_receipt: report.receipt_identity.clone(),
+        retention_and_collision_window: BACKUP_VERIFY_RETENTION_WINDOW.to_owned(),
+        identity_digest: String::new(),
+    };
+    identity
+        .with_computed_digest()
+        .map_err(|error| error.to_string())
+}
+
 /// Computes the canonical request digest of one `backup.verify` operation.
 ///
-/// Only owner-proved values enter the preimage: the fixed operation kind, its
-/// canonical encoding version, this operation's domain, and the verification
-/// owner's own digest of the complete encoded archive. The caller's `bundle_hex`
-/// spelling is deliberately excluded - the same bytes re-spelled in another case
-/// must resolve to the same operation, and a caller-authored checksum is not the
-/// owner's answer (see the module docs). I5.27 forbids omitting or defaulting a
-/// field that affects authority, scope, ordering, privacy or effect, so the
-/// preimage names the operation kind and its version instead of a bare archive
-/// digest.
-fn backup_verify_request_digest(archive_sha256: &str) -> Result<String, String> {
-    let preimage = serde_json::json!({
-        "archive_sha256": archive_sha256,
-        "canonical_encoding_version": BACKUP_VERIFY_REQUEST_ENCODING_VERSION,
-        "domain_separator": BACKUP_VERIFY_REQUEST_DOMAIN,
-        "semantic_command_kind": BACKUP_VERIFY_OPERATION,
-    });
-    let bytes = canonical_json_bytes(&preimage).map_err(|error| error.to_string())?;
-    Ok(sha256_hex(&bytes))
+/// Since #2883 the preimage is the WHOLE accepted request identity minus the three
+/// ambient observation fields, and `eliot_ors::BackupVerifyIdentityPreimage` is the
+/// authoritative field list — this function does not restate it, deliberately, so a
+/// field added there cannot leave a stale copy of the list behind here. I5.27
+/// requires exactly this: canonical encoding is versioned and a field affecting
+/// authority, scope, ordering, privacy or effect cannot be omitted or defaulted
+/// silently, so nothing that could decide *who may read this result* or *what the
+/// result is about* is left out of the preimage, and nothing in it is given a
+/// default.
+///
+/// Three things are NOT in the preimage, each for a stated reason, and the list is
+/// exhaustive:
+/// - `session_id`, `resource_generation` and `authority_epoch` — ambient
+///   observation context, because binding them would make every I14.21
+///   reconcile-by-key and every post-rotation replay a second stored row;
+/// - `identity_digest` itself, so the digest is a function of the request and never
+///   of itself;
+/// - the caller's `bundle_hex` SPELLING. The same bytes re-spelled in another case
+///   must resolve to the same operation, and a caller-authored checksum is not the
+///   archive's answer. The archive's own `archive_sha256` IS in the preimage, so a
+///   re-spelling that decodes to different bytes is still a different operation.
+fn backup_verify_request_digest(identity: &BackupVerifyRequestIdentity) -> Result<String, String> {
+    Ok(identity
+        .clone()
+        .with_computed_digest()
+        .map_err(|error| error.to_string())?
+        .identity_digest)
 }
 
 /// Digest over the exact reply body one verification projects.
@@ -760,27 +1065,27 @@ fn reply_body_digest(body: &Value) -> Result<String, String> {
 /// Projects the I5.27 identity conflict for a reused operation identity.
 ///
 /// Reusing an idempotency key with a different canonical request hash returns
-/// `IDENTITY_CONFLICT` and performs no transition, so the refusal names the two
-/// bounded digests and nothing else: no archive bytes, no caller text, and no
-/// stored answer is projected into a refusal. `bound_request_digest` is
-/// optional because a conflict observed at stage time can be answered before the
-/// bound row could be read back.
-fn identity_conflict_reply(
-    idempotency_key: &str,
-    bound_request_digest: Option<&str>,
-    presented_request_digest: &str,
-) -> Value {
-    let reason = bound_request_digest.map_or_else(
-        || {
-            format!(
-                "IDENTITY_CONFLICT: idempotency key is already bound to a different canonical request than {presented_request_digest}; no transition"
-            )
-        },
-        |bound| {
-            format!(
-                "IDENTITY_CONFLICT: idempotency key already bound to request digest {bound}; presented request digest {presented_request_digest}; no transition"
-            )
-        },
+/// `IDENTITY_CONFLICT` and performs no transition. The refusal names the
+/// PRESENTED digest and nothing else: no archive bytes, no caller text, no stored
+/// answer, and — deliberately — no stored digest.
+///
+/// The stored digest used to be an `Option<&str>` argument here. It is gone, and
+/// that is a real change in what this function can say. Rendering a stored digest
+/// is only safe when the caller already owns the row it names, and after #2883
+/// there is exactly one producer left: the fresh-verify path, where
+/// `answer_bound_verification` and `answer_failed_stage` answer about the caller's
+/// OWN key and the digest is its own freshly computed one. The reconciliation
+/// path is the caller-supplied-digest case, and there a stored digest must never be
+/// echoed: `stored.identity.identity_digest` is the second half of a
+/// successor-evidence pair, so naming it would let a caller that failed the scope
+/// or archive check assemble a valid pair for a row it is not authorised to read.
+/// That path answers with [`successor_not_observed_reply`], which is digest-free.
+///
+/// So the single parameter is always the caller's own presented digest, and this
+/// function is unreachable from any path where the presented digest is a guess.
+fn identity_conflict_reply(idempotency_key: &str, presented_request_digest: &str) -> Value {
+    let reason = format!(
+        "IDENTITY_CONFLICT: idempotency key is already bound to a different canonical request than {presented_request_digest}; no transition"
     );
     backup_reply(
         BACKUP_VERIFY_OPERATION,
@@ -791,6 +1096,147 @@ fn identity_conflict_reply(
             ("field", Value::String("backup.verify".to_owned())),
             ("reason", Value::String(bounded_reason(&reason))),
         ],
+    )
+}
+
+/// Returns whether the live, already-admitted session may observe the one stored
+/// predecessor row it named (#2883 instruction 5 "or permitted successor" and
+/// instruction 7 "the new caller must still be authorized to observe/reconcile
+/// that exact operation").
+///
+/// This is a JOIN over facts the live `Session` already holds against facts the
+/// stored [`BackupVerifyRequestIdentity`] holds, and it is deliberately a JOIN and
+/// nothing more. It is not a second front-door admission gate —
+/// [`admit_backup_caller`] already proved the peer identity and the exact single
+/// front-door capability, and `verify_only` already refused an unadmitted caller
+/// through `require_capture_admitted`, both before this runs.
+///
+/// Only two terms survive, because only two can FAIL and a comparison that cannot
+/// fail is not evidence. Each is a real cross-boundary comparison between a live
+/// session value and a stored row value:
+///
+/// - `scope_id` against the live `session.module_generation.module_id`, the
+///   admitted `WorkScope` owner value. A successor outside the predecessor's scope
+///   is refused, and this cannot be a constant comparison: the two sides come from
+///   different sources.
+/// - authority LINEAGE: `stored.identity.authority_epoch.lineage_id` against
+///   `session.module_generation.state_fence.authority_epoch.lineage_id`, compared
+///   as the lineage alone. The sequence is deliberately excluded because it is
+///   ambient (an Authority Epoch rotation is the same authority lineage observed
+///   later), and instruction 7 says replaying a historical result after such a
+///   rotation may be valid. A different lineage is a different authority and is
+///   refused. `EpochId::is_same_authority` is deliberately NOT used: it is an exact
+///   `(lineage_id, sequence)` compare — "true only when `lineage_id` and `sequence`
+///   are both equal" (`crates/foundation/eliot-contracts/src/epoch_identity.rs`) —
+///   and would refuse the very rotation this must permit.
+///
+/// Three comparisons that were here before are GONE because they cannot fail:
+/// `capability` against `caller.capability` is constant against a value
+/// `admit_backup_caller` already forced; `semantic_command_kind` against the
+/// route's own operation constant is constant against constant, and the row's
+/// `validate()` already pins the PROFILE ID and VERSION — not the command kind,
+/// which it does not compare against anything; `retention_and_collision_window`
+/// against the route's own window constant is constant against constant.
+/// `resource_generation` is also gone, and that is a narrowing rather than a
+/// tautology: it is ambient by the same argument as the epoch sequence, so
+/// requiring it equal would forbid the post-restart, post-re-registration
+/// reconciliation that the ambient rule exists to enable.
+///
+/// Deliberately NOT compared here, and why: `principal` and `session_id`. The
+/// `principal` cross-check IS made, but in `answer_successor_verification`, because
+/// it compares against the live authenticated peer rather than against a session
+/// value and belongs with the rest of the reconciliation decision. `session_id` is
+/// not compared anywhere, and the reason is the one that matters most on this path:
+/// a new session inheriting a prior session's operation is the ENTIRE POINT of a
+/// succession, so requiring session equality would make every reconciliation
+/// impossible. Note what the presented `predecessor_identity_digest` does and does
+/// not do: the canonical request hash covers the predecessor's principal, so the
+/// evidence names WHICH principal's operation it is, but it provably does NOT cover
+/// the predecessor's session — `BackupVerifyIdentityPreimage` omits `session_id` as
+/// ambient, and the type doc says so. So the successor is bound to that exact
+/// PRINCIPAL-and-operation, not to a session.
+///
+/// There is deliberately no installation field comparison here, and that is a
+/// decision rather than a gap. There is no platform-independent
+/// verifying-installation identifier on this frame to join against:
+/// `KernelStartupBinding::installation_id` is `#[cfg(windows)]` and is not held on
+/// `KernelComposition`, and the composition's `kernel_artifact_sha256` is an
+/// `Option` that is `None` whenever no Host launch injected one. Binding the
+/// predecessor row's own `archive_source_installation` would be a
+/// self-comparison that proves nothing about the caller while looking exactly like
+/// isolation, so it is not written — and that value is caller-presented archive
+/// text besides. The installation scope IS enforced on this path, but
+/// STRUCTURALLY: the predecessor row was read out of *this* composition's own ORS
+/// file, and a row belonging to a different installation is not in this table at
+/// all, so no digest pair can name it. The first real platform-independent
+/// verifying-installation identifier is where a field check would belong;
+/// inventing one now would mean inventing an owner value.
+fn successor_may_observe(session: &Session, stored: &BackupVerificationResultRecord) -> bool {
+    stored.identity.scope_id == session.module_generation.module_id.as_str()
+        && stored.identity.authority_epoch.lineage_id
+            == session
+                .module_generation
+                .state_fence
+                .authority_epoch
+                .lineage_id
+}
+
+/// Returns the authenticated principal of the reconciling session.
+///
+/// It reads the same single authenticated source as
+/// [`authenticated_backup_principal`], so the principal the capture owner admitted
+/// and the principal compared against the stored predecessor cannot drift apart.
+/// `None` is unreachable here — [`admit_backup_caller`] already fenced the frame
+/// on an unauthenticated peer — so the route treats it as a fenced transport error
+/// rather than as a scope decision.
+fn successor_caller_principal(session: &Session) -> Result<&str, TransportError> {
+    authenticated_backup_principal(session).map(|(principal, _)| principal)
+}
+
+/// Projects the ONE refusal the failed AUTHORIZATION checks on the reconciliation
+/// path answer with (instructions 4, 5, 7 and 8 on that path).
+///
+/// This function's sibling refusal call sites do NOT use this sentence. The load
+/// miss, the row that cannot be rebuilt, and the `reply_digest` that does not
+/// re-derive all answer with the fail-closed `verification_not_recorded_reply`,
+/// which is the same refusal the caller's own replay path returns for an
+/// untrustworthy row. So a caller can tell "no row at that key" from "a row you may
+/// not read" — that residue is deliberate, and the full accounting, including the
+/// count of arms on each side, is on [`answer_successor_verification`].
+///
+/// It is deliberately a SINGLE sentence for all of them, and that is a security
+/// property, not brevity. A caller that learns a namespace digest can probe for
+/// rows; when the scope, principal, digest and archive checks each answered with
+/// their own class, those replies told it whether a row exists there and whether it
+/// belongs to another principal or another scope — an existence and ownership oracle
+/// built out of our own refusals. One sentence removes that. The stored
+/// `identity_digest` is the second half of a successor-evidence pair and
+/// `operation_namespace` is on the wire, so an echo anywhere on this path would hand
+/// a caller the exact value that completes the pair for any row it can name.
+///
+/// What this DOES guarantee: no stored VALUE is extractable on this path. No
+/// principal, session, scope, lineage, digest, archive identity, count, store error
+/// or path ever leaves the store here. What it does NOT conceal: whether a row
+/// exists at the probed key at all. A refusal is never proof of absence, and
+/// separating "no such row" from "a row you may not read" would require the typed
+/// classes this path used to have — which were themselves the oracle. That trade is
+/// deliberate. It is also not observable by the shipped product today, because the
+/// operator surface cannot send `successor_of` at all (see
+/// `answer_successor_verification`).
+///
+/// It is routed through the same bounded reason the other refusals use, so it is
+/// truncated at the route's own operator text bound and can never relay an
+/// unbounded value. It is deliberately NOT a fence: a caller may be perfectly well
+/// admitted and still not entitled to this operation, and fencing the session would
+/// hide an ordinary scope answer behind an authorisation failure.
+fn successor_not_observed_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        &bounded_reason(
+            "the presented succession evidence does not name a stored verification operation this caller may observe; no stored result is projected",
+        ),
     )
 }
 
@@ -811,13 +1257,99 @@ fn verification_not_recorded_reply(idempotency_key: &str) -> Value {
     )
 }
 
+/// Projects the typed refusal for a verification operation that belongs to a
+/// DIFFERENT authenticated principal (#2883 instruction 8).
+///
+/// The reason names the CLASS of the refusal and nothing else: no bound
+/// principal, no session id, no stored identity digest, no stored archive
+/// identity, counts or capture receipt, and no store error string or path. The
+/// store's own disposition is a unit variant for exactly this reason — it has no
+/// field a foreign row's metadata could travel through — so this function has
+/// nothing to leak even if it wanted to.
+///
+/// It has exactly ONE producer, the STORE's
+/// [`BackupVerificationDisposition::ForeignOperation`], which compares the stored
+/// row's `principal` OR its `scope_id` against the candidate. Both classes are named
+/// in the reason because both are real and both are reachable:
+///
+/// - a different `scope_id` at the same key is an ORDINARY, uncorrupted case.
+///   `scope_id` is deliberately not a key component, so two sessions of one
+///   principal, on one lineage, with one `operation_id` and one archive but
+///   different `WorkScope`s share one key, and a load-then-stage race between them
+///   lands the second writer on the first's row here;
+/// - a different `principal` at the same key is a SHA-256 collision over the key
+///   preimage and is not reachable through the route; it is here for a hand-edited
+///   row.
+///
+/// So the reason names both rather than only the reachable one: naming only the
+/// collision case would misdescribe the case that actually happens, and splitting it
+/// into two typed reasons would give the caller a distinguishability it has no need
+/// for. The reconciliation path's own authorization refusals are a different
+/// mechanism entirely — the four authorization checks there are all
+/// [`successor_not_observed_reply`], one static sentence, so a caller
+/// cannot use them to probe for rows it may not read.
+fn foreign_operation_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        "this operation identity is bound to a different authenticated principal or work scope; no stored result is projected",
+    )
+}
+
+/// Projects the typed refusal for a pre-#2883 unscoped durable row
+/// (#2883 instruction 9).
+///
+/// A new durable key is a 64-hex namespace digest — its preimage is enumerated in
+/// exactly one place, `eliot_ors::BackupVerifyRequestIdentity::namespace_digest`,
+/// and is deliberately not restated here — so a legacy row's raw caller-text key
+/// cannot collide with a new key and the two are told apart by shape alone. That is
+/// what makes the extra probe sound: a scoped lookup returning absent is NOT proof
+/// that nothing is stored under the caller's own text, because a pre-#2883 row may
+/// be. The probe therefore exists precisely so a legacy row is neither silently
+/// ignored NOR silently adopted: it is quarantined as unscoped evidence, never
+/// certified to, re-keyed for, or projected to this caller, and the caller is told
+/// to re-run under a fresh key.
+///
+/// The third probe outcome, bytes under that key that decode as neither shape, is
+/// answered differently and more strictly: it fails closed as
+/// `verification_not_recorded_reply` rather than reaching this function, because
+/// staging over an unreadable row would destroy evidence and answer `ok`.
+///
+/// The reason deliberately echoes no stored field: not the legacy key's contents,
+/// not its request digest, not its archive identity or counts. It is a class
+/// statement about evidence this route refuses to rely on, and it is bounded like
+/// every other reason on this route.
+fn legacy_unscoped_evidence_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        "a pre-scoped durable result exists under the unscoped raw idempotency key; it carries no principal, session, scope or fence ownership, so it is quarantined as legacy evidence and is neither certified to, re-keyed for, nor projected here; re-run this operation under a fresh key",
+    )
+}
+
 /// Returns whether one durable-store failure is the I5.27 identity conflict
 /// rather than an outage.
 ///
-/// The store reports a binding conflict through the same typed integrity error
-/// it uses for every record family, distinguished by the record type, so the
-/// route reads the published record-type constant instead of matching error
-/// prose or inventing a second error type.
+/// Read the honest version of what this predicate does and does not distinguish. It
+/// matches ONE variant, [`OrsError::IntegrityProblem`], filtered by the published
+/// record type — so the route reads the contract constant instead of matching error
+/// prose or inventing a second error type. But #2883 introduced a SECOND
+/// `IntegrityProblem` for this record type, raised when a row at the staged key
+/// cannot be decoded as a current-contract row at all: a corrupted row, a partial
+/// write, or a shape from a future contract.
+///
+/// That means this predicate CONFLATES the two, and the consequence is stated
+/// rather than hidden: a corrupt row at the staged key is answered to the operator
+/// as `IDENTITY_CONFLICT` instead of as an outage. That is a real loss of precision,
+/// and it is deliberate for now because both outcomes are fail-closed — neither
+/// writes a row and neither answers `ok` — and because giving the corruption class
+/// its own signal would mean either a new public `OrsError` variant or a new field
+/// on the disposition, and both are a wider store contract change than this route
+/// may make on its own. The open point is the ORS store owner: split the two
+/// `IntegrityProblem` causes there, and this predicate becomes exact without any
+/// route change.
 fn is_backup_verification_conflict(error: &OrsError) -> bool {
     matches!(
         error,
@@ -863,33 +1395,150 @@ fn undecided_report_reply(report: &CaptureReport, idempotency_key: &str) -> Opti
     ))
 }
 
-/// What the durable store already holds for one verification operation.
+/// What the durable store already holds for one scoped verification identity.
 ///
-/// `Absent` is a positive fact about the store, not an unknown answer: it means
-/// this operation identity was never recorded, so the caller may verify and
-/// stage exactly once. It is never produced from a store failure, because a
-/// failure that degraded to `Absent` would answer `ok` for a result nothing
-/// recorded. The bound record is boxed so this two-variant shape stays small
-/// next to `Absent`.
+/// Be precise about who checks what, because the split matters. The STORE's
+/// `validate()` supplies SHAPE, SELF-CONSISTENCY and DIGEST INCLUSION: the profile
+/// id and version, the per-field text and digest shapes, the four
+/// flat-versus-nested drift checks, and `identity_digest == compute_digest()`. It
+/// compares NOTHING against the live caller — it cannot, it holds no session. The
+/// LIVE-CALLER JOINS are this route's: the namespace key itself is scoped to
+/// `(principal, authority lineage, operation id)`, and on the reconciliation path
+/// `successor_may_observe` plus the principal comparison in
+/// `answer_successor_verification` are what join a caller to a stored row. So
+/// `Bound` means "the store proved this row is well-formed and names the operation
+/// the caller addressed", NOT "the store authorised this caller".
+///
+/// `Absent` is a positive fact about the store, not an unknown answer: nothing is
+/// stored under this identity's namespace digest AND nothing is stored under the
+/// caller's raw text in any of the three probe classes. It is never produced from a
+/// store failure, because a failure that degraded to `Absent` would answer `ok` for
+/// a result nothing recorded. `LegacyUnscoped` is the quarantined pre-#2883 class,
+/// neither replayable nor stageable, and `Unreadable` is the fail-closed arm for
+/// bytes that decode as neither shape. The bound record is boxed so this shape stays
+/// small next to the three unit answers.
 enum PriorVerification {
-    /// No durable row owns this operation identity yet.
+    /// No durable row owns this scoped verification identity, and no pre-#2883
+    /// row owns the caller's raw text either.
     Absent,
-    /// A durable owner-backed result already owns this operation identity.
+    /// A pre-#2883 unscoped row owns the caller's raw text. It is quarantined
+    /// legacy evidence: never certified to, re-keyed for, or projected.
+    LegacyUnscoped,
+    /// Bytes are stored under the caller's raw text and decode as NEITHER the
+    /// current contract nor the pre-#2883 shape. The durable row is unreadable, so
+    /// the route fails closed and answers no verification result at all. This arm
+    /// exists because collapsing "not a legacy row" into "absent" is fail-OPEN: it
+    /// would stage a new scoped row over evidence that is still on disk and answer
+    /// `ok`, which is the outcome instruction 9 and acceptance clause 6 exist to
+    /// prevent.
+    Unreadable,
+    /// A durable owner-backed result already owns this scoped verification
+    /// identity, validated under the same accepted request identity.
     Bound(Box<BackupVerificationResultRecord>),
 }
 
-/// Admits the bounded inline bundle bytes one verify frame presents.
+/// Optional caller-presented succession evidence for a reconciliation verify
+/// (#2883 instruction 4).
+///
+/// A fresh session may read a prior operation's stored answer ONLY by naming it
+/// exactly. The two digests are that naming: the predecessor's durable namespace
+/// key and the predecessor's canonical request hash. This is the same
+/// predecessor-pair shape the ORS activation lifecycle already uses for
+/// `successor_of` (`eliot_ors::ActivationSuccessorBinding`), reused rather than
+/// a second succession family: a predecessor identity is named by a durable key
+/// plus the request hash under that key.
+///
+/// The pair alone is deliberately not sufficient, and the checks are ordered so
+/// that a wrong guess is worthless:
+///
+/// 1. [`successor_may_observe`] joins the live, already-admitted session against
+///    the named row's `WorkScope` and authority LINEAGE. This runs FIRST, before any
+///    digest comparison and before the row is used for anything observable.
+/// 2. the named predecessor must belong to the SAME authenticated principal, so a
+///    caller cannot read another principal's operation at all.
+/// 3. the presented request hash must equal the stored one AND the presented archive
+///    must be the stored archive. The stored request hash covers the predecessor's
+///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, so guessing the
+///    namespace key alone — which is on the wire as `operation_namespace` — yields
+///    nothing. It provably does NOT cover the predecessor's session, because
+///    `session_id` is ambient; that is deliberate and is justified in
+///    `answer_successor_verification`, not by any claim that the hash names it.
+/// 4. the row must still rebuild the exact reply body it claims to hold before
+///    anything is projected, which is what makes a stored row safe to project at
+///    all.
+///
+/// Presenting a WRONG predecessor digest yields NO STORED VALUE AT ALL: the
+/// mismatch answers with [`successor_not_observed_reply`], whose reason is a
+/// single static string, and the scope and principal checks have already refused a
+/// caller that was never allowed to ask. The pair therefore cannot be used to
+/// EXTRACT a value: a caller cannot learn a row's request hash or any of its answers
+/// by guessing, and the one value it could start from — the namespace digest on the
+/// wire — is useless without the hash, which is what check 3 requires.
+///
+/// Be precise about the half that is NOT a guarantee, because an earlier draft of
+/// this doc claimed it and was wrong: existence and ownership CLASS are NOT
+/// concealed. A caller that knows or guesses a namespace digest learns whether a row
+/// exists there — the load-miss arm answers the fail-closed
+/// `verification_not_recorded_reply`, which is distinguishable from the refusal —
+/// and it gets a refusal either way. Collapsing the four authorization failures onto
+/// one sentence removes the per-class oracle; it does not make the probe blind, and
+/// it does not make the load-miss indistinguishable. See
+/// `answer_successor_verification` and `successor_not_observed_reply` for why that
+/// trade is taken deliberately, and for the fact that the successor path has no
+/// operator surface today.
+///
+/// What the pair is NOT is an owner-issued capability: nothing here proves the
+/// owner would have authorised THIS caller to reconcile THAT operation, because
+/// no owner issues a backup-verify succession or reconciliation receipt on this
+/// product. That owner is `backup-capture-owner (#959)`, which is OPEN.
+struct VerifySuccessorEvidence {
+    /// The predecessor operation's durable namespace key.
+    predecessor_namespace_digest: String,
+    /// The predecessor operation's full accepted-identity digest.
+    predecessor_identity_digest: String,
+}
+
+/// The verify shape this route admits: the decoded inline bundle bytes and the
+/// optional succession evidence naming a predecessor operation.
+type AdmittedVerifyBundle = (Vec<u8>, Option<VerifySuccessorEvidence>);
+
+/// Admits the bounded inline bundle bytes one verify frame presents, and its
+/// optional succession evidence.
 ///
 /// Every refusal here is a shape failure decided before any owner is named: a
 /// non-object payload, an unexpected or missing key, a non-string or non-hex
-/// `bundle_hex`, and empty bytes. The returned field and reason are the route's
-/// own shape vocabulary; the owner's refusal vocabulary is never used for a
-/// shape the owner never saw.
-fn admit_verify_bundle(payload: &Value) -> Result<Vec<u8>, (&'static str, String)> {
+/// `bundle_hex`, empty bytes, and a `successor_of` that is not an object of
+/// exactly two 64-hex digests. The returned field and reason are the route's own
+/// shape vocabulary; the owner's refusal vocabulary is never used for a shape the
+/// owner never saw.
+///
+/// `successor_of` is admitted only when present, so the payload is `{bundle_hex}`
+/// or `{bundle_hex, successor_of}` and nothing else. The presence of the key
+/// SELECTS which of the two route bodies runs — a fresh verification or a
+/// reconciliation read of a named predecessor — and no accepted request identity is
+/// constructed at all on the reconciliation path, so it is not accurate to say the
+/// evidence "changes the accepted request identity". What it does change is which
+/// durable row is read and what the answer means, and the two are distinguishable
+/// on the wire: a reconciliation's `operation_id` and `operation_namespace` carry
+/// the PREDECESSOR's values while the envelope correlation stays the caller's own
+/// key.
+///
+/// Admitting the shape here proves nothing about the caller. The two digests are
+/// only checked for 64-hex shape. Every check that decides whether the named
+/// operation may be observed happens AFTER the real store read, and not all of it
+/// is in one function: the `WorkScope` and authority-lineage joins are in
+/// [`successor_may_observe`], while the principal comparison and the
+/// digest-and-archive equality are in [`answer_successor_verification`].
+fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, (&'static str, String)> {
     let Some(object) = payload.as_object() else {
         return Err(("backup.verify", "payload must be a JSON object".to_owned()));
     };
-    if let Err(reason) = require_exact_keys(object, &["bundle_hex"]) {
+    let admitted_keys: &[&str] = if object.contains_key("successor_of") {
+        &["bundle_hex", "successor_of"]
+    } else {
+        &["bundle_hex"]
+    };
+    if let Err(reason) = require_exact_keys(object, admitted_keys) {
         return Err(("backup.verify", reason));
     }
     let bundle_hex = match get_str(object, "bundle_hex") {
@@ -906,32 +1555,109 @@ fn admit_verify_bundle(payload: &Value) -> Result<Vec<u8>, (&'static str, String
             "bundle bytes must be non-empty".to_owned(),
         ));
     }
-    Ok(bundle_raw)
+    if !object.contains_key("successor_of") {
+        return Ok((bundle_raw, None));
+    }
+    let successor = match get_object(object, "successor_of") {
+        Ok(successor) => successor,
+        Err(reason) => return Err(("backup.successor_of", reason)),
+    };
+    if let Err(reason) = require_exact_keys(
+        successor,
+        &[
+            "predecessor_identity_digest",
+            "predecessor_namespace_digest",
+        ],
+    ) {
+        return Err(("backup.successor_of", reason));
+    }
+    let mut digests = [String::new(), String::new()];
+    for (index, key) in [
+        "predecessor_identity_digest",
+        "predecessor_namespace_digest",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let value = match get_str(successor, key) {
+            Ok(value) => value.to_owned(),
+            Err(reason) => return Err(("backup.successor_of", reason)),
+        };
+        if let Err(shape) = sha256_digest_shape(&value, "backup.successor_of") {
+            return Err(("backup.successor_of", shape.reason));
+        }
+        digests[index] = value;
+    }
+    Ok((
+        bundle_raw,
+        Some(VerifySuccessorEvidence {
+            predecessor_namespace_digest: digests[1].clone(),
+            predecessor_identity_digest: digests[0].clone(),
+        }),
+    ))
 }
 
 /// Answers from the durable owner-backed result that owns this operation.
 ///
 /// A different canonical request hash under the same key is the I5.27 identity
 /// conflict: the request performs no transition, and the stored answers are not
-/// projected into a refusal. An equal hash replays the persisted result, whose
-/// stored answers win over anything recomputed on this call, so an exact replay
-/// after a Kernel restart or an Authority Epoch rotation reports the historical
-/// archived-fence relation and the exact receipt proved then. The stored reply
-/// digest is recomputed and must match; a row that cannot rebuild the body it
-/// claims to hold fails closed instead of projecting one it never produced.
+/// projected into a refusal. Since #2883 that hash covers the whole accepted
+/// request identity MINUS the three ambient observation fields (`session_id`,
+/// `resource_generation`, `authority_epoch`) — that is the authoritative field
+/// list, `eliot_ors::BackupVerifyIdentityPreimage`, and it is not restated here.
+/// So a changed archive, declared source, class, `WorkScope` or admitted
+/// capability under one bound key conflicts instead of reading as a replay, and
+/// nothing is stored.
+///
+/// A changed authority LINEAGE is NOT one of those, and cannot be: the lineage is
+/// a key component, so a lineage change MOVES the key and stages a new row
+/// rather than conflicting on the old one. That is deliberate and disclosed at
+/// `eliot_ors::BackupVerifyRequestIdentity::namespace_digest`; cross-authority
+/// separation is worth more than cross-lineage conflict detection.
+///
+/// An equal hash replays the persisted result, whose stored answers win over
+/// anything recomputed on this call, so an exact replay after a Kernel restart or
+/// an Authority Epoch rotation reports the historical archived-fence relation and
+/// the exact receipt proved then. That replay is possible at all because neither
+/// the restart nor the rotation is in the hash or in the key: they are recorded as
+/// ambient observation context, so the same operation retried later addresses the
+/// same row instead of staging a second one (I14.21). The stored reply digest is
+/// recomputed and must match; a row that cannot rebuild the body it claims to hold
+/// fails closed instead of projecting one it never produced.
+///
+/// This is a REPLAY of the CALLER'S PRINCIPAL's own operation, not a
+/// reconciliation of somebody else's, so the envelope correlation and the
+/// `operation_id` field are the same value and are both the caller's own key. The
+/// row is the row of the CALLER'S PRINCIPAL at the PRINCIPAL's namespace key — not
+/// "the caller's own row at the caller's own key" in any per-session sense: a NEW
+/// SESSION of that same principal, in the same scope, replaying it here with no
+/// reconciliation evidence at all, is the INTENDED I14.21 behaviour, not a
+/// reconciliation. That is what acceptance clause 2 and I14.21 require, and it is
+/// why `session_id` is ambient. A caller that is NOT that principal cannot reach
+/// this function at all: the key is namespaced by principal, and the
+/// reconciliation path exists for the non-owner case and answers from
+/// `answer_successor_verification`.
+///
+/// It is one of exactly TWO producers of [`identity_conflict_reply`], the other
+/// being [`answer_failed_stage`]. Both are safe for the same reason: each is about
+/// the CALLER'S PRINCIPAL's own key, and the digest each names is either its own
+/// freshly computed one or a row at its own key. [`answer_failed_stage`] is
+/// genuinely reachable, not merely defensive: two different archives that share a
+/// declared `export_id` produce the same key with the same principal and the same
+/// scope but different canonical request hashes, so the store reports a conflict and
+/// that branch answers.
 fn answer_bound_verification(
     record: &BackupVerificationResultRecord,
     fresh: &VerifiedProjection,
     idempotency_key: &str,
 ) -> Value {
     if record.request_digest != fresh.request_digest {
-        return identity_conflict_reply(
-            idempotency_key,
-            Some(record.request_digest.as_str()),
-            fresh.request_digest.as_str(),
-        );
+        return identity_conflict_reply(idempotency_key, fresh.request_digest.as_str());
     }
-    let body = verified_reply(&projection_from_record(record), idempotency_key);
+    let Ok(stored) = projection_from_record(record) else {
+        return verification_not_recorded_reply(idempotency_key);
+    };
+    let body = verified_reply(&stored, idempotency_key, idempotency_key);
     match reply_body_digest(&body) {
         Ok(digest) if digest == record.reply_digest => body,
         _ => verification_not_recorded_reply(idempotency_key),
@@ -941,27 +1667,59 @@ fn answer_bound_verification(
 impl KernelComposition {
     /// Handles one backup verify frame: admits the bounded inline bundle bytes,
     /// then decodes and validates them through the real capture owner and binds
-    /// the decided answer to this operation's durable identity.
+    /// the decided answer to the exact authenticated request identity.
     ///
     /// The owner is [`super::backup_capture::KernelBackupCapture`], already bound
     /// on the composition by #959; this route supplies only what a front door
     /// legitimately holds: the presented bytes, the session's own admission
     /// projection, the Kernel's live state fence, and the request's stable
-    /// operation identity. Manifest, member integrity, the closed class rules
-    /// and the archived-fence relation are the owner's answers, so a corrupted
-    /// archive refuses as a typed `invalid` carrying the owner's own reason
-    /// instead of a shape check passing. Shape failures refuse as `invalid`
-    /// before the owner is called at all.
+    /// operation identity. Manifest, member integrity, the closed class rules,
+    /// the archive's own source/provenance commitments and the archived-fence
+    /// relation are the owner's answers, so a corrupted archive refuses as a
+    /// typed `invalid` carrying the owner's own reason instead of a shape check
+    /// passing. Shape failures refuse as `invalid` before the owner is called at
+    /// all.
     ///
-    /// The durable readback is consulted before the expensive recompute, and a
-    /// store outage fails closed there: an answer must never be returned for a
-    /// result that could not be bound to this operation's identity. A decided
-    /// answer is recorded under the request's own idempotency key before it is
-    /// returned, so an exact replay after a Kernel restart or an Authority Epoch
-    /// rotation reads the same owner-backed result back - retaining its
-    /// historical fence and its exact member denominators - while a changed
-    /// archive under the same identity is an `IDENTITY_CONFLICT` that performs
-    /// no transition (I5.27, I14.21).
+    /// Order since #2883: shape-admit, then [`admit_backup_caller`], then the
+    /// real capture owner, then the accepted request identity, then the durable
+    /// readback, then the decision, then the record. The owner must run BEFORE
+    /// the readback now, because the request identity is built from the owner's
+    /// own archive provenance: the owner answer, not the caller text, decides
+    /// which durable row this operation is. The front-door checks in
+    /// [`dispatch_backup_frame`] and in `admit_backup_caller` are unchanged and
+    /// still run before any of this.
+    ///
+    /// The durable readback is keyed by the accepted identity's namespace digest —
+    /// principal, authority lineage, operation id and the four profile constants,
+    /// enumerated in exactly one place,
+    /// `eliot_ors::BackupVerifyRequestIdentity::namespace_digest` — and never by the
+    /// caller's idempotency text, so two principals that pick the same human key
+    /// land on different rows and can neither read nor conflict with each other.
+    /// There is no in-band installation component: "within one installation" is
+    /// structural, because a row is only ever read out of the ORS file that owns
+    /// it. A store outage still fails closed: an answer is never returned for a
+    /// result that could not be bound to this identity. A decided answer is recorded
+    /// under that namespace key before it is returned, so an exact replay by the
+    /// owning PRINCIPAL after a Kernel restart or an Authority Epoch rotation reads
+    /// the same owner-backed result back - retaining its historical fence and its
+    /// exact member denominators - because neither the restart nor the rotation is in
+    /// the key or in the request hash. A new SESSION of that same principal
+    /// replaying it here, with no `successor_of` at all, is the intended I14.21
+    /// behaviour and not a reconciliation. A changed archive, declared source,
+    /// class, `WorkScope` or admitted capability under one bound key is an
+    /// `IDENTITY_CONFLICT` that performs no transition and stores nothing (I5.27,
+    /// I14.21); a changed authority LINEAGE is not one of those, because it is a key
+    /// component, so it moves the key and stages a new row instead.
+    ///
+    /// `successor_of` is therefore for exactly one case: a caller that is NOT the
+    /// principal owning the operation, which the namespace key cannot otherwise
+    /// separate from it. Such a reconciliation answers from the NAMED predecessor's
+    /// own row, not from a recompute of the presented bytes, so the presented bundle
+    /// must be that predecessor's archive: the freshly decoded
+    /// `report.archive_sha256` is compared against the stored
+    /// `identity.archive_sha256` before anything is projected. The bundle is still
+    /// decoded and validated first either way, so a reconciliation never skips the
+    /// capture owner's admission gate.
     ///
     /// The command stays read-only in every other respect: no restore, no
     /// activation, no cutover, no key availability, no Product readiness and no
@@ -972,8 +1730,8 @@ impl KernelComposition {
         payload: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TransportError> {
-        let bundle_raw = match admit_verify_bundle(payload) {
-            Ok(bundle_raw) => bundle_raw,
+        let (bundle_raw, successor) = match admit_verify_bundle(payload) {
+            Ok(admitted) => admitted,
             Err((field, reason)) => {
                 return Ok(invalid_reply(
                     BACKUP_VERIFY_OPERATION,
@@ -984,9 +1742,6 @@ impl KernelComposition {
             }
         };
         let caller = admit_backup_caller(session)?;
-        let Ok(prior) = self.load_prior_verification(idempotency_key) else {
-            return Ok(verification_not_recorded_reply(idempotency_key));
-        };
         let report = match self.backup_capture().verify_only(
             &bundle_raw,
             &caller,
@@ -999,49 +1754,289 @@ impl KernelComposition {
         if let Some(refusal) = undecided_report_reply(&report, idempotency_key) {
             return Ok(refusal);
         }
-        let Ok(request_digest) = backup_verify_request_digest(&report.archive_sha256) else {
-            return Ok(verification_not_recorded_reply(idempotency_key));
-        };
-        let fresh = match projection_from_report(&report, request_digest) {
-            Ok(fresh) => fresh,
+        // A permitted successor reconciles a prior operation by naming it
+        // exactly, and that answer comes from the predecessor's own row. It is
+        // answered before the fresh identity is even built, because a
+        // reconciliation is a read of another operation, not a new one. The live
+        // session, the admitted caller and the freshly decoded owner report are
+        // all handed in: a reconciliation must additionally prove that THIS caller
+        // may observe THAT operation, and that the archive just decoded from the
+        // presented bytes is the predecessor's archive.
+        if let Some(successor) = successor {
+            return Ok(self.answer_successor_verification(
+                session,
+                &report,
+                &successor,
+                idempotency_key,
+            ));
+        }
+        let identity = match backup_verify_identity(session, &caller, &report, idempotency_key) {
+            Ok(identity) => identity,
             Err(reason) => {
                 return Ok(invalid_reply(
                     BACKUP_VERIFY_OPERATION,
                     idempotency_key,
-                    "backup.class_ceiling",
+                    "backup.verify",
                     &bounded_reason(&reason),
                 ));
             }
         };
-        Ok(self.answer_backup_verify(prior, &fresh, idempotency_key))
+        let Ok(request_digest) = backup_verify_request_digest(&identity) else {
+            return Ok(verification_not_recorded_reply(idempotency_key));
+        };
+        let Ok(record_key) = identity.namespace_digest() else {
+            return Ok(verification_not_recorded_reply(idempotency_key));
+        };
+        let fresh =
+            match projection_from_report(&report, &identity, request_digest, record_key.clone()) {
+                Ok(fresh) => fresh,
+                Err(reason) => {
+                    return Ok(invalid_reply(
+                        BACKUP_VERIFY_OPERATION,
+                        idempotency_key,
+                        "backup.class_ceiling",
+                        &bounded_reason(&reason),
+                    ));
+                }
+            };
+        let Ok(prior) = self.load_prior_verification(record_key.as_str(), idempotency_key) else {
+            return Ok(verification_not_recorded_reply(idempotency_key));
+        };
+        Ok(self.answer_backup_verify(prior, &identity, &fresh, idempotency_key))
     }
 
-    /// Reads the durable verification result already bound to this operation.
+    /// Reads the durable verification result already bound to this scoped
+    /// identity, and quarantines a pre-#2883 row on the caller's raw text.
     ///
-    /// A store failure is returned, never flattened into "absent": a store
-    /// outage that silently downgraded to a non-persisted answer would let this
-    /// route answer `ok` for a verification with no durable result behind it,
-    /// which A0.3 classifies as a false proof claim. The caller fails closed.
+    /// `record_key` is the accepted identity's 64-hex namespace digest, not caller
+    /// text. A scoped lookup that finds nothing is NOT proof that nothing is stored
+    /// under the caller's own text, so the raw key is probed as well and its class
+    /// is carried through rather than collapsed into "absent":
+    /// [`LegacyUnscopedBackupVerificationClass::Absent`] is the only arm that lets a
+    /// fresh row be staged, `Legacy` is quarantined, and `Unreadable` fails closed.
+    /// Both probes return store failures rather than degrading, because a store
+    /// outage that silently downgraded to a non-persisted answer would let this route
+    /// answer `ok` for a verification with no durable result behind it, which A0.3
+    /// classifies as a false proof claim.
     fn load_prior_verification(
         &self,
+        record_key: &str,
         idempotency_key: &str,
     ) -> Result<PriorVerification, OrsError> {
-        match self
-            .p07_ors
-            .load_backup_verification_result(idempotency_key)?
-        {
+        match self.p07_ors.load_backup_verification_result(record_key)? {
             Some(record) => Ok(PriorVerification::Bound(Box::new(record))),
-            None => Ok(PriorVerification::Absent),
+            None => Ok(
+                match self
+                    .p07_ors
+                    .legacy_unscoped_backup_verification_class(idempotency_key)?
+                {
+                    LegacyUnscopedBackupVerificationClass::Absent => PriorVerification::Absent,
+                    LegacyUnscopedBackupVerificationClass::Legacy => {
+                        PriorVerification::LegacyUnscoped
+                    }
+                    LegacyUnscopedBackupVerificationClass::Unreadable => {
+                        PriorVerification::Unreadable
+                    }
+                },
+            ),
+        }
+    }
+
+    /// Answers one reconciliation from the predecessor row the caller named.
+    ///
+    /// Three independent things are proved before anything is projected.
+    ///
+    /// (1) The caller is admitted for this front door in the SAME scope as the
+    /// predecessor. The reconciling session is already authenticated and admitted
+    /// by the time this runs — [`admit_backup_caller`] proved the peer identity
+    /// and the single front-door capability, and `verify_only` →
+    /// `require_capture_admitted` refused an unadmitted caller before this point —
+    /// so these are additional joins on facts the live `Session` already holds,
+    /// not a new admission gate and not a re-implementation of one. The joins are
+    /// enumerated, with what is deliberately excluded and why, in
+    /// [`successor_may_observe`]. The authority term is lineaged rather than
+    /// exact, so a legitimate epoch rotation on this installation's own lineage
+    /// is still a permitted reconciliation, which is exactly what instruction 7
+    /// allows, while a foreign authority lineage is refused.
+    ///
+    /// The PRINCIPAL compare is a FOURTH check and a separate call site, not part
+    /// of [`successor_may_observe`] — see that function's own note on what it
+    /// deliberately does not compare. It is the one check a same-scope caller on the
+    /// same lineage would otherwise slip past, and the one that makes `successor_of`
+    /// a non-owner case at all. Like the other three it answers with
+    /// [`successor_not_observed_reply`], so the four are indistinguishable to a
+    /// caller that fails one.
+    ///
+    /// (2) The named predecessor is a real stored `backup.verify` row in that
+    /// scope, and it is exactly the row the caller named: the presented
+    /// `predecessor_identity_digest` must equal the stored row's canonical
+    /// request hash, which covers the row's principal, `WorkScope`, operation id and
+    /// archive provenance. A namespace key alone is therefore not a succession
+    /// claim.
+    ///
+    /// (3) The presented archive IS that predecessor's archive: the freshly
+    /// decoded `report.archive_sha256` must equal the stored
+    /// `identity.archive_sha256`. Without this the caller could present a valid
+    /// but different archive and be answered with the predecessor's identity,
+    /// class, counts and fence relation, which would be a projection about bytes
+    /// the caller did not present.
+    ///
+    /// The answer then keeps BOTH facts the transport needs. The envelope
+    /// correlation is always the reconciling caller's own `idempotency_key`,
+    /// because that is what the operator surface correlates against and a
+    /// different value is a `CorrelationMismatch`; the `operation_id` field and
+    /// the `operation_namespace` field carry the PREDECESSOR's, because that is
+    /// the operation that produced the answer and the original operation identity
+    /// must not be re-spelled as the reconciling caller's.
+    ///
+    /// The `reply_digest` check is preserved, not dropped, and it is checked
+    /// against the body the PREDECESSOR would have projected: the stored digest
+    /// was computed over the predecessor's own reply, so it is recomputed from
+    /// `verified_reply(projection, stored.identity.operation_id,
+    /// stored.identity.operation_id)` before the answer is re-projected with the
+    /// caller's correlation. That is the only thing that makes a stored row safe
+    /// to project at all — it proves the row can still rebuild the exact body it
+    /// claims to hold — so a row that cannot is `verification_not_recorded_reply`
+    /// rather than a re-projected answer nobody can check. The two bodies differ
+    /// in exactly one field, the envelope `idempotency_key`, and the `ok`
+    /// projection is a pure function of the row plus that correlation.
+    ///
+    /// NO CALLER-SUPPLIED-DIGEST PATH CAN RENDER A STORED VALUE, AND NONE OF THEM
+    /// NAMES A CLASS EITHER, BUT THE ONE-SENTENCE CLAIM IS ABOUT THE AUTHORIZATION
+    /// ARMS ONLY, NOT ALL SIX ARMS OF THIS FUNCTION. This function has six refusal
+    /// call sites, and they answer with TWO different sentences:
+    /// - the three AUTHORIZATION call sites — the scope/lineage join, the separate
+    ///   principal compare, and the presented-digest + presented-archive compare —
+    ///   all answer with the ONE [`successor_not_observed_reply`], whose reason is a
+    ///   single static sentence naming no principal, no session, no scope, no
+    ///   lineage, no digest, no archive identity, no count and no store error;
+    /// - the three INTEGRITY/NO-ROW call sites — the load miss, the row that cannot
+    ///   be rebuilt, and the `reply_digest` that does not re-derive — all answer
+    ///   with the fail-closed [`verification_not_recorded_reply`], the same refusal
+    ///   the caller's OWN replay path returns for a key holding nothing
+    ///   trustworthy. So a caller CAN distinguish "there is no row at that key" (and
+    ///   "a row whose body does not verify") from "there is a row you may not read".
+    ///
+    /// That residue is deliberate and it is the non-concealment paragraph below
+    /// stated in the other direction: it is an OUTAGE signal, not an authorization
+    /// oracle, because every one of those three arms is equally reachable by the
+    /// caller for its own key. Collapsing them onto the authorization sentence would
+    /// only hide a store fault behind an authorization refusal.
+    ///
+    /// Be precise about what the collapse does and does not buy, because the two are
+    /// different and only one is a guarantee:
+    /// - It DOES guarantee that no stored VALUE is extractable. Every field of the
+    ///   predecessor's row, and every digest computed from it, stays inside the
+    ///   store unless all checks pass.
+    /// - It does NOT conceal existence or ownership CLASS. A caller that knows or
+    ///   guesses a namespace digest can still learn whether a row exists there, and
+    ///   it always gets a refusal either way, so a refusal is not proof of absence.
+    ///   Distinguishing "no such row" from "a row you may not read" would require
+    ///   the typed classes this path used to have, and those classes were themselves
+    ///   the oracle. That trade is deliberate. It is also not currently observable
+    ///   by the shipped product: the successor path has NO operator surface, because
+    ///   `crates/surfaces/eliot-cli/src/backup.rs` builds the verify payload from
+    ///   `CommandArguments::BackupVerify { bundle_hex }` only and cannot send
+    ///   `successor_of` at all. A frame-level consumer could observe it; the CLI
+    ///   cannot.
+    ///
+    /// RESIDUAL, stated rather than softened. What this route proves is: (a) the
+    /// caller is admitted for the front door, by [`admit_backup_caller`] and by
+    /// `verify_only`'s own `require_capture_admitted`, before this function runs;
+    /// (b) the caller is in the same `WorkScope` and on the same authority LINEAGE as
+    /// the named predecessor; and (c) the named predecessor is a real stored
+    /// `backup.verify` row in this ORS file, whose canonical request hash — which
+    /// covers its PRINCIPAL, `WorkScope`, operation id and archive provenance, and
+    /// provably NOT its session — is exactly the one presented, and whose archive is
+    /// exactly the one presented. The predecessor's own SESSION is deliberately not
+    /// required to match and is deliberately not covered by the hash, and the
+    /// justification is not a claim that the hash names it: a new session inheriting
+    /// a prior session's operation is the ENTIRE POINT of a succession, so requiring
+    /// session equality would make every reconciliation impossible.
+    ///
+    /// What it does NOT prove is that the owner would authorise THIS caller to
+    /// reconcile THAT operation, because no owner issues a backup-verify succession
+    /// or reconciliation receipt on this product. That owner is
+    /// `backup-capture-owner (#959)`, which is OPEN. Instruction 4's
+    /// "owner-authorized" half is therefore NOT met on this product, and it cannot
+    /// be met here without inventing a capability, a receipt type, or an owner value
+    /// that does not exist.
+    ///
+    /// # OPEN POINT FOR THE OWNER — the issue's clause-1 phrase. Clause 1 says "two
+    /// authenticated principals OR SESSIONS" may use the same human idempotency text
+    /// without reading or conflicting with each other's verification operation. Read
+    /// per-SESSION, that would require `session_id` in the durable key. This
+    /// implementation reads it per-PRINCIPAL, because acceptance clause 2 ("exact
+    /// replay by the OWNING IDENTITY returns the same durable result after restart")
+    /// and I14.21 (a retry after a lost response necessarily arrives on a NEW session
+    /// and must reconcile to the committed result) cannot both hold if the key moves
+    /// with the session. Note also that in this codebase
+    /// `CaptureCallerAuth::principal` is `format!("{user_identity}@{session_identity}")`,
+    /// so "principal/session" is already one composite string at the capture owner.
+    /// The reading is DISCLOSED here for the owner to settle and is deliberately NOT
+    /// resolved in code; no change here could resolve it without breaking clause 2.
+    fn answer_successor_verification(
+        &self,
+        session: &Session,
+        report: &CaptureReport,
+        successor: &VerifySuccessorEvidence,
+        idempotency_key: &str,
+    ) -> Value {
+        let Ok(Some(stored)) = self
+            .p07_ors
+            .load_backup_verification_result(successor.predecessor_namespace_digest.as_str())
+        else {
+            return verification_not_recorded_reply(idempotency_key);
+        };
+        // (1) FIRST, before any digest is compared and before the row is used for
+        // anything observable. (2) and (3) follow. All three checks still run, in
+        // this order, before any projection — only the ANSWER they produce is
+        // shared, so a refusal cannot be used to tell the cases apart.
+        if !successor_may_observe(session, &stored) {
+            return successor_not_observed_reply(idempotency_key);
+        }
+        let Ok(caller_principal) = successor_caller_principal(session) else {
+            return successor_not_observed_reply(idempotency_key);
+        };
+        if stored.identity.principal != caller_principal {
+            return successor_not_observed_reply(idempotency_key);
+        }
+        if stored.identity.identity_digest != successor.predecessor_identity_digest
+            || stored.identity.archive_sha256 != report.archive_sha256
+        {
+            return successor_not_observed_reply(idempotency_key);
+        }
+        let Ok(projection) = projection_from_record(&stored) else {
+            return verification_not_recorded_reply(idempotency_key);
+        };
+        // Verify the row can still rebuild the exact body it claims to hold,
+        // using the predecessor's OWN correlation, because that is the body the
+        // stored digest was computed over.
+        let predecessor_body = verified_reply(
+            &projection,
+            stored.identity.operation_id.as_str(),
+            stored.identity.operation_id.as_str(),
+        );
+        match reply_body_digest(&predecessor_body) {
+            Ok(digest) if digest == stored.reply_digest => verified_reply(
+                &projection,
+                idempotency_key,
+                stored.identity.operation_id.as_str(),
+            ),
+            _ => verification_not_recorded_reply(idempotency_key),
         }
     }
 
     /// Answers one decided verification from the owner report and the store.
     ///
-    /// Every branch either replays the persisted owner-backed result or records
-    /// the fresh one first, so an `ok` reply never precedes its durable row.
+    /// Every branch either replays the persisted owner-backed result, refuses a
+    /// class the store named, or records the fresh one first, so an `ok` reply
+    /// never precedes its durable row and a refusal never carries a stored
+    /// projection.
     fn answer_backup_verify(
         &self,
         prior: PriorVerification,
+        identity: &BackupVerifyRequestIdentity,
         fresh: &VerifiedProjection,
         idempotency_key: &str,
     ) -> Value {
@@ -1049,7 +2044,15 @@ impl KernelComposition {
             PriorVerification::Bound(record) => {
                 answer_bound_verification(&record, fresh, idempotency_key)
             }
-            PriorVerification::Absent => self.stage_backup_verification(fresh, idempotency_key),
+            PriorVerification::LegacyUnscoped => legacy_unscoped_evidence_reply(idempotency_key),
+            // Fail closed: bytes are stored under this caller's text and decode as
+            // neither shape. Staging over them would destroy evidence and answer
+            // `ok` for a verification whose prior answer is still on disk, so the
+            // only honest answer is no verification result at all.
+            PriorVerification::Unreadable => verification_not_recorded_reply(idempotency_key),
+            PriorVerification::Absent => {
+                self.stage_backup_verification(identity, fresh, idempotency_key)
+            }
         }
     }
 
@@ -1057,51 +2060,74 @@ impl KernelComposition {
     ///
     /// Persist-before-answer: the durable row is committed before the body is
     /// returned, so a lost response reconciles to this same persisted result
-    /// (I14.21) rather than re-deriving a differently-fenced one. A concurrent
-    /// stage that already bound this key is answered from the durable winner.
+    /// (I14.21) rather than re-deriving a differently-fenced one — and it
+    /// reconciles to it because the durable key does not move with the session,
+    /// the resource generation or the Authority Epoch, so the retry addresses this
+    /// row. A concurrent stage that already bound this key is answered from the
+    /// durable winner. A fresh verify is not a reconciliation, so the envelope
+    /// correlation and the `operation_id` field are the same value and are both
+    /// the caller's own key.
     fn stage_backup_verification(
         &self,
+        identity: &BackupVerifyRequestIdentity,
         fresh: &VerifiedProjection,
         idempotency_key: &str,
     ) -> Value {
-        let body = verified_reply(fresh, idempotency_key);
+        let body = verified_reply(fresh, idempotency_key, idempotency_key);
         let Ok(reply_digest) = reply_body_digest(&body) else {
             return verification_not_recorded_reply(idempotency_key);
         };
-        let record = record_from_projection(idempotency_key, fresh, reply_digest);
+        let record = record_from_projection(identity, fresh, reply_digest);
         match self.p07_ors.stage_backup_verification_result(&record) {
             Ok(BackupVerificationDisposition::Stored) => body,
+            // `AlreadyBound` means the full canonical request hash already matched,
+            // so the stored principal and session are necessarily the candidate's
+            // own and re-checking them here could never fail. It is answered
+            // directly; the store's own cross-identity branch is below.
             Ok(BackupVerificationDisposition::AlreadyBound(bound)) => {
                 answer_bound_verification(&bound, fresh, idempotency_key)
             }
-            Err(error) => self.answer_failed_stage(&fresh.request_digest, idempotency_key, &error),
+            // Store-side refusal on a row that already occupies this key but whose
+            // stored owner-bearing identity contradicts the candidate. It is
+            // REACHABLE on an ordinary, uncorrupted row, and this is the branch a
+            // reviewer reads first, so say why honestly: `scope_id` is deliberately
+            // NOT a key component, so two sessions of the SAME principal, on the
+            // same lineage, with the same `operation_id` and the same archive but
+            // DIFFERENT `WorkScope`s produce the SAME key. The load and the stage
+            // are two separate redb transactions, so between them a second writer
+            // reads the first's row here: `same_binding` is false because `scope_id`
+            // is in the request hash, and `foreign_to` is true because it is not.
+            // See `BackupVerificationResultRecord::foreign_to` for exactly which
+            // fields it compares. A different PRINCIPAL at the same key would be a
+            // SHA-256 collision and is not reachable through this route; that
+            // narrower case is a hand-edited row, and the same class answers it.
+            // Either way the stored row is never read back, so the typed class is
+            // the whole of what leaves the store.
+            Ok(BackupVerificationDisposition::ForeignOperation) => {
+                foreign_operation_reply(idempotency_key)
+            }
+            Err(error) => answer_failed_stage(&fresh.request_digest, idempotency_key, &error),
         }
     }
+}
 
-    /// Answers after the durable stage did not succeed.
-    ///
-    /// The I5.27 identity conflict is the one stage failure that is an answer
-    /// rather than an outage, so the bound digest is read back to make the
-    /// refusal concrete. Every other failure is an outage: the effect was not
-    /// recorded, and this route must not answer `ok` for it.
-    fn answer_failed_stage(
-        &self,
-        presented_request_digest: &str,
-        idempotency_key: &str,
-        error: &OrsError,
-    ) -> Value {
-        if !is_backup_verification_conflict(error) {
-            return verification_not_recorded_reply(idempotency_key);
-        }
-        let bound = match self
-            .p07_ors
-            .load_backup_verification_result(idempotency_key)
-        {
-            Ok(Some(record)) => Some(record.request_digest),
-            Ok(None) | Err(_) => None,
-        };
-        identity_conflict_reply(idempotency_key, bound.as_deref(), presented_request_digest)
+/// Answers after the durable stage did not succeed.
+///
+/// The I5.27 identity conflict is the one stage failure that is an answer rather
+/// than an outage, and it needs no readback: the refusal names only the caller's
+/// own presented digest, so there is nothing to make concrete by reading the
+/// bound row back, and that readback was the only reason this decision needed the
+/// namespace key or the composition. Every other failure is an outage: the effect
+/// was not recorded, and this route must not answer `ok` for it.
+fn answer_failed_stage(
+    presented_request_digest: &str,
+    idempotency_key: &str,
+    error: &OrsError,
+) -> Value {
+    if !is_backup_verification_conflict(error) {
+        return verification_not_recorded_reply(idempotency_key);
     }
+    identity_conflict_reply(idempotency_key, presented_request_digest)
 }
 
 /// Validates the restore target shape and binds the exact authority tuple,
