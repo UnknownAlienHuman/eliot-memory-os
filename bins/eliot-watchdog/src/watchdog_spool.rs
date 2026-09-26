@@ -1048,7 +1048,6 @@ impl WatchdogSpool {
                 observation_digest,
                 lineage,
                 observed_at_ms,
-                producer_generation,
             )?);
         }
         state.record_observation(intent::GovernorIntentObservationRecord {
@@ -1104,8 +1103,10 @@ impl WatchdogSpool {
         observation_digest: &str,
         lineage: intent::IntentLineage,
         observed_at_ms: u64,
-        producer_generation: u64,
     ) -> Result<(intent::WatchdogIntentClass, intent::GovernorIntentEmission), SpoolError> {
+        // The recording generation is the lineage's own, so it is read here
+        // rather than passed alongside it: one source, not two that can disagree.
+        let producer_generation = lineage.watchdog_generation();
         // The threshold evidence of the episode including this crossing
         // observation: exactly one digest per unit of threshold progress,
         // and never more than the bounded evidence frame.
