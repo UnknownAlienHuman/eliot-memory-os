@@ -1665,6 +1665,17 @@ pub struct PredecessorRetirementRelation {
     /// Activation the issuer recorded for the predecessor it retires.
     pub activation_id: PlatformHandle,
     /// Host activation lineage the issuer recorded for `retired_host`.
+    ///
+    /// This is the retired epoch's own recorded transition, which is what an
+    /// issuer can actually observe for a predecessor. It is NOT the activation
+    /// that owned the predecessor generation: that transition lives in the retired
+    /// epoch's own log (`EliotActivationRecord`) and no current owner retains it
+    /// once the epoch is retired. An [`EpochRetirementRecord`] therefore carries
+    /// two distinct `activation_generation`-named fields - this one, and
+    /// `fence.activation_generation` for the activation performing the cutover -
+    /// holding different values. Neither is checked against the other, and a
+    /// reader must not treat this field as proof of the activation that owned the
+    /// retired generation.
     pub activation_generation: EpochTransition,
     /// Authority fence under which the issuer observed the mapping.
     pub state_fence: StateFence,
@@ -1673,13 +1684,104 @@ pub struct PredecessorRetirementRelation {
     pub cutover_operation: IdempotencyIdentity,
     /// Owner that issued the relation.
     pub relation_issuer: PlatformHandle,
-    /// Owner-recorded issuance instant.
+    /// Issuer-recorded issuance identity for this exact relation.
+    ///
+    /// This is deliberately NOT a wall-clock reading. The issuer supplies it and
+    /// [`PredecessorRetirementRelation::issue`] covers it with `relation_digest`,
+    /// so it is a currentness commitment over the owner read that produced the
+    /// relation rather than a timestamp the effect could fabricate. A pure crate
+    /// that may not read a clock (and the Host journal owner is one) therefore
+    /// still issues a reproducible value.
+    ///
+    /// What it commits to is exactly what the issuer hashed into it - the
+    /// owner-read facts behind this relation. This record cannot itself verify
+    /// that set; a reader must compare it against the issuer's own inputs. An
+    /// issuer that omits a fact it consumed produces an `issued_at` that does not
+    /// move when that fact changes, so the field is only as strong as the issuer's
+    /// construction of it.
     pub issued_at: PlatformHandle,
     /// Canonical digest over the contract separator and every field above.
     pub relation_digest: PlatformHandle,
 }
 
 impl PredecessorRetirementRelation {
+    /// Constructs one relation from issuer-proved facts and returns it only if
+    /// it validates.
+    ///
+    /// `relation_digest` and `retired_host_epoch_digest` are NOT inputs: both are
+    /// re-derived here from the values that were supplied, and the finished record
+    /// is validated before it is handed back. So a caller cannot present a mapping
+    /// whose digest was computed over different contents (I5.27).
+    ///
+    /// This is a convenience that makes the correct construction the easy one, NOT
+    /// a gate. The type's fields are `pub`, it is not `#[non_exhaustive]`, it
+    /// derives `Deserialize`, and this constructor is `pub` - so any dependent
+    /// crate can equally build a value and recompute the digest by the documented
+    /// canonical formula. Nothing may treat "built by `issue`" as provenance.
+    /// What actually bounds a forged relation is structural and lives elsewhere:
+    /// the retirement effect accepts no relation from any caller, and this
+    /// journal's own reducer re-checks a record's relation against the retained
+    /// cutover intent before it is admitted.
+    ///
+    /// It grants no authority by itself. A relation proves a mapping only for the
+    /// cutover operation it names, and it becomes durable evidence only when the
+    /// journal owner appends it inside an [`EpochRetirementRecord`] whose
+    /// `retired_host` is the same epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Invalid`] when a supplied fact fails this record's
+    /// own validation - for example a `retired_host` belonging to another
+    /// installation, an unusable handle, or a `state_fence` the fence contract
+    /// rejects. It does NOT report a mismatched epoch digest: that field is
+    /// computed from `retired_host` here, so it cannot disagree unless the epoch
+    /// itself is invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        installation: PlatformHandle,
+        predecessor_generation: PlatformHandle,
+        retired_host: HostInstallationEpoch,
+        activation_id: PlatformHandle,
+        activation_generation: EpochTransition,
+        state_fence: StateFence,
+        cutover_operation: IdempotencyIdentity,
+        relation_issuer: PlatformHandle,
+        issued_at: PlatformHandle,
+    ) -> Result<Self, JournalError> {
+        let mut value = Self {
+            contract: PlatformHandle::new(PREDECESSOR_RETIREMENT_RELATION_CONTRACT).map_err(
+                |error| {
+                    JournalError::Invalid(format!(
+                        "predecessor_relation.contract is not constructible: {error}"
+                    ))
+                },
+            )?,
+            installation,
+            predecessor_generation,
+            retired_host,
+            retired_host_epoch_digest: PlatformHandle::new("pending").map_err(|error| {
+                JournalError::Invalid(format!(
+                    "predecessor_relation.retired_host_epoch_digest is not constructible: {error}"
+                ))
+            })?,
+            activation_id,
+            activation_generation,
+            state_fence,
+            cutover_operation,
+            relation_issuer,
+            issued_at,
+            relation_digest: PlatformHandle::new("pending").map_err(|error| {
+                JournalError::Invalid(format!(
+                    "predecessor_relation.relation_digest is not constructible: {error}"
+                ))
+            })?,
+        };
+        value.retired_host_epoch_digest = host_owner_epoch_digest(&value.retired_host)?;
+        value.relation_digest = value.canonical_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
+
     /// The canonical digest this relation's own field values produce.
     ///
     /// Deterministic and versioned: the contract separator is the first tuple

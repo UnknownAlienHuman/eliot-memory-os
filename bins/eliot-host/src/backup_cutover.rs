@@ -2730,9 +2730,11 @@ fn registry_activation_binds_this_operation(
 /// What the current durable owners can prove about which Host epoch carried one
 /// cutover's exact expected predecessor generation (#2868).
 ///
-/// The installation registry owns generations; the Host journal owns epochs.
-/// Neither durable owner carries both, so this is a two-state answer and the
-/// negative case is a first-class outcome rather than a fallback.
+/// The installation registry's committed activation fence pairs an approved
+/// generation handle with the Host epoch that carried it, and the Host journal
+/// owns the epoch values themselves. So this is a two-state answer derived from a
+/// real owner read, and the negative case is a first-class outcome rather than a
+/// fallback.
 ///
 /// The relation is boxed because it is a full durable record and the other arm
 /// carries nothing; keeping it inline would make every value of this enum as
@@ -2757,7 +2759,7 @@ pub enum PredecessorRelationResolution {
 /// independently, so the retired epoch is whatever the owners name and nothing
 /// else.
 ///
-/// # Why the answer is currently `Unavailable`
+/// # What the owners currently say
 ///
 /// The owner that relates a generation to a Host epoch **does exist**, and it
 /// is the approved-generation/Host-activation handoff #2868 item 1 asks to
@@ -2768,28 +2770,54 @@ pub enum PredecessorRelationResolution {
 /// * its `phase_b_live_binding: Option<PhaseBLiveBinding>` is **mandatory on
 ///   every committed activation** (`ActivationCommitFence::validate` returns
 ///   `IncompleteObservation` without it), and `PhaseBLiveBinding` carries
-///   `host_owner_epoch`, `host_epoch_lineage`, `host_epoch_sequence` and
-///   `host_process_nonce_digest`;
+///   `host_owner_epoch`, `host_epoch_lineage`, `host_epoch_sequence`,
+///   `host_process_nonce_digest`, `effect_id` and `receipt_digest`;
 /// * `validate()` already proves the join internally:
 ///   `provisioned_supervision_authority.candidate_generation == generation`.
 ///
 /// So the join is constructed and owner-checked - for the generation of the
-/// activation being committed. It cannot answer a PREDECESSOR retirement, for
-/// two reasons that are properties of the current owners rather than of this
-/// function:
+/// activation being committed. What stops it from answering a PREDECESSOR
+/// retirement is a property of the current owner, not of this function:
 ///
-/// 1. **Retention.** The registry keeps exactly one such fence -
-///    `last_terminal_activation.commit_fence`, read through
-///    `last_committed_activation_fence()`, the only public reader of that slot.
-///    Staging a new approved generation clears the slot, and staging the target
-///    is a prerequisite of the cutover's registry CAS, so by the time
-///    retirement is authorized the predecessor's generation-to-epoch join is no
-///    longer retained anywhere. (`activate`, which performs the flip, does not
-///    clear it - staging does, earlier.)
-/// 2. **Shape.** The fence describes the activation being COMMITTED, so it
-///    carries no activation id, activation lineage, issuer, or issuance instant
-///    for the epoch being RETIRED. Filling those in would mean inventing values,
-///    which is exactly what a proof-of-mapping record must never do.
+/// 1. **No public reader of the predecessor's copy.** Staging a new approved
+///    generation clears the registry's one-slot terminal projection
+///    (`last_terminal_activation` at `approved_generation_registry.rs:3016`, and
+///    the sibling `active_phase_b_rebind` at `:3022`), and staging the target is
+///    a prerequisite of the cutover's registry CAS. The cutover's own
+///    compare-and-swap never writes that slot - `commit_cutover_activation`
+///    calls only `activate` and `record_cutover_activation` - so the fresh read
+///    in step (1) below comes back with no committed fence at all.
+///
+///    The predecessor's generation-to-epoch join is **not** destroyed, and this
+///    function does not claim it is: `ActiveVerifiedReceiptBinding`
+///    (`approved_generation_registry.rs:2328`) retains a full `commit_fence`
+///    inside the installation transaction's v9 wire, precisely so a retry can
+///    tell the original terminal from a different fence. That copy is
+///    `pub(crate)` and has no reader reachable from `HostComposition`, which is
+///    the actual gap: a missing READER, not a missing record. Exposing it is an
+///    owner correction in `eliot-installation`; this issue's Delivery forbids
+///    building it here.
+///
+/// No second reason is claimed, and none is needed. Every other element the
+/// relation requires is read from an owner rather than invented, and it is worth
+/// being exact about which are CHECKED and which are only CARRIED, because the
+/// difference is the proof's real strength:
+///
+/// * **Checked** - `fence.generation` against this cutover's sealed
+///   `expected_predecessor`, and the binding's `host_epoch_lineage` /
+///   `host_epoch_sequence` against the journal's retained epoch (the Host epoch's
+///   authority identity). That is the whole discriminating join.
+/// * **Carried, not checked against anything** - `binding.effect_id` as the
+///   activation identity, `fence.authority_state_fence` as the authority fence,
+///   and the epoch's own transition as the retired epoch's recorded lineage. They
+///   enter the record and are covered by `relation_digest`; no second owner holds
+///   a value to compare them against, and inventing a comparison is exactly what
+///   an earlier draft of this function wrongly did.
+/// * **Not re-derived here** - the raw process nonce. The only helper computing
+///   that digest (`phase_b_bytes_digest`) is `#[cfg(windows)]` inside the Phase-B
+///   owner. The retired epoch VALUE is the journal's own complete
+///   `HostInstallationEpoch`, so the record still carries the nonce; the proof
+///   rests on the fence plus the epoch-identity join.
 ///
 /// The Host journal cannot supply the missing side either. Its one record that
 /// names installation generations is `CutoverIntentRecord`
@@ -2798,24 +2826,191 @@ pub enum PredecessorRelationResolution {
 /// PERFORMED the cutover, never to the epoch that CARRIED the predecessor
 /// generation. `EpochEvidence` is rebuilt from replayed log bytes and reducer
 /// state without access to any record body, so it cannot carry a generation
-/// either.
+/// either - which is why the epoch is matched here by authority identity and
+/// never selected.
 ///
-/// The join therefore has no owner for this question, and this returns
-/// [`PredecessorRelationResolution::Unavailable`]. That is #2868 item 6's
-/// prescribed outcome, not a guess and not a storage error: the caller refuses
-/// the effect, reports a typed residual and appends nothing (I5.13, A13.7,
-/// I14.21). The `Bound` arm is the seam an owner correction fills - it needs a
-/// per-generation activation fence (or a predecessor-retaining one), and no
-/// further change to the effect.
-///
-/// The parameters are intentionally unused: reading an owner whose answer
-/// cannot change the result, and calling that a measurement, would be exactly
-/// the kind of claim this repository rejects.
+/// The join is therefore read, not assumed, and the answer is whatever the owners
+/// currently say. While no public reader exposes the predecessor's retained copy,
+/// that read is negative and the effect refuses with #2868 item 6's prescribed
+/// outcome: a typed residual, no appended record, no state mutation (I5.13,
+/// A13.7, I14.21, A0.3's "false proof claim" rule). The refusal is DERIVED - the
+/// registry is re-read fresh, validated, and the fence compared - so it is
+/// re-derivable rather than asserted, and the `Bound` arm needs no further change
+/// to this effect once that reader exists.
 pub fn resolve_predecessor_retirement_relation(
-    _host: &HostComposition,
-    _request: &CutoverRequest,
+    host: &HostComposition,
+    request: &CutoverRequest,
+    operation: &CutoverOperationIdentity,
+    journal: &HostState,
 ) -> PredecessorRelationResolution {
+    if let Some(relation) = owner_predecessor_retirement_relation(host, request, operation, journal)
+    {
+        return PredecessorRelationResolution::Bound(Box::new(relation));
+    }
     PredecessorRelationResolution::Unavailable
+}
+
+/// The owner this effect reads a predecessor relation from.
+///
+/// Attribution only, and covered by `relation_digest` like every other field:
+/// the proof that the mapping holds is the fresh owner read itself plus the
+/// canonical digest, never this name.
+const PREDECESSOR_RELATION_ISSUER: &str = "eliot.installation.approved-generation-registry";
+
+/// Derives the predecessor relation from a fresh durable owner read, or returns
+/// `None`.
+///
+/// Every `None` below is a measured fact about an owner, never a constant: step
+/// (1) re-reads the installation registry from its store rather than from the
+/// cached projection, and each later step refuses when what it read does not say
+/// what the retirement would otherwise have to assume. A relation is returned
+/// only when the owner that pairs an approved generation with a Host epoch names
+/// this cutover's exact predecessor and the journal retains exactly that one
+/// epoch, so `Bound` is reachable the moment such a read is possible, and stays
+/// unreachable while it is not.
+///
+/// `journal` is the SAME durable snapshot the caller already matched this
+/// operation's committed intent against. Reusing it is not only cheaper than a
+/// second read: it guarantees the relation is derived from one coherent view of
+/// the journal, so the intent this retirement is authorized by and the epoch it
+/// would retire cannot come from two different observations of a moving owner.
+fn owner_predecessor_retirement_relation(
+    host: &HostComposition,
+    request: &CutoverRequest,
+    operation: &CutoverOperationIdentity,
+    journal: &HostState,
+) -> Option<PredecessorRetirementRelation> {
+    // (1) A FRESH durable owner read, never the cached projection. This file's own
+    //     TOCTOU rule - stated at `execute_cutover` above - is explicit that "the
+    //     fresh owner readback, not the cached projection check, is what the
+    //     effect runs against", and `HostComposition::registry` is documented as a
+    //     revision-keyed, rebuildable cache that "never creates authority or
+    //     freshness" and that this cutover's own compare-and-swap never updates.
+    //     Reading the cache could hand back a fence naming the predecessor from a
+    //     state the durable registry has already superseded, and a relation built
+    //     on that would be persisted as completion evidence - a proof record
+    //     contradicted by its own owner. A store that cannot be opened, loaded or
+    //     validated yields no relation, which refuses the effect.
+    let fresh = {
+        let store = super::open_registry_store_at(&host.registry_host_root).ok()?;
+        let loaded = store.load().ok()?;
+        // Release the bounded writer handle before anything else runs.
+        drop(store);
+        loaded
+    };
+    fresh.validate().ok()?;
+    // The one record that pairs an approved generation handle with the Host epoch
+    // that carried it is the committed activation fence this registry retains -
+    // the approved-generation/Host activation handoff #2868 item 1 asks to reuse.
+    // Nothing else in durable state names both halves: the Host journal's
+    // `EpochEvidence` has no generation field, and its `CutoverIntentRecord` binds
+    // generations to the epoch that PERFORMED the cutover. A fence the owner
+    // itself cannot validate is no evidence, so it is refused rather than trusted.
+    let fence = fresh.last_committed_activation_fence()?;
+    fence.validate().ok()?;
+
+    // (2) That fence must describe THIS cutover's exact expected predecessor, or
+    //     the mapping answers a different question. This is a real discriminator
+    //     and not a formality: the registry retains ONE terminal activation, and
+    //     the cutover's compare-and-swap never writes that slot at all
+    //     (`commit_cutover_activation` calls only `activate` and
+    //     `record_cutover_activation`), so in the real flow it is step (1) above
+    //     that comes back empty. The comparison still belongs here: it is what
+    //     stops a fence for some OTHER generation from being read as this
+    //     cutover's predecessor.
+    if fence.generation != request.expected_predecessor {
+        return None;
+    }
+    // `ActivationCommitFence::validate` already refuses a fence without the
+    // Phase-B binding. It is still read as an option, so that no future fence
+    // shape can silently skip the join this relation depends on.
+    let binding = fence.phase_b_live_binding.as_ref()?;
+
+    // (3) The registry retains the Host epoch as a lineage plus a sequence; the
+    //     epoch value itself lives in the Host journal's own retained-epoch
+    //     evidence. `(installation, lineage_id, sequence)` IS the Host epoch's
+    //     authority identity, so this is an identity join - not a comparison of
+    //     unrelated strings, and not numeric coincidence. Exactly one unretired
+    //     epoch of this installation may match: two matches mean the mapping is
+    //     ambiguous, and taking the first is precisely the arbitrary selection
+    //     #2868 removes, so both refuse rather than choose.
+    let mut candidates = journal.retained_epochs.iter().filter(|retained| {
+        !retained.retired
+            && retained.host.installation == host.host.installation
+            && retained.host.epoch.current.lineage_id.as_str()
+                == binding.host_epoch_lineage.as_str()
+            && retained.host.epoch.current.sequence.get() == binding.host_epoch_sequence
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+
+    // (4) Build the relation from owner-proved values only.
+    //
+    // There is deliberately NO further digest comparison here. An earlier draft
+    // re-derived `host_owner_epoch_digest(&candidate.host)` and compared it to
+    // `binding.host_owner_epoch`, and called that a second join; it was not one.
+    // That digest covers exactly `(installation, lineage_id, sequence)` - the
+    // three values step (3) had already fixed to the binding's - so the check
+    // could never refuse, and presenting a re-read of an already-matched fact as
+    // a measurement is the claim this repository rejects. It was removed rather
+    // than relabelled, because there was no second fact to spend it on.
+    //
+    // `issued_at` is a digest over exactly the owner-read facts this relation
+    // consumes, so an exact replay re-derives it byte-identically while ANY change
+    // in what was read changes it. The raw process nonce is deliberately not
+    // re-verified: the only helper computing that digest (`phase_b_bytes_digest`)
+    // is `#[cfg(windows)]` inside the Phase-B owner, and reimplementing its
+    // formula in another crate is the divergence this repository rejects. The
+    // retired epoch VALUE passed below is the journal's own complete
+    // `HostInstallationEpoch`, so the durable record still carries the exact
+    // nonce; what the proof rests on is the registry's own validated fence plus
+    // the epoch-identity join of step (3).
+    let issued_facts = super::sha256_json(&(
+        "predecessor-relation-issued-at-v1",
+        &fence.generation,
+        &fence.authority_state_fence,
+        &binding.manifest_digest,
+        &binding.receipt_digest,
+        &binding.effect_id,
+        &binding.host_owner_epoch,
+        &binding.host_epoch_lineage,
+        binding.host_epoch_sequence,
+        &candidate.host,
+        &operation.operation_id,
+        &operation.request_digest,
+    ))
+    .ok()?;
+    let issued_at =
+        PlatformHandle::new(format!("predecessor-relation-issued-at:{issued_facts}")).ok()?;
+    PredecessorRetirementRelation::issue(
+        operation.installation.clone(),
+        request.expected_predecessor.clone(),
+        candidate.host.clone(),
+        // The Phase-B materialization effect identity the owner's own public
+        // receipt carries for the activation that published this generation.
+        binding.effect_id.clone(),
+        // The retired epoch's OWN recorded transition - the same value already
+        // matched against the binding's `host_epoch_lineage` /
+        // `host_epoch_sequence` in step (3). Named precisely, because it is NOT
+        // the same thing as `EpochRetirementRecord::fence.activation_generation`
+        // (the activation retiring this cutover) and no owner retains the
+        // ACTIVATION transition that owned the predecessor: `EliotActivationRecord`
+        // lives in the retired epoch's own log, which is not loaded here. This is
+        // one of the two `activation_generation`-named fields in the resulting
+        // record and they hold different values; neither is derived from the
+        // other, and the record does not pretend otherwise.
+        candidate.host.epoch.clone(),
+        fence.authority_state_fence.clone(),
+        IdempotencyIdentity {
+            operation_id: operation.operation_id.clone(),
+            idempotency_key: operation.request_digest.clone(),
+        },
+        PlatformHandle::new(PREDECESSOR_RELATION_ISSUER).ok()?,
+        issued_at,
+    )
+    .ok()
 }
 
 /// Runs the separately authorized prior-generation retirement that completes
@@ -2944,9 +3139,11 @@ pub fn retire_authorized_generation(
     // This runs BEFORE the outstanding-epoch scan below and before any record is
     // appended, because a scan cannot tell the owners apart: with two outstanding
     // prior epochs it is satisfied by either one, and picking the first match is
-    // exactly the arbitrary retirement #2868 removes.
+    // exactly the arbitrary retirement #2868 removes. The sealed operation
+    // identity is passed in, not re-read from the presented request, because the
+    // relation is operation-specific and `request.operation` is unvalidated text.
     let PredecessorRelationResolution::Bound(relation) =
-        resolve_predecessor_retirement_relation(host, request)
+        resolve_predecessor_retirement_relation(host, request, &operation, &journal)
     else {
         observe_cutover_progress("retire_authorize", "relation_unavailable", "unknown", 0);
         return Ok(CutoverOutcome {
@@ -3102,12 +3299,21 @@ fn append_cutover_intent(
 /// outcome; `OutcomeUnknown` reconciles through the choke and never forges
 /// success.
 ///
-/// Private on purpose. `PredecessorRetirementRelation` has public fields and no
-/// restricted constructor, so a `pub` effect taking one would let any dependent
-/// crate mint a relation naming any outstanding epoch and obtain a `Reconciled`
-/// retirement of it - the same arbitrary selection #2868 removes, one level up.
-/// Only [`retire_authorized_generation`], which receives the relation solely
-/// from [`resolve_predecessor_retirement_relation`], can call this.
+/// Private on purpose, and the guarantee does NOT rest on this being private.
+/// `PredecessorRetirementRelation` has public fields, is not
+/// `#[non_exhaustive]`, derives `Deserialize`, and now has a public
+/// `PredecessorRetirementRelation::issue` - so a dependent crate can build a
+/// relation that passes its own `validate()`, and the safety of this boundary
+/// must not be written down as if it could not. What actually holds is
+/// structural: no `pub` entry point accepts a relation from a caller.
+/// [`retire_authorized_generation`] takes none, and the only way it obtains one
+/// is from [`resolve_predecessor_retirement_relation`], which derives it from a
+/// fresh owner read. Defence in depth behind that: the journal owner
+/// independently re-checks the record's relation against the retained intent
+/// (installation, `cutover_operation`, and the intent's own
+/// `expected_predecessor`) and refuses a relation whose `retired_host` differs
+/// from the epoch being retired, so a minted relation has no durable path into a
+/// `Reconciled` retirement even if one were constructed.
 fn retire_prior_generation(
     host: &HostComposition,
     validated: &ValidatedCutover,
