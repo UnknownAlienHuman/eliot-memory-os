@@ -72,7 +72,8 @@ pub use status_projection::{
     SupervisionStatusReason,
 };
 pub use store::{
-    CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
+    CanonicalEvidenceProvider, MAX_BRIDGE_EVENT_HANDOFFS, MAX_BRIDGE_EVENT_RECORDS,
+    OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
 };
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, VersionedArtifact,

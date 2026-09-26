@@ -485,6 +485,9 @@ fn decode_durable_outcome(
     accepted: bool,
     port: &mut KernelMcpForwardingPort,
 ) -> Result<EventPortOutcome, ProviderFailure> {
+    if value.get("disposition").and_then(serde_json::Value::as_str) == Some("backpressure") {
+        return decode_backpressure_outcome(value);
+    }
     if value.get("forwarded").is_some() {
         return Err(event_shape_failure(
             "event reply refused: durable event answered with a best-effort outcome",
@@ -577,6 +580,61 @@ fn decode_best_effort_outcome(
     Ok(EventPortOutcome::BestEffortDropped {
         reason_ref: reason.to_owned(),
     })
+}
+
+/// Closed backpressure-dimension vocabulary answered by the Kernel
+/// delivery-budget owner (issue #2731, item 6). Each saturation names the
+/// exhausted table; the permitted recovery action rides beside it. Unknown
+/// dimensions refuse rather than mapping to a nearby budget.
+fn backpressure_reason(dimension: &str) -> Option<ProviderFailure> {
+    let reason = match dimension {
+        "bridge-event-handoffs" => {
+            "handoff capacity exhausted; reconcile presented namespaces \
+            to retire eligible charges, then retry; the session remains admitted"
+        }
+        "bridge-event-records" => {
+            "event-record capacity exhausted; reconcile presented \
+            namespaces to retire eligible charges, then retry; the session remains admitted"
+        }
+        "bridge-event-capacity" => {
+            "delivery capacity exhausted at insert; reconcile presented \
+            namespaces to retire eligible charges, then retry; the session remains admitted"
+        }
+        "bridge-event-gaps" => {
+            "gap capacity exhausted; reconcile presented namespaces to \
+            retire eligible charges, then retry; the session remains admitted"
+        }
+        _ => return None,
+    };
+    Some(ProviderFailure::new("eliot-kernel-backpressure", reason))
+}
+
+/// Decodes one typed capacity answer on the forward path: `accepted: false`
+/// with the `backpressure` disposition, a closed-vocabulary dimension, and
+/// the permitted recovery action. Surfaces the dimension-naming failure so
+/// the caller can tell a wedged budget from a fence and retry after
+/// legitimate retirement; anything else shaped refuses, never guesses.
+fn decode_backpressure_outcome(
+    value: &serde_json::Value,
+) -> Result<EventPortOutcome, ProviderFailure> {
+    if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false) {
+        return Err(event_shape_failure(
+            "event reply refused: backpressure answer without the determined negative shape",
+        ));
+    }
+    let dimension = value
+        .get("pressure_dimension")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            event_shape_failure("event reply refused: backpressure answer names no dimension")
+        })?;
+    recovery_text(value, "recovery_action")?;
+    match backpressure_reason(dimension) {
+        Some(failure) => Err(failure),
+        None => Err(event_shape_failure(
+            "event reply refused: backpressure dimension is not admitted",
+        )),
+    }
 }
 
 /// Extracts bounded owner text: non-blank, no control characters, within
@@ -1533,6 +1591,34 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let reply = self.exchange(&frame)?;
         let value =
             decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        if value.get("disposition").and_then(serde_json::Value::as_str) == Some("backpressure") {
+            if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
+                || value.get("gap_id").and_then(serde_json::Value::as_str)
+                    != Some(gap.gap_id.as_str())
+            {
+                return Err(event_shape_failure(
+                    "gap reply refused: backpressure answer without the determined negative shape",
+                ));
+            }
+            recovery_text(&value, "recovery_action")?;
+            let dimension = value
+                .get("pressure_dimension")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if dimension != "bridge-event-gaps" {
+                return Err(event_shape_failure(
+                    "gap reply refused: backpressure dimension is not the gap budget",
+                ));
+            }
+            match backpressure_reason(dimension) {
+                Some(failure) => return Err(failure),
+                None => {
+                    return Err(event_shape_failure(
+                        "gap reply refused: backpressure dimension is not admitted",
+                    ));
+                }
+            }
+        }
         if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
             || value.get("gap_id").and_then(serde_json::Value::as_str) != Some(gap.gap_id.as_str())
         {

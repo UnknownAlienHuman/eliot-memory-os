@@ -61,8 +61,8 @@ use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
-    HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
-    RedbRecoveryStore,
+    HostRequestRecord, HostRequestState, MAX_BRIDGE_EVENT_HANDOFFS, MAX_BRIDGE_EVENT_RECORDS,
+    OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
@@ -148,6 +148,36 @@ pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_ev
 /// record owns lifecycle state, so eviction only drops daemon-leg queue
 /// memory and never fabricates admission.
 const MAX_QUEUED_LOCAL_READS: usize = 64;
+
+/// Closed backpressure-dimension vocabulary for bridge-event capacity answers
+/// (issue #2731, item 6). Each saturation names the exhausted table so the
+/// receiver can tell a wedged handoff budget from a full event-record or gap
+/// budget; the permitted recovery action is the same everywhere and rides the
+/// answer beside the dimension.
+const BRIDGE_PRESSURE_HANDOFFS: &str = "bridge-event-handoffs";
+/// Bridge-event record-table dimension: the staged live-event budget.
+const BRIDGE_PRESSURE_RECORDS: &str = "bridge-event-records";
+/// Bridge-event gap-table dimension: the per-stream coverage-gap budget.
+const BRIDGE_PRESSURE_GAPS: &str = "bridge-event-gaps";
+/// Fallback dimension when admission failed with a capacity error but the
+/// post-failure fill probe finds neither table at its cap (a concurrent
+/// retirement freed room in between): the saturation was real at insert
+/// time, only its table attribution is unknown.
+const BRIDGE_PRESSURE_CAPACITY: &str = "bridge-event-capacity";
+/// Permitted recovery action carried by every bridge-event capacity answer:
+/// reconcile the presented namespaces so eligible charges retire, then retry
+/// the refused stage. The session remains admitted; no re-attach is needed.
+const BRIDGE_PRESSURE_RECOVERY_ACTION: &str = "reconcile-presented-namespaces-then-retry";
+/// Bound on retire passes driven inside one maintenance call per presented
+/// namespace (issue #2731, items 4 and 5). Each pass retires at most the
+/// per-recovery budget (64) in its own short transaction; 40 passes cover
+/// 2560 charges, above the table-global 2048 cap, so any backlog that fits
+/// the table converges inside the single recovery entry already running —
+/// including a quiet stream's full receipt-complete backlog on the one
+/// reconcile that will ever present it. The loop still stops early when the
+/// continuation clears or a pass retires nothing, and any remainder keeps
+/// its continuation for the next legitimate recovery entry.
+const MAX_BRIDGE_MAINTENANCE_RETIRE_PASSES: usize = 40;
 
 /// Returns whether the operation string selects the P-04 host-request route.
 ///
@@ -3248,6 +3278,27 @@ impl KernelComposition {
         }
     }
 
+    /// Names the exhausted delivery-budget dimension after a failed stage
+    /// insert (issue #2731, item 6): the post-failure fill probe reports
+    /// which table stood at its cap. Advisory by construction — a
+    /// concurrent retirement may have freed room in between — so an
+    /// unattributed saturation answers the joint capacity dimension rather
+    /// than guessing a table. Called on the stage capacity path only.
+    fn bridge_event_pressure_dimension(&self) -> &'static str {
+        match self.generation_gateway.ors.bridge_event_table_fill() {
+            Ok((records, handoffs)) => {
+                if handoffs >= MAX_BRIDGE_EVENT_HANDOFFS as u64 {
+                    BRIDGE_PRESSURE_HANDOFFS
+                } else if records >= MAX_BRIDGE_EVENT_RECORDS as u64 {
+                    BRIDGE_PRESSURE_RECORDS
+                } else {
+                    BRIDGE_PRESSURE_CAPACITY
+                }
+            }
+            Err(_) => BRIDGE_PRESSURE_CAPACITY,
+        }
+    }
+
     /// Stages one durable/control event with its pre-persistence privacy
     /// decision and records the Governor-intake handoff (Implements #2561,
     /// I7.23 + I5(i)).
@@ -3322,11 +3373,25 @@ impl KernelComposition {
                 // foreign digest or cursor leaks.
                 return self.bridge_event_conflict_response(event, evidence, envelope_sha);
             }
+            Err(OrsError::ProjectionLimitExceeded) => {
+                // Capacity exhaustion is a typed backpressure answer on
+                // the normal reply channel (issue #2731, item 6): the
+                // fill probe names the exhausted dimension and the
+                // answer carries the permitted recovery action, while
+                // the admitted session stays up for the retry.
+                let dimension = self.bridge_event_pressure_dimension();
+                return Ok(bridge_event_backpressure_response(
+                    &event.stream_id,
+                    &event.event_id,
+                    event.sequence,
+                    envelope_sha,
+                    dimension,
+                    None,
+                ));
+            }
             Err(error) => {
                 return Err(match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
+                    OrsError::PayloadTooLarge => TransportError::Backpressure,
                     _ => TransportError::SessionFenced,
                 });
             }
@@ -3347,11 +3412,29 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         // Handoff persist (I5(i)): the staged durable event is handed
-        // toward Governor/coordinator intake under its envelope
-        // digest. The handoff entry is idempotent, so a lost
-        // acknowledgement replays to the existing handoff instead of
-        // a second record; a handoff failure fails closed here while
-        // the durable row stays staged for reconcile recovery.
+        // toward Governor/coordinator intake under its envelope digest;
+        // see the intake-handoff entry below for the idempotency and
+        // capacity semantics.
+        self.record_bridge_intake_handoff(session, event, envelope_sha, &outcome)
+    }
+
+    /// Records the Governor-intake handoff for one staged durable event and
+    /// answers the forward outcome (Implements #2561, I5(i)).
+    ///
+    /// The handoff entry is idempotent, so a lost acknowledgement replays to
+    /// the existing handoff instead of a second record; a handoff failure
+    /// fails closed here while the durable row stays staged for reconcile
+    /// recovery. Handoff-table saturation answers the typed backpressure
+    /// reply with the handoff dimension (issue #2731, item 6) — the event
+    /// row already committed, so the answer also carries its exact pending
+    /// phase instead of a blanket safe-to-resubmit answer.
+    fn record_bridge_intake_handoff(
+        &self,
+        session: &Session,
+        event: &EventEnvelope,
+        envelope_sha: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
         let handoff = serde_json::json!({
             "owner_namespace": outcome
                 .get("owner_namespace")
@@ -3362,21 +3445,31 @@ impl KernelComposition {
             "envelope_sha256": envelope_sha,
             "staging_connection": session.connection_id,
         });
-        self.generation_gateway
+        match self
+            .generation_gateway
             .ors
             .record_bridge_event_handoff_checked(&handoff)
-            .map_err(|error| match error {
-                OrsError::DuplicateConflict => TransportError::IdentityConflict,
-                // Capacity exhaustion is typed backpressure with the
-                // exhausted dimension (issue #2731, item 6): the handoff
-                // table is a bounded delivery budget, never an
-                // authentication failure.
-                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                    TransportError::Backpressure
-                }
-                _ => TransportError::SessionFenced,
-            })?;
-        Ok(bridge_event_forward_response(&outcome, true))
+        {
+            Ok(_) => {}
+            Err(OrsError::DuplicateConflict) => {
+                return Err(TransportError::IdentityConflict);
+            }
+            Err(OrsError::ProjectionLimitExceeded) => {
+                return Ok(bridge_event_backpressure_response(
+                    &event.stream_id,
+                    &event.event_id,
+                    event.sequence,
+                    envelope_sha,
+                    BRIDGE_PRESSURE_HANDOFFS,
+                    Some(BRIDGE_EVENT_PHASE_DURABLE),
+                ));
+            }
+            Err(OrsError::PayloadTooLarge) => {
+                return Err(TransportError::Backpressure);
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        }
+        Ok(bridge_event_forward_response(outcome, true))
     }
 
     /// Answers a same-identity content conflict with the proven owner's
@@ -3510,15 +3603,28 @@ impl KernelComposition {
             "owner_session_epoch".to_owned(),
             serde_json::Value::from(evidence.session_epoch),
         );
-        let outcome = self
+        let gap_id = gap
+            .get("gap_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let outcome = match self
             .generation_gateway
             .ors
             .record_bridge_event_gap_checked(&gap)
-            .map_err(|error| match error {
-                OrsError::DuplicateConflict => TransportError::IdentityConflict,
-                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
-                _ => TransportError::SessionFenced,
-            })?;
+        {
+            Ok(outcome) => outcome,
+            Err(OrsError::DuplicateConflict) => {
+                return Err(TransportError::IdentityConflict);
+            }
+            Err(OrsError::ProjectionLimitExceeded) => {
+                // Capacity exhaustion is a typed backpressure answer on
+                // the normal reply channel (issue #2731, item 6): the
+                // gap-table dimension with the permitted recovery action,
+                // echoing the gap identity, while the session stays up.
+                return Ok(bridge_gap_backpressure_response(gap_id));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         let accepted = outcome
             .get("accepted")
             .and_then(serde_json::Value::as_bool)
@@ -3683,19 +3789,73 @@ impl KernelComposition {
     }
 
     /// Runs the bounded handoff maintenance for one reconciled scope on the
-    /// existing owner recovery path (issue #2731, items 3 and 5): per
+    /// existing owner recovery path (issue #2731, items 3, 4 and 5): per
     /// presented namespace it retires terminal handoffs first so eligible
     /// rows free their charge before the repair slice accounts its bounded
     /// inserts, then restores missing handoffs for retained events under
-    /// their original identities. Both steps are idempotent with finite
-    /// per-call budgets and continuations, so a lost answer replays safely
-    /// and successive legitimate recovery entries converge. Maintenance
-    /// pressure answers typed backpressure (never a cursor reset or a
+    /// their original identities. Retirement converges inside the running
+    /// entry (bounded passes over the per-recovery budget) so a quiet
+    /// stream's full receipt-complete backlog releases on the one reconcile
+    /// presenting it; any remainder keeps its continuation for the next
+    /// legitimate recovery entry. Both steps are idempotent, so a lost
+    /// answer replays safely and successive legitimate recovery entries
+    /// converge. Maintenance pressure answers as a per-namespace pressure
+    /// disposition inside the usable answer (never a cursor reset or a
     /// declaration that missing evidence is complete); any other
     /// maintenance failure fails the frame closed. The per-namespace result
     /// rides the reconcile answer as the `handoff_maintenance` post-key leg,
     /// excluded from the `reconcile_key` preimage by construction (see the
     /// preimage contract on [`Self::answer_bridge_event_reconcile`]).
+    /// Drives one namespace's bounded retirement to convergence inside the
+    /// running recovery entry (issue #2731, items 4 and 5): each pass
+    /// retires at most the per-recovery budget in its own short
+    /// transaction, and the loop stops when the continuation clears, when a
+    /// pass retires nothing (only unactionable rows remain — live payloads
+    /// without receiver evidence, which are never evicted), or at the
+    /// pass cap that still covers any backlog fitting the table. Returns
+    /// the total releases, the residual continuation, and the pressure
+    /// disposition when the store itself reported saturation instead.
+    fn retire_bridge_handoffs_converged(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<(u64, bool, Option<serde_json::Value>), TransportError> {
+        let mut retired_total = 0_u64;
+        let mut continuation = false;
+        for _ in 0..MAX_BRIDGE_MAINTENANCE_RETIRE_PASSES {
+            let retired = match self
+                .generation_gateway
+                .ors
+                .retire_bridge_event_handoffs_checked(request)
+            {
+                Ok(retired) => retired,
+                Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
+                    return Ok((
+                        retired_total,
+                        true,
+                        Some(serde_json::json!({
+                            "pressure_dimension": "bridge-replay-commitments",
+                            "recovery_action": BRIDGE_PRESSURE_RECOVERY_ACTION,
+                        })),
+                    ));
+                }
+                Err(_) => return Err(TransportError::SessionFenced),
+            };
+            let retired_this = retired
+                .get("retired")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            retired_total = retired_total.saturating_add(retired_this);
+            continuation = retired
+                .get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !continuation || retired_this == 0 {
+                break;
+            }
+        }
+        Ok((retired_total, continuation, None))
+    }
+
     fn maintain_bridge_event_handoffs(
         &self,
         batch_namespaces: &[(String, String, u64, u64, u64)],
@@ -3708,38 +3868,50 @@ impl KernelComposition {
                 "expected_revision": revision,
                 "expected_incarnation": incarnation,
             });
-            let retired = self
-                .generation_gateway
-                .ors
-                .retire_bridge_event_handoffs_checked(&maintenance_request)
-                .map_err(|error| match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
-                    _ => TransportError::SessionFenced,
-                })?;
-            let repaired = self
+            let (retired, retirement_continuation, retire_pressure) =
+                self.retire_bridge_handoffs_converged(&maintenance_request)?;
+            let (repaired, repair_continuation, repair_pressure) = match self
                 .generation_gateway
                 .ors
                 .repair_bridge_event_handoffs_checked(&maintenance_request)
-                .map_err(|error| match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
-                    _ => TransportError::SessionFenced,
-                })?;
+            {
+                Ok(repaired) => (
+                    repaired
+                        .get("repaired")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    repaired
+                        .get("repair_continuation")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    None,
+                ),
+                Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
+                    // Repair saturation is a per-namespace pressure
+                    // disposition inside the usable answer (issue #2731,
+                    // item 6), not a failed reconciliation: the retired
+                    // counts above still freed charges, and the retry
+                    // after further retirement restores the missing
+                    // handoffs.
+                    (
+                        0,
+                        true,
+                        Some(serde_json::json!({
+                            "pressure_dimension": BRIDGE_PRESSURE_HANDOFFS,
+                            "recovery_action": BRIDGE_PRESSURE_RECOVERY_ACTION,
+                        })),
+                    )
+                }
+                Err(_) => return Err(TransportError::SessionFenced),
+            };
+            let pressure = retire_pressure.or(repair_pressure);
             handoff_maintenance.push(serde_json::json!({
                 "stream_id": stream_id,
-                "retired": retired.get("retired").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                "retirement_continuation": retired
-                    .get("retirement_continuation")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-                "repaired": repaired.get("repaired").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                "repair_continuation": repaired
-                    .get("repair_continuation")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
+                "retired": retired,
+                "retirement_continuation": retirement_continuation,
+                "repaired": repaired,
+                "repair_continuation": repair_continuation,
+                "pressure": pressure,
             }));
         }
         Ok(handoff_maintenance)
@@ -4292,6 +4464,58 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
 /// Typed answer for one staged durable event: the store outcome plus the
 /// closed `known`/`accepted` envelope the bridge joins to its sent envelope.
 /// Carries the independently verifiable phase from the persistent owner.
+/// Typed capacity answer for one refused durable/control event (issue
+/// #2731, item 6): the saturation rides the normal `known` reply channel as
+/// `accepted: false` with the `backpressure` disposition, the exhausted
+/// dimension, and the permitted recovery action — never as a session-tearing
+/// transport error. The bridge decodes this shape into its typed
+/// backpressure failure, so the receiver can name the exhausted dimension
+/// and retry after legitimate retirement instead of re-attaching. When the
+/// event row already committed and only the handoff leg hit the cap,
+/// `staged_phase` carries the exact pending phase (`DURABLE`): the work is
+/// durably pending, and the duplicate/reconcile legs keep reporting that
+/// phase — never a blanket safe-to-resubmit answer.
+fn bridge_event_backpressure_response(
+    stream_id: &str,
+    event_id: &str,
+    sequence: u64,
+    envelope_sha256: &str,
+    dimension: &'static str,
+    staged_phase: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "accepted": false,
+        "disposition": "backpressure",
+        "pressure_dimension": dimension,
+        "recovery_action": BRIDGE_PRESSURE_RECOVERY_ACTION,
+        "stream_id": stream_id,
+        "event_id": event_id,
+        "sequence": sequence,
+        "envelope_sha256": envelope_sha256,
+    });
+    if let (Some(object), Some(phase)) = (value.as_object_mut(), staged_phase) {
+        object.insert(
+            "staged_phase".to_owned(),
+            serde_json::Value::String(phase.to_owned()),
+        );
+    }
+    serde_json::json!({ "status": "known", "value": value })
+}
+
+/// Typed capacity answer for one refused coverage gap (issue #2731, item 6):
+/// the same `backpressure` disposition with the gap-table dimension and the
+/// permitted recovery action on the normal reply channel, echoing the gap
+/// identity the bridge continuity check requires.
+fn bridge_gap_backpressure_response(gap_id: &str) -> serde_json::Value {
+    serde_json::json!({ "status": "known", "value": {
+        "accepted": false,
+        "disposition": "backpressure",
+        "pressure_dimension": BRIDGE_PRESSURE_GAPS,
+        "recovery_action": BRIDGE_PRESSURE_RECOVERY_ACTION,
+        "gap_id": gap_id,
+    } })
+}
+
 fn bridge_event_forward_response(outcome: &serde_json::Value, accepted: bool) -> serde_json::Value {
     let mut value = outcome.clone();
     if let Some(object) = value.as_object_mut() {

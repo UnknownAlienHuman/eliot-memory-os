@@ -175,7 +175,7 @@ const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
 /// Maximum staged bridge-event rows. Mirrors the I14.2 canonical-writes pool
 /// (2048 items): breach fails with [`OrsError::ProjectionLimitExceeded`]
 /// (typed backpressure), never with silent loss.
-const MAX_BRIDGE_EVENT_RECORDS: usize = 2048;
+pub const MAX_BRIDGE_EVENT_RECORDS: usize = 2048;
 /// Maximum canonical envelope bytes staged per bridge event. Mirrors the I7.2
 /// hard MCP structured response ceiling (256 KiB): larger envelopes fail with
 /// [`OrsError::PayloadTooLarge`] instead of occupying unbounded durable
@@ -250,7 +250,7 @@ const MAX_BRIDGE_EVENT_REDACTED_CLASSES: usize = 16;
 /// Maximum staged bridge-event handoff rows. Mirrors the bridge-event record
 /// bound: breach fails with [`OrsError::ProjectionLimitExceeded`] (typed
 /// backpressure), never with silent loss of handoff state.
-const MAX_BRIDGE_EVENT_HANDOFFS: usize = 2048;
+pub const MAX_BRIDGE_EVENT_HANDOFFS: usize = 2048;
 /// Handoff state persisted at DURABLE stage time: the staged envelope is
 /// durably held and handed toward Governor/coordinator intake, not yet
 /// reconciled against a consumed frontier.
@@ -838,16 +838,24 @@ impl BridgeEventHandoffRow {
     }
 
     /// Reports whether this row may retire once its payload is gone (issue
-    /// #2731, items 1 and 5). Either the exact owner receipt above, or the
+    /// #2731, items 1, 4 and 5). Either the exact owner receipt below, or the
     /// admitted terminal disposition: still `handed_off` but covered by the
     /// receiver's acked cursor at or below the retained compacted boundary,
     /// whose missing row answers the explicit retired disposition instead of
-    /// a fresh event. Pending rows (above the boundary) and ownerless legacy
-    /// rows never report true: unknown and pending work is never evicted to
-    /// admit new work.
+    /// a fresh event. A receipt-complete row covered by the producer's acked
+    /// cursor is eligible even above the compacted boundary: the compacted
+    /// boundary advances only past the retained 512-row acked window, so a
+    /// stream that stops producing at or below the window would otherwise
+    /// hold its receipt-complete charges against the table-global budget
+    /// forever. Pending rows (above the boundary without the exact receipt)
+    /// and ownerless legacy rows never report true: unknown and pending work
+    /// is never evicted to admit new work.
     fn retirement_eligible(&self, acked_cursor: u64, compacted_boundary: u64) -> bool {
         if self.owner_namespace.is_empty() || self.sequence == 0 {
             return false;
+        }
+        if self.has_receiver_receipt() && self.sequence <= acked_cursor {
+            return true;
         }
         if self.sequence > compacted_boundary {
             return false;
@@ -1006,6 +1014,20 @@ impl persistence_codec::PersistedValue for BridgeEventReplayCommitment {
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
     }
+}
+
+/// One namespace's planned retirement actions (issue #2731, item 5):
+/// handoff rows to delete, payload records to evict with their retained
+/// commitments, the compacted boundary those evictions advance, and the
+/// total charge releases. Built by `RedbRecoveryStore::bridge_retire_plan_in`
+/// and applied by `RedbRecoveryStore::retire_bridge_handoffs_in`.
+#[derive(Default)]
+struct BridgeRetirePlan {
+    handoff_victims: Vec<String>,
+    record_victims: Vec<String>,
+    commitments: Vec<BridgeEventReplayCommitment>,
+    terminalized_boundary: u64,
+    retired: u64,
 }
 
 /// One ordered bridge-event position binding (issue #2730, item 1).
@@ -8233,6 +8255,42 @@ impl RedbRecoveryStore {
         Ok(parsed)
     }
 
+    /// Builds the retained replay commitment for one evicted payload row
+    /// (issues #2730 and #2731, item 4): the original admitted identity and
+    /// content commitment with its representation facts, so the original
+    /// admitted identity and content commitment outlives payload eviction.
+    /// Shared by window-driven compaction and receipt-driven retirement, so
+    /// both eviction paths retain the identical evidence.
+    fn bridge_replay_commitment_for(
+        victim: &BridgeEventRow,
+        now_ms: u64,
+        acked: u64,
+    ) -> BridgeEventReplayCommitment {
+        BridgeEventReplayCommitment {
+            contract_version: crate::CONTRACT_VERSION,
+            commitment_version: BRIDGE_REPLAY_COMMITMENT_VERSION,
+            owner_namespace: victim.owner_namespace.clone(),
+            stream_id: victim.stream_id.clone(),
+            event_id: victim.event_id.clone(),
+            sequence: victim.sequence,
+            producer_id: victim.producer_id.clone(),
+            producer_generation: victim.producer_generation,
+            authority_epoch: victim.authority_epoch.clone(),
+            envelope_sha256: victim.envelope_sha256.clone(),
+            transport_hash: if victim.transport_hash.is_empty() {
+                victim.envelope_sha256.clone()
+            } else {
+                victim.transport_hash.clone()
+            },
+            redacted: victim.redacted,
+            redacted_classes: victim.redacted_classes.clone(),
+            redaction_marker: victim.redaction_marker.clone(),
+            redaction_version: victim.redaction_version,
+            compacted_at_ms: now_ms,
+            acked_at_compaction: acked,
+        }
+    }
+
     /// Compacts acknowledged rows of one owner namespace past the
     /// retention window inside the acknowledgement transaction (issue
     /// #2729). Only durable rows at or below the acked frontier minus the
@@ -8287,29 +8345,7 @@ impl RedbRecoveryStore {
         let mut pruned = 0_u64;
         let mut compacted_boundary = 0_u64;
         for victim in &victims {
-            let commitment = BridgeEventReplayCommitment {
-                contract_version: crate::CONTRACT_VERSION,
-                commitment_version: BRIDGE_REPLAY_COMMITMENT_VERSION,
-                owner_namespace: victim.owner_namespace.clone(),
-                stream_id: victim.stream_id.clone(),
-                event_id: victim.event_id.clone(),
-                sequence: victim.sequence,
-                producer_id: victim.producer_id.clone(),
-                producer_generation: victim.producer_generation,
-                authority_epoch: victim.authority_epoch.clone(),
-                envelope_sha256: victim.envelope_sha256.clone(),
-                transport_hash: if victim.transport_hash.is_empty() {
-                    victim.envelope_sha256.clone()
-                } else {
-                    victim.transport_hash.clone()
-                },
-                redacted: victim.redacted,
-                redacted_classes: victim.redacted_classes.clone(),
-                redaction_marker: victim.redaction_marker.clone(),
-                redaction_version: victim.redaction_version,
-                compacted_at_ms: now_ms,
-                acked_at_compaction: acked,
-            };
+            let commitment = Self::bridge_replay_commitment_for(victim, now_ms, acked);
             // A legacy-shaped row predating the privacy decision stores
             // its verbatim bytes bound by the identity digest; its
             // commitment is the admissible form, never a projection.
@@ -9175,7 +9211,13 @@ impl RedbRecoveryStore {
     /// (reconciled with the presented frontier plus its admitting
     /// revision/incarnation) or the admitted terminal disposition
     /// (`handed_off` but covered by the receiver's acked cursor, whose
-    /// missing row already answers the explicit retired disposition).
+    /// missing row already answers the explicit retired disposition). A
+    /// receipt-complete row covered by the acked cursor also retires above
+    /// the compacted boundary by terminalizing first: its replay commitment
+    /// is retained, its payload record deletes with its handoff, and the
+    /// compacted boundary advances past it, so quiet streams that stop
+    /// producing at or below the retained acked window still release their
+    /// charges instead of holding the table-global budget forever.
     /// Retirement deletes exactly those rows — the capacity charge releases
     /// exactly once because a re-run finds no row to delete again — while
     /// the #2730 position binding, replay commitment, and compacted boundary
@@ -9361,13 +9403,128 @@ impl RedbRecoveryStore {
         }))
     }
 
+    /// Collects one namespace's retirement-eligible handoffs with their keys
+    /// (issue #2731, item 5): the per-row [`BridgeEventHandoffRow::retirement_eligible`]
+    /// decision against the current acked cursor and compacted boundary.
+    /// Called by [`Self::retire_bridge_handoffs_in`]; kept separate so the
+    /// recovery transaction stays within its line budget.
+    fn bridge_retire_eligible_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        acked: u64,
+        compacted: u64,
+    ) -> Result<(Vec<String>, Vec<BridgeEventHandoffRow>), OrsError> {
+        let prefix = format!("{}::", access.namespace);
+        let mut eligible_keys: Vec<String> = Vec::new();
+        let mut eligible: Vec<BridgeEventHandoffRow> = Vec::new();
+        let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+        for entry in handoffs.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                continue;
+            }
+            let row: BridgeEventHandoffRow = decode(value.value())?;
+            row.validate()?;
+            if row.owner_namespace != access.namespace {
+                continue;
+            }
+            if row.retirement_eligible(acked, compacted) {
+                eligible_keys.push(key.value().to_owned());
+                eligible.push(row);
+            }
+        }
+        Ok((eligible_keys, eligible))
+    }
+
     /// Retires one namespace's eligible handoffs inside the recovery
-    /// transaction (issue #2731, item 5). Eligibility is evaluated per row by
-    /// [`BridgeEventHandoffRow::retirement_eligible`] against the current
-    /// acked cursor and compacted boundary; the live-payload recheck keeps a
+    /// transaction (issue #2731, items 4 and 5). Eligibility is evaluated per
+    /// row by [`BridgeEventHandoffRow::retirement_eligible`] against the
+    /// current acked cursor and compacted boundary; a receipt-complete row
+    /// covered by the acked cursor is eligible even above the compacted
+    /// boundary, so quiet streams that stop producing at or below the
+    /// retained acked window still release their charges. An eligible row
+    /// with no live payload deletes by exact key. An eligible
+    /// receipt-complete row whose live payload is still retained
+    /// terminalizes: its #2730 replay commitment is written first (the same
+    /// evidence window-driven compaction retains), then the payload record
+    /// and the handoff row delete together and the compacted boundary
+    /// advances past the terminalized sequences, so exact replays keep
+    /// answering duplicate from the commitment, old occurrences below the
+    /// boundary keep answering retired, and the repair step (which skips
+    /// rows at or below the boundary and recreates only for retained
+    /// records) never resurrects them. Rows with a live payload but no
+    /// receiver receipt are never touched: the live-payload recheck keeps a
     /// row whose payload outlived the boundary scan (a torn state this entry
-    /// never repairs by guessing). Deletes are by exact key, so the charge
-    /// releases exactly once.
+    /// never repairs by guessing), and unknown or pending work is never
+    /// evicted to admit new work. Deletes are by exact key, so the charge
+    /// releases exactly once. At most `budget` rows terminalize or delete
+    /// per call; `retirement_continuation` reports whether eligible rows
+    /// remain for the next legitimate recovery entry.
+    /// Decides the per-key retirement actions for one namespace's eligible
+    /// handoffs (issue #2731, items 4 and 5): rows with no live payload
+    /// delete by exact key; receipt-complete rows covered by the acked
+    /// cursor terminalize (their commitment is retained, then payload and
+    /// handoff delete together); rows with a live payload but no receiver
+    /// receipt are never touched. At most `budget` actions plan per call.
+    /// Called by [`Self::retire_bridge_handoffs_in`]; kept separate so the
+    /// recovery transaction stays within its line budget.
+    fn bridge_retire_plan_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        acked: u64,
+        compacted: u64,
+        eligible_keys: &[String],
+        eligible: &[BridgeEventHandoffRow],
+        budget: usize,
+    ) -> Result<BridgeRetirePlan, OrsError> {
+        let mut order: Vec<usize> = (0..eligible.len()).collect();
+        order.sort_by(|left, right| eligible_keys[*left].cmp(&eligible_keys[*right]));
+        let now_ms = current_unix_ms_u64()?;
+        let mut plan = BridgeRetirePlan {
+            terminalized_boundary: compacted,
+            ..BridgeRetirePlan::default()
+        };
+        let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+        for index in order {
+            if plan.retired >= budget as u64 {
+                break;
+            }
+            let key = eligible_keys[index].as_str();
+            let handoff = &eligible[index];
+            let payload: Option<BridgeEventRow> = records
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            match payload {
+                None => {
+                    plan.handoff_victims.push(key.to_owned());
+                    plan.retired += 1;
+                }
+                Some(payload) => {
+                    payload.validate()?;
+                    let binds_same_event = payload.owner_namespace == access.namespace
+                        && payload.sequence == handoff.sequence
+                        && payload.envelope_sha256 == handoff.envelope_sha256
+                        && payload.phase == BRIDGE_EVENT_PHASE_DURABLE;
+                    if binds_same_event
+                        && handoff.has_receiver_receipt()
+                        && handoff.sequence <= acked
+                    {
+                        plan.commitments
+                            .push(Self::bridge_replay_commitment_for(&payload, now_ms, acked));
+                        plan.record_victims.push(key.to_owned());
+                        plan.handoff_victims.push(key.to_owned());
+                        plan.terminalized_boundary =
+                            plan.terminalized_boundary.max(handoff.sequence);
+                        plan.retired += 1;
+                    }
+                }
+            }
+        }
+        Ok(plan)
+    }
+
     fn retire_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -9385,30 +9542,16 @@ impl RedbRecoveryStore {
             expected_incarnation,
             BridgeStreamRight::Acknowledge,
         )?;
-        let (acked, compacted) = Self::load_bridge_cursor_row_in(write, namespace)?
-            .map_or((0, 0), |row| {
-                (row.last_acked_sequence, row.last_compacted_sequence)
-            });
-        let prefix = format!("{namespace}::");
-        let mut eligible: Vec<String> = Vec::new();
-        {
-            let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for entry in handoffs.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                if !key.value().starts_with(prefix.as_str()) {
-                    continue;
-                }
-                let row: BridgeEventHandoffRow = decode(value.value())?;
-                row.validate()?;
-                if row.owner_namespace != access.namespace {
-                    continue;
-                }
-                if row.retirement_eligible(acked, compacted) {
-                    eligible.push(key.value().to_owned());
-                }
-            }
-        }
-        eligible.sort();
+        let cursor = Self::load_bridge_cursor_row_in(write, namespace)?;
+        let (durable, acked, compacted) = cursor.as_ref().map_or((0, 0, 0), |row| {
+            (
+                row.last_durable_sequence,
+                row.last_acked_sequence,
+                row.last_compacted_sequence,
+            )
+        });
+        let (eligible_keys, eligible) =
+            Self::bridge_retire_eligible_in(write, &access, acked, compacted)?;
         if eligible.is_empty() {
             return Ok(json!({
                 "namespace": access.namespace,
@@ -9416,27 +9559,44 @@ impl RedbRecoveryStore {
                 "retirement_continuation": false,
             }));
         }
-        let mut retired = 0_u64;
-        let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-        let mut victims: Vec<String> = Vec::new();
-        for key in eligible.iter().take(budget) {
-            if records.get(key.as_str()).map_err(storage)?.is_some() {
-                continue;
-            }
-            victims.push(key.clone());
+        let plan = Self::bridge_retire_plan_in(
+            write,
+            &access,
+            acked,
+            compacted,
+            &eligible_keys,
+            &eligible,
+            budget,
+        )?;
+        for commitment in &plan.commitments {
+            Self::write_bridge_commitment_in(write, commitment)?;
         }
-        drop(records);
-        if !victims.is_empty() {
-            let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for key in &victims {
-                handoffs.remove(key.as_str()).map_err(storage)?;
-                retired += 1;
+        if !plan.record_victims.is_empty() {
+            let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            for key in &plan.record_victims {
+                records.remove(key.as_str()).map_err(storage)?;
             }
+        }
+        if !plan.handoff_victims.is_empty() {
+            let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            for key in &plan.handoff_victims {
+                handoffs.remove(key.as_str()).map_err(storage)?;
+            }
+        }
+        if plan.terminalized_boundary > compacted {
+            Self::write_bridge_cursors_compacted_in(
+                write,
+                &access,
+                &owner.local_stream,
+                durable,
+                acked,
+                plan.terminalized_boundary,
+            )?;
         }
         Ok(json!({
             "namespace": access.namespace,
-            "retired": retired,
-            "retirement_continuation": eligible.len() as u64 > retired,
+            "retired": plan.retired,
+            "retirement_continuation": eligible.len() as u64 > plan.retired,
         }))
     }
 
@@ -9526,82 +9686,105 @@ impl RedbRecoveryStore {
         }))
     }
 
+    /// Reads the global bridge-event delivery-budget fill (issue #2731, item
+    /// 6): the live record and handoff table lengths the stage transaction
+    /// admission-caps. Served to the Kernel capacity answer so a saturation
+    /// names the exhausted dimension instead of surfacing as a bare
+    /// transport failure. Advisory by construction: the lengths are read
+    /// after the failed insert, so a concurrent retirement may have freed
+    /// room in between — the saturation itself was real at insert time.
+    pub fn bridge_event_table_fill(&self) -> Result<(u64, u64), OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let records = read
+            .open_table(BRIDGE_EVENT_RECORDS)
+            .map_err(storage)?
+            .len()
+            .map_err(storage)?;
+        let handoffs = read
+            .open_table(BRIDGE_EVENT_HANDOFFS)
+            .map_err(storage)?
+            .len()
+            .map_err(storage)?;
+        Ok((records, handoffs))
+    }
+
+    /// Sums one bridge-event table's per-namespace footprint (issue #2731,
+    /// item 4): the count of rows admitted by `matches` plus their key and
+    /// serialized-record bytes — the accountable persisted size, never the
+    /// source payload length. Called by
+    /// [`Self::bridge_capacity_accounting_for`] once per lifecycle table so
+    /// the denominator stays one auditable scan per table.
+    fn bridge_table_usage_in(
+        read: &redb::ReadTransaction,
+        table: redb::TableDefinition<'_, &str, &str>,
+        mut matches: impl FnMut(&str, &str) -> Result<bool, OrsError>,
+    ) -> Result<(u64, u64), OrsError> {
+        let stored = read.open_table(table).map_err(storage)?;
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        for entry in stored.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            if matches(key.value(), value.value())? {
+                count += 1;
+                bytes += (key.value().len() + value.value().len()) as u64;
+            }
+        }
+        Ok((count, bytes))
+    }
+
     /// Accounts one namespace's bridge-event capacity under its owner
-    /// (issue #2731, item 4): pending live events, handoffs, retained replay
-    /// commitments, stream/cursor metadata, and scoped gaps with their total
-    /// encoded bytes. Every byte count sums key bytes plus serialized-record
-    /// bytes — the accountable persisted size, never the source payload
-    /// length (which is not exact persisted size or heap use). Engine index
-    /// structure and in-memory heap stay outside this measure; the global
-    /// admission caps absorb them. The #2730 position index is owned and
-    /// capped by #2730, so it is not double-counted here: this view covers
-    /// exactly the #2561/#2729 lifecycle rows this owner retires. Served
-    /// inside the owner recovery inventory, where the receiver sizes
-    /// backpressure against pending versus retained evidence.
+    /// (issue #2731, item 4): pending live events, handoffs, the ordered
+    /// position index rows naming this namespace's admitted positions,
+    /// retained replay commitments, stream/cursor metadata, and scoped gaps
+    /// with their total encoded bytes. Every byte count sums key bytes plus
+    /// serialized-record bytes — the accountable persisted size, never the
+    /// source payload length (which is not exact persisted size or heap use).
+    /// Engine index structure and in-memory heap stay outside this measure;
+    /// the global admission caps absorb them. Position rows are counted here
+    /// (their bounded maintenance is issue #2885's repair); this view covers
+    /// the full #2561/#2729 lifecycle denominator this owner retires
+    /// against. Served inside the owner recovery inventory, where the
+    /// receiver sizes backpressure against pending versus retained evidence.
     fn bridge_capacity_accounting_for(
         database: &Database,
         namespace: &str,
     ) -> Result<serde_json::Value, OrsError> {
         crate::model::validate_digest(namespace, "owner_namespace")?;
+        let prefix = format!("{namespace}::");
         let read = database.begin_read().map_err(storage)?;
-        let mut pending_events = 0_u64;
-        let mut pending_event_bytes = 0_u64;
-        {
-            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            for entry in records.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventRow = decode(value.value())?;
+        let (pending_events, pending_event_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_RECORDS, |_, value| {
+                let row: BridgeEventRow = decode(value)?;
                 row.validate()?;
-                if row.owner_namespace == namespace {
-                    pending_events += 1;
-                    pending_event_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut handoffs_count = 0_u64;
-        let mut handoff_bytes = 0_u64;
-        {
-            let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for entry in handoffs.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventHandoffRow = decode(value.value())?;
+                Ok(row.owner_namespace == namespace)
+            })?;
+        let (handoffs_count, handoff_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_HANDOFFS, |_, value| {
+                let row: BridgeEventHandoffRow = decode(value)?;
                 row.validate()?;
-                if row.owner_namespace == namespace {
-                    handoffs_count += 1;
-                    handoff_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut commitments = 0_u64;
-        let mut commitment_bytes = 0_u64;
-        {
-            let retained = read
-                .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
-                .map_err(storage)?;
-            for entry in retained.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let commitment: BridgeEventReplayCommitment = decode(value.value())?;
+                Ok(row.owner_namespace == namespace)
+            })?;
+        let (commitments, commitment_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_REPLAY_COMMITMENTS, |_, value| {
+                let commitment: BridgeEventReplayCommitment = decode(value)?;
                 commitment.validate()?;
-                if commitment.owner_namespace == namespace {
-                    commitments += 1;
-                    commitment_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut gaps = 0_u64;
-        let mut gap_bytes = 0_u64;
-        {
-            let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
-            for entry in stored.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventGapRow = decode(value.value())?;
+                Ok(commitment.owner_namespace == namespace)
+            })?;
+        let (gaps, gap_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_GAPS, |_, value| {
+                let row: BridgeEventGapRow = decode(value)?;
                 row.validate()?;
-                if row.owner_namespace == namespace {
-                    gaps += 1;
-                    gap_bytes += (key.value().len() + value.value().len()) as u64;
+                Ok(row.owner_namespace == namespace)
+            })?;
+        let (positions, position_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_POSITIONS, |key, value| {
+                if !key.starts_with(prefix.as_str()) {
+                    return Ok(false);
                 }
-            }
-        }
+                let position: BridgeEventPosition = decode(value)?;
+                position.validate()?;
+                Ok(true)
+            })?;
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
             cursors
@@ -9618,6 +9801,7 @@ impl RedbRecoveryStore {
         };
         let total_bytes = pending_event_bytes
             .saturating_add(handoff_bytes)
+            .saturating_add(position_bytes)
             .saturating_add(commitment_bytes)
             .saturating_add(gap_bytes)
             .saturating_add(cursor_bytes)
@@ -9627,6 +9811,8 @@ impl RedbRecoveryStore {
             "pending_event_bytes": pending_event_bytes,
             "handoffs": handoffs_count,
             "handoff_bytes": handoff_bytes,
+            "positions": positions,
+            "position_bytes": position_bytes,
             "replay_commitments": commitments,
             "replay_commitment_bytes": commitment_bytes,
             "gaps": gaps,
