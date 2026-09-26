@@ -3604,6 +3604,152 @@ impl UnknownCommitRecord {
     }
 }
 
+/// Stable ORS record-type name of one durable backup-verification result.
+///
+/// It is published rather than spelled as a literal at the call site so the
+/// Kernel verify route can name the I5.27 identity-conflict signal by this
+/// contract instead of by a second copy of the same string.
+pub const BACKUP_VERIFICATION_RESULT_RECORD_TYPE: &str = "backup_verification_result";
+
+/// Outcome of staging one durable backup-verification result.
+///
+/// The disposition names what the durable row says about the request, never a
+/// retry policy: `AlreadyBound` is the exact-replay answer for one operation
+/// identity, and the durable winner it carries is the record the caller must
+/// answer from. The winner is boxed so this two-variant disposition stays small
+/// next to `Stored` instead of being sized by the record it may carry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackupVerificationDisposition {
+    /// This candidate is now the durable row under its operation identity.
+    Stored,
+    /// An already-durable row owns this operation identity under the same
+    /// request binding. The carried record is the durable winner: the stored
+    /// answers, not the caller's fresh ones, decide the reply.
+    AlreadyBound(Box<BackupVerificationResultRecord>),
+}
+
+/// Durable owner-backed result of one `backup.verify` operation (issue #2802).
+///
+/// I5.27 makes idempotency a property of canonical request bytes and I14.21
+/// makes the answer a query by idempotency key. This record is that durable
+/// answer: one row per public request operation identity, holding exactly the
+/// values the verification owner proved. An exact replay after a Kernel restart
+/// or an Authority Epoch rotation therefore reads the same owner-backed result
+/// back instead of a freshly derived, differently-fenced one, and a changed
+/// archive under the same operation identity is a conflict rather than a second
+/// answer. ORS stores the row verbatim and interprets no archive, class, fence
+/// or recovery meaning.
+///
+/// It is deliberately not an unknown-commit record: a read-only verification is
+/// not a canonical write attempt, so it has its own table and its own single
+/// writer rather than a semantic reuse of another owner's table.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerificationResultRecord {
+    /// ORS wire/storage contract version of this row. A row written under
+    /// another version fails its read closed instead of being reinterpreted as
+    /// the same answer.
+    pub contract_version: u16,
+    /// Durable key: the public request's own operation/idempotency identity.
+    /// The route never mints a second identity such as a `verify-only-` name
+    /// for the same operation, so the key and the answer stay one identity.
+    pub idempotency_key: String,
+    /// Digest of the canonical request bytes this operation was admitted with.
+    /// Reusing the key with a different value is an identity conflict, never a
+    /// silent overwrite of the bound row.
+    pub request_digest: String,
+    /// The verification owner's own digest of the complete encoded archive. It
+    /// is the owner-proved input to `request_digest`, so the same bytes
+    /// re-spelled by a caller under the same key still resolve to one
+    /// operation while different bytes do not.
+    pub archive_sha256: String,
+    /// Archive identity the owner proved.
+    pub backup_id: String,
+    /// Evidenced archive class in the owner's own class-name spelling.
+    pub class: String,
+    /// Exact class-specific restore proof ceiling in the owner's own spelling.
+    /// I5.13 keeps a degraded class from ever being advertised as operational
+    /// recovery, so the ceiling is retained beside the class it bounds.
+    pub class_ceiling: String,
+    /// Evidence level the owner proved for this archive, in its own spelling.
+    pub verification_level: String,
+    /// Relation of the archive's own fence to the verifying target, in the
+    /// owner's own spelling. It is retained verbatim so a replay after an epoch
+    /// rotation reports the historical relation instead of re-deriving one
+    /// against whatever generation happens to be live.
+    pub target_compatibility: String,
+    /// Canonical-member denominator in the owner's own dispositions.
+    pub event_count: u64,
+    /// Receipt-obligation member denominator in the owner's own dispositions.
+    pub receipt_count: u64,
+    /// Sealed-blob obligation member denominator in the owner's own
+    /// dispositions. Equal bytes under different obligations stay distinct
+    /// counts here rather than being coalesced.
+    pub blob_count: u64,
+    /// Owner-issued publication receipt identity. `None` is the owner's own
+    /// answer on a path where no retained-artifact owner issues one; an absent
+    /// receipt is never replaced by a placeholder identity.
+    pub capture_receipt: Option<String>,
+    /// Digest over the exact reply body this operation projects. A replay
+    /// recomputes it, so a row that cannot rebuild the answer it claims to hold
+    /// fails closed instead of projecting one it never produced.
+    pub reply_digest: String,
+}
+
+impl BackupVerificationResultRecord {
+    /// Returns the durable key binding one result to its operation identity.
+    #[must_use]
+    pub fn record_key(&self) -> String {
+        self.idempotency_key.clone()
+    }
+
+    /// Returns whether two records describe the same admitted operation.
+    ///
+    /// Only the request identity is compared. The owner's answers are
+    /// deliberately excluded: the archived-fence relation and the observed
+    /// member denominators are answers to the *same* request under a different
+    /// verifying target, so re-answering them after a restart or an epoch
+    /// rotation is not a second operation and must not read as one.
+    #[must_use]
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.idempotency_key == other.idempotency_key
+            && self.request_digest == other.request_digest
+    }
+
+    /// Validates shape, digests and the owner-produced spellings.
+    ///
+    /// Every string is a closed owner spelling, so each is checked for shape
+    /// only: ORS does not interpret class, ceiling, evidence level or fence
+    /// meaning. The three member denominators are the owner's own counts and
+    /// carry no presence flag, because a real count of zero is a real answer
+    /// and an absent one is not representable.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(&self.idempotency_key, "backup_verification_idempotency_key")?;
+        validate_digest(&self.request_digest, "backup_verification_request_digest")?;
+        validate_digest(&self.archive_sha256, "backup_verification_archive_sha256")?;
+        validate_digest(&self.reply_digest, "backup_verification_reply_digest")?;
+        validate_text(&self.backup_id, "backup_verification_backup_id")?;
+        validate_text(&self.class, "backup_verification_class")?;
+        validate_text(&self.class_ceiling, "backup_verification_class_ceiling")?;
+        validate_text(
+            &self.verification_level,
+            "backup_verification_verification_level",
+        )?;
+        validate_text(
+            &self.target_compatibility,
+            "backup_verification_target_compatibility",
+        )?;
+        if let Some(receipt) = &self.capture_receipt {
+            validate_text(receipt, "backup_verification_capture_receipt")?;
+        }
+        Ok(())
+    }
+}
+
 /// Closed P-04 host-request kinds preserved by ORS without interpretation.
 ///
 /// The kind is an opaque routing label. ORS never interprets task, scope,
