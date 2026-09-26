@@ -313,6 +313,10 @@ pub enum ExecutionOutcome {
 pub enum CausalCredit {
     NoCausalCredit,
     ObservedAssociation,
+    /// Shared success attributed across Skills, never to one Skill alone.
+    Distributed,
+    /// Success with unknown attribution; not assigned to any Skill.
+    Uncertain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -345,10 +349,17 @@ impl SkillExecutionEvidence {
                 reason: "observed execution requires exact step evidence",
             });
         }
-        if self.causal_credit != CausalCredit::NoCausalCredit {
+        // Causal attribution is never a sole-cause claim: only the
+        // distributed/uncertain/associated representations exist, and any
+        // non-default credit must link to exact step evidence (I7.25: Skill
+        // execution is linked to exact steps, artifacts and verifiers when
+        // observable; shared success may remain distributed or uncertain
+        // rather than being assigned to one Skill). A bare credit claim
+        // without exact steps fails closed.
+        if self.causal_credit != CausalCredit::NoCausalCredit && self.exact_step_refs.is_empty() {
             return Err(SkillError::InvalidField {
                 field: "execution.causal_credit",
-                reason: "Skill execution cannot claim causal credit",
+                reason: "causal credit requires exact step evidence",
             });
         }
         Ok(())
@@ -450,6 +461,14 @@ pub struct SkillLifecycleView {
     pub dependencies: Vec<DependencyVersion>,
     pub counters: LifecycleCounters,
     pub execution_evidence: Vec<SkillExecutionEvidence>,
+    /// Exact per-attempt harness receipts this view folds. Counter values are
+    /// bijective with these records by construction in
+    /// [`derive_lifecycle_view`](activation::derive_lifecycle_view):
+    /// `delivered`/`expanded`/`useful` count exactly the bound receipts, so
+    /// aggregate counts never substitute for the retained receipts. Defaults
+    /// empty so rows persisted before receipt retention still decode.
+    #[serde(default)]
+    pub attempt_receipts: Vec<SkillHarnessActivationReceipt>,
     pub observed_decision_or_verifier_delta: Option<String>,
     pub false_activation_refs: Vec<String>,
     pub interactions: SkillInteractionView,
@@ -494,38 +513,8 @@ impl SkillLifecycleView {
         for evidence in &self.execution_evidence {
             evidence.validate()?;
         }
-        let observed = self
-            .execution_evidence
-            .iter()
-            .filter(|evidence| evidence.outcome == ExecutionOutcome::Observed)
-            .count() as u64;
-        let failed = self
-            .execution_evidence
-            .iter()
-            .filter(|evidence| evidence.outcome == ExecutionOutcome::Failed)
-            .count() as u64;
-        let uncertain = self
-            .execution_evidence
-            .iter()
-            .filter(|evidence| evidence.outcome == ExecutionOutcome::Uncertain)
-            .count() as u64;
-        let verified = self
-            .execution_evidence
-            .iter()
-            .filter(|evidence| {
-                evidence.outcome == ExecutionOutcome::Observed && !evidence.verifier_refs.is_empty()
-            })
-            .count() as u64;
-        if self.counters.executed != observed
-            || self.counters.failed != failed
-            || self.counters.uncertain != uncertain
-            || self.counters.verified != verified
-        {
-            return Err(SkillError::InvalidField {
-                field: "counters",
-                reason: "execution counters do not match exact evidence",
-            });
-        }
+        self.validate_attempt_receipts()?;
+        self.validate_execution_counters()?;
         if let Some(delta) = &self.observed_decision_or_verifier_delta {
             text(delta, "observed_decision_or_verifier_delta")?;
         }
@@ -565,6 +554,63 @@ impl SkillLifecycleView {
             return Err(SkillError::InvalidField {
                 field: "review",
                 reason: "Keep cannot carry a mutation review",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates every retained per-attempt receipt as exact evidence bound
+    /// to this view's skill identity: shape-validated and
+    /// revision/digest-bound, exactly as the derivation fold requires.
+    /// Foreign receipts fail closed here instead of entering the lifecycle
+    /// record.
+    fn validate_attempt_receipts(&self) -> Result<(), SkillError> {
+        for receipt in &self.attempt_receipts {
+            receipt.validate()?;
+            if receipt.skill_id != self.skill_id()
+                || receipt.skill_revision != self.skill_ref.registration.revision
+                || receipt.package_digest != self.skill_ref.package_digest
+            {
+                return Err(SkillError::IdentityMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the execution counters against the exact retained evidence:
+    /// `executed`/`failed`/`uncertain` match outcomes, `verified` matches
+    /// observed executions carrying verifier refs.
+    fn validate_execution_counters(&self) -> Result<(), SkillError> {
+        let observed = self
+            .execution_evidence
+            .iter()
+            .filter(|evidence| evidence.outcome == ExecutionOutcome::Observed)
+            .count() as u64;
+        let failed = self
+            .execution_evidence
+            .iter()
+            .filter(|evidence| evidence.outcome == ExecutionOutcome::Failed)
+            .count() as u64;
+        let uncertain = self
+            .execution_evidence
+            .iter()
+            .filter(|evidence| evidence.outcome == ExecutionOutcome::Uncertain)
+            .count() as u64;
+        let verified = self
+            .execution_evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.outcome == ExecutionOutcome::Observed && !evidence.verifier_refs.is_empty()
+            })
+            .count() as u64;
+        if self.counters.executed != observed
+            || self.counters.failed != failed
+            || self.counters.uncertain != uncertain
+            || self.counters.verified != verified
+        {
+            return Err(SkillError::InvalidField {
+                field: "counters",
+                reason: "execution counters do not match exact evidence",
             });
         }
         Ok(())
@@ -952,7 +998,7 @@ impl SkillRegistry {
     /// revision and package digest, and gated on review state: stale and
     /// quarantined Skills stay blocked until governed review or restore. The
     /// returned summary keeps delivered, retrieved, activated, adhered and
-    /// useful distinct; absent adherence evidence stays unassessed or unknown,
+    /// useful distinct; absent adherence evidence stays unknown,
     /// never compliance, and usefulness additionally requires verifier-backed
     /// outcome refs — never installation, retrieval, repetition or agreement.
     pub fn admit_material_attempt(
