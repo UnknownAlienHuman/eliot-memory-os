@@ -3309,6 +3309,9 @@ impl KernelComposition {
                 Some("schedule.occurrence_key.encoding"),
             ),
             UserAutomationError::LegacyScheduleEncoding(field) => ("legacy_encoding", Some(*field)),
+            UserAutomationError::SubMinuteZoneOffset { field, .. } => {
+                ("unrepresentable_zone_offset", Some(*field))
+            }
             UserAutomationError::ZoneDatabaseRevision(field) => {
                 ("stale_normalization_revision", Some(*field))
             }
@@ -3341,9 +3344,21 @@ impl KernelComposition {
         if let Some(field) = field {
             refusal.insert("field".to_owned(), serde_json::json!(field));
         }
+        if let UserAutomationError::SubMinuteZoneOffset {
+            zone,
+            offset_seconds,
+            ..
+        } = error
+        {
+            refusal.insert("zone".to_owned(), serde_json::json!(zone));
+            refusal.insert(
+                "offset_seconds".to_owned(),
+                serde_json::json!(offset_seconds),
+            );
+        }
         // The caller key was already capped at 256 UTF-8 bytes. The request ID
-        // and StateFence have closed validated shapes, and every refusal field
-        // is a fixed enum or a static contract field, so this envelope is bounded.
+        // and StateFence have closed validated shapes. Refusal fields are static
+        // contract names; the optional zone is a pinned table member.
         serde_json::json!({
             "status": "unknown",
             "value": {

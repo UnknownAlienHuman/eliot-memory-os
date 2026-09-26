@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 #: Format tag written into the table header; the Kernel refuses any other one.
-TABLE_FORMAT = "eliot.user-automation.zone-table.v1"
+TABLE_FORMAT = "eliot.user-automation.zone-table.v2"
 
 #: Unit of the offset column of every body line, written into the table header as
 #: `# offset_unit seconds`; the Kernel refuses a table that does not declare
