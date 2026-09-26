@@ -182,7 +182,8 @@ pub use maintenance_trigger_evaluator::{
 };
 pub use notification_state_emit::{
     AutomationFailureKey, NotificationStateEmit, automation_failure_key,
-    emit_blocked_automation_notification, read_notification_ordering_head,
+    emit_blocked_automation_notification, notification_already_recorded,
+    read_notification_ordering_head,
 };
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{

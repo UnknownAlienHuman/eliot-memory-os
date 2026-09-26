@@ -452,6 +452,36 @@ struct StoreNamedOperation {
     request: NamedReadRequest,
 }
 
+/// Strips the daemon transport's routing key from one application body.
+///
+/// The retained daemon client inserts `operation` into every JSON body so the
+/// dispatcher can route it (`bins/eliotd/src/daemon_kernel_client/handshake.rs::operation_payload`),
+/// and the frame loop routes on exactly that key. A carrier that decodes the
+/// **whole** body with `#[serde(deny_unknown_fields)]` therefore sees a key it
+/// never declared, refuses the body, and the daemon frame loop propagates the
+/// resulting `SessionFenced` with `?` — fencing the Kernel connection, not just
+/// the one request. Removing the key before the closed decode is the shape the
+/// dispatcher already establishes for its own nested carriers
+/// (`daemon_supervision_progress_operation` removes its wrapper key before
+/// decoding, and `OwnerPublishOperation` *declares* `operation` and has its
+/// feeder omit it).
+///
+/// Only the carriers that need it call this. The key is routing, not
+/// application data: it is already bound to the dispatched `operation` string,
+/// so removing it cannot lose or invent a request field, and a body that is
+/// not an object still fails closed exactly as before.
+fn without_daemon_routing_key(
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, TransportError> {
+    match payload {
+        serde_json::Value::Object(mut object) => {
+            object.remove("operation");
+            Ok(serde_json::Value::Object(object))
+        }
+        _ => Err(TransportError::SessionFenced),
+    }
+}
+
 /// Closed local-read envelope for one admitted `eliot.query` (Implements #18).
 ///
 /// Carries the exact admitted envelope plus the exact canonical tool bytes it
@@ -3560,8 +3590,13 @@ impl KernelComposition {
         request_id: RequestId,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
+        // The daemon client routes on the `operation` key it inserts into every
+        // body; this carrier decodes the whole body, so that routing key is
+        // removed before the closed decode instead of being refused as unknown
+        // (see `without_daemon_routing_key`).
         let operation: NotificationStateApplyOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Some(refusal) =
             Self::validate_notification_state_apply(session, &request_id, &operation)?
         {
@@ -3805,8 +3840,13 @@ impl KernelComposition {
         session: &Session,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
+        // The daemon client routes on the `operation` key it inserts into every
+        // body; this carrier decodes the whole body, so that routing key is
+        // removed before the closed decode instead of being refused as unknown
+        // (see `without_daemon_routing_key`).
         let operation: StoreNamedOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.request.validate() {
             return Ok(Self::store_error_response_text(
                 "store_named",
