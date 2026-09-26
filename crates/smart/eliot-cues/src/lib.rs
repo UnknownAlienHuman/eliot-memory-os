@@ -20,20 +20,30 @@
 //! | 4 | `LegacyDeliveryHandoff` | `InertHandoff` | names `B-RCTX/Host` (#612); fabricates no completion |
 //! | 5 | `V1RowMigration` | `LegacyDTO` | inert v1 replay identity; byte-identical fields |
 //! | 6 | `V1SnapshotMigration` | `LegacyDTO` | inert v1 replay identity; byte-identical fields |
-//! | 7 | `FacadeError` | `FacadeSurface` | closed refusal vocabulary below |
-//! | 8 | `FACADE_DISPOSITIONS` | `FacadeSurface` | this table, machine-checked by `tests/legacy_facade.rs` |
-//! | 9 | `LEGACY_KIND_SPELLINGS` | `FacadeSurface` | frozen 10 `snake_case` spellings from the #706 denominator |
-//! | 10 | `preserve_v1_row` | `AdapterEntry` | inert replay constructor |
-//! | 11 | `preserve_v1_snapshot` | `AdapterEntry` | inert replay constructor |
-//! | 12 | `decode_legacy_kind` | `AdapterEntry` | exact 10 frozen spellings; all else refused |
-//! | 13 | `decode_legacy_mode` | `AdapterEntry` | exact 3 spellings; all else refused |
-//! | 14 | `adapt_normalize` | `AdapterEntry` | one A-11 call + identity check |
-//! | 15 | `adapt_bind` | `AdapterEntry` | one A-12 call + echo check |
-//! | 16 | `adapt_rebuild_snapshot` | `AdapterEntry` | one A-13 call + digest check |
-//! | 17 | `adapt_activate` | `AdapterEntry` | one A-14a call + result validation |
-//! | 18 | `legacy_row_id_v2` | `AdapterEntry` | frozen owner `cue_row_id` projection |
-//! | 19 | `require_reobservation` | `AdapterEntry` | typed refusal with exact owner/revision pointer |
-//! | 20 | `request_legacy_delivery` | `InertHandoff` | validates envelope, names handoff, no completion |
+//! | 7 | `V1PreservedRow` | `LegacyDTO` | exact v1 row bytes and identity input |
+//! | 8 | `V1MigrationRejection` | `FacadeSurface` | closed typed conversion-refusal vocabulary |
+//! | 9 | `FacadeError` | `FacadeSurface` | closed refusal vocabulary below |
+//! | 10 | `FACADE_DISPOSITIONS` | `FacadeSurface` | this table, machine-checked by `tests/legacy_facade.rs` |
+//! | 11 | `LEGACY_KIND_SPELLINGS` | `FacadeSurface` | frozen 10 `snake_case` spellings from the #706 denominator |
+//! | 12 | `preserve_v1_row` | `AdapterEntry` | refuses identity-only migration |
+//! | 13 | `preserve_v1_snapshot` | `AdapterEntry` | refuses identity-only migration |
+//! | 14 | `preserve_v1_row_bytes` | `AdapterEntry` | exact v1 row bytes plus replay identity |
+//! | 15 | `preserve_v1_snapshot_bytes` | `AdapterEntry` | refuses missing per-row bytes |
+//! | 16 | `preserve_v1_snapshot_bytes_with_rows` | `AdapterEntry` | exact snapshot and per-row byte preservation |
+//! | 17 | `preserve_v1_snapshot_conversion` | `AdapterEntry` | joins byte-preserved row dispositions |
+//! | 18 | `reject_v1_row_conversion` | `AdapterEntry` | typed `V2Rejected` with raw bytes |
+//! | 19 | `convert_v1_row` | `AdapterEntry` | fresh-observation-only v1-to-v2 conversion |
+//! | 20 | `convert_v1_row_from_fresh_observation` | `AdapterEntry` | fresh owner observation and normalization conversion |
+//! | 21 | `decode_legacy_kind` | `AdapterEntry` | exact 10 frozen spellings; all else refused |
+//! | 22 | `decode_legacy_mode` | `AdapterEntry` | exact 3 spellings; all else refused |
+//! | 23 | `adapt_normalize` | `AdapterEntry` | one A-11 call + identity check |
+//! | 24 | `adapt_bind` | `AdapterEntry` | one A-12 call + echo check |
+//! | 25 | `adapt_rebuild_snapshot` | `AdapterEntry` | one A-13 call + digest check |
+//! | 26 | `adapt_activate` | `AdapterEntry` | one A-14a call + result validation |
+//! | 27 | `legacy_row_id_v2` | `AdapterEntry` | refuses stored legacy values until fresh owner input |
+//! | 28 | `legacy_row_id_v2_from_fresh_observation` | `AdapterEntry` | frozen owner `cue_row_id` projection after fresh normalization |
+//! | 29 | `require_reobservation` | `AdapterEntry` | typed refusal with exact owner/revision pointer |
+//! | 30 | `request_legacy_delivery` | `InertHandoff` | validates envelope, names handoff, no completion |
 //!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
@@ -103,9 +113,23 @@ pub struct LegacyEliotCuesV1Row {
 }
 
 impl LegacyEliotCuesV1Row {
-    /// Validates envelope shape only: non-blank, control-free text.
-    /// Vocabulary membership is decided by the decoder, not here.
+    /// Validates envelope shape only: non-blank, control-free text and a
+    /// non-zero source revision. Vocabulary membership is decided by the
+    /// decoder, not here.
     pub fn validate(&self) -> Result<(), FacadeError> {
+        self.validate_shape(true)
+    }
+
+    /// Validates the replay envelope while retaining a zero revision as a
+    /// semantic conversion refusal. A zero revision is not a usable v1
+    /// envelope, but the migration boundary must preserve its bytes and emit a
+    /// typed `V2Rejected` disposition instead of losing the supplied identity
+    /// behind a structural error.
+    pub(crate) fn validate_for_conversion(&self) -> Result<(), FacadeError> {
+        self.validate_shape(false)
+    }
+
+    fn validate_shape(&self, require_revision: bool) -> Result<(), FacadeError> {
         for (field, value) in [
             ("row.scope", &self.scope),
             ("row.kind", &self.kind),
@@ -120,6 +144,11 @@ impl LegacyEliotCuesV1Row {
             && (mode.trim().is_empty() || mode.chars().any(char::is_control))
         {
             return Err(FacadeError::EnvelopeInvalid { field: "row.mode" });
+        }
+        if require_revision && self.revision == 0 {
+            return Err(FacadeError::EnvelopeInvalid {
+                field: "row.revision",
+            });
         }
         Ok(())
     }
@@ -153,6 +182,8 @@ pub struct LegacyDeliveryHandoff {
 pub struct V1RowMigration {
     /// Legacy row identity kept byte-identical.
     pub legacy_row_id: String,
+    /// Exact v1 row bytes retained for replay.
+    pub legacy_bytes: Vec<u8>,
     /// Explicit conversion disposition from the owner vocabulary.
     pub disposition: eliot_cue_contracts::ConversionDisposition,
 }
@@ -165,37 +196,346 @@ pub struct V1RowMigration {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct V1SnapshotMigration {
+    /// Legacy snapshot identity retained for replay.
+    pub legacy_snapshot_id: String,
+    /// Exact v1 snapshot bytes retained for replay.
+    pub legacy_snapshot_bytes: Vec<u8>,
     /// One entry per preserved legacy row.
     pub rows: Vec<V1RowMigration>,
     /// Migration proof ceiling (candidate artifact only).
     pub ceiling: eliot_cue_contracts::ProofCeiling,
 }
 
-/// Preserves one legacy row identity for replay without converting it.
+impl V1RowMigration {
+    /// Validates that replay bytes and the disposition retain the same legacy
+    /// identity. This never authenticates a v2 identity or grants semantics.
+    pub fn validate(&self) -> Result<(), FacadeError> {
+        validate_legacy_identity(&self.legacy_row_id)?;
+        if self.legacy_bytes.is_empty() {
+            return Err(FacadeError::EnvelopeInvalid {
+                field: "legacy_bytes",
+            });
+        }
+        let parsed = legacy_adapter::parse_bound_v1_row(&self.legacy_bytes, &self.legacy_row_id)?;
+        parsed.validate_for_conversion()?;
+        self.disposition.validate().map_err(FacadeError::Contract)?;
+        if self.disposition.legacy_row_id() != self.legacy_row_id {
+            return Err(FacadeError::ResponseIdentityMismatch {
+                what: "migration.legacy_row_id",
+            });
+        }
+        if let eliot_cue_contracts::ConversionDisposition::V2Rejected { reason, .. } =
+            &self.disposition
+            && V1MigrationRejection::from_reason(reason).is_none()
+        {
+            return Err(FacadeError::Contract(
+                eliot_cue_contracts::CueContractError::Foundation {
+                    field: "conversion.reason",
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl V1SnapshotMigration {
+    /// Validates the complete snapshot envelope and every retained row.
+    pub fn validate(&self) -> Result<(), FacadeError> {
+        validate_legacy_identity(&self.legacy_snapshot_id)?;
+        if self.legacy_snapshot_bytes.is_empty() {
+            return Err(FacadeError::EnvelopeInvalid {
+                field: "legacy_snapshot_bytes",
+            });
+        }
+        if self.ceiling != eliot_cue_contracts::ProofCeiling::CandidateArtifact {
+            return Err(FacadeError::EnvelopeInvalid { field: "ceiling" });
+        }
+        let parsed_ids = legacy_adapter::parse_bound_v1_snapshot(
+            &self.legacy_snapshot_bytes,
+            &self.legacy_snapshot_id,
+        )?;
+        let parsed = parsed_ids
+            .into_iter()
+            .map(|(id, row)| (id, row))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for row in &self.rows {
+            row.validate()?;
+            let parsed_row =
+                legacy_adapter::parse_bound_v1_row(&row.legacy_bytes, &row.legacy_row_id)?;
+            if parsed.get(&row.legacy_row_id) != Some(&parsed_row) {
+                return Err(FacadeError::ResponseIdentityMismatch {
+                    what: "migration.snapshot.row_payload",
+                });
+            }
+            if !seen.insert(row.legacy_row_id.clone()) {
+                return Err(FacadeError::ResponseIdentityMismatch {
+                    what: "migration.duplicate_legacy_row_id",
+                });
+            }
+        }
+        if parsed.len() != seen.len() || parsed.keys().any(|row_id| !seen.contains(row_id)) {
+            return Err(FacadeError::ResponseIdentityMismatch {
+                what: "migration.snapshot.row_set",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_legacy_identity(value: &str) -> Result<(), FacadeError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_identity",
+        });
+    }
+    Ok(())
+}
+
+/// One exact legacy row input for a byte-preserving snapshot conversion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct V1PreservedRow {
+    /// Legacy row identity, retained without rewriting.
+    pub legacy_row_id: String,
+    /// Exact bytes as received from the v1 owner.
+    pub legacy_bytes: Vec<u8>,
+}
+
+impl V1PreservedRow {
+    /// Constructs one immutable legacy row input.
+    pub fn new(
+        legacy_row_id: impl Into<String>,
+        legacy_bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self, FacadeError> {
+        let value = Self {
+            legacy_row_id: legacy_row_id.into(),
+            legacy_bytes: legacy_bytes.into(),
+        };
+        validate_legacy_identity(&value.legacy_row_id)?;
+        if value.legacy_bytes.is_empty() {
+            return Err(FacadeError::EnvelopeInvalid {
+                field: "legacy_bytes",
+            });
+        }
+        legacy_adapter::parse_bound_v1_row(&value.legacy_bytes, &value.legacy_row_id)?;
+        Ok(value)
+    }
+}
+
+/// Closed reasons for refusing a v1-to-v2 identity conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum V1MigrationRejection {
+    /// No fresh owner observation was supplied.
+    MissingFreshObservation,
+    /// The supplied observation did not belong to the legacy row.
+    FreshObservationMismatch,
+    /// The fresh normalized result did not produce the requested key.
+    MissingNormalizedKey,
+    /// The legacy row is not in the frozen v1 vocabulary.
+    UnsupportedLegacyIdentity,
+}
+
+impl V1MigrationRejection {
+    /// Stable bounded reason emitted in a rejection disposition.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingFreshObservation => "missing_fresh_observation",
+            Self::FreshObservationMismatch => "fresh_observation_mismatch",
+            Self::MissingNormalizedKey => "missing_normalized_key",
+            Self::UnsupportedLegacyIdentity => "unsupported_legacy_identity",
+        }
+    }
+
+    /// Parses only the closed rejection vocabulary retained by this facade.
+    #[must_use]
+    pub fn from_reason(value: &str) -> Option<Self> {
+        match value {
+            "missing_fresh_observation" => Some(Self::MissingFreshObservation),
+            "fresh_observation_mismatch" => Some(Self::FreshObservationMismatch),
+            "missing_normalized_key" => Some(Self::MissingNormalizedKey),
+            "unsupported_legacy_identity" => Some(Self::UnsupportedLegacyIdentity),
+            _ => None,
+        }
+    }
+}
+
+/// Refuses an identity-only legacy row migration.
+///
+/// A replay claim without the original bytes is not a closed migration. Use
+/// [`preserve_v1_row_bytes`] with the exact v1 payload instead.
 pub fn preserve_v1_row(legacy_row_id: &str) -> Result<V1RowMigration, FacadeError> {
     if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
         return Err(FacadeError::EnvelopeInvalid {
             field: "legacy_row_id",
         });
     }
-    Ok(V1RowMigration {
-        legacy_row_id: legacy_row_id.to_owned(),
-        disposition: eliot_cue_contracts::ConversionDisposition::V1ReplayPreserved {
-            legacy_row_id: legacy_row_id.to_owned(),
-        },
+    Err(FacadeError::MigrationRequired {
+        owner: "legacy-v1-replay",
+        revision: "raw-bytes-required",
     })
 }
 
-/// Preserves a set of legacy row identities for replay without converting them.
-pub fn preserve_v1_snapshot(row_ids: &[String]) -> Result<V1SnapshotMigration, FacadeError> {
-    let mut rows = Vec::with_capacity(row_ids.len());
-    for row_id in row_ids {
-        rows.push(preserve_v1_row(row_id)?);
+/// Preserves the exact v1 row bytes and identity for replay.
+pub fn preserve_v1_row_bytes(
+    legacy_row_id: &str,
+    legacy_bytes: &[u8],
+) -> Result<V1RowMigration, FacadeError> {
+    if legacy_row_id.trim().is_empty() || legacy_row_id.chars().any(char::is_control) {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
     }
-    Ok(V1SnapshotMigration {
-        rows,
-        ceiling: eliot_cue_contracts::ProofCeiling::CandidateArtifact,
+    if legacy_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_bytes",
+        });
+    }
+    let record = V1RowMigration {
+        legacy_row_id: legacy_row_id.to_owned(),
+        legacy_bytes: legacy_bytes.to_vec(),
+        disposition: eliot_cue_contracts::ConversionDisposition::V1ReplayPreserved {
+            legacy_row_id: legacy_row_id.to_owned(),
+        },
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// Refuses an identity-only legacy snapshot migration.
+///
+/// A replay claim without the original snapshot bytes is not closed. Use
+/// [`preserve_v1_snapshot_bytes`] with the exact v1 payload instead.
+pub fn preserve_v1_snapshot(row_ids: &[String]) -> Result<V1SnapshotMigration, FacadeError> {
+    if row_ids
+        .iter()
+        .any(|row_id| row_id.trim().is_empty() || row_id.chars().any(char::is_control))
+    {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
+    }
+    Err(FacadeError::MigrationRequired {
+        owner: "legacy-v1-replay",
+        revision: "raw-bytes-required",
     })
+}
+
+/// Refuses a snapshot migration that has no exact per-row bytes.
+///
+/// Snapshot-wide bytes alone cannot prove that each retained row identity is
+/// paired with its original row payload. Call
+/// [`preserve_v1_snapshot_bytes_with_rows`] with one byte-closed row input for
+/// every legacy row.
+pub fn preserve_v1_snapshot_bytes(
+    legacy_snapshot_id: &str,
+    legacy_snapshot_bytes: &[u8],
+    row_ids: &[String],
+) -> Result<V1SnapshotMigration, FacadeError> {
+    validate_legacy_identity(legacy_snapshot_id)?;
+    if legacy_snapshot_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_snapshot_bytes",
+        });
+    }
+    if row_ids
+        .iter()
+        .any(|row_id| row_id.trim().is_empty() || row_id.chars().any(char::is_control))
+    {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_row_id",
+        });
+    }
+    Err(FacadeError::MigrationRequired {
+        owner: "legacy-v1-replay",
+        revision: "row-bytes-required",
+    })
+}
+
+/// Preserves exact snapshot bytes and exact bytes for every legacy row.
+pub fn preserve_v1_snapshot_bytes_with_rows(
+    legacy_snapshot_id: &str,
+    legacy_snapshot_bytes: &[u8],
+    rows: &[V1PreservedRow],
+) -> Result<V1SnapshotMigration, FacadeError> {
+    validate_legacy_identity(legacy_snapshot_id)?;
+    if legacy_snapshot_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_snapshot_bytes",
+        });
+    }
+    let mut retained = Vec::with_capacity(rows.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        let record = preserve_v1_row_bytes(&row.legacy_row_id, &row.legacy_bytes)?;
+        if !seen.insert(record.legacy_row_id.clone()) {
+            return Err(FacadeError::ResponseIdentityMismatch {
+                what: "migration.duplicate_legacy_row_id",
+            });
+        }
+        retained.push(record);
+    }
+    let snapshot = V1SnapshotMigration {
+        legacy_snapshot_id: legacy_snapshot_id.to_owned(),
+        legacy_snapshot_bytes: legacy_snapshot_bytes.to_vec(),
+        rows: retained,
+        ceiling: eliot_cue_contracts::ProofCeiling::CandidateArtifact,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+/// Joins already-validated row conversion records to one exact snapshot
+/// envelope. The rows may be replayed, converted, or explicitly rejected;
+/// every row still carries its original bytes and identity.
+pub fn preserve_v1_snapshot_conversion(
+    legacy_snapshot_id: &str,
+    legacy_snapshot_bytes: &[u8],
+    rows: &[V1RowMigration],
+) -> Result<V1SnapshotMigration, FacadeError> {
+    let snapshot = V1SnapshotMigration {
+        legacy_snapshot_id: legacy_snapshot_id.to_owned(),
+        legacy_snapshot_bytes: legacy_snapshot_bytes.to_vec(),
+        rows: rows.to_vec(),
+        ceiling: eliot_cue_contracts::ProofCeiling::CandidateArtifact,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+/// Records a precise v1-to-v2 rejection while retaining the original row
+/// bytes and identity. The result is candidate-only and never an admission.
+pub fn reject_v1_row_conversion(
+    legacy_row_id: &str,
+    row: &LegacyEliotCuesV1Row,
+    legacy_bytes: &[u8],
+    reason: V1MigrationRejection,
+) -> Result<V1RowMigration, FacadeError> {
+    row.validate_for_conversion()?;
+    let parsed = legacy_adapter::parse_bound_v1_row(legacy_bytes, legacy_row_id)?;
+    if &parsed != row {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload",
+        });
+    }
+    validate_legacy_identity(legacy_row_id)?;
+    if legacy_bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid {
+            field: "legacy_bytes",
+        });
+    }
+    let record = V1RowMigration {
+        legacy_row_id: legacy_row_id.to_owned(),
+        legacy_bytes: legacy_bytes.to_vec(),
+        disposition: eliot_cue_contracts::ConversionDisposition::V2Rejected {
+            legacy_row_id: legacy_row_id.to_owned(),
+            reason: reason.as_str().to_owned(),
+        },
+    };
+    record.validate()?;
+    Ok(record)
 }
 
 /// Closed refusal vocabulary for the facade.
@@ -228,6 +568,12 @@ pub enum FacadeError {
     /// A legacy envelope field failed shape validation.
     #[error("legacy envelope field is blank or carries control characters: {field}")]
     EnvelopeInvalid {
+        /// Stable field path, never caller payload.
+        field: &'static str,
+    },
+    /// Preserved v1 bytes were not a parseable, identity-bound envelope.
+    #[error("legacy bytes are not a complete identity-bound v1 envelope: {field}")]
+    LegacyBytesInvalid {
         /// Stable field path, never caller payload.
         field: &'static str,
     },
@@ -280,7 +626,7 @@ pub enum FacadeError {
 /// `InertHandoff`. `tests/legacy_facade.rs` enforces the exact row count
 /// so additions stay deliberate, and the reexport rows resolve by type
 /// identity, not prose.
-pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
+pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 30] = [
     ("CueKind", "ReexportOwner", "eliot-cue-contracts"),
     ("MatchMode", "ReexportOwner", "eliot-cue-contracts"),
     (
@@ -293,11 +639,25 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
         "InertHandoff",
         "B-RCTX/Host (#612); no completion fabricated",
     ),
-    ("V1RowMigration", "LegacyDTO", "inert v1 replay identity"),
+    (
+        "V1RowMigration",
+        "LegacyDTO",
+        "v1 replay identity and raw-byte slot",
+    ),
     (
         "V1SnapshotMigration",
         "LegacyDTO",
-        "inert v1 replay identity",
+        "v1 replay identity and raw-byte slot",
+    ),
+    (
+        "V1PreservedRow",
+        "LegacyDTO",
+        "exact v1 row bytes and identity input",
+    ),
+    (
+        "V1MigrationRejection",
+        "FacadeSurface",
+        "closed typed conversion-refusal vocabulary",
     ),
     ("FacadeError", "FacadeSurface", "closed refusal vocabulary"),
     (
@@ -313,12 +673,47 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
     (
         "preserve_v1_row",
         "AdapterEntry",
-        "inert replay constructor",
+        "refuses identity-only migration",
     ),
     (
         "preserve_v1_snapshot",
         "AdapterEntry",
-        "inert replay constructor",
+        "refuses identity-only migration",
+    ),
+    (
+        "preserve_v1_row_bytes",
+        "AdapterEntry",
+        "exact v1 row bytes and identity",
+    ),
+    (
+        "preserve_v1_snapshot_bytes",
+        "AdapterEntry",
+        "refuses missing per-row bytes",
+    ),
+    (
+        "preserve_v1_snapshot_bytes_with_rows",
+        "AdapterEntry",
+        "exact snapshot and per-row byte preservation",
+    ),
+    (
+        "preserve_v1_snapshot_conversion",
+        "AdapterEntry",
+        "joins byte-preserved row dispositions",
+    ),
+    (
+        "reject_v1_row_conversion",
+        "AdapterEntry",
+        "typed V2Rejected disposition with raw bytes",
+    ),
+    (
+        "convert_v1_row",
+        "AdapterEntry",
+        "fresh-observation-only v1-to-v2 conversion",
+    ),
+    (
+        "convert_v1_row_from_fresh_observation",
+        "AdapterEntry",
+        "fresh owner observation and normalization conversion",
     ),
     (
         "decode_legacy_kind",
@@ -337,7 +732,12 @@ pub const FACADE_DISPOSITIONS: [(&str, &str, &str); 20] = [
     (
         "legacy_row_id_v2",
         "AdapterEntry",
-        "frozen owner cue_row_id projection",
+        "refuses stored legacy values",
+    ),
+    (
+        "legacy_row_id_v2_from_fresh_observation",
+        "AdapterEntry",
+        "frozen owner cue_row_id after fresh normalization",
     ),
     (
         "require_reobservation",

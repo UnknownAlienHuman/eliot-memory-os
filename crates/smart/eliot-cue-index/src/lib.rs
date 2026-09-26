@@ -3,7 +3,11 @@
 //! The builder is a bounded strict all-or-error prototype: it accepts active
 //! records with exact freshness and supported evidence statuses, caps measured
 //! input at 512 KiB, and sorts the resulting member set deterministically. The
-//! registry revision is optional only for zero-edge builds. It remains a
+//! open entry point is an explicitly non-published compatibility fixture;
+//! `build_cue_snapshot_closed` is the only closed builder and retains the
+//! denominator, exact row/source joins, relation endpoints, policy weights,
+//! source revision, and measured graph closure.
+//! The registry revision is optional only for zero-edge builds. It remains a
 //! candidate producer and does not authenticate admission, publish a snapshot,
 //! run activation, or provide a complete rejection report.
 //!

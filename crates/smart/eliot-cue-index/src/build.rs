@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::StateFence;
 use eliot_cue_contracts::{
     AdmittedCueBindingProjection, CONTRACT_REVISION, ClosedSnapshotRow, CueComparisonKey,
-    CueContractError, CueProjectionDenominator, CueSnapshot, CueSnapshotBuildCandidate, Digest,
-    NormalizationProfile, RebuildIdentity, RelationEdge, SnapshotEdgeWeight, SnapshotId,
-    SnapshotMember, WorkScopeId,
+    CueContractError, CueProjectionDenominator, CueSnapshot, CueSnapshotBuildCandidate,
+    CueSnapshotClosure, CueSnapshotFanout, Digest, NormalizationProfile, RebuildIdentity,
+    RelationEdge, SnapshotEdgeWeight, SnapshotId, SnapshotMember, WorkScopeId,
 };
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 
@@ -73,6 +73,9 @@ pub fn rebuild_cue_snapshot(
     registry_revision: Option<&str>,
 ) -> Result<CueSnapshotBuildCandidate, CueContractError> {
     candidate.validate()?;
+    if let Some(closure) = candidate.snapshot.retained_closure() {
+        return rebuild_cue_snapshot_with_closure(candidate, registry_revision, closure);
+    }
     let rebuilt = build_cue_snapshot(
         &candidate.scope_id,
         candidate.snapshot.snapshot_id.clone(),
@@ -115,6 +118,7 @@ pub fn build_cue_snapshot_closed(
     denominator: &CueProjectionDenominator,
     weights: &[SnapshotEdgeWeight],
 ) -> Result<CueSnapshotBuildCandidate, CueContractError> {
+    denominator.validate()?;
     let candidate = build_cue_snapshot(
         scope_id,
         snapshot_id,
@@ -124,50 +128,148 @@ pub fn build_cue_snapshot_closed(
         relation_edges,
         registry_revision,
     )?;
-    let rows = join_closed_rows(scope_id, &candidate.snapshot.members, projections)?;
-    candidate
-        .snapshot
-        .validate_closed(&rows, denominator, relation_edges, weights)?;
-    Ok(candidate)
+    let rows = join_closed_rows(
+        scope_id,
+        &candidate.snapshot.members,
+        projections,
+        denominator.source_revision,
+    )?;
+    let closed_weights = bind_weights_at_revision(weights, denominator.source_revision)?;
+    let closure = CueSnapshotClosure::new(
+        denominator.clone(),
+        rows,
+        relation_edges.to_vec(),
+        closed_weights,
+        CueSnapshotFanout::from_graph(&candidate.snapshot.members, relation_edges)?,
+    );
+    let mut snapshot = candidate.snapshot.with_closure(closure.clone());
+    snapshot.rebuild.digest = snapshot.canonical_digest()?;
+    snapshot.validate_self_closed()?;
+    let closed = CueSnapshotBuildCandidate::seal_closed(
+        scope_id.clone(),
+        snapshot,
+        candidate.admitted_bindings,
+        candidate.relation_edges,
+        closure,
+    )?;
+    Ok(closed)
 }
 
-/// Rebuilds a closed candidate and re-proves its closure.
+/// Rebuilds a closed candidate and re-proves its retained closure.
 ///
-/// The denominator, keys, and weights are caller inputs, not retained state:
-/// a rebuild with different closure inputs is a different claim and must be
-/// validated as one.
+/// When the candidate is already closed, the supplied denominator and weights
+/// are checked against the retained values and are not allowed to replace
+/// them. Older open candidates are upgraded only through the explicit closed
+/// seam below.
 pub fn rebuild_cue_snapshot_closed(
     candidate: &CueSnapshotBuildCandidate,
     registry_revision: Option<&str>,
     denominator: &CueProjectionDenominator,
     weights: &[SnapshotEdgeWeight],
 ) -> Result<CueSnapshotBuildCandidate, CueContractError> {
+    if let Some(retained) = candidate.snapshot.retained_closure() {
+        if *denominator != retained.denominator || weights != retained.edge_weights.as_slice() {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        return rebuild_cue_snapshot_with_closure(candidate, registry_revision, retained);
+    }
     let rebuilt = rebuild_cue_snapshot(candidate, registry_revision)?;
     let rows = join_closed_rows(
         &rebuilt.scope_id,
         &rebuilt.snapshot.members,
         &rebuilt.admitted_bindings,
+        denominator.source_revision,
     )?;
-    rebuilt
-        .snapshot
-        .validate_closed(&rows, denominator, &rebuilt.relation_edges, weights)?;
-    Ok(rebuilt)
+    let closed_weights = bind_weights_at_revision(weights, denominator.source_revision)?;
+    let closure = CueSnapshotClosure::new(
+        denominator.clone(),
+        rows,
+        rebuilt.relation_edges.clone(),
+        closed_weights,
+        CueSnapshotFanout::from_graph(&rebuilt.snapshot.members, &rebuilt.relation_edges)?,
+    );
+    let mut snapshot = rebuilt.snapshot.with_closure(closure.clone());
+    snapshot.rebuild.digest = snapshot.canonical_digest()?;
+    snapshot.validate_self_closed()?;
+    CueSnapshotBuildCandidate::seal_closed(
+        rebuilt.scope_id.clone(),
+        snapshot,
+        rebuilt.admitted_bindings,
+        rebuilt.relation_edges,
+        closure,
+    )
+}
+
+fn rebuild_cue_snapshot_with_closure(
+    candidate: &CueSnapshotBuildCandidate,
+    registry_revision: Option<&str>,
+    closure: &CueSnapshotClosure,
+) -> Result<CueSnapshotBuildCandidate, CueContractError> {
+    let rebuilt = build_cue_snapshot(
+        &candidate.scope_id,
+        candidate.snapshot.snapshot_id.clone(),
+        candidate.snapshot.rebuild.normalization_profile.clone(),
+        candidate.snapshot.state_fence.clone(),
+        &candidate.admitted_bindings,
+        &candidate.relation_edges,
+        registry_revision,
+    )?;
+    let mut snapshot = rebuilt.snapshot.with_closure(closure.clone());
+    snapshot.rebuild.digest = snapshot.canonical_digest()?;
+    let result = CueSnapshotBuildCandidate::seal_closed(
+        rebuilt.scope_id,
+        snapshot,
+        rebuilt.admitted_bindings,
+        rebuilt.relation_edges,
+        closure.clone(),
+    )?;
+    if result.build_digest != candidate.build_digest
+        || result.canonical_payload_bytes()? != candidate.canonical_payload_bytes()?
+    {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    Ok(result)
+}
+
+fn bind_weights_at_revision(
+    weights: &[SnapshotEdgeWeight],
+    source_revision: u64,
+) -> Result<Vec<SnapshotEdgeWeight>, CueContractError> {
+    if source_revision == 0
+        || weights
+            .iter()
+            .any(|weight| weight.source_revision != source_revision)
+    {
+        return Err(CueContractError::Foundation {
+            field: "index.edge_weight.source_revision",
+        });
+    }
+    // Preserve the supplied records byte-for-byte. A missing, stale, or
+    // mismatched revision is a refusal, never an opportunity for the builder
+    // to rewrite policy input into the denominator revision.
+    Ok(weights.to_vec())
 }
 
 fn join_closed_rows(
     scope_id: &WorkScopeId,
     members: &[SnapshotMember],
     projections: &[AdmittedCueBindingProjection],
+    source_revision: u64,
 ) -> Result<Vec<ClosedSnapshotRow>, CueContractError> {
     let mut by_member = BTreeMap::new();
     for projection in projections {
-        by_member.insert(
-            (
-                projection.candidate.canonical.canonical_cue_id.clone(),
-                projection.candidate.target.clone(),
-            ),
-            projection,
+        let key = (
+            projection.candidate.canonical.canonical_cue_id.clone(),
+            projection.candidate.target.clone(),
         );
+        if by_member.insert(key, projection).is_some() {
+            return Err(CueContractError::DuplicateIdentity {
+                field: "index.closed_rows.projections",
+            });
+        }
+    }
+    if by_member.len() != members.len() {
+        return Err(CueContractError::SnapshotNotRebuildable);
     }
     let mut rows = Vec::with_capacity(members.len());
     for member in members {
@@ -187,7 +289,12 @@ fn join_closed_rows(
             primary.match_mode,
             primary.key_value.clone(),
         );
-        let row = ClosedSnapshotRow::new(member.clone(), comparison);
+        let row = ClosedSnapshotRow::new_at_revision(
+            member.clone(),
+            comparison,
+            projection.normalized.observed.source.clone(),
+            source_revision,
+        )?;
         row.validate()?;
         rows.push(row);
     }
