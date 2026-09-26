@@ -181,6 +181,7 @@ pub use named_pipe_process_admission::{
     NamedPipePeerEvidence, NamedPipePeerExpectation, NamedPipePeerJobBinding,
     NamedPipePeerProcessBinding, current_process_named_pipe_expectation,
     observe_named_pipe_peer_process, observe_running_eliot_host_process,
+    observe_running_eliot_watchdog_process,
 };
 #[cfg(test)]
 pub(crate) use nonce_generation::{
