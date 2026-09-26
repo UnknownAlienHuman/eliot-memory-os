@@ -450,6 +450,9 @@ fn host_admission(
         privacy_policy: "project_code".to_owned(),
         comparator: "shadow-exact".to_owned(),
         rollback_generation: None,
+        state_fence_generation: 0,
+        state_fence_nonce: String::new(),
+        authority_epoch: String::new(),
     };
     let decision = PrototypeContourDecision::default();
     must(
@@ -1239,6 +1242,9 @@ fn non_wasm_admission_is_refused_before_a12() {
         privacy_policy: "project_code".to_owned(),
         comparator: "shadow-exact".to_owned(),
         rollback_generation: None,
+        state_fence_generation: 0,
+        state_fence_nonce: String::new(),
+        authority_epoch: String::new(),
     };
     let admitted = must(admit_generation(Some(&native), &manifest, &[]));
     let mut runner = must(
@@ -1469,6 +1475,9 @@ fn foreign_component_admission_denies_before_a12() {
         privacy_policy: "project_code".to_owned(),
         comparator: "shadow-exact".to_owned(),
         rollback_generation: None,
+        state_fence_generation: 0,
+        state_fence_nonce: String::new(),
+        authority_epoch: String::new(),
     };
     let decision = PrototypeContourDecision::default();
     let foreign_admitted = must(

@@ -38,6 +38,8 @@ mod shadow;
 mod typed_bindings;
 mod typed_execution;
 mod wasmtime_provider;
+// Pool sits with its sole consumer (the Wasmtime provider construction).
+mod pool;
 
 pub use admission::{LiveAuthority, PortGrantError, ResolvedPortGrant, resolve_kernel_port_grant};
 pub use artifact_preflight::{
@@ -46,11 +48,12 @@ pub use artifact_preflight::{
 pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
 pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
 pub use contour::{
-    AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
-    FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
-    PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
-    STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
-    authorize_host_call, check_activation_imports, check_admitted_request, experimental_manifest,
+    AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, CAPABILITY_GRANT_REVOKED,
+    CAPABILITY_INTRODUCTION_REQUIRED, Contour, ContourGateError, FS_CAPABILITY, GenerationManifest,
+    GovernorGrant, HostCallProposal, NET_CAPABILITY, PINNED_WASMTIME_VERSION,
+    PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET, STANDARD_GUEST_TARGET, admit_generation,
+    admit_generation_with_bytes, admit_prototype, authorize_host_call, check_activation_imports,
+    check_admitted_request, experimental_manifest,
 };
 pub use dispatch_drive::{
     DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
@@ -448,6 +451,9 @@ mod tests {
             privacy_policy: "project_code".to_owned(),
             comparator: "shadow-exact".to_owned(),
             rollback_generation: Some("gen-41".to_owned()),
+            state_fence_generation: 0,
+            state_fence_nonce: String::new(),
+            authority_epoch: String::new(),
         }
     }
 

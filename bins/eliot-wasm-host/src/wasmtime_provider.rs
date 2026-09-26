@@ -245,29 +245,49 @@ impl WasmtimeComponentEngine {
         })
     }
 
-    /// Builds the engine for P03-admitted component bytes with a
-    /// provider-derived binding: exact pinned implementation and version,
-    /// configuration digest recomputed from the supplied configuration,
-    /// and WIT digest recomputed from the checked-in world. The caller
-    /// supplies the artifact digest it verified (TOCTOU-checked by the
-    /// guest-runner child against the bytes it actually read).
-    pub fn new_for_admitted_bytes(
+    /// Builds the engine for P03-admitted component bytes through the
+    /// owned component pool (issue #21, W1): the pool derives its capacity
+    /// from the child-held admitted limits, compiles the artifact under
+    /// both pooled engines through the digest-keyed cache, and releases
+    /// the engines to the constructed engine. The binding is
+    /// provider-derived (exact pinned implementation and version,
+    /// pooled-configuration digest recomputed from the pool capacity, WIT
+    /// digest recomputed from the checked-in world); the artifact digest
+    /// is recomputed from the bytes (TOCTOU-checked by the guest-runner
+    /// child against the bytes it actually read before calling here).
+    pub fn new_for_admitted_limits(
         artifact: &[u8],
         component_configuration: &[u8],
+        limits: &InvocationLimits,
     ) -> Result<Self, WasmtimeBuildError> {
-        let binding = EngineBinding {
-            implementation_id: "wasmtime-component".to_owned(),
-            exact_version: WASMTIME_VERSION.to_owned(),
-            engine_artifact_digest: Sha256Digest::of_bytes(ENGINE_FIXTURE_IDENTITY),
-            engine_configuration_digest: configuration_digest(),
-            wit_interface_digest: Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")),
+        let pool_config = crate::pool::InstancePoolConfig::from_limits(limits);
+        let mut pool =
+            crate::pool::ComponentPool::new(&pool_config).map_err(WasmtimeBuildError::Config)?;
+        let key = crate::pool::PoolCacheKey {
+            artifact: Sha256Digest::of_bytes(artifact),
+            component_configuration: Sha256Digest::of_bytes(component_configuration),
+            engine_configuration: crate::pool::pooled_configuration_digest(&pool_config),
         };
-        Self::new(
-            binding,
-            Sha256Digest::of_bytes(artifact),
-            artifact,
-            component_configuration,
-        )
+        let (epoch_component, fuel_component) = pool
+            .compile(&key, artifact)
+            .map_err(WasmtimeBuildError::Compile)?;
+        let (epoch_engine, fuel_engine) = pool.into_engines();
+        Ok(Self {
+            epoch_engine,
+            epoch_component,
+            fuel_engine,
+            fuel_component,
+            binding: EngineBinding {
+                implementation_id: "wasmtime-component".to_owned(),
+                exact_version: WASMTIME_VERSION.to_owned(),
+                engine_artifact_digest: Sha256Digest::of_bytes(ENGINE_FIXTURE_IDENTITY),
+                engine_configuration_digest: key.engine_configuration,
+                wit_interface_digest: Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")),
+            },
+            artifact_digest: key.artifact,
+            component_configuration_digest: key.component_configuration,
+            artifact_bytes: artifact.len() as u64,
+        })
     }
 
     /// Executes raw input through the admitted component without the port
