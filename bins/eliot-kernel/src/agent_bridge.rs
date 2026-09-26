@@ -51,6 +51,7 @@ fn bridge_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownRequest => "bridge_unknown_request",
         TransportError::UnknownOutcome => "bridge_unknown_outcome",
         TransportError::IdentityConflict => "bridge_identity_conflict",
+        TransportError::LegacyCorrelationUnresolved => "bridge_legacy_correlation_unresolved",
         TransportError::Cancelled => "bridge_cancelled",
         TransportError::Backpressure => "bridge_backpressure",
         TransportError::InvalidLimits => "bridge_invalid_limits",
