@@ -1752,7 +1752,14 @@ impl KernelComposition {
     /// stale fence each stop here before the path-proof and gateway steps. A
     /// malformed presented generation is an invalid request, not a coverage
     /// observation, and keeps its own stable code.
-    fn reject_process_start_without_material_coverage(
+    ///
+    /// Crate-visible so the production front-door process start
+    /// ([`GatewayProcessStarter`](crate::process_execution_client) is built
+    /// from the same composition) runs this one guard instead of a parallel
+    /// fence reconstruction: the decision, the refusal projection, and the
+    /// `kernel.process.request_rejected` observation then have exactly one
+    /// owner on every start path.
+    pub(crate) fn reject_process_start_without_material_coverage(
         &self,
         admission: &eliot_process::ProcessExecutionAdmissionRequest,
     ) -> Option<eliot_kernel_service::ProcessExecutionRejection> {
