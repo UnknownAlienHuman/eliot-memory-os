@@ -1062,12 +1062,12 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
-    HostStoreBootstrapRequirement, KernelActivationPermit, KernelActivationQuery,
-    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
-    KernelReadyReceipt, KernelServiceState, ProcessAuthorityHandoffDescriptor, RestartBudget,
-    StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
-    StoreRebindReceipt, control_request_frame, decode_control_response_frame,
-    semantic_store_config_hash_from_json,
+    HostStartupEvidence, HostStoreBootstrapRequirement, KernelActivationPermit,
+    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
+    KernelControlResponse, KernelReadyReceipt, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
+    StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
+    decode_control_response_frame, semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -2146,10 +2146,41 @@ impl HostJobBranches {
             host_state_root,
             store_data_root,
         )?;
+        Self::send_bound_host_startup_evidence(
+            transport,
+            &evidence,
+            candidate,
+            generation_handle,
+            sequence,
+        )
+        .await
+    }
+
+    /// Sends one already-built startup-evidence carrier on this connection and
+    /// requires the exact response binding.
+    ///
+    /// I1.5 (#1750): this is the single wire seam for the carrier, shared by
+    /// the activation sequence and by the bounded readiness cadence that
+    /// republishes a CURRENT independent Watchdog observation before its repeat
+    /// probe. One send, one binding check, no second protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the frame cannot be delivered with a known
+    /// outcome, or when the Kernel response is not exactly bound to this
+    /// request.
+    #[cfg(windows)]
+    async fn send_bound_host_startup_evidence(
+        transport: &mut NamedPipeTransport,
+        evidence: &HostStartupEvidence,
+        candidate: &HostKernelCandidateBinding,
+        generation_handle: &PlatformHandle,
+        sequence: u64,
+    ) -> Result<(), HostError> {
         let request = kernel_control_request(
             candidate,
-            authority_generation,
-            KernelControlCommand::ReportHostStartupEvidence(evidence),
+            evidence.state_fence.resource_generation,
+            KernelControlCommand::ReportHostStartupEvidence(evidence.clone()),
             sequence,
         )?;
         let frame = control_request_frame(
@@ -3516,6 +3547,7 @@ impl HostJobBranches {
         approved_kernel_artifact: &PlatformHandle,
         approved_store_artifact: &PlatformHandle,
         approved_config: &PlatformHandle,
+        supervision_evidence: &HostStartupEvidence,
     ) -> Result<AuthenticatedKernelReadiness, HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -3600,11 +3632,25 @@ impl HostJobBranches {
             ))?;
             let peer_evidence = PlatformHandle::new(format!("kernel-peer:{peer_digest}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?;
+            // I1.5 (#1750): the independent Watchdog observation is republished
+            // on this connection before the probe, so Kernel binds a CURRENT
+            // owner observation to this contour and this consumer fence rather
+            // than answering the probe from retained text. It occupies the first
+            // command on the strict per-connection sequence and the probe
+            // follows as the second.
+            HostJobBranches::send_bound_host_startup_evidence(
+                &mut transport,
+                supervision_evidence,
+                candidate,
+                approved_generation,
+                1,
+            )
+            .await?;
             let request = KernelControlRequest {
                 wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
                 wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
                 message_id: fresh_identity("kernel-probe")?,
-                sequence: 1,
+                sequence: 2,
                 peer_process_id: std::process::id(),
                 generation: launch.authority_generation,
                 candidate: candidate.clone(),
@@ -8514,6 +8560,63 @@ impl HostComposition {
         outcome
     }
 
+    /// Re-observes the independent Watchdog branch for one readiness contour
+    /// and returns the closed carrier that publishes it.
+    ///
+    /// I1.5 (#1750): a repeated readiness probe is an ordinary request and must
+    /// not be answered from the observation retained since activation. This
+    /// re-runs the SAME single producer the startup path uses, so the live SCM
+    /// Watchdog incarnation is re-read from the OS right now (bound PID/start
+    /// pair, process liveness, and image bytes equal to the approved Watchdog
+    /// artifact) and the whole carrier is rebuilt from fresh probes. It runs on
+    /// the Host's own bounded readiness cadence, never synchronously on an
+    /// ordinary request, and it introduces no second supervisor, no second
+    /// observation protocol and no new wire field.
+    ///
+    /// # Errors
+    ///
+    /// Returns the producer's own typed reason: an unreadable journal, no
+    /// usable active manifest, an unbound or dead Watchdog incarnation, a
+    /// substituted Watchdog image, a tampered Blob manifest, or a contour that
+    /// is not the approved active generation.
+    #[cfg(windows)]
+    fn reobserve_watchdog_supervision_evidence(
+        &self,
+        generation: &PlatformHandle,
+    ) -> Result<HostStartupEvidence, HostError> {
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+        })?;
+        if self.jobs.approved_generation.as_ref() != Some(generation) {
+            return Err(HostError::ProcessContour(
+                "readiness re-observation is not for the approved active generation".to_owned(),
+            ));
+        }
+        let active = self
+            .registry
+            .generations()
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness re-observation generation is not present in the approved registry"
+                        .to_owned(),
+                )
+            })?;
+        host_startup_evidence::build_host_startup_evidence(
+            &self.journal,
+            &active.manifest,
+            candidate,
+            launch.authority_generation,
+            candidate.kernel_epoch.clone(),
+            self.launch_options.host_state_root(),
+            Path::new(launch.runtime_state_roots.store_data_root.as_str()),
+        )
+    }
+
     /// Persists the durable evidence for one failed authenticated readiness
     /// proof, with a cause-specific reason.
     ///
@@ -8910,6 +9013,12 @@ impl HostComposition {
                 "readiness probe has no materialized Store config digest".to_owned(),
             )
         })?;
+        // I1.5 (#1750): republish a CURRENT independent Watchdog observation
+        // before the repeat probe, on this bounded readiness cadence, so the
+        // probe is answered from a fresh owner observation instead of from the
+        // one retained since activation. The carrier rides the same connection
+        // and the same strict per-connection command sequence as the probe.
+        let supervision_evidence = self.reobserve_watchdog_supervision_evidence(generation)?;
         let contour = self.current_readiness_contour(
             generation,
             kernel_artifact,
@@ -8921,6 +9030,7 @@ impl HostComposition {
             kernel_artifact,
             store_artifact,
             materialized_config_digest,
+            &supervision_evidence,
         )?;
         let registry_authority = self
             .registry

@@ -480,19 +480,31 @@ impl KernelComposition {
             // I1.5 (#1750), I1.11 steps 1/11: this probe may not author a
             // ready receipt — and therefore may not publish any
             // supervised-readiness claim — unless the independent Watchdog
-            // branch currently verifies from a LIVE SCM incarnation.
+            // branch verifies from a CURRENT owner observation bound to this
+            // contour and to the exact consumer State Fence.
             //
             // This is the production gate main had here and the branch dropped.
             // The dropped predicate was a lease-derived watchdog-epoch
             // equality: two bookkeeping `u64`s on the renewed ORS head, which
             // stay equal while Watchdog is stopped, replaced or wedged, so it
             // could admit a contour whose branch had never been observed. The
-            // replacement requires the recorded live SCM incarnation digest for
-            // THIS contour (only `HostStartupEvidence` can set it, and only
-            // after Host revalidated the PID/start pair against the live OS and
-            // the live image bytes against the approved Watchdog artifact)
-            // plus the whole supervised-branch conjunction. It therefore
-            // refuses strictly more, never less.
+            // replacement requires an independent Watchdog observation bound to
+            // THIS contour and to the exact consumer State Fence and still
+            // inside its own finite validity interval (only `HostStartupEvidence`
+            // can record one, and only after Host revalidated the PID/start pair
+            // against the live OS and the live image bytes against the approved
+            // Watchdog artifact), plus the whole supervised-branch conjunction.
+            //
+            // What this gate establishes, precisely: it refuses every case the
+            // dropped lease-derived equality refused, and it additionally
+            // refuses every case in which no current independent observation is
+            // bound to this contour and fence — including one that has aged out
+            // of its validity interval. It does NOT establish that it refuses a
+            // Watchdog which stopped, was replaced or wedged after the last
+            // observation while that observation is still inside its validity
+            // interval. The evidence these predicates consume is the owner's
+            // observation; a contradiction or an expiry is what narrows the
+            // claim. See `admit_probe_watchdog_branch`.
             //
             // The target fence is read from the freshly renewed,
             // signature-verified head's own binding rather than rebuilt from
