@@ -3614,7 +3614,7 @@ fn nextest_joined_stdout(raw: &[RawEvidence]) -> Result<NextestStdoutStream, Com
 /// Every normalized item carries the owner-observed executable identity,
 /// config hash, WorkScope/candidate identity, profile revision, and
 /// truncation signal of the exact run it was parsed from. Timing detail
-/// stays on the run clocks; the TestD receipt projects no Job Object
+/// stays on the run clocks; the `TestD` receipt projects no Job Object
 /// resource accounting, so `resource_outcome` stays absent rather than
 /// invented. Parse success is proven by the fail-closed full-consumption
 /// check, so no parse note is attached.
