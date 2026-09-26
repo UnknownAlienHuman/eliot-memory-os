@@ -1969,6 +1969,7 @@ fn automation_state_payload(
             })?;
             let mut revisions = Vec::new();
             let mut truncated = false;
+            let mut last_row_id: Option<String> = None;
             if let Some(requested_revision) = decoded.requested_revision.as_deref() {
                 if let Some(row) = state.automation_revisions.values().find(|row| {
                     row.automation_id == id
@@ -1986,6 +1987,17 @@ fn automation_state_payload(
                     if row.automation_id != id || row.state_fence != *fence {
                         continue;
                     }
+                    // Ascending revision identity is the denominator's total
+                    // ordering, so the exclusive continuation resumes strictly
+                    // after the last served row instead of skipping a fixed
+                    // count over a moving set.
+                    if decoded
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|cursor| row.revision.as_str() <= cursor.after_row_id.as_str())
+                    {
+                        continue;
+                    }
                     // One probe row past the bound decides owner-proven
                     // completeness: a page that merely happens to be shorter
                     // than the bound is not proof that no later row exists.
@@ -1993,6 +2005,7 @@ fn automation_state_payload(
                         truncated = true;
                         break;
                     }
+                    last_row_id = Some(row.revision.clone());
                     revisions.push(json!({
                         "automation_id": row.automation_id,
                         "revision": row.revision,
@@ -2001,14 +2014,33 @@ fn automation_state_payload(
                 }
                 if truncated {
                     revisions.pop();
+                    last_row_id = revisions
+                        .last()
+                        .and_then(|row| row.get("revision"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                 }
             }
             let returned = revisions.len();
+            let read_revision = automation_page_read_revision(state)?;
+            let mut completeness =
+                automation_page_completeness(&read_revision, returned, truncated);
+            if truncated {
+                completeness = automation_page_with_continuation(
+                    completeness,
+                    AUTOMATION_QUERY_HISTORY,
+                    &id,
+                    &read_revision,
+                    fence,
+                    last_row_id.as_deref(),
+                    limit,
+                )?;
+            }
             serde_json::to_value(json!({
                 "revisions": revisions,
                 "revision": returned,
                 "state_fence": fence,
-                "completeness": automation_page_completeness(state, returned, truncated)?,
+                "completeness": completeness,
             }))
         }
         AUTOMATION_QUERY_INVOCATIONS => {
@@ -2021,6 +2053,7 @@ fn automation_state_payload(
                 &id,
                 limit,
                 decoded.requested_occurrence_id.as_deref(),
+                decoded.cursor.as_ref(),
             )
         }
         AUTOMATION_QUERY_FAILURE => {
@@ -2046,9 +2079,11 @@ fn automation_invocations_payload(
     automation_id: &str,
     limit: usize,
     requested_occurrence_id: Option<&str>,
+    cursor: Option<&eliot_store_api::AutomationPageCursor>,
 ) -> Result<Value, serde_json::Error> {
     let mut invocations = Vec::new();
     let mut truncated = false;
+    let mut last_row_id: Option<String> = None;
     for row in state.automation_invocations.values() {
         if row.automation_id != automation_id || row.state_fence != *fence {
             continue;
@@ -2056,10 +2091,17 @@ fn automation_invocations_payload(
         if requested_occurrence_id.is_some_and(|occurrence_id| row.occurrence_id != occurrence_id) {
             continue;
         }
+        // Ascending occurrence identity is the denominator's total ordering, so
+        // the exclusive continuation resumes strictly after the last served row
+        // instead of skipping a fixed count over a moving set.
+        if cursor.is_some_and(|cursor| row.occurrence_id.as_str() <= cursor.after_row_id.as_str()) {
+            continue;
+        }
         if invocations.len() > limit {
             truncated = true;
             break;
         }
+        last_row_id = Some(row.occurrence_id.clone());
         invocations.push(json!({
             "occurrence_id": row.occurrence_id,
             "automation_id": row.automation_id,
@@ -2068,41 +2110,100 @@ fn automation_invocations_payload(
     }
     if truncated {
         invocations.pop();
+        last_row_id = invocations
+            .last()
+            .and_then(|row| row.get("occurrence_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
     let returned = invocations.len();
+    let read_revision = automation_page_read_revision(state)?;
+    let mut completeness = automation_page_completeness(&read_revision, returned, truncated);
+    if truncated {
+        completeness = automation_page_with_continuation(
+            completeness,
+            AUTOMATION_QUERY_INVOCATIONS,
+            automation_id,
+            &read_revision,
+            fence,
+            last_row_id.as_deref(),
+            limit,
+        )?;
+    }
     serde_json::to_value(json!({
         "invocations": invocations,
         "revision": returned,
         "state_fence": fence,
-        "completeness": automation_page_completeness(state, returned, truncated)?,
+        "completeness": completeness,
     }))
 }
 
-/// Builds the owner-issued denominator completeness metadata for one page.
+/// Digests the exact revision-head set one automation read observed.
 ///
-/// `read_revision` digests the exact revision-head set this read observed
-/// through the store-api head digest, so it is owner-issued rather than a
-/// caller claim, and it changes whenever a commit advances any head (a new
-/// occurrence, a retirement, or an edit). `coverage` is the closed
-/// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts that the owner read
-/// one probe row past the bound and matched nothing further.
-fn automation_page_completeness(
-    state: &MemoryState,
-    returned: usize,
-    truncated: bool,
-) -> Result<Value, serde_json::Error> {
+/// The value is the owner-issued read revision a page reports and a
+/// continuation is bound to. It changes whenever a commit advances any head,
+/// which is exactly when an outstanding continuation must stop being valid.
+fn automation_page_read_revision(state: &MemoryState) -> Result<String, serde_json::Error> {
     let heads: Vec<(String, u64)> = state
         .revision_heads
         .values()
         .map(|head| (head.key.as_str().to_owned(), head.revision))
         .collect();
-    let read_revision =
-        audit_heads_digest(&heads).map_err(|error| serde_json::Error::custom(error.to_string()))?;
-    Ok(json!({
+    audit_heads_digest(&heads).map_err(|error| serde_json::Error::custom(error.to_string()))
+}
+
+/// Builds the owner-issued denominator completeness metadata for one page.
+///
+/// `read_revision` is the owner-issued digest of the head set this read
+/// observed, so it is not a caller claim. `coverage` is the closed
+/// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts that the owner read
+/// one probe row past the bound and matched nothing further. A truncated page
+/// additionally carries the owner-minted continuation for the next page.
+fn automation_page_completeness(read_revision: &str, returned: usize, truncated: bool) -> Value {
+    json!({
         "read_revision": read_revision,
         "returned": returned,
         "coverage": if truncated { "TRUNCATED" } else { "COMPLETE" },
-    }))
+    })
+}
+
+/// Mints and attaches the owner continuation for one truncated automation page.
+///
+/// A truncated page that carried no successor cursor would be indistinguishable
+/// from a terminator, so the owner refuses rather than serving a page whose
+/// remainder has no address.
+fn automation_page_with_continuation(
+    mut completeness: Value,
+    query: &str,
+    automation_id: &str,
+    read_revision: &str,
+    fence: &StateFence,
+    last_row_id: Option<&str>,
+    max_records: usize,
+) -> Result<Value, serde_json::Error> {
+    let last_row_id = last_row_id.ok_or_else(|| {
+        serde_json::Error::custom("truncated automation page served no row to continue from")
+    })?;
+    let max_records = u16::try_from(max_records).map_err(|_| {
+        serde_json::Error::custom("automation page bound is not representable as a cursor bound")
+    })?;
+    let next_cursor = eliot_store_api::automation_cursor_mint(
+        query,
+        automation_id,
+        read_revision,
+        fence,
+        last_row_id,
+        max_records,
+    )
+    .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let object = completeness.as_object_mut().ok_or_else(|| {
+        serde_json::Error::custom("automation completeness metadata is not an object")
+    })?;
+    object.insert(
+        eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR.to_owned(),
+        Value::String(next_cursor),
+    );
+    Ok(completeness)
 }
 
 /// Projects the last same-fence failure row for one automation, or
