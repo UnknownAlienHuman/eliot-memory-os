@@ -2362,6 +2362,287 @@ impl AgentBridgeActivationResponse {
     }
 }
 
+/// Closed control disposition carried by the additive I7.20 activation
+/// denial envelope. Reason codes remain open strings alongside this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentResponseDisposition {
+    /// The request shape or identity was invalid.
+    InvalidRequest,
+    /// The request was denied by policy or authority.
+    Denied,
+    /// The request conflicted with a stale or current state fence.
+    StaleOrConflict,
+    /// Additional evidence is required before the request can proceed.
+    NeedsEvidence,
+    /// Capacity or an unavailable dependency prevents the request.
+    UnavailableOrCapacity,
+    /// The caller must follow a recovery action before retrying.
+    RecoveryRequired,
+    /// The request failed during execution.
+    Failed,
+}
+
+impl AgentResponseDisposition {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "INVALID_REQUEST",
+            Self::Denied => "DENIED",
+            Self::StaleOrConflict => "STALE_OR_CONFLICT",
+            Self::NeedsEvidence => "NEEDS_EVIDENCE",
+            Self::UnavailableOrCapacity => "UNAVAILABLE_OR_CAPACITY",
+            Self::RecoveryRequired => "RECOVERY_REQUIRED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// Closed, typed activation directive kinds already used by the bridge's
+/// known-denial projection. The strings are stable wire values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AgentActivationDirectiveKind {
+    /// Present candidate recovery options without selecting one for the agent.
+    #[serde(rename = "candidate-recovery-no-auto-selection")]
+    CandidateRecoveryNoAutoSelection,
+    /// Retry only with a newly identified ticket.
+    #[serde(rename = "retry-requires-new-ticket")]
+    RetryRequiresNewTicket,
+    /// Fail closed and do not reuse the stale fence.
+    #[serde(rename = "stale-fence-fail-closed")]
+    StaleFenceFailClosed,
+    /// Carry the owner-issued failure capsule.
+    #[serde(rename = "failure-capsule")]
+    FailureCapsule,
+}
+
+impl AgentActivationDirectiveKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateRecoveryNoAutoSelection => "candidate-recovery-no-auto-selection",
+            Self::RetryRequiresNewTicket => "retry-requires-new-ticket",
+            Self::StaleFenceFailClosed => "stale-fence-fail-closed",
+            Self::FailureCapsule => "failure-capsule",
+        }
+    }
+}
+
+/// Additive activation response view. `Denied` retains the original wire
+/// shape and closed transport code; `CanonicalDenied` carries the open
+/// agent-facing reason plus its explicit closed control disposition,
+/// applicable typed directive, and owner-issued detail.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum OpenAgentBridgeActivationDisposition {
+    /// Exact semantic binding produced by the authenticated resolver.
+    Authenticated {
+        /// Complete owner-produced activation binding.
+        binding: Box<AgentBridgeAuthenticatedBinding>,
+    },
+    /// Existing known-denial wire form, kept byte-compatible with the closed
+    /// transport code used by current Kernel producers.
+    Denied {
+        /// Stable legacy Kernel-to-bridge denial code.
+        reason_code: AgentBridgeActivationDenialCode,
+        /// Exact owner-issued semantic denial detail, when present.
+        detail: Option<AgentActivationResolutionDisposition>,
+    },
+    /// Additive open-reason form. Unknown reason strings are accepted only
+    /// with explicit typed control fields and matching owner-issued detail.
+    CanonicalDenied {
+        /// Exact additive reason code; unknown future values remain verbatim.
+        reason_code: String,
+        /// Closed control disposition for this non-success result.
+        disposition: AgentResponseDisposition,
+        /// Typed applicable directive kind for the carried detail.
+        directive_kind: AgentActivationDirectiveKind,
+        /// Non-success detail issued by the semantic owner.
+        detail: AgentActivationResolutionDisposition,
+    },
+}
+
+impl OpenAgentBridgeActivationDisposition {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Authenticated { binding } => binding.validate(),
+            Self::Denied {
+                reason_code,
+                detail,
+            } => AgentBridgeActivationDisposition::Denied {
+                reason_code: *reason_code,
+                detail: detail.clone(),
+            }
+            .validate(),
+            Self::CanonicalDenied {
+                reason_code,
+                disposition,
+                directive_kind,
+                detail,
+            } => {
+                text(reason_code, "agent_bridge_activation_response.reason_code")?;
+                detail.validate()?;
+                let compatible = match detail {
+                    AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+                        *disposition == AgentResponseDisposition::InvalidRequest
+                            && *directive_kind
+                                == AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection
+                    }
+                    AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => {
+                        *disposition == AgentResponseDisposition::StaleOrConflict
+                            && *directive_kind
+                                == AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection
+                    }
+                    AgentActivationResolutionDisposition::NotReady { .. } => {
+                        *disposition == AgentResponseDisposition::UnavailableOrCapacity
+                            && *directive_kind
+                                == AgentActivationDirectiveKind::RetryRequiresNewTicket
+                    }
+                    AgentActivationResolutionDisposition::StaleFence { .. } => {
+                        *disposition == AgentResponseDisposition::StaleOrConflict
+                            && *directive_kind == AgentActivationDirectiveKind::StaleFenceFailClosed
+                    }
+                    AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                        *disposition == AgentResponseDisposition::Failed
+                            && *directive_kind == AgentActivationDirectiveKind::FailureCapsule
+                    }
+                    AgentActivationResolutionDisposition::Resolved { .. } => false,
+                };
+                if compatible {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidField {
+                        field: "agent_bridge_activation_response.denial",
+                        reason: "closed disposition and directive must match the carried owner-issued detail",
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Deserialization view for activation responses that accepts the existing
+/// known-denial wire form and the additive canonical open-reason form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAgentBridgeActivationResponse {
+    /// Activation response wire identity.
+    pub wire_id: String,
+    /// Activation response wire version.
+    pub wire_version: u16,
+    /// Request identity copied from the activation request.
+    pub request_id: RequestId,
+    /// Digest of the exact activation request.
+    pub request_sha256: String,
+    /// Typed activation outcome, including additive canonical denials.
+    pub disposition: OpenAgentBridgeActivationDisposition,
+    /// Lowercase SHA-256 over every response field except this field.
+    pub response_sha256: String,
+}
+
+impl OpenAgentBridgeActivationResponse {
+    /// Current activation response contract version.
+    #[must_use]
+    pub const fn contract_version() -> u16 {
+        AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION
+    }
+
+    /// Constructs the additive canonical denial response for one exact
+    /// activation request. Its detail is owner-issued; no disposition or
+    /// directive is inferred from the open reason string.
+    pub fn canonical_denied(
+        request: &AgentBridgeActivationRequest,
+        reason_code: String,
+        disposition: AgentResponseDisposition,
+        directive_kind: AgentActivationDirectiveKind,
+        detail: AgentActivationResolutionDisposition,
+    ) -> Result<Self, ProtocolError> {
+        request.validate()?;
+        Self {
+            wire_id: AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
+            wire_version: Self::contract_version(),
+            request_id: request.request_identity.request.metadata.request_id.clone(),
+            request_sha256: request.request_sha256.clone(),
+            disposition: OpenAgentBridgeActivationDisposition::CanonicalDenied {
+                reason_code,
+                disposition,
+                directive_kind,
+                detail,
+            },
+            response_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .and_then(|response| {
+            response.validate_request(request)?;
+            Ok(response)
+        })
+    }
+
+    /// Returns canonical bytes covered by `response_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.response_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Populates the canonical activation response digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.response_sha256 = eliot_contracts::sha256_hex(&self.canonical_unsigned_bytes()?);
+        Ok(self)
+    }
+
+    /// Validates response shape and its canonical self digest.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID
+            || self.wire_version != Self::contract_version()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.wire",
+                reason: "unsupported agent-bridge activation response",
+            });
+        }
+        text(
+            self.request_id.as_str(),
+            "agent_bridge_activation_response.request_id",
+        )?;
+        lowercase_sha256(
+            &self.request_sha256,
+            "agent_bridge_activation_response.request_sha256",
+        )?;
+        self.disposition.validate()?;
+        lowercase_sha256(
+            &self.response_sha256,
+            "agent_bridge_activation_response.response_sha256",
+        )?;
+        if self.response_sha256 != eliot_contracts::sha256_hex(&self.canonical_unsigned_bytes()?) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.response_sha256",
+                reason: "activation response digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that this response belongs to the exact activation request.
+    pub fn validate_request(
+        &self,
+        request: &AgentBridgeActivationRequest,
+    ) -> Result<(), ProtocolError> {
+        self.validate()?;
+        request.validate()?;
+        if self.request_id != request.request_identity.request.metadata.request_id
+            || self.request_sha256 != request.request_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.request_sha256",
+                reason: "must bind the exact activation request",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the complete challenge/receipt binding remains explicit at one protocol boundary"

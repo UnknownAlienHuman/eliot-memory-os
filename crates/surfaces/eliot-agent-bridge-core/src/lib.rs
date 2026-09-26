@@ -537,9 +537,9 @@ pub const ACTIVATION_DIRECTIVE_FAILURE_CAPSULE: &str = "failure-capsule";
 /// into one static string.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivationDenialReport {
-    reason_code: &'static str,
-    disposition: &'static str,
-    directive_kind: &'static str,
+    reason_code: String,
+    disposition: String,
+    directive_kind: String,
     operation: String,
     detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
 }
@@ -553,25 +553,28 @@ impl ActivationDenialReport {
     /// rejection: the legs arrive from the trusted provider projection, so a
     /// blank leg means the provider violated its contract.
     pub fn new(
-        reason_code: &'static str,
-        disposition: &'static str,
-        directive_kind: &'static str,
+        reason_code: impl Into<String>,
+        disposition: impl Into<String>,
+        directive_kind: impl Into<String>,
         operation: String,
         detail: Option<eliot_protocol::AgentActivationResolutionDisposition>,
     ) -> Result<Self, ProviderFailure> {
-        validate_text(reason_code, "activation_denial.reason_code").map_err(|_| {
+        let reason_code = reason_code.into();
+        let disposition = disposition.into();
+        let directive_kind = directive_kind.into();
+        validate_text(&reason_code, "activation_denial.reason_code").map_err(|_| {
             ProviderFailure::new(
                 "eliot-agent-bridge-core",
                 "activation denial reason must be non-blank",
             )
         })?;
-        validate_text(disposition, "activation_denial.disposition").map_err(|_| {
+        validate_text(&disposition, "activation_denial.disposition").map_err(|_| {
             ProviderFailure::new(
                 "eliot-agent-bridge-core",
                 "activation denial disposition must be non-blank",
             )
         })?;
-        validate_text(directive_kind, "activation_denial.directive_kind").map_err(|_| {
+        validate_text(&directive_kind, "activation_denial.directive_kind").map_err(|_| {
             ProviderFailure::new(
                 "eliot-agent-bridge-core",
                 "activation denial directive must be non-blank",
@@ -595,18 +598,18 @@ impl ActivationDenialReport {
     /// Catalogue `reason_code` from the I7.20 reason registry (open layer);
     /// legacy transport codes arrive already projected to their catalogue
     /// alias and unknown future codes pass through verbatim.
-    pub const fn reason_code(&self) -> &'static str {
-        self.reason_code
+    pub fn reason_code(&self) -> &str {
+        &self.reason_code
     }
 
     /// Closed I7.20 control disposition the bridge switches on.
-    pub const fn disposition(&self) -> &'static str {
-        self.disposition
+    pub fn disposition(&self) -> &str {
+        &self.disposition
     }
 
     /// Applicable Recovery or Conflict Directive kind; never auto-selected.
-    pub const fn directive_kind(&self) -> &'static str {
-        self.directive_kind
+    pub fn directive_kind(&self) -> &str {
+        &self.directive_kind
     }
 
     /// Operation identity (the exact demand) this denial answers.
