@@ -11,15 +11,15 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
-    RecoveryView, SessionId,
+    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
+    RecoveryProjectionPage, SessionId,
 };
-use eliot_contracts::EpochId;
+use eliot_contracts::{BridgeEventCapacityPressure, EpochId};
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
     HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
-    KernelHostRequestPort, NegotiatedWireVersion, ToolRequest, WIRE_INTERNAL_ERROR,
+    KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest, WIRE_INTERNAL_ERROR,
     WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
     build_host_cancellation, build_host_invocation, decode_cancel_notification,
     decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
@@ -28,8 +28,8 @@ use eliot_mcp::{
     tools_list_result,
 };
 #[cfg(test)]
-use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
-use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
+use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
+use eliot_protocol::{AckPhase, AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -197,6 +197,14 @@ enum Request {
     /// owner (I7.19 persist step; the attach-time restore already imports).
     ReactiveSnapshot,
     ReconcileExternal {},
+    /// Reads one bounded page from the imported recovery identity projection.
+    /// The encoded continuation is read-only and checked against the current
+    /// owner window, attach generation, and imported-page revision. It is
+    /// not a completeness receipt.
+    RecoveryProjectionPage {
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     /// Reads one bounded recovery page inside the declared window (issue
     /// #2732).
     ///
@@ -259,6 +267,8 @@ enum Response {
         reconciliation_required: bool,
         activation_port: &'static str,
         host_request_port: &'static str,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel_binding_failure: Option<PortFailure>,
         observation_forwarding_port: &'static str,
         recovery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +340,12 @@ enum Response {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reactive_receipts: Vec<InjectionReceipt>,
     },
+    /// Typed refusal to allocate a bridge-event slot. The exact exhausted
+    /// resource, permitted reconciliation path, and ORS-local acceptance
+    /// phase remain structured through the host response.
+    Backpressure {
+        pressure: BridgeEventCapacityPressure,
+    },
     /// Typed acknowledgement of one live reactive admission.
     ///
     /// Carries the minted ledger item identity plus how many delivered items
@@ -365,6 +381,8 @@ enum Response {
     },
     Reconciled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryProjectionPage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
     /// Typed projection of one bounded recovery page (issue #2732).
@@ -380,7 +398,13 @@ enum Response {
     /// that shape would imply the gate cleared, which a single page never
     /// does by itself.
     RecoveryPage {
-        page: RecoveryPageProjection,
+        page: RecoveryProjectionPage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    /// Bounded read-only page through all imported recovery identities.
+    RecoveryProjectionPage {
+        page: RecoveryProjectionPage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
@@ -452,89 +476,6 @@ struct ReactiveStatusView {
 #[serde(deny_unknown_fields)]
 struct ResourceRegistryView {
     entries: usize,
-}
-
-/// Read-only projection of one bounded recovery page for the `RecoveryPage`
-/// frame (issue #2732).
-///
-/// Projects only the walk progress the core already holds: the live
-/// generation, per-stream cursor facts and recovered counts, the
-/// unscoped-gap count, scope provenance, and the disposition with its exact
-/// reason. No event payloads cross here; recovered obligations stay
-/// available through the pending view while forwarding is interrupted.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryPageProjection {
-    live_generation: u64,
-    streams: Vec<RecoveryStreamProjection>,
-    unscoped_gaps: u64,
-    unproven_scope_present: bool,
-    stream_list_complete: bool,
-    disposition: &'static str,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    disposition_reason: Option<&'static str>,
-}
-
-/// Per-stream cursor facts and recovered counts inside one recovery page.
-///
-/// `next_after` is the replay-safe continuation the next bounded read must
-/// advance past; `page_complete` marks this stream's page drained. Facts
-/// come from the core's declared window; nothing here admits, delivers, or
-/// acknowledges.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryStreamProjection {
-    stream_id: String,
-    acked_base: u64,
-    durable_cursor: u64,
-    contiguous_frontier: u64,
-    highest_observed: u64,
-    next_after: u64,
-    recovered_events: u64,
-    recovered_gaps: u64,
-    page_complete: bool,
-}
-
-/// Shapes one imported recovery page into its typed response frame.
-///
-/// The disposition is projected losslessly: `complete` carries no reason,
-/// `partial`/`unavailable` carry the exact core reason the gate is held
-/// under. The window key itself never crosses: it is the verified
-/// reconciliation hash that already names the receipt, not host-driving
-/// state — pagination is driven by repeating the operation, with the bridge
-/// deriving each bounded read from its own live window.
-fn recovery_page_response(view: &RecoveryView) -> Response {
-    let (disposition, disposition_reason) = match view.disposition() {
-        RecoveryDisposition::Complete => ("complete", None),
-        RecoveryDisposition::Partial { reason } => ("partial", Some(reason)),
-        RecoveryDisposition::Unavailable { reason } => ("unavailable", Some(reason)),
-    };
-    Response::RecoveryPage {
-        page: RecoveryPageProjection {
-            live_generation: view.live_generation(),
-            streams: view
-                .streams()
-                .iter()
-                .map(|stream| RecoveryStreamProjection {
-                    stream_id: stream.stream_id().to_owned(),
-                    acked_base: stream.acked_base(),
-                    durable_cursor: stream.durable_cursor(),
-                    contiguous_frontier: stream.contiguous_frontier(),
-                    highest_observed: stream.highest_observed(),
-                    next_after: stream.next_after(),
-                    recovered_events: stream.recovered_events(),
-                    recovered_gaps: stream.recovered_gaps(),
-                    page_complete: stream.page_complete(),
-                })
-                .collect(),
-            unscoped_gaps: view.unscoped_gaps(),
-            unproven_scope_present: view.unproven_scope_present(),
-            stream_list_complete: view.stream_list_complete(),
-            disposition,
-            disposition_reason,
-        },
-        bootstrap: None,
-    }
 }
 
 /// Original identity of one durable in-flight delivery pending at Stop.
@@ -901,14 +842,38 @@ fn main() {
             }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
             Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                Ok(_) => Response::Reconciled { bootstrap: None },
+                Ok(_) => match runner.recovery_projection_page(None) {
+                    Ok(page) => {
+                        let has_window = page.summary.is_some();
+                        Response::Reconciled {
+                            recovery: has_window.then_some(page),
+                            bootstrap: None,
+                        }
+                    }
+                    Err(error) => bridge_error(&error),
+                },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
+            Ok(Request::RecoveryProjectionPage { cursor }) => {
+                match runner.recovery_projection_page(cursor.as_deref()) {
+                    Ok(page) => Response::RecoveryProjectionPage {
+                        page,
+                        bootstrap: None,
+                    },
+                    Err(error) => bridge_error(&error),
+                }
+            }
             Ok(Request::RecoverNextPage {}) => match runner.recover_next_page() {
-                Ok(view) => recovery_page_response(&view),
+                Ok(_) => match runner.recovery_projection_page(None) {
+                    Ok(page) => Response::RecoveryPage {
+                        page,
+                        bootstrap: None,
+                    },
+                    Err(error) => bridge_error(&error),
+                },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
@@ -952,7 +917,9 @@ fn main() {
                 authority_epoch,
                 &fence_nonce,
             ),
-            Ok(Request::Status) => status_response(config.profile, &runner),
+            Ok(Request::Status) => {
+                status_response(config.profile, &runner, Some(&mut host_request_client))
+            }
             Ok(Request::Stop) => handle_stop(&runner),
             Err(detail) => Response::Error {
                 code: "REQUEST_INVALID",
@@ -962,7 +929,17 @@ fn main() {
         // I7.17 auto-boot: the first successful ELIOT response in a session
         // carries the bounded bootstrap exactly once. Explicit retrieval
         // through the bootstrap operation stays available afterwards.
-        attach_auto_bootstrap(&mut runner, &mut response);
+        if is_recovery_projection_response(&response) {
+            attach_recovery_bootstrap_if_it_fits(&mut runner, &mut response);
+        } else {
+            attach_auto_bootstrap(&mut runner, &mut response);
+        }
+        if is_recovery_projection_response(&response) && !fits_output_frame(&response) {
+            response = Response::Error {
+                code: "RECOVERY_PROJECTION_TOO_LARGE",
+                detail: "bounded recovery response exceeds the negotiated stdio frame".to_owned(),
+            };
+        }
         // Only the deserialization-failure arm above produces REQUEST_INVALID:
         // every handler, gateway, and runner error path uses a distinct code,
         // so this flag exactly tracks whether a request was dispatched. Valid
@@ -1048,7 +1025,43 @@ fn handle_bootstrap(
 /// separate empty candidate set — so the agent identifies or explicitly
 /// requests the intended task from owner-produced inputs alone.
 fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
-    let slot = match response {
+    let Some(slot) = response_bootstrap_slot(response) else {
+        return;
+    };
+    if slot.is_none() {
+        let tasks = runner.retained_auto_boot_tasks();
+        *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
+    }
+}
+
+fn attach_recovery_bootstrap_if_it_fits(runner: &mut BridgeRunner, response: &mut Response) {
+    if !fits_output_frame(response) {
+        return;
+    }
+    let tasks = runner.retained_auto_boot_tasks();
+    let Some(preview) = runner.preview_first_response_bootstrap(&tasks, CurrentAssessment::Ready)
+    else {
+        return;
+    };
+    let previous_bootstrap = {
+        let Some(slot) = response_bootstrap_slot(response) else {
+            return;
+        };
+        let previous = slot.clone();
+        *slot = Some(preview);
+        previous
+    };
+    let candidate_fits = fits_output_frame(response);
+    if let Some(slot) = response_bootstrap_slot(response) {
+        *slot = previous_bootstrap;
+    }
+    if candidate_fits {
+        attach_auto_bootstrap(runner, response);
+    }
+}
+
+fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<UnderstandingBootstrap>> {
+    match response {
         Response::Status { bootstrap, .. }
         | Response::Attached { bootstrap }
         | Response::Reconnected { bootstrap, .. }
@@ -1059,19 +1072,15 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::ReactiveAdmitted { bootstrap, .. }
         | Response::ReactiveRecorded { bootstrap, .. }
         | Response::ReactiveLedger { bootstrap, .. }
-        | Response::Reconciled { bootstrap }
+        | Response::Reconciled { bootstrap, .. }
         | Response::RecoveryPage { bootstrap, .. }
-        | Response::Stopped { bootstrap, .. } => bootstrap,
+        | Response::RecoveryProjectionPage { bootstrap, .. }
+        | Response::Stopped { bootstrap, .. } => Some(bootstrap),
         Response::Bootstrap { .. }
+        | Response::Backpressure { .. }
         | Response::Error { .. }
         | Response::ActivationDenied { .. }
-        | Response::DryRun { .. } => {
-            return;
-        }
-    };
-    if slot.is_none() {
-        let tasks = runner.retained_auto_boot_tasks();
-        *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
+        | Response::DryRun { .. } => None,
     }
 }
 /// Fail-closed bounded decode bound to the accepted input profile.
@@ -1151,7 +1160,8 @@ fn forward_stage(error: &BridgeError) -> &'static str {
         BridgeError::MissingDurableAck
         | BridgeError::OutstandingDeliveryReconciliationRequired { .. }
         | BridgeError::ExternalAttachReconciliationRequired
-        | BridgeError::ExternalReconciliationDenied(_) => "durability",
+        | BridgeError::ExternalReconciliationDenied(_)
+        | BridgeError::Backpressure(_) => "durability",
         BridgeError::InvalidContract { .. }
         | BridgeError::ProviderContract(_)
         | BridgeError::AckIdentityMismatch
@@ -1594,15 +1604,13 @@ struct ReconnectClaim<'a> {
 /// Local authority match alone does not move the binding: after the claims
 /// shape up, the live Kernel binding is proven current through
 /// [`KernelHostRequestClient::check_kernel_binding`] — one observation-only
-/// reconcile probe over the shared admitted transport — before
-/// `Runner::reconnect` runs. When no operation has been admitted yet the
-/// probe passes vacuously on the attach-time handshake, so a fence or epoch
-/// rotation inside that pre-first-exchange window is not detected here;
-/// owner-issued reconnect currency for that window stays open under
-/// issue #77. A failed probe fails closed with
+/// Heartbeat/Health exchange over the shared admitted transport — before
+/// `Runner::reconnect` runs. The probe runs before the first host invocation
+/// too; it creates no request identity, durable operation, or replay entry.
+/// A failed probe fails closed with
 /// `RECONNECT_STALE_AUTHORITY` without mutating the runner, so a fenced,
-/// rotated, or dead Kernel binding proven stale by an admitted operation
-/// can never be papered over with a fresh local label. Cursors and replay inheritance survive only through that
+/// rotated, or dead Kernel binding can never be papered over with a fresh
+/// local label. Cursors and replay inheritance survive only through that
 /// exact owner-authorized match; the kernel transport itself is untouched, so
 /// kernel envelopes keep riding the admitted receipt connection until a new
 /// process admission replaces it (the activation one-shot guard is preserved:
@@ -1674,12 +1682,11 @@ fn handle_reconnect(
     };
     // The bearer claims shaped up against the live local binding; the
     // binding itself is proven current against the Kernel before anything
-    // mutates whenever an admitted operation exists to parent the probe to.
-    // With an empty replay cache the check passes vacuously on the
-    // attach-time handshake, so this comment claims currency only for the
-    // probed case. A failed probe leaves the runner untouched: the replacement
-    // inherits only a Kernel-current binding, never a fresh label over a
-    // fenced, rotated, or dead one.
+    // mutates. Health is a live exchange even with an empty replay cache, so
+    // the attach-time handshake cannot stand in for current owner evidence.
+    // A failed probe leaves the runner untouched: the replacement inherits
+    // only a Kernel-current binding, never a fresh label over a fenced,
+    // rotated, or dead one.
     if let Err(error) = client.check_kernel_binding() {
         return Response::Error {
             code: "RECONNECT_STALE_AUTHORITY",
@@ -1846,20 +1853,24 @@ fn handle_stop(runner: &BridgeRunner) -> Response {
     build_stop_response(pending)
 }
 
-/// Projects owner-derived bridge liveness without probing the Kernel.
+/// Projects bridge liveness and probes the attached Kernel binding before
+/// reporting it as current.
 ///
 /// Every fact comes from the composition or activation owners: the profile
 /// from CLI decoding, capacity from the runtime, and attach/session/fence
 /// facts from the activation-sealed binding (the kernel-issued
 /// `activated_session` captured by the one-shot activation exchange).
-/// Pre-activation reports `not-attached` with no liveness text; post-activation
-/// reports the admitted-session facts but never a probe-backed readiness claim —
-/// dispatch still traverses the live admitted transport per operation, and
-/// staleness surfaces as typed `RECONNECT_*`/`DETACH_*` failures pointing back
-/// at this status, the reconnect/detach operations, and the kernel-owned
-/// `AGENT_HOST_REQUEST_REHYDRATE_OPERATION` exact (envelope, admission-receipt)
-/// pair path. A replacement connection always requires a new admission.
-fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
+/// Pre-activation reports `not-attached`. An attached row marks the retained
+/// binding current only after the live Heartbeat/Health exchange succeeds;
+/// failure remains an explicit unknown Kernel status while preserving the
+/// local attach facts for recovery. Exact-pair rehydration remains a separate
+/// open port-composition contour; a replacement connection always requires a
+/// new admission.
+fn status_response(
+    profile: Profile,
+    runner: &BridgeRunner,
+    client: Option<&mut KernelHostRequestClient>,
+) -> Response {
     match runner.attach_view() {
         None => Response::Status {
             profile: Profile::as_str(profile),
@@ -1872,39 +1883,51 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             reconciliation_required: false,
             activation_port: "not-attached",
             host_request_port: "no-session: attach and activate before host-request dispatch",
+            kernel_binding_failure: None,
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: format!(
-                "attach and activate before host requests; reconnect requires a live attach; \
-                one exact operation recovers only through the kernel-owned \
-                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
-                and a replacement connection requires a new admission"
-            ),
+            recovery: "attach and activate before host requests; attached Status and reconnect probe the live Kernel binding; a replacement connection requires a new admission".to_owned(),
             reactive: None,
             bootstrap: None,
             resources: None,
         },
-        Some(view) => Response::Status {
-            profile: Profile::as_str(profile),
-            control_capacity: runner.control_capacity(),
-            attached: true,
-            connection_id: Some(view.binding().connection_id().as_str().to_owned()),
-            session_id: Some(view.binding().session_id().as_str().to_owned()),
-            activation_generation: Some(view.binding().activation_generation().get()),
-            authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
-            reconciliation_required: view.reconciliation_required(),
-            activation_port: "attached",
-            host_request_port: "session-bound: dispatch joins the admitted Kernel session",
-            observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: format!(
-                "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; \
-                stale targets fail closed; one exact operation recovers only through the kernel-owned \
-                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
-                and a replacement connection requires a new admission"
-            ),
-            reactive: Some(reactive_status_view(runner)),
-            bootstrap: None,
-            resources: Some(resource_status_view(runner)),
-        },
+        Some(view) => {
+            let probe = match client {
+                Some(client) => client.check_kernel_binding(),
+                None => Err(PortFailure::TransportBindingRejected {
+                    reason: "Kernel status client is unavailable".to_owned(),
+                }),
+            };
+            let (host_request_port, kernel_binding_failure, recovery) = match probe {
+                Ok(()) => (
+                    "kernel-binding-current: live Kernel Health probe succeeded; session-bound dispatch joins the admitted Kernel session",
+                    None,
+                    "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned(),
+                ),
+                Err(error) => (
+                    "kernel-binding-unknown: live Kernel Health probe failed; local attach facts are not currentness proof",
+                    Some(error),
+                    "Kernel binding is unknown; re-attach and activate to establish a new admission before relying on these local attach facts".to_owned(),
+                ),
+            };
+            Response::Status {
+                profile: Profile::as_str(profile),
+                control_capacity: runner.control_capacity(),
+                attached: true,
+                connection_id: Some(view.binding().connection_id().as_str().to_owned()),
+                session_id: Some(view.binding().session_id().as_str().to_owned()),
+                activation_generation: Some(view.binding().activation_generation().get()),
+                authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
+                reconciliation_required: view.reconciliation_required(),
+                activation_port: "attached",
+                host_request_port,
+                kernel_binding_failure,
+                observation_forwarding_port: "unavailable: Kernel observation route not admitted",
+                recovery,
+                reactive: Some(reactive_status_view(runner)),
+                bootstrap: None,
+                resources: Some(resource_status_view(runner)),
+            }
+        }
     }
 }
 
@@ -1955,6 +1978,10 @@ fn bridge_error(error: &BridgeError) -> Response {
         Response::Error {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
+        }
+    } else if let BridgeError::Backpressure(pressure) = error {
+        Response::Backpressure {
+            pressure: *pressure,
         }
     } else if let BridgeError::ActivationDenied(report) = error {
         Response::ActivationDenied {
@@ -2130,6 +2157,23 @@ fn frame_response(response: &Response) -> Result<Vec<u8>, StdioBreakCause> {
     Ok(framed)
 }
 
+fn is_recovery_projection_response(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::Reconciled {
+            recovery: Some(_),
+            ..
+        } | Response::RecoveryPage { .. }
+            | Response::RecoveryProjectionPage { .. }
+    )
+}
+
+/// Checks the complete containing JSON response, including the framing
+/// newline, against the negotiated output frame before it reaches the writer.
+fn fits_output_frame(response: &Response) -> bool {
+    frame_response(response).is_ok()
+}
+
 fn write_response(response: &Response) -> StdioWriteReceipt {
     let framed = match frame_response(response) {
         Ok(framed) => framed,
@@ -2263,7 +2307,12 @@ struct McpFrontDoor {
     initialized: bool,
     handles: Vec<(String, HostOperationHandle)>,
     cancelled: Vec<String>,
-    resources: Vec<(String, eliot_agent_bridge::ResourceHandle)>,
+    resources: Vec<(
+        String,
+        eliot_agent_bridge::ResourceHandle,
+        HostOperationHandle,
+        String,
+    )>,
 }
 
 impl McpFrontDoor {
@@ -2321,30 +2370,50 @@ impl McpFrontDoor {
 
     /// Retains one exact hot-resource handle under its exact URI, retiring
     /// the oldest entry past the bound.
-    fn retain_resource(&mut self, uri: &str, handle: eliot_agent_bridge::ResourceHandle) {
-        if let Some(slot) = self.resources.iter_mut().find(|(known, _)| known == uri) {
+    fn retain_resource(
+        &mut self,
+        uri: &str,
+        handle: eliot_agent_bridge::ResourceHandle,
+        operation_handle: HostOperationHandle,
+        binding: String,
+    ) {
+        if let Some(slot) = self
+            .resources
+            .iter_mut()
+            .find(|(known, _, _, _)| known == uri)
+        {
             slot.1 = handle;
+            slot.2 = operation_handle;
+            slot.3 = binding;
             return;
         }
         if self.resources.len() >= MAX_RETAINED_RESOURCES {
             self.resources.remove(0);
         }
-        self.resources.push((uri.to_owned(), handle));
+        self.resources
+            .push((uri.to_owned(), handle, operation_handle, binding));
     }
 
-    /// Returns the exact retained handle for one resource URI.
-    fn find_resource(&self, uri: &str) -> Option<&eliot_agent_bridge::ResourceHandle> {
+    /// Returns the exact retained resource and its source-operation binding.
+    fn find_resource(
+        &self,
+        uri: &str,
+    ) -> Option<(
+        &eliot_agent_bridge::ResourceHandle,
+        &HostOperationHandle,
+        &str,
+    )> {
         self.resources
             .iter()
-            .find(|(known, _)| known == uri)
-            .map(|(_, handle)| handle)
+            .find(|(known, _, _, _)| known == uri)
+            .map(|(_, handle, operation, binding)| (handle, operation, binding.as_str()))
     }
 
     /// Lists every retained resource as its exact URI plus media type.
     fn list_resources(&self) -> Vec<Value> {
         self.resources
             .iter()
-            .map(|(uri, _)| {
+            .map(|(uri, _, _, _)| {
                 serde_json::json!({
                     "uri": uri,
                     "name": uri,
@@ -2629,6 +2698,7 @@ fn handle_mcp_frame(
             valid(Some(handle_mcp_resources_list(state, &id, &request.params)))
         }
         (Some(id), "resources/read") => valid(Some(handle_mcp_resources_read(
+            port,
             runner,
             state,
             &id,
@@ -2762,7 +2832,7 @@ fn handle_mcp_tools_call(
     };
     match gateway.invoke_with_receipt(port, &request) {
         Ok((result, receipt)) => {
-            render_mcp_invocation(runner, state, id, &correlation, &result, &receipt)
+            render_mcp_invocation(port, runner, state, id, &correlation, &result, &receipt)
         }
         Err(error) => {
             let (code, message) = gateway_error_to_wire(&error);
@@ -2781,6 +2851,7 @@ fn handle_mcp_tools_call(
 /// result, retaining the exact admitted handle and any hot-resource
 /// evidence for later cancellation and expansion.
 fn render_mcp_invocation(
+    port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
@@ -2801,7 +2872,7 @@ fn render_mcp_invocation(
             response,
         } => {
             state.retain_handle(correlation, operation_handle.clone());
-            let evidence = record_mcp_delivery(runner, state, result.outcome());
+            let evidence = record_mcp_delivery(port, runner, state, result.outcome());
             match render_responded_result(operation_handle, response, evidence.as_ref()) {
                 Ok(result) => render_result(id, result),
                 Err(rejection) => render_rejection(Some(id), &rejection),
@@ -2821,15 +2892,50 @@ fn render_mcp_invocation(
 ///
 /// Mirrors the private `Invoke` delivery recording: only supported
 /// candidate/projection content beyond the hot preview bound snapshots, and
-/// only a UTF-8 preview rides the wire. Anything else leaves the owner
-/// response exactly as shaped.
+/// only a UTF-8 preview rides the wire. A resource is retained only after a
+/// fresh exact-operation owner resolve verifies the actual response and
+/// captures its current attach/session/task/scope binding. Anything else
+/// leaves the owner response exactly as shaped.
 fn record_mcp_delivery(
+    port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     outcome: &HostInvocationOutcome,
 ) -> Option<Value> {
+    let HostInvocationOutcome::Responded {
+        operation_handle,
+        response,
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    if !matches!(
+        response.kind,
+        eliot_mcp::ResponseKind::Candidate | eliot_mcp::ResponseKind::Projection
+    ) {
+        return None;
+    }
+    let content_bytes = serde_json::to_vec(&response.content).ok()?;
+    if content_bytes.len() <= eliot_agent_bridge::MAX_PREVIEW_BYTES
+        || content_bytes.len() > eliot_agent_bridge::MAX_CONTENT_BYTES
+    {
+        return None;
+    }
+    let binding = match port.capture_resource_binding(operation_handle, response) {
+        Ok(binding) => binding,
+        Err(error) => {
+            emit_error("RESOURCE_SOURCE_REFUSED", &error.to_string());
+            return None;
+        }
+    };
     let view = runner.record_tool_result_delivery(outcome)?;
-    state.retain_resource(view.handle().uri().as_str(), view.handle().clone());
+    state.retain_resource(
+        view.handle().uri().as_str(),
+        view.handle().clone(),
+        operation_handle.clone(),
+        binding,
+    );
     let preview = std::str::from_utf8(view.preview()).ok()?;
     Some(serde_json::json!({
         "uri": view.handle().uri().as_str(),
@@ -2857,6 +2963,7 @@ fn handle_mcp_resources_list(state: &McpFrontDoor, id: &JsonRpcId, params: &Valu
 /// Unknown URIs fail explicitly: only handles retained from a real delivery
 /// on this connection expand, never an invented or stale identity.
 fn handle_mcp_resources_read(
+    port: &mut KernelHostRequestClient,
     runner: &BridgeRunner,
     state: &McpFrontDoor,
     id: &JsonRpcId,
@@ -2866,8 +2973,8 @@ fn handle_mcp_resources_read(
         Ok(uri) => uri,
         Err(rejection) => return render_rejection(Some(id), &rejection),
     };
-    let handle = match state.find_resource(uri) {
-        Some(handle) => handle,
+    let (handle, operation_handle, binding) = match state.find_resource(uri) {
+        Some(resource) => resource,
         None => {
             return render_error(
                 Some(id),
@@ -2877,6 +2984,15 @@ fn handle_mcp_resources_read(
             );
         }
     };
+    if let Err(error) = port.authorize_resource_read(operation_handle, binding) {
+        emit_error("RESOURCE_SOURCE_REFUSED", &error.to_string());
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "resource source is not authorized by the current Kernel attach",
+            Value::Null,
+        );
+    }
     let bytes = match runner.expand_resource(handle) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -3644,7 +3760,7 @@ mod tests {
         assert!(!view.attention_truncated);
         let resources = resource_status_view(&runner);
         assert_eq!(resources.entries, 0);
-        let response = status_response(Profile::SpineFunctional, &runner);
+        let response = status_response(Profile::SpineFunctional, &runner, None);
         let value = serde_json::to_value(&response).expect("status must serialize");
         assert_eq!(value["attached"], Value::Bool(false));
         assert!(
@@ -3785,6 +3901,7 @@ mod tests {
                         Request::ReactiveRecordDisposition { .. } => "reactive_record_disposition",
                         Request::ReactiveSnapshot => "reactive_snapshot",
                         Request::ReconcileExternal {} => "reconcile_external",
+                        Request::RecoveryProjectionPage { .. } => "recovery_projection_page",
                         Request::RecoverNextPage {} => "recover_next_page",
                         Request::Reconnect { .. } => "reconnect",
                         Request::Detach { .. } => "detach",
@@ -4221,7 +4338,7 @@ mod tests {
                 .expect("expand resolves the issued handle");
             assert_eq!(expanded, stored);
             // Status projects the populated registry.
-            let status = status_response(Profile::SpineFunctional, &runner);
+            let status = status_response(Profile::SpineFunctional, &runner, None);
             let status_value = serde_json::to_value(&status).expect("status must serialize");
             assert_eq!(
                 status_value["resources"]["entries"],
@@ -4492,6 +4609,13 @@ mod tests {
                     "test-forwarder",
                     "reconciliation not exercised",
                 ))
+            }
+
+            fn reconciliation_imported(
+                &mut self,
+                _binding: &AttachBinding,
+                _result: &eliot_agent_bridge_core::ReconciliationPortResult,
+            ) {
             }
         }
 

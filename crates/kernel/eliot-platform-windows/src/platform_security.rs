@@ -21,6 +21,16 @@ pub enum NamedPipePeerKind {
     Eliotd,
     /// The separately installed agent bridge module.
     AgentBridge,
+    /// The independent supervision service, observed live from its own SCM
+    /// service identity.
+    ///
+    /// The Watchdog is an SCM-owned sibling of the Host service, not a Host or
+    /// Kernel child (I1.4), so it needs its own role: it is never admitted as
+    /// the `Eliotd` or `AgentBridge` role and never inherits one of their
+    /// weaker dynamic-process expectations. It carries no static profile
+    /// identity and is authenticated only through one exact OS-observed service
+    /// process binding, the same strength the Host and `eliotd` roles get.
+    Watchdog,
 }
 
 impl NamedPipePeerKind {
@@ -31,6 +41,7 @@ impl NamedPipePeerKind {
             Self::Host => "eliot-host",
             Self::Eliotd => "eliotd",
             Self::AgentBridge => "eliot-agent-bridge",
+            Self::Watchdog => "eliot-watchdog",
         }
     }
 }
@@ -104,9 +115,10 @@ pub struct NamedPipePeerSet {
 
 impl NamedPipePeerSet {
     /// Maximum number of local peer roles in one set.
-    pub const MAX_ENTRIES: usize = 3;
+    pub const MAX_ENTRIES: usize = 4;
 
-    /// Seals a bounded set with at most one Host, Eliotd, and `AgentBridge`.
+    /// Seals a bounded set with at most one Host, Eliotd, `AgentBridge`, and
+    /// `Watchdog`.
     pub fn new(mut entries: Vec<NamedPipePeerProfile>) -> Result<Self, WindowsAdapterError> {
         if entries.is_empty() || entries.len() > Self::MAX_ENTRIES {
             return Err(WindowsAdapterError::InvalidInput);

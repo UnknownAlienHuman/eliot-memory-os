@@ -18,13 +18,26 @@
 //! completes, or issues authority. Pure delegation to the Governor owner
 //! crate; no state machines, policy semantics, stores, providers,
 //! credentials, or repair logic live here.
+//!
+//! # One checked commitment, never a second one
+//!
+//! Both consumers here read the record the Governor pipeline committed.
+//! [`route_improvement_candidate`] returns the disposition whose canary handoff
+//! carries that exact commitment and its discriminator projection, and
+//! [`assess_improvement_repeat`] compares a retained prior record against that
+//! same checked record. Neither computes a digest, substitutes a fallback, empty,
+//! or legacy value, or swallows a failure: a hashing or serialization failure is
+//! produced once by the pipeline and crosses into the daemon as the typed
+//! `PipelineError` it is.
 
+use eliot_maintenance::improvement_pipeline::{
+    ImprovementCurrentProposal, RetainedImprovementProposal, compare_improvement_commitments,
+};
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
     ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, ProposalCommitment,
-    RollbackContract, assess_improvement_replay, reconcile_unknown_activation,
-    run_improvement_candidate_pipeline,
+    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
+    reconcile_unknown_activation, run_improvement_candidate_pipeline,
 };
 
 /// Borrowed inputs for one production improvement-candidate route call.
@@ -59,11 +72,16 @@ pub struct ImprovementRouteRequest<'a> {
 /// borrowed request and returns the advisory-only terminal disposition.
 ///
 /// The route deliberately computes no proposal digest of its own. The checked
-/// pipeline joins the inputs, computes exactly one commitment, and carries that
-/// commitment into the joined result, so a pre-validation digest computed here
-/// could only disagree with the committed one. Never promotes, activates, or
-/// completes; a `CanaryAdmitted` disposition carries an inspectable,
-/// non-authorizing handoff for Kernel (`#11`) authorization.
+/// pipeline joins the inputs, computes exactly one commitment and the
+/// discriminator projection of the same bytes, and carries that one record both
+/// into the joined result and into the canary handoff, so a pre-validation
+/// digest computed here could only disagree with the committed one. A hashing
+/// or serialization failure is produced once, by the pipeline, and crosses this
+/// boundary as the typed [`eliot_maintenance::PipelineError`] it is: there is no
+/// fallback digest, no empty digest, and no legacy value substituted for it.
+/// Never promotes, activates, or completes; a `CanaryAdmitted` disposition
+/// carries an inspectable, non-authorizing handoff for Kernel (`#11`)
+/// authorization.
 pub fn route_improvement_candidate(
     request: ImprovementRouteRequest<'_>,
 ) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
@@ -138,19 +156,29 @@ pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, 
     ]
 }
 
-/// Assesses one current proposal against a retained prior commitment.
+/// Assesses one retained prior record against the current checked record.
 ///
-/// Production caller of [`assess_improvement_replay`]. The retained commitment
-/// carries its own domain, encoding revision, and algorithm identity, so a
-/// legacy value is never matched as a current commitment. The caller supplies no
-/// progress boolean: a new proposal identity, a different digest, or a repeat
-/// all establish no progress by themselves, and no unknown external effect is
-/// cleared here. Effect retry stays with its own owner.
+/// Production caller of
+/// [`eliot_maintenance::improvement_pipeline::compare_improvement_commitments`].
+/// Both arguments are records the Governor pipeline already committed: `current`
+/// is the exact commitment and discriminator projection the pipeline computed
+/// and carried into the canary handoff, and `retained` is the prior record its
+/// owner retained. This route commits nothing and hashes nothing, so it can
+/// neither substitute a second opinion, an empty digest, nor a legacy value, and
+/// it has no failure channel to swallow one — a hashing or serialization
+/// failure is produced once by the pipeline and reaches the daemon as the typed
+/// [`eliot_maintenance::PipelineError`] from [`route_improvement_candidate`].
+///
+/// The caller supplies no progress boolean: a new proposal identity, a different
+/// digest, or a repeat all establish no progress by themselves, an absent or
+/// non-discriminating retained record establishes nothing, and no unknown
+/// external effect is cleared here. Effect retry stays with its own owner.
+#[must_use]
 pub fn assess_improvement_repeat(
-    prior: &ProposalCommitment,
-    proposal: &ImprovementProposal,
-) -> Result<eliot_maintenance::ImprovementReplayAssessment, eliot_maintenance::PipelineError> {
-    assess_improvement_replay(prior, proposal)
+    retained: &RetainedImprovementProposal,
+    current: &ImprovementCurrentProposal,
+) -> eliot_maintenance::ImprovementReplayAssessment {
+    compare_improvement_commitments(retained, current)
 }
 
 /// Reconciles an unknown external activation outcome without retrying blindly.

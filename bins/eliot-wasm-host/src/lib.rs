@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use std::time::Duration;
 use eliot_runtime::RuntimeConfig;
 use eliot_runtime::{Runtime, ShutdownHandle, ShutdownOutcome};
 use eliot_wasm_runtime::{
-    ComponentEnginePort, InvocationId, InvocationRequest, InvocationResult, RuntimeError,
-    RuntimePorts, WasmRuntime,
+    ComponentEnginePort, GuestInterruptHandle, InvocationId, InvocationRequest, InvocationResult,
+    RuntimeError, RuntimePorts, WasmRuntime,
 };
 
 mod admission;
@@ -86,10 +87,12 @@ pub use parent_dispatch::drive_parent_dispatch;
 pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime};
 pub use request_loop::{
     AdmittedBinding, DeliverySetChannel, KernelControlReader, LoopError, MAX_RESULT_FRAME_BYTES,
-    OP_CANCEL, OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError, OrdinaryOutcome,
-    WASM_HOST_REQUEST_WIRE_ID, WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID,
-    WasmHostRequest, WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame,
-    run_ordinary_request_loop, run_request_loop,
+    MAX_RESULT_SEQUENCE, OP_CANCEL, OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError,
+    OrdinaryOutcome, RESULT_PHASE_CONTAIN, RESULT_PHASE_DENY, RESULT_PHASE_EXECUTE,
+    RESULT_PHASE_RECONCILE, WASM_HOST_REQUEST_WIRE_ID, WASM_HOST_REQUEST_WIRE_VERSION,
+    WASM_HOST_RESULT_WIRE_ID, WASM_HOST_RESULT_WIRE_VERSION, WasmHostRequest,
+    WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame, run_ordinary_request_loop,
+    run_request_loop,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
@@ -220,6 +223,14 @@ impl WasmHostRunner {
         request_digest: &eliot_wasm_runtime::Sha256Digest,
     ) -> Result<InvocationResult, RuntimeError> {
         self.wasm_runtime.reconcile(invocation_id, request_digest)
+    }
+
+    /// Returns the seated engine's cloneable cross-thread interruption
+    /// handle, when the engine offers one. Taken before the worker owns the
+    /// runner, so the control loop can request prompt guest termination while
+    /// a command is outstanding (#2568 A3).
+    pub fn interrupt_handle(&self) -> Option<Arc<dyn GuestInterruptHandle>> {
+        self.wasm_runtime.interrupt_handle()
     }
 
     /// Requests P-11 admission shutdown and returns whether this call won it.

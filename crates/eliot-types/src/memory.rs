@@ -879,6 +879,40 @@ pub struct RecallL0Request {
     pub concept_refs: Vec<String>,
 }
 
+/// I7.17 corpus-level conflict observation for one recall.
+///
+/// The ranking boundary's real per-record `contradiction_signal` is counted
+/// here over the candidates the response owner actually weighed — including
+/// candidates that were never admitted, which the delivered rank trace alone
+/// cannot show, because the trace only retains scored survivors. This is an
+/// observation, not a verdict: [`derive_recall_disposition`] decides what it
+/// means. A response that carries no observation keeps conflict state unknown,
+/// and unknown is never coerced to `false`.
+///
+/// Decoder: preserved `deny_unknown_fields` closure. Unknown member keys are
+/// refused; the derived map reader refuses a repeated key before insertion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallConflictObservation {
+    /// `true` when the response owner projected conflict state for this recall.
+    /// `false` means the owner never looked, not that it looked and found none.
+    pub observed: bool,
+    /// Weighed candidates that carried a contradiction signal.
+    pub signalled_candidates: u32,
+}
+
+impl RecallConflictObservation {
+    /// Observed conflict state, or `None` when the owner never looked.
+    #[must_use]
+    pub const fn conflicted(&self) -> Option<bool> {
+        if self.observed {
+            Some(self.signalled_candidates > 0)
+        } else {
+            None
+        }
+    }
+}
+
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -895,6 +929,11 @@ pub struct RecallL0Response {
     pub query_mode: String,
     #[serde(default)]
     pub rank_trace: L0RankTrace,
+    /// Corpus-level conflict state observed while ranking this recall. A
+    /// payload without the key decodes to the unobserved default, which keeps
+    /// conflict state unknown instead of asserting its absence.
+    #[serde(default)]
+    pub conflict: RecallConflictObservation,
     pub truncation: TruncationInfo,
 }
 
@@ -1093,10 +1132,14 @@ pub struct RecallDispositionInputs {
     pub projection_state: CognitiveProjectionReadState,
     /// Retrieval covered the corpus without truncation or scan gaps.
     pub coverage_complete: bool,
-    /// Conflicting evidence blocks admission when observed by the response
-    /// owner. That observation must cover the candidates the owner actually
-    /// weighed; a path that never inspected conflict state keeps `None` and
-    /// `None` preserves an unavailable observation.
+    /// Conflicting evidence blocked admission, as observed by the response
+    /// owner. `Some(true)` means the owner saw a contradiction signal among the
+    /// candidates it weighed; `Some(false)` means it weighed them and saw none.
+    /// `None` means the owner did not inspect conflict state at all, and it is
+    /// never coerced to `false`. On the L0 path the only source is
+    /// [`RecallL0Response::conflicted`], which projects the ranking boundary's
+    /// per-record contradiction signal, so no caller asserts a conflict verdict
+    /// the retrieval did not observe.
     pub conflicted: Option<bool>,
     /// Best admitted total score, when any handle was admitted.
     pub top_score: Option<i32>,
@@ -1104,12 +1147,34 @@ pub struct RecallDispositionInputs {
 
 /// Derives the canonical [`RecallDisposition`] server-side.
 ///
-/// Deterministic priority: empty corpus, then projection freshness, then
-/// conflict, then admission strength, then coverage, then all-candidate scope
-/// suppression, then server-observed uselessness, and finally no match. If a
-/// required owner observation is unavailable, derivation returns
-/// `INCOMPLETE_COVERAGE` rather than coercing unknown state to a boolean.
-/// `NO_USEFUL_MEMORY` is returned only here, never by an agent.
+/// Deterministic priority: authoritative empty corpus, then projection
+/// freshness, then admission strength, then the observed cause of a
+/// zero-delivery result (conflict, then total scope suppression, then ranked
+/// uselessness), and finally no match. The zero-delivery causal claims require
+/// observed conflict state and complete coverage; when either is unavailable
+/// derivation returns `INCOMPLETE_COVERAGE` instead of coercing unknown state to
+/// a boolean, so an undescribed page still refuses. `NO_USEFUL_MEMORY` is
+/// returned only here, never by an agent.
+///
+/// Three orderings are load-bearing:
+///
+/// 1. Freshness is compared before any admission decision. I12.26: a mismatch
+///    of source/projection revisions and the State Fence is compared before
+///    exact cue firing, and stale projection data is never silently injected
+///    into a Material decision.
+/// 2. Conflict is decided *after* the admission arms. A verdict must never
+///    report `CONFLICTED` while handing back the very handles it claims are
+///    blocked. A delivered handle instead carries its observed contradiction
+///    penalty in its own feature score, inside the rank-trace handle, so the
+///    conflict evidence stays bound to the delivery rather than contradicting
+///    it.
+/// 3. Corpus cardinality gates only the final bucket, where it is the sole
+///    difference between `EMPTY_CORPUS` and `NO_MATCH`. It cannot decide any
+///    earlier arm: a delivered handle refutes emptiness, and a nonzero
+///    scope-suppressed count equal to every candidate considered both refutes
+///    emptiness and settles total scope coverage on the retrieved set. Gating
+///    those arms on cardinality is what made `SCOPE_SUPPRESSED` unreachable
+///    for every recall whose owner cannot prove corpus cardinality.
 #[must_use]
 pub const fn derive_recall_disposition(
     inputs: &RecallDispositionInputs,
@@ -1126,19 +1191,17 @@ pub const fn derive_recall_disposition(
         };
         return (RecallDisposition::StaleProjection, reason);
     }
-    if let Some(true) = inputs.conflicted {
-        return (
-            RecallDisposition::Conflicted,
-            "conflicting evidence blocks admission",
-        );
-    }
-    if let (None, _) | (_, None) = (inputs.corpus_empty, inputs.conflicted) {
-        return (
-            RecallDisposition::IncompleteCoverage,
-            "required server observation unavailable",
-        );
-    }
     if inputs.visible_count > 0 {
+        // Contradiction risk is an admission input (I12.26). Without the
+        // observation the server cannot say whether the handle it just admitted
+        // carries unresolved conflict, so it refuses instead of claiming a
+        // strength it did not verify.
+        if inputs.conflicted.is_none() {
+            return (
+                RecallDisposition::IncompleteCoverage,
+                "admission without an observed conflict state",
+            );
+        }
         return match inputs.top_score {
             Some(score) if score >= 200 => (
                 RecallDisposition::AdmittedStrong,
@@ -1149,6 +1212,23 @@ pub const fn derive_recall_disposition(
                 "top handle admitted with weak score",
             ),
         };
+    }
+    if let Some(true) = inputs.conflicted {
+        return (
+            RecallDisposition::Conflicted,
+            "conflicting evidence blocks admission",
+        );
+    }
+    // Nothing was delivered. Naming a cause — scope, ranking, or no match at
+    // all — is a claim about the whole candidate set, so it requires the owner
+    // to have inspected conflict state and to have covered the corpus without
+    // truncation. Both refusals stay exactly where they were: after the
+    // positive evidence above, and before any zero-delivery cause below.
+    if inputs.conflicted.is_none() {
+        return (
+            RecallDisposition::IncompleteCoverage,
+            "zero-delivery result without an observed conflict state",
+        );
     }
     if !inputs.coverage_complete {
         return (
@@ -1170,7 +1250,13 @@ pub const fn derive_recall_disposition(
             "candidates considered but none admissible",
         );
     }
-    (RecallDisposition::NoMatch, "no matching records")
+    if inputs.corpus_empty.is_some() {
+        return (RecallDisposition::NoMatch, "no matching records");
+    }
+    (
+        RecallDisposition::IncompleteCoverage,
+        "required server observation unavailable",
+    )
 }
 
 /// Maximum opaque-text length accepted on a server-issued recall receipt.
@@ -1282,8 +1368,9 @@ fn hash_rank_trace_field(hasher: &mut blake3::Hasher, value: &str) {
 impl ServerRecallVerdict {
     /// Issues the verdict for callers that already hold authoritative boolean
     /// observations. New production paths should use
-    /// [`Self::issue_for_l0_response_with_observations`] so unavailable
-    /// owner facts remain unknown.
+    /// [`Self::issue_for_l0_response_with_observations`], which reads conflict
+    /// state from the response's own [`RecallConflictObservation`] and therefore
+    /// has no conflict parameter to assert.
     pub fn issue_for_l0_response(
         response: &RecallL0Response,
         scope: &str,
@@ -1292,50 +1379,67 @@ impl ServerRecallVerdict {
         coverage_complete: bool,
         conflicted: bool,
     ) -> Result<Self, String> {
-        Self::issue_for_l0_response_with_observations(
-            response,
-            scope,
-            state_fence,
-            Some(corpus_empty),
-            coverage_complete,
-            Some(conflicted),
-        )
+        let mut inputs = Self::disposition_inputs(response);
+        inputs.corpus_empty = Some(corpus_empty);
+        inputs.coverage_complete = coverage_complete;
+        inputs.conflicted = Some(conflicted);
+        Self::issue_for_disposition_inputs(response, scope, state_fence, &inputs)
     }
 
     /// Issues the verdict from explicit owner observations. `None` means the
     /// response owner has not supplied that fact; it is never coerced to
-    /// `false`. The disposition is derived, never accepted from bridge/model
-    /// output.
+    /// `false`. Conflict state is deliberately **not** a parameter: it is read
+    /// from the response's own [`RecallConflictObservation`], so no caller can
+    /// assert a conflict verdict the retrieval boundary did not observe. The
+    /// disposition is derived, never accepted from bridge/model output.
     pub fn issue_for_l0_response_with_observations(
         response: &RecallL0Response,
         scope: &str,
         state_fence: &str,
         corpus_empty: Option<bool>,
         coverage_complete: bool,
-        conflicted: Option<bool>,
+    ) -> Result<Self, String> {
+        let mut inputs = Self::disposition_inputs(response);
+        inputs.corpus_empty = corpus_empty;
+        inputs.coverage_complete = coverage_complete;
+        Self::issue_for_disposition_inputs(response, scope, state_fence, &inputs)
+    }
+
+    /// The disposition inputs the response itself determines.
+    ///
+    /// Corpus cardinality and coverage stay unknown here because only the
+    /// response owner observes them; the caller fills in what it actually
+    /// observed. Conflict state comes from the response, so it cannot be
+    /// supplied by a caller that never inspected it.
+    fn disposition_inputs(response: &RecallL0Response) -> RecallDispositionInputs {
+        RecallDispositionInputs {
+            corpus_empty: None,
+            candidates_considered: response.rank_trace.candidates_considered,
+            visible_count: response.handles.len(),
+            scope_suppressed_count: response.rank_trace.scope_suppressions.len(),
+            projection_state: response.projection_state,
+            coverage_complete: false,
+            conflicted: response.conflicted(),
+            top_score: response
+                .rank_trace
+                .feature_scores
+                .iter()
+                .map(|score| score.total)
+                .max(),
+        }
+    }
+
+    fn issue_for_disposition_inputs(
+        response: &RecallL0Response,
+        scope: &str,
+        state_fence: &str,
+        inputs: &RecallDispositionInputs,
     ) -> Result<Self, String> {
         let visible_count = u32::try_from(response.handles.len())
             .map_err(|_| "visible handle count overflows u32".to_owned())?;
         let suppressed_count = u32::try_from(response.suppressed_count())
             .map_err(|_| "suppressed count overflows u32".to_owned())?;
-        let scope_suppressed_count = response.rank_trace.scope_suppressions.len();
-        let top_score = response
-            .rank_trace
-            .feature_scores
-            .iter()
-            .map(|score| score.total)
-            .max();
-        let inputs = RecallDispositionInputs {
-            corpus_empty,
-            candidates_considered: response.rank_trace.candidates_considered,
-            visible_count: response.handles.len(),
-            scope_suppressed_count,
-            projection_state: response.projection_state,
-            coverage_complete,
-            conflicted,
-            top_score,
-        };
-        let (disposition, reason) = derive_recall_disposition(&inputs);
+        let (disposition, reason) = derive_recall_disposition(inputs);
         let receipt = RecallReceipt::issue(
             scope,
             response.at_revision,
@@ -1539,6 +1643,13 @@ impl RecallL0Response {
             .lifecycle_suppressions
             .len()
             .saturating_add(self.rank_trace.scope_suppressions.len())
+    }
+
+    /// Corpus-level conflict state observed while ranking this response, or
+    /// `None` when the owner never projected one.
+    #[must_use]
+    pub const fn conflicted(&self) -> Option<bool> {
+        self.conflict.conflicted()
     }
 }
 
@@ -3360,6 +3471,7 @@ mod recall_disposition_tests {
             memory_confidence: MemoryConfidence::None,
             query_mode: "test".to_owned(),
             rank_trace: L0RankTrace::default(),
+            conflict: RecallConflictObservation::default(),
             truncation: TruncationInfo {
                 truncated: false,
                 limit: 12,

@@ -35,6 +35,18 @@
 # fixture workspaces (test-only packages, ignored by the discovery rule below).
 # 11 packages + 3 non-production roots = 14 `[workspace]` tables.
 #
+# CURRENT CHECKPOINT (issue #2612, base_sha of this file unchanged): the figures
+# above are the historical denominator measured at `base_sha` and are NOT
+# re-measured here. Since then `crates/governor/eliot-memory-projection-provider`
+# was admitted as a root workspace member, so it is no longer a standalone
+# package: its obsolete `[[crate]]` row is deleted here, tree discovery now
+# yields 9 standalone package crates, and `standalone_package_count` is 9 to
+# match the 9 unique remaining rows. That package keeps its existing owner,
+# `REWORK` disposition and prototype limitation in its own admitted manifest
+# metadata (`workspace_member_prototype_proof_pending`); membership removes
+# neither the prototype proof limitation nor any other disposition requirement,
+# and this row deletion is not a runtime-capability or supply-chain promotion.
+#
 # REMAINDER (explicitly not this slice): per-crate SBOM, lock/provenance
 # evidence, license/advisory records, and release/build gating that rejects
 # undeclared excluded inputs. No row here confers workspace, runtime, state,
@@ -56,26 +68,8 @@ base_sha = "f74c20e5652b12beabe60dc19f57ed197646a781"
 discovery = "python scripts/verify-standalone-crates.py --root . --list"
 gate = "python scripts/verify-excluded-dispositions-1811.py --root ."
 root_exclude_at_base = []
-standalone_package_count = 10
+standalone_package_count = 9
 allowed_dispositions = ["KEEP", "WRAP", "EXTRACT", "REWORK", "REPLACE", "RETIRE", "UNKNOWN"]
-
-[[crate]]
-path = "crates/governor/eliot-memory-projection-provider"
-package = "eliot-memory-projection-provider"
-disposition = "REWORK"
-owner = "governor.memory.projection-provider"
-standalone = "own [workspace] table; absent from root members and root exclude"
-prototype = true
-source_status = "IMPLEMENTED_PROTOTYPE"
-workspace_admission = "pending_agent_implementation_and_proof"
-functional_cell = "governor.memory.projection-provider"
-agent_order = 46
-lifecycle_owner = "governor.memory.projection-provider"
-lifecycle_owner_source = "crates/governor/eliot-memory-projection-provider/module.toml"
-integration_owner = "cognitive-wave-integrator"
-integration_owner_source = "crates/governor/eliot-memory-projection-provider/module.toml"
-production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
-remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
 
 [[crate]]
 path = "crates/research/eliot-dreamer-source-assurance"

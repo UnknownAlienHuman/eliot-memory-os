@@ -557,7 +557,11 @@ async fn serve_agent_bridge_connection(
 /// process/daemon actions, failed dispatch, failed send) revokes and fences.
 /// Connections without a retained admitted Session — including typed
 /// activation denials — serve no further frames: their next frame fences
-/// exactly as before, and their disconnect still closes clean.
+/// exactly as before, and their disconnect still closes clean. Capacity
+/// saturation is the one dispatch failure that never revokes: a
+/// `Backpressure` error is answered with a typed pressure reply on the
+/// ordinary reply channel and the loop continues, so authorized
+/// recovery/retirement stays usable on the retained session.
 #[cfg(windows)]
 async fn serve_admitted_bridge_host_requests(
     kernel: Arc<KernelComposition>,
@@ -588,6 +592,55 @@ async fn serve_admitted_bridge_host_requests(
         };
         let action = match kernel.dispatch_frame(&session, &frame) {
             Ok(action) => action,
+            Err(TransportError::Backpressure) => {
+                // Capacity saturation is typed backpressure with its
+                // exhausted dimension and permitted recovery action, never
+                // an authentication failure (issue #2731, item 6): the
+                // admitted session is retained so the gap, reconcile, and
+                // eligible-retirement recovery legs stay usable on this same
+                // transport, and the shed frame is answered on the ordinary
+                // reply channel instead of tearing the exchange down. The
+                // reply envelope mirrors the Kernel status-reply shape
+                // (`Response`/`Result`, echoed correlation, no request
+                // identity) but carries no acceptance claim — the shed
+                // frame's commit fate is unknown at this layer, so the
+                // bridge must resolve it through the idempotent
+                // duplicate/reconcile legs rather than a blind retry. Any
+                // send failure still revokes and fences exactly as for the
+                // other kinds.
+                let signal = TransportError::Backpressure
+                    .backpressure_signal()
+                    .unwrap_or(eliot_ipc::BACKPRESSURE_BRIDGE_DISPATCH);
+                let reply = eliot_protocol::Frame {
+                    protocol_version: session.protocol_version,
+                    encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+                    connection_id: session.connection_id.clone(),
+                    request_id: frame.request_id.clone(),
+                    kind: eliot_protocol::FrameKind::Response,
+                    message_type: eliot_protocol::MessageType::Result,
+                    request_identity: None,
+                    payload: eliot_protocol::ProtocolPayload::Json(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "backpressure": true,
+                            "dimension": signal.dimension,
+                            "recovery_action": signal.recovery_action,
+                            "shed_work": signal.shed_work,
+                            "outcome": "unknown",
+                        },
+                    })),
+                    trace_context: std::collections::BTreeMap::new(),
+                };
+                if let Err(error) = reply.validate() {
+                    kernel.revoke_agent_bridge(&connection_id);
+                    return Err(TransportError::Protocol(error));
+                }
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    kernel.revoke_agent_bridge(&connection_id);
+                    return Err(error);
+                }
+                continue;
+            }
             Err(error) => {
                 kernel.revoke_agent_bridge(&connection_id);
                 return Err(error);

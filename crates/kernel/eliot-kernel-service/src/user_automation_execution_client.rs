@@ -363,6 +363,22 @@ pub enum UserAutomationHostExecutionFailure {
         /// Closed reason supplied by the Host owner.
         reason: String,
     },
+    /// The Host owner read its own state and definitively retains no such
+    /// record.
+    ///
+    /// This crosses the process boundary as its own closed variant because it is
+    /// a COMPLETE negative answer, whereas `Unavailable` means the owner could
+    /// not answer at all. Folding the two into one wire value here would erase
+    /// the distinction in transit and make a proven absence indistinguishable
+    /// from an unreadable owner on the Kernel side. It is an additive variant of
+    /// an externally tagged, `deny_unknown_fields` enum: no existing variant,
+    /// member name, or digest input changed, and an older peer that cannot decode
+    /// it fails closed on the closed `deny_unknown_fields` surface rather than
+    /// answering `Unavailable`.
+    NotRetained {
+        /// Closed reason supplied by the Host owner.
+        reason: String,
+    },
     /// The owner may have committed and the result must be reconciled.
     UnknownOutcome {
         /// Closed reason supplied by the Host owner.
@@ -381,6 +397,7 @@ impl UserAutomationHostExecutionFailure {
     fn from_runtime_error(error: UserAutomationRuntimeError) -> Self {
         match error {
             UserAutomationRuntimeError::Unavailable(reason) => Self::Unavailable { reason },
+            UserAutomationRuntimeError::NotRetained(reason) => Self::NotRetained { reason },
             UserAutomationRuntimeError::UnknownOutcome(reason) => Self::UnknownOutcome { reason },
             UserAutomationRuntimeError::Rejected(reason) => Self::Rejected { reason },
             UserAutomationRuntimeError::IdentityConflict => Self::IdentityConflict,
@@ -390,6 +407,7 @@ impl UserAutomationHostExecutionFailure {
     fn into_runtime_error(self) -> UserAutomationRuntimeError {
         match self {
             Self::Unavailable { reason } => UserAutomationRuntimeError::Unavailable(reason),
+            Self::NotRetained { reason } => UserAutomationRuntimeError::NotRetained(reason),
             Self::UnknownOutcome { reason } => UserAutomationRuntimeError::UnknownOutcome(reason),
             Self::Rejected { reason } => UserAutomationRuntimeError::Rejected(reason),
             Self::IdentityConflict => UserAutomationRuntimeError::IdentityConflict,
@@ -400,6 +418,7 @@ impl UserAutomationHostExecutionFailure {
     pub fn validate(&self) -> Result<(), UserAutomationRuntimeError> {
         match self {
             Self::Unavailable { reason }
+            | Self::NotRetained { reason }
             | Self::UnknownOutcome { reason }
             | Self::Rejected { reason } => validate_text(reason, "failure.reason"),
             Self::IdentityConflict => Ok(()),

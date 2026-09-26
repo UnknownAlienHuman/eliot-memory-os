@@ -79,7 +79,7 @@ pub use module::control_reserve_front_door::{
     FRONT_DOOR_BOTTLENECK, FrontDoor, IdempotencyDisposition, IdempotencyLedger, NormalWorkClass,
     PermitOperation,
 };
-pub use module::epoch_and_fence::{EpochActivation, RouteFence, RouteScope};
+pub use module::epoch_and_fence::{EpochActivation, LineageChange, RouteFence, RouteScope};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
 pub use module::notification_state::{
     Acknowledgement, DeadlineOrReview, DeliveryChannel, DeliveryState, Notification,

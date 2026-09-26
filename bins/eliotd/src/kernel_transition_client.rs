@@ -67,16 +67,42 @@ fn check_identity_binding(
     // independently re-derives the same two codes as a typed
     // `StoreError::InvalidField { field: "task_binding", reason: <code> }`,
     // so neither layer depends on the other's encoding.
+    //
+    // # Why no selection is passed here (issue #1929)
+    //
+    // The identity and the transition carry no compiled readiness receipt and
+    // no `TaskSelectionEvidence`, and neither does `self`: a
+    // `TaskSelectionEvidence` needs a non-zero `task_revision` and an
+    // `acceptance_digest` that this edge has no legitimate source for, and the
+    // repository's only production constructor of the receipt
+    // (`eliot_workscope::ColdStartController::compile`, reached only through
+    // `OnboardingSingleFlight::compile_and_publish` and therefore only through
+    // the uncalled `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`)
+    // has no caller. So `admit_named_mutation_capture` is called without one
+    // and this edge reports `ColdUnbound`, which is the complete and honest
+    // answer for a task-free capture: it asserts no compatibility it did not
+    // compute and manufactures no authority. The two stable codes are still
+    // enforced on the real write path by
+    // `eliot_store_surreal::task_binding_gate::gate_apply`, which re-derives
+    // them from the opaque proof handles the transition actually carries.
+    // Threading a real selection onto this edge requires that receipt owner to
+    // exist first; see `task_binding_admission`'s "Measured reachability"
+    // section.
     let admission = super::task_binding_admission::admit_named_mutation_capture(
         &identity.request.metadata,
         transition,
     )
     .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    // Issue #1929: the durable retention of this cold unbound candidate is not
+    // this log line. The store admits it as `GateDisposition::ColdUnbound` and
+    // its adapter persists one `EvidenceRecord` per `CaptureObservation`
+    // regardless of task binding, read back later through `GetEvidencePack`;
+    // this is only the operator-visible projection of the admission decision.
     if let super::task_binding_admission::TaskBindingAdmission::ColdUnbound(candidate) = &admission
     {
         tracing::info!(
             candidate_id = %super::diagnostics::sanitize_identity(&candidate.candidate_id),
-            "cold unbound observation candidate: durable capture-first bytes, no task activation, support/influence promotion, or finish relevance"
+            "cold unbound observation candidate: durable capture-first bytes retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
         );
     }
     if transition.state_fence != identity.request.metadata.state_fence {

@@ -54,9 +54,18 @@ use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
 
 use super::watchdog_publication::live_supervision_obligation;
 use super::{
-    HostBranchDisposition, HostComposition, HostError, HostTerminalGuard, drain_rearm_operation,
-    fresh_identity, host_lifecycle_observe_drain, host_lifecycle_observe_requested,
-    host_lifecycle_observe_scm, operation, record_fence,
+    BOUNDARY_ACTIVATION_ADMISSION_REQUESTED, BOUNDARY_DRAIN_RESUME_ACTIVE_RESTORED,
+    BOUNDARY_DRAIN_RESUME_TERMINAL, BOUNDARY_IDLE_DRAIN_DRAIN_FAILED_BLOCKED,
+    BOUNDARY_IDLE_DRAIN_NOT_ACTIVE, BOUNDARY_IDLE_DRAIN_PRE_COMMIT_OPEN,
+    BOUNDARY_IDLE_DRAIN_REARM_CENSUS_NOT_IDLE, BOUNDARY_IDLE_DRAIN_REARM_NOT_ACTIVE,
+    BOUNDARY_IDLE_DRAIN_REARM_REQUESTED, BOUNDARY_IDLE_DRAIN_TERMINAL,
+    BOUNDARY_LEASE_CENSUS_REQUESTED, BOUNDARY_OBSERVABLE_USE_COALESCED,
+    BOUNDARY_OBSERVABLE_USE_DRAIN_CANCELLED, BOUNDARY_OBSERVABLE_USE_NEXT_GENERATION_QUEUED,
+    BOUNDARY_OBSERVABLE_USE_REPLAY_ALREADY_CONSUMED, BOUNDARY_OBSERVABLE_USE_TERMINAL,
+    BOUNDARY_WAKE_REVALIDATION_OBSERVED, BOUNDARY_WAKE_SATISFIED_OBSERVED,
+    BOUNDARY_WAKE_SATISFY_TERMINAL, HostBranchDisposition, HostComposition, HostError,
+    HostTerminalGuard, drain_rearm_operation, fresh_identity, host_lifecycle_observe_drain,
+    host_lifecycle_observe_requested, host_lifecycle_observe_scm, operation, record_fence,
 };
 
 /// Capability every I1.5 observable-use trigger needs: the Host-owned
@@ -286,7 +295,7 @@ impl HostComposition {
     /// activation record is absent.
     pub fn activation_admission(&self) -> Result<ActivationAdmission, HostError> {
         // F-LOG-HOST-1: projection only, never a readiness or lease claim.
-        host_lifecycle_observe_requested("host.activation-admission requested");
+        host_lifecycle_observe_requested(BOUNDARY_ACTIVATION_ADMISSION_REQUESTED);
         activation_admission_from(&self.snapshot()?)
     }
 
@@ -318,7 +327,7 @@ impl HostComposition {
         evidence: &PlatformHandle,
     ) -> Result<DrainWakeOutcome, HostError> {
         // F-LOG-HOST-1: one terminal for the whole classification.
-        let mut host_terminal = HostTerminalGuard::armed("host-observable-use-failed");
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_OBSERVABLE_USE_TERMINAL);
         self.ensure_admission_open()?;
         let state = self.snapshot()?;
         let activation = state.activation.clone().ok_or_else(|| {
@@ -327,7 +336,26 @@ impl HostComposition {
         let trigger_class = PlatformHandle::new(trigger.as_str())
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let outcome = if state.drain_commit.is_some() {
-            self.queue_next_generation_wake(&activation, trigger, trigger_class, evidence)?;
+            let queued =
+                self.queue_next_generation_wake(&activation, trigger, trigger_class, evidence)?;
+            // W5 read side: the queued `WakeIntent` is read back out of the
+            // durable journal before the disposition is published. The
+            // append above only proves the write was accepted; this read is the
+            // single place that observes the *persisted* pending intent, so a
+            // journal that dropped or replaced the entry fails the trigger
+            // instead of reporting a queued next generation nothing can claim.
+            let persisted = self.pending_next_generation_wake()?.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "queued next-generation WakeIntent is absent from the durable journal"
+                        .to_owned(),
+                )
+            })?;
+            if persisted != queued {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "queued next-generation WakeIntent is not the durable pending intent"
+                        .to_owned(),
+                ));
+            }
             DrainWakeOutcome::QueueNextGeneration
         } else if let Some(drain) = state.drain.as_ref().filter(|drain| {
             drain.state == DrainState::Draining
@@ -382,11 +410,11 @@ impl HostComposition {
             )));
         };
         let detail = match outcome {
-            DrainWakeOutcome::Proceed => "host.observable-use coalesced",
-            DrainWakeOutcome::CancelDrain => "host.observable-use drain-cancelled",
-            DrainWakeOutcome::QueueNextGeneration => "host.observable-use next-generation-queued",
+            DrainWakeOutcome::Proceed => BOUNDARY_OBSERVABLE_USE_COALESCED,
+            DrainWakeOutcome::CancelDrain => BOUNDARY_OBSERVABLE_USE_DRAIN_CANCELLED,
+            DrainWakeOutcome::QueueNextGeneration => BOUNDARY_OBSERVABLE_USE_NEXT_GENERATION_QUEUED,
             DrainWakeOutcome::ReplayAlreadyConsumed => {
-                "host.observable-use replay-already-consumed"
+                BOUNDARY_OBSERVABLE_USE_REPLAY_ALREADY_CONSUMED
             }
         };
         host_lifecycle_observe_scm(detail);
@@ -411,7 +439,7 @@ impl HostComposition {
         disposition: HostBranchDisposition,
     ) -> Result<bool, HostError> {
         // F-LOG-HOST-1: readiness revalidation boundary.
-        let mut host_terminal = HostTerminalGuard::armed("host-drain-resume-failed");
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_DRAIN_RESUME_TERMINAL);
         if disposition != HostBranchDisposition::Healthy {
             host_terminal.disarm();
             return Ok(false);
@@ -433,7 +461,7 @@ impl HostComposition {
             return Ok(false);
         }
         self.transition_activation(ActivationState::Active, "host-drain-cancelled")?;
-        host_lifecycle_observe_drain("host.drain-resume active-restored");
+        host_lifecycle_observe_drain(BOUNDARY_DRAIN_RESUME_ACTIVE_RESTORED);
         host_terminal.disarm();
         Ok(true)
     }
@@ -478,7 +506,7 @@ impl HostComposition {
     /// drain.
     pub fn begin_idle_drain(&mut self, census_code: &'static str) -> Result<bool, HostError> {
         // F-LOG-HOST-1: Requested vs Draining vs committed stay distinct.
-        let mut host_terminal = HostTerminalGuard::armed("host-idle-drain-begin-failed");
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_IDLE_DRAIN_TERMINAL);
         self.ensure_admission_open()?;
         let evidence = fresh_identity("host-idle-drain-evidence")?;
         let census_evidence = PlatformHandle::new(census_code)
@@ -511,7 +539,7 @@ impl HostComposition {
                 // `STOPPED_CLEAN`." A `Failed` attempt is not re-armed here:
                 // its failure direction is unreconciled, so the result names
                 // the recovery obligation instead of resetting a timer.
-                host_lifecycle_observe_drain("host.idle-drain drain-failed blocked");
+                host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_DRAIN_FAILED_BLOCKED);
                 return Err(HostError::RecoveryRequired(
                     "pre-commit drain is FAILED; drain re-arm requires manual recovery before another attempt"
                         .to_owned(),
@@ -532,7 +560,7 @@ impl HostComposition {
             Some(DrainState::Requested) => {}
             None => {
                 if activation.state != ActivationState::Active {
-                    host_lifecycle_observe_drain("host.idle-drain not-active");
+                    host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_NOT_ACTIVE);
                     host_terminal.disarm();
                     return Ok(false);
                 }
@@ -548,7 +576,7 @@ impl HostComposition {
         }
         self.append_idle_drain_draining(&activation, rearm.as_ref(), evidence_refs)?;
         self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
-        host_lifecycle_observe_drain("host.idle-drain pre-commit open");
+        host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_PRE_COMMIT_OPEN);
         host_terminal.disarm();
         Ok(true)
     }
@@ -633,7 +661,7 @@ impl HostComposition {
         predecessor: &DrainRecord,
     ) -> Result<Option<DrainRearmAttempt>, HostError> {
         if activation.state != ActivationState::Active {
-            host_lifecycle_observe_drain("host.idle-drain rearm-not-active");
+            host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_NOT_ACTIVE);
             return Ok(None);
         }
         // A cancellation changes the obligation set, so the caller's cached
@@ -644,7 +672,7 @@ impl HostComposition {
         // per tick.
         let census = self.idle_lease_census()?;
         if !census.admits_drain() {
-            host_lifecycle_observe_drain("host.idle-drain rearm-census-not-idle");
+            host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_CENSUS_NOT_IDLE);
             return Ok(None);
         }
         let predecessor_checksum = record_checksum(&HostStateRecord::Drain(predecessor.clone()))?;
@@ -683,7 +711,7 @@ impl HostComposition {
             evidence_refs,
             expected_predecessor: Some(attempt.predecessor_checksum.clone()),
         }))?;
-        host_lifecycle_observe_drain("host.idle-drain rearm-requested");
+        host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_REQUESTED);
         Ok(Some(attempt))
     }
 
@@ -700,7 +728,7 @@ impl HostComposition {
     /// cannot be read.
     pub fn idle_lease_census(&self) -> Result<IdleLeaseCensus, HostError> {
         // F-LOG-HOST-1: guard probe only; never a terminal and never a claim.
-        host_lifecycle_observe_scm("host.lease-census requested");
+        host_lifecycle_observe_scm(BOUNDARY_LEASE_CENSUS_REQUESTED);
         let state = self.snapshot()?;
         let activation = state.activation.as_ref().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
@@ -745,6 +773,26 @@ impl HostComposition {
         Ok(state.wakes.iter().find_map(|wake| {
             (wake.intent.state == WakeIntentState::Pending).then(|| wake.wake_id.clone())
         }))
+    }
+
+    /// Returns the capability set this activation generation durably requires.
+    ///
+    /// I1.5 "start only the remaining capabilities required by the admitted
+    /// request": the set that may gate a process contour is the one the
+    /// activation record itself carries, read back from the journal. It is never
+    /// recomputed from the caller's intent, so a contour cannot be started
+    /// against a capability no admitted request ever required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state or the activation record
+    /// cannot be read.
+    pub fn required_generation_capabilities(&self) -> Result<Vec<PlatformHandle>, HostError> {
+        let state = self.snapshot()?;
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        Ok(activation.requested_capabilities.clone())
     }
 
     /// Revalidates every queued `WakeIntent` against the current activation
@@ -806,7 +854,7 @@ impl HostComposition {
             };
             self.append_record(HostStateRecord::Wake(next))?;
         }
-        host_lifecycle_observe_scm("host.wake-revalidation observed");
+        host_lifecycle_observe_scm(BOUNDARY_WAKE_REVALIDATION_OBSERVED);
         Ok(claimed)
     }
 
@@ -824,7 +872,7 @@ impl HostComposition {
     /// rejects a transition.
     pub fn satisfy_claimed_wakes(&mut self) -> Result<usize, HostError> {
         // F-LOG-HOST-1: single terminal for the whole satisfaction pass.
-        let mut host_terminal = HostTerminalGuard::armed("host-wake-satisfy-failed");
+        let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_WAKE_SATISFY_TERMINAL);
         let state = self.snapshot()?;
         let claimed: Vec<WakeRecord> = state
             .wakes
@@ -848,7 +896,7 @@ impl HostComposition {
             self.append_record(HostStateRecord::Wake(done))?;
             satisfied += 1;
         }
-        host_lifecycle_observe_scm("host.wake-satisfied observed");
+        host_lifecycle_observe_scm(BOUNDARY_WAKE_SATISFIED_OBSERVED);
         host_terminal.disarm();
         Ok(satisfied)
     }
@@ -920,6 +968,34 @@ impl HostComposition {
         }))?;
         Ok(wake_id)
     }
+}
+
+/// The capability requirement of a fresh control-contour activation.
+///
+/// I1.5 startup: "Host starts/reconciles Kernel and requests the independent
+/// Watchdog service through SCM as sibling activation branches", and the
+/// canonical store branch belongs to the same contour because the Host
+/// readiness fence refuses `ControlReady` without a proven Store branch. This
+/// is the bootstrap requirement of a generation that has no narrower proven
+/// ingress; a narrower trigger class contributes its own set through
+/// [`ActivationTriggerClass::requested_capabilities`].
+#[must_use]
+pub const fn control_contour_capabilities() -> &'static [&'static str] {
+    &[
+        CAPABILITY_RUNTIME_SUPERVISION,
+        CAPABILITY_CANONICAL_STORE,
+        CAPABILITY_INDEPENDENT_SUPERVISION,
+    ]
+}
+
+/// Whether a durable activation-generation capability set requires `capability`.
+///
+/// The set carries handles spelled by the
+/// [`ActivationTriggerClass::requested_capabilities`] vocabulary, so the
+/// comparison is against that frozen spelling rather than a fresh literal.
+#[must_use]
+pub fn requires_capability(required: &[PlatformHandle], capability: &str) -> bool {
+    required.iter().any(|value| value.as_str() == capability)
 }
 
 fn activation_admission_from(state: &HostState) -> Result<ActivationAdmission, HostError> {

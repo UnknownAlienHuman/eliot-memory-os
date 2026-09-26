@@ -237,6 +237,11 @@ pub struct SeatedVerdicts {
 ///   seating leave nothing in flight.
 /// - Rollback candidacy: traps and unknown outcomes implicate the
 ///   generation; request denials do not.
+/// - Trap with effect/state evidence: a trap that left proposed effects or a
+///   state delta cannot prove no-effect, so its scope stays blocked until
+///   reconciliation resolves it
+///   ([`InFlightDisposition::BlockScopeUnknownOutcome`]), like an unknown
+///   outcome. A trap with neither stays a plain rejection.
 #[must_use]
 pub fn evaluate_seated_verdicts(result: &InvocationResult) -> SeatedVerdicts {
     let trap = match &result.receipt.error {
@@ -256,6 +261,9 @@ pub fn evaluate_seated_verdicts(result: &InvocationResult) -> SeatedVerdicts {
         }
         InvocationDisposition::Rejected if cancelled && no_effects && no_delta => {
             Some(InFlightDisposition::CancelProvenNoEffect)
+        }
+        InvocationDisposition::Rejected if trap.is_some() && !(no_effects && no_delta) => {
+            Some(InFlightDisposition::BlockScopeUnknownOutcome)
         }
         InvocationDisposition::Rejected | InvocationDisposition::Unavailable => None,
         InvocationDisposition::Unknown => Some(InFlightDisposition::BlockScopeUnknownOutcome),

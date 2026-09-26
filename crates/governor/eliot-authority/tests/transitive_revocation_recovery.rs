@@ -78,7 +78,7 @@ fn restore_with_origin_evidence(
         .recovery_snapshot()
         .expect("snapshot");
     let evidence = origin_evidence(fence, denominator);
-    GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&evidence))
+    GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
         .expect("current evidence restores")
 }
 
@@ -102,7 +102,7 @@ fn restore_with_mid_evidence(fence: &StateFence, denominator: &Denominator) -> G
             fence,
         )],
     };
-    GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&evidence))
+    GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
         .expect("current evidence restores")
 }
 
@@ -341,7 +341,7 @@ fn revoke_origin_recovery_suppresses_origin_and_dependents() {
     let snapshot = graph.recovery_snapshot().expect("snapshot");
     let evidence = origin_evidence(&fence, &denominator);
     let outcome =
-        GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&evidence))
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
             .expect("current evidence restores");
     let suppressed: BTreeSet<&str> = outcome
         .suppressed
@@ -433,7 +433,7 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
         )],
     };
     let outcome =
-        GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&evidence))
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&evidence))
             .expect("current evidence restores");
     let by_id: std::collections::BTreeMap<&str, &eliot_authority::SuppressedGrant> = outcome
         .suppressed
@@ -470,7 +470,7 @@ fn missing_evidence_refuses_restoration() {
     let snapshot = chain(&fence, &denominator)
         .recovery_snapshot()
         .expect("snapshot");
-    let error = GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, None)
+    let error = GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, None)
         .expect_err("missing history must refuse");
     assert_eq!(error, RevocationHistoryError::MissingHistory);
 }
@@ -490,7 +490,7 @@ fn stale_evidence_refuses_restoration() {
         closures: Vec::new(),
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot.clone(), Some(&zero))
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&zero))
             .expect_err("zero revision must refuse"),
         RevocationHistoryError::StaleHistory
     );
@@ -507,11 +507,8 @@ fn stale_evidence_refuses_restoration() {
         )],
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(
-            snapshot.clone(),
-            Some(&drifted)
-        )
-        .expect_err("revision drift must refuse"),
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&drifted))
+            .expect_err("revision drift must refuse"),
         RevocationHistoryError::StaleHistory
     );
     // A fence from another epoch is stale.
@@ -527,7 +524,7 @@ fn stale_evidence_refuses_restoration() {
         closures: Vec::new(),
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&foreign))
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&foreign))
             .expect_err("foreign fence must refuse"),
         RevocationHistoryError::StaleHistory
     );
@@ -558,7 +555,7 @@ fn unknown_evidence_refuses_restoration() {
     };
     assert_eq!(
         GrantGraph::from_recovery_snapshot_with_revocation_history(
-            snapshot.clone(),
+            &snapshot,
             Some(&active_evidence)
         )
         .expect_err("non-revoked closure must refuse"),
@@ -585,7 +582,7 @@ fn unknown_evidence_refuses_restoration() {
         closures: vec![later, earlier],
     };
     assert_eq!(
-        GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot, Some(&unordered))
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&unordered))
             .expect_err("unordered closures must refuse"),
         RevocationHistoryError::UnknownHistory
     );
@@ -606,7 +603,7 @@ fn current_empty_history_restores_unrelated_grants() {
         closures: Vec::new(),
     };
     let outcome =
-        GrantGraph::from_recovery_snapshot_with_revocation_history(snapshot.clone(), Some(&empty))
+        GrantGraph::from_recovery_snapshot_with_revocation_history(&snapshot, Some(&empty))
             .expect("current empty history restores");
     assert!(outcome.suppressed.is_empty());
     assert_eq!(

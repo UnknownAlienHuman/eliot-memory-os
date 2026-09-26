@@ -188,7 +188,7 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
     },
     ConsumerSurface {
         path: "docs/release/WINDOWS_X64_RELEASE.md",
-        live_reference: "The Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`",
+        live_reference: "the Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`",
         body: WINDOWS_RELEASE_GUIDE,
     },
     ConsumerSurface {
@@ -478,7 +478,7 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
         ConsumerEntry {
             consumer: "Windows x64 release retention record",
             proof: "docs/release/WINDOWS_X64_RELEASE.md",
-            live_reference: "The Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`",
+            live_reference: "the Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`",
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when the retained legacy entry points are deleted under #18",
         },

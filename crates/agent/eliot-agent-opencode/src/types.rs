@@ -13,8 +13,11 @@ use eliot_agent_api::{
     RouteObservationState, SessionLifecycleObservation, SessionLifecycleTransition,
     UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
     WarningObservation, contains_restricted_source_token, route_divergence_fields,
+    route_fingerprint_digest_for,
 };
-use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ResourceGeneration, StateFence, canonical_json_bytes, parse_versioned_sha256_digest, sha256_hex,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::Value;
 
@@ -760,6 +763,15 @@ type ObservedSideClassification = (
     Option<String>,
 );
 
+/// Factored return shape for the sealed-disposition receipt summary below.
+type SummaryReceiptFields = (
+    &'static str,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+);
+
 /// Canonical live wire-locator agent identity bound into every minted
 /// locator (issue #369 W11/W12). The production minter
 /// (`OpenCodeClient::success_result`) and the conversion verifier
@@ -775,8 +787,13 @@ pub const OPENCODE_WIRE_LOCATOR_PROTOCOL_REVISION: &str = "eliot-opencode-bootst
 /// route bindings (issue #369 W11/W12): `sha256:<hex>` over NUL-separated
 /// protocol revision, endpoint, server version, observed provider/model, and
 /// agent. This single recipe is shared by the production minter and the
-/// verifier, so a forged, replayed-across-sessions, or stale locator fails
-/// closed instead of manufacturing `MATCHED`/`DIVERGED`.
+/// verifier, so a forged or stale locator (different live values) fails
+/// closed instead of manufacturing `MATCHED`/`DIVERGED`. The digest carries
+/// no session/execution commitment, so it alone cannot fail a cross-session
+/// replay closed: a locator replayed with identical live values under another
+/// session still recomputes. Cross-session/cross-binding protection comes
+/// only from the explicit wire-session/binding owner join in the seal path
+/// (issue #2902), never from this locator.
 pub fn wire_route_locator(
     endpoint: &str,
     server_version: &str,
@@ -1032,20 +1049,42 @@ impl OpenCodeWireRouteReceipt {
                         .ok_or(OpenCodeObservationConversionError::Wire(
                             OpenCodeWireRouteError::ObservedIdentityMissing,
                         ))?;
-                // The observed fingerprint starts from the dispatched
-                // execution's attested route (`binding_route`: the exact
-                // route the execution unit was launched with, confirmed by
-                // the session/message seal), overlaid with the wire-observed
-                // provider/model. Non-wire components are the dispatched
-                // execution's configuration, never re-observed provider
-                // behavior promoted from the requested side (issue #369
-                // W11): a runtime/serializer/tool substitution outside the
-                // wire-observed channels cannot corroborate here, and the
-                // live locator check in `to_physical_observation` fails a
-                // forged or stale wire closed before this classification.
-                let mut observed_fp = binding_route.clone();
-                observed_fp.provider.clone_from(&observed_wire.provider_id);
-                observed_fp.model.clone_from(&observed_wire.model_id);
+                // The observed fingerprint is derived field-by-field from
+                // wire observation plus the dispatched execution record,
+                // never by cloning a whole route (issue #369 W11/A27): the
+                // wire-observed provider/model overwrite the dispatched
+                // values, while every other behavior-bearing component is
+                // taken from the dispatched binding route -- the exact route
+                // the adapter itself launched this execution unit under, held
+                // by the session/message seal, not a caller-supplied request.
+                // Field-complete classification below (`Matched` only on full
+                // equality, else `Diverged` with the exact difference set)
+                // therefore compares the dispatched execution against the
+                // requested baseline on wire-observed provider/model plus
+                // adapter-attested dispatch. A runtime/serializer/tool
+                // substitution outside the wire-observed channels cannot
+                // corroborate here: the admitted dispatch gates (healthy
+                // expected server version, bound session identity, read-only
+                // permission attestation) fail a swapped server closed before
+                // this classification, and the live locator check in
+                // `to_physical_observation` fails a forged or stale wire
+                // closed. Same-version bit-identical swaps stay outside the
+                // wire channels and are disclosed, not asserted.
+                let observed_fp = RouteFingerprint {
+                    host_family: binding_route.host_family.clone(),
+                    adapter: binding_route.adapter.clone(),
+                    protocol_transport: binding_route.protocol_transport.clone(),
+                    runtime_hash: binding_route.runtime_hash.clone(),
+                    adapter_hash: binding_route.adapter_hash.clone(),
+                    provider: observed_wire.provider_id.clone(),
+                    model: observed_wire.model_id.clone(),
+                    auth_billing: binding_route.auth_billing.clone(),
+                    serializer_hash: binding_route.serializer_hash.clone(),
+                    tool_semantics_hash: binding_route.tool_semantics_hash.clone(),
+                    reasoning_mode: binding_route.reasoning_mode.clone(),
+                    continuation_behavior: binding_route.continuation_behavior.clone(),
+                    feature_flags_hash: binding_route.feature_flags_hash.clone(),
+                };
                 let diverged = route_divergence_fields(requested, &observed_fp);
                 let state = if diverged.is_empty() {
                     RouteObservationState::Matched
@@ -1158,8 +1197,12 @@ impl OpenCodeWireRouteReceipt {
         // locator must be the shared recipe recomputed over the wire's own
         // live-observed fields (endpoint, server version, observed
         // provider/model). A locator minted for different live values
-        // (forged, replayed across sessions, or stale) fails closed here
-        // instead of manufacturing `MATCHED`/`DIVERGED` below.
+        // (forged or stale) fails closed here instead of manufacturing
+        // `MATCHED`/`DIVERGED` below. The digest omits the wire session and
+        // the execution-unit/message identity by construction, so a locator
+        // replayed across sessions with identical live values still
+        // recomputes: cross-session protection is the seal path's explicit
+        // wire-session/binding join (issue #2902), never this check.
         if self.state == OpenCodeWireRouteState::Observed {
             let observed_wire =
                 self.observed
@@ -1271,17 +1314,14 @@ fn is_blank(value: Option<&str>) -> bool {
 
 /// Returns true when the wire route locator is a well-formed live
 /// `sha256:<64 lowercase hex>` locator. Placeholder labels such as
-/// `sha256:runtime` or `sha256:route`, uppercase, short, long, and non-hex
-/// forms are not live observations and never corroborate a classification
-/// (issue #369 W11/W12).
+/// `sha256:runtime` or `sha256:route`, uppercase, short, long, non-hex, and
+/// wrong-algorithm forms are not live observations and never corroborate a
+/// classification (issue #369 W11/W12/A10): the algorithm/body discipline is
+/// the shared foundation [`parse_versioned_sha256_digest`] envelope, and a
+/// well-formed value over the wrong live fields additionally fails the
+/// recipe recomputation in `to_physical_observation`.
 fn is_live_wire_locator(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    parse_versioned_sha256_digest(value).is_ok()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -2460,6 +2500,470 @@ pub struct PhysicalObservationBody {
     pub event_sequence: u64,
     /// Observed cancellation, when any.
     pub cancellation: Option<CancellationState>,
+}
+
+/// Versioned schema tag for the digest-bound route-disposition summary sealed
+/// into the run extra before candidate sealing (issue #2902).
+///
+/// `v2` carries one provenance label per [`RouteFingerprint`] component
+/// (thirteen keys under `component_sources`); `v1` carried only three labels
+/// (`provider`, `model`, `launch_runtime_tool_serializer`), leaving eight
+/// binding-attested components undisclosed.
+pub const SEALED_ROUTE_DISPOSITION_SUMMARY_SCHEMA: &str = "eliot-opencode-route-disposition/v2";
+
+/// Passive reconciliation handle for a seal-time route observation whose
+/// outcome is unknown (issue #2902): the admitted edge seals only reconciled
+/// terminal candidates, so an unprocessable route observation after possible
+/// dispatch reconciles through the session/message surface, never by resynthesizing evidence.
+pub const OPENCODE_ROUTE_RECONCILIATION_REF: &str = "opencode-route-reconciliation";
+
+/// Bounded reason marking previously sealed outcomes that carry no route
+/// disposition at all (issue #2902 item 11): they predate typed
+/// route-observation truthfulness, so they are explicitly unverified and
+/// quarantined, never silently current `Unobserved` or `Matched` receipts.
+pub const LEGACY_UNVERIFIED_ROUTE_REASON: &str = "opencode-legacy-route-unverified";
+
+/// Provenance label for route components physically observed on the provider
+/// wire (issue #2902 item 6): provider/model identity only.
+pub const ROUTE_COMPONENT_SOURCE_WIRE_OBSERVED: &str = "wire-observed";
+/// Provenance label for route components attested by the exact #361
+/// execution binding under which the unit was launched (issue #2902 item 6):
+/// launch, runtime, tool, and serializer semantics. They are dispatched
+/// execution configuration, never re-observed provider behavior, and must not
+/// be presented as physical observation merely by equality with requested values.
+pub const ROUTE_COMPONENT_SOURCE_BINDING_ATTESTED: &str = "execution-binding-attested";
+/// Provenance label for route components with no observation and no
+/// attestation (issue #2902 item 6): they are absent, never fabricated equal
+/// to requested or observed values.
+pub const ROUTE_COMPONENT_SOURCE_UNOBSERVED: &str = "unobserved";
+
+/// Typed seal-time route-observation disposition for one admitted `OpenCode`
+/// attempt (issue #2902).
+///
+/// This replaces the optional best-effort `Option<PhysicalRouteObservationReceipt>`
+/// projection whose canonical-conversion errors were discarded with `.ok()`:
+/// every construction path preserves either the validated canonical receipt
+/// or the exact bounded conversion cause plus the retained wire evidence, so
+/// a malformed, stale, mismatched, or otherwise unconvertible wire route can
+/// never appear as ordinary success plus an unexplained absence.
+///
+/// The variant vocabulary reuses the accepted #369 physical-observation
+/// states (`MATCHED`/`DIVERGED` ride inside the `Observed` receipt,
+/// `UNOBSERVED`/`UNKNOWN_OUTCOME` inside the `Unobserved` receipt); no fifth
+/// route owner is invented. A valid physical route still carries no finish or
+/// canonical authority: the sealed candidate stays
+/// [`AuthorityCeiling::CandidateOnly`] on every variant, and a route conflict
+/// never erases the retained provider output evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SealedRouteDisposition {
+    /// Canonical conversion succeeded and the receipt asserts observed
+    /// execution (`MATCHED` or `DIVERGED`, both with
+    /// [`ExecutionOutcome::Observed`]). Provider/model components come from
+    /// wire observation; every other component is execution-binding
+    /// attestation (see [`observed_component_sources`]).
+    Observed(PhysicalRouteObservationReceipt),
+    /// Canonical conversion succeeded on an honestly unavailable wire
+    /// observation: the receipt carries `UNOBSERVED`/`UNKNOWN_OUTCOME` with
+    /// its exact reason, retained wire evidence, and recovery reference
+    /// (issue #369 A18). Absence is typed evidence here, never a missing field.
+    Unobserved(PhysicalRouteObservationReceipt),
+    /// The wire evidence contradicts the admitted binding or the canonical
+    /// contract (`Wire`/`Contract` conversion cause, or the explicit
+    /// wire-session/binding owner join failed). No receipt is minted; the
+    /// exact typed cause and the retained wire evidence travel with the
+    /// disposition instead of collapsing to a string or to absence.
+    RejectedConflict {
+        cause: OpenCodeObservationConversionError,
+        wire_evidence_digest: Option<LowercaseSha256>,
+        wire_evidence_ref: Option<String>,
+    },
+    /// The route observation is unprocessable after provider work may have
+    /// dispatched (`Serialization`/`InvalidInput` conversion cause, or no
+    /// observed terminal wall time exists to bound an `Observed` receipt).
+    /// Carries the last observation boundary that would have applied, the
+    /// exact typed cause, whatever wire evidence digest survived, and the
+    /// passive reconciliation handle — per #369 A18/A20 this seals unknown,
+    /// never retried, cancelled, or completed here.
+    UnknownOutcome {
+        last_cursor: EventCursor,
+        last_sequence: u64,
+        cause: OpenCodeObservationConversionError,
+        wire_evidence_digest: Option<LowercaseSha256>,
+        wire_evidence_ref: Option<String>,
+        reconciliation_ref: String,
+    },
+    /// A previously sealed outcome that predates typed route-observation
+    /// truthfulness and therefore carries no disposition at all (issue #2902
+    /// item 11). Explicitly unverified and quarantined: it must never be
+    /// read as a current `Unobserved` or `Matched` receipt, and it justifies
+    /// no actual route column at durable staging.
+    LegacyUnverified { reason: &'static str },
+}
+
+impl SealedRouteDisposition {
+    /// Wraps a previously sealed outcome with no route disposition as
+    /// explicitly unverified quarantine (issue #2902 item 11). Fresh seals
+    /// never construct this: the seal path always produces one of the typed
+    /// observed/conflict/unknown variants.
+    pub fn legacy_unverified() -> Self {
+        Self::LegacyUnverified {
+            reason: LEGACY_UNVERIFIED_ROUTE_REASON,
+        }
+    }
+
+    /// Returns the validated canonical receipt when conversion minted one
+    /// (`Observed`/`Unobserved`), or `None` when no receipt exists
+    /// (`RejectedConflict`/`UnknownOutcome`/`LegacyUnverified`).
+    pub fn receipt(&self) -> Option<&PhysicalRouteObservationReceipt> {
+        match self {
+            Self::Observed(receipt) | Self::Unobserved(receipt) => Some(receipt),
+            Self::RejectedConflict { .. }
+            | Self::UnknownOutcome { .. }
+            | Self::LegacyUnverified { .. } => None,
+        }
+    }
+
+    /// Returns true exactly when conversion minted an execution-observed
+    /// receipt (`MATCHED` or `DIVERGED`). Honest unavailability, conflict,
+    /// unknown outcome, and legacy absence are never observed.
+    pub fn is_observed(&self) -> bool {
+        matches!(self, Self::Observed(_))
+    }
+
+    /// Bounded public cause code for diagnostics (issue #2902 item 12): wire
+    /// failures name their exact wire variant; contract, serialization, and
+    /// invalid-input failures name only their bounded kind. The exact typed
+    /// cause stays on the enum itself; this projection never embeds raw
+    /// provider, session, or path material.
+    pub fn cause_code(&self) -> &'static str {
+        match self {
+            Self::Observed(_) => "observed",
+            Self::Unobserved(_) => "unobserved",
+            Self::RejectedConflict { cause, .. } | Self::UnknownOutcome { cause, .. } => {
+                conversion_cause_code(cause)
+            }
+            Self::LegacyUnverified { .. } => "legacy-unverified",
+        }
+    }
+
+    /// Digest-bound staging columns for the #2645 durable staging consumer
+    /// (issue #2902 item 10).
+    ///
+    /// The requested column always recomputes
+    /// [`route_fingerprint_digest_for`] from the accepted admission's
+    /// original requested route — never a copied string and never a wire
+    /// self-hash. The actual column recomputes from the validated observed
+    /// route exactly when this disposition minted an execution-observed
+    /// receipt; every other disposition (honest unavailability, conflict,
+    /// unknown outcome, legacy absence) yields no actual digest, so a `None`
+    /// disposition or a wire self-hash can never justify an actual column.
+    /// A staging validator recomputes both columns from its own owner
+    /// material rather than trusting these values.
+    pub fn staging_columns(
+        &self,
+        admission: &AdmittedRouteReceipt,
+    ) -> Result<(LowercaseSha256, Option<LowercaseSha256>), AdmittedAttemptError> {
+        let requested = route_fingerprint_digest_for(&admission.requested_route)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        let actual = match self {
+            Self::Observed(receipt) => receipt
+                .observed_route
+                .as_ref()
+                .map(route_fingerprint_digest_for)
+                .transpose()
+                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
+            Self::Unobserved(_)
+            | Self::RejectedConflict { .. }
+            | Self::UnknownOutcome { .. }
+            | Self::LegacyUnverified { .. } => None,
+        };
+        Ok((requested, actual))
+    }
+
+    /// Canonical digest-bound summary sealed into the run extra *before*
+    /// candidate sealing, so the candidate `result_digest` binds the final
+    /// route disposition, its evidence/recovery references, and the staging
+    /// columns (issue #2902 item 8). A consumer cannot drop the disposition
+    /// and retain an indistinguishable stronger candidate: any dropped or
+    /// altered route evidence changes the sealed candidate digest.
+    ///
+    /// Every field is bounded and redacted (digests, refs, codes, provenance
+    /// labels); raw provider/session/path material never enters the summary
+    /// (issue #2902 item 12).
+    pub fn summary_value(
+        &self,
+        admission: &AdmittedRouteReceipt,
+    ) -> Result<Value, AdmittedAttemptError> {
+        let fail = |error: serde_json::Error| AdmittedAttemptError::DigestFailed(error.to_string());
+        let (requested_digest, actual_digest) = self.staging_columns(admission)?;
+        let (disposition, receipt_digest, route_state, execution_outcome, diverged_fields) =
+            self.summary_receipt_fields()?;
+        let (wire_evidence_digest, wire_evidence_ref) = self.summary_wire_fields();
+        let (recovery_ref, observation_cursor, observation_sequence) =
+            self.summary_recovery_fields();
+        // One provenance label per RouteFingerprint component (issue #2902
+        // item 6): a consumer of the sealed candidate digest can determine
+        // the origin and proof ceiling of every observed-route field.
+        let component_sources = observed_component_sources(self)
+            .into_iter()
+            .map(|(component, source)| (component.to_owned(), Value::String(source.to_owned())))
+            .collect::<serde_json::Map<String, Value>>();
+        serde_json::to_value(serde_json::json!({
+            "schema": SEALED_ROUTE_DISPOSITION_SUMMARY_SCHEMA,
+            "disposition": disposition,
+            "cause": self.cause_code(),
+            "receipt_digest": receipt_digest,
+            "route_state": route_state,
+            "execution_outcome": execution_outcome,
+            "diverged_fields": diverged_fields,
+            "wire_evidence_digest": wire_evidence_digest,
+            "wire_evidence_ref": wire_evidence_ref,
+            "recovery_ref": recovery_ref,
+            "component_sources": Value::Object(component_sources),
+            "observation_cursor": observation_cursor,
+            "observation_sequence": observation_sequence,
+            "staging_requested_route_digest": requested_digest.as_str(),
+            "staging_actual_route_digest": actual_digest.as_ref().map(LowercaseSha256::as_str),
+        }))
+        .map_err(fail)
+    }
+
+    /// Receipt-bound summary fields: disposition tag, receipt digest,
+    /// canonical state names, and divergence classification (issue #2902 item
+    /// 8). Receipt-free dispositions carry none of these rather than a
+    /// fabricated placeholder.
+    fn summary_receipt_fields(&self) -> Result<SummaryReceiptFields, AdmittedAttemptError> {
+        match self {
+            Self::Observed(receipt) => {
+                let (route_state, execution_outcome) = canonical_state_names(receipt)?;
+                Ok((
+                    "observed",
+                    Some(receipt.self_digest.as_str().to_owned()),
+                    Some(route_state),
+                    Some(execution_outcome),
+                    receipt.diverged_fields.clone(),
+                ))
+            }
+            Self::Unobserved(receipt) => {
+                let (route_state, execution_outcome) = canonical_state_names(receipt)?;
+                Ok((
+                    "unobserved",
+                    Some(receipt.self_digest.as_str().to_owned()),
+                    Some(route_state),
+                    Some(execution_outcome),
+                    receipt.diverged_fields.clone(),
+                ))
+            }
+            Self::RejectedConflict { .. } => {
+                Ok(("rejected-conflict", None, None, None, Vec::new()))
+            }
+            Self::UnknownOutcome { .. } => Ok(("unknown-outcome", None, None, None, Vec::new())),
+            Self::LegacyUnverified { .. } => {
+                Ok(("legacy-unverified", None, None, None, Vec::new()))
+            }
+        }
+    }
+
+    /// Retained wire-evidence linkage: digest hex plus immutable reference,
+    /// or absence exactly when no receipt minted one and no wire digest
+    /// survived (issue #2902 items 2 and 12).
+    fn summary_wire_fields(&self) -> (Option<String>, Option<String>) {
+        match self {
+            Self::Observed(receipt) | Self::Unobserved(receipt) => (
+                receipt
+                    .raw_evidence_digest
+                    .as_ref()
+                    .map(|digest| digest.as_str().to_owned()),
+                receipt.raw_evidence_ref.clone(),
+            ),
+            Self::RejectedConflict {
+                wire_evidence_digest,
+                wire_evidence_ref,
+                ..
+            }
+            | Self::UnknownOutcome {
+                wire_evidence_digest,
+                wire_evidence_ref,
+                ..
+            } => (
+                wire_evidence_digest
+                    .as_ref()
+                    .map(|digest| digest.as_str().to_owned()),
+                wire_evidence_ref.clone(),
+            ),
+            Self::LegacyUnverified { .. } => (None, None),
+        }
+    }
+
+    /// Recovery handle plus the observation boundary the disposition applies
+    /// to: the receipt boundary for minted receipts, the last boundary for
+    /// unknown outcome, and neither for conflict/legacy absence (issue #2902
+    /// items 2 and 8).
+    fn summary_recovery_fields(&self) -> (Option<String>, Option<Value>, Option<Value>) {
+        let recovery_ref = match self {
+            Self::Observed(receipt) | Self::Unobserved(receipt) => receipt.recovery_ref.clone(),
+            Self::UnknownOutcome {
+                reconciliation_ref, ..
+            } => Some(reconciliation_ref.clone()),
+            Self::RejectedConflict { .. } | Self::LegacyUnverified { .. } => None,
+        };
+        let (observation_cursor, observation_sequence) = match self {
+            Self::Observed(receipt) | Self::Unobserved(receipt) => (
+                Some(Value::String(receipt.event_cursor.as_str().to_owned())),
+                Some(Value::from(receipt.event_sequence)),
+            ),
+            Self::UnknownOutcome {
+                last_cursor,
+                last_sequence,
+                ..
+            } => (
+                Some(Value::String(last_cursor.as_str().to_owned())),
+                Some(Value::from(*last_sequence)),
+            ),
+            Self::RejectedConflict { .. } | Self::LegacyUnverified { .. } => (None, None),
+        };
+        (recovery_ref, observation_cursor, observation_sequence)
+    }
+}
+
+/// Canonical state names for one validated receipt (issue #2902 item 12):
+/// the accepted `SCREAMING_SNAKE_CASE` serialization (`MATCHED`/`DIVERGED`/
+/// `UNOBSERVED`, `OBSERVED`/`UNKNOWN_OUTCOME`), never an ad-hoc rendering.
+fn canonical_state_names(
+    receipt: &PhysicalRouteObservationReceipt,
+) -> Result<(String, String), AdmittedAttemptError> {
+    let fail = |error: serde_json::Error| AdmittedAttemptError::DigestFailed(error.to_string());
+    let route_state = serde_json::to_value(receipt.route_state).map_err(fail)?;
+    let execution_outcome = serde_json::to_value(receipt.execution_outcome).map_err(fail)?;
+    match (route_state, execution_outcome) {
+        (Value::String(route_state), Value::String(execution_outcome)) => {
+            Ok((route_state, execution_outcome))
+        }
+        _ => Err(AdmittedAttemptError::DigestFailed(
+            "route state encoding".to_owned(),
+        )),
+    }
+}
+
+/// Per-component evidence provenance for one sealed route disposition (issue
+/// #2902 item 6): exactly one label per [`RouteFingerprint`] field, in
+/// canonical field order, so no observed-route component rides without a
+/// statement of whether it came from wire observation or execution-binding
+/// attestation.
+///
+/// Provider/model are wire-observed exactly when a validated `Observed`
+/// receipt exists (the only channels the live wire corroborates through the
+/// shared [`wire_route_locator`] recipe). Every other behavior-bearing
+/// component (`host_family`, `adapter`, `protocol_transport`, `runtime_hash`,
+/// `adapter_hash`, `auth_billing`, `serializer_hash`, `tool_semantics_hash`,
+/// `reasoning_mode`, `continuation_behavior`, `feature_flags_hash`) is
+/// execution-binding attestation whenever the disposition was derived under
+/// the verified admission — dispatched execution configuration taken from the
+/// exact binding route the adapter launched under, never a
+/// caller-supplied request and never presented as physical observation merely
+/// by equality with requested values. Anything else is unobserved and never
+/// fabricated equal to requested or observed values; a legacy absence
+/// attests nothing at all.
+pub fn observed_component_sources(
+    disposition: &SealedRouteDisposition,
+) -> [(&'static str, &'static str); 13] {
+    // Direct (wire-observed) versus attested (binding) source per
+    // disposition class; legacy absence carries neither.
+    let (direct, attested) = match disposition {
+        SealedRouteDisposition::Observed(_) => (
+            ROUTE_COMPONENT_SOURCE_WIRE_OBSERVED,
+            ROUTE_COMPONENT_SOURCE_BINDING_ATTESTED,
+        ),
+        SealedRouteDisposition::Unobserved(_)
+        | SealedRouteDisposition::RejectedConflict { .. }
+        | SealedRouteDisposition::UnknownOutcome { .. } => (
+            ROUTE_COMPONENT_SOURCE_UNOBSERVED,
+            ROUTE_COMPONENT_SOURCE_BINDING_ATTESTED,
+        ),
+        SealedRouteDisposition::LegacyUnverified { .. } => (
+            ROUTE_COMPONENT_SOURCE_UNOBSERVED,
+            ROUTE_COMPONENT_SOURCE_UNOBSERVED,
+        ),
+    };
+    [
+        ("host_family", attested),
+        ("adapter", attested),
+        ("protocol_transport", attested),
+        ("runtime_hash", attested),
+        ("adapter_hash", attested),
+        ("provider", direct),
+        ("model", direct),
+        ("auth_billing", attested),
+        ("serializer_hash", attested),
+        ("tool_semantics_hash", attested),
+        ("reasoning_mode", attested),
+        ("continuation_behavior", attested),
+        ("feature_flags_hash", attested),
+    ]
+}
+
+/// Bounded public cause code for one canonical conversion failure (issue
+/// #2902 items 2 and 12). Wire-shape failures name their exact wire variant;
+/// linkage/shape failures name only the bounded `contract` kind and
+/// serialization/input failures their bounded kind. No raw material is
+/// embedded; the exact typed cause travels on the disposition itself.
+pub fn conversion_cause_code(error: &OpenCodeObservationConversionError) -> &'static str {
+    match error {
+        OpenCodeObservationConversionError::Wire(wire) => match wire {
+            OpenCodeWireRouteError::InvalidRequestedModel(_) => "wire:invalid-requested-model",
+            OpenCodeWireRouteError::InvalidObservedModel(_) => "wire:invalid-observed-model",
+            OpenCodeWireRouteError::ObservedIdentityMissing => "wire:observed-identity-missing",
+            OpenCodeWireRouteError::ObservedProviderMissing => "wire:observed-provider-missing",
+            OpenCodeWireRouteError::ObservedProviderMismatch => "wire:observed-provider-mismatch",
+            OpenCodeWireRouteError::ObservedEndpointMissing => "wire:observed-endpoint-missing",
+            OpenCodeWireRouteError::ObservedEndpointNotLoopback => {
+                "wire:observed-endpoint-not-loopback"
+            }
+            OpenCodeWireRouteError::ObservedRouteFingerprintMissing => {
+                "wire:observed-route-fingerprint-missing"
+            }
+            OpenCodeWireRouteError::ObservedRouteFingerprintMalformed => {
+                "wire:observed-route-fingerprint-malformed"
+            }
+            OpenCodeWireRouteError::ObservedSessionIdentityMissing => {
+                "wire:observed-session-identity-missing"
+            }
+            OpenCodeWireRouteError::ObservedDirectoryMissing => "wire:observed-directory-missing",
+            OpenCodeWireRouteError::ObservedDirectoryNotAbsolute => {
+                "wire:observed-directory-not-absolute"
+            }
+            OpenCodeWireRouteError::ObservedServerVersionMissing => {
+                "wire:observed-server-version-missing"
+            }
+            OpenCodeWireRouteError::ObservedWorkspaceIdentityBlank => {
+                "wire:observed-workspace-identity-blank"
+            }
+            OpenCodeWireRouteError::UnavailableHasIdentity => "wire:unavailable-has-identity",
+        },
+        OpenCodeObservationConversionError::Contract(_) => "contract",
+        OpenCodeObservationConversionError::Serialization(_) => "serialization",
+        OpenCodeObservationConversionError::InvalidInput(_) => "invalid-input",
+    }
+}
+
+/// Retained wire-evidence linkage for one wire route receipt (issue #2902
+/// items 2 and 12): the canonical-bytes digest plus its immutable reference.
+/// Digests only — raw provider/session/path bytes never enter the public
+/// disposition. `None` exactly when even the evidence bytes cannot be
+/// canonically encoded (a serialization failure retains the typed cause, not
+/// a fabricated digest).
+pub fn wire_receipt_evidence(
+    wire: &OpenCodeWireRouteReceipt,
+) -> (Option<LowercaseSha256>, Option<String>) {
+    let Ok(bytes) = canonical_json_bytes(wire) else {
+        return (None, None);
+    };
+    let digest: LowercaseSha256 = match serde_json::from_value(Value::String(sha256_hex(&bytes))) {
+        Ok(digest) => digest,
+        Err(_) => return (None, None),
+    };
+    let reference = format!("opencode-wire-route:{}", digest.as_str());
+    (Some(digest), Some(reference))
 }
 
 /// Sealed candidate-only outcome of one admitted read-only attempt.

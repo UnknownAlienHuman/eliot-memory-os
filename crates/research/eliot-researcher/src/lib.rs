@@ -24,7 +24,9 @@ use eliot_research_exchange_api::{
 // population the account learns, the owner-bound absence preconditions and the
 // verdict they produce. Referenced, never redefined here.
 pub use evidence_portfolio::{
-    AbsencePreconditions, AbsenceVerdict, ManifestSource, NoMatchEvaluation, ObservedOutsideScope,
+    AbsencePreconditions, AbsenceVerdict, ManifestSource, MemberNoMatchResult,
+    NoMatchApplicability, NoMatchDimension, NoMatchEvaluation, NoMatchEvaluationParams,
+    ObservedOutsideScope,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
@@ -38,8 +40,8 @@ pub use inquiry_governance::{
     InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
     InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty, MissingSourceClass,
     PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind,
-    SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
-    UnadmittedReferenceKind, VerifierStrength,
+    ResearchDebtRestriction, SourcePortfolio, SpecialistDiscoverability, StopRuleKind,
+    StreamEvidence, UnadmittedReference, UnadmittedReferenceKind, VerifierStrength,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
@@ -54,6 +56,11 @@ pub use inquiry_lanes::{
     OwnerOrderingReceiptParams, PartitionAssignment, PartitionSide, PrimaryOutcomeRule,
     RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
 };
+// The committed registration a profile revision is given. It is a read-only
+// value here: the only way to obtain one is this crate's own profile-resolution
+// path, which is what keeps a caller from declaring a confirmatory lane by
+// supplying a digest.
+pub use inquiry_lanes::CommittedLaneRegistration;
 pub use inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationStatus,
     TaskGraphCompilationInputs,

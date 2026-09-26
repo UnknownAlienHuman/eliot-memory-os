@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use eliot_types::{
     CognitiveProjectionReadState, L0CollapsedDuplicateTrace, L0FeatureScore, L0RankTrace,
     L0SuppressionTrace, MemoryConfidence, MemoryHandlePreview, MemoryRevision, ProjectSequence,
-    RecallL0Request, RecallL0Response, TruncationInfo,
+    RecallConflictObservation, RecallL0Request, RecallL0Response, TruncationInfo,
 };
 
 use super::{MAX_RECALL_RESULTS, RecallCandidateLoad, RecallCandidateRow};
@@ -55,6 +55,22 @@ pub(super) fn rank_recall_candidates(
     let (capacity_segments, ordinary): (Vec<_>, Vec<_>) = filtered
         .into_iter()
         .partition(|(row, _)| row.record_type == "memory_blob_segment");
+    // I7.17 (#1940): project the real per-record `contradiction_signal` out of
+    // this ranking boundary as a corpus-level conflict observation. The count
+    // covers exactly the candidates this ranking weighs — after lifecycle and
+    // scope policy, and before duplicate collapse and retrieval admission — so a
+    // contradiction on a candidate that was never admitted still reaches the
+    // response owner. `contradiction_penalty` alone cannot carry that: it only
+    // reaches the response for candidates that survived admission, which is why
+    // the conflict fact was previously lost for every non-admitted candidate.
+    // Candidates removed by lifecycle or scope policy are outside the weighed
+    // set and therefore outside this count; that is deliberate, because a
+    // candidate the caller may not see must not decide the caller's disposition.
+    let signalled_candidates = ordinary
+        .iter()
+        .chain(capacity_segments.iter())
+        .filter(|(row, _)| row.contradiction_signal)
+        .count();
     let (collapsed, mut collapsed_duplicates) = collapse_recall_candidates(ordinary);
     let mut admitted = collapsed
         .into_iter()
@@ -136,6 +152,10 @@ pub(super) fn rank_recall_candidates(
             collapsed_duplicates,
             no_useful_memory: candidates_returned == 0,
             query_mode,
+        },
+        conflict: RecallConflictObservation {
+            observed: true,
+            signalled_candidates: u32::try_from(signalled_candidates).unwrap_or(u32::MAX),
         },
         truncation: TruncationInfo {
             truncated: load.truncated || admitted_count > MAX_RECALL_RESULTS,

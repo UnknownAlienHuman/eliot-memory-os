@@ -121,10 +121,10 @@ use eliot_contracts::{
     StateFence, TaskId, contract_identity as make_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalReadClient, ExperienceRangePage, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
-    StoreError, activated_read_operations, declared_read_parameters, named_read_operation_name,
-    parameter_schema_digest, project_parameter_schema,
+    AutomationContinuationFailure, CanonicalReadClient, ExperienceRangePage, NamedReadOperation,
+    NamedReadRequest, NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey,
+    ScopeId, StoreError, activated_read_operations, declared_read_parameters,
+    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1193,12 +1193,16 @@ pub enum ReadError {
     Outcome(ReadOutcome),
     /// Store boundary rejected the named read, with its exact typed identity.
     ///
-    /// Every [`StoreError`] discriminant maps to exactly one variant below, so
+    /// Every [`StoreError`] discriminant maps to explicit variants below, so
     /// stale, conflicted, missing, unknown, partial, and unavailable outcomes
     /// stay distinguishable and can never collapse into a successful
     /// empty/current result. The mapping in `From<StoreError>` is exhaustive:
     /// a future store variant fails compilation here until it is assigned an
-    /// explicit disposition, never silently erased.
+    /// explicit disposition, never silently erased. The
+    /// [`StoreError::AutomationContinuation`] discriminant keeps one variant per
+    /// [`AutomationContinuationFailure`] member, so a legacy migration, an
+    /// invalid reference, a stale snapshot, an expiry and capacity pressure
+    /// each stay a different read outcome.
     #[error("store read: {0}")]
     Store(StoreReadFailure),
 }
@@ -1208,8 +1212,11 @@ pub enum ReadError {
 /// This mirrors every [`StoreError`] discriminant in store-neutral Governor
 /// vocabulary. Static store details (`field`/`reason`) become bounded owned
 /// strings; transitions digests keep their expected/observed pair; contract
-/// inner errors keep their exact display text. No variant carries provider
-/// secrets or raw query text.
+/// inner errors keep their exact display text. The user-automation
+/// continuation family is carried as five explicit variants rather than one
+/// opaque payload, because the five [`AutomationContinuationFailure`] members
+/// authorize different next actions and none of them may be reported as
+/// another. No variant carries provider secrets or raw query text.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoreReadFailure {
@@ -1250,6 +1257,20 @@ pub enum StoreReadFailure {
     RevisionConflict,
     /// An ordering conflict was observed.
     OrderingConflict,
+    /// A legacy unauthenticated user-automation continuation was presented; the
+    /// caller must read a fresh first page instead of resuming it.
+    AutomationContinuationLegacyRefresh,
+    /// The presented user-automation continuation reference or its retained
+    /// owner record is malformed, unknown or bound to another request.
+    AutomationContinuationInvalidOrUnknown,
+    /// The user-automation continuation snapshot or admission fence advanced;
+    /// never reinterpreted against current rows.
+    AutomationContinuationStaleSnapshot,
+    /// The retained user-automation continuation record has expired.
+    AutomationContinuationExpired,
+    /// The owner cannot retain another bounded user-automation continuation
+    /// record; the source is not complete.
+    AutomationContinuationCapacityPressure,
     /// The projection publication is invalid.
     InvalidProjection,
     /// The outbox intent is invalid.
@@ -1298,6 +1319,21 @@ impl std::fmt::Display for StoreReadFailure {
             Self::FenceMismatch => formatter.write_str("state fence mismatch"),
             Self::RevisionConflict => formatter.write_str("revision conflict"),
             Self::OrderingConflict => formatter.write_str("ordering conflict"),
+            Self::AutomationContinuationLegacyRefresh => {
+                formatter.write_str("user-automation continuation requires a first-page refresh")
+            }
+            Self::AutomationContinuationInvalidOrUnknown => {
+                formatter.write_str("user-automation continuation is invalid or unknown")
+            }
+            Self::AutomationContinuationStaleSnapshot => {
+                formatter.write_str("user-automation continuation snapshot is stale")
+            }
+            Self::AutomationContinuationExpired => {
+                formatter.write_str("user-automation continuation has expired")
+            }
+            Self::AutomationContinuationCapacityPressure => {
+                formatter.write_str("user-automation continuation retention capacity is exhausted")
+            }
             Self::InvalidProjection => formatter.write_str("invalid projection publication"),
             Self::InvalidOutbox => formatter.write_str("invalid outbox intent"),
             Self::InvalidReceipt => formatter.write_str("invalid terminal receipt"),
@@ -1339,6 +1375,21 @@ impl From<StoreError> for StoreReadFailure {
             StoreError::FenceMismatch => Self::FenceMismatch,
             StoreError::RevisionConflict => Self::RevisionConflict,
             StoreError::OrderingConflict => Self::OrderingConflict,
+            StoreError::AutomationContinuation(failure) => match failure {
+                AutomationContinuationFailure::LegacyRefresh => {
+                    Self::AutomationContinuationLegacyRefresh
+                }
+                AutomationContinuationFailure::InvalidOrUnknown => {
+                    Self::AutomationContinuationInvalidOrUnknown
+                }
+                AutomationContinuationFailure::StaleSnapshot => {
+                    Self::AutomationContinuationStaleSnapshot
+                }
+                AutomationContinuationFailure::Expired => Self::AutomationContinuationExpired,
+                AutomationContinuationFailure::CapacityPressure => {
+                    Self::AutomationContinuationCapacityPressure
+                }
+            },
             StoreError::InvalidProjection => Self::InvalidProjection,
             StoreError::InvalidOutbox => Self::InvalidOutbox,
             StoreError::InvalidReceipt => Self::InvalidReceipt,

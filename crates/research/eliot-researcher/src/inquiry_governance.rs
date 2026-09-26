@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::StateFence;
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass,
-    ResearchContractError, SourceClass,
+    LocatorClass, ResearchContractError, SourceClass, classify_locator,
 };
 
 use crate::evidence_portfolio::{
@@ -46,6 +46,12 @@ use crate::evidence_portfolio::{
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
     check_precision, digest, freeze, grade_name, grade_rank, push_count, push_field, reject_vague,
     text,
+};
+use crate::inquiry_lanes::{
+    CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
+    INQUIRY_LANES_CONTRACT, LaneRegistration, LaneRegistrationError, LaneRegistrationParams,
+    OrderedSubjectKind, OwnerOrderingReceipt, OwnerOrderingReceiptParams, PrimaryOutcomeRule,
+    RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
 };
 use crate::inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationParams, InquiryObligationStatus,
@@ -58,7 +64,33 @@ use crate::source_admissibility::{
 /// Stable identity of this domain surface.
 pub const INQUIRY_GOVERNANCE_CONTRACT: &str = "eliot.research.inquiry-governance";
 /// Current revision of this domain surface.
-pub const INQUIRY_GOVERNANCE_VERSION: &str = "1.0.0";
+///
+/// #2894: `1.0.0` -> `2.0.0`. The untrusted-reference diagnostic changed
+/// incompatibly: `UnadmittedReferenceKind` gained
+/// `INTERNAL_OWNED_REFERENCE` and `AMBIGUOUS_REFERENCE`, the kind of every
+/// unadmitted reference is now read from
+/// `eliot_research_exchange_api::classify_locator` instead of a `://` substring
+/// test, and every reason now names the lever that can actually change the
+/// verdict on this path. Both the `kind` and the `reason` are inside
+/// `UnadmittedReference::compute_digest`, so every retained diagnostic has a
+/// different digest than it did under `absolute-locator/1`.
+///
+/// **What this constant does not do, stated plainly:** it is in no digest
+/// preimage. It appears only in the `Display` impl below. The invalidation above
+/// is real but rests entirely on the five reason strings having changed text, not
+/// on this constant. Two consequences a reader must not assume away:
+///
+/// - a future classifier change that produced the *same* `(kind, reason)` pair for
+///   a handle would not move any digest, so bumping this constant alone would
+///   invalidate nothing;
+/// - `UnadmittedReference::observe` is `pub`, so a caller can construct a
+///   diagnostic carrying a pre-bump `(kind, reason)` pair and
+///   `validate_integrity` will accept it, because that method re-proves the digest
+///   against the pair it was handed rather than against a version.
+///
+/// So the honest statement is: a diagnostic *this path* produced before the bump
+/// cannot re-present as one produced after it, and nothing stronger is claimed.
+pub const INQUIRY_GOVERNANCE_VERSION: &str = "2.0.0";
 
 /// Typed inquiry-governance failure. Every variant names the failing concept or
 /// field path only; no supplied value is ever echoed back.
@@ -121,13 +153,58 @@ pub enum InquiryError {
         /// Failing field path.
         field: &'static str,
     },
+    /// A terminal disposition is one an open research debt restricts (I21.12).
+    ///
+    /// The debt is already registered and its restriction already derived, so
+    /// binding the disposition anyway would publish a claim the same record
+    /// proves is blocked. A debt that is resolved, or one whose claim class
+    /// this disposition does not name, does not raise this error.
+    ///
+    /// MEASURED REACHABILITY, stated so this is not mistaken for live
+    /// enforcement: on the `InquiryGovernance::record` path this error CANNOT
+    /// fire today, and the reason is structural rather than accidental. The
+    /// only disposition `terminal_disposition` can return that any debt
+    /// refuses is `ANSWERED_WITH_SUPPORTED_RESULT`, and reaching it requires
+    /// `outcome == Completed` with an intact denominator. A completed run
+    /// contributes no `provider_degradation` (so no `Verification` debt) and
+    /// leaves no open member (so no `Coverage` debt); `Replication` and
+    /// `Provenance` refuse no disposition, and `Contradiction` is never
+    /// registered. The guard is kept because it is the correct invariant and
+    /// because `bind` is public: a caller that binds a record directly can
+    /// reach it today. It is a bound, not a fired, check.
+    DebtRestrictedDisposition {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// A confirmatory lane was declared without a frozen registration.
     LaneRegistrationRequired {
         /// Failing field path.
         field: &'static str,
     },
+    /// The confirmatory-lane registration discipline refused the material.
+    ///
+    /// I21.4's registration, its owner commit receipt and its exposure ordering
+    /// are owned by [`crate::inquiry_lanes`]. This domain keeps its own closed
+    /// vocabulary, so a lane refusal is carried here as the failing field path
+    /// the lane owner named; the two refusals that carry a foreign typed error
+    /// are converted to that domain's own error instead.
+    LaneRegistrationRefused {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// The recomputed digest of a record does not match its own content.
     IntegrityMismatch {
+        /// Failing field path.
+        field: &'static str,
+    },
+    /// A record has no canonical encoding, so it has no decision identity.
+    ///
+    /// Refused rather than defaulted: a digest computed over a silently
+    /// shortened preimage would look like provenance while covering fewer bytes
+    /// than the record it claims to identify. The spelling matches
+    /// [`PortfolioError::Unencodable`], which is the same refusal on the
+    /// acquisition side of this domain.
+    Unencodable {
         /// Failing field path.
         field: &'static str,
     },
@@ -185,13 +262,27 @@ impl std::fmt::Display for InquiryError {
                     "{field} cannot close without a complete-scope denominator"
                 )
             }
+            Self::DebtRestrictedDisposition { field } => write!(
+                formatter,
+                "{field} is restricted by an open research debt (I21.12)"
+            ),
             Self::LaneRegistrationRequired { field } => {
                 write!(formatter, "{field} requires a frozen lane registration")
             }
+            Self::LaneRegistrationRefused { field } => write!(
+                formatter,
+                "{field} was refused by the confirmatory lane registration discipline"
+            ),
             Self::IntegrityMismatch { field } => {
                 write!(
                     formatter,
                     "{field} does not match its own recomputed digest"
+                )
+            }
+            Self::Unencodable { field } => {
+                write!(
+                    formatter,
+                    "{field} cannot be encoded into its canonical preimage"
                 )
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
@@ -213,6 +304,24 @@ impl From<PortfolioError> for InquiryError {
 impl From<ResearchContractError> for InquiryError {
     fn from(error: ResearchContractError) -> Self {
         Self::Contract(error)
+    }
+}
+
+impl From<LaneRegistrationError> for InquiryError {
+    /// Converts one lane-discipline refusal into this domain's closed
+    /// vocabulary.
+    ///
+    /// The two lane variants that carry a foreign typed error convert to that
+    /// domain's own error, which is lossless; every other lane variant names
+    /// only a field path, and that path is what this domain keeps.
+    fn from(error: LaneRegistrationError) -> Self {
+        match error {
+            LaneRegistrationError::Portfolio(error) => Self::Portfolio(error),
+            LaneRegistrationError::Profile(error) => error,
+            error => Self::LaneRegistrationRefused {
+                field: error.field().unwrap_or("lane_registration"),
+            },
+        }
     }
 }
 
@@ -760,12 +869,17 @@ pub struct IndependenceBlindingPolicy {
 impl IndependenceBlindingPolicy {
     /// Resolves and freezes the policy for one grade and lane.
     ///
+    /// `committed_registration` is a [`CommittedLaneRegistration`], never a
+    /// digest: it is re-proved here, so a string a caller composed cannot
+    /// declare a confirmatory lane.
+    ///
     /// # Errors
     ///
     /// Returns [`InquiryError::GradeCeiling`] when a grade below
     /// `CORROBORATED` declares a non-zero independence requirement it cannot
     /// carry, [`InquiryError::LaneRegistrationRequired`] when a confirmatory
-    /// lane has no frozen registration, and a field error for blank or
+    /// lane has no committed registration, a lane-discipline refusal when the
+    /// presented registration does not re-prove, and a field error for blank or
     /// malformed input.
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
@@ -776,7 +890,7 @@ impl IndependenceBlindingPolicy {
         blinded_fields: Vec<BlindedField>,
         shared_assumptions: Vec<String>,
         allowed_deviations: Vec<String>,
-        lane_registration_digest: Option<String>,
+        committed_registration: Option<&CommittedLaneRegistration>,
     ) -> Result<Self, InquiryError> {
         let corroborated_rank = EvidenceGrade::from_name("CORROBORATED")?.rank();
         if grade.rank() < corroborated_rank && minimum_independent_families > 0 {
@@ -784,12 +898,22 @@ impl IndependenceBlindingPolicy {
                 field: "profile.independence_policy.minimum_independent_families",
             });
         }
-        let registered_before_outcome_exposure = lane_registration_digest.is_some();
+        // The flag is a declaration, not the ordering proof: what it now says is
+        // that an owner-committed registration exists and re-proves itself here,
+        // not that any caller asserted an order. A confirmatory lane without one
+        // is still refused, and the actual order proof stays
+        // `crate::inquiry_lanes::LaneRegistration::require_commit_precedes`.
+        if let Some(registration) = committed_registration {
+            registration.validate_integrity()?;
+        }
+        let registered_before_outcome_exposure = committed_registration.is_some();
         if lane == InquiryLane::Confirmatory && !registered_before_outcome_exposure {
             return Err(InquiryError::LaneRegistrationRequired {
                 field: "profile.independence_policy.lane_registration_digest",
             });
         }
+        let lane_registration_digest =
+            committed_registration.map(|registration| registration.digest().to_owned());
         if let Some(registration) = &lane_registration_digest {
             require_digest(registration, "profile.lane_registration_digest")?;
         }
@@ -1310,8 +1434,14 @@ pub struct InquiryProfileParams {
     pub stop_rule: InquiryStopRule,
     /// State Fence this revision is frozen under.
     pub state_fence: StateFence,
-    /// Optional frozen lane registration digest.
-    pub lane_registration_digest: Option<String>,
+    /// Owner-committed lane registration this revision carries.
+    ///
+    /// A confirmatory lane requires one and an exploratory lane must carry none.
+    /// The value is a registration, not a digest: it is re-proved on
+    /// construction, so no caller can declare a confirmatory lane by supplying
+    /// 64 hex characters. `None` here is the honest "no registration was
+    /// committed", which the confirmatory arm below refuses.
+    pub committed_lane_registration: Option<CommittedLaneRegistration>,
 }
 
 /// Versioned inquiry protocol profile (I21.2/I21.3).
@@ -1374,6 +1504,20 @@ pub struct InquiryProtocolProfile {
     pub independence_and_blinding_policy: IndependenceBlindingPolicy,
     /// Digest of the independence and blinding policy.
     pub independence_and_blinding_policy_digest: String,
+    /// Digest a lane registration commits to, covering every field of this
+    /// revision except the one that names the registration.
+    ///
+    /// `integrity_digest` cannot serve that purpose: it covers the independence
+    /// and blinding policy, that policy's digest covers the committed
+    /// registration identity, and a registration that names
+    /// `integrity_digest` would have to be committed before the profile that
+    /// contains the digest of that commit. I21.4 needs the registration to name
+    /// the exact revision and I21.3 needs the profile to carry the committed
+    /// identity, so this second digest is what makes both true at once. It is
+    /// resolved from the same admitted material as `integrity_digest`, by the
+    /// same function the registration producer calls, so it is never a second
+    /// guess at the selection.
+    pub registration_binding_digest: String,
     /// Fidelity ceiling declared for this inquiry.
     pub fidelity_ceiling: String,
     /// Budget, deadline and stop rule.
@@ -1390,6 +1534,183 @@ pub struct InquiryProtocolProfile {
     pub integrity_digest: String,
 }
 
+/// The half of one profile revision that does not depend on the committed lane
+/// registration.
+///
+/// I21.4 requires the registration to name the exact profile revision it
+/// governs, and I21.3 requires the profile to carry the registration's committed
+/// identity, so one of those two facts has to be resolvable before the other
+/// exists. Holding the selection separately means
+/// [`InquiryProtocolProfile::select`] and the registration producer resolve the
+/// same selection through the same code, and the registration binding digest
+/// they agree on is not a second guess at it.
+struct ProfileSelection {
+    /// Resolved protocol.
+    protocol: InquiryProtocol,
+    /// Resolved coverage goal.
+    coverage_goal: CoverageGoal,
+    /// Whether the admitted coverage-goal text is exactly this resolved goal.
+    admitted_coverage_goal_resolved: bool,
+    /// Declared hypothesis policy.
+    hypothesis_policy: HypothesisPolicy,
+    /// Selected evidence grade.
+    evidence_grade: EvidenceGrade,
+    /// Declared lane.
+    lane: InquiryLane,
+    /// Dimensions independence is required on.
+    dimensions: Vec<IndependenceDimension>,
+    /// Minimum number of independent lineages the evidence set must reach.
+    minimum_independent_families: u64,
+    /// Digest of the structural selection inputs.
+    selection_features_digest: String,
+    /// Fidelity ceiling declared for this inquiry.
+    fidelity_ceiling: String,
+    /// Budget, deadline and stop rule.
+    stop_rule: InquiryStopRule,
+    /// Output contract and declared reopen conditions.
+    output_contract: InquiryOutputContract,
+    /// Privacy and disclosure ceiling for the whole inquiry.
+    disclosure_ceiling: DisclosureClass,
+}
+
+/// Digest a lane registration commits to for one profile revision.
+///
+/// This covers every field of the revision except the committed lane
+/// registration itself, and it is resolved from the admitted material through
+/// the same values [`InquiryProtocolProfile::build`] freezes into the revision.
+/// It is not a weaker identity than
+/// [`InquiryProtocolProfile::integrity_digest`] for the purpose I21.4 states:
+/// it names the same revision, and it is the only one of the two a
+/// registration can name without a SHA-256 fixed point (see
+/// [`InquiryProtocolProfile::registration_binding_digest`]).
+fn registration_binding_digest(
+    params: &InquiryProfileParams,
+    revision: u64,
+    supersedes: Option<&str>,
+    selection: &ProfileSelection,
+) -> String {
+    let mut preimage = String::from("inquiry-profile-registration-binding/v1;");
+    push_field(&mut preimage, "profile_id", &params.profile_id);
+    push_field(&mut preimage, "revision", &revision.to_string());
+    push_field(&mut preimage, "supersedes", supersedes.unwrap_or("none"));
+    push_field(&mut preimage, "inquiry_id", &params.inquiry_id);
+    push_field(&mut preimage, "operation_id", &params.operation_id);
+    push_field(&mut preimage, "exchange_id", &params.exchange_id);
+    push_field(&mut preimage, "question", &params.question);
+    push_field(
+        &mut preimage,
+        "intended_decision_or_artifact",
+        &params.intended_decision_or_artifact,
+    );
+    push_field(&mut preimage, "scope", &params.scope);
+    push_field(
+        &mut preimage,
+        "requester_principal",
+        &params.requester_principal,
+    );
+    push_field(
+        &mut preimage,
+        "admitted_inquiry_digest",
+        &params.admitted_inquiry_digest,
+    );
+    push_field(&mut preimage, "protocol", selection.protocol.wire_name());
+    push_field(
+        &mut preimage,
+        "selection_features_digest",
+        &selection.selection_features_digest,
+    );
+    push_field(
+        &mut preimage,
+        "evidence_grade",
+        &selection.evidence_grade.to_string(),
+    );
+    push_field(&mut preimage, "lane", selection.lane.wire_name());
+    push_field(
+        &mut preimage,
+        "coverage_goal",
+        selection.coverage_goal.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "admitted_coverage_goal",
+        &params.admitted_coverage_goal,
+    );
+    push_field(
+        &mut preimage,
+        "admitted_coverage_goal_resolved",
+        bool_text(selection.admitted_coverage_goal_resolved),
+    );
+    push_field(
+        &mut preimage,
+        "hypothesis_policy",
+        selection.hypothesis_policy.wire_name(),
+    );
+    push_binding_admission(&mut preimage, params);
+    push_binding_independence(&mut preimage, selection);
+    freeze(&preimage)
+}
+
+/// Appends the admitted material half of a registration binding: what the run
+/// was admitted under, and the contracts the revision is bound to.
+fn push_binding_admission(preimage: &mut String, params: &InquiryProfileParams) {
+    push_count(
+        preimage,
+        "truth_surfaces",
+        params.truth_surfaces_and_admissible_providers.len(),
+    );
+    for surface in &params.truth_surfaces_and_admissible_providers {
+        push_field(preimage, "truth_surface", surface);
+    }
+    push_count(
+        preimage,
+        "admissible_source_classes",
+        params.admissible_source_classes.len(),
+    );
+    for class in &params.admissible_source_classes {
+        push_field(preimage, "source_class", class_wire(*class));
+    }
+    push_field(
+        preimage,
+        "reference_manifest_digest",
+        &params.reference_manifest_digest,
+    );
+    push_field(
+        preimage,
+        "admitted_denominator_digest",
+        &params.admitted_denominator_digest,
+    );
+}
+
+/// Appends the independence, fidelity and contract half of a registration
+/// binding.
+fn push_binding_independence(preimage: &mut String, selection: &ProfileSelection) {
+    push_count(
+        preimage,
+        "independence_dimensions",
+        selection.dimensions.len(),
+    );
+    for dimension in &selection.dimensions {
+        push_field(preimage, "independence_dimension", dimension.wire_name());
+    }
+    push_field(
+        preimage,
+        "minimum_independent_families",
+        &selection.minimum_independent_families.to_string(),
+    );
+    push_field(preimage, "fidelity_ceiling", &selection.fidelity_ceiling);
+    push_field(preimage, "stop_rule_digest", &selection.stop_rule.digest);
+    push_field(
+        preimage,
+        "output_contract_digest",
+        &selection.output_contract.digest,
+    );
+    push_field(
+        preimage,
+        "disclosure_ceiling",
+        disclosure_wire(selection.disclosure_ceiling),
+    );
+}
+
 impl InquiryProtocolProfile {
     /// Resolves the first revision of one inquiry profile.
     ///
@@ -1400,7 +1721,14 @@ impl InquiryProtocolProfile {
     /// ladder, and [`InquiryError::LaneRegistrationRequired`] when a
     /// confirmatory lane has no frozen registration.
     pub fn resolve(params: InquiryProfileParams) -> Result<Self, InquiryError> {
-        Self::build(params, 1, None, "initial inquiry protocol resolution")
+        let selection = Self::select(&params)?;
+        Self::build(
+            params,
+            selection,
+            1,
+            None,
+            "initial inquiry protocol resolution",
+        )
     }
 
     /// Resolves the next revision of this profile with a recorded reason.
@@ -1424,7 +1752,14 @@ impl InquiryProtocolProfile {
             .ok_or(InquiryError::Duplicate {
                 field: "profile.revision",
             })?;
-        let mut revision = Self::build(params, next, Some(self.integrity_digest.clone()), reason)?;
+        let selection = Self::select(&params)?;
+        let mut revision = Self::build(
+            params,
+            selection,
+            next,
+            Some(self.integrity_digest.clone()),
+            reason,
+        )?;
         if revision.inquiry_id != self.inquiry_id
             || revision.profile_id != self.profile_id
             || revision.question != self.question
@@ -1486,14 +1821,15 @@ impl InquiryProtocolProfile {
         }
     }
 
-    fn build(
-        params: InquiryProfileParams,
-        revision: u64,
-        supersedes: Option<String>,
-        change_reason: &str,
-    ) -> Result<Self, InquiryError> {
-        validate_profile_params(&params, change_reason)?;
-
+    /// Resolves the selection half of one profile revision from admitted
+    /// material.
+    ///
+    /// This is separated from [`InquiryProtocolProfile::build`] because I21.4
+    /// needs the lane registration to name the profile revision before that
+    /// revision is frozen. The registration producer and the profile therefore
+    /// resolve the *same* selection through the *same* function, so the binding
+    /// digest they agree on cannot drift from the selection the profile carries.
+    fn select(params: &InquiryProfileParams) -> Result<ProfileSelection, InquiryError> {
         let protocol = select_protocol(&params.features);
         let coverage_goal = select_coverage_goal(&params.features);
         let lane = select_lane(protocol, &params.features);
@@ -1501,27 +1837,54 @@ impl InquiryProtocolProfile {
         let evidence_grade = select_evidence_grade(&params.features, lane)?;
         let (dimensions, minimum_independent_families) =
             select_independence_requirement(evidence_grade);
-        let independence_and_blinding_policy = IndependenceBlindingPolicy::resolve(
-            evidence_grade,
-            lane,
-            dimensions,
-            minimum_independent_families,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            params.lane_registration_digest.clone(),
-        )?;
         let output_contract = InquiryOutputContract::resolve(
             &params.required_schema,
             select_reopen_conditions(coverage_goal, hypothesis_policy),
         )?;
-        let fidelity_ceiling = format!(
-            "verifier_strength={} horizon={}",
-            params.features.verifier_strength.wire_name(),
-            params.features.horizon.wire_name()
-        );
-        let admitted_coverage_goal_resolved =
-            CoverageGoal::from_wire(&params.admitted_coverage_goal) == Some(coverage_goal);
+        Ok(ProfileSelection {
+            protocol,
+            coverage_goal,
+            admitted_coverage_goal_resolved: CoverageGoal::from_wire(
+                &params.admitted_coverage_goal,
+            ) == Some(coverage_goal),
+            hypothesis_policy,
+            evidence_grade,
+            lane,
+            dimensions,
+            minimum_independent_families,
+            selection_features_digest: selection_features_digest(&params.features),
+            fidelity_ceiling: format!(
+                "verifier_strength={} horizon={}",
+                params.features.verifier_strength.wire_name(),
+                params.features.horizon.wire_name()
+            ),
+            stop_rule: params.stop_rule.clone(),
+            output_contract,
+            disclosure_ceiling: params.disclosure_ceiling,
+        })
+    }
+
+    fn build(
+        params: InquiryProfileParams,
+        selection: ProfileSelection,
+        revision: u64,
+        supersedes: Option<String>,
+        change_reason: &str,
+    ) -> Result<Self, InquiryError> {
+        validate_profile_params(&params, change_reason)?;
+
+        let independence_and_blinding_policy = IndependenceBlindingPolicy::resolve(
+            selection.evidence_grade,
+            selection.lane,
+            selection.dimensions.clone(),
+            selection.minimum_independent_families,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            params.committed_lane_registration.as_ref(),
+        )?;
+        let binding =
+            registration_binding_digest(&params, revision, supersedes.as_deref(), &selection);
         let mut profile = Self {
             profile_id: params.profile_id,
             revision,
@@ -1534,14 +1897,14 @@ impl InquiryProtocolProfile {
             scope: params.scope,
             requester_principal: params.requester_principal,
             admitted_inquiry_digest: params.admitted_inquiry_digest,
-            protocol,
-            selection_features_digest: selection_features_digest(&params.features),
-            evidence_grade,
-            lane,
-            coverage_goal,
-            admitted_coverage_goal_resolved,
+            protocol: selection.protocol,
+            selection_features_digest: selection.selection_features_digest,
+            evidence_grade: selection.evidence_grade,
+            lane: selection.lane,
+            coverage_goal: selection.coverage_goal,
+            admitted_coverage_goal_resolved: selection.admitted_coverage_goal_resolved,
             admitted_coverage_goal: params.admitted_coverage_goal,
-            hypothesis_policy,
+            hypothesis_policy: selection.hypothesis_policy,
             truth_surfaces_and_admissible_providers: params.truth_surfaces_and_admissible_providers,
             admissible_source_classes: params.admissible_source_classes,
             reference_manifest_digest: params.reference_manifest_digest,
@@ -1550,10 +1913,11 @@ impl InquiryProtocolProfile {
                 .digest
                 .clone(),
             independence_and_blinding_policy,
-            fidelity_ceiling,
-            stop_rule: params.stop_rule,
-            output_contract,
-            disclosure_ceiling: params.disclosure_ceiling,
+            registration_binding_digest: binding,
+            fidelity_ceiling: selection.fidelity_ceiling,
+            stop_rule: selection.stop_rule,
+            output_contract: selection.output_contract,
+            disclosure_ceiling: selection.disclosure_ceiling,
             state_fence: params.state_fence,
             change_reason: change_reason.to_owned(),
             integrity_digest: String::new(),
@@ -1651,6 +2015,11 @@ impl InquiryProtocolProfile {
             &mut preimage,
             "independence_and_blinding_policy_digest",
             &self.independence_and_blinding_policy_digest,
+        );
+        push_field(
+            &mut preimage,
+            "registration_binding_digest",
+            &self.registration_binding_digest,
         );
         push_field(&mut preimage, "fidelity_ceiling", &self.fidelity_ceiling);
         push_field(&mut preimage, "stop_rule_digest", &self.stop_rule.digest);
@@ -2149,7 +2518,11 @@ impl CoverageReceipt {
     /// Returns [`InquiryError::IncompleteDenominator`] when the frozen
     /// denominator has no member to account, a field error for a vague
     /// scope or a malformed frozen-scope digest, and the absence-precondition
-    /// error when a bound predicate evaluation names no member.
+    /// error when a bound predicate evaluation names no member or no longer
+    /// re-proves its own identity. This route binds neither a bounded predicate
+    /// evaluation nor an authorized manifest, so the absence verdict it produces
+    /// can never be [`AbsenceVerdict::Proven`] and the receipt stays
+    /// fail-closed.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         profile: &InquiryProtocolProfile,
@@ -2185,12 +2558,17 @@ impl CoverageReceipt {
         // This plane records per-source acquisition dispositions, not per-member
         // query predicate results, and it holds no authoritative enumeration
         // attestation for the route. It therefore binds no bounded predicate
-        // evaluation here, and the absence assessment names the accounting facts
-        // that block the negative as its reason instead of resting on a
-        // caller-supplied flag.
+        // evaluation and no `AuthorizedManifest` here, and the absence assessment
+        // names the accounting facts that block the negative as its reason
+        // instead of resting on a caller-supplied flag. Both arguments are the
+        // fail-closed answer, not a placeholder: `AbsencePreconditions::derive`
+        // admits an owner-issued `NoMatchEvaluation` only when the live route
+        // supplies one, and #2893 forbids fabricating one here to complete the
+        // receipt.
         let absence_preconditions = AbsencePreconditions::derive(
             account,
             &vetted_records(records),
+            None,
             assessment_time_ms,
             frozen_scope_digest,
             None,
@@ -2241,7 +2619,23 @@ impl CoverageReceipt {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("coverage-receipt/v1;");
+        // Bumped `v1` -> `v2` by #2893, and the reason is that this preimage does
+        // not bind an identity, it binds a *reason string verbatim* (see the
+        // `absence_reason` push below). #2893 changed two of those strings and the
+        // population that reaches them, so for the same run this digest now
+        // produces a different value under one name — the exact defect the
+        // declared-domain rule exists to prevent. The preimage field set did not
+        // change; what changed is the value space of a field that was already
+        // there, which is the same reason `source-record/v1` -> `v2` was recorded.
+        //
+        // Transitively, `evidence-freeze/v1` and `inquiry-terminal-record/v1` bind
+        // this digest and therefore produce different values for the same run.
+        // Their own field sets and domains are unchanged and are deliberately not
+        // bumped: a domain names the shape of the record being hashed, and a
+        // changed value in a field they already declared is exactly the dependency
+        // behaving as declared, not a new shape. `research-debt/v1` is unaffected
+        // because its preimage never named the receipt digest.
+        let mut preimage = String::from("coverage-receipt/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
         push_field(&mut preimage, "requested_scope", &self.requested_scope);
@@ -2696,6 +3090,50 @@ impl ResearchDebtKind {
             Self::Authority => "the final decision",
         }
     }
+
+    /// Whether an open debt of this kind refuses this terminal disposition.
+    ///
+    /// The I21.12 table names a claim class, not a disposition, so the claim
+    /// class is mapped onto the canonical closed
+    /// [`CompletionDisposition`] vocabulary here and nowhere else. Only the
+    /// two closing dispositions can be refused: `ANSWERED_WITH_SUPPORTED_RESULT`
+    /// is a strong claim, a release and a unified conclusion at once, and
+    /// `NO_MATCH_IN_COMPLETE_SCOPE` is a completeness claim. The remaining
+    /// kinds do not name a disposition — replication, fidelity and provenance
+    /// constrain what a release may GENERALIZE, how CONFIDENT it may be and
+    /// whether it may be AUDITED, which is carried by the narrower claim
+    /// instead of by a disposition the I21.9 vocabulary has no word for.
+    /// Refusing more would turn an honest narrow outcome into a refusal, and
+    /// I21.12 keeps unrelated independently supported claims free to proceed.
+    ///
+    /// The published [`blocks`](Self::blocks) text is the I21.12 claim-class
+    /// LABEL, verbatim from the table; this function is that label's projection
+    /// onto dispositions, and the two are not the same granularity. `Coverage`
+    /// reads "completeness" and refuses both closing dispositions, because a
+    /// supported result inside an incomplete scope asserts completeness just as
+    /// much as a scoped absence does. `Verification` reads "release" and
+    /// likewise refuses both, because both closing dispositions ARE releases.
+    /// A reader who needs the enforced set rather than the label reads
+    /// [`ResearchDebtRestriction::refused_dispositions`], which publishes it
+    /// per record, and [`ResearchDebtRestriction::statement`], which names it
+    /// per debt.
+    #[must_use]
+    pub const fn blocks_disposition(self, disposition: CompletionDisposition) -> bool {
+        match self {
+            Self::Epistemic | Self::Contradiction => {
+                matches!(
+                    disposition,
+                    CompletionDisposition::AnsweredWithSupportedResult
+                )
+            }
+            Self::Verification | Self::Coverage | Self::Authority => matches!(
+                disposition,
+                CompletionDisposition::AnsweredWithSupportedResult
+                    | CompletionDisposition::NoMatchInCompleteScope
+            ),
+            Self::Replication | Self::Fidelity | Self::Provenance => false,
+        }
+    }
 }
 
 /// One registered research debt (I21.12).
@@ -2789,6 +3227,210 @@ impl ResearchDebt {
         }
         push_field(&mut preimage, "blocks", &self.blocks);
         freeze(&preimage)
+    }
+}
+
+/// The restriction open research debts place on one terminal claim (I21.12).
+///
+/// I21.12 states the rule this record enforces: "A release that carries open
+/// debts states them; it does not describe them as minor limitations." A debt
+/// is therefore not a count and not a footnote: this record names every open
+/// debt, the claim class it blocks, its accountable owner and the condition
+/// under which it is reviewed, and it names the terminal dispositions those
+/// debts refuse.
+///
+/// The restriction is derived from the registered debts rather than restated,
+/// so the debt a consumer reads and the debt the producer registered cannot
+/// drift. It is bound into the terminal record digest: an unbound restriction
+/// would be a claim, not evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResearchDebtRestriction {
+    /// Inquiry identity the restriction was derived for.
+    pub inquiry_id: String,
+    /// Whether at least one open debt restricts the terminal claim.
+    pub restricted: bool,
+    /// The closing dispositions the open debts refuse, in canonical order.
+    pub refused_dispositions: Vec<CompletionDisposition>,
+    /// Identity of every open debt contributing to the restriction.
+    pub debt_ids: Vec<String>,
+    /// I21.12 kind of every open debt, aligned with `debt_ids`.
+    ///
+    /// Published so a reader can tell WHICH restriction applies to which debt
+    /// without re-deriving it, and so the enforced refusal set is stated per
+    /// debt rather than only in aggregate.
+    pub debt_kinds: Vec<ResearchDebtKind>,
+    /// The claim class each open debt blocks, paired with its debt identity.
+    pub blocked_claims: Vec<(String, String)>,
+    /// Accountable owner of each open debt, paired with its debt identity.
+    pub owners: Vec<(String, String)>,
+    /// Review condition of each open debt, paired with its debt identity.
+    pub review_conditions: Vec<(String, String)>,
+    /// Expiry in Unix milliseconds of each open debt, paired with its identity.
+    pub expiries: Vec<(String, Option<i64>)>,
+    /// Digest over the shape.
+    pub digest: String,
+}
+
+impl ResearchDebtRestriction {
+    /// Derives the restriction the open debts place on a terminal disposition.
+    ///
+    /// Only open debts restrict: a resolved debt is not carried by this record
+    /// and never blocks. An empty debt set derives an unrestricted record
+    /// rather than a refusal, so an inquiry that registered no obligation is
+    /// not thinned by the absence of one.
+    #[must_use]
+    pub fn derive(inquiry_id: &str, debts: &[ResearchDebt]) -> Self {
+        let open: Vec<&ResearchDebt> = debts.iter().filter(|debt| debt.open).collect();
+        let mut refused: Vec<CompletionDisposition> = Vec::new();
+        for disposition in [
+            CompletionDisposition::AnsweredWithSupportedResult,
+            CompletionDisposition::NoMatchInCompleteScope,
+        ] {
+            if open
+                .iter()
+                .any(|debt| debt.kind.blocks_disposition(disposition))
+            {
+                refused.push(disposition);
+            }
+        }
+        let mut debt_ids = Vec::with_capacity(open.len());
+        let mut debt_kinds = Vec::with_capacity(open.len());
+        let mut blocked_claims = Vec::with_capacity(open.len());
+        let mut owners = Vec::with_capacity(open.len());
+        let mut review_conditions = Vec::with_capacity(open.len());
+        let mut expiries = Vec::with_capacity(open.len());
+        for debt in &open {
+            debt_ids.push(debt.debt_id.clone());
+            debt_kinds.push(debt.kind);
+            blocked_claims.push((debt.debt_id.clone(), debt.blocks.clone()));
+            owners.push((debt.debt_id.clone(), debt.owner.clone()));
+            review_conditions.push((debt.debt_id.clone(), debt.review_condition.clone()));
+            expiries.push((debt.debt_id.clone(), debt.expires_at_ms));
+        }
+        let mut restriction = Self {
+            inquiry_id: inquiry_id.to_owned(),
+            restricted: !open.is_empty(),
+            refused_dispositions: refused,
+            debt_ids,
+            debt_kinds,
+            blocked_claims,
+            owners,
+            review_conditions,
+            expiries,
+            digest: String::new(),
+        };
+        restriction.digest = restriction.compute_digest();
+        restriction
+    }
+
+    /// Whether this restriction refuses the given disposition.
+    #[must_use]
+    pub fn refuses(&self, disposition: CompletionDisposition) -> bool {
+        self.refused_dispositions.contains(&disposition)
+    }
+
+    /// The I21.12 statement of every open debt, in one bounded line.
+    ///
+    /// Names the debt, the claim class it blocks, its owner and its review
+    /// condition, so a release that carries open debts states them rather than
+    /// describing them as minor limitations. Where a debt actually refuses a
+    /// disposition, the refused wire names are stated with it, so the claim a
+    /// reader can check and the claim the gate enforces are the same claim.
+    /// No provider prose is reproduced.
+    #[must_use]
+    pub fn statement(&self) -> Option<String> {
+        if !self.restricted {
+            return None;
+        }
+        let parts = self
+            .debt_ids
+            .iter()
+            .zip(&self.blocked_claims)
+            .zip(&self.owners)
+            .zip(&self.review_conditions)
+            .zip(&self.debt_kinds)
+            .map(
+                |((((debt_id, (blocked_id, blocks)), (owner_id, owner)), (review_id, review)), kind)| {
+                    debug_assert_eq!(debt_id, blocked_id);
+                    debug_assert_eq!(debt_id, owner_id);
+                    debug_assert_eq!(debt_id, review_id);
+                    let refused = refused_dispositions_for(*kind);
+                    if refused.is_empty() {
+                        format!("{debt_id} blocks {blocks} (owner {owner}; review: {review})")
+                    } else {
+                        format!(
+                            "{debt_id} blocks {blocks} and refuses {} (owner {owner}; review: {review})",
+                            refused.join(",")
+                        )
+                    }
+                },
+            )
+            .collect::<Vec<String>>()
+            .join("; ");
+        Some(format!(
+            "{} open research debt(s) restrict this claim: {parts}",
+            self.debt_ids.len()
+        ))
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("research-debt-restriction/v1;");
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(&mut preimage, "restricted", bool_text(self.restricted));
+        push_count(
+            &mut preimage,
+            "refused_dispositions",
+            self.refused_dispositions.len(),
+        );
+        for disposition in &self.refused_dispositions {
+            push_field(
+                &mut preimage,
+                "refused_disposition",
+                disposition_wire(*disposition),
+            );
+        }
+        push_count(&mut preimage, "debt_ids", self.debt_ids.len());
+        for debt_id in &self.debt_ids {
+            push_field(&mut preimage, "debt_id", debt_id);
+        }
+        for kind in &self.debt_kinds {
+            push_field(&mut preimage, "debt_kind", kind.wire_name());
+        }
+        for (debt_id, blocks) in &self.blocked_claims {
+            push_field(&mut preimage, "blocked_debt", debt_id);
+            push_field(&mut preimage, "blocked_claim", blocks);
+        }
+        for (debt_id, owner) in &self.owners {
+            push_field(&mut preimage, "owner_debt", debt_id);
+            push_field(&mut preimage, "owner", owner);
+        }
+        for (debt_id, review) in &self.review_conditions {
+            push_field(&mut preimage, "review_debt", debt_id);
+            push_field(&mut preimage, "review_condition", review);
+        }
+        for (debt_id, expiry) in &self.expiries {
+            push_field(&mut preimage, "expiry_debt", debt_id);
+            if let Some(expiry) = expiry {
+                push_field(&mut preimage, "expires_at_ms", &expiry.to_string());
+            }
+        }
+        freeze(&preimage)
+    }
+
+    /// Re-proves this restriction's own digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.compute_digest() == self.digest {
+            Ok(())
+        } else {
+            Err(InquiryError::IntegrityMismatch {
+                field: "debt_restriction.digest",
+            })
+        }
     }
 }
 
@@ -2955,6 +3597,8 @@ pub struct InquiryTerminalRecord {
     pub explicit_unknown: Option<PreservedUnknown>,
     /// Narrower claim the evidence actually supports.
     pub narrower_claim: Option<String>,
+    /// Restriction the open research debts place on this claim (I21.12).
+    pub debt_restriction: ResearchDebtRestriction,
     /// Preserved next probe.
     pub next_probe: Option<PreservedNextProbe>,
     /// State Fence the disposition was taken under.
@@ -2991,6 +3635,7 @@ impl InquiryTerminalRecord {
         reason_code: &str,
         explicit_unknown: Option<PreservedUnknown>,
         narrower_claim: Option<String>,
+        debt_restriction: ResearchDebtRestriction,
         next_probe: Option<PreservedNextProbe>,
     ) -> Result<Self, InquiryError> {
         require_text(evidence_set_id, "terminal.evidence_set_id")?;
@@ -2998,6 +3643,24 @@ impl InquiryTerminalRecord {
         require_digest(portfolio_digest, "terminal.portfolio_digest")?;
         require_digest(manifest_digest, "terminal.manifest_digest")?;
         require_digest(coverage_receipt_digest, "terminal.coverage_receipt_digest")?;
+        debt_restriction.validate_integrity()?;
+        if debt_restriction.inquiry_id != profile.inquiry_id {
+            return Err(InquiryError::UnknownHandle {
+                field: "terminal.debt_restriction.inquiry_id",
+            });
+        }
+        // I21.12 use-time check. A closing disposition is exactly the strong
+        // claim, release, completeness claim and unified conclusion the table
+        // restricts, so an open debt that refuses it must not be bound beside
+        // it. Rejecting the record here is the honest outcome: the debt is
+        // already registered and its restriction is already derived, so
+        // emitting a closing disposition anyway would publish a claim the
+        // same record proves is blocked.
+        if debt_restriction.refuses(disposition) {
+            return Err(InquiryError::DebtRestrictedDisposition {
+                field: "terminal.disposition",
+            });
+        }
         let may_close = disposition.may_close_inquiry();
         if may_close && !denominator_kind.supports_scoped_absence() {
             return Err(InquiryError::ClosureWithoutCompleteScope {
@@ -3026,6 +3689,7 @@ impl InquiryTerminalRecord {
             reason_code: reason_code.to_owned(),
             explicit_unknown,
             narrower_claim,
+            debt_restriction,
             next_probe,
             state_fence: profile.state_fence.clone(),
             candidate_only: true,
@@ -3096,6 +3760,28 @@ impl InquiryTerminalRecord {
         if let Some(claim) = &self.narrower_claim {
             push_field(&mut preimage, "narrower_claim", claim);
         }
+        push_field(
+            &mut preimage,
+            "debt_restriction_digest",
+            &self.debt_restriction.digest,
+        );
+        push_field(
+            &mut preimage,
+            "debt_restricted",
+            bool_text(self.debt_restriction.restricted),
+        );
+        push_count(
+            &mut preimage,
+            "debt_restriction_refused",
+            self.debt_restriction.refused_dispositions.len(),
+        );
+        for disposition in &self.debt_restriction.refused_dispositions {
+            push_field(
+                &mut preimage,
+                "debt_restriction_refused_disposition",
+                disposition_wire(*disposition),
+            );
+        }
         if let Some(probe) = &self.next_probe {
             push_field(
                 &mut preimage,
@@ -3116,13 +3802,21 @@ impl InquiryTerminalRecord {
         freeze(&preimage)
     }
 
-    /// Re-proves this record's own digest.
+    /// Re-proves this record's own digest and the debt restriction it carries.
     ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
-    /// disagrees with the stored one.
+    /// disagrees with the stored one, and
+    /// [`InquiryError::DebtRestrictedDisposition`] when a closing disposition
+    /// coexists with an open debt that refuses it.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        self.debt_restriction.validate_integrity()?;
+        if self.debt_restriction.refuses(self.disposition) {
+            return Err(InquiryError::DebtRestrictedDisposition {
+                field: "terminal.disposition",
+            });
+        }
         if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "terminal.digest",
@@ -3223,9 +3917,33 @@ pub struct CandidateEvidence {
 /// I21.7: "It cannot mint a valid citation, URL, source ID, line range, artifact
 /// handle or support relation through prose." Naming which of those identities
 /// was observed is what makes the retained diagnostic actionable, because each
-/// has a different acquisition path: a URL needs a provider to resolve and
-/// snapshot it, an artifact handle needs a manifest transition, and a stale or
-/// revoked handle needs a fresh admission rather than any acquisition at all.
+/// has a different acquisition path: a URL needs an exact `url_handles` entry and
+/// a provider to resolve and snapshot it, an internally owned reference and a
+/// plain handle both need a manifest transition that admits the handle, an
+/// ambiguous spelling needs nothing to be acquired first — the text itself has to
+/// become a classifiable reference — and a stale or revoked handle needs a fresh
+/// admission rather than any acquisition at all.
+///
+/// Every arm is chosen by the one shared classifier,
+/// [`eliot_research_exchange_api::classify_locator`], which is the same function
+/// the delivered-bundle firewall in
+/// [`eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`]
+/// applies to `SourceSnapshot::locator`. Before #2894 this path tested
+/// `handle.contains("://")` instead, so `https://…` was named a URL in one path
+/// and a non-URL in the other, and `urn:`/`mailto:` were named artifact handles
+/// even though the enforcement path gated them as URLs. The kinds are now
+/// projections of one classification, not a second spelling of it.
+///
+/// # A kind names the reference; the reason names the lever
+///
+/// A candidate handle is a reference identity, and the only thing that admits one
+/// on this path is `AllowedReferenceManifest::allows`, which reads
+/// `source_handles`, `evidence_handles` and `artifact_handles`. `url_handles`
+/// belongs to the separate `admits_url` predicate on the delivered-locator path
+/// and is never consulted here. So `LocatorUrl` says *what the spelling presents
+/// itself as* and the reason says *which list can change the verdict*; a reader
+/// who follows the reason reaches the lever, and the two cannot disagree because
+/// both come from the same function.
 ///
 /// # What the live record path can actually observe
 ///
@@ -3234,41 +3952,70 @@ pub struct CandidateEvidence {
 /// set a property of what a candidate handle can be, not of all six identities
 /// I21.7 enumerates:
 ///
-/// - `ArtifactHandle` is what the live path produces. The composition root
-///   supplies exactly one candidate, derived from the retained provider artifact
-///   digest as `provider-artifact:<sha256>`
-///   (`retained_provider_material` in `bins/eliot-mod-research`), which is
-///   caller-influenced text the manifest does not admit.
-/// - `LocatorUrl` is **not** reachable on the live path today, and the reason is
-///   structural: the arm is chosen by a `://` test, and the single live handle
-///   `provider-artifact:<sha256>` contains no scheme separator. A URL inside the
-///   provider body is never observable here because the projection never decodes
-///   the body; the URL surface is closed instead at
-///   `SourceSnapshot::locator` in
-///   `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
-/// - `StaleOrRevoked` is reachable only for a manifest that lists a candidate
-///   handle in `stale_or_revoked_handles`. The live handle is minted after
-///   admission from a digest an out-of-repo envelope has no reason to list, so
-///   the live path does not reach it either — but the case it names is real and
-///   distinct: a reference the manifest *did* admit and that has since gone
-///   stale, which [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`]
-///   reports as `ManifestEntryRevoked`.
+/// - The single live candidate is the `provider-artifact:<sha256>` handle that
+///   `retained_provider_material` in `bins/eliot-mod-research` derives from the
+///   retained stdout digest, so the live kind is `InternalOwnedReference`. That
+///   spelling carries a valid RFC 3986 scheme token (`provider-artifact`)
+///   followed by a non-colon, so it is formally a URI with an opaque part; it is
+///   internally owned because a named owner mints it under a closed 64-hex
+///   grammar (see `owned_scheme` in `eliot_research_exchange_api`). The `://`
+///   test used to name it `ArtifactHandle` and the first #2894 revision named it
+///   `LocatorUrl`; both were wrong, in opposite directions.
+/// - Nothing is promoted by that reading.
+///   `AllowedReferenceManifest::allows` is unchanged, so the live handle is still
+///   unadmitted exactly as before and the diagnostic is still candidate-only.
+///   Only the named kind and reason change — from a label that sent the reader to
+///   a list which cannot admit the value, to one that names the list which can.
+/// - `LocatorUrl` is reached by any other unadmitted candidate whose scheme is
+///   not internally owned, which includes `https://…`, `urn:…` and `mailto:…`
+///   that the `://` test mislabelled as artifact handles.
 ///
-/// All three variants are kept because this is the retained diagnostic's
-/// vocabulary and a candidate handle is caller-shaped, not fixed: a bridge that
-/// projects a URL-shaped or manifest-revoked candidate reaches the other two
-/// arms with no code change here. A source identity is judged on the
-/// `SourceRecord.handle` the observation projects into
+/// A URL inside the provider body is still not observable here, because the
+/// projection never decodes the body; the delivered-locator surface is closed at
+/// `SourceSnapshot::locator` in
+/// `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+///
+/// `AmbiguousReference` is reachable for a candidate that breaks the shared
+/// classifier's own grammar — a blank or oversized spelling, a bare scheme
+/// separator, a non-canonical internal form, or a malformed `name::…`. A
+/// *well-formed* `name::id` is not one of these: it is a namespaced opaque handle
+/// and classifies as `ArtifactHandle`. No current production caller projects an
+/// `AmbiguousReference` — the one live candidate is `provider-artifact:<sha256>`
+/// — and the kind is kept because a candidate handle is caller-shaped, not fixed.
+/// A source identity is judged on the `SourceRecord.handle` the observation
+/// projects into
 /// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`], and a
 /// line range is judged by the manifest's admitted anchor precision in
 /// [`EvidenceSetPrecision::evaluate`]; neither can be a *citation* on this path,
 /// so neither is a candidate diagnostic here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnadmittedReferenceKind {
-    /// A URL the manifest does not list as a URL handle.
+    /// An absolute locator URL, named for what the spelling presents itself as.
+    ///
+    /// It says nothing about `url_handles`: `reference_firewall` never calls
+    /// `admits_url`, so it cannot know whether the manifest lists this value
+    /// there. A value can be listed in `url_handles` and still be unadmitted as a
+    /// handle, and this kind is still the right one. The lever is in the reason.
     LocatorUrl,
-    /// An artifact handle the manifest does not list.
+    /// An opaque handle the manifest does not list.
     ArtifactHandle,
+    /// A reference a named owner mints internally — a canonical `eliot://`
+    /// resource identity, or a `provider-artifact:<sha256>` content handle —
+    /// presented as a candidate handle.
+    ///
+    /// Not named "resource URI": the live case is a provider artifact handle,
+    /// not a bridge resource, and a diagnostic that misnames the one candidate
+    /// the product actually produces is its own defect.
+    InternalOwnedReference,
+    /// A spelling the shared classifier cannot classify as a reference at all:
+    /// blank, control-bearing, oversized, a scheme-separator with nothing after
+    /// it, a non-canonical internal form, or a `name::id` spelling that breaks the
+    /// namespaced-handle grammar.
+    ///
+    /// A *well-formed* `name::id` is not in this kind — it classifies as
+    /// `ArtifactHandle`, because a namespaced opaque handle is a handle and the
+    /// grammar is what keeps it distinct from a URI scheme.
+    AmbiguousReference,
     /// A handle the manifest lists but marks stale or revoked.
     StaleOrRevoked,
 }
@@ -3280,6 +4027,8 @@ impl UnadmittedReferenceKind {
         match self {
             Self::LocatorUrl => "LOCATOR_URL",
             Self::ArtifactHandle => "ARTIFACT_HANDLE",
+            Self::InternalOwnedReference => "INTERNAL_OWNED_REFERENCE",
+            Self::AmbiguousReference => "AMBIGUOUS_REFERENCE",
             Self::StaleOrRevoked => "STALE_OR_REVOKED",
         }
     }
@@ -3540,6 +4289,13 @@ pub struct InquiryGovernance {
     /// Governor-facing profile admission request.
     pub profile_admission_request: GovernorInquiryAdmissionRequest,
     /// Governor-facing source transition requests.
+    ///
+    /// The Researcher half of the two-record pair, one request per
+    /// admissibility decision, each committed to its own bytes. There is
+    /// deliberately no owner receipt field beside them: the
+    /// Governor/Kernel/Store commit receipt is the owner's, this domain has no
+    /// named transition to submit to, and inventing a placeholder for it would
+    /// be a false proof claim under A0.3.
     pub source_admission_requests: Vec<GovernorSourceTransitionRequest>,
     /// Compiler inputs for the existing `TaskGraphCompiler` owner.
     pub compilation_inputs: TaskGraphCompilationInputs,
@@ -3599,6 +4355,7 @@ impl InquiryGovernance {
             &portfolio,
             &coverage_receipt,
             &precision,
+            &admissibility,
         )?;
         let freeze = evidence_freeze(
             &observation,
@@ -3615,6 +4372,7 @@ impl InquiryGovernance {
             &coverage_receipt,
             &precision,
             &obligations,
+            &research_debts,
         )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
@@ -3652,6 +4410,23 @@ impl InquiryGovernance {
         self.freeze.validate_integrity()?;
         self.terminal.validate_integrity()?;
         self.compilation_inputs.validate_integrity()?;
+        // I21.12: the restriction a reader sees must be the restriction the
+        // registered debts imply. Re-deriving it here means a debt added,
+        // removed or resolved after the terminal record was built is caught
+        // instead of being published beside a stale restriction.
+        let derived = ResearchDebtRestriction::derive(&self.inquiry_id, &self.research_debts);
+        if derived != self.terminal.debt_restriction {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "terminal.debt_restriction",
+            });
+        }
+        for debt in &self.research_debts {
+            if !self.freeze.open_research_debts.contains(&debt.debt_id) {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "freeze.open_research_debts",
+                });
+            }
+        }
         if self.compilation_inputs.profile_digest != self.profile.integrity_digest
             || self.compilation_inputs.evidence_set_id != self.evidence_set_id
         {
@@ -3688,6 +4463,44 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
+        // The Researcher half of the two-record pair a positive admitted source
+        // has to show is re-proved here rather than trusted: each
+        // Governor-facing request is an artefact that leaves this domain, and a
+        // request whose inquiry, evidence set, profile revision, source handle,
+        // source-record digest, eligibility, scope or fence was rewritten after
+        // it was built would otherwise be published beside a decision it no
+        // longer describes. The other half of the pair — the actual
+        // Governor/Kernel/Store commit receipt — is deliberately absent and this
+        // domain does not synthesize one; I21.1 puts the transition through the
+        // sole canonical writer.
+        if self.source_admission_requests.len() != self.admissibility.len() {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.source_admission_requests",
+            });
+        }
+        for (request, record) in self
+            .source_admission_requests
+            .iter()
+            .zip(&self.admissibility)
+        {
+            request.validate_integrity()?;
+            // The request must still be the request for *this* decision under
+            // *this* inquiry and evidence set. Its own digest proves it was not
+            // edited; these bindings prove it was not swapped for a well-formed
+            // request about a different source, a different decision or a
+            // different set.
+            if request.inquiry_id != self.inquiry_id
+                || request.evidence_set_id != self.evidence_set_id
+                || request.admissibility_digest != record.digest
+                || request.source_handle != record.record.handle
+                || request.eligibility != record.eligibility
+                || request.state_fence != record.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request_binding",
+                });
+            }
+        }
         for diagnostic in &self.unadmitted_references {
             diagnostic.validate_integrity()?;
             if diagnostic.inquiry_id != self.inquiry_id
@@ -3713,6 +4526,13 @@ impl std::fmt::Display for InquiryGovernance {
     /// dispositions appear: no provider prose, payload body or credential is
     /// reproduced, and the candidate-only flag is printed so a reader cannot
     /// mistake the line for an admitted result.
+    ///
+    /// The Governor-facing source-admission requests are counted and their
+    /// digests published here, which is what makes this line the Researcher half
+    /// of the two-record pair a positive admitted source has to show. They are
+    /// proposals, so the line states that no owner receipt exists: the
+    /// Governor/Kernel/Store commit receipt is the owner's, and a line that
+    /// implied one would be a false proof claim under A0.3.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terminal = &self.terminal;
         let eligible = self
@@ -3731,9 +4551,12 @@ impl std::fmt::Display for InquiryGovernance {
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} compilation_inputs={} freeze={} debts={} \
+             debt_kinds={} debt_restricted={} debt_restriction_refused={} \
              disposition={} terminal_denominator_kind={} may_close={} \
              acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
-             next_probe={} reason={} authority_epoch={}/{} candidate_only={}",
+             next_probe={} reason={} authority_epoch={}/{} candidate_only={} \
+             source_admission_requests={} source_admission_request_digests={} \
+             source_admission_owner_receipt=none",
             self.inquiry_id,
             self.evidence_set_id,
             self.profile.profile_id,
@@ -3772,6 +4595,15 @@ impl std::fmt::Display for InquiryGovernance {
             self.compilation_inputs.digest,
             self.freeze.digest,
             self.research_debts.len(),
+            debt_kinds_wire(&self.research_debts),
+            terminal.debt_restriction.restricted,
+            terminal
+                .debt_restriction
+                .refused_dispositions
+                .iter()
+                .map(|disposition| disposition_wire(*disposition))
+                .collect::<Vec<&str>>()
+                .join(","),
             disposition_wire(terminal.disposition),
             terminal.denominator_kind,
             terminal.may_close(),
@@ -3783,11 +4615,25 @@ impl std::fmt::Display for InquiryGovernance {
             terminal.state_fence.authority_epoch.lineage_id,
             terminal.state_fence.authority_epoch.sequence,
             terminal.candidate_only,
+            self.source_admission_requests.len(),
+            self.source_admission_requests
+                .iter()
+                .map(|request| request.request_digest.as_str())
+                .collect::<Vec<&str>>()
+                .join(","),
         )
     }
 }
 
 /// Resolves the profile revision for one observed inquiry.
+///
+/// This is on the live path of every run: `InquiryGovernance::record` calls it
+/// before anything else is assessed, and it is the only place a profile revision
+/// is produced. It resolves the selection, commits the lane registration the
+/// selection demands through [`commit_lane_registration`], and only then freezes
+/// the revision that carries it — so a confirmatory profile exists only where an
+/// owner-committed registration precedes it, and an exploratory one exists where
+/// none is needed.
 fn resolve_profile(
     observation: &InquiryObservation,
 ) -> Result<InquiryProtocolProfile, InquiryError> {
@@ -3801,7 +4647,7 @@ fn resolve_profile(
     truth_surfaces.push(observation.provider_generation.clone());
     truth_surfaces.sort();
     truth_surfaces.dedup();
-    InquiryProtocolProfile::resolve(InquiryProfileParams {
+    let mut params = InquiryProfileParams {
         profile_id: observation.profile_id.clone(),
         inquiry_id: observation.inquiry_id.clone(),
         operation_id: observation.operation_id.clone(),
@@ -3821,8 +4667,389 @@ fn resolve_profile(
         disclosure_ceiling: observation.disclosure,
         stop_rule,
         state_fence: observation.reference_manifest.state_fence.clone(),
-        lane_registration_digest: None,
-    })
+        committed_lane_registration: None,
+    };
+    // I21.4: the profile states the required rigour, and a confirmatory lane
+    // additionally requires a frozen registration committed before any outcome
+    // exposure. The selection is resolved first because the registration has to
+    // name the exact revision it governs, and the registration is committed
+    // before the revision that carries it is frozen.
+    let selection = InquiryProtocolProfile::select(&params)?;
+    params.committed_lane_registration =
+        commit_lane_registration(&params, &selection, observation.assessment_time_ms)?;
+    InquiryProtocolProfile::build(
+        params,
+        selection,
+        1,
+        None,
+        "initial inquiry protocol resolution",
+    )
+}
+
+/// The contract owner that commits lane registrations into the ordering journal
+/// of one inquiry.
+///
+/// I21.2 resolves the grade and the lane here, and I21.4 freezes the
+/// registration under the Researcher contract owner, so this is the owner whose
+/// commit receipt a confirmatory claim rests on. It is a named constant rather
+/// than a caller-supplied string: a caller that may name its own owner could
+/// also place its own exposure receipts in a journal of its own choosing and
+/// order them against a registration nobody committed.
+const LANE_JOURNAL_OWNER: &str = "eliot.research.inquiry-governance.contract-owner";
+
+/// Commits the lane registration one profile revision must carry.
+///
+/// This is the producer the issue was missing. It returns `None` for a purely
+/// exploratory selection, because I21.4 requires no registration for purely
+/// exploratory work and inventing one would let a confirmatory claim be
+/// manufactured for work that never had a confirmatory surface. For confirmatory
+/// content it freezes one [`LaneRegistration`] and admits it as a
+/// [`CommittedLaneRegistration`], which is the only value
+/// [`InquiryProfileParams::committed_lane_registration`] accepts.
+///
+/// # What the registration commits to, and where each part comes from
+///
+/// Every value below is derived from material the profile was already resolved
+/// from, so nothing here is asserted, guessed or supplied by a caller:
+///
+/// - `contract_digest` is the kernel-admitted `admitted_inquiry_digest`, i.e.
+///   the exact contract the run executes under;
+/// - `protocol_digest` is the resolved protocol/coverage/grade/lane selection
+///   this revision carries, so any later reader can recompute it from the
+///   published profile;
+/// - `hypothesis_digest` is the exact question, scope and intended decision the
+///   proposition consists of;
+/// - `evaluator_digest` is the admitted evaluation surface — result schema,
+///   verifier cost and strength, admitted routes and provider generation. The
+///   Researcher record carries no evaluator identity of its own, so this is the
+///   exact admitted surface the registration freezes; substituting any part of
+///   it after exposure is a content change and therefore a new revision;
+/// - the primary outcome and its decision rule are the admitted result schema
+///   and the admitted coverage goal plus the intended decision, frozen
+///   verbatim, so I21.4's "may not change the primary metric" has something
+///   concrete to compare against;
+/// - the stated exclusion rule and the quality controls are the run-bound
+///   reference allowlist and the declared denominator, i.e. the two controls the
+///   run is actually admitted under;
+/// - the blinded fields are the I21.4-named channels that carry the answer to
+///   the evaluator, and the sealed mapping over the concealed assignment is
+///   retained under this contract owner at the journal origin, before the
+///   registration that cites it is committed;
+/// - the only permitted deviation is an exclusion made under the stated rule.
+///   I21.4 forbids changing the metric, weakening the proposition, replacing the
+///   evaluator after seeing results or hiding failed attempts, so no allowance
+///   is registered for those facets and a deviation on any of them is refused by
+///   `LaneRegistration::classify_deviation`.
+///
+/// # Where the commit sits in the owner journal
+///
+/// Two owner acts happen here, in this order, and both are issued into one
+/// journal: the blinding mapping is sealed at the origin, and the registration
+/// that cites that mapping is committed immediately after it, chained to the
+/// seal. Positions are therefore the journal's own two positions rather than
+/// numbers chosen to order something, and the proof is
+/// `CommittedLaneRegistration::commit`'s hash-chain ancestry check — not a
+/// comparison of `recorded_at_ms` against anything.
+///
+/// `recorded_at_ms` is the instant the run itself reported. It is retained as a
+/// record of that fact only; this module never orders anything by it.
+///
+/// # Errors
+///
+/// Returns [`InquiryError::LaneRegistrationRefused`] carrying the lane owner's
+/// own field path for a malformed or unprovable registration, and
+/// [`InquiryError::UnknownVocabulary`] for a mixed-lane selection, which
+/// [`select_lane`] does not currently produce and for which the observation
+/// carries no frozen partition membership or deterministic assignment rule.
+fn commit_lane_registration(
+    params: &InquiryProfileParams,
+    selection: &ProfileSelection,
+    recorded_at_ms: i64,
+) -> Result<Option<CommittedLaneRegistration>, InquiryError> {
+    if selection.lane == InquiryLane::Exploratory {
+        return Ok(None);
+    }
+    if selection.lane != InquiryLane::Confirmatory {
+        // A mixed lane needs a partition frozen before outcomes are seen, and
+        // `InquiryObservation` carries neither explicit membership nor an
+        // assignment rule with its version and seed. Refusing is the honest
+        // reading: a partition cannot be invented, and a complete partition map
+        // with unknown leak history is not proof of uncontaminated confirmation.
+        return Err(InquiryError::UnknownVocabulary {
+            field: "profile.lane.mixed_partition",
+        });
+    }
+    let state_fence = params.state_fence.clone();
+    let journal = lane_journal_identity(params, selection.lane);
+    let sealed_blinding_mapping = seal_blinded_mapping(params, &journal, &state_fence)?;
+    let registration_params = LaneRegistrationParams {
+        registration_id: format!("lane-registration/{}", params.inquiry_id),
+        inquiry_id: params.inquiry_id.clone(),
+        profile_id: params.profile_id.clone(),
+        profile_revision: 1,
+        profile_digest: registration_binding_digest(params, 1, None, selection),
+        digests: RegistrationDigests::bind(
+            &params.admitted_inquiry_digest,
+            &lane_protocol_digest(selection),
+            &lane_hypothesis_digest(params),
+            &lane_evaluator_digest(params),
+        )?,
+        primary_outcome: PrimaryOutcomeRule::bind(
+            &format!("admitted_result_schema:{}", params.required_schema),
+            &format!(
+                "admitted_coverage_goal:{};intended_decision:{}",
+                params.admitted_coverage_goal, params.intended_decision_or_artifact
+            ),
+        )?,
+        exclusions_and_quality_controls: ExclusionAndQualityControl::bind(
+            vec![format!(
+                "no case may be excluded unless its handle is admitted by run_bound_reference_allowlist:{}",
+                params.reference_manifest_digest
+            )],
+            vec![
+                format!(
+                    "run_bound_reference_allowlist:{}",
+                    params.reference_manifest_digest
+                ),
+                format!(
+                    "declared_denominator:{}",
+                    params.admitted_denominator_digest
+                ),
+            ],
+        )?,
+        blinded_fields: lane_blinded_fields(),
+        allowed_deviations: lane_allowed_deviations()?,
+        evidence_partition: None,
+        // The commit receipt does not exist yet: it is issued *over* the frozen
+        // content, which is why `LaneRegistration::content_digest_of` exists.
+        // The mapping seal receipt stands in until the real commit receipt
+        // replaces it two steps below, and `freeze_content` never reads it.
+        owner_receipt: sealed_blinding_mapping.receipt.clone(),
+        sealed_blinding_mapping,
+        registered_at_ms: recorded_at_ms,
+        state_fence,
+    };
+    let content_digest = LaneRegistration::content_digest_of(&registration_params)?;
+    let mut registration_params = registration_params;
+    registration_params.owner_receipt = OwnerOrderingReceipt::issue(OwnerOrderingReceiptParams {
+        receipt_id: format!("{journal}#1"),
+        owner_principal: LANE_JOURNAL_OWNER.to_owned(),
+        journal_identity: journal,
+        position: 1,
+        predecessor_receipt_digest: Some(
+            registration_params
+                .sealed_blinding_mapping
+                .receipt
+                .receipt_digest
+                .clone(),
+        ),
+        subject: OrderedSubjectKind::LaneRegistrationCommit,
+        subject_id: registration_params.registration_id.clone(),
+        subject_digest: content_digest,
+        state_fence: registration_params.state_fence.clone(),
+    })?;
+    let registration = LaneRegistration::register(registration_params)?;
+    Ok(Some(CommittedLaneRegistration::commit(registration)?))
+}
+
+/// Identity of the one owner journal this inquiry's lane receipts order inside.
+///
+/// Positions are meaningful only together with the owner and the journal, so
+/// the journal is derived from exactly those admitted facts: the contract owner
+/// that issues the receipts, the inquiry and profile identity, and the State
+/// Fence everything is frozen under. A different fence is a different journal,
+/// which is what makes a receipt from a superseded fence order nothing.
+fn lane_journal_identity(params: &InquiryProfileParams, lane: InquiryLane) -> String {
+    let fence = &params.state_fence;
+    let mut preimage = String::from("inquiry-lane-journal/v1;");
+    push_field(&mut preimage, "owner_principal", LANE_JOURNAL_OWNER);
+    push_field(&mut preimage, "contract", INQUIRY_LANES_CONTRACT);
+    push_field(&mut preimage, "inquiry_id", &params.inquiry_id);
+    push_field(&mut preimage, "profile_id", &params.profile_id);
+    push_field(&mut preimage, "lane", lane.wire_name());
+    push_field(
+        &mut preimage,
+        "authority_lineage",
+        fence.authority_epoch.lineage_id.as_str(),
+    );
+    push_field(
+        &mut preimage,
+        "authority_sequence",
+        &fence.authority_epoch.sequence.to_string(),
+    );
+    push_field(
+        &mut preimage,
+        "resource_generation",
+        &fence.resource_generation.value().to_string(),
+    );
+    freeze(&preimage)
+}
+
+/// Seals the blinding mapping the declared channels conceal, at the journal
+/// origin.
+///
+/// I21.4 keeps the sealed mapping under the existing independence/disclosure
+/// owner and lets the registration carry only its handle and digest, so what is
+/// sealed here is a digest of the assignment the blinding conceals — the
+/// admitted source classes, the admitted truth surfaces and the admitted
+/// disclosure ceiling — and never the concealed values themselves. The receipt
+/// sits at position zero with no predecessor because it opens the journal: it
+/// is the first act of this owner for this inquiry, which is a structural fact
+/// and not a claim about a clock.
+fn seal_blinded_mapping(
+    params: &InquiryProfileParams,
+    journal: &str,
+    state_fence: &StateFence,
+) -> Result<SealedBlindingMapping, InquiryError> {
+    let mapping_handle = format!("blinded-mapping/{}", params.inquiry_id);
+    let mapping_digest = lane_blinded_mapping_digest(params);
+    let receipt = OwnerOrderingReceipt::issue(OwnerOrderingReceiptParams {
+        receipt_id: format!("{journal}#0"),
+        owner_principal: LANE_JOURNAL_OWNER.to_owned(),
+        journal_identity: journal.to_owned(),
+        position: 0,
+        predecessor_receipt_digest: None,
+        subject: OrderedSubjectKind::SealedBlindingMapping,
+        subject_id: mapping_handle.clone(),
+        subject_digest: mapping_digest.clone(),
+        state_fence: state_fence.clone(),
+    })?;
+    Ok(SealedBlindingMapping::seal(SealedBlindingMappingParams {
+        mapping_handle,
+        mapping_digest,
+        owner_principal: LANE_JOURNAL_OWNER.to_owned(),
+        receipt,
+    })?)
+}
+
+/// The exact protocol selection a registration freezes.
+fn lane_protocol_digest(selection: &ProfileSelection) -> String {
+    let mut preimage = String::from("inquiry-lane-protocol/v1;");
+    push_field(&mut preimage, "protocol", selection.protocol.wire_name());
+    push_field(
+        &mut preimage,
+        "coverage_goal",
+        selection.coverage_goal.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "hypothesis_policy",
+        selection.hypothesis_policy.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "evidence_grade",
+        &selection.evidence_grade.to_string(),
+    );
+    push_field(&mut preimage, "lane", selection.lane.wire_name());
+    push_field(
+        &mut preimage,
+        "selection_features_digest",
+        &selection.selection_features_digest,
+    );
+    freeze(&preimage)
+}
+
+/// The exact proposition a registration freezes.
+fn lane_hypothesis_digest(params: &InquiryProfileParams) -> String {
+    let mut preimage = String::from("inquiry-lane-hypothesis/v1;");
+    push_field(&mut preimage, "question", &params.question);
+    push_field(&mut preimage, "scope", &params.scope);
+    push_field(
+        &mut preimage,
+        "intended_decision_or_artifact",
+        &params.intended_decision_or_artifact,
+    );
+    freeze(&preimage)
+}
+
+/// The exact admitted evaluation surface a registration freezes as its
+/// evaluator.
+fn lane_evaluator_digest(params: &InquiryProfileParams) -> String {
+    let mut preimage = String::from("inquiry-lane-evaluator/v1;");
+    push_field(&mut preimage, "required_schema", &params.required_schema);
+    push_field(
+        &mut preimage,
+        "verifier_cost",
+        params.features.verifier_cost.wire_name(),
+    );
+    push_field(
+        &mut preimage,
+        "verifier_strength",
+        params.features.verifier_strength.wire_name(),
+    );
+    push_count(
+        &mut preimage,
+        "admissible_routes",
+        params.truth_surfaces_and_admissible_providers.len(),
+    );
+    for surface in &params.truth_surfaces_and_admissible_providers {
+        push_field(&mut preimage, "truth_surface", surface);
+    }
+    freeze(&preimage)
+}
+
+/// The concealed assignment the sealed blinding mapping covers.
+fn lane_blinded_mapping_digest(params: &InquiryProfileParams) -> String {
+    let mut classes: Vec<&str> = params
+        .admissible_source_classes
+        .iter()
+        .map(|class| class_wire(*class))
+        .collect();
+    classes.sort_unstable();
+    classes.dedup();
+    let mut preimage = String::from("inquiry-lane-blinded-mapping/v1;");
+    push_field(
+        &mut preimage,
+        "disclosure_ceiling",
+        disclosure_wire(params.disclosure_ceiling),
+    );
+    push_count(&mut preimage, "source_classes", classes.len());
+    for class in classes {
+        push_field(&mut preimage, "source_class", class);
+    }
+    push_count(
+        &mut preimage,
+        "truth_surfaces",
+        params.truth_surfaces_and_admissible_providers.len(),
+    );
+    for surface in &params.truth_surfaces_and_admissible_providers {
+        push_field(&mut preimage, "truth_surface", surface);
+    }
+    freeze(&preimage)
+}
+
+/// The leakage channels a confirmatory run closes before outcome exposure.
+///
+/// I21.4 names these as the typical fields: "preferred hypothesis, condition
+/// labels, …, holdout expected score". Each one would otherwise hand the
+/// evaluator the answer the registration exists to keep from it, so a confirmatory
+/// lane declares all three. This is a policy definition, not an observed value,
+/// and `BlindingApplication::evaluate` is what later proves each one was actually
+/// delivered masked and that masking it did not remove essential task or safety
+/// information.
+fn lane_blinded_fields() -> Vec<BlindedField> {
+    vec![
+        BlindedField::PreferredHypothesis,
+        BlindedField::ConditionLabel,
+        BlindedField::HoldoutExpectedScore,
+    ]
+}
+
+/// The deviations a confirmatory run permits before outcome exposure.
+///
+/// Only `Exclusions` is permitted, and only under the stated rule the
+/// registration carries. I21.4 forbids changing the primary metric, weakening
+/// the proposition, replacing the evaluator after seeing results and hiding
+/// failed attempts, so those four facets get no allowance and a deviation on any
+/// of them is classified `OutsideDeclaredAllowance`, which invalidates the
+/// affected confirmation.
+fn lane_allowed_deviations() -> Result<Vec<DeviationAllowance>, InquiryError> {
+    Ok(vec![DeviationAllowance::allow(
+        "exclusion-under-stated-rule",
+        DeviationScope::Exclusions,
+        "a case may be excluded only under the exclusion rule stated in this registration",
+    )?])
 }
 
 /// Produces the source-admissibility disposition of every proposed source.
@@ -3861,10 +5088,28 @@ fn assess_sources(
 /// The candidate handle is the reference identity this boundary can observe: the
 /// composition root derives it from the retained provider artifact digest, so it
 /// is caller-influenced text and is checked against the manifest like any other.
-/// A URL appearing inside the provider body is not observable here — the live
-/// projection never decodes the body — so a URL is admitted or refused at the
-/// `SourceSnapshot::locator` boundary in
-/// `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+///
+/// #2894: the kind is read from the one shared classifier,
+/// [`eliot_research_exchange_api::classify_locator`], which is the same
+/// classification the delivered-bundle firewall applies to
+/// `SourceSnapshot::locator`. This path used to test `handle.contains("://")`,
+/// so it disagreed with the enforcement path in both directions: `https://…` was
+/// named a URL here while the enforcement path could not name it one, and
+/// `urn:`/`mailto:` were named artifact handles while the enforcement path gates
+/// them as URLs. There is no `contains` test left in this function.
+///
+/// Every reason this function emits names a lever that can change the verdict
+/// here, and the branch comment records which list that is. Two mistakes this
+/// replaces are worth naming, because they are mirror images of each other: the
+/// first #2894 revision told a reader that an unadmitted URL-shaped candidate
+/// needed an exact `url_handles` entry, and this function never calls
+/// `admits_url`, so following that advice left the diagnostic recurring forever;
+/// and the same revision told a reader that an unclassifiable spelling could be
+/// admitted by no list at all, which was equally wrong in the other direction —
+/// this path tests `manifest.allows` and nothing else, so a handle entry removes
+/// the diagnostic whatever the spelling is. A reason here names a list this
+/// function actually reads, and says plainly when the remaining problem is the
+/// text rather than the list.
 fn reference_firewall(
     observation: &InquiryObservation,
 ) -> Result<Vec<UnadmittedReference>, InquiryError> {
@@ -3875,25 +5120,81 @@ fn reference_firewall(
         if !seen.insert(candidate.handle.clone()) {
             continue;
         }
-        let (kind, reason) = if manifest
+        let (kind, reason): (UnadmittedReferenceKind, String) = if manifest
             .stale_or_revoked_handles
             .iter()
             .any(|stale| stale == &candidate.handle)
         {
+            // Revocation is applied after membership and on every call, so this
+            // verdict survives a handle-list entry too. The reason says that, or
+            // a reader adds the handle to a list, the diagnostic recurs, and the
+            // firewall looks broken.
             (
                 UnadmittedReferenceKind::StaleOrRevoked,
-                "the run-bound manifest lists this reference as stale or revoked",
+                "the run-bound manifest lists this reference as stale or revoked, and revocation \
+                 applies after membership, so a handle entry alone does not readmit it"
+                    .to_owned(),
             )
         } else if !manifest.allows(&candidate.handle) {
-            let kind = if candidate.handle.contains("://") {
-                UnadmittedReferenceKind::LocatorUrl
-            } else {
-                UnadmittedReferenceKind::ArtifactHandle
-            };
-            (
-                kind,
-                "the run-bound manifest does not admit this reference handle",
-            )
+            // Every reason below names the one thing that can change this
+            // verdict, and the arm it names is one this path actually reads.
+            // This path tests `manifest.allows` and nothing else:
+            // `AllowedReferenceManifest::allows` reads `source_handles`,
+            // `evidence_handles` and `artifact_handles`, so the handle allowlist
+            // is the only lever here. `url_handles` belongs to the separate
+            // `admits_url` predicate, which is the delivered-locator path in
+            // `eliot_research_exchange_api` and is never called from this
+            // function — so a reason that told a reader to add the value to
+            // `url_handles` would name a list that cannot admit it and the
+            // diagnostic would recur forever.
+            match classify_locator(&candidate.handle) {
+                // The spelling presents as an absolute locator, and the lever is
+                // still the handle allowlist: a candidate handle is a reference
+                // identity, not a `SourceSnapshot::locator`, so it is admitted by
+                // `allows` or by nothing. Saying so is the whole point — naming
+                // `url_handles` here would send the reader to the wrong list.
+                LocatorClass::ExternalUri { .. } => (
+                    UnadmittedReferenceKind::LocatorUrl,
+                    "this reference presents as an absolute locator URL; a candidate handle is \
+                     admitted only by the manifest's source, evidence and artifact handles, and \
+                     url_handles is not consulted on this path"
+                        .to_owned(),
+                ),
+                // An internally owned reference is still just a handle identity:
+                // being internal is not admission, so the lever is the same
+                // handle allowlist.
+                LocatorClass::InternalUri { .. } => (
+                    UnadmittedReferenceKind::InternalOwnedReference,
+                    "this reference is an internally owned handle; admission is a source, evidence \
+                     or artifact handle entry, and being internal is not admission"
+                        .to_owned(),
+                ),
+                LocatorClass::OpaqueHandle => (
+                    UnadmittedReferenceKind::ArtifactHandle,
+                    "the run-bound manifest does not admit this reference handle in its source, \
+                     evidence or artifact handles"
+                        .to_owned(),
+                ),
+                // A spelling the classifier cannot read. The lever is STILL the
+                // handle allowlist, and this is the arm where that is easiest to
+                // get wrong: `classify_locator` plays no part in the admission
+                // decision above — it only chose this kind and this string. A
+                // manifest handle entry for this exact text removes the
+                // diagnostic, exactly as it does for every other arm, so the
+                // reason says so rather than claiming no list can help. What no
+                // entry can do is make the *text* classifiable: that is a
+                // property of the spelling, and the reason names the rule that
+                // failed so a reader knows which one to fix.
+                LocatorClass::MalformedOrAmbiguous { reason } => (
+                    UnadmittedReferenceKind::AmbiguousReference,
+                    format!(
+                        "this reference is not a classifiable locator: {}; a source, evidence or \
+                         artifact handle entry admits it like any other candidate, but no entry \
+                         can make the text itself classifiable",
+                        reason.wire_name()
+                    ),
+                ),
+            }
         } else {
             continue;
         };
@@ -3902,7 +5203,7 @@ fn reference_firewall(
             &observation.evidence_set_id,
             &candidate.handle,
             kind,
-            reason,
+            &reason,
             &manifest.state_fence,
         )?);
     }
@@ -3987,6 +5288,45 @@ fn degradation(observation: &InquiryObservation, account: &CoverageAccount) -> R
 /// Planning is receding-horizon: only what current observations can determine is
 /// materialised, and an information-dependent future stays `Stub` until the
 /// upstream result arrives.
+///
+/// # Why a revoked member's obligation is invalidated rather than re-materialised
+///
+/// I21.5: "Invalidated obligations are not deleted: they retain the invalidating
+/// cause, spent resources and any reusable artifacts, so that repeated planning
+/// cost becomes visible." Exactly one member class on this path is decidable now
+/// rather than pending, and leaving it pending is a real defect rather than a
+/// conservative default.
+///
+/// [`coverage_account`] opens the denominator over the manifest's source,
+/// evidence and artifact handles and does not apply the manifest's revocation
+/// list, while [`AllowedReferenceManifest::allows`] documents that a handle the
+/// manifest admits *and* lists as stale or revoked is never admitted. Such a
+/// member therefore stays an open denominator member on every run, and the very
+/// same handle delivered as a candidate is refused outright by
+/// [`crate::source_admissibility::SourceAdmissibilityReason::ManifestEntryRevoked`].
+/// A fresh work obligation for it each run is the repeated planning cost I21.5
+/// names, and no admission of this manifest can ever satisfy it.
+///
+/// The obligation is therefore retained as `INVALIDATED` with that cause instead
+/// of staying `STUB`. The member is **not** removed from the denominator: the
+/// coverage receipt, the coverage research debt, the preserved explicit unknown
+/// and the preserved next probe all keep reading it as unresolved, so nothing
+/// here narrows a completeness or absence claim, and the obligation stays in
+/// [`TaskGraphCompilationInputs`] and in the next probe's obligation references so
+/// the spent planning stays visible.
+///
+/// `resources_spent` is `0` and `reusable_artifacts` is empty because the
+/// obligation is materialised and invalidated inside one record and was never
+/// dispatched; both are the honest values for this transition, not defaults
+/// standing in for a measurement. Nothing is asserted here that the observation
+/// does not carry: the trigger is the run-bound manifest's own revocation list,
+/// which this crate already reads on the candidate path.
+///
+/// MEASURED, and stated so no one reads more into this than it is: no admitted
+/// material that exists today carries a handle in both the admissible and the
+/// revoked list, so this branch is not exercised by any fixture on the
+/// `eliot-mod-research` path. It fires only for an admitted manifest the contract
+/// explicitly permits in exactly that state.
 fn open_obligations(
     observation: &InquiryObservation,
     profile: &InquiryProtocolProfile,
@@ -3994,7 +5334,7 @@ fn open_obligations(
 ) -> Result<Vec<InquiryObligation>, InquiryError> {
     let mut obligations = Vec::new();
     for member in account.open_members() {
-        obligations.push(InquiryObligation::new(InquiryObligationParams {
+        let mut obligation = InquiryObligation::new(InquiryObligationParams {
             obligation_id: format!("obl-{member}"),
             parent_question: observation.question.clone(),
             goal: format!("resolve admitted reference {member} inside the frozen scope"),
@@ -4009,7 +5349,25 @@ fn open_obligations(
             stop_condition: StopRuleKind::BudgetOrDeadlineExhausted.wire_name(),
             status: InquiryObligationStatus::Stub,
             profile,
-        })?);
+        })?;
+        if observation
+            .reference_manifest
+            .stale_or_revoked_handles
+            .iter()
+            .any(|revoked| revoked == &member)
+        {
+            obligation.invalidate(
+                &format!(
+                    "the run-bound manifest lists reference {member} as stale or revoked, so no \
+                     admission of this manifest can resolve it; the member is retained as an open \
+                     denominator member and this obligation is retained as INVALIDATED with the \
+                     cause instead of being re-materialised as pending work on every run"
+                ),
+                0,
+                Vec::new(),
+            )?;
+        }
+        obligations.push(obligation);
     }
     Ok(obligations)
 }
@@ -4021,6 +5379,7 @@ fn research_debts(
     portfolio: &SourcePortfolio,
     coverage_receipt: &CoverageReceipt,
     precision: &EvidenceSetPrecision,
+    admissibility: &[SourceAdmissibilityRecord],
 ) -> Result<Vec<ResearchDebt>, InquiryError> {
     let mut debts = Vec::new();
     if !coverage_receipt.open_members.is_empty() {
@@ -4069,7 +5428,72 @@ fn research_debts(
             None,
         )?);
     }
+    // I21.12 names eight debt kinds. The three above are decided by the
+    // coverage, independence and precision receipts; `Verification` below by a
+    // fourth signal this record already computes. The remaining four
+    // (`Contradiction`, `Epistemic`, `Fidelity`, `Authority`) are deliberately
+    // NOT registered, each for a measured reason rather than for convenience: a
+    // producer that can never fire is the "helper without a caller" the brief
+    // forbids, so a kind is registered only where an observed signal exists.
+    // `Contradiction` is the instructive one - see `unresolved_contradictions`
+    // - and the assert below is the tripwire that will tell the next attempt
+    // when its signal finally becomes real.
+    if !coverage_receipt.provider_degradation.is_empty() {
+        debts.push(ResearchDebt::register(
+            &format!("debt-verification-{}", observation.inquiry_id),
+            &observation.inquiry_id,
+            profile,
+            ResearchDebtKind::Verification,
+            &format!(
+                "acquisition degraded rather than completing cleanly, so no admitted candidate is \
+                 backed by an independently verified source: {}",
+                coverage_receipt.provider_degradation.join(",")
+            ),
+            "researcher",
+            "a non-degraded acquisition admits a candidate with an independently verified source",
+            None,
+        )?);
+    }
+    let contradictions = unresolved_contradictions(admissibility);
+    debug_assert!(
+        contradictions.is_empty(),
+        "a populated counterevidence set changes the I21.12 debt set; re-derive the producers",
+    );
     Ok(debts)
+}
+
+/// The admitted sources recorded as counterevidence of another admitted source.
+///
+/// Extracted so the contradiction check and the evidence freeze read the SAME
+/// unresolved set: if they computed it separately, one could name a conflict
+/// the other does not carry, and the freeze would then understate an
+/// obligation the same record registered.
+///
+/// MEASURED: on the `InquiryGovernance::record` path this set is provably
+/// EMPTY, because `candidate_source_record` is the only producer of
+/// admissibility records here and it hardcodes `counterevidence_of:
+/// BTreeSet::new()`. A `Contradiction` debt registered from it would be a
+/// producer that can never fire, which is the "helper without a caller" the
+/// brief forbids, so no such debt is registered. Populating the field is the
+/// prerequisite, and it is NOT invented here.
+fn unresolved_contradictions(admissibility: &[SourceAdmissibilityRecord]) -> Vec<String> {
+    let included: Vec<&str> = admissibility
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| record.record.handle.as_str())
+        .collect();
+    let mut contradictions: Vec<String> = included
+        .iter()
+        .filter(|handle| {
+            admissibility
+                .iter()
+                .any(|record| record.record.counterevidence_of.contains(**handle))
+        })
+        .map(|handle| (*handle).to_owned())
+        .collect();
+    contradictions.sort();
+    contradictions.dedup();
+    contradictions
 }
 
 /// Freezes the accepted evidence revision for one inquiry.
@@ -4100,15 +5524,7 @@ fn evidence_freeze(
             (record.record.handle.clone(), reasons)
         })
         .collect();
-    let contradictions: Vec<String> = included
-        .iter()
-        .filter(|handle| {
-            admissibility
-                .iter()
-                .any(|record| record.record.counterevidence_of.contains(*handle))
-        })
-        .cloned()
-        .collect();
+    let contradictions = unresolved_contradictions(admissibility);
     EvidenceFreeze::freeze(
         &observation.inquiry_id,
         profile,
@@ -4217,6 +5633,13 @@ fn preserved_next_probe(
 }
 
 /// Builds the terminal typed inquiry record for one observed run.
+///
+/// `debts` is the set this run registered, and it is the ONLY input that can
+/// restrict the claim: the disposition is derived from the acquisition outcome
+/// and the coverage receipt, then narrowed by the open research debts before it
+/// is bound. Deriving the restriction from the registered debts rather than
+/// restating it is what makes the I21.12 use-time check an invariant of the
+/// record rather than a comment about it.
 fn terminal_record(
     observation: &InquiryObservation,
     profile: &InquiryProtocolProfile,
@@ -4224,13 +5647,39 @@ fn terminal_record(
     coverage_receipt: &CoverageReceipt,
     precision: &EvidenceSetPrecision,
     obligations: &[InquiryObligation],
+    debts: &[ResearchDebt],
 ) -> Result<InquiryTerminalRecord, InquiryError> {
-    let narrower_claim = precision.has_residue().then(|| {
+    let debt_restriction = ResearchDebtRestriction::derive(&observation.inquiry_id, debts);
+    let derived = terminal_disposition(observation, coverage_receipt);
+    // A restricted disposition is downgraded to the typed incomplete-coverage
+    // outcome rather than dropped: the run did complete, but the claim it could
+    // have carried is blocked, and I21.13 requires the honest limited outcome
+    // to be the one reported. The debt statement below keeps the specific
+    // reason, so the downgrade loses nothing a reader needs.
+    //
+    // MEASURED: on this path the downgrade is currently INERT. No debt kind
+    // that refuses a disposition can coexist with a disposition this function
+    // produces - see the reachability note on
+    // `InquiryError::DebtRestrictedDisposition` for the proof. The branch is
+    // kept because it is the correct invariant and because it costs nothing,
+    // but nothing should be read into it as live enforcement today.
+    let disposition = if debt_restriction.refuses(derived) {
+        CompletionDisposition::IncompleteCoverage
+    } else {
+        derived
+    };
+    let precision_claim = precision.has_residue().then(|| {
         format!(
             "claim may not exceed {} precision on this evidence set",
             anchor_wire(precision.supported_precision)
         )
     });
+    let narrower_claim = match (precision_claim, debt_restriction.statement()) {
+        (Some(precision), Some(debts)) => Some(format!("{precision}; {debts}")),
+        (Some(precision), None) => Some(precision),
+        (None, Some(debts)) => Some(debts),
+        (None, None) => None,
+    };
     InquiryTerminalRecord::bind(
         profile,
         &portfolio.digest,
@@ -4238,11 +5687,12 @@ fn terminal_record(
         &coverage_receipt.digest,
         &observation.evidence_set_id,
         coverage_receipt.denominator_kind,
-        terminal_disposition(observation, coverage_receipt),
+        disposition,
         observation.outcome,
         &observation.reason_code,
         preserved_unknown(observation, coverage_receipt),
         narrower_claim,
+        debt_restriction,
         Some(preserved_next_probe(
             observation,
             coverage_receipt,
@@ -4341,6 +5791,35 @@ fn disclosure_wire(class: DisclosureClass) -> &'static str {
         DisclosureClass::ExportableRedacted => "exportable_redacted",
         DisclosureClass::Public => "public",
     }
+}
+
+/// Stable wire spelling of the canonical completion disposition.
+/// The dispositions one I21.12 debt kind refuses, in wire names.
+///
+/// Stated per debt so a reader can check the enforced set against the claim
+/// class the debt publishes, instead of having to trust that the two agree.
+fn refused_dispositions_for(kind: ResearchDebtKind) -> Vec<&'static str> {
+    [
+        CompletionDisposition::AnsweredWithSupportedResult,
+        CompletionDisposition::NoMatchInCompleteScope,
+    ]
+    .into_iter()
+    .filter(|disposition| kind.blocks_disposition(*disposition))
+    .map(disposition_wire)
+    .collect()
+}
+
+/// Stable wire spelling of the debt kinds a run registered, deduplicated and
+/// ordered.
+///
+/// I21.12 requires a release that carries open debts to STATE them, so the kind
+/// reaches the boundary as a closed wire name rather than only as a count.
+/// No debt summary, owner prose or provider text is reproduced here.
+fn debt_kinds_wire(debts: &[ResearchDebt]) -> String {
+    let mut kinds: Vec<&str> = debts.iter().map(|debt| debt.kind.wire_name()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    kinds.join(",")
 }
 
 /// Stable wire spelling of the canonical completion disposition.

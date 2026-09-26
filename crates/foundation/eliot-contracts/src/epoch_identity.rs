@@ -64,6 +64,41 @@ impl<'de> Deserialize<'de> for LowercaseSha256 {
     }
 }
 
+/// Rejected `sha256:`-prefixed digest text. The supplied value is never
+/// echoed: only the rejection class is reported.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum VersionedDigestError {
+    #[error("digest algorithm must be sha256")]
+    WrongAlgorithm,
+    #[error("digest body must be 64 lowercase hex")]
+    Malformed,
+}
+
+/// Parses one versioned `sha256:<64 lowercase hex>` digest value into its
+/// bare canonical digest (issue #369 A10).
+///
+/// The `sha256:` slot is an explicit algorithm claim, not decoration: empty,
+/// short, long, uppercase, non-hex, placeholder (`sha256:route`,
+/// `sha256:runtime`), and wrong-algorithm (`md5:…`, bare hex, any other
+/// prefix) values all fail here instead of entering a receipt. A
+/// well-formed value that was computed over the wrong canonical byte domain
+/// still parses as shape: domain agreement is enforced by recomputing the
+/// expected digest at the use site (for example the shared wire-locator
+/// recipe), never by trusting this parse alone.
+pub fn parse_versioned_sha256_digest(text: &str) -> Result<LowercaseSha256, VersionedDigestError> {
+    let hex = text
+        .strip_prefix("sha256:")
+        .ok_or(VersionedDigestError::WrongAlgorithm)?;
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(VersionedDigestError::Malformed);
+    }
+    Ok(LowercaseSha256(hex.to_owned()))
+}
+
 /// A validated, opaque Host/recovery lineage identity.
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[schemars(transparent)]

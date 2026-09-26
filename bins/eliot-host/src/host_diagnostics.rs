@@ -18,12 +18,13 @@
 //!
 //! Delivery is workspace `tracing` only, written to stderr so the
 //! newline-delimited console protocol on stdout
-//! (`host_console_protocol::write_response`) is never contaminated. The
-//! facade itself routes to `tracing` only: its Windows Event Log arm stays
-//! an explicitly unavailable seam (see [`DiagnosticSink`]), while real
-//! delivery through #984's landed safe port lives in the
-//! `windows_event_log` wrapper, never here. This facade acquires no Event
-//! Log FFI and never fakes delivery through another sink.
+//! (`host_console_protocol::write_response`) is never contaminated. Every
+//! projected Host request additionally routes its admitted
+//! service start/stop/failure record to the `windows_event_log` wrapper,
+//! where real delivery through #984's landed safe port happens; that
+//! wrapper, not this facade, owns the mapping and the OS call, and this
+//! facade never acquires Event Log FFI and never fakes delivery through
+//! another sink.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -631,6 +632,7 @@ impl HostRequestProjection {
 /// All macro arguments are precomputed pure values, so a disabled event
 /// evaluates no extra effectful operation.
 pub fn observe_host_request(projection: &HostRequestProjection) {
+    publish_projected_event_log_record(projection);
     let installation = projection.installation.as_ref();
     tracing::info!(
         target: HOST_DIAGNOSTICS_TARGET,
@@ -659,5 +661,66 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
         receipt_exit = projection.receipt_exit.unwrap_or(0),
         receipt_exit_missing = projection.receipt_exit.is_none(),
         "host request projection"
+    );
+}
+
+/// Reports the Event Log record a projected Host request carries, if any.
+///
+/// The Event Log admits service start, stop, and failure only
+/// ([`AdmittedEvent`]), so a projection reaches the sink when it both names
+/// one of those operations and carries the evidence that actually supports
+/// it: [`HostRequestEvidence::ProcessStarted`] for a start,
+/// [`HostRequestEvidence::DurableCommitted`] for a stop, and
+/// [`HostRequestEvidence::Failed`] for a failure. Every other evidence class
+/// (sighted, admitted, ready, cancelled, unknown) asserts no completed
+/// operation, so it stays on the stderr `tracing` sink and the Event Log is
+/// never asked to record an outcome the owner did not produce (I14.20: the
+/// diagnostic projects owner state, it never asserts one).
+///
+/// The submission is the same synchronous OS port
+/// [`crate::windows_event_log::report_event`] uses, reached through
+/// [`crate::windows_event_log::report_admitted_event`]. The insertion string
+/// is built here from the projection's own frozen vocabulary (service, phase,
+/// evidence, operation, and the bounded terminal exit when the record
+/// carries one) and is then bounded by the wrapper, so no secret, payload,
+/// free-text, or unredacted error text can cross into the Event Log
+/// (I15.4, I07.20).
+///
+/// Delivery is attempted before the `tracing` record so a blocking or refused
+/// port cannot reorder the two sinks. The outcome is diagnostics only: it
+/// never changes the Host operation, result, order, retry, state, or receipt,
+/// and the typed disposition is recorded on the same stderr sink.
+fn publish_projected_event_log_record(projection: &HostRequestProjection) {
+    let Some(operation) = projection.operation else {
+        return;
+    };
+    if !operation.is_admitted_by(projection.evidence) {
+        return;
+    }
+    let receipt_exit = projection
+        .receipt_exit
+        .map_or_else(String::new, |exit| format!(" exit={exit}"));
+    let correlation = format!(
+        "service={} phase={} evidence={} operation={}{receipt_exit}",
+        crate::SERVICE_NAME,
+        projection.phase.as_str(),
+        projection.evidence.as_str(),
+        operation.as_str(),
+    );
+    let outcome = match crate::windows_event_log::report_admitted_event(operation, &correlation) {
+        // OS acceptance only: not a registered source, not installed message
+        // resources, not downstream delivery, and not a Host result.
+        Ok(delivery) => delivery.as_str(),
+        Err(error) => error.as_str(),
+    };
+    tracing::info!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.event_log_delivery",
+        service = crate::SERVICE_NAME,
+        phase = projection.phase.as_str(),
+        evidence = projection.evidence.as_str(),
+        operation = operation.as_str(),
+        outcome = outcome,
+        "host event log delivery outcome"
     );
 }

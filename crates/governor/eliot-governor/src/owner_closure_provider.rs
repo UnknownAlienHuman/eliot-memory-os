@@ -36,9 +36,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_authority::{
     GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
-    RevocationHistoryEvidence,
+    RevocationClosureState, RevocationClosureVerdict, RevocationHistoryEvidence,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes};
+use eliot_influence::RevocationBounds;
 use eliot_kernel_core::{
     GovernorClosureRestore, GrantActivationIntent, GrantClosureMember, GrantClosureSurvivor,
     IntroductionActivationIntent, IntroductionHydration, RootGrantHydration,
@@ -353,9 +354,15 @@ impl OwnerClosureProvider {
         roots.into_iter().collect()
     }
 
-    /// Enumerates the complete durable descendant closure for one grant at
+    /// Enumerates the same-root durable descendant closure for one grant at
     /// the restored revision: the canonical enumeration authority behind
     /// the Kernel-side closure gate.
+    ///
+    /// This is the same-root denominator only. Receipt-authorized cross-root
+    /// descendants and quarantined dependents are not members here; durable
+    /// fencing consumes [`Self::revocation_closure_verdict`] instead (#2100
+    /// item N3), so a silently-omitted cross-root child can never be
+    /// presented as valid complete closure.
     ///
     /// # Errors
     ///
@@ -370,6 +377,63 @@ impl OwnerClosureProvider {
             .grants
             .delegated_closure(&target)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Serves the honest revocation-closure verdict for one grant at the
+    /// restored revision and fence (#2100 item N3): the same-root
+    /// denominator, the receipt-authorized cross-root descendants with
+    /// their authorizing receipts, the quarantined frontier with its
+    /// separate-quarantine receipts, every traversed transition, and the
+    /// completeness state reconciling the bounded engine outcome against
+    /// the live graph.
+    ///
+    /// The full verdict is always served, including an explicit
+    /// partial/unknown state carrying the exact frontier and omissions.
+    /// Every fencing use refuses unless the state is complete (see
+    /// [`Self::complete_closure_verdict`]): completeness requires every
+    /// omission bound to a verified separate-quarantine receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] for an unknown grant identity
+    /// or a refused bounded traversal.
+    pub fn revocation_closure_verdict(
+        &self,
+        grant_id: &str,
+    ) -> Result<RevocationClosureVerdict, CompositionError> {
+        let target = GrantId::new(grant_id)
+            .map_err(|_| CompositionError::Recovery("grant identity is invalid".to_owned()))?;
+        let bounds = RevocationBounds::default_bounds();
+        self.owner
+            .grants
+            .revocation_closure_verdict(&target, &self.state_fence, &bounds)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Serves the fencing verdict for one grant, refusing unless the closure
+    /// is honestly complete.
+    ///
+    /// A partial/unknown verdict carries unresolved dependents the fence
+    /// cannot account for, so the fencing sites refuse instead of
+    /// presenting an incomplete closure as complete. The exact frontier
+    /// stays available through [`Self::revocation_closure_verdict`].
+    fn complete_closure_verdict(
+        &self,
+        target: &GrantId,
+    ) -> Result<RevocationClosureVerdict, CompositionError> {
+        let bounds = RevocationBounds::default_bounds();
+        let verdict = self
+            .owner
+            .grants
+            .revocation_closure_verdict(target, &self.state_fence, &bounds)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
+            return Err(CompositionError::Owner(
+                "closure verdict is partial or unknown; refusing to present an incomplete closure as complete"
+                    .to_owned(),
+            ));
+        }
+        Ok(verdict)
     }
 
     /// Returns the durable snapshot plus the CURRENT history evidence the
@@ -574,11 +638,36 @@ impl OwnerClosureProvider {
             }
             let target_id = GrantId::new(&target.grant_id)
                 .map_err(|_| CompositionError::Owner("grant identity is invalid".to_owned()))?;
-            let closure = self
-                .owner
-                .grants
-                .delegated_closure(&target_id)
-                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+            // #2100 item N3: fence from the verdict, never from the
+            // same-root-only denominator. A partial/unknown verdict refuses
+            // here; receipt-authorized cross-root descendants refuse below
+            // because the single-root v1 declaration cannot fence an
+            // identity on its own root with its authorizing receipt.
+            let verdict = self.complete_closure_verdict(&target_id)?;
+            if !verdict.authorized_cross_root.is_empty() {
+                return Err(CompositionError::Owner(
+                    "closure has receipt-authorized cross-root descendants the single-root declaration cannot fence; refusing to silently omit them"
+                        .to_owned(),
+                ));
+            }
+            // The complete verdict binds every omitted cross-root dependent
+            // to its verified separate-quarantine receipt: those receipts
+            // are consumed by this gate, and the quarantined identities
+            // stay inert, never fenced members.
+            let quarantined = verdict
+                .quarantined_frontier
+                .iter()
+                .map(|member| member.grant_id.as_str())
+                .collect::<BTreeSet<_>>();
+            if verdict
+                .members
+                .iter()
+                .any(|member| quarantined.contains(member.grant_id.as_str()))
+            {
+                return Err(CompositionError::Owner(
+                    "quarantined identity must never enter the fenced closure".to_owned(),
+                ));
+            }
             let mut preserved = self
                 .registry
                 .preserved
@@ -590,9 +679,9 @@ impl OwnerClosureProvider {
                 .iter()
                 .map(|survivor| survivor.grant_id.as_str())
                 .collect::<BTreeSet<_>>();
-            let mut members = Vec::with_capacity(closure.members.len());
+            let mut members = Vec::with_capacity(verdict.members.len());
             let mut proof_ceiling = ProofCeiling::ObservedExternalEffect;
-            for member in &closure.members {
+            for member in &verdict.members {
                 if preserved_ids.contains(member.grant_id.as_str()) {
                     continue;
                 }
@@ -617,8 +706,8 @@ impl OwnerClosureProvider {
                 schema: GRANT_CLOSURE_SCHEMA.to_owned(),
                 version: GRANT_CLOSURE_VERSION,
                 target_grant_id: target.grant_id.clone(),
-                authority_root_ref: closure.authority_root_ref,
-                grant_graph_revision: closure.revision,
+                authority_root_ref: verdict.authority_root_ref,
+                grant_graph_revision: verdict.revision,
                 members,
                 preserved,
                 proof_ceiling,
@@ -1275,20 +1364,32 @@ impl OwnerClosureProvider {
         }
         let target_id = GrantId::new(target_grant_id)
             .map_err(|_| CompositionError::Owner("preserved target is invalid".to_owned()))?;
-        let closure = self
-            .owner
-            .grants
-            .delegated_closure(&target_id)
-            .map_err(|error| CompositionError::Owner(error.to_string()))?;
-        if !closure
-            .members
-            .iter()
-            .any(|member| member.grant_id.as_str() == survivor.grant_id)
-            || closure
+        // #2100 item N3: test against the verdict denominator — the
+        // same-root members plus the receipt-authorized cross-root
+        // descendants — never the same-root-only enumeration. A
+        // partial/unknown verdict refuses; the quarantined frontier is
+        // excluded because quarantined identities are inert: they are
+        // never fenced and authorize nothing.
+        let verdict = self.complete_closure_verdict(&target_id)?;
+        if verdict.quarantined_frontier.iter().any(|member| {
+            member.grant_id.as_str() == survivor.grant_id
+                || member.grant_id.as_str() == survivor.covering_grant_id
+        }) {
+            return Err(CompositionError::Owner(
+                "preserved survivor and cover must exclude the quarantined frontier".to_owned(),
+            ));
+        }
+        let in_denominator = |grant_id: &str| {
+            verdict
                 .members
                 .iter()
-                .any(|member| member.grant_id.as_str() == survivor.covering_grant_id)
-        {
+                .any(|member| member.grant_id.as_str() == grant_id)
+                || verdict
+                    .authorized_cross_root
+                    .iter()
+                    .any(|member| member.grant_id.as_str() == grant_id)
+        };
+        if !in_denominator(&survivor.grant_id) || in_denominator(&survivor.covering_grant_id) {
             return Err(CompositionError::Owner(
                 "preserved survivor must be a target descendant and its cover must remain outside the fenced closure"
                     .to_owned(),

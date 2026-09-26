@@ -25,8 +25,8 @@
 use std::path::Path;
 
 use crate::{
-    ELIOT_HOST_SERVICE_NAME, FileIdentity, NamedPipeAuthDiscriminator, ProcessIdentity,
-    WindowsAdapterError, file_identity, inspect_process_identity, job_process_ids,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity, NamedPipeAuthDiscriminator,
+    ProcessIdentity, WindowsAdapterError, file_identity, inspect_process_identity, job_process_ids,
     last_windows_adapter_error, process_token_identity, same_process_identity,
     same_process_image_path, service_runtime_sample_is_stable, valid_process_image_path,
     valid_sid_text, windows_adapter_from_io,
@@ -605,23 +605,22 @@ pub fn observe_named_pipe_peer_process_in_job(
     Err(WindowsAdapterError::Unavailable)
 }
 
-/// Queries the canonical `EliotHost` service and retains its live PID, process
+/// Queries a canonical ELIOT SCM service and retains its live PID, process
 /// creation time and image identity for subsequent named-pipe admission.
 /// Request data cannot supply any of those identity fields.
-///
-/// # Errors
-///
-/// Returns a typed adapter error when the service cannot be queried, is not
-/// running, or its live process identity cannot be observed.
 #[cfg(windows)]
-pub fn observe_running_eliot_host_process()
--> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+fn observe_running_canonical_service_process(
+    service_name: &str,
+) -> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
         SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
     };
-    let name = std::ffi::OsStr::new(ELIOT_HOST_SERVICE_NAME)
+    if !crate::canonical_runtime_service_name(service_name) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    let name = std::ffi::OsStr::new(service_name)
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
@@ -691,8 +690,53 @@ pub fn observe_running_eliot_host_process()
     }
     result
 }
+/// Queries the canonical `EliotHost` service and retains its live PID, process
+/// creation time and image identity for subsequent named-pipe admission.
+/// Request data cannot supply any of those identity fields.
+///
+/// # Errors
+///
+/// Returns a typed adapter error when the service cannot be queried, is not
+/// running, or its live process identity cannot be observed.
+#[cfg(windows)]
+pub fn observe_running_eliot_host_process()
+-> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    observe_running_canonical_service_process(ELIOT_HOST_SERVICE_NAME)
+}
+
+/// Queries the canonical `EliotWatchdog` service and retains its live PID,
+/// process creation time and image identity for subsequent named-pipe
+/// admission.
+///
+/// The Watchdog is an SCM-owned sibling service outside the Host and Kernel
+/// failure domain (I1.4, I8.1), so its pipe role is admitted from the process
+/// the SCM itself reports rather than from a Host- or Kernel-injected value.
+/// The evidence is exactly the sealed kind the Host role already uses: the
+/// live process is opened and observed by the platform adapter, the SCM sample
+/// is re-read, and both process bindings must be identical, so request data
+/// cannot supply a PID, start time, image path, or executable file identity. A
+/// Watchdog that is not running yields a typed error and therefore no Watchdog
+/// role at all, which fails peer selection closed instead of admitting a
+/// weaker substitute role.
+///
+/// # Errors
+///
+/// Returns a typed adapter error when the service cannot be queried, is not
+/// running, or its live process identity cannot be observed.
+#[cfg(windows)]
+pub fn observe_running_eliot_watchdog_process()
+-> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    observe_running_canonical_service_process(ELIOT_WATCHDOG_SERVICE_NAME)
+}
+
 #[cfg(not(windows))]
 pub fn observe_running_eliot_host_process()
+-> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
+    Err(WindowsAdapterError::Unavailable)
+}
+
+#[cfg(not(windows))]
+pub fn observe_running_eliot_watchdog_process()
 -> Result<NamedPipePeerProcessBinding, WindowsAdapterError> {
     Err(WindowsAdapterError::Unavailable)
 }

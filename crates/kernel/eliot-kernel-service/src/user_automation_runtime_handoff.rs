@@ -8,6 +8,10 @@
 //! never reported as an execution result, and a required handoff that is absent
 //! or unknown is never answered as a known success with no recovery directive.
 //!
+//! The transition also carries the one post-commit orchestration record of that
+//! parent operation, so the runtime obligations retained before any owner effect
+//! are reported beside the phases they produced.
+//!
 //! [`UserAutomationOperatorRuntime`] is the concrete
 //! [`UserAutomationRuntimePort`](super::UserAutomationRuntimePort) over the
 //! already-authenticated `USER_AUTOMATION_RUNTIME_OPERATION` Host channel. It
@@ -36,6 +40,10 @@ use super::user_automation_execution::{
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionTransport,
+};
+use super::user_automation_orchestration::{
+    UserAutomationOrchestrationRecord, UserAutomationRuntimeObligation,
+    UserAutomationRuntimeObligationDisposition,
 };
 
 /// Stable wire identity of the post-commit orchestration transition.
@@ -345,6 +353,13 @@ pub struct UserAutomationOperatorTransition {
     /// `None` rather than an empty horizon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub horizon: Option<Box<UserAutomationHorizonPhase>>,
+    /// The one post-commit orchestration record of this parent operation, bound
+    /// to the runtime obligations that are retained durably before any owner
+    /// effect is issued. It is `None` exactly when the operation owns no
+    /// runtime obligation, which is a complete answer about an obligation that
+    /// never existed rather than an empty record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Box<UserAutomationOrchestrationRecord>>,
 }
 
 impl UserAutomationOperatorTransition {
@@ -357,11 +372,20 @@ impl UserAutomationOperatorTransition {
         wake: UserAutomationWakePhase,
         execution: UserAutomationExecutionPhase,
     ) -> Self {
-        Self::with_horizon(identity, state_fence, configuration, wake, execution, None)
+        Self::with_horizon(
+            identity,
+            state_fence,
+            configuration,
+            wake,
+            execution,
+            None,
+            None,
+        )
     }
 
     /// Composes the parent transition with the bounded recurring horizon this
-    /// operation published, if it owns one.
+    /// operation published, if it owns one, and the post-commit orchestration
+    /// record its runtime obligations were retained under, if it owns any.
     #[must_use]
     pub fn with_horizon(
         identity: OperationIdentity,
@@ -370,6 +394,7 @@ impl UserAutomationOperatorTransition {
         wake: UserAutomationWakePhase,
         execution: UserAutomationExecutionPhase,
         horizon: Option<UserAutomationHorizonPhase>,
+        orchestration: Option<UserAutomationOrchestrationRecord>,
     ) -> Self {
         Self {
             wire_id: USER_AUTOMATION_TRANSITION_WIRE_ID.to_owned(),
@@ -380,6 +405,7 @@ impl UserAutomationOperatorTransition {
             wake,
             execution,
             horizon: horizon.map(Box::new),
+            orchestration: orchestration.map(Box::new),
         }
     }
 
@@ -424,20 +450,28 @@ impl UserAutomationOperatorTransition {
         }
         match &self.execution {
             UserAutomationExecutionPhase::UnknownOutcome { reason } => {
-                Some(UserAutomationRecoveryPhase::UnknownOutcome {
+                return Some(UserAutomationRecoveryPhase::UnknownOutcome {
                     reason: reason.clone(),
-                })
+                });
             }
             UserAutomationExecutionPhase::Unavailable { reason } => {
-                Some(UserAutomationRecoveryPhase::Unavailable {
+                return Some(UserAutomationRecoveryPhase::Unavailable {
                     reason: reason.clone(),
-                })
+                });
             }
             UserAutomationExecutionPhase::NotApplicable { .. }
             | UserAutomationExecutionPhase::Admitted { .. }
             | UserAutomationExecutionPhase::Deferred { .. }
-            | UserAutomationExecutionPhase::BlockedConfig { .. } => None,
+            | UserAutomationExecutionPhase::BlockedConfig { .. } => {}
         }
+        // The retained obligations are the last source of a directive, so a
+        // runtime obligation this operation still owns can never be reported
+        // beside a null recovery, and a phase that already named a more
+        // specific reason keeps it.
+        self.orchestration
+            .as_ref()
+            .and_then(|record| record.outstanding().into_iter().next())
+            .map(recovery_phase_for_obligation)
     }
 
     /// Reports whether every phase of this transition is owner-proven.
@@ -501,6 +535,32 @@ impl UserAutomationOperatorTransition {
                 }
             }
         }
+        if let Some(orchestration) = &self.orchestration {
+            orchestration
+                .validate()
+                .map_err(|error| error.to_string())?;
+            if orchestration.parent != self.identity
+                || orchestration.state_fence != self.state_fence
+            {
+                return Err(
+                    "a post-commit orchestration record is not bound to this parent operation and \
+                     State Fence"
+                        .to_owned(),
+                );
+            }
+            if !orchestration.resolved() && self.recovery().is_none() {
+                // The one invariant that makes a retained obligation visible: a
+                // runtime obligation this operation still owns, whose owner
+                // effect is not durably answered, can never be reported beside a
+                // null recovery directive. `recovery` derives its directive from
+                // the same record, so this check refuses any projection where the
+                // two could disagree.
+                return Err(
+                    "an unanswered post-commit runtime obligation requires a recovery directive"
+                        .to_owned(),
+                );
+            }
+        }
         for reason in [
             match &self.wake {
                 UserAutomationWakePhase::NotApplicable { reason }
@@ -535,6 +595,53 @@ fn committed_revision_id(phase: &UserAutomationConfigurationPhase) -> Option<Str
     match phase.mutation_result()? {
         UserAutomationMutationResult::Revision { revision, .. } => Some(revision.revision.clone()),
         UserAutomationMutationResult::RunNow { .. } => None,
+    }
+}
+
+/// Recovery directive for one runtime obligation that is not durably answered.
+///
+/// A `Reconciling` obligation is one whose owner effect may already have been
+/// issued, so its directive is the unknown-outcome one: the original owner
+/// operation identity must be reconciled before the effect is repeated or
+/// released. A `Retained` obligation was never issued and an `Unavailable` one
+/// could not be retained at all; both are owed to an owner that is not
+/// currently reachable. An answered obligation is never passed here, because the
+/// caller only asks for obligations that are not durably answered, and the arm
+/// states that fact rather than assuming it.
+fn recovery_phase_for_obligation(
+    obligation: &UserAutomationRuntimeObligation,
+) -> UserAutomationRecoveryPhase {
+    match &obligation.disposition {
+        UserAutomationRuntimeObligationDisposition::Reconciling { reason } => {
+            UserAutomationRecoveryPhase::UnknownOutcome {
+                reason: reason.clone(),
+            }
+        }
+        UserAutomationRuntimeObligationDisposition::Retained => {
+            UserAutomationRecoveryPhase::Unavailable {
+                reason: format!(
+                    "runtime obligation {} of kind {} covers {} exact occurrence identities and is \
+                     durably retained, but its owner effect has not been issued",
+                    obligation.owner_operation_id,
+                    obligation.kind.as_str(),
+                    obligation.subject_ids.len()
+                ),
+            }
+        }
+        UserAutomationRuntimeObligationDisposition::Unavailable { reason } => {
+            UserAutomationRecoveryPhase::Unavailable {
+                reason: reason.clone(),
+            }
+        }
+        UserAutomationRuntimeObligationDisposition::Answered { .. } => {
+            UserAutomationRecoveryPhase::Unavailable {
+                reason: format!(
+                    "runtime obligation {} is reported without a durable owner answer, which this \
+                     outbox never records",
+                    obligation.owner_operation_id
+                ),
+            }
+        }
     }
 }
 

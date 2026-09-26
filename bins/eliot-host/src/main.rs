@@ -1189,8 +1189,8 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         // I1.5: an authenticated request on the runtime-control plane is an
         // observable-use trigger. It both restarts the idle grace and may
         // cancel a pre-linearization drain.
-        for evidence in process_runtime_control_requests(&mut host, &runtime_queue) {
-            idle_drain.note_observable_use(&mut host, &evidence);
+        for (trigger, evidence) in process_runtime_control_requests(&mut host, &runtime_queue) {
+            idle_drain.note_observable_use(&mut host, trigger, &evidence);
         }
         // One bounded sweep of the authenticated `UserAutomation` owner queue.
         // The dedicated execution pipe blocks until this drain answers, so it
@@ -1435,19 +1435,55 @@ fn process_user_automation_owner_requests(host: &HostComposition) {
     }
 }
 
+/// I1.5 trigger class of one authenticated runtime-control request.
+///
+/// The class is derived from the request that actually arrived on the
+/// authenticated front door, not from a fixed class chosen for the plane. The
+/// projection is total over [`HostRuntimeControlOperation`] and reuses only
+/// the frozen [`ActivationTriggerClass`] vocabulary, so two different request
+/// kinds persist two different `trigger_class` / `required_capabilities` pairs
+/// instead of one spelling for every real ingress.
+///
+/// * `RestartKernel` / `ReconcileKernelRestart` restart or reconcile the
+///   control contour itself. I1.5 "approved maintenance, backup, migration or
+///   recovery job", which requests the contour and the store but not the
+///   independent supervision branch.
+/// * `RecoverStore` / `ReconcileStoreRecovery` perform a protected store
+///   effect that still requires supervision. I1.5 "protected external effect
+///   that still requires supervision".
+/// * `DeliverReactiveContext` hands owner-produced Context to an attached
+///   agent/session. I1.5 "MCP/agent bridge attach or tool call".
+/// * `AdmitUserAutomationOccurrence` / `CancelUserAutomationPendingWakes`
+///   admit or cancel an occurrence of one ELIOT-launched automation attempt.
+///   I1.5 "ELIOT-launched `AgentAttempt` or external-agent reconciliation"; the
+///   two share a class because both are the same attempt on the automation
+///   plane, one admitting its occurrence and one withdrawing its pending wakes.
+#[cfg(windows)]
+fn runtime_control_trigger_class(
+    operation: &HostRuntimeControlOperation,
+) -> ActivationTriggerClass {
+    match runtime_control_dispatch(operation) {
+        RuntimeControlDispatch::Kernel => ActivationTriggerClass::ApprovedMaintenanceJob,
+        RuntimeControlDispatch::Store => ActivationTriggerClass::ProtectedExternalEffect,
+        RuntimeControlDispatch::ReactiveContext => ActivationTriggerClass::AgentBridgeAttach,
+        RuntimeControlDispatch::UserAutomation => ActivationTriggerClass::AgentAttempt,
+    }
+}
+
 /// Serves every queued authenticated runtime-control request and returns the
-/// durable trigger evidence of every request admitted in this pass.
+/// proven ingress of every request admitted in this pass.
 ///
 /// I1.5 makes an authenticated Kernel/CLI/UI/bridge request an activation
 /// trigger, and the same request must be able to cancel a pre-linearization
-/// drain. Returning the evidence — instead of leaving the trigger implicit in
-/// the request handler — lets
-/// [`HostComposition::note_observable_use`] record it durably.
+/// drain. Returning the trigger class next to the evidence — instead of
+/// leaving the trigger implicit in the request handler — lets
+/// [`HostComposition::note_observable_use`] record the real class and its
+/// capability set durably.
 #[cfg(windows)]
 fn process_runtime_control_requests(
     host: &mut HostComposition,
     queue: &eliot_host::HostRuntimeControlQueue,
-) -> Vec<PlatformHandle> {
+) -> Vec<(ActivationTriggerClass, PlatformHandle)> {
     let mut observed = Vec::new();
     loop {
         let request = match queue.lock() {
@@ -1455,6 +1491,7 @@ fn process_runtime_control_requests(
             Err(_) => None,
         };
         let Some(envelope) = request else { break };
+        let trigger = runtime_control_trigger_class(&envelope.request().operation);
         let response = match runtime_control_dispatch(&envelope.request().operation) {
             RuntimeControlDispatch::Kernel => {
                 host.handle_kernel_restart_request(envelope.request())
@@ -1469,7 +1506,7 @@ fn process_runtime_control_requests(
         };
         // The authenticated request digest is the durable trigger evidence; the
         // endpoint already proved the peer before queueing this envelope.
-        observed.push(envelope.request().request_digest.clone());
+        observed.push((trigger, envelope.request().request_digest.clone()));
         let _ = envelope.respond(response);
     }
     observed
@@ -1646,10 +1683,19 @@ impl HostIdleDrainSupervisor {
     /// One authenticated observable-use trigger was admitted. I1.5: a trigger
     /// before the durable drain linearization point cancels drain and returns
     /// the same generation to `ACTIVE` after readiness revalidation.
-    fn note_observable_use(&mut self, host: &mut HostComposition, evidence: &PlatformHandle) {
+    ///
+    /// `trigger` is the class of the request that actually arrived, so the
+    /// durable `trigger_class` / `required_capabilities` of this generation
+    /// reflect the real ingress rather than one class for the whole plane.
+    fn note_observable_use(
+        &mut self,
+        host: &mut HostComposition,
+        trigger: ActivationTriggerClass,
+        evidence: &PlatformHandle,
+    ) {
         self.idle_since = None;
         self.precommit_opened_at = None;
-        match host.note_observable_use(ActivationTriggerClass::AgentBridgeAttach, evidence) {
+        match host.note_observable_use(trigger, evidence) {
             Ok(DrainWakeOutcome::CancelDrain) => {
                 // A cancellation ends the drain attempt and changes the
                 // obligation set, so the cached census is no longer authority

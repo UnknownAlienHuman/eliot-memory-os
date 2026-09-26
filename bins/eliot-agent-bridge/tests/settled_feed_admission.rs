@@ -75,6 +75,13 @@ impl McpForwardingPort for OkForwarder {
             "reconciliation not exercised",
         ))
     }
+
+    fn reconciliation_imported(
+        &mut self,
+        _binding: &AttachBinding,
+        _result: &eliot_agent_bridge_core::ReconciliationPortResult,
+    ) {
+    }
 }
 
 fn attached_runner(session: &str) -> BridgeRunner {

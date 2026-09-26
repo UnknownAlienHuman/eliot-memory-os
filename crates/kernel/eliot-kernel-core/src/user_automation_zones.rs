@@ -63,14 +63,18 @@ const PINNED_ZONE_TABLE: &str = include_str!("user_automation_zone_table.tzd");
 ///
 /// Regenerating the table changes this constant, which is a deliberate, visible
 /// act: a database update can never silently rewrite an existing revision.
-const PINNED_ZONE_TABLE_SHA256: &str =
-    "f702c1d3e98a530500ff22d2ff88a3a0e222512449ead590947602d11bf9630b";
+pub(crate) const PINNED_ZONE_TABLE_SHA256: &str =
+    "b65a60cafecc6fb71679825f81de3367ae6014222c8d175b388e48eaa36a246d";
 
 /// The only zone database release this build admits.
 pub(crate) const PINNED_ZONE_DATABASE_RELEASE: &str = "2026c";
 
-/// Format tag the table header must carry.
-pub(crate) const ZONE_TABLE_FORMAT: &str = "eliot.user-automation.zone-table.v1";
+/// Format and semantic-unit domain tag the table header must carry.
+///
+/// Version 2 explicitly binds the table's seconds unit. Version 1 bytes are
+/// refused even if they declare seconds, because that identity did not bind the
+/// unit contract and was also used for the prior seconds-as-minutes interpretation.
+pub(crate) const ZONE_TABLE_FORMAT: &str = "eliot.user-automation.zone-table.v2";
 
 /// The only offset unit the table header may declare.
 ///
@@ -78,7 +82,7 @@ pub(crate) const ZONE_TABLE_FORMAT: &str = "eliot.user-automation.zone-table.v1"
 /// This module requires that declaration and refuses a table without it, so the
 /// wire unit is decided by the data rather than assumed by the consumer. Changing
 /// this token without regenerating the table makes every lookup fail closed.
-const ZONE_TABLE_OFFSET_UNIT: &str = "seconds";
+pub(crate) const ZONE_TABLE_OFFSET_UNIT: &str = "seconds";
 
 /// Inclusive first instant of the admitted window: `1970-01-01T00:00:00Z`.
 pub(crate) const ZONE_TABLE_WINDOW_START_SECONDS: i64 = 0;
@@ -280,7 +284,8 @@ impl TableHeader {
     }
 
     /// Requires the declared format, offset unit and release to be exactly the
-    /// pinned ones.
+    /// pinned ones. The v2 format tag is the explicit boundary that refuses v1
+    /// table bytes rather than treating the unit addition as a silent v1 update.
     ///
     /// The offset unit is required because it is what the body is read in. A table
     /// that does not declare one leaves this `None`, and the whole table is refused

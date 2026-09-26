@@ -34,16 +34,24 @@
 //! Two more disciplines close the loop's edges:
 //!
 //! - **External control is real intake, not self-talk.** An installed
-//!   [`KernelControlReader`] polls the owner-staged control-request file on
-//!   every tick — including while guest work is pending — and admits what
-//!   it yields through the same frame shape, parse, and binding validation
-//!   the delivery-set path uses, so one admission path serves both sources.
-//!   Only an identity-matching Cancel/Reconcile/Shutdown is consumed;
-//!   anything else is left for its own delivery.
-//! - **Emission and cleanup are bounded.** One result frame gets a bounded
-//!   stdout wait and then fails closed, never reusing the contended stream,
-//!   and the staged set is consumed only while it still names the served
-//!   generation, so a replacement staged mid-run is never deleted.
+//!   [`KernelControlReader`] polls the owner-published replayable control
+//!   spool on every tick — including while guest work is pending — and admits
+//!   what it yields through the same frame shape, parse, and binding
+//!   validation the delivery-set path uses, so one admission path serves both
+//!   sources. A delivery is acknowledged only after admission plus successful
+//!   worker enqueue, by staging an ack beside its exact generation/sequence
+//!   name; deliveries are never deleted by the child, and anything
+//!   unadmittable stays in place as typed evidence for the owner.
+//!   An admitted Cancel/Shutdown interrupts pending guest work without
+//!   consuming its owner delivery; Reconcile waits for the idle path.
+//! - **Emission and cleanup are bounded.** Each result event is validated
+//!   and gets a bounded caller wait on stdout; a caller timeout retains
+//!   the helper for tracked termination and never reuses the contended
+//!   stream while it runs, and the staged set is consumed only while it
+//!   still names the served generation, so a replacement staged mid-run is
+//!   never deleted. Control spool files and acks are owner-reclaimed;
+//!   cleanup deletes none of them, so a stale operation can never remove
+//!   a newer control.
 //!
 //! The experimental describe path and the one-shot guest-child protocol are
 //! separate modes reachable only through their own CLI branches; the
@@ -55,11 +63,16 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::time::Duration;
 
+use eliot_contracts::sha256_hex;
+use eliot_wasm_runtime::lifecycle::InFlightDisposition;
 use eliot_wasm_runtime::{
-    EngineBinding, InvocationRequest, InvocationResult, Sha256Digest, VerificationVerdict,
+    EngineBinding, GuestInterruptHandle, InvocationRequest, InvocationResult, Sha256Digest,
+    VerificationVerdict,
 };
 
 use crate::WasmHostRunner;
@@ -69,8 +82,13 @@ use crate::dispatch_drive::{
     evaluate_seated_verdicts,
 };
 use crate::dispatch_material::{
-    MaterialError, ValidatedDispatchMaterial, WASM_HOST_CONTROL_FILE_NAME, admitted_material_path,
-    consume_staged, read_dispatch_material, read_staged_bytes,
+    ControlAckPhase, ControlFileClass, ExpectedControlBinding, MaterialError,
+    ValidatedDispatchMaterial, WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION,
+    WASM_CONTROL_MAX_DETAIL_BYTES, WASM_CONTROL_SPOOL_MAX_DELIVERIES, WASM_CONTROL_SPOOL_SCAN_CAP,
+    WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
+    admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
+    parse_control_delivery, parse_control_name, read_control_bytes, retire_legacy_control,
+    stage_control_bytes,
 };
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{AdmittedRuntime, build_admitted_runtime};
@@ -91,6 +109,34 @@ pub const OP_SHUTDOWN: &str = "wasm_host_shutdown";
 /// Result-frame wire identity, matched exactly with the request wire so one
 /// correlated receipt answers one request.
 pub const WASM_HOST_RESULT_WIRE_ID: &str = "eliot.wasm.host-result";
+/// Result-event wire version (#2787). Independent of the request constant:
+/// the result family is its own versioned contract, so a request-shape
+/// revision never silently re-versions emitted results and a result-shape
+/// revision never admits foreign requests. Version 2 adds the required
+/// bounded `observation_predecessors` field; this producer no longer emits
+/// version 1. Consumers must reject every other version. (Prior emissions
+/// carried the request constant by defect.)
+pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 2;
+/// Closed observation phase: the frame observes guest execution.
+pub const RESULT_PHASE_EXECUTE: &str = "execute";
+/// Closed observation phase: the frame observes containment of an uncertain
+/// attempt through the runtime owner.
+pub const RESULT_PHASE_CONTAIN: &str = "contain";
+/// Closed observation phase: the frame observes reconciliation of an
+/// uncertain attempt through its owners.
+pub const RESULT_PHASE_RECONCILE: &str = "reconcile";
+/// Closed observation phase: the frame refuses before execution. Admission
+/// denials currently surface as the process exit path (stderr plus exit
+/// status), not as stdout frames, so no producer emits this phase today; it
+/// stays in the closed vocabulary so a future pre-execution denial frame
+/// cannot masquerade as an execution observation.
+pub const RESULT_PHASE_DENY: &str = "deny";
+/// Bound on the retained/emitted result-event sequence per operation
+/// (#2787). The follow-up taxonomy admits at most one initial observation
+/// plus one follow-up observation per operation, so two events is the
+/// structural maximum; the bound leaves headroom for future bounded phases
+/// without permitting unbounded growth, and emission fails closed past it.
+pub const MAX_RESULT_SEQUENCE: u64 = 8;
 
 /// Bounded result-byte budget: the largest result frame the loop publishes.
 pub const MAX_RESULT_FRAME_BYTES: usize = 64 * 1024;
@@ -122,6 +168,34 @@ pub enum LoopError {
     ChannelUnavailable,
     /// The result frame exceeded the admitted result-byte budget.
     ResultTooLarge,
+    /// A result frame failed its own consistency validation before
+    /// emission (#2787: digest/length/hex agreement, omission semantics,
+    /// engine/claim/operation bindings, phase versus command, sequence
+    /// bound). A frame that cannot prove itself is never emitted.
+    ResultInvalid {
+        /// Stable field name.
+        field: &'static str,
+    },
+    /// A command was not accepted because the bounded command queue was full.
+    CommandQueueFull {
+        /// Exact command whose enqueue remains pending.
+        command: &'static str,
+    },
+    /// A command was not accepted because the worker command receiver closed.
+    CommandChannelDisconnected {
+        /// Exact command whose enqueue was refused.
+        command: &'static str,
+    },
+    /// The worker exited before returning the accepted command's outcome.
+    WorkerTerminatedWithoutOutcome {
+        /// Exact accepted command whose outcome remains unknown.
+        command: &'static str,
+    },
+    /// The worker outcome channel disconnected before the accepted command replied.
+    OutcomeChannelDisconnected {
+        /// Exact accepted command whose outcome remains unknown.
+        command: &'static str,
+    },
 }
 
 impl LoopError {
@@ -132,6 +206,13 @@ impl LoopError {
             Self::RequestDenied { .. } => "REQUEST_LOOP_DENIED",
             Self::ChannelUnavailable => "REQUEST_LOOP_CHANNEL_UNAVAILABLE",
             Self::ResultTooLarge => "REQUEST_LOOP_RESULT_TOO_LARGE",
+            Self::ResultInvalid { .. } => "REQUEST_LOOP_RESULT_INVALID",
+            Self::CommandQueueFull { .. } => "REQUEST_LOOP_COMMAND_QUEUE_FULL",
+            Self::CommandChannelDisconnected { .. } => "REQUEST_LOOP_COMMAND_CHANNEL_DISCONNECTED",
+            Self::WorkerTerminatedWithoutOutcome { .. } => {
+                "REQUEST_LOOP_WORKER_TERMINATED_WITHOUT_OUTCOME"
+            }
+            Self::OutcomeChannelDisconnected { .. } => "REQUEST_LOOP_OUTCOME_CHANNEL_DISCONNECTED",
         }
     }
 }
@@ -140,6 +221,12 @@ impl fmt::Display for LoopError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RequestDenied { field } => write!(formatter, "{}:{field}", self.code()),
+            Self::CommandQueueFull { command }
+            | Self::CommandChannelDisconnected { command }
+            | Self::WorkerTerminatedWithoutOutcome { command }
+            | Self::OutcomeChannelDisconnected { command } => {
+                write!(formatter, "{}:{command}", self.code())
+            }
             other => formatter.write_str(other.code()),
         }
     }
@@ -163,6 +250,9 @@ pub struct AdmittedBinding {
     invocation_id: String,
     request_digest: String,
     grant_digest: String,
+    generation: u64,
+    work_scope: String,
+    authority_epoch_json: String,
     component_id: String,
     artifact_digest: String,
     input_digest: String,
@@ -186,6 +276,9 @@ impl AdmittedBinding {
             invocation_id: request.invocation_id.as_str().to_owned(),
             request_digest: request.request_digest().as_str().to_owned(),
             grant_digest: material.grant.grant_digest.as_str().to_owned(),
+            generation: material.generation,
+            work_scope: material.work.work_scope.clone(),
+            authority_epoch_json: material.authority_epoch_json.clone(),
             component_id: ceilings.component_id.clone(),
             artifact_digest: ceilings.artifact_digest.as_str().to_owned(),
             input_digest: ceilings.input_digest.as_str().to_owned(),
@@ -406,17 +499,58 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
     Ok(())
 }
 
-/// Correlated owner-backed result frame. Bounded serialization only: the
-/// guest output travels as lowercase hex under the admitted output
-/// ceiling, and a frame that would exceed the result budget is published
-/// with the payload omitted and its digest retained.
+/// Correlated owner-backed result event (#2787: the one versioned result
+/// contract). Bounded serialization only: the guest output travels as
+/// lowercase hex under the admitted output ceiling, and a frame that would
+/// exceed the result budget is published with the payload omitted and its
+/// digest retained.
+///
+/// This is the only schema ever emitted under [`WASM_HOST_RESULT_WIRE_ID`]:
+/// there is no second parallel result DTO. Allowed stream sequences per
+/// operation, all under [`WASM_HOST_RESULT_WIRE_VERSION`] with gapless
+/// `sequence` values from 0 and exactly one `terminal: true` event closing
+/// the stream:
+/// - one terminal success/refusal event (healthy execution, worker
+///   refusal);
+/// - one nonterminal `Unknown` execution event followed by one terminal
+///   containment/reconciliation event carrying its own command/phase
+///   identity and an ordered reference to the prior observation, with the
+///   original uncertainty preserved, never rewritten;
+/// - a publication failure surfaces through the loop error and the retained
+///   observation, never as an ad hoc fallback object.
+///
+/// Consumers must reject mixed versions, duplicate terminal events, sequence
+/// gaps, and contradictory identities. Absence stays absence per I5.16:
+/// `None` serializes absent, measured zero stays numeric zero, Booleans stay
+/// Booleans, and no formatting helper feeds stringified values back into
+/// this contract.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+// Four JSON Booleans are the versioned wire shape (#2787 step 4: Booleans
+// stay Booleans); an enum would break the Boolean contract.
+#[allow(clippy::struct_excessive_bools)]
 pub struct WasmHostResultFrame {
     /// Result wire identity.
     pub wire_id: &'static str,
-    /// Result wire version.
+    /// Result wire version ([`WASM_HOST_RESULT_WIRE_VERSION`]).
     pub wire_version: u16,
+    /// Closed observation phase (`execute`, `contain`, `reconcile`, `deny`):
+    /// what this event observes. A Cancel/Reconcile outcome carries its own
+    /// phase and never masquerades as a new Invoke result.
+    pub phase: String,
+    /// Worker command this event observes (`execute`, `cancel`,
+    /// `reconcile`); `None` when the frame refuses before any worker
+    /// command ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_command: Option<String>,
+    /// Bounded event sequence number within the operation, from 0, gapless.
+    pub sequence: u64,
+    /// Complete ordered prefix of prior observation sequence numbers used by
+    /// this event. The first event has no predecessors; each follow-up names
+    /// every retained event before it, bounded by `sequence`.
+    pub observation_predecessors: Vec<u64>,
+    /// Whether this event closes the operation's result stream.
+    pub terminal: bool,
     /// Operation this frame answers.
     pub operation: String,
     /// Admitted claim identity.
@@ -435,29 +569,50 @@ pub struct WasmHostResultFrame {
     pub artifact_digest: String,
     /// Proven input digest.
     pub input_digest: String,
-    /// Seated engine mode identity.
-    pub engine_implementation_id: String,
-    /// Seated engine exact version.
-    pub engine_version: String,
+    /// Opaque #2786 delivery identity passthrough. `None` until the
+    /// delivery/acknowledgement lane binds it; carried as an opaque string,
+    /// never interpreted here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    /// Seated engine mode identity; `None` when no engine observation
+    /// exists (a refusal invents no engine evidence).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_implementation_id: Option<String>,
+    /// Seated engine exact version; `None` when no engine observation
+    /// exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
     /// Classified disposition.
     pub disposition: String,
     /// Typed error code, when the invocation did not succeed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// SHA-256 of the guest output bytes.
+    /// SHA-256 of the guest output bytes; present only when output bytes
+    /// were actually observed (or retained under omission).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<String>,
     /// Guest output byte count actually observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_bytes: Option<u64>,
-    /// Lowercase-hex guest output, omitted when the frame budget is spent.
+    /// Lowercase-hex guest output, present only when output bytes were
+    /// actually observed: absent output stays absent (never empty hex), an
+    /// observed empty vector serializes as `""`, and a budget-omitted
+    /// payload is `None` with `output_omitted` set.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_hex: Option<String>,
     /// True when the output payload was omitted under the frame budget.
     pub output_omitted: bool,
     /// Child-observed fuel consumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuel_consumed: Option<u64>,
     /// Child-observed peak memory bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
     /// Child-observed table elements.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub table_elements: Option<u64>,
     /// Child-observed epoch ticks.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epoch_ticks: Option<u64>,
     /// Lifecycle verdicts evaluated from the retained result.
     pub verdict_shadow: String,
@@ -465,8 +620,10 @@ pub struct WasmHostResultFrame {
     pub verdict_rollback: String,
     pub verdict_cutover: String,
     /// Seated trap / cancel / drain / rollback verdicts for the same run.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trap: Option<String>,
     pub cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<String>,
     pub rollback_candidate: bool,
 }
@@ -519,9 +676,20 @@ fn usage_frames(result: &InvocationResult) -> (Option<u64>, Option<u64>, Option<
 }
 
 /// Projects one classified invocation result onto the correlated frame.
+///
+/// The observed worker command fixes the frame's operation, phase, and
+/// worker-command identities: a Cancel outcome answers [`OP_CANCEL`] in the
+/// `contain` phase, a Reconcile outcome answers [`OP_RECONCILE`] in the
+/// `reconcile` phase, and neither ever masquerades as a new Invoke result.
+/// Absent output stays absent: `output_hex` is present only when output
+/// bytes were actually observed, so no-output, observed-empty, and
+/// budget-omitted stay distinct. Sequence and terminal disposition are
+/// assigned by the loop when the frame joins the retained sequence, not
+/// here.
 fn project_result(
     binding: &AdmittedBinding,
     engine: &EngineBinding,
+    command: WorkerCommand,
     result: &InvocationResult,
 ) -> WasmHostResultFrame {
     let (shadow, canary, rollback, cutover) = lifecycle_frame(evaluate_lifecycle_verdicts(result));
@@ -530,8 +698,13 @@ fn project_result(
     let (fuel_consumed, peak_memory_bytes, table_elements, epoch_ticks) = usage_frames(result);
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID,
-        wire_version: WASM_HOST_REQUEST_WIRE_VERSION,
-        operation: OP_INVOKE.to_owned(),
+        wire_version: WASM_HOST_RESULT_WIRE_VERSION,
+        phase: command_phase(command).to_owned(),
+        worker_command: Some(command_name(command).to_owned()),
+        sequence: 0,
+        observation_predecessors: Vec::new(),
+        terminal: false,
+        operation: command_operation(command).to_owned(),
         claim_id: binding.claim_id.clone(),
         operation_id: binding.operation_id.clone(),
         invocation_id: binding.invocation_id.clone(),
@@ -540,8 +713,9 @@ fn project_result(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        engine_implementation_id: engine.implementation_id.clone(),
-        engine_version: engine.exact_version.clone(),
+        delivery_id: None,
+        engine_implementation_id: Some(engine.implementation_id.clone()),
+        engine_version: Some(engine.exact_version.clone()),
         disposition: disposition_text(result.receipt.disposition),
         error: result
             .receipt
@@ -553,7 +727,7 @@ fn project_result(
             .as_ref()
             .map(|bytes| Sha256Digest::of_bytes(bytes).as_str().to_owned()),
         output_bytes: result.output.as_ref().map(|bytes| bytes.len() as u64),
-        output_hex: Some(hex(&result.output.clone().unwrap_or_default())),
+        output_hex: result.output.as_ref().map(|bytes| hex(bytes)),
         output_omitted: false,
         fuel_consumed,
         peak_memory_bytes,
@@ -582,22 +756,227 @@ fn enforce_frame_budget(
         .is_some_and(|observed| observed > max_output_bytes);
     let within =
         serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() <= MAX_RESULT_FRAME_BYTES);
-    if over_ceiling || !within {
+    // Omission drops a payload that exists: a frame with no observed output
+    // has nothing to omit, so `output_omitted` stays false and the size
+    // refusal (if any) surfaces at publish instead of inventing evidence.
+    if (over_ceiling || !within) && frame.output_hex.is_some() {
         frame.output_hex = None;
         frame.output_omitted = true;
     }
     frame
 }
 
-/// Terminal frame for a request that never reached execution.
+/// Decodes the lowercase hex the loop emits. `None` on any shape or digit
+/// fault; used only to check a frame's own digest/length agreement.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = hex_value(bytes[index])?;
+        let low = hex_value(bytes[index + 1])?;
+        out.push(high * 16 + low);
+        index += 2;
+    }
+    Some(out)
+}
+
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Stable invalid-frame fault constructor.
+fn invalid(field: &'static str) -> LoopError {
+    LoopError::ResultInvalid { field }
+}
+
+fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    let predecessor_count = u64::try_from(frame.observation_predecessors.len())
+        .map_err(|_| invalid("observation-predecessors"))?;
+    if predecessor_count != frame.sequence {
+        return Err(invalid("observation-predecessors"));
+    }
+    for (index, predecessor) in frame.observation_predecessors.iter().enumerate() {
+        let expected = u64::try_from(index).map_err(|_| invalid("observation-predecessors"))?;
+        if *predecessor != expected {
+            return Err(invalid("observation-predecessors"));
+        }
+    }
+    Ok(())
+}
+
+/// Validates one result frame's internal consistency before emission
+/// (#2787 step 5): wire identity/version, closed operation/phase/command
+/// vocabulary and their agreement, sequence bound and complete ordered
+/// predecessor prefix, output
+/// digest/length/hex agreement and omission semantics, and engine-evidence
+/// bindings. A frame that cannot prove itself is never emitted; a refusal
+/// carries its exact phase with no invented engine, usage, or output
+/// evidence, and an unknown outcome stays unknown — local serialization
+/// success upgrades nothing.
+fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    if frame.wire_id != WASM_HOST_RESULT_WIRE_ID {
+        return Err(invalid("wire-id"));
+    }
+    if frame.wire_version != WASM_HOST_RESULT_WIRE_VERSION {
+        return Err(invalid("wire-version"));
+    }
+    if frame.sequence >= MAX_RESULT_SEQUENCE {
+        return Err(invalid("sequence-bound"));
+    }
+    validate_observation_predecessors(frame)?;
+    let operation_known = matches!(
+        frame.operation.as_str(),
+        OP_INVOKE | OP_CANCEL | OP_RECONCILE | OP_SHUTDOWN
+    );
+    if !operation_known {
+        return Err(invalid("operation"));
+    }
+    let phase_known = matches!(
+        frame.phase.as_str(),
+        RESULT_PHASE_EXECUTE | RESULT_PHASE_CONTAIN | RESULT_PHASE_RECONCILE | RESULT_PHASE_DENY
+    );
+    if !phase_known {
+        return Err(invalid("phase"));
+    }
+    // Phase versus command: the observed command fixes the phase, and each
+    // operation answers in its own phase, so a Cancel/Reconcile outcome can
+    // never masquerade as a new Invoke result.
+    let phase_matches_command = match frame.worker_command.as_deref() {
+        Some("execute") => frame.phase == RESULT_PHASE_EXECUTE && frame.operation == OP_INVOKE,
+        Some("cancel") => frame.phase == RESULT_PHASE_CONTAIN && frame.operation == OP_CANCEL,
+        Some("reconcile") => {
+            frame.phase == RESULT_PHASE_RECONCILE && frame.operation == OP_RECONCILE
+        }
+        Some(_) => false,
+        None => frame.phase == RESULT_PHASE_DENY,
+    };
+    if !phase_matches_command {
+        return Err(invalid("phase-command"));
+    }
+    if frame.claim_id.is_empty()
+        || frame.operation_id.is_empty()
+        || frame.invocation_id.is_empty()
+        || frame.request_digest.is_empty()
+        || frame.grant_digest.is_empty()
+        || frame.component_id.is_empty()
+        || frame.artifact_digest.is_empty()
+        || frame.input_digest.is_empty()
+    {
+        return Err(invalid("claim-binding"));
+    }
+    // Output agreement: hex present ⟹ digest and length agree with the
+    // decoded bytes; omitted ⟹ hex absent with digest and length retained;
+    // neither ⟹ no output evidence at all. Each state is distinct.
+    match (
+        frame.output_hex.as_deref(),
+        frame.output_digest.as_deref(),
+        frame.output_bytes,
+        frame.output_omitted,
+    ) {
+        (Some(text), Some(digest), Some(length), false) => {
+            let Some(bytes) = unhex(text) else {
+                return Err(invalid("output-hex"));
+            };
+            let observed = u64::try_from(bytes.len()).map_err(|_| invalid("output-length"))?;
+            if observed != length {
+                return Err(invalid("output-length"));
+            }
+            if Sha256Digest::of_bytes(&bytes).as_str() != digest {
+                return Err(invalid("output-digest"));
+            }
+        }
+        (None, Some(_), Some(_), true) | (None, None, None, false) => {}
+        _ => return Err(invalid("output-omitted")),
+    }
+    // Engine-evidence binding: an executed observation names its seated
+    // engine; a worker refusal or a pre-execution denial carries none and
+    // invents none. Mixed or empty engine halves are never valid.
+    match (
+        frame.worker_command.as_deref(),
+        frame.engine_implementation_id.as_deref(),
+        frame.engine_version.as_deref(),
+    ) {
+        (Some(_), Some(engine), Some(version)) if !engine.is_empty() && !version.is_empty() => {}
+        (_, None, None) => {}
+        _ => return Err(invalid("engine-binding")),
+    }
+    // A frame with no engine observation is a refusal, so it names its
+    // refusal code; an error-free frame always names its engine.
+    if frame.engine_implementation_id.is_none() && frame.error.is_none() {
+        return Err(invalid("refusal-code"));
+    }
+    // Refusals carry no invented usage or output evidence — both
+    // pre-execution denials (no worker command) and worker refusals (a
+    // command with no engine binding): no engine observation means no
+    // usage or output was measured. Executed observations keep whatever
+    // the child actually reported, including absence.
+    if frame.engine_implementation_id.is_none()
+        && (frame.fuel_consumed.is_some()
+            || frame.peak_memory_bytes.is_some()
+            || frame.table_elements.is_some()
+            || frame.epoch_ticks.is_some()
+            || frame.output_digest.is_some()
+            || frame.output_bytes.is_some()
+            || frame.output_hex.is_some()
+            || frame.output_omitted)
+    {
+        return Err(invalid("denial-evidence"));
+    }
+    validate_lifecycle_vocabulary(frame)
+}
+
+/// Lifecycle verdict applicability: verdicts are the closed
+/// `verified`/`rejected` vocabulary from the owning dispatch-drive
+/// evaluator, never lifecycle strings manufacturing success; the
+/// classified disposition is the closed `InvocationDisposition`
+/// vocabulary. Both producers emit only these spellings.
+fn validate_lifecycle_vocabulary(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    for verdict in [
+        frame.verdict_shadow.as_str(),
+        frame.verdict_canary.as_str(),
+        frame.verdict_rollback.as_str(),
+        frame.verdict_cutover.as_str(),
+    ] {
+        if verdict != "verified" && verdict != "rejected" {
+            return Err(invalid("lifecycle-verdict"));
+        }
+    }
+    match frame.disposition.as_str() {
+        "Succeeded" | "Rejected" | "Unavailable" | "Unknown" => {}
+        _ => return Err(invalid("disposition-vocabulary")),
+    }
+    Ok(())
+}
+
+/// Terminal frame for a worker command the runtime refused, or for a
+/// request refused before execution. The frame carries the exact operation
+/// and phase of what was attempted — never a hardcoded Invoke — the stable
+/// refusal code, and no invented engine, usage, or output evidence.
+/// Sequence and terminal disposition are assigned by the loop when the
+/// frame joins the retained sequence, not here.
 fn denial_frame(
     binding: &AdmittedBinding,
     operation: &str,
-    error: LoopError,
+    phase: &str,
+    worker_command: Option<WorkerCommand>,
+    error_code: &str,
 ) -> WasmHostResultFrame {
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID,
-        wire_version: WASM_HOST_REQUEST_WIRE_VERSION,
+        wire_version: WASM_HOST_RESULT_WIRE_VERSION,
+        phase: phase.to_owned(),
+        worker_command: worker_command.map(|command| command_name(command).to_owned()),
+        sequence: 0,
+        observation_predecessors: Vec::new(),
+        terminal: false,
         operation: operation.to_owned(),
         claim_id: binding.claim_id.clone(),
         operation_id: binding.operation_id.clone(),
@@ -607,10 +986,11 @@ fn denial_frame(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        engine_implementation_id: String::new(),
-        engine_version: String::new(),
+        delivery_id: None,
+        engine_implementation_id: None,
+        engine_version: None,
         disposition: "Rejected".to_owned(),
-        error: Some(error.code().to_owned()),
+        error: Some(error_code.to_owned()),
         output_digest: None,
         output_bytes: None,
         output_hex: None,
@@ -630,6 +1010,66 @@ fn denial_frame(
     }
 }
 
+/// Terminal Unknown observation for accepted work whose outcome never
+/// resolved: a failed follow-up or a lost worker reply (#2568 A4). The frame
+/// carries the exact operation and phase of what was attempted, the stable
+/// failure code, no invented engine, usage, or output evidence — and the
+/// uncertainty is preserved, never rewritten into success or denial: the
+/// scope stays blocked ([`InFlightDisposition::BlockScopeUnknownOutcome`])
+/// until receipt/probe/reconciliation resolves it, and the generation stays
+/// a rollback candidate. Sequence and terminal disposition are assigned by
+/// the loop when the frame joins the retained sequence, not here.
+fn unknown_frame(
+    binding: &AdmittedBinding,
+    operation: &str,
+    phase: &str,
+    worker_command: Option<WorkerCommand>,
+    error_code: &str,
+) -> WasmHostResultFrame {
+    WasmHostResultFrame {
+        wire_id: WASM_HOST_RESULT_WIRE_ID,
+        wire_version: WASM_HOST_RESULT_WIRE_VERSION,
+        phase: phase.to_owned(),
+        worker_command: worker_command.map(|command| command_name(command).to_owned()),
+        sequence: 0,
+        observation_predecessors: Vec::new(),
+        terminal: false,
+        operation: operation.to_owned(),
+        claim_id: binding.claim_id.clone(),
+        operation_id: binding.operation_id.clone(),
+        invocation_id: binding.invocation_id.clone(),
+        request_digest: binding.request_digest.clone(),
+        grant_digest: binding.grant_digest.clone(),
+        component_id: binding.component_id.clone(),
+        artifact_digest: binding.artifact_digest.clone(),
+        input_digest: binding.input_digest.clone(),
+        delivery_id: None,
+        engine_implementation_id: None,
+        engine_version: None,
+        disposition: UNCERTAIN_DISPOSITION.to_owned(),
+        error: Some(error_code.to_owned()),
+        output_digest: None,
+        output_bytes: None,
+        output_hex: None,
+        output_omitted: false,
+        fuel_consumed: None,
+        peak_memory_bytes: None,
+        table_elements: None,
+        epoch_ticks: None,
+        verdict_shadow: verdict_text(VerificationVerdict::Rejected),
+        verdict_canary: verdict_text(VerificationVerdict::Rejected),
+        verdict_rollback: verdict_text(VerificationVerdict::Rejected),
+        verdict_cutover: verdict_text(VerificationVerdict::Rejected),
+        trap: None,
+        cancelled: false,
+        drain: Some(format!(
+            "{:?}",
+            InFlightDisposition::BlockScopeUnknownOutcome
+        )),
+        rollback_candidate: true,
+    }
+}
+
 /// Bounded typed request source and result sink for the ordinary loop.
 pub trait WasmHostRequestChannel {
     /// Returns the next request frame, or `None` when the delivery set is
@@ -646,6 +1086,8 @@ pub trait WasmHostRequestChannel {
     /// never exhaustion: the loop keeps serving the delivery set and polls
     /// again on its next tick, including while guest work is pending. The
     /// default has no external source and always reports nothing pending.
+    /// Polling never acknowledges or retires anything: the staged delivery
+    /// stays replayable until it is confirmed after worker enqueue.
     ///
     /// # Errors
     ///
@@ -655,105 +1097,714 @@ pub trait WasmHostRequestChannel {
         Ok(None)
     }
 
-    /// Publishes one correlated result frame.
+    /// Non-blocking poll for one staged Cancel/Shutdown naming this
+    /// operation (#2568 A3). This runs before the single-gate intake check.
+    /// Polling leaves the owner delivery unacknowledged and replayable;
+    /// Reconcile stays staged for the idle path.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::ChannelUnavailable`] or
-    /// [`LoopError::ResultTooLarge`] when the frame cannot be written.
+    /// Returns [`LoopError::ChannelUnavailable`] when the control source
+    /// fails in a way the loop must not ignore.
+    fn poll_control_urgent(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
+        Ok(None)
+    }
+
+    /// Confirms that the last polled control delivery for `operation` was
+    /// admitted and enqueued to the worker owner. The default has no
+    /// external source and confirms nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ChannelUnavailable`] when the acknowledgement
+    /// cannot be staged.
+    fn confirm_control_enqueued(&mut self, _operation: &str) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Confirms that the exact worker outcome of the accepted control for
+    /// `operation` was observed, carrying the outcome digest when the loop
+    /// reports one. The default has no external source and confirms nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ChannelUnavailable`] when the acknowledgement
+    /// cannot be staged.
+    fn confirm_control_completed(
+        &mut self,
+        _operation: &str,
+        _outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Publishes one correlated result frame: the one stdout emission
+    /// owner for the ordinary result stream (#2787 step 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ResultInvalid`] when the frame fails its own
+    /// consistency validation, [`LoopError::ChannelUnavailable`] when the
+    /// stream cannot be written (or stays contended past a caller timeout),
+    /// or [`LoopError::ResultTooLarge`] when the frame exceeds the budget.
+    /// Success is an observed local write plus flush, not owner
+    /// acceptance; failure retains the observed result in the loop for
+    /// drain accounting, never an ad hoc fallback.
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError>;
+}
+
+/// Maps an owner control kind onto the loop's closed operation vocabulary.
+fn control_operation(kind: WasmControlKind) -> &'static str {
+    match kind {
+        WasmControlKind::Cancel => OP_CANCEL,
+        WasmControlKind::Reconcile => OP_RECONCILE,
+        WasmControlKind::Shutdown => OP_SHUTDOWN,
+    }
+}
+
+/// One polled-but-unconfirmed control delivery: validated and yielded to the
+/// loop, but not yet admitted and enqueued, so still unacknowledged and
+/// fully replayable.
+#[derive(Clone, Debug)]
+enum PendingControl {
+    /// A versioned spool delivery at its exact generation/sequence slot.
+    Spool {
+        /// Owner control kind.
+        kind: WasmControlKind,
+        /// Delivery generation (equals the running generation).
+        generation: u64,
+        /// Owner sequence.
+        sequence: u64,
+        /// Replay key of the validated delivery.
+        replay_key: String,
+        /// Digest of the validated delivery.
+        delivery_digest: String,
+    },
+    /// The legacy fixed file, joined under the serialized owner rule.
+    Legacy {
+        /// Control kind parsed from the staged frame.
+        kind: WasmControlKind,
+        /// Digest of the admitted bytes; retirement deletes only these.
+        digest: String,
+    },
+}
+
+impl PendingControl {
+    /// Returns the owner control kind of the pending delivery.
+    fn kind(&self) -> WasmControlKind {
+        match self {
+            Self::Spool { kind, .. } | Self::Legacy { kind, .. } => *kind,
+        }
+    }
+
+    /// Returns the loop operation of the pending delivery.
+    fn operation(&self) -> &'static str {
+        control_operation(self.kind())
+    }
+}
+
+/// One enqueue-confirmed spool delivery whose exact worker outcome is still
+/// open. At most one exists: the single-gate intake admits nothing new while
+/// a command is outstanding.
+#[derive(Clone, Debug)]
+struct AcceptedControl {
+    /// Owner control kind.
+    kind: WasmControlKind,
+    /// Delivery generation.
+    generation: u64,
+    /// Owner sequence.
+    sequence: u64,
+    /// Replay key of the accepted delivery.
+    replay_key: String,
+    /// Digest of the accepted delivery.
+    delivery_digest: String,
+}
+
+/// Bounded control-file reads per poll: at most one spool row of deliveries
+/// plus their acks and predecessor links. The walk stops when the budget is
+/// spent and resumes on the next tick, so a foreign-filled directory degrades
+/// admission instead of growing work without bound.
+const CONTROL_POLL_READ_BUDGET: usize = WASM_CONTROL_SPOOL_MAX_DELIVERIES * 3;
+
+/// Resolution of one delivery's ack slot.
+#[derive(Clone, Debug)]
+enum AckSlot {
+    /// Skip the delivery: terminal evidence, garbage, or our own still-open
+    /// acceptance already occupies the slot.
+    Skip,
+    /// The slot is free: the delivery may validate and refuse into it.
+    Free,
+    /// A prior incarnation left the slot openly accepted: the delivery may
+    /// be re-offered for UNKNOWN recovery when its bytes still match.
+    Reoffer(WasmControlAck),
 }
 
 /// Installed Kernel control reader: the external control intake of the
 /// ordinary loop.
 ///
-/// The owner stages the delivery set as files beside the installation; a
-/// Kernel Cancel/Reconcile/Shutdown for the running operation stages the
-/// same way, as one [`WasmHostRequestFrame`] JSON document at the
-/// loader-derived control path. The loop polls this reader on every tick —
-/// including while guest work is pending — and admits what it yields
+/// One spool slot address: (generation, sequence).
+type ControlSlot = (u64, u64);
+/// Bounded spool slot listing collected by one directory scan.
+type ControlSlotList = Vec<ControlSlot>;
+
+/// The owner publishes Cancel/Reconcile/Shutdown for the running operation
+/// as versioned deliveries in a generation-specific immutable spool colocated
+/// with the delivery set, one exact `generation-sequence` name per delivery
+/// plus the child-staged ack beside it. The loop polls this reader on every
+/// tick — including while guest work is pending — and admits what it yields
 /// through the same frame shape, parse, and binding validation the
 /// delivery-set path uses, so one admission path serves both sources.
 ///
-/// Fail-closed per frame: an absent, unreadable, oversize, malformed, or
-/// foreign control file yields nothing and is left in place — ownership of
-/// an unidentifiable file can never be established, and unauthenticated
-/// input must neither act nor abort the admitted operation. Only a
-/// well-formed frame naming this exact operation is consumed and returned.
-/// `Invoke` is never admitted externally: the one admitted invoke comes
-/// from the delivery set only, so a second execution path cannot open
-/// through the control file.
+/// Validate-then-admit-then-enqueue-then-ack: polling validates and stages
+/// terminal refusals, but a delivery is acknowledged only after the loop
+/// confirms admission plus successful worker enqueue. Queue-full,
+/// disconnected, admission failure, and crash leave the original staged
+/// delivery replayable with its typed disposition — never falsely accepted.
+/// Deliveries are never deleted by the child; the owner reclaims its own
+/// stream. In-memory state is bounded (one pending slot, one accepted slot,
+/// capped scan buffers), and every poll does bounded directory/file work,
+/// so intake holds no unbounded queue and a poisoned file cannot wedge it.
+///
+/// The legacy fixed file joins only while the versioned spool holds no
+/// delivery or ack for this generation — the sequenced stream always wins —
+/// and retires only after admission plus successful worker enqueue, by
+/// exact-name byte-verified delete.
 pub struct KernelControlReader {
-    path: PathBuf,
-    identity: WasmHostControl,
+    /// Loader-derived install directory holding the delivery set and spool.
+    directory: PathBuf,
+    /// Exact legacy fixed-file path inside `directory`.
+    legacy_path: PathBuf,
+    /// Full admitted binding: derived control frames reuse it.
+    admitted: AdmittedBinding,
+    /// Exact operation binding every delivery must join.
+    binding: ExpectedControlBinding,
+    /// One polled-but-unconfirmed delivery, if the loop holds a yield.
+    pending: Option<PendingControl>,
+    /// One enqueue-confirmed delivery with its outcome still open, if any.
+    accepted: Option<AcceptedControl>,
+    /// Whether the legacy file was consumed this run.
+    legacy_consumed: bool,
+    /// Whether any same-generation spool delivery or ack was observed this
+    /// run: the versioned stream permanently closes the legacy join, even if
+    /// the owner reclaims its terminal files mid-run.
+    versioned_seen: bool,
+    /// Directory cursor retained across polls so unrelated names cannot
+    /// consume every scan budget before this operation's control slots.
+    scan_entries: Option<std::fs::ReadDir>,
+    scan_deliveries: ControlSlotList,
+    scan_acks: ControlSlotList,
 }
 
 impl KernelControlReader {
-    /// Pins the reader to the loader-derived control path and the exact
-    /// admitted operation identity it may consume control for.
+    /// Pins the reader to the loader-derived install directory and the exact
+    /// admitted operation binding every delivery must join. A generation of
+    /// zero or an unparseable authority epoch fails closed inside the join:
+    /// every delivery refuses or skips, and the loop still serves the
+    /// delivery set.
     #[must_use]
-    pub fn new(binding: &AdmittedBinding, path: PathBuf) -> Self {
+    pub fn new(binding: &AdmittedBinding, directory: PathBuf) -> Self {
+        let authority_epoch =
+            serde_json::from_str(&binding.authority_epoch_json).unwrap_or(serde_json::Value::Null);
         Self {
-            path,
-            identity: WasmHostControl {
+            legacy_path: directory.join(WASM_HOST_CONTROL_FILE_NAME),
+            directory,
+            admitted: binding.clone(),
+            binding: ExpectedControlBinding {
                 operation_id: binding.operation_id.clone(),
                 invocation_id: binding.invocation_id.clone(),
-                request_digest: binding.request_digest.clone(),
+                claim_id: binding.claim_id.clone(),
+                generation: binding.generation,
+                grant_digest: binding.grant_digest.clone(),
+                work_scope: binding.work_scope.clone(),
+                authority_epoch,
             },
+            pending: None,
+            accepted: None,
+            legacy_consumed: false,
+            versioned_seen: false,
+            scan_entries: None,
+            scan_deliveries: Vec::new(),
+            scan_acks: Vec::new(),
         }
     }
 
-    /// Returns one staged control frame naming this operation, consuming
-    /// it, or `None` when nothing admittable is staged. Never fails the
-    /// loop: every control-file fault degrades to nothing pending.
-    fn poll(&self) -> Option<WasmHostRequestFrame> {
-        let Ok(bytes) = read_staged_bytes(&self.path) else {
+    /// Returns one staged control frame for this operation, or `None` when
+    /// nothing admittable is staged. Never fails the loop and never
+    /// acknowledges or retires anything: every fault degrades to nothing
+    /// pending, and the staged delivery stays replayable until the loop
+    /// confirms it after worker enqueue.
+    fn poll(&mut self) -> Option<WasmHostRequestFrame> {
+        // A previous yield that was never confirmed was never enqueued: its
+        // delivery is still staged and unacknowledged, so dropping the slot
+        // re-discovers it below rather than losing it.
+        self.pending = None;
+        let (deliveries, acks) = self.scan_spool()?;
+        if deliveries
+            .iter()
+            .chain(acks.iter())
+            .any(|(generation, _)| *generation == self.binding.generation)
+        {
+            self.versioned_seen = true;
+        }
+        if let Some(frame) = self.poll_spool(&deliveries, &acks) {
+            return Some(frame);
+        }
+        self.poll_legacy(&deliveries, &acks)
+    }
+
+    /// Lists this generation's delivery and ack slots in bounded steps over
+    /// the loader-derived directory. A cursor survives between polls, so
+    /// unrelated names cannot permanently hide a later control delivery.
+    /// No file is read during enumeration.
+    fn scan_spool(&mut self) -> Option<(ControlSlotList, ControlSlotList)> {
+        if self.scan_entries.is_none() {
+            self.scan_entries = std::fs::read_dir(&self.directory).ok();
+            if self.scan_entries.is_none() {
+                return Some((Vec::new(), Vec::new()));
+            }
+        }
+        for _ in 0..WASM_CONTROL_SPOOL_SCAN_CAP {
+            let Some(entry) = self.scan_entries.as_mut().and_then(Iterator::next) else {
+                self.scan_entries = None;
+                let mut deliveries = std::mem::take(&mut self.scan_deliveries);
+                let acks = std::mem::take(&mut self.scan_acks);
+                deliveries.sort_by_key(|(_, sequence)| *sequence);
+                return Some((deliveries, acks));
+            };
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some((generation, sequence, class)) = parse_control_name(&name) else {
+                continue;
+            };
+            if generation != self.binding.generation {
+                continue;
+            }
+            match class {
+                ControlFileClass::Delivery => {
+                    if self.scan_deliveries.len() < WASM_CONTROL_SPOOL_SCAN_CAP {
+                        self.scan_deliveries.push((generation, sequence));
+                    }
+                }
+                ControlFileClass::Ack => {
+                    if self.scan_acks.len() < WASM_CONTROL_SPOOL_SCAN_CAP {
+                        self.scan_acks.push((generation, sequence));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Walks the staged deliveries lowest-first and yields the first
+    /// admittable one. Terminal acks make exact replays idempotent skips;
+    /// changed same-sequence content conflicts by leaving both files for the
+    /// owner; our-generation refusals stage one typed refused ack each;
+    /// foreign generations are skipped without touching their slots, which
+    /// belong to their own stream.
+    fn poll_spool(
+        &mut self,
+        deliveries: &[ControlSlot],
+        acks: &[ControlSlot],
+    ) -> Option<WasmHostRequestFrame> {
+        let mut reads = 0usize;
+        for &(generation, sequence) in deliveries {
+            let slot = self.open_ack(generation, sequence, acks, &mut reads);
+            if matches!(slot, AckSlot::Skip) {
+                continue;
+            }
+            let slot_taken = matches!(slot, AckSlot::Reoffer(_));
+            if reads >= CONTROL_POLL_READ_BUDGET {
+                return None;
+            }
+            reads += 1;
+            let path = self
+                .directory
+                .join(control_delivery_name(generation, sequence));
+            let Ok(bytes) = read_control_bytes(&path) else {
+                continue;
+            };
+            let Ok(delivery) = parse_control_delivery(&bytes) else {
+                // Malformed: no identity to bind an ack to, so the file
+                // itself stays as the bounded evidence and the walk moves
+                // on — a poisoned file cannot wedge intake.
+                continue;
+            };
+            // A re-offered open delivery must still carry its accepted
+            // bytes: changed same-sequence content is an identity conflict,
+            // left as the two mismatching files for the owner, never
+            // re-acknowledged over the taken slot.
+            if let AckSlot::Reoffer(ack) = &slot
+                && ack.delivery_digest != delivery.delivery_digest
+            {
+                continue;
+            }
+            let identity = &delivery.identity;
+            if identity.generation != generation || identity.owner_sequence != sequence {
+                self.refuse_slot(generation, sequence, &delivery, "control-slot", slot_taken);
+                continue;
+            }
+            if identity.generation != self.binding.generation {
+                // Foreign generation: never admit, never act, and never
+                // stage into its slot — a concurrent replacement stream
+                // owns it. Skipping is the refusal; the file stays.
+                continue;
+            }
+            if let Err(refusal) = join_control_delivery(&delivery, &self.binding, edge_now_ms()) {
+                self.refuse_slot(generation, sequence, &delivery, refusal.field, slot_taken);
+                continue;
+            }
+            if !self.check_previous(generation, sequence, &delivery, &mut reads) {
+                self.refuse_slot(
+                    generation,
+                    sequence,
+                    &delivery,
+                    "control-previous",
+                    slot_taken,
+                );
+                continue;
+            }
+            let kind = identity.control_kind;
+            self.pending = Some(PendingControl::Spool {
+                kind,
+                generation,
+                sequence,
+                replay_key: identity.replay_key.clone(),
+                delivery_digest: delivery.delivery_digest.clone(),
+            });
+            return Some(WasmHostRequestFrame::control(
+                control_operation(kind),
+                &self.admitted,
+            ));
+        }
+        None
+    }
+
+    /// Resolves the ack slot for one delivery.
+    fn open_ack(
+        &self,
+        generation: u64,
+        sequence: u64,
+        acks: &[(u64, u64)],
+        reads: &mut usize,
+    ) -> AckSlot {
+        if !acks.contains(&(generation, sequence)) {
+            return AckSlot::Free;
+        }
+        if *reads >= CONTROL_POLL_READ_BUDGET {
+            return AckSlot::Skip;
+        }
+        *reads += 1;
+        let path = self.directory.join(control_ack_name(generation, sequence));
+        let Ok(bytes) = read_control_bytes(&path) else {
+            return AckSlot::Skip;
+        };
+        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
+            return AckSlot::Skip;
+        };
+        if ack.wire_id != WASM_CONTROL_ACK_WIRE_ID
+            || ack.wire_version != WASM_CONTROL_ACK_WIRE_VERSION
+            || ack.generation != generation
+            || ack.owner_sequence != sequence
+            || ack
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.len() > WASM_CONTROL_MAX_DETAIL_BYTES)
+        {
+            return AckSlot::Skip;
+        }
+        match ack.phase {
+            ControlAckPhase::Completed | ControlAckPhase::Refused => AckSlot::Skip,
+            ControlAckPhase::Enqueued => {
+                let mine = self.accepted.as_ref().is_some_and(|accepted| {
+                    accepted.generation == generation && accepted.sequence == sequence
+                });
+                if mine {
+                    AckSlot::Skip
+                } else {
+                    AckSlot::Reoffer(ack)
+                }
+            }
+        }
+    }
+
+    /// Checks the previous-delivery link: sequence zero must open the stream,
+    /// and a later sequence must chain to its retained predecessor. A retired
+    /// predecessor (no ack to check against) cannot wedge the stream: the
+    /// delivery is accepted without the link.
+    fn check_previous(
+        &self,
+        generation: u64,
+        sequence: u64,
+        delivery: &WasmControlDelivery,
+        reads: &mut usize,
+    ) -> bool {
+        let previous = delivery.identity.previous_delivery_digest.as_ref();
+        if sequence == 0 {
+            return previous.is_none();
+        }
+        if *reads >= CONTROL_POLL_READ_BUDGET {
+            return false;
+        }
+        *reads += 1;
+        let path = self
+            .directory
+            .join(control_ack_name(generation, sequence - 1));
+        let Ok(bytes) = read_control_bytes(&path) else {
+            return true;
+        };
+        let Ok(ack) = serde_json::from_slice::<WasmControlAck>(&bytes) else {
+            return true;
+        };
+        previous.is_some_and(|digest| *digest == ack.delivery_digest)
+    }
+
+    /// Stages one typed refused ack at an exact free slot. Best-effort: a
+    /// staging failure leaves the delivery unacknowledged for the next poll,
+    /// and polling never fails the loop. A taken slot is never overwritten.
+    fn refuse_slot(
+        &self,
+        generation: u64,
+        sequence: u64,
+        delivery: &WasmControlDelivery,
+        field: &'static str,
+        slot_taken: bool,
+    ) {
+        if slot_taken {
+            return;
+        }
+        let ack = WasmControlAck {
+            wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+            replay_key: delivery.identity.replay_key.clone(),
+            operation_id: delivery.identity.operation_id.clone(),
+            generation,
+            owner_sequence: sequence,
+            delivery_digest: delivery.delivery_digest.clone(),
+            phase: ControlAckPhase::Refused,
+            detail: Some(field.to_owned()),
+            outcome_digest: None,
+        };
+        let _ = self.stage_ack(generation, sequence, &ack);
+    }
+
+    /// Polls the legacy fixed file under the serialized owner rule: only
+    /// while no versioned delivery or ack for this generation was ever
+    /// observed, only for the exact running operation and grant, and never
+    /// for `Invoke`. Unjoinable content stays in place as owner evidence.
+    fn poll_legacy(
+        &mut self,
+        deliveries: &[(u64, u64)],
+        acks: &[(u64, u64)],
+    ) -> Option<WasmHostRequestFrame> {
+        if self.legacy_consumed || self.versioned_seen {
+            return None;
+        }
+        let versioned_staged = deliveries
+            .iter()
+            .chain(acks.iter())
+            .any(|(generation, _)| *generation == self.binding.generation);
+        if versioned_staged {
+            self.versioned_seen = true;
+            return None;
+        }
+        let Ok(bytes) = read_control_bytes(&self.legacy_path) else {
             return None;
         };
         let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
             return None;
         };
-        match WasmHostRequestFrame::parse(&frame) {
-            Ok(WasmHostRequest::Cancel(control) | WasmHostRequest::Reconcile(control))
-                if control == self.identity =>
-            {
-                consume_staged(&self.path);
-                Some(frame)
+        if frame.grant_digest != self.admitted.grant_digest {
+            return None;
+        }
+        let expected = WasmHostControl {
+            operation_id: self.admitted.operation_id.clone(),
+            invocation_id: self.admitted.invocation_id.clone(),
+            request_digest: self.admitted.request_digest.clone(),
+        };
+        let kind = match WasmHostRequestFrame::parse(&frame) {
+            Ok(WasmHostRequest::Cancel(control)) if control == expected => WasmControlKind::Cancel,
+            Ok(WasmHostRequest::Reconcile(control)) if control == expected => {
+                WasmControlKind::Reconcile
             }
             Ok(WasmHostRequest::Shutdown) if self.controls_this_operation(&frame) => {
-                consume_staged(&self.path);
-                Some(frame)
+                WasmControlKind::Shutdown
             }
-            Ok(WasmHostRequest::Invoke(_)) if self.controls_this_operation(&frame) => {
-                // Names this operation but is never externally admittable:
-                // consume so it cannot spin the poll, and yield nothing.
-                consume_staged(&self.path);
-                None
-            }
-            Ok(_) | Err(_) => None,
+            Ok(_) | Err(_) => return None,
+        };
+        self.pending = Some(PendingControl::Legacy {
+            kind,
+            digest: sha256_hex(&bytes),
+        });
+        Some(frame)
+    }
+
+    /// Offers the first ordered control only when it can interrupt pending
+    /// guest work. Reconcile remains staged and unacknowledged until idle;
+    /// Cancel/Shutdown also remain unacknowledged until their owner action
+    /// reaches the worker. No fixed or versioned control file is consumed.
+    fn poll_urgent(&mut self) -> Option<WasmHostRequestFrame> {
+        let frame = self.poll()?;
+        if matches!(
+            self.pending.as_ref().map(PendingControl::kind),
+            Some(WasmControlKind::Cancel | WasmControlKind::Shutdown)
+        ) {
+            Some(frame)
+        } else {
+            self.pending = None;
+            None
         }
     }
 
-    /// Pins a Shutdown or Invoke frame to this operation. Those parses
-    /// carry their identity as plain fields, so the external path checks
-    /// them here: parse alone authenticates nothing.
+    /// Confirms admission plus successful worker enqueue for the pending
+    /// delivery of `operation`: a spool delivery stages its `enqueued` ack at
+    /// the exact slot, a legacy delivery retires by exact-name byte-verified
+    /// delete. Any other operation — or no pending delivery — is a no-op, so
+    /// internal commands confirm nothing.
+    fn confirm_enqueued(&mut self, operation: &str) -> Result<(), LoopError> {
+        let Some(pending) = self.pending.clone() else {
+            return Ok(());
+        };
+        if pending.operation() != operation {
+            return Ok(());
+        }
+        match pending {
+            PendingControl::Spool {
+                kind,
+                generation,
+                sequence,
+                replay_key,
+                delivery_digest,
+            } => {
+                let ack = WasmControlAck {
+                    wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+                    wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+                    replay_key: replay_key.clone(),
+                    operation_id: self.binding.operation_id.clone(),
+                    generation,
+                    owner_sequence: sequence,
+                    delivery_digest: delivery_digest.clone(),
+                    phase: ControlAckPhase::Enqueued,
+                    detail: None,
+                    outcome_digest: None,
+                };
+                self.stage_ack(generation, sequence, &ack)?;
+                self.accepted = Some(AcceptedControl {
+                    kind,
+                    generation,
+                    sequence,
+                    replay_key,
+                    delivery_digest,
+                });
+            }
+            PendingControl::Legacy { digest, .. } => {
+                // Best-effort: the file itself remains as visible evidence
+                // when retirement fails, so the run continues and a restart
+                // re-offers the same bytes under at-least-once delivery.
+                let _ = retire_legacy_control(&self.legacy_path, &digest);
+                self.legacy_consumed = true;
+            }
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    /// Confirms the exact observed worker outcome of the accepted delivery
+    /// for `operation` by staging its `completed` ack over the exact slot.
+    /// Any other operation — including internal commands and legacy
+    /// deliveries, which carry no ack slot — is a no-op.
+    fn confirm_completed(
+        &mut self,
+        operation: &str,
+        outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        let Some(accepted) = self.accepted.clone() else {
+            return Ok(());
+        };
+        if control_operation(accepted.kind) != operation {
+            return Ok(());
+        }
+        let outcome_digest = outcome_digest
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .map(str::to_owned);
+        let ack = WasmControlAck {
+            wire_id: WASM_CONTROL_ACK_WIRE_ID.to_owned(),
+            wire_version: WASM_CONTROL_ACK_WIRE_VERSION,
+            replay_key: accepted.replay_key.clone(),
+            operation_id: self.binding.operation_id.clone(),
+            generation: accepted.generation,
+            owner_sequence: accepted.sequence,
+            delivery_digest: accepted.delivery_digest.clone(),
+            phase: ControlAckPhase::Completed,
+            detail: None,
+            outcome_digest,
+        };
+        self.stage_ack(accepted.generation, accepted.sequence, &ack)?;
+        self.accepted = None;
+        Ok(())
+    }
+
+    /// Stages one ack at its exact generation/sequence name.
+    fn stage_ack(
+        &self,
+        generation: u64,
+        sequence: u64,
+        ack: &WasmControlAck,
+    ) -> Result<(), LoopError> {
+        let bytes = serde_json::to_vec(ack).map_err(|_| LoopError::ChannelUnavailable)?;
+        stage_control_bytes(
+            &self.directory.join(control_ack_name(generation, sequence)),
+            &bytes,
+        )
+        .map_err(|_| LoopError::ChannelUnavailable)
+    }
+
+    /// Pins a legacy Shutdown frame to this operation. The parse carries its
+    /// identity as plain fields, so the external path checks them here: parse
+    /// alone authenticates nothing.
     fn controls_this_operation(&self, frame: &WasmHostRequestFrame) -> bool {
-        frame.operation_id == self.identity.operation_id
-            && frame.invocation_id == self.identity.invocation_id
-            && frame.request_digest == self.identity.request_digest
+        frame.operation_id == self.admitted.operation_id
+            && frame.invocation_id == self.admitted.invocation_id
+            && frame.request_digest == self.admitted.request_digest
     }
 }
 
-/// Emits one serialized frame on stdout with the bounded output wait.
+/// Outcome of one bounded stdout emission (#2787 owner comment on #2895).
+/// A missed caller wait is reported as what it is — the caller gave up
+/// waiting — never as bounded termination of the writer: the helper may
+/// still be blocked holding the stdout lock, so its handle is retained for
+/// tracked termination instead of dropped.
+enum BoundedEmission {
+    /// The helper confirmed `write_all` plus `flush` inside the wait.
+    Written,
+    /// The helper confirmed the write plus flush failed.
+    WriteFailed,
+    /// The caller wait elapsed first. The retained helper handle is still
+    /// owned here: the caller must reap it once finished and must never
+    /// claim the writer stopped.
+    CallerTimedOut { helper: std::thread::JoinHandle<()> },
+}
+
+/// Emits one serialized frame on stdout with the bounded caller wait.
 ///
 /// The write plus flush runs on a single named helper thread so a stalled
 /// reader cannot wedge the control thread past [`OUTPUT_DEADLINE`]. At most
 /// one frame is ever outstanding — the synchronous loop never pipelines a
-/// second — and a missed deadline fails closed: the helper still holds the
-/// stdout lock, so the caller must never touch the stream again.
-fn emit_frame_bounded(framed: Vec<u8>) -> Result<(), LoopError> {
+/// second. The deadline is a caller-side observation window, not a bound on
+/// the writer: on timeout the helper handle is returned (never dropped),
+/// and the contended stream stays untouched until the helper is reaped
+/// finished.
+fn emit_frame_bounded(framed: Vec<u8>) -> Result<BoundedEmission, LoopError> {
     let (done_tx, done_rx) = channel::<bool>();
-    let spawn = std::thread::Builder::new()
+    let helper = std::thread::Builder::new()
         .name("eliot-wasm-host-stdout-write".to_owned())
         .spawn(move || {
             let stdout = std::io::stdout();
@@ -764,13 +1815,18 @@ fn emit_frame_bounded(framed: Vec<u8>) -> Result<(), LoopError> {
                 .and_then(|()| output.flush())
                 .is_ok();
             let _ = done_tx.send(ok);
-        });
-    if spawn.is_err() {
-        return Err(LoopError::ChannelUnavailable);
-    }
+        })
+        .map_err(|_| LoopError::ChannelUnavailable)?;
     match done_rx.recv_timeout(OUTPUT_DEADLINE) {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(LoopError::ChannelUnavailable),
+        Ok(true) => {
+            let _ = helper.join();
+            Ok(BoundedEmission::Written)
+        }
+        Ok(false) => {
+            let _ = helper.join();
+            Ok(BoundedEmission::WriteFailed)
+        }
+        Err(_) => Ok(BoundedEmission::CallerTimedOut { helper }),
     }
 }
 
@@ -787,6 +1843,11 @@ pub struct DeliverySetChannel {
     delivered: bool,
     control: Option<KernelControlReader>,
     emission_broken: bool,
+    /// stdout helper retained past a caller timeout (#2787). The handle is
+    /// reaped once finished — tracked termination — and while it runs the
+    /// contended stream is never reused, so at most one frame is ever
+    /// outstanding and wire order is preserved.
+    pending_helper: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DeliverySetChannel {
@@ -799,6 +1860,7 @@ impl DeliverySetChannel {
             delivered: false,
             control: None,
             emission_broken: false,
+            pending_helper: None,
         }
     }
 
@@ -821,29 +1883,97 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     }
 
     fn poll_control(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
-        match self.control.as_ref() {
+        match self.control.as_mut() {
             Some(reader) => Ok(reader.poll()),
             None => Ok(None),
         }
     }
 
+    fn poll_control_urgent(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
+        match self.control.as_mut() {
+            Some(reader) => Ok(reader.poll_urgent()),
+            None => Ok(None),
+        }
+    }
+
+    fn confirm_control_enqueued(&mut self, operation: &str) -> Result<(), LoopError> {
+        match self.control.as_mut() {
+            Some(reader) => reader.confirm_enqueued(operation),
+            None => Ok(()),
+        }
+    }
+
+    fn confirm_control_completed(
+        &mut self,
+        operation: &str,
+        outcome_digest: Option<&str>,
+    ) -> Result<(), LoopError> {
+        match self.control.as_mut() {
+            Some(reader) => reader.confirm_completed(operation, outcome_digest),
+            None => Ok(()),
+        }
+    }
+
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+        // Internal consistency first: a frame that cannot prove itself is
+        // never emitted, and a publication failure retains the observed
+        // result through the loop's drain accounting, never an ad hoc
+        // fallback. A successful write plus flush below is an observed
+        // local stream write, not proof the owner durably accepted the
+        // result.
+        validate_frame(frame)?;
         if self.emission_broken {
-            // A previous emission missed its output deadline; the helper
-            // thread still holds the stdout lock, so the contended stream
-            // is never reused — every later frame fails closed here.
+            // A previous emission confirmed its write failed; the stream
+            // state is unusable, so every later frame fails closed here.
+            return Err(LoopError::ChannelUnavailable);
+        }
+        // Tracked helper termination: reap a retained helper only once it
+        // actually finished — a reaped handle is joined, never dropped
+        // running. While it still runs, the contended stream is never
+        // reused: the caller timeout is reported as a timeout, never as
+        // bounded writer termination.
+        if self
+            .pending_helper
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(helper) = self.pending_helper.take()
+        {
+            let _ = helper.join();
+        }
+        if self.pending_helper.is_some() {
             return Err(LoopError::ChannelUnavailable);
         }
         let bytes = serde_json::to_vec(frame).map_err(|_| LoopError::ResultTooLarge)?;
         if bytes.len() > MAX_RESULT_FRAME_BYTES {
             return Err(LoopError::ResultTooLarge);
         }
-        match emit_frame_bounded(bytes) {
-            Ok(()) => Ok(()),
-            Err(error) => {
+        match emit_frame_bounded(bytes)? {
+            BoundedEmission::Written => Ok(()),
+            BoundedEmission::WriteFailed => {
                 self.emission_broken = true;
-                Err(error)
+                Err(LoopError::ChannelUnavailable)
             }
+            BoundedEmission::CallerTimedOut { helper } => {
+                self.pending_helper = Some(helper);
+                Err(LoopError::ChannelUnavailable)
+            }
+        }
+    }
+}
+
+impl Drop for DeliverySetChannel {
+    /// Reaps the retained stdout helper when — and only when — it already
+    /// finished. A still-blocked helper is never joined here: joining it
+    /// could wedge teardown forever, and the drop must not claim a
+    /// termination it did not observe.
+    fn drop(&mut self) {
+        if self
+            .pending_helper
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(helper) = self.pending_helper.take()
+        {
+            let _ = helper.join();
         }
     }
 }
@@ -857,11 +1987,49 @@ enum WorkerCommand {
     Shutdown,
 }
 
+/// Closed `worker_command` name the result event records for one observed
+/// worker command.
+fn command_name(command: WorkerCommand) -> &'static str {
+    match command {
+        WorkerCommand::Execute => "execute",
+        WorkerCommand::Cancel => "cancel",
+        WorkerCommand::Reconcile => "reconcile",
+        WorkerCommand::Shutdown => "shutdown",
+    }
+}
+
+/// Operation a result event answers for one observed worker command. A
+/// Shutdown outcome never projects a frame (the loop returns `None` for
+/// it); the arm exists so the mapping stays total. The same vocabulary
+/// keys control confirmation: `Execute` never carries an external
+/// delivery, so confirming it is always a no-op.
+fn command_operation(command: WorkerCommand) -> &'static str {
+    match command {
+        WorkerCommand::Execute => OP_INVOKE,
+        WorkerCommand::Cancel => OP_CANCEL,
+        WorkerCommand::Reconcile => OP_RECONCILE,
+        WorkerCommand::Shutdown => OP_SHUTDOWN,
+    }
+}
+
+/// Observation phase a result event carries for one observed worker
+/// command. Shutdown never projects a frame; see [`command_operation`].
+fn command_phase(command: WorkerCommand) -> &'static str {
+    match command {
+        WorkerCommand::Execute => RESULT_PHASE_EXECUTE,
+        WorkerCommand::Cancel => RESULT_PHASE_CONTAIN,
+        WorkerCommand::Reconcile => RESULT_PHASE_RECONCILE,
+        WorkerCommand::Shutdown => RESULT_PHASE_DENY,
+    }
+}
+
 /// One reply from the tracked engine worker.
 #[derive(Debug)]
 struct WorkerOutcome {
     command: WorkerCommand,
     result: Result<InvocationResult, String>,
+    /// Whether this Shutdown request won the runner's P-11 request race.
+    shutdown_request_won: Option<bool>,
 }
 
 /// The tracked engine worker's channels and join handle.
@@ -894,6 +2062,7 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
         let mut attempt: Option<InvocationRequest> = None;
         let mut shutdown = false;
         while let Ok(command) = command_rx.recv() {
+            let mut shutdown_request_won = None;
             let result = match command {
                 WorkerCommand::Execute => {
                     attempt = Some(invocation.clone());
@@ -913,12 +2082,19 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
                     None => Err("NO_ATTEMPT".to_owned()),
                 },
                 WorkerCommand::Shutdown => {
-                    let _ = runner.request_shutdown();
+                    shutdown_request_won = Some(runner.request_shutdown());
                     shutdown = true;
                     Err("SHUTDOWN".to_owned())
                 }
             };
-            if outcome_tx.send(WorkerOutcome { command, result }).is_err() {
+            if outcome_tx
+                .send(WorkerOutcome {
+                    command,
+                    result,
+                    shutdown_request_won,
+                })
+                .is_err()
+            {
                 break;
             }
             if shutdown {
@@ -947,18 +2123,35 @@ enum FollowUp {
     Reconciled,
 }
 
+/// Explicit loop phase (#2785): intake runs only while `Running`; close or
+/// exhaustion moves to `Draining`, an idled worker to `Drained`, and the
+/// joined worker to `ShutDown`. Admission open/closed stays the existing
+/// `LifecycleFlags.closed` bit plus the published/denial terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopPhase {
+    Running,
+    Draining,
+    Drained,
+    ShutDown,
+}
+
 /// Bounded lifecycle flags of the loop. Grouped so no single struct carries
 /// an unbounded set of independent booleans.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LifecycleFlags {
-    /// A command is outstanding on the tracked worker.
-    in_flight: bool,
+    /// The exact command outstanding on the tracked worker, if any. This is
+    /// the accepted-command half of the drain accounting: a command stays
+    /// here until its own outcome is consumed and correlated.
+    outstanding: Option<WorkerCommand>,
     /// Admission is closed (delivery exhausted, drained, or revoked).
     closed: bool,
     /// The one-shot grant authority already funded an executed effect.
     one_shot_spent: bool,
     /// Which uncertain-outcome follow-up was already spent.
     follow_up: FollowUp,
+    /// An admitted Shutdown demanded typed shutdown: the post-outcome path
+    /// skips follow-ups and proceeds to drain and typed shutdown (#2568 A3).
+    shutdown_demanded: bool,
 }
 
 /// Bounded state of the ordinary request loop.
@@ -966,21 +2159,42 @@ struct LifecycleFlags {
 /// Every transition is explicit: the control loop decides, the tracked
 /// worker executes, and nothing here constructs a second runner, a second
 /// engine, or a second effect for the same admitted operation.
+///
+/// Drain wedge (#2785), fixed by drain-before-join: trigger 1 joins the
+/// worker while a command is outstanding — the `Timeout` arm keeps the
+/// `outstanding` command, the intake loop returns on exhaustion, and the join then
+/// wedges behind the unconsumed outcome on the bound-1 channel; trigger 2
+/// admits after close — `tick` closes admission after the loop-top check
+/// yet intake still runs, and the `Timeout` arm stacks a second command
+/// behind the outstanding one against `max_in_flight = 1`.
 pub struct BoundedRequestLoop {
     binding: AdmittedBinding,
     engine: EngineBinding,
     live: Arc<LiveAuthority>,
     max_in_flight: usize,
-    /// Exact retained results keyed by the sealed request digest, so an
-    /// exact replay is a readback and performs no new execution.
-    retained: BTreeMap<String, WasmHostResultFrame>,
+    /// Exact retained result-event sequences keyed by the sealed request
+    /// digest (#2787 step 3). Each observation appends; history is never
+    /// rewritten, so an initial `Unknown` and its later control outcome
+    /// both survive, and an exact replay republishes the same bounded
+    /// sequence without executing again. Bounded by [`MAX_RESULT_SEQUENCE`].
+    retained: BTreeMap<String, Vec<WasmHostResultFrame>>,
     /// Command queued by the last transition, not yet handed to the worker.
     queued: Option<WorkerCommand>,
-    /// Retained frame to republish when a request is an exact replay.
-    replay: Option<WasmHostResultFrame>,
+    /// Retained sequence to republish when a request is an exact replay.
+    replay: Option<Vec<WasmHostResultFrame>>,
+    /// Next event sequence number for this operation, from 0, gapless.
+    next_sequence: u64,
+    phase: LoopPhase,
     lifecycle: LifecycleFlags,
     published: Option<WasmHostResultFrame>,
     denial: Option<LoopError>,
+    /// Exact observed P-11 request disposition, distinct from join/exit.
+    shutdown_request_won: Option<bool>,
+    /// Cloneable cross-thread guest-interruption handle taken from the
+    /// seated engine before the worker owns the runner (#2568 A3). `None`
+    /// when the engine offers none; the deadline machinery still bounds the
+    /// wait then.
+    interrupt: Option<Arc<dyn GuestInterruptHandle>>,
 }
 
 impl BoundedRequestLoop {
@@ -996,15 +2210,28 @@ impl BoundedRequestLoop {
             retained: BTreeMap::new(),
             queued: None,
             replay: None,
+            next_sequence: 0,
+            phase: LoopPhase::Running,
             lifecycle: LifecycleFlags {
-                in_flight: false,
+                outstanding: None,
                 closed: false,
                 one_shot_spent: false,
                 follow_up: FollowUp::None,
+                shutdown_demanded: false,
             },
             published: None,
             denial: None,
+            shutdown_request_won: None,
+            interrupt: None,
         }
+    }
+
+    /// Stores the seated engine's cross-thread interruption handle, taken
+    /// before the worker owns the runner (#2568 A3).
+    #[must_use]
+    pub fn with_interrupt_handle(mut self, handle: Arc<dyn GuestInterruptHandle>) -> Self {
+        self.interrupt = Some(handle);
+        self
     }
 
     /// Returns the terminal frame the loop published, if any.
@@ -1024,6 +2251,49 @@ impl BoundedRequestLoop {
         self.published.is_none() && self.denial.is_none() && !self.lifecycle.closed
     }
 
+    /// Moves `Running` to `Draining`. Idempotent: every close path calls it,
+    /// so a second close is a no-op rather than a second transition.
+    fn begin_drain(&mut self) {
+        if self.phase == LoopPhase::Running {
+            self.phase = LoopPhase::Draining;
+        }
+    }
+
+    /// Moves `Draining` to `Drained` once every accepted command's outcome
+    /// was consumed with nothing queued. The caller gates this on a
+    /// successful drain; idempotent over already-terminal phases.
+    fn mark_drained(&mut self) {
+        if self.phase == LoopPhase::Draining {
+            self.phase = LoopPhase::Drained;
+        }
+    }
+
+    /// Moves `Drained` to `ShutDown` once the worker handle joined.
+    /// Idempotent over already-terminal phases.
+    fn mark_shutdown(&mut self) {
+        if self.phase == LoopPhase::Drained {
+            self.phase = LoopPhase::ShutDown;
+        }
+    }
+
+    /// Single-gate intake (#2785): new demand is taken only while `Running`
+    /// with admission open, nothing outstanding, and nothing already queued.
+    /// The bound-1 command channel admits exactly one outstanding command,
+    /// so `outstanding` is the capacity signal — sending while a command is
+    /// outstanding would stack a second command behind it.
+    fn intake_open(&self) -> bool {
+        self.phase == LoopPhase::Running
+            && self.lifecycle.outstanding.is_none()
+            && self.queued.is_none()
+            && self.admission_open()
+    }
+
+    /// Drain-complete predicate: every accepted command's outcome was
+    /// consumed (nothing outstanding) and none is queued.
+    fn drain_complete(&self) -> bool {
+        self.lifecycle.outstanding.is_none() && self.queued.is_none()
+    }
+
     /// Control phase: refresh the observed clock and close admission on a
     /// revoked or expired binding. A trap in one bounded instance never
     /// reaches this state; it is classified and the loop keeps its contract.
@@ -1031,6 +2301,7 @@ impl BoundedRequestLoop {
         self.live.observe(edge_now_ms());
         if !self.live.is_live() {
             self.lifecycle.closed = true;
+            self.begin_drain();
         }
     }
 
@@ -1041,14 +2312,22 @@ impl BoundedRequestLoop {
     /// loop has one admission path rather than two.
     fn admit(&mut self, frame: &WasmHostRequestFrame) -> Result<(), LoopError> {
         let request = WasmHostRequestFrame::parse(frame)?;
+        // Drain gate (#2785): once draining, new invoke demand is refused
+        // with the typed drain-closed denial; pre-drain admitted demand —
+        // the control follow-ups settling the admitted attempt — keeps its
+        // exact scope through the unchanged arms below.
+        if self.phase != LoopPhase::Running && matches!(request, WasmHostRequest::Invoke(_)) {
+            return Err(denied("drain-closed"));
+        }
         self.queued = None;
         self.replay = None;
         match &request {
             WasmHostRequest::Invoke(invoke) => {
                 check_invoke(&self.binding, &self.live, invoke)?;
                 if let Some(retained) = self.retained.get(&invoke.request_digest) {
-                    // Exact retained-result replay: legitimate result
-                    // readback, never a new execution and never a new effect.
+                    // Exact retained-sequence replay: legitimate result
+                    // readback of the same bounded event sequence, never a
+                    // new execution and never a new effect.
                     self.replay = Some(retained.clone());
                     return Ok(());
                 }
@@ -1063,15 +2342,21 @@ impl BoundedRequestLoop {
             }
             WasmHostRequest::Cancel(control) => {
                 check_control(&self.binding, control)?;
-                self.lifecycle.follow_up = FollowUp::Contained;
+                // Admission only validates and queues: the follow-up is
+                // spent by `send` after the worker accepts the enqueue, so
+                // a full/disconnected channel never advances containment
+                // truthfully owed to an accepted command.
                 self.queued = Some(WorkerCommand::Cancel);
             }
             WasmHostRequest::Reconcile(control) => {
                 check_control(&self.binding, control)?;
-                self.lifecycle.follow_up = FollowUp::Reconciled;
                 self.queued = Some(WorkerCommand::Reconcile);
             }
-            WasmHostRequest::Shutdown => self.lifecycle.closed = true,
+            WasmHostRequest::Shutdown => {
+                self.lifecycle.closed = true;
+                self.lifecycle.shutdown_demanded = true;
+                self.begin_drain();
+            }
         }
         Ok(())
     }
@@ -1095,51 +2380,86 @@ impl BoundedRequestLoop {
     /// owner-side reconciliation record rather than reissued.
     fn on_outcome(&mut self, outcome: WorkerOutcome) -> Option<WasmHostResultFrame> {
         if outcome.command == WorkerCommand::Shutdown {
+            self.shutdown_request_won = outcome.shutdown_request_won;
             return None;
         }
-        let frame = match outcome.result {
-            Ok(result) => {
-                let projected = project_result(&self.binding, &self.engine, &result);
-                enforce_frame_budget(projected, self.binding.max_output_bytes)
-            }
-            Err(code) => {
-                let field = if code == "NO_ATTEMPT" {
-                    "attempt-identity"
-                } else {
-                    "execution-refused"
-                };
-                let denial = denial_frame(&self.binding, OP_INVOKE, denied(field));
-                enforce_frame_budget(denial, self.binding.max_output_bytes)
-            }
+        // The observed command fixes the frame's operation/phase identity:
+        // a Cancel outcome answers `OP_CANCEL` in the `contain` phase, a
+        // Reconcile outcome answers `OP_RECONCILE` in the `reconcile` phase.
+        // Control outcomes never masquerade as Invoke results.
+        let command = outcome.command;
+        let mut frame = match outcome.result {
+            Ok(result) => project_result(&self.binding, &self.engine, command, &result),
+            Err(code) if self.lifecycle.follow_up != FollowUp::None => unknown_frame(
+                &self.binding,
+                command_operation(command),
+                command_phase(command),
+                Some(command),
+                code.as_str(),
+            ),
+            Err(code) => denial_frame(
+                &self.binding,
+                command_operation(command),
+                command_phase(command),
+                Some(command),
+                code.as_str(),
+            ),
         };
-        self.retained
-            .insert(frame.request_digest.clone(), frame.clone());
+        frame.sequence = self.next_sequence;
+        frame.observation_predecessors = self
+            .retained
+            .get(&frame.request_digest)
+            .into_iter()
+            .flatten()
+            .map(|previous| previous.sequence)
+            .collect();
+        frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
+        self.next_sequence = self.next_sequence.saturating_add(1);
         self.lifecycle.one_shot_spent = true;
         if frame.disposition == UNCERTAIN_DISPOSITION {
-            self.settle_uncertain(frame.clone());
+            self.settle_uncertain(&mut frame);
         } else {
             self.queued = None;
+            frame.terminal = true;
             self.published = Some(frame.clone());
         }
+        self.retained
+            .entry(frame.request_digest.clone())
+            .or_default()
+            .push(frame.clone());
         Some(frame)
     }
 
     /// Chooses the single bounded next step for an uncertain outcome:
     /// containment once authority closed, one reconciliation pass while it
     /// is live, and terminal retention once either has been spent. The
-    /// uncertain frame is published either way, so the outcome is never
-    /// hidden behind the follow-up step.
-    fn settle_uncertain(&mut self, frame: WasmHostResultFrame) {
+    /// uncertain frame is nonterminal while its follow-up is queued and
+    /// terminal once the follow-up is spent, and it is published either
+    /// way, so the outcome is never hidden behind the follow-up step and
+    /// the original uncertainty is never rewritten.
+    fn settle_uncertain(&mut self, frame: &mut WasmHostResultFrame) {
+        if self.lifecycle.shutdown_demanded {
+            // Typed shutdown wins over follow-ups: the uncertain frame is
+            // retained terminal as observed — never rewritten — and the loop
+            // proceeds to drain and typed shutdown with nothing queued.
+            self.queued = None;
+            frame.terminal = true;
+            self.published = Some(frame.clone());
+            return;
+        }
         match self.lifecycle.follow_up {
             FollowUp::None if !self.live.is_live() => {
                 let _ = self.queue_control(OP_CANCEL);
+                frame.terminal = false;
             }
             FollowUp::None => {
                 let _ = self.queue_control(OP_RECONCILE);
+                frame.terminal = false;
             }
             FollowUp::Contained | FollowUp::Reconciled => {
                 self.queued = None;
-                self.published = Some(frame);
+                frame.terminal = true;
+                self.published = Some(frame.clone());
             }
         }
     }
@@ -1150,24 +2470,158 @@ impl BoundedRequestLoop {
     /// guest; this delivers the owner's containment to the runtime owner at
     /// the first point it can accept it.
     fn containment_step(&mut self) -> Result<(), LoopError> {
-        if self.lifecycle.follow_up != FollowUp::None || self.live.is_live() {
+        // Never queue containment behind an outstanding command: the bound-1
+        // channel admits exactly one, so the uncertain attempt settles after
+        // its own outcome arrives, through the follow-up taxonomy.
+        if self.lifecycle.outstanding.is_some()
+            || self.lifecycle.follow_up != FollowUp::None
+            || self.live.is_live()
+        {
             return Ok(());
         }
         self.queue_control(OP_CANCEL)
     }
 
-    /// Hands the queued command to the tracked worker.
+    /// Hands the queued command to the tracked worker. Containment and
+    /// reconciliation state advances only here, after the worker accepts the
+    /// enqueue: a refused send leaves the follow-up unspent and the command
+    /// queued, so the delivery stays replayable and the drain still owes it
+    /// its exact outcome.
     fn send(
         &mut self,
         command: WorkerCommand,
         sender: &SyncSender<WorkerCommand>,
     ) -> Result<(), LoopError> {
-        sender
-            .try_send(command)
-            .map_err(|_| LoopError::ChannelUnavailable)?;
+        match sender.try_send(command) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(LoopError::CommandQueueFull {
+                    command: command_name(command),
+                });
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(LoopError::CommandChannelDisconnected {
+                    command: command_name(command),
+                });
+            }
+        }
         self.queued = None;
-        self.lifecycle.in_flight = true;
+        self.lifecycle.outstanding = Some(command);
+        match command {
+            WorkerCommand::Cancel => self.lifecycle.follow_up = FollowUp::Contained,
+            WorkerCommand::Reconcile => self.lifecycle.follow_up = FollowUp::Reconciled,
+            WorkerCommand::Execute | WorkerCommand::Shutdown => {}
+        }
         Ok(())
+    }
+
+    /// Fires the stored guest-interruption handle while a command is
+    /// outstanding and interruption-class control is pending (#2568 A3): an
+    /// admitted Cancel held in `queued`, or an admitted Shutdown. Firing is
+    /// best-effort and idempotent, so the tick retries until the outcome
+    /// arrives — this closes the race where the worker has accepted the
+    /// command but not started the child yet. Never sends: the bound-1 slot
+    /// stays single-owner.
+    fn interrupt_outstanding(&self) {
+        if self.lifecycle.outstanding.is_none() {
+            return;
+        }
+        let pending =
+            self.queued == Some(WorkerCommand::Cancel) || self.lifecycle.shutdown_demanded;
+        if !pending {
+            return;
+        }
+        if let Some(handle) = self.interrupt.as_ref() {
+            handle.interrupt();
+        }
+    }
+
+    /// Projects and best-effort publishes the terminal Unknown frame for an
+    /// accepted command whose worker reply never arrived (#2568 A4). The
+    /// emitted frame is the durable record of the loss; the loop error still
+    /// returns afterwards, so a publication failure here never masks the lost
+    /// response. Runs once: a published terminal or a recorded denial
+    /// suppresses any later loss projection, and nothing is projected without
+    /// an accepted command to observe.
+    fn publish_lost_response(
+        &mut self,
+        channel: &mut dyn WasmHostRequestChannel,
+        error: LoopError,
+    ) {
+        if self.published.is_some() || self.denial.is_some() {
+            return;
+        }
+        let Some(command) = self.lifecycle.outstanding else {
+            return;
+        };
+        // A Shutdown outcome never projects a worker-command frame (the
+        // validator rejects it); its loss observes the shutdown demand
+        // itself in the deny phase with no worker command.
+        let (operation, phase, worker_command) = if command == WorkerCommand::Shutdown {
+            (OP_SHUTDOWN, RESULT_PHASE_DENY, None)
+        } else {
+            (
+                command_operation(command),
+                command_phase(command),
+                Some(command),
+            )
+        };
+        let mut frame = unknown_frame(
+            &self.binding,
+            operation,
+            phase,
+            worker_command,
+            error.code(),
+        );
+        frame.sequence = self.next_sequence;
+        frame.observation_predecessors = self
+            .retained
+            .get(&frame.request_digest)
+            .into_iter()
+            .flatten()
+            .map(|previous| previous.sequence)
+            .collect();
+        frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
+        frame.terminal = true;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.published = Some(frame.clone());
+        self.retained
+            .entry(frame.request_digest.clone())
+            .or_default()
+            .push(frame.clone());
+        let _ = channel.publish(&frame);
+    }
+}
+
+/// Stores the seated engine's interruption handle on the loop state (#2568
+/// A3). Called before the worker owns the runner, so the control loop can
+/// terminate pending guest work while a command is outstanding.
+fn install_interrupt_handle(
+    state: BoundedRequestLoop,
+    runner: &WasmHostRunner,
+) -> BoundedRequestLoop {
+    match runner.interrupt_handle() {
+        Some(handle) => state.with_interrupt_handle(handle),
+        None => state,
+    }
+}
+
+/// Revokes the live authority cell and enqueues typed shutdown, but only
+/// after accepted work and its outcomes have settled. The accepted Shutdown
+/// remains outstanding until its exact worker reply is consumed. Returns
+/// whether Shutdown was accepted plus any enqueue failure.
+fn enqueue_typed_shutdown(
+    state: &mut BoundedRequestLoop,
+    commands: &SyncSender<WorkerCommand>,
+) -> (bool, Option<LoopError>) {
+    state.live.revoke();
+    if !state.drain_complete() {
+        return (false, None);
+    }
+    state.queued = Some(WorkerCommand::Shutdown);
+    match state.send(WorkerCommand::Shutdown, commands) {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error)),
     }
 }
 
@@ -1185,51 +2639,207 @@ pub fn run_request_loop(
     let binding = AdmittedBinding::from_material(material, &runtime.invocation);
     let request_frame = WasmHostRequestFrame::admitted_invoke(&binding);
     let mut channel = DeliverySetChannel::new(request_frame);
-    if let Some(path) = kernel_control_path() {
-        channel = channel.with_kernel_control(KernelControlReader::new(&binding, path));
+    if let Some(directory) = kernel_control_dir() {
+        channel = channel.with_kernel_control(KernelControlReader::new(&binding, directory));
     }
     let mut state = BoundedRequestLoop::new(
         binding,
         runtime.engine_binding.clone(),
         Arc::clone(&runtime.live),
     );
+    state = install_interrupt_handle(state, &runtime.runner);
     let worker = spawn_worker(runtime, state.max_in_flight);
-    let outcome = drive_loop(&mut state, &mut channel, &worker.commands, &worker.outcomes);
-    // Typed shutdown: close admission, ask the worker to stop, and join it so
-    // no guest work is left untracked.
-    state.live.revoke();
-    let _ = worker.commands.try_send(WorkerCommand::Shutdown);
-    drop(worker.commands);
-    let _ = worker.handle.join();
+    let outcome = drive_loop(
+        &mut state,
+        &mut channel,
+        &worker.commands,
+        &worker.outcomes,
+        &worker.handle,
+    );
+    drain_and_shutdown_request_worker(&mut state, &mut channel, worker, outcome)
+}
+
+/// Drains accepted work, shuts down and joins the worker, then returns the
+/// exact terminal result of the ordinary request loop.
+fn drain_and_shutdown_request_worker(
+    state: &mut BoundedRequestLoop,
+    channel: &mut DeliverySetChannel,
+    worker: EngineWorker,
+    outcome: Result<(), LoopError>,
+) -> Result<WasmHostResultFrame, LoopError> {
+    // Join-after-drain (#2785 trigger 1): intake returns on close or
+    // exhaustion with a command possibly outstanding, so keep polling
+    // outcomes until the worker idles and only then shut down and join.
+    // Joining with a command outstanding or an outcome unconsumed wedges the
+    // worker's Shutdown reply behind the unread outcome on the bound-1
+    // channel and the join never returns.
+    state.begin_drain();
+    let drained = drain_outstanding(
+        state,
+        channel,
+        &worker.commands,
+        &worker.outcomes,
+        &worker.handle,
+    );
+    let (shutdown_sent, shutdown_error) = enqueue_typed_shutdown(state, &worker.commands);
+    let mut confirm_error: Option<LoopError> = None;
+    if shutdown_sent && let Err(error) = channel.confirm_control_enqueued(OP_SHUTDOWN) {
+        confirm_error = Some(error);
+    }
+    let shutdown_drained = if shutdown_sent {
+        drain_outstanding(
+            state,
+            channel,
+            &worker.commands,
+            &worker.outcomes,
+            &worker.handle,
+        )
+    } else {
+        Ok(())
+    };
+    // If Shutdown was not accepted, select sender closure as the termination
+    // protocol. If it was accepted, keep the sender alive and require the
+    // tracked reply; the two protocols are never combined for an accepted
+    // Shutdown.
+    if !shutdown_sent {
+        drop(worker.commands);
+    }
+    let termination_drain =
+        drain_until_worker_exit(state, channel, &worker.outcomes, &worker.handle);
+    let shutdown_observed = shutdown_sent
+        && state.lifecycle.outstanding != Some(WorkerCommand::Shutdown)
+        && state.shutdown_request_won.is_some();
+    if state.drain_complete()
+        && drained.is_ok()
+        && shutdown_drained.is_ok()
+        && termination_drain.is_ok()
+        && shutdown_observed
+    {
+        state.mark_drained();
+    }
+    // `JoinHandle::join` is called only after the worker owner confirms
+    // termination. The wait also drains any late bounded outcome before the
+    // handle can be joined.
+    let joined = join_shutdown_worker(state, channel, worker.handle, &mut confirm_error);
+    if let Some(error) = shutdown_error {
+        return Err(error);
+    }
+    shutdown_drained?;
+    termination_drain?;
     if let Some(error) = state.denial() {
         // The loop recorded the exact admission denial; report that stable
         // field rather than the transport symptom that surfaced it.
         return Err(error);
     }
     outcome?;
+    drained?;
+    // Explicit termination accounting (#2785): a worker that never took
+    // `Shutdown` or never joined left guest work untracked; that is a
+    // failed loop, never a silent success.
+    if !shutdown_sent {
+        return Err(LoopError::CommandChannelDisconnected {
+            command: "shutdown",
+        });
+    }
+    if !shutdown_observed {
+        let error = LoopError::WorkerTerminatedWithoutOutcome {
+            command: "shutdown",
+        };
+        state.publish_lost_response(channel, error);
+        return Err(error);
+    }
+    if !joined {
+        return Err(LoopError::ChannelUnavailable);
+    }
+    // A Shutdown ack that could not be staged fails the loop honestly: the
+    // delivery stays unacknowledged and the owner must reconcile it, rather
+    // than the child reporting success it cannot prove.
+    if let Some(error) = confirm_error {
+        return Err(error);
+    }
     state.published().cloned().ok_or(denied("no-request"))
 }
 
-/// Derives the Kernel control-request path from the loader path only —
-/// never from argv, stdin, or environment. `None` when the loader path is
-/// unavailable, in which case the loop serves the delivery set with no
-/// external control source.
-fn kernel_control_path() -> Option<PathBuf> {
-    admitted_material_path().and_then(|path| {
-        path.parent()
-            .map(|directory| directory.join(WASM_HOST_CONTROL_FILE_NAME))
-    })
+/// Joins the terminated worker and confirms its observed Shutdown outcome.
+fn join_shutdown_worker(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    handle: std::thread::JoinHandle<()>,
+    confirm_error: &mut Option<LoopError>,
+) -> bool {
+    while !handle.is_finished() {
+        std::thread::yield_now();
+    }
+    let joined = handle.join().is_ok();
+    if joined {
+        state.mark_shutdown();
+        // Termination observed: the accepted Shutdown's exact outcome is the
+        // joined worker (its reply stays unread by #2785 design), so the
+        // delivery completes here with no outcome digest.
+        if let Err(error) = channel.confirm_control_completed(OP_SHUTDOWN, None)
+            && confirm_error.is_none()
+        {
+            *confirm_error = Some(error);
+        }
+    }
+    joined
+}
+
+/// Derives the Kernel control spool directory from the loader path only —
+/// never from argv, stdin, or environment: the install directory holding the
+/// delivery set. `None` when the loader path is unavailable, in which case
+/// the loop serves the delivery set with no external control source.
+fn kernel_control_dir() -> Option<PathBuf> {
+    admitted_material_path().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// What one external-control intake step admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalIntake {
+    /// Nothing was staged.
+    None,
+    /// A Cancel/Reconcile was admitted and queued: the caller enqueues it
+    /// and confirms the delivery only after the worker accepts it.
+    Command(WorkerCommand),
+    /// A Shutdown was admitted: admission is closed and the drain is
+    /// entered, and the delivery is confirmed after the worker accepts the
+    /// tracked shutdown in the join tail.
+    Shutdown,
 }
 
 /// Admits one externally staged Kernel control frame through the same
-/// admission path internal control uses. Returns whether a frame was
-/// admitted; the caller then applies the loop's normal send/close handling
-/// and continues its tick without pulling a new delivery request.
+/// admission path internal control uses. The caller enqueues the admitted
+/// command through the loop's normal send handling and continues its tick
+/// without pulling a new delivery request; a Shutdown instead closes
+/// admission and enters the drain. Admission failure records the exact
+/// denial and leaves the staged delivery replayable — nothing is
+/// acknowledged or retired here.
 fn admit_external_control(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
-) -> Result<bool, LoopError> {
+) -> Result<ExternalIntake, LoopError> {
     let Some(frame) = channel.poll_control()? else {
+        return Ok(ExternalIntake::None);
+    };
+    if let Err(error) = state.admit(&frame) {
+        state.denial = Some(error);
+        return Err(error);
+    }
+    match state.queued {
+        Some(command) => Ok(ExternalIntake::Command(command)),
+        None => Ok(ExternalIntake::Shutdown),
+    }
+}
+
+/// Admits one staged urgent Cancel/Shutdown through the same admission path
+/// internal control uses (#2568 A3). Runs before the single-gate intake
+/// check, so the caller can interrupt outstanding guest work; the caller
+/// never sends while a command is outstanding.
+fn admit_external_control_urgent(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+) -> Result<bool, LoopError> {
+    let Some(frame) = channel.poll_control_urgent()? else {
         return Ok(false);
     };
     if let Err(error) = state.admit(&frame) {
@@ -1246,23 +2856,37 @@ fn drive_loop(
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
 ) -> Result<(), LoopError> {
     while state.admission_open() {
         state.tick();
-        if state.lifecycle.in_flight {
-            poll_pending(state, channel, commands, outcomes)?;
+        if state.lifecycle.outstanding.is_some() {
+            poll_pending(state, channel, commands, outcomes, handle)?;
             continue;
+        }
+        // Single-gate intake (#2785 trigger 2): `tick` may have closed
+        // admission after the loop-top check, so recheck before touching
+        // the delivery set — no Execute lands after close.
+        if !state.intake_open() {
+            state.begin_drain();
+            break;
         }
         // External control stays processable while the loop is idle too: a
         // Kernel Cancel racing the delivery set is admitted before the
-        // invoke is pulled, never after it executed.
-        if admit_external_control(state, channel)? {
-            if let Some(command) = state.queued {
+        // invoke is pulled, never after it executed. Intake is provably
+        // open here (nothing outstanding or queued), so no second command
+        // stacks behind an outstanding one.
+        match admit_external_control(state, channel)? {
+            ExternalIntake::Command(command) => {
                 state.send(command, commands)?;
+                channel.confirm_control_enqueued(command_operation(command))?;
+                continue;
             }
-            continue;
+            ExternalIntake::Shutdown => continue,
+            ExternalIntake::None => {}
         }
         let Some(frame) = channel.next_frame()? else {
+            state.begin_drain();
             break;
         };
         if let Err(error) = state.admit(&frame) {
@@ -1270,16 +2894,27 @@ fn drive_loop(
             // transport-level refusal, so the receipt names the field that
             // actually broke the binding.
             state.denial = Some(error);
+            state.begin_drain();
             return Err(error);
         }
         if let Some(replay) = state.replay.clone() {
             state.replay = None;
-            state.published = Some(replay.clone());
-            channel.publish(&replay)?;
+            // Exact replay republishes the retained bounded sequence in
+            // order — same events, same sequence numbers, same terminal —
+            // without executing again. The terminal projection is the last
+            // retained event.
+            for event in &replay {
+                channel.publish(event)?;
+            }
+            state.published = replay.last().cloned();
+            state.begin_drain();
             break;
         }
         if let Some(command) = state.queued {
+            // Delivery-set demand carries no external delivery: the confirm
+            // is a no-op by construction, kept so every send site confirms.
             state.send(command, commands)?;
+            channel.confirm_control_enqueued(command_operation(command))?;
         }
     }
     Ok(())
@@ -1293,34 +2928,198 @@ fn poll_pending(
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
 ) -> Result<(), LoopError> {
     match outcomes.recv_timeout(CONTROL_POLL) {
-        Ok(outcome) => {
-            state.lifecycle.in_flight = false;
-            if let Some(frame) = state.on_outcome(outcome) {
-                channel.publish(&frame)?;
-            }
-            if let Some(command) = state.queued {
-                state.send(command, commands)?;
-            }
-            Ok(())
-        }
+        Ok(outcome) => consume_worker_outcome(state, channel, commands, outcome),
         Err(RecvTimeoutError::Timeout) => {
+            if handle.is_finished()
+                && let Some(command) = state.lifecycle.outstanding
+            {
+                // A reply can arrive between the timeout and the termination
+                // observation. Consume that last reply before calling it lost.
+                if let Ok(outcome) = outcomes.try_recv() {
+                    return consume_worker_outcome(state, channel, commands, outcome);
+                }
+                let error = LoopError::WorkerTerminatedWithoutOutcome {
+                    command: command_name(command),
+                };
+                state.publish_lost_response(channel, error);
+                return Err(error);
+            }
+            // Interrupt, don't queue (#2568 A3): poll urgent external
+            // control BEFORE the single-gate intake check below, so an
+            // admitted Cancel/Shutdown terminates outstanding guest work
+            // instead of waiting for its outcome. Nothing is ever sent
+            // while a command is outstanding — the bound-1 slot stays
+            // single-owner — and the uncertain attempt still settles after
+            // its own outcome arrives, through the follow-up taxonomy.
+            if state.lifecycle.outstanding.is_some() {
+                admit_external_control_urgent(state, channel)?;
+                state.interrupt_outstanding();
+                return Ok(());
+            }
+            // Single-gate intake (#2785 trigger 2): while a command is
+            // outstanding on the bound-1 channel — or admission has
+            // closed — never queue a second command behind it. An
+            // uncertain attempt settles after its own outcome arrives,
+            // through the existing follow-up taxonomy.
+            if !state.intake_open() {
+                return Ok(());
+            }
             state.containment_step()?;
-            // External control intake while guest work is pending: the
-            // control poll never blocks, so the outstanding command keeps
-            // its outcome wait while a Kernel Cancel/Reconcile/Shutdown
+            // External control intake while the worker is idle (past the
+            // single-gate check above, nothing is outstanding): the control
+            // poll never blocks, so a Kernel Cancel/Reconcile/Shutdown
             // staged beside the delivery set is admitted through the same
             // path. Owner intent wins the single command slot over the
-            // clock-derived containment above.
+            // clock-derived containment above. While a command is
+            // outstanding the urgent poll above applies instead — Cancel
+            // and Shutdown interrupt, Reconcile stays staged, and nothing
+            // is ever stacked behind the outstanding command.
             admit_external_control(state, channel)?;
             if let Some(command) = state.queued {
                 state.send(command, commands)?;
+                channel.confirm_control_enqueued(command_operation(command))?;
             }
             Ok(())
         }
-        Err(RecvTimeoutError::Disconnected) => Err(LoopError::ChannelUnavailable),
+        Err(RecvTimeoutError::Disconnected) => {
+            let command = state
+                .lifecycle
+                .outstanding
+                .map_or("untracked", command_name);
+            let error = LoopError::OutcomeChannelDisconnected { command };
+            state.publish_lost_response(channel, error);
+            Err(error)
+        }
     }
+}
+
+fn consume_worker_outcome(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    commands: &SyncSender<WorkerCommand>,
+    outcome: WorkerOutcome,
+) -> Result<(), LoopError> {
+    // An uncorrelated reply cannot settle an accepted command.
+    if state.lifecycle.outstanding != Some(outcome.command) {
+        return Err(denied("uncorrelated-outcome"));
+    }
+    let command = outcome.command;
+    state.lifecycle.outstanding = None;
+    if let Some(frame) = state.on_outcome(outcome) {
+        // The exact outcome is observed here: complete the accepted
+        // control before publishing, so the ack is durable ahead of
+        // the best-effort emission the drain may still record.
+        let digest = serde_json::to_vec(&frame)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        channel.confirm_control_completed(command_operation(command), digest.as_deref())?;
+        channel.publish(&frame)?;
+    }
+    if let Some(command) = state.queued {
+        state.send(command, commands)?;
+        channel.confirm_control_enqueued(command_operation(command))?;
+    }
+    Ok(())
+}
+
+/// Join-after-drain (#2785): after intake closes, keep polling worker
+/// outcomes until the worker idles, so the join never meets an outstanding
+/// command or an unconsumed outcome. Pre-drain admitted demand keeps its
+/// exact scope — a queued follow-up is handed over once the worker is idle
+/// — and control outcomes settle through the existing taxonomy. A
+/// publication failure is recorded but never stops the drain: outcomes keep
+/// flowing until the worker idles, and the failure surfaces afterwards.
+fn drain_outstanding(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    commands: &SyncSender<WorkerCommand>,
+    outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
+) -> Result<(), LoopError> {
+    let mut first_error: Option<LoopError> = None;
+    while !state.drain_complete() {
+        if state.lifecycle.outstanding.is_some() {
+            match poll_pending(state, channel, commands, outcomes, handle) {
+                // The outcome was consumed but its delivery failed: keep
+                // draining — a publication failure must not stop outcome
+                // draining — and report the first such failure once idle.
+                Err(error) if state.lifecycle.outstanding.is_none() => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                result => result?,
+            }
+        } else if let Some(command) = state.queued {
+            // A retried external send confirms its still-pending delivery;
+            // internal follow-ups confirm nothing.
+            state.send(command, commands)?;
+            channel.confirm_control_enqueued(command_operation(command))?;
+        }
+        state.tick();
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Supervises the worker to termination while retaining every outcome still
+/// available on the bounded channel. Used after drain/termination errors so
+/// no return path drops a live `JoinHandle`. An unresolved command or enqueue
+/// remains an explicit error after the worker exits.
+fn drain_until_worker_exit(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    outcomes: &Receiver<WorkerOutcome>,
+    handle: &std::thread::JoinHandle<()>,
+) -> Result<(), LoopError> {
+    let mut first_error: Option<LoopError> = None;
+    let mut observe = |outcome: WorkerOutcome| {
+        if state.lifecycle.outstanding != Some(outcome.command) {
+            first_error.get_or_insert(denied("uncorrelated-outcome"));
+            return;
+        }
+        state.lifecycle.outstanding = None;
+        if let Some(frame) = state.on_outcome(outcome)
+            && let Err(error) = channel.publish(&frame)
+        {
+            first_error.get_or_insert(error);
+        }
+        if let Some(command) = state.queued {
+            first_error.get_or_insert(LoopError::CommandChannelDisconnected {
+                command: command_name(command),
+            });
+        }
+    };
+
+    while !handle.is_finished() {
+        match outcomes.recv_timeout(CONTROL_POLL) {
+            Ok(outcome) => observe(outcome),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                std::thread::yield_now();
+            }
+        }
+    }
+    while let Ok(outcome) = outcomes.try_recv() {
+        observe(outcome);
+    }
+    if let Some(command) = state.lifecycle.outstanding {
+        let error = LoopError::WorkerTerminatedWithoutOutcome {
+            command: command_name(command),
+        };
+        state.publish_lost_response(channel, error);
+        first_error.get_or_insert(error);
+    }
+    if let Some(command) = state.queued {
+        first_error.get_or_insert(LoopError::CommandChannelDisconnected {
+            command: command_name(command),
+        });
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Outcome of the ordinary governed path: the canonical correlated frame.
@@ -1331,6 +3130,18 @@ pub type OrdinaryOutcome = WasmHostResultFrame;
 pub enum OrdinaryDriveError {
     /// No owner delivery set is staged beside this installation.
     NoDeliverySet,
+    /// A staged delivery this drive already served — or its spent grant
+    /// re-staged — is still present: terminal-unacknowledged across
+    /// restart, with no retained result in this process. Explicit
+    /// in-progress, never mistaken for absence.
+    DeliveryInProgress {
+        /// Served operation identity.
+        operation_id: String,
+        /// Served generation.
+        generation: u64,
+        /// Served claim identity.
+        claim_id: String,
+    },
     /// The delivery set, installation binding, permit, or admitted world
     /// failed closed before the loop could start.
     Drive(DriveError),
@@ -1342,6 +3153,7 @@ impl fmt::Display for OrdinaryDriveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDeliverySet => formatter.write_str("ORDINARY_NO_ADMITTED_DELIVERY_SET"),
+            Self::DeliveryInProgress { .. } => formatter.write_str("ORDINARY_DELIVERY_IN_PROGRESS"),
             Self::Drive(error) => write!(formatter, "{error}"),
             Self::Loop(error) => write!(formatter, "{error}"),
         }
@@ -1371,95 +3183,163 @@ impl std::error::Error for OrdinaryDriveError {}
 /// binding, the one-shot permit, the admitted world, the request source,
 /// the result sink, or a request binding fails closed.
 pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError> {
-    let mut served_grant: Option<String> = None;
+    let mut served: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
     let mut outcome: Option<OrdinaryOutcome> = None;
+    let mut replayed: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
     // The staged path is the owner's only route into this process, and the
     // previous set was consumed, so any set observed here is either a
     // replacement generation or a same-grant re-stage. Nothing is carried
-    // across iterations except the served grant digest below, so no
+    // across iterations except the served delivery identity below, so no
     // accumulation is possible.
-    while let Some(material) = read_admitted_material().map_err(OrdinaryDriveError::Drive)? {
-        if served_grant.as_deref() == Some(material.grant.grant_digest.as_str()) {
-            // Same grant this process already served to its published
-            // terminal frame. Serving it again would revive spent one-shot
-            // authority for a new effect, so the chain ends here.
-            break;
+    while let Some((claim, material)) =
+        read_admitted_material().map_err(OrdinaryDriveError::Drive)?
+    {
+        // The claim arrives with the material from one claim-first read:
+        // the pre-read envelope identity selected this operation before
+        // the payload files were trusted, so the claim below is that
+        // selection — never a copy derived after the fact. Durable served
+        // state extends in-memory retention across restart: a staged set
+        // the marker names is terminal-unacknowledged (a crash between
+        // publish and reclaim), so it replays below instead of
+        // re-executing.
+        let served_marker = crate::dispatch_material::admitted_material_path()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .and_then(|directory| crate::dispatch_material::read_served_marker(&directory));
+        match crate::dispatch_material::classify_staged_delivery(
+            &material,
+            served.as_ref(),
+            served_marker.as_ref(),
+        ) {
+            crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
+                // The classifier also treats a differing identity under the
+                // same spent grant as Replay. Preserve the staged identity;
+                // the final projection may reuse an outcome only when this
+                // identity exactly matches the one served in this process.
+                // A replay without a matching in-process outcome has no
+                // durable result or acknowledgement to authorize reclamation.
+                // Keep the claimed set and served marker as local identity
+                // evidence; the projection below reports DeliveryInProgress
+                // with this exact identity until an owner can reconcile it.
+                replayed = Some(identity);
+                break;
+            }
+            crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
+                // Explicit v1 compatibility: full admission under the staged
+                // identity verbatim, never reinterpreted as a fresh
+                // generation with new identity.
+                let _admitted_operation = identity.operation_id.len();
+            }
         }
         let runtime =
             build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
         let frame = run_request_loop(runtime, &material);
-        // The delivery set is one-shot: it is consumed exactly once, so a
-        // leftover is a fresh-drive signal rather than a silent reuse. The
-        // in-memory retention of the terminal frame above is the readback
+        // The delivery set is one-shot: a published terminal outcome reclaims
+        // exactly the claimed generation, so a leftover is a fresh-drive
+        // signal rather than a silent reuse. Unknown execution, failed
+        // publication, lost response, or failed drain retains the exact
+        // operation/generation evidence for recovery and never reclaims. The
+        // in-memory retention of the terminal frame below is the readback
         // path, not a second execution.
-        consume_delivery_set(&material);
-        let frame = frame.map_err(OrdinaryDriveError::Loop)?;
-        served_grant = Some(material.grant.grant_digest.as_str().to_owned());
-        outcome = Some(frame);
+        match frame {
+            Ok(ok_frame) => {
+                // Durable served marker (#2786 step 7): after the terminal
+                // outcome published, before reclaim. A crash between the two
+                // leaves staged bytes plus this marker, so restart replays
+                // instead of re-executing. Best-effort: the serve already
+                // happened exactly once.
+                if let Some(directory) = crate::dispatch_material::admitted_material_path()
+                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                {
+                    let _ = crate::dispatch_material::write_served_marker(
+                        &directory,
+                        claim.identity(),
+                        edge_now_ms(),
+                    );
+                }
+                let reclamation = consume_delivery_set(&claim);
+                // Bounded residual only: a partial reclamation never
+                // overwrites the primary result; retained files stay for
+                // maintenance under the exact claimed identity.
+                let _residual_complete = match &reclamation {
+                    crate::dispatch_material::ClaimedReclamation::Reclaimed(detail) => {
+                        let _reclaimed_operation = detail.identity.operation_id.len();
+                        detail.fully_reclaimed()
+                    }
+                    crate::dispatch_material::ClaimedReclamation::ReplacementPreserved {
+                        claimed,
+                    }
+                    | crate::dispatch_material::ClaimedReclamation::AlreadyGone { claimed }
+                    | crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
+                        claimed,
+                    } => {
+                        let _preserved_operation = claimed.operation_id.len();
+                        false
+                    }
+                };
+                served = Some(claim.into_identity());
+                outcome = Some(ok_frame);
+            }
+            Err(loop_error) => {
+                return Err(OrdinaryDriveError::Loop(loop_error));
+            }
+        }
     }
-    outcome.ok_or(OrdinaryDriveError::NoDeliverySet)
+    // Only an exact in-process replay may return the retained terminal
+    // frame. A same-grant replay for another identity cannot borrow that
+    // result. Cross-restart terminal-unacknowledged state remains explicitly
+    // in-progress because its marker carries identity, not a result payload.
+    // Only a drive that observed nothing staged reports absence.
+    match (outcome, replayed) {
+        (Some(frame), None) => Ok(frame),
+        (Some(frame), Some(identity)) if served.as_ref() == Some(&identity) => Ok(frame),
+        (_, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id: identity.operation_id,
+            generation: identity.generation,
+            claim_id: identity.claim_id,
+        }),
+        (None, None) => Err(OrdinaryDriveError::NoDeliverySet),
+    }
 }
 
 /// Consumes the staged delivery set beside this installation — but only
-/// while it still names the generation this loop served.
+/// while it still names the exact claimed generation this loop served.
 ///
 /// The publisher stages replacements under the same fixed filenames, so a
 /// replacement published while this loop ran now owns those paths: the
-/// staged envelope is re-read and the set is consumed only when its grant
-/// and guest digests still match the served material. Anything else — a
+/// claimed identity (claim, operation, generation, nonce, grant/fence,
+/// digests, window, epoch) is re-read and compared, preserving the #2895
+/// grant/artifact/input digest comparison as a subset, and each removal
+/// re-verifies after a claim-by-rename move. Anything else — a
 /// replacement, an unreadable envelope, or an already-consumed set — is
 /// left untouched; a leftover is a fresh-drive signal, never silent reuse.
 /// Derived from the loader path only — never from argv, stdin, or
-/// environment. Best effort by contract.
-fn consume_delivery_set(material: &ValidatedDispatchMaterial) {
-    use crate::dispatch_material::{
-        WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
-        WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, consume_staged,
-    };
+/// environment. Returns the typed claimed reclamation; a partial outcome is
+/// a bounded residual, never a primary-result overwrite.
+fn consume_delivery_set(
+    claim: &crate::dispatch_material::DeliveryClaim,
+) -> crate::dispatch_material::ClaimedReclamation {
+    use crate::dispatch_material::admitted_material_path;
     let Some(directory) =
         admitted_material_path().and_then(|path| path.parent().map(Path::to_path_buf))
     else {
-        return;
+        return crate::dispatch_material::ClaimedReclamation::RetainedForRecovery {
+            claimed: claim.identity().clone(),
+        };
     };
-    let still_ours = match read_dispatch_material() {
-        Ok(Some(current)) => {
-            current.grant.grant_digest == material.grant.grant_digest
-                && current.ceilings.artifact_digest == material.ceilings.artifact_digest
-                && current.ceilings.input_digest == material.ceilings.input_digest
-        }
-        Ok(None) | Err(_) => false,
-    };
-    if still_ours {
-        consume_staged(&directory.join(WASM_HOST_MATERIAL_FILE_NAME));
-        consume_staged(&directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME));
-        consume_staged(&directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME));
-    }
-    // A control leftover naming this operation is ours to retire under the
-    // same ownership rule; a foreign or malformed one is left for its own
-    // delivery (and self-heals when the next control overwrites the file).
-    let control_path = directory.join(WASM_HOST_CONTROL_FILE_NAME);
-    if control_names_operation(&control_path, material) {
-        consume_staged(&control_path);
-    }
+    crate::dispatch_material::reclaim_claimed_delivery(claim, &directory)
 }
 
-/// Returns whether the staged control file names the served operation. Any
-/// read, shape, or identity mismatch answers no: ownership of an
-/// unidentifiable file can never be established.
-fn control_names_operation(path: &Path, material: &ValidatedDispatchMaterial) -> bool {
-    let Ok(bytes) = read_staged_bytes(path) else {
-        return false;
-    };
-    let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
-        return false;
-    };
-    frame.operation_id == material.operation_id
-        && frame.grant_digest == material.grant.grant_digest.as_str()
-}
-
-/// Reads the owner-staged delivery set beside this installation.
-fn read_admitted_material() -> Result<Option<ValidatedDispatchMaterial>, DriveError> {
-    read_dispatch_material().map_err(|error| match error {
+/// Reads the owner-staged delivery set beside this installation,
+/// claim-first: the pre-read claim arrives with its bound material from
+/// one snapshot, so the fixed names never select the operation twice.
+fn read_admitted_material() -> Result<
+    Option<(
+        crate::dispatch_material::DeliveryClaim,
+        ValidatedDispatchMaterial,
+    )>,
+    DriveError,
+> {
+    crate::dispatch_material::read_claimed_dispatch_material().map_err(|error| match error {
         MaterialError::Missing => DriveError::NoMaterial,
         other => DriveError::Material(other),
     })

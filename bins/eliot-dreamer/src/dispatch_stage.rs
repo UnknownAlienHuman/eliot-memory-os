@@ -27,9 +27,14 @@
 //! There is no class-only stub seam: every arm either genuinely invokes its
 //! owner or refuses naming the exact missing governed input. Orientation
 //! derives the v1 hypothesis pair, validates it through the real v1 A-05
-//! entry, and genuinely invokes the pulse composer (which runs the packet
-//! projection) before projecting the
-//! packet; Curation genuinely resolves descriptors, validates
+//! entry, then resolves the production carrier prerequisites and returns the
+//! typed [`DreamResult::Orientation`] complete/partial/blocked result (issue
+//! #2901): with no CC-002 outcome, CC-004 set, or stage-owner records
+//! in-binary, production returns blocked, never a packet. The packet-only
+//! compatibility seam ([`dispatch_orientation_with`],
+//! [`project_validated_orientation`]) stays byte-stable for its tests but is
+//! not the production pulse and cannot satisfy the #41 Product Pulse
+//! acceptance; Curation genuinely resolves descriptors, validates
 //! registry/policy/screen, and routes the injected batch through the real
 //! A-31 fan-in; `ResearchSynthesis` and `Maintenance` fail closed naming
 //! their missing Governor-resolved inputs; the remaining five classes refuse
@@ -64,7 +69,7 @@ use eliot_dreamer_curation::{
     route_validated_curation,
 };
 use eliot_dreamer_orientation::{
-    AdmittedOrientationJob, OrientationError, OrientationPolicy,
+    AdmittedOrientationJob, LocalOrientationFrame, OrientationError, OrientationPolicy,
     projection::OrientationPacketCandidate,
 };
 
@@ -187,8 +192,10 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
 /// match runs with no wildcard. Orientation proves the structured receipt
 /// binding first ([`require_validated_binding`]), then derives the v1
-/// hypothesis pair, validates it through the real v1 A-05 entry, and
-/// genuinely invokes the pulse composer; Curation checks the carrier first
+/// hypothesis pair, validates it through the real v1 A-05 entry, resolves
+/// the production carrier prerequisites, and returns the typed
+/// [`DreamResult::Orientation`] complete/partial/blocked result (blocked
+/// until the Governor supply channel lands); Curation checks the carrier first
 /// (a missing carrier refuses before any screen or registry work, so no
 /// generic stage burns on a job that cannot route), then the screen binding,
 /// then the real A-31 fan-in; `ResearchSynthesis` and `Maintenance` prove
@@ -222,11 +229,11 @@ pub(crate) fn dispatch_admitted(
             };
             dispatch_curation(binding, carrier)
         }
-        // Native owner: the Orientation pulse composer (packet projection via
-        // eliot-dreamer-orientation build_projection), gated on
-        // the structured A-05 receipt: without the validated candidate there
-        // is no proved pre-handler gate, so the arm refuses before any v1
-        // derivation or owner projection work.
+        // Native owner: the production Orientation composer (typed
+        // complete/partial/blocked result via the versioned carrier), gated
+        // on the structured A-05 receipt: without the validated candidate
+        // there is no proved pre-handler gate, so the arm refuses before any
+        // v1 derivation or owner projection work.
         JobClass::Orientation => {
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
@@ -323,77 +330,161 @@ pub(crate) fn require_validated_binding(
     Ok(())
 }
 
-/// Projects one v1-validated candidate through the native owner.
+/// Projects one v1-validated candidate through the compatibility composer.
 ///
-/// This is the single pulse-composer call site in this binary (the
-/// production `project_once` body, also reused by the validation-stage
-/// integration tests so they exercise the identical call site): it takes
-/// only `&ValidatedCandidate` — the receipt-bound v1 aggregate — plus the
+/// This is the packet-only compatibility seam (the `project_once` body
+/// exercised by the validation-stage integration tests): it takes only
+/// `&ValidatedCandidate` — the receipt-bound v1 aggregate — plus the
 /// admitted job/bundle/policy it was validated against, never a raw draft.
 /// The pulse runs with packet inputs only; every other stage records an
-/// explicit pending disposition until its owner values land, and the packet
-/// projection is byte-identical to the direct owner call. Raw unvalidated
-/// input cannot reach the native projector through this seam: construction
-/// requires the v1 validator receipt, and dispatch proves the structured
-/// receipt binding first. Governor-resolved evidence and
-/// epistemic-position handles travel empty here (G5: locally built envelopes
-/// would be self-issued authority).
+/// explicit pending disposition, and the packet projection is byte-identical
+/// to the direct owner call. Raw unvalidated input cannot reach the native
+/// projector through this seam: construction requires the v1 validator
+/// receipt, and dispatch proves the structured receipt binding first.
+/// Governor-resolved evidence and epistemic-position handles travel empty
+/// here (G5: locally built envelopes would be self-issued authority). This
+/// seam is not the production pulse and its output cannot satisfy the #41
+/// Product Pulse acceptance.
+#[allow(
+    dead_code,
+    reason = "packet-only compatibility seam retained for validation-stage tests; production dispatches through dispatch_orientation"
+)]
 pub(crate) fn project_validated_orientation(
     admitted_job: &AdmittedOrientationJob,
     candidate: &ValidatedCandidate,
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
 ) -> Result<OrientationPacketCandidate, OrientationError> {
-    crate::pulse::run_production_orientation_pulse(admitted_job, candidate, bundle, policy)
-        .map(|pulse| pulse.packet)
+    crate::pulse::run_compat_orientation_pulse(admitted_job, candidate, bundle, policy)
+        .map(|pulse| {
+            pulse.verify_compat();
+            pulse.packet
+        })
         .map_err(crate::pulse::PulseError::into_orientation_error)
 }
 
-/// Dispatches one admitted Orientation job through the native projector.
+/// Dispatches one admitted Orientation job through the production composer.
 ///
 /// Takes the structured A-05 validated candidate alongside the admitted pair:
 /// typestate makes raw dispatch impossible — without the receipt there is no
-/// call. Production delegates to [`dispatch_orientation_with`] with the real
-/// v1 A-05 entry and the real projector.
+/// call. The structured receipt binding is proved first, then the v1
+/// hypothesis pair validates through the real v1 A-05 entry exactly once,
+/// then the production carrier prerequisites resolve into the typed
+/// [`DreamResult::Orientation`] complete/partial/blocked result. A v1
+/// semantic rejection maps to the static refusal and never reaches
+/// composition, so rejection invokes zero handlers with no fallback dispatch.
 fn dispatch_orientation(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     validated: &ValidatedGroundingCandidate,
 ) -> Result<DreamResult, DreamerError> {
-    dispatch_orientation_with(
+    require_validated_binding(admission, job, validated)?;
+    let admitted = admission_of(admission, job)?;
+    let bundle = bundle_of(admission, job)?;
+    let frame_source = orientation_frame_source(&bundle)?;
+    let model = v1_model_of(admission, job)?;
+    let grounded = v1_grounded_of(&model)?;
+    let usage = usage_of(&admitted.budget);
+    let validation_policy = validation_policy_of(admitted.policy_ref.as_str())?;
+    let preservation = preservation_of()?;
+    let candidate = match validate_grounded_dream_draft_at(
+        &admitted,
+        &bundle,
+        &model,
+        &grounded,
+        &validation_policy,
+        &usage,
+        &preservation,
+        Some(0),
+        false,
+    ) {
+        Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
+        Ok(CandidateValidationOutcome::Rejected(_)) => {
+            return Err(DreamerError::InvalidAdmission(
+                "validation semantic rejection",
+            ));
+        }
+        Err(error) => return Err(v1_denied(&error)),
+    };
+    let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
+    let admitted_job = orientation_admitted_job(admitted, frame);
+    let policy = orientation_dispatch_policy()?;
+    match crate::production_orientation::resolve_production_inputs(
         admission,
-        job,
-        validated,
-        |admitted, bundle, model, grounded, policy, usage, preservation| {
-            validate_grounded_dream_draft_at(
-                admitted,
-                bundle,
-                model,
-                grounded,
-                policy,
-                usage,
-                preservation,
-                Some(0),
-                false,
-            )
-        },
-        |admitted_job, candidate, bundle, policy| {
-            project_validated_orientation(admitted_job, candidate, bundle, policy)
-        },
-    )
+        &admitted_job,
+        &candidate,
+        &bundle,
+        &policy,
+    ) {
+        Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
+            .map(DreamResult::Orientation)
+            .map_err(|error| orientation_denied(&error.into_orientation_error())),
+        Err(blocked) => Ok(DreamResult::Orientation(*blocked)),
+    }
+}
+
+/// Selects the deterministic frame-source handle from admitted bundle material.
+///
+/// The first non-excluded material in bundle order is the deterministic
+/// candidate frame source until the Governor pins the frame source
+/// explicitly. No handle is invented: a bundle with no bindable material
+/// refuses. This selects the same first evidence handle the bundle plants
+/// the frame digest on, so the frame built downstream is byte-identical to
+/// the planted one.
+fn orientation_frame_source(bundle: &DreamInputBundle) -> Result<String, DreamerError> {
+    bundle
+        .materials
+        .iter()
+        .find(|material| !matches!(material.disposition, SourceDisposition::Excluded))
+        .map(|material| material.handle.clone())
+        .ok_or(DreamerError::InvalidAdmission(FRAME_SOURCE_REFUSAL))
+}
+
+/// Builds the admitted Orientation job over one validated frame.
+///
+/// Governor-resolved evidence travels empty here (G5: locally built
+/// envelopes would be self-issued authority), as does the coverage
+/// denominator, which only the Governor can pin.
+fn orientation_admitted_job(
+    admitted: DreamJobAdmission,
+    frame: LocalOrientationFrame,
+) -> AdmittedOrientationJob {
+    AdmittedOrientationJob {
+        job: admitted,
+        frame,
+        admitted_evidence: Vec::new(),
+        coverage_denominator: None,
+    }
+}
+
+/// Builds the bounded sealed dispatch policy for Orientation projection.
+///
+/// Explicit identity and revision, a 1 MiB output envelope (inside the owner
+/// 4 MiB ceiling), and the owner defaults for every other maximum. Sealing
+/// freezes the policy digest the packet provenance binds.
+fn orientation_dispatch_policy() -> Result<OrientationPolicy, DreamerError> {
+    let mut policy = OrientationPolicy::new("eliot-dreamer-dispatch", 1, 1_048_576);
+    policy.seal().map_err(|error| orientation_denied(&error))?;
+    Ok(policy)
 }
 
 /// Dispatches one admitted Orientation job with injectable owner calls.
 ///
-/// `validate_once` wraps the real v1 A-05 entry and `project_once` wraps the
-/// real projector: both are `FnOnce`, so neither owner can run twice for one
-/// admission through this seam. Production passes the real owner functions
-/// (see [`dispatch_orientation`]); deterministic tests pass counting wrappers
-/// around the real functions to prove validator-once/handler-once-or-never.
-/// The structured receipt binding ([`require_validated_binding`]) runs before
-/// either owner call; a v1 semantic rejection maps to the static refusal and
-/// never reaches the projector, so rejection invokes zero handlers with no
-/// fallback dispatch.
+/// This is the packet-only compatibility seam: `validate_once` wraps the real
+/// v1 A-05 entry and `project_once` wraps the compatibility projector; both
+/// are `FnOnce`, so neither owner can run twice for one admission through
+/// this seam. Deterministic tests pass counting wrappers around the real
+/// functions to prove validator-once/handler-once-or-never. The structured
+/// receipt binding ([`require_validated_binding`]) runs before either owner
+/// call; a v1 semantic rejection maps to the static refusal and never reaches
+/// the projector, so rejection invokes zero handlers with no fallback
+/// dispatch. Production dispatches through [`dispatch_orientation`] instead;
+/// this seam is not the production pulse and its output cannot satisfy the
+/// #41 Product Pulse acceptance.
+#[allow(
+    dead_code,
+    reason = "packet-only compatibility seam retained for validation-stage tests; production dispatches through dispatch_orientation"
+)]
 pub(crate) fn dispatch_orientation_with(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -417,18 +508,9 @@ pub(crate) fn dispatch_orientation_with(
     require_validated_binding(admission, job, validated)?;
     let admitted = admission_of(admission, job)?;
     let bundle = bundle_of(admission, job)?;
-    // The frame binds admitted bundle material: the first non-excluded
-    // material in bundle order is the deterministic candidate frame source
-    // until the Governor pins the frame source explicitly. No handle is
-    // invented: a bundle with no bindable material refuses. This selects the
-    // same first evidence handle the bundle plants the frame digest on, so
-    // the frame built here is byte-identical to the planted one.
-    let frame_source = bundle
-        .materials
-        .iter()
-        .find(|material| !matches!(material.disposition, SourceDisposition::Excluded))
-        .map(|material| material.handle.clone())
-        .ok_or(DreamerError::InvalidAdmission(FRAME_SOURCE_REFUSAL))?;
+    // The frame binds admitted bundle material; see
+    // `orientation_frame_source`.
+    let frame_source = orientation_frame_source(&bundle)?;
     let model = v1_model_of(admission, job)?;
     let grounded = v1_grounded_of(&model)?;
     let usage = usage_of(&admitted.budget);
@@ -452,23 +534,12 @@ pub(crate) fn dispatch_orientation_with(
         Err(error) => return Err(v1_denied(&error)),
     };
     let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
-    let admitted_job = AdmittedOrientationJob {
-        job: admitted,
-        frame,
-        admitted_evidence: Vec::new(),
-        coverage_denominator: None,
-    };
-    // Bounded dispatch policy: explicit identity and revision, a 1 MiB output
-    // envelope (inside the owner 4 MiB ceiling), and the owner defaults for
-    // every other maximum. Sealing freezes the policy digest the packet
-    // provenance binds.
-    let mut policy = OrientationPolicy::new("eliot-dreamer-dispatch", 1, 1_048_576);
-    policy.seal().map_err(|error| orientation_denied(&error))?;
+    let admitted_job = orientation_admitted_job(admitted, frame);
+    let policy = orientation_dispatch_policy()?;
     // Orientation adaptations (G1-G5) as owned by the orientation crate and
-    // composed here (see the previous `dispatch_orientation` documentation):
-    // G1 scope/state-fence split via the admitted frame, G2/G3 native shapes,
-    // G4 marker preservation in `map_orientation_packet`, G5 empty
-    // Governor-sourced handles inside `project_validated_orientation`.
+    // composed here: G1 scope/state-fence split via the admitted frame, G2/G3
+    // native shapes, G4 marker preservation in `map_orientation_packet`, G5
+    // empty Governor-sourced handles inside `project_validated_orientation`.
     let packet = project_once(&admitted_job, &candidate, &bundle, &policy)
         .map_err(|error| orientation_denied(&error))?;
     Ok(DreamResult::Packet(map_orientation_packet(&packet, job)))
@@ -504,7 +575,13 @@ fn v1_denied(error: &DreamDraftValidationError) -> DreamerError {
 /// dropped or thinned by this mapping. Unknowns, inert probes (text only:
 /// probes never execute), invalidation conditions, and projection-input
 /// provenance (proof of inputs, never of truth) travel likewise.
-fn map_orientation_packet(packet: &OrientationPacketCandidate, job: &DreamJobInput) -> DreamPacket {
+///
+/// Shared by the compatibility seam and the production composer so the
+/// packet projection stays byte-identical on both paths.
+pub(crate) fn map_orientation_packet(
+    packet: &OrientationPacketCandidate,
+    job: &DreamJobInput,
+) -> DreamPacket {
     let mut rival_models_and_dissent: Vec<String> = packet
         .rival_models_and_dissent
         .iter()

@@ -10,7 +10,10 @@
 //! Implemented by issue #64: the route, the cutover decision, and the router's
 //! own active epoch all carry the canonical [`EpochId`] tuple. There is no
 //! scalar epoch field left for a caller to coerce, and no numeric comparison
-//! can decide authority across two lineages.
+//! can decide authority across two lineages. A cutover advances only by the
+//! exact one-step direct child of the live tuple, so a restart within one
+//! lineage cannot replay a skipped sequence; a lineage change is not a cutover
+//! and is minted through [`crate::EpochActivation::new_lineage`].
 
 use std::collections::BTreeMap;
 
@@ -101,15 +104,18 @@ impl CutoverDecision {
     /// Creates and validates a cutover decision.
     ///
     /// The epoch pair is compared on the exact tuple first. Two lineages are
-    /// unrelated, never ordered, so a cross-lineage pair is refused before any
-    /// sequence is read. Only inside one lineage is the strictly-rising
-    /// sequence rule evaluated.
+    /// unrelated and never ordered, so a cross-lineage pair is refused before
+    /// any sequence is read at all. Inside one lineage the only admitted
+    /// forward transition is the exact direct child: one step, no repeat, no
+    /// skip, no overflow. A cutover never mints a lineage — restore, migration,
+    /// corruption recovery and break-glass do that separately, through
+    /// [`crate::EpochActivation::new_lineage`].
     ///
     /// # Errors
     ///
     /// Returns an error when the identity is blank, the generations are not
-    /// distinct, the epochs belong to different lineages, or the sequence does
-    /// not strictly rise inside that one lineage.
+    /// distinct, the epochs belong to different lineages, or the new epoch is
+    /// not the exact direct child of the old one.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cutover_id: impl Into<String>,
@@ -134,10 +140,10 @@ impl CutoverDecision {
                 reason: "cutover must stay inside one epoch lineage",
             });
         }
-        if new_epoch.sequence.get() <= old_epoch.sequence.get() {
+        if !new_epoch.is_direct_child_of(&old_epoch) {
             return Err(KernelError::InvalidField {
                 field: "new_epoch",
-                reason: "cutover must raise the authority epoch",
+                reason: "cutover must advance by the exact one-step direct child of the old epoch",
             });
         }
         Ok(Self {
@@ -229,19 +235,19 @@ impl GenerationRouter {
     /// Registers or replaces a route at the current epoch.
     ///
     /// The route epoch must be the exact same tuple as the router's active
-    /// epoch. A route minted under a different lineage at the same sequence is
-    /// unrelated and is refused as [`KernelError::StaleEpochTuple`].
+    /// epoch, decided by the one shared exact-epoch guard. A route minted
+    /// under a different lineage at the same sequence is unrelated, so it is
+    /// refused as [`KernelError::StaleEpochTuple`] with both complete tuples;
+    /// a different sequence of the router's own lineage is a
+    /// [`KernelError::FenceMismatch`]. Neither arm reads a sequence across two
+    /// lineages.
     ///
     /// # Errors
     ///
-    /// Returns an error when the route's epoch tuple is not the router's.
+    /// Returns an error when the route's epoch tuple is not the router's active
+    /// tuple.
     pub fn register(&mut self, route: GenerationRoute) -> Result<(), KernelError> {
-        if !route.authority_epoch().is_same_authority(&self.epoch) {
-            return Err(KernelError::StaleEpochTuple {
-                observed: route.authority_epoch().clone(),
-                active: self.epoch.clone(),
-            });
-        }
+        self.authorize_presented_epoch(route.authority_epoch())?;
         self.routes.insert(route.route_scope().clone(), route);
         Ok(())
     }
@@ -274,33 +280,34 @@ impl GenerationRouter {
 
     /// Resolves the active route for an exact, current fence.
     ///
-    /// The presented epoch is the canonical [`EpochId`] tuple. Exact tuple
-    /// equality is the only authorization rule: the fence's own scalar epoch
-    /// is never read here, so a cross-lineage same-sequence fence cannot be
-    /// admitted and no caller can coerce a lineaged epoch back to a counter.
-    /// The epoch decision is the router's one shared #59 exact-epoch guard,
-    /// which also decides [`Self::route_for_supervised_generation`].
+    /// The epoch decided here is the fence's *own* bound tuple,
+    /// [`RouteFence::authority_epoch`]. There is deliberately no second
+    /// presented-epoch parameter: a caller-supplied tuple beside a fence would
+    /// let a fence minted under one lineage be authorized by a tuple from
+    /// another. Exact tuple equality against the router's active epoch is the
+    /// only authorization rule, and no caller can coerce a lineaged epoch back
+    /// to a counter. The epoch decision is the router's one shared #59
+    /// exact-epoch guard, which also decides
+    /// [`Self::route_for_supervised_generation`].
     ///
     /// # Errors
     ///
     /// Returns [`KernelError::RouteMismatch`] for an unknown route,
-    /// [`KernelError::StaleEpochTuple`] when the presented tuple is not the
+    /// [`KernelError::StaleEpochTuple`] when the fence's tuple is not the
     /// router's active tuple, or [`KernelError::FenceMismatch`] when the
     /// generation disagrees with the route or the fence covers another scope.
-    pub fn route_for_fence(
-        &self,
-        fence: &RouteFence,
-        fence_epoch: &EpochId,
-    ) -> Result<&GenerationRoute, KernelError> {
+    pub fn route_for_fence(&self, fence: &RouteFence) -> Result<&GenerationRoute, KernelError> {
         let route = self
             .routes
             .get(fence.route_scope())
             .ok_or(KernelError::RouteMismatch)?;
-        self.authorize_presented_epoch(fence_epoch)?;
+        self.authorize_presented_epoch(fence.authority_epoch())?;
         if fence.route_scope() != route.route_scope() {
             return Err(KernelError::FenceMismatch);
         }
-        if !route.authority_epoch().is_same_authority(fence_epoch)
+        if !route
+            .authority_epoch()
+            .is_same_authority(fence.authority_epoch())
             || route.active_generation() != fence.resource_generation()
         {
             return Err(KernelError::FenceMismatch);
@@ -398,11 +405,13 @@ impl GenerationRouter {
                 active: self.epoch.clone(),
             });
         }
-        // The new epoch must be strictly newer *inside the router's own
-        // lineage*. A different lineage is unrelated and can never advance the
-        // live fence, and an equal or older sequence is not a forward
-        // transition.
-        if decision.new_epoch().relation_to(&self.epoch) != EpochRelation::SameLineageNewer {
+        // The new epoch must be the exact one-step direct child of the live
+        // tuple, inside the router's own lineage. A different lineage is
+        // unrelated and can never advance the live fence, a repeat or an older
+        // sequence is a backward transition, and a skipped sequence is a replay
+        // — so a restart within one lineage advances only by an admitted
+        // direct-child step.
+        if decision.new_epoch().relation_to(&self.epoch) != EpochRelation::DirectChild {
             return Err(KernelError::StaleEpochTuple {
                 observed: decision.new_epoch().clone(),
                 active: self.epoch.clone(),
@@ -435,7 +444,7 @@ impl GenerationRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, EpochLineageId};
+    use eliot_contracts::EpochLineageId;
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -467,28 +476,26 @@ mod tests {
         Ok(router)
     }
 
+    fn fence_for(epoch: EpochId, route: &str, generation: u64) -> Result<RouteFence, KernelError> {
+        RouteFence::new(
+            RouteScope::new(route)?,
+            epoch,
+            ResourceGeneration::new(generation)?,
+            eliot_process::Generation::new(1)?,
+            "nonce",
+        )
+    }
+
     #[test]
     fn fence_must_match_route_generation_and_epoch() -> Result<(), KernelError> {
         let router = router_with_daemon(2, 5)?;
         let epoch = canonical_epoch(TEST_LINEAGE, 2)?;
-        let good_fence = RouteFence::new(
-            RouteScope::new("daemon")?,
-            AuthorityEpoch::new(2)?,
-            ResourceGeneration::new(5)?,
-            eliot_process::Generation::new(1)?,
-            "nonce",
-        )?;
-        assert!(router.route_for_fence(&good_fence, &epoch).is_ok());
+        let good_fence = fence_for(epoch.clone(), "daemon", 5)?;
+        assert!(router.route_for_fence(&good_fence).is_ok());
 
-        let wrong_generation = RouteFence::new(
-            RouteScope::new("daemon")?,
-            AuthorityEpoch::new(2)?,
-            ResourceGeneration::new(6)?,
-            eliot_process::Generation::new(1)?,
-            "nonce",
-        )?;
+        let wrong_generation = fence_for(epoch, "daemon", 6)?;
         assert!(matches!(
-            router.route_for_fence(&wrong_generation, &epoch),
+            router.route_for_fence(&wrong_generation),
             Err(KernelError::FenceMismatch)
         ));
         Ok(())
@@ -674,19 +681,24 @@ mod tests {
     #[test]
     fn canonical_fence_gates_route_before_scalar_match() -> Result<(), KernelError> {
         let router = router_with_daemon(2, 5)?;
-        let fence = RouteFence::new(
-            RouteScope::new("daemon")?,
-            AuthorityEpoch::new(2)?,
-            ResourceGeneration::new(5)?,
-            eliot_process::Generation::new(1)?,
-            "nonce",
-        )?;
-        let active = canonical_epoch(TEST_LINEAGE, 2)?;
-        let same = canonical_epoch(TEST_LINEAGE, 2)?;
-        let cross_lineage_same_sequence = canonical_epoch(FOREIGN_LINEAGE, 2)?;
-        assert!(router.route_for_fence(&fence, &same).is_ok());
+        // A fence minted under the router's own lineage at its exact sequence
+        // is the only fence the router admits.
+        let fence = fence_for(canonical_epoch(TEST_LINEAGE, 2)?, "daemon", 5)?;
+        assert!(router.route_for_fence(&fence).is_ok());
+        // The same sequence under an unrelated lineage is refused as
+        // unrelated, not as a stale counter, and it is the fence's own tuple
+        // that decides it.
+        let cross_lineage_same_sequence =
+            fence_for(canonical_epoch(FOREIGN_LINEAGE, 2)?, "daemon", 5)?;
         assert!(matches!(
-            router.route_for_fence(&fence, &cross_lineage_same_sequence),
+            router.route_for_fence(&cross_lineage_same_sequence),
+            Err(KernelError::StaleEpochTuple { .. })
+        ));
+        // A numerically larger sequence from that unrelated lineage is not
+        // newer and cannot supersede the live route.
+        let larger_foreign = fence_for(canonical_epoch(FOREIGN_LINEAGE, 9)?, "daemon", 5)?;
+        assert!(matches!(
+            router.route_for_fence(&larger_foreign),
             Err(KernelError::StaleEpochTuple { .. })
         ));
         Ok(())

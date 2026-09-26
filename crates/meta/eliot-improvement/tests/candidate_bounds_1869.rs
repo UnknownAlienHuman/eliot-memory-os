@@ -12,13 +12,13 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision};
 use eliot_governor::{
-    Governor, GovernorConfig, LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim,
-    LearningAdmissionError, QueueLimits, VerifiedLearningAdmission, issue_learning_admission,
-    verify_learning_admission,
+    CrossTaskAdmissionError, CrossTaskAdmissionRecord, Governor, GovernorConfig,
+    LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError, QueueLimits,
+    VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
 };
 use eliot_improvement::candidate_bounds::{
     AdmitOutcome, ArchiveCause, BoundedBacklog, BoundsError, CandidateBoundPolicy,
-    CrossTaskAdmission, GovernedClosureError, GovernedOverlay, GovernedRetrieval, OverlayState,
+    CrossTaskCarryover, GovernedClosureError, GovernedOverlay, GovernedRetrieval, OverlayState,
     ReusableCandidateRef, governed_assemble_campaign_learning_closure, retrieve_for_attempt,
     retrieve_governed,
 };
@@ -230,9 +230,16 @@ fn cross_task_use_requires_governed_admission() {
     );
     assert_eq!(refusal, Err(BoundsError::CrossTaskAdmissionMissing));
 
-    // Admission missing rollback revalidation: still refused.
-    let incomplete = CrossTaskAdmission {
+    // A revalidation missing its rollback value is still refused, and the
+    // refusal still names the field. The rule moved rather than vanished: the
+    // revalidation is now an owner-issued
+    // [`CrossTaskAdmissionRecord`] whose shape is checked by the owner, so it
+    // can no longer be spelled as bare retrieval text.
+    let incomplete = CrossTaskAdmissionRecord {
+        schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
         admission_id: "xadmit-1869-1".to_string(),
+        source_admission_digest: "a".repeat(64),
+        cross_task_admission_digest: "b".repeat(64),
         source_campaign_id: "campaign-a".to_string(),
         target_task_id: "task-campaign-b".to_string(),
         scope_ref: "scope-1869".to_string(),
@@ -241,37 +248,36 @@ fn cross_task_use_requires_governed_admission() {
         evaluator_ref: "evaluator-1869".to_string(),
         rollback_ref: String::new(),
     };
+    assert_eq!(
+        incomplete.validate(),
+        Err(CrossTaskAdmissionError::UnusableField(
+            "record.rollback_ref"
+        ))
+    );
+
+    // A COMPLETE revalidation still authorizes nothing here on its own. The
+    // gate now demands a [`CrossTaskCarryover`], whose fields are private and
+    // whose only constructor needs a second, distinctly digested owner-issued
+    // admission for the foreign task; re-spelling the local permit's own bound
+    // values as text cannot produce one. The old expectation here — that this
+    // hand-built eight-`String` record made the retrieval succeed and be
+    // reported `cross_task` with the requester's own `admission_id` — was the
+    // defect #1869 removes, so the honest fixture is the refusal.
+    let complete = CrossTaskAdmissionRecord {
+        rollback_ref: "rollback-1869".to_string(),
+        ..incomplete
+    };
+    assert_eq!(complete.validate(), Ok(()));
     let refusal = retrieve_for_attempt(
         "campaign-b",
         "task-campaign-b",
         &overlay_a,
         Some(&reusable),
         false,
-        Some(&incomplete),
+        None,
         now,
     );
-    assert_eq!(refusal, Err(BoundsError::MissingField("rollback_ref")));
-
-    // Complete revalidation: eligible, explicitly marked cross-task.
-    let admission = CrossTaskAdmission {
-        rollback_ref: "rollback-1869".to_string(),
-        ..incomplete
-    };
-    let decision = retrieve_for_attempt(
-        "campaign-b",
-        "task-campaign-b",
-        &overlay_a,
-        Some(&reusable),
-        false,
-        Some(&admission),
-        now,
-    )
-    .expect("governed cross-task admission authorizes carryover");
-    assert!(decision.cross_task);
-    assert_eq!(
-        decision.cross_task_admission_id,
-        Some("xadmit-1869-1".to_string())
-    );
+    assert_eq!(refusal, Err(BoundsError::CrossTaskAdmissionMissing));
 }
 
 #[test]
@@ -480,7 +486,7 @@ fn assemble_through_consumer(
     verified: &VerifiedLearningAdmission<'_>,
     overlay: &GovernedOverlay,
     reusable: Option<&ReusableCandidateRef>,
-    cross_task_admission: Option<&CrossTaskAdmission>,
+    cross_task: Option<&CrossTaskCarryover<'_>>,
     now: OffsetDateTime,
 ) -> Result<ClosureAssembly, GovernedClosureError> {
     governed_assemble_campaign_learning_closure(
@@ -499,7 +505,7 @@ fn assemble_through_consumer(
             overlay,
             reusable,
             draft_delta_present: false,
-            cross_task_admission,
+            cross_task,
             backlog,
             verified,
             now,
@@ -644,7 +650,7 @@ fn foreign_task_without_matching_permit_is_refused() {
             overlay: &backing_overlay_1869(&fence, now),
             reusable: None,
             draft_delta_present: false,
-            cross_task_admission: None,
+            cross_task: None,
             backlog: &backlog,
             verified: &verified,
             now,
@@ -662,69 +668,59 @@ fn cross_task_carryover_with_owner_issued_permit() {
     let now = OffsetDateTime::now_utc();
     let governor = governor_1869(3);
     let fence = fence_1869(3);
-    // Cross-task permit: source campaign A, target task B, all revalidation
-    // refs digest-bound by the owner.
-    let claim = LearningAdmissionClaim {
-        schema_version: LEARNING_ADMISSION_SCHEMA_VERSION,
-        source_campaign_id: CAMPAIGN_1869.to_string(),
-        target_task_id: "task-1869-b".to_string(),
-        fence: fence.clone(),
-        overlay_id: Some(OVERLAY_1869.to_string()),
-        candidate_id: None,
-        scope_ref: SCOPE_1869.to_string(),
-        authority_ref: AUTHORITY_1869.to_string(),
-        retention_ref: RETENTION_1869.to_string(),
-        evaluator_ref: EVALUATOR_1869.to_string(),
-        rollback_ref: ROLLBACK_1869.to_string(),
-    };
-    let permit = issue_learning_admission(&governor, &claim).expect("owner issues");
-    let verified = verify_learning_admission(&governor, &permit, &fence).expect("owner verifies");
     let backlog = BoundedBacklog::new(vec![policy(8)]).expect("policy validates");
-    let admission = CrossTaskAdmission {
-        admission_id: "xadmit-1869-1".to_string(),
-        source_campaign_id: CAMPAIGN_1869.to_string(),
+    // The LOCAL admission: source campaign A, target task A.
+    let permit = issue_learning_admission(&governor, &claim_1869(&fence, OVERLAY_1869, None))
+        .expect("owner issues for task-1869-a");
+    let verified = verify_learning_admission(&governor, &permit, &fence).expect("owner verifies");
+    // A genuinely DISTINCT cross-task admission for the FOREIGN target task,
+    // with the owner-issued record revalidating scope, authority, retention,
+    // evaluator and rollback for it.
+    let foreign_claim = LearningAdmissionClaim {
         target_task_id: "task-1869-b".to_string(),
-        scope_ref: SCOPE_1869.to_string(),
-        authority_ref: AUTHORITY_1869.to_string(),
-        retention_ref: RETENTION_1869.to_string(),
-        evaluator_ref: EVALUATOR_1869.to_string(),
-        rollback_ref: ROLLBACK_1869.to_string(),
+        ..claim_1869(&fence, OVERLAY_1869, None)
     };
-    let decision = retrieve_governed(GovernedRetrieval {
-        requesting_campaign_id: "campaign-1869-b",
-        requesting_task_id: "task-1869-b",
-        overlay: &backing_overlay_1869(&fence, now),
-        reusable: None,
-        draft_delta_present: false,
-        cross_task_admission: Some(&admission),
-        backlog: &backlog,
-        verified: &verified,
-        now,
-    })
-    .expect("owner-issued cross-task permit authorizes carryover");
-    assert!(decision.cross_task);
-    assert_eq!(
-        decision.cross_task_admission_id,
-        Some("xadmit-1869-1".to_string())
-    );
+    let (cross_permit, record) = permit
+        .issue_cross_task_admission(&governor, &foreign_claim)
+        .expect("owner mints a distinct cross-task admission for task-1869-b");
 
-    // Same strings without the permit-bound match: refused. A record that
-    // rewrites even one revalidated ref does not match the permit.
-    let mut forged = admission.clone();
-    forged.rollback_ref = "rollback-forged".to_string();
+    // A retrieval for the FOREIGN task with no carryover presented is
+    // refused. The old expectation here asserted the defect #1869 removes: a
+    // hand-built record that re-spelled the LOCAL permit's own bound values
+    // (and named the LOCAL target task, so no other task was involved at all)
+    // made the decision come back `cross_task` with the requester's own
+    // `admission_id`. A carryover is now unforgeable owner evidence, so the
+    // honest fixture is the refusal.
     let err = retrieve_governed(GovernedRetrieval {
-        requesting_campaign_id: "campaign-1869-b",
+        requesting_campaign_id: CAMPAIGN_1869,
         requesting_task_id: "task-1869-b",
         overlay: &backing_overlay_1869(&fence, now),
         reusable: None,
         draft_delta_present: false,
-        cross_task_admission: Some(&forged),
+        cross_task: None,
         backlog: &backlog,
         verified: &verified,
         now,
     })
-    .expect_err("rewritten revalidation record is refused");
-    assert_eq!(err, BoundsError::CrossTaskAdmissionMismatch);
+    .expect_err("a cross-task request with no distinct admission is refused");
+    assert_eq!(err, BoundsError::CrossTaskAdmissionMissing);
+
+    // The owner-issued record is the only revalidation a carryover can carry,
+    // and it binds the two owner-minted digests: a record that rewrites even
+    // one revalidated ref does not match the cross-task permit. The gate above
+    // can no longer observe that directly — a rewritten record cannot become a
+    // carryover — so the same property is pinned where the record is checked.
+    let mut forged = record;
+    forged.rollback_ref = "rollback-forged".to_string();
+    let err = permit
+        .verify_cross_task_record(&cross_permit, &forged)
+        .expect_err("rewritten revalidation record is refused");
+    assert_eq!(
+        err,
+        CrossTaskAdmissionError::RevalidationMismatch {
+            field: "rollback_ref"
+        }
+    );
 }
 
 #[test]
@@ -758,7 +754,7 @@ fn archived_reusable_loses_retrieval() {
             overlay: &backing_overlay_1869(&fence, now),
             reusable: Some(&reusable),
             draft_delta_present: false,
-            cross_task_admission: None,
+            cross_task: None,
             backlog,
             verified: &verified,
             now,

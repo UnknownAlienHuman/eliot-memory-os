@@ -14,11 +14,11 @@
 // Source of truth:
 //   crates/kernel/eliot-kernel-core/src/user_automation.rs
 //   crates/kernel/eliot-kernel-core/src/user_automation_zones.rs
-// contract_source_sha256: 67160fdc392e3f2bd17391ec19c939a261b60265685857454304d42199b89148
-// constants_source_sha256: 8f3d9437a4e8619f264af668e9aff53ce538158d6cc648a52686d7c56d7906a3
+// contract_source_sha256: f60b648de9d6ceb841d531f2714aaaeba5d6300670d37090d1d5a009ef8acd24
+// constants_source_sha256: ca0abcd46126deaad6db7ccea413e1c74c4d11ab3cf0e82200f43068d95fd429
 // dispositions_source_sha256: c4e647fdf7f44d2ad6a194259323bf75c220b4b2bf4f00f40ffbb258cf0c2817
-// refusals_source_sha256: 84f8338e38fd3c6f3a468b9363db73f1782a5183c89c38d4fa19590578108b37
-// grammar_source_sha256: a8b934d78d8d46457ebb91e81a76eb14936a3a88972852b0dc65953fb2c5eba5
+// refusals_source_sha256: 2f2fd3ce7bbf507d067887e936c06089a7b21fb2576271524c55374010a2ade6
+// grammar_source_sha256: 0283a4fe812976c36ae4e22821c8b445c3b9881b516600b6727820381cb8c5a6
 //
 // Stated boundary of this mirror. The Operator validates the bounded wire
 // shape, the exact supported contract version and the self-consistency of the
@@ -58,10 +58,12 @@ public static class OperatorScheduleContract
     /// </summary>
     public static readonly IReadOnlyList<string> ConstantSourceLines =
     [
-        "NORMALIZED_OCCURRENCE_ENCODING\t&str\t\"ELIOT/I11.12/OCCURRENCE/V2\"",
-        "SCHEDULE_SOURCE_DIGEST_DOMAIN\t&str\t\"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V1\"",
+        "NORMALIZED_OCCURRENCE_ENCODING\t&str\t\"ELIOT/I11.12/OCCURRENCE/V4\"",
+        "LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3\t&str\t\"ELIOT/I11.12/OCCURRENCE/V3\"",
+        "LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2\t&str\t\"ELIOT/I11.12/OCCURRENCE/V2\"",
+        "SCHEDULE_SOURCE_DIGEST_DOMAIN\t&str\t\"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2\"",
         "NORMALIZED_OCCURRENCE_FIELD_SEPARATOR\tchar\t'|'",
-        "NORMALIZED_OCCURRENCE_FIELD_COUNT\tusize\t9",
+        "NORMALIZED_OCCURRENCE_FIELD_COUNT\tusize\t10",
         "MAX_OCCURRENCE_KEY_BYTES\tusize\t1024",
         "CIVIL_WALL_CLOCK_BYTES\tusize\t19",
         "UTC_INSTANT_BYTES\tusize\t20",
@@ -83,9 +85,9 @@ public static class OperatorScheduleContract
     /// </summary>
     public static readonly IReadOnlyList<string> GrammarFunctionDigests =
     [
-        "source_digest\t1dbad744b030c301dfaee7b8d17e2486ac11c6058568db35e7f5dd31d8f934f7",
+        "source_digest\t72e77c33b6c5de08128633a32ad1a2ceeed345a1eeababe5cf10f0f57d7abb82",
         "normalized_occurrences\t2568a995fe2adf9502018f9553bf3d595679d0ef478025cfde89695cff159202",
-        "parse_occurrence\t24ea2bc243557c9bb10fe149d323a65ac1c8a9810b96da1980d50a17ddc78128",
+        "parse_occurrence\t53ee26d8c5f5363416264b0d56eb527d744dd78129c530eeb6624e95e8349b0f",
         "parse_civil_wall_clock\t5578d2b151cd928f77ced97ed589e5ab4879d7cd11e0be0f1389f973a75a0984",
         "parse_utc_offset\t355b42de90101091999ed58b7faac560e01ba9199b36fe9e1a5026cc9f410de5",
         "parse_utc_instant\t8de99cbd0be7aa84e6c816e79c8abbb96616bac23898542e30bf66aaeee5c83d",
@@ -93,22 +95,29 @@ public static class OperatorScheduleContract
         "parse_occurrence_disposition\t72aad363a0c7ecaa05acf18e3b662b1b5d674e9afc79db61f28cc11f381d0814",
         "parse_transition_window\t7f912ddc488a1ff1a0a14de076fced04f61a4032508317538f49a9c1b216c69a",
         "require_declared_disposition\teeeec5751b869b8742c579923ba839300c7a199cfc9288fb8296bcf9948ce9e2",
-        "require_resolved_instant\t3401ada204551c160f4e771371e77342ada73eebc7f95783772bf7ac51ee2f30",
+        "require_resolved_instant\t272939f3d5168170f837dbab3bc40c8567f37be566c8c2bb2d93514f76a5052d",
+        "validate_occurrence_local_relation\t3637a1bbeb16e256d1db8c060f4aa5b936b34d439fac6c8f0c59edf7877ba7a5",
         "is_legacy_occurrence_key\tf6bff998e06f1c131919c0101da407e4a071e73e8a73e96b85164f8e45134897",
         "is_canonical_zone_database_revision\t982a619027ff4455883f8e12e16a503e017adb4e5bfee8c04cb0c10f4d73a159",
     ];
 
-    /// <summary>`NORMALIZED_OCCURRENCE_ENCODING	&str	"ELIOT/I11.12/OCCURRENCE/V2"`</summary>
-    public const string NORMALIZED_OCCURRENCE_ENCODING = "ELIOT/I11.12/OCCURRENCE/V2";
+    /// <summary>`NORMALIZED_OCCURRENCE_ENCODING	&str	"ELIOT/I11.12/OCCURRENCE/V4"`</summary>
+    public const string NORMALIZED_OCCURRENCE_ENCODING = "ELIOT/I11.12/OCCURRENCE/V4";
 
-    /// <summary>`SCHEDULE_SOURCE_DIGEST_DOMAIN	&str	"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V1"`</summary>
-    public const string SCHEDULE_SOURCE_DIGEST_DOMAIN = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V1";
+    /// <summary>`LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3	&str	"ELIOT/I11.12/OCCURRENCE/V3"`</summary>
+    public const string LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3 = "ELIOT/I11.12/OCCURRENCE/V3";
+
+    /// <summary>`LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2	&str	"ELIOT/I11.12/OCCURRENCE/V2"`</summary>
+    public const string LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2 = "ELIOT/I11.12/OCCURRENCE/V2";
+
+    /// <summary>`SCHEDULE_SOURCE_DIGEST_DOMAIN	&str	"ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2"`</summary>
+    public const string SCHEDULE_SOURCE_DIGEST_DOMAIN = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2";
 
     /// <summary>`NORMALIZED_OCCURRENCE_FIELD_SEPARATOR	char	'|'`</summary>
     public const string NORMALIZED_OCCURRENCE_FIELD_SEPARATOR = "|";
 
-    /// <summary>`NORMALIZED_OCCURRENCE_FIELD_COUNT	usize	9`</summary>
-    public const int NORMALIZED_OCCURRENCE_FIELD_COUNT = 9;
+    /// <summary>`NORMALIZED_OCCURRENCE_FIELD_COUNT	usize	10`</summary>
+    public const int NORMALIZED_OCCURRENCE_FIELD_COUNT = 10;
 
     /// <summary>`MAX_OCCURRENCE_KEY_BYTES	usize	1024`</summary>
     public const int MAX_OCCURRENCE_KEY_BYTES = 1024;
@@ -180,7 +189,7 @@ public static class OperatorScheduleContract
         new("FailureFingerprintMismatch", "owner-issued failure fingerprint is not the deterministic class fingerprint", "owner-issued failure fingerprint is not the deterministic class fingerprint", false),
         new("InvalidSupersession", "UserAutomation revision supersession is invalid", "UserAutomation revision supersession is invalid", false),
         new("Serialization", "UserAutomation canonical serialization failed: {0}", "UserAutomation canonical serialization failed: ", true),
-        new("LegacyScheduleEncoding", "normalized occurrence is legacy shape-only and requires re-normalization: {0}", "normalized occurrence is legacy shape-only and requires re-normalization: ", true),
+        new("LegacyScheduleEncoding", "normalized occurrence uses a retired encoding and requires re-normalization: {0}", "normalized occurrence uses a retired encoding and requires re-normalization: ", true),
         new("UnknownZone", "normalized occurrence names a zone the pinned zone table does not carry: {0}", "normalized occurrence names a zone the pinned zone table does not carry: ", true),
         new("ZoneDatabaseRevision", "pinned zone database revision is not the revision this build carries: {0}", "pinned zone database revision is not the revision this build carries: ", true),
         new("ZoneTableWindow", "occurrence instant is outside the pinned zone table window {window}: {field}", "occurrence instant is outside the pinned zone table window ", true),

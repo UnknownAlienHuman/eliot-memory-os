@@ -3,7 +3,10 @@ use std::{error::Error, fmt};
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
-use crate::{GrantId, IntroductionId, SnapshotId};
+use crate::{
+    GrantId, IntroductionId, RootTransitionActivationReceipt, RootTransitionActivationRequest,
+    SnapshotId,
+};
 
 /// Typed G-01 request presented to the P-07 activation boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +55,14 @@ pub enum P07PortError {
     Unavailable,
     NotAdmitted,
     InvalidBinding,
-    UnknownOutcome { snapshot_id: SnapshotId },
+    /// Changed content was presented under an operation identity that already
+    /// committed different content (issue #2962, step 6 / I5.27). The
+    /// committed result is authoritative; the new content is refused, never
+    /// merged and never re-applied under the same identity.
+    IdentityConflict,
+    UnknownOutcome {
+        snapshot_id: SnapshotId,
+    },
 }
 
 impl fmt::Display for P07PortError {
@@ -66,6 +76,9 @@ impl fmt::Display for P07PortError {
             Self::InvalidBinding => {
                 formatter.write_str("P-07 activation binding is internally inconsistent")
             }
+            Self::IdentityConflict => formatter.write_str(
+                "P-07 activation identity already committed different content for this request",
+            ),
             Self::UnknownOutcome { snapshot_id } => write!(
                 formatter,
                 "P-07 activation outcome is unknown for snapshot {snapshot_id}; \
@@ -98,6 +111,30 @@ pub trait P07AuthorityPort: Send + Sync {
         &self,
         request: &IntroductionRevocationRequest,
     ) -> Result<AuthorityRevocationReceipt, P07PortError>;
+
+    /// Mechanically activates ONE authenticated root crossing (issue #2962,
+    /// step 4).
+    ///
+    /// This is a distinct operation from ordinary grant activation, not an
+    /// overload of it: the request carries the full root-transition operation
+    /// binding (operation identity, idempotency key, canonical request digest,
+    /// both grant identities AND their immutable commitments, both roots, the
+    /// graph snapshot/revisions, the full binding, policy revision, deadline,
+    /// effect ceiling, semantic decision reference, and the authenticated
+    /// subject), and the reply is a transition-specific receipt that commits
+    /// every one of those fields together with the Kernel activation identity
+    /// and its durable ORS record.
+    ///
+    /// Implementations must return the SAME receipt for exact replay of
+    /// identical bytes under one operation identity, and must refuse changed
+    /// content under that identity with
+    /// [`P07PortError::IdentityConflict`]. A possible commit with a lost
+    /// acknowledgement is `UnknownOutcome` carrying the exact
+    /// `graph_snapshot_id`; it is never re-presented under a fresh identity.
+    fn activate_root_transition(
+        &self,
+        request: &RootTransitionActivationRequest,
+    ) -> Result<RootTransitionActivationReceipt, P07PortError>;
 }
 
 /// Deterministic no-authority port used by pure tests and pre-P-07 profiles.
@@ -130,6 +167,13 @@ impl P07AuthorityPort for UnavailableP07AuthorityPort {
         &self,
         _request: &IntroductionRevocationRequest,
     ) -> Result<AuthorityRevocationReceipt, P07PortError> {
+        Err(P07PortError::Unavailable)
+    }
+
+    fn activate_root_transition(
+        &self,
+        _request: &RootTransitionActivationRequest,
+    ) -> Result<RootTransitionActivationReceipt, P07PortError> {
         Err(P07PortError::Unavailable)
     }
 }

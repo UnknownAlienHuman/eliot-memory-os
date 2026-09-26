@@ -191,6 +191,8 @@ use generation_recovery::OrsGenerationCoordinator;
 use generation_recovery::update_handshake_policy;
 #[cfg(windows)]
 use host_request_route::HostRequestOperationRef;
+#[cfg(windows)]
+use host_request_route::WATCHDOG_INTENT_SUBMIT_OPERATION;
 use runtime_identity::stable_owner_principal_digest;
 #[cfg(windows)]
 use runtime_identity::{
@@ -329,9 +331,11 @@ use eliot_platform::ClockObservation;
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    FileIdentity as WindowsFileIdentity, NamedPipePeerKind, NamedPipePeerProfile, NamedPipePeerSet,
-    ProtectedRootLease, ProtectedRuntimePathLease, PublicationOutcome, PublicationPrecondition,
-    publish_atomic_owned_runtime_receipt, read_protected_file, windows_paths_equal,
+    ELIOT_WATCHDOG_SERVICE_NAME, FileIdentity as WindowsFileIdentity, NamedPipePeerKind,
+    NamedPipePeerProfile, NamedPipePeerSet, ProtectedRootLease, ProtectedRuntimePathLease,
+    PublicationOutcome, PublicationPrecondition, observe_running_eliot_watchdog_process,
+    publish_atomic_owned_runtime_receipt, read_protected_file, resolve_service_sid,
+    windows_paths_equal,
 };
 #[cfg(test)]
 pub use eliot_platform_windows::{

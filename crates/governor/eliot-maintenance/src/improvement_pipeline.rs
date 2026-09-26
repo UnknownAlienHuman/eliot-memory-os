@@ -27,21 +27,31 @@
 //!
 //! The proposal commitment is a versioned, domain-separated SHA-256 over one
 //! canonical JSON envelope holding the complete normalized proposal. The
-//! pipeline computes exactly one commitment and carries it into the handoff.
+//! pipeline computes exactly one commitment and carries that same value into
+//! the canary handoff and into the admission gate, so no consumer in this
+//! repository recomputes it and none can substitute a fallback, empty, or legacy
+//! digest.
 //!
-//! That same commitment decides progress. The admission gate receives the
-//! canonical-byte comparison of the retained prior commitment the admission
-//! evidence carries against the one commitment computed here, so the gate is
-//! never told by a caller that a repeat happened or that a new discriminator
-//! exists. Integrity and semantic progress stay separate: an exact replay is no
-//! progress, changed content under one operation and idempotency key is a typed
-//! identity conflict, a prior written under another domain, encoding revision,
-//! or algorithm is unestablished and requires reconciliation, and a different
-//! logical operation is an ordinary new candidate rather than a progress claim.
+//! That one commitment decides integrity. Semantic progress is a different
+//! question, so it gets a separately named and versioned
+//! [`ImprovementDiscriminatorProjection`] over the current source/target
+//! context and the owner-issued evidence references the proposal declares. The
+//! admission gate derives the assessment from the two records themselves and
+//! never accepts an assessment from a caller, so no field of a record can
+//! assert that a repeat happened or that a new discriminator exists. Integrity
+//! and semantic progress stay separate: an exact replay is no progress, changed
+//! content under one operation and idempotency key is a typed identity conflict,
+//! a retained record written under another domain, encoding revision, or
+//! algorithm is unestablished and requires reconciliation, and a different
+//! logical operation is a new causal discriminator only when the current
+//! projection differs from the retained one *and* the current proposal declares
+//! owner-issued evidence the retained record did not. No retained record at all
+//! establishes nothing and is reported as no progress; absence is never read as
+//! novelty, and no progress claim clears an unknown external effect.
 //!
 //! # Wire revision
 //!
-//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `3`. Revision `2` added typed
+//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `4`. Revision `2` added typed
 //! `cause`/`remedy` fields to the rejection and block branches, added the
 //! `Blocked` disposition and the inspectable canary handoff, bound
 //! candidate/experiment/content-revision/run identities onto the admission
@@ -51,7 +61,16 @@
 //! assert a repeat or a new discriminator from the admission evidence view, and
 //! replaces them with the retained prior [`ProposalCommitment`] those bytes are
 //! compared against, so the progress decision is derived from canonical bytes.
-//! The canary handoff shape is unchanged.
+//! Revision `4` replaces that bare retained commitment with the retained record
+//! [`RetainedImprovementProposal`], which pairs the commitment with the
+//! discriminator projection of the same retained bytes; adds the
+//! `NoRetainedPrior`, `EstablishedNewDiscriminator`, and typed
+//! `UnestablishedPriorCause` cases so an absent record and an unchanged
+//! discriminator are distinguishable outcomes instead of novelty; threads the
+//! current [`ImprovementCurrentProposal`] the pipeline computed into the
+//! admission gate instead of a caller-authored verdict; carries the checked
+//! discriminator projection in the canary handoff next to the checked
+//! commitment; and stops collapsing a typed admission refusal into reason text.
 //!
 //! Deserialization is fail-closed: bytes written before the current revision no
 //! longer decode, so a stale disposition cannot be read as a current one.
@@ -67,9 +86,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::improvement_admission::{
-    ImprovementAdmissionDecision, ImprovementAdmissionPolicy, ImprovementBlockCause,
-    ImprovementBlockRemedy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementRejectCause, admit_improvement_candidate,
+    ImprovementAdmissionDecision, ImprovementAdmissionError, ImprovementAdmissionPolicy,
+    ImprovementBlockCause, ImprovementBlockRemedy, ImprovementCandidateView,
+    ImprovementEvidenceView, ImprovementRejectCause, admit_improvement_candidate,
 };
 
 /// Governor maintenance owner for the improvement pipeline (`G-19`).
@@ -118,8 +137,19 @@ pub const IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM: &str = "sha256";
 /// are not padded, not reinterpreted as SHA-256, and never matched against a
 /// current proposal.
 pub const IMPROVEMENT_LEGACY_DIGEST_ALGORITHM: &str = "fnv1a-64-legacy";
+/// Fixed domain separator of the improvement discriminator projection.
+///
+/// The projection is a separately named object, not a second commitment: it
+/// answers whether the causal discriminator of a candidate changed and whether
+/// new owner-issued evidence backs it, never whether two byte strings are equal.
+pub const IMPROVEMENT_DISCRIMINATOR_DOMAIN: &str = "eliot.improvement.proposal.discriminator";
+/// Canonical encoding revision of the discriminator projection.
+///
+/// A retained projection written under any other revision cannot be compared
+/// against a current one and stays an unestablished observation.
+pub const IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION: &str = "1";
 /// Wire revision of the improvement pipeline result and identity contracts.
-pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 3;
+pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 4;
 /// Maximum members in one declared set of the committed proposal.
 ///
 /// Matches the nearest existing declared-set ceiling in the repository
@@ -491,6 +521,88 @@ pub struct ProposalCommitment {
     pub canonical_bytes: usize,
 }
 
+/// Separately named, versioned projection of one proposal's causal
+/// discriminator.
+///
+/// [`ProposalCommitment`] answers "are these the same bytes?". This projection
+/// answers a different question — "did the discriminator of this candidate
+/// change, and does new owner-issued evidence back the change?" — so it is a
+/// separate object with its own fixed domain and encoding revision, never a
+/// second opinion about the commitment and never a second digest. It is derived
+/// from the same normalized bytes the commitment covers, so it cannot name a
+/// context, target, hypothesis, or evidence reference that the committed
+/// proposal does not contain, and a caller cannot establish a new discriminator
+/// by spelling a reference the proposal never declared.
+///
+/// Every field is copied unchanged from the committed content. Reference bytes,
+/// punctuation, and ordered prose are not normalized here; only the declared
+/// evidence set is carried in its committed deterministic order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementDiscriminatorProjection {
+    /// Fixed discriminator-projection domain separator.
+    pub domain: String,
+    /// Canonical encoding revision of this projection.
+    pub encoding_version: String,
+    /// Current source identity of the candidate.
+    pub source_identity: String,
+    /// Current runtime identity of the candidate.
+    pub runtime_identity: String,
+    /// Current data identity of the candidate.
+    pub data_identity: String,
+    /// Capability the candidate currently targets.
+    pub target_capability: String,
+    /// Generation the candidate currently observes.
+    pub target_generation: String,
+    /// Declared mechanism identity.
+    pub mechanism_id: String,
+    /// Declared falsifiable hypothesis, verbatim.
+    pub hypothesis: String,
+    /// Declared causal link, verbatim.
+    pub causal_link: String,
+    /// Declared expected delta, verbatim.
+    pub expected_delta: String,
+    /// Owner-issued evidence references in committed deterministic order.
+    pub declared_evidence_refs: Vec<String>,
+}
+
+/// One retained prior proposal record.
+///
+/// A record, never a verdict. It pairs the retained content commitment with the
+/// discriminator projection computed from those same retained bytes, so a
+/// consumer can compare the current candidate against the retained one without
+/// re-committing either. The record supplies no judgement: a caller may read it,
+/// carry it, or withhold it, and withholding it establishes nothing.
+///
+/// Durable retention of this record is owned outside this module. Nothing here
+/// stores it, so the record's authenticity is only as good as the owner that
+/// issued it, and this module never treats its presence as evidence of
+/// improvement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedImprovementProposal {
+    /// Retained content commitment with its own version identity.
+    pub commitment: ProposalCommitment,
+    /// Discriminator projection of the same retained bytes.
+    pub discriminator: ImprovementDiscriminatorProjection,
+}
+
+/// The current proposal exactly as the pipeline committed it.
+///
+/// The one commitment this run computed, plus the projection of the same
+/// normalized bytes. The pipeline builds it once and hands the same value to the
+/// admission gate and to the canary handoff, so a consumer reads the checked
+/// version instead of computing a second opinion. It carries no decision: the
+/// assessment belongs to [`compare_improvement_commitments`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementCurrentProposal {
+    /// The single commitment computed for these exact bytes.
+    pub commitment: ProposalCommitment,
+    /// Discriminator projection of the same normalized bytes.
+    pub discriminator: ImprovementDiscriminatorProjection,
+}
+
 /// Inspectable, non-authorizing canary handoff for one joined run.
 ///
 /// Every field is an exact identity taken from the checked records. The
@@ -505,6 +617,10 @@ pub struct ImprovementCanaryHandoff {
     pub proposal_id: String,
     /// The single commitment computed for the exact proposal bytes.
     pub proposal_commitment: ProposalCommitment,
+    /// The discriminator projection of those same bytes, carried so a consumer
+    /// compares progress against the checked content instead of recomputing it.
+    /// It is a projection, not a permit and not a second commitment.
+    pub proposal_discriminator: ImprovementDiscriminatorProjection,
     /// Candidate identity the handoff is bound to.
     pub candidate_id: String,
     /// Campaign the handoff is bound to.
@@ -735,6 +851,13 @@ pub enum PipelineError {
     /// The versioned proposal commitment could not be produced.
     #[error("improvement proposal commitment failed: {0}")]
     CommitmentFailed(&'static str),
+    /// Governor admission refused the candidate with a typed failure.
+    ///
+    /// The admission error is carried whole, so an identity conflict stays an
+    /// identity conflict across this layer boundary and never collapses into
+    /// reason text or a generic code.
+    #[error("improvement admission refused: {0}")]
+    AdmissionRefused(#[from] ImprovementAdmissionError),
     /// Governor admission refused or failed with the inner reason.
     #[error("improvement admission failed: {0}")]
     AdmissionFailed(String),
@@ -750,80 +873,265 @@ pub enum PipelineError {
 /// total-size profile is validated before any clone, sort, or serialization,
 /// and a serialization failure is propagated as a typed error rather than a
 /// fallback or legacy hash.
+///
+/// This is the crate's public one-shot commitment entry point, for a caller that
+/// holds a proposal and no commitment yet. The pipeline itself reaches the
+/// commitment through `current_proposal_of`, so a commitment and its
+/// discriminator projection always describe the same bytes, and every consumer
+/// of a checked record reads that record instead of committing again. The digest
+/// describes content and never declares it admissible, so this function
+/// deliberately does not validate the proposal.
 pub fn proposal_digest(
     proposal: &ImprovementProposal,
 ) -> Result<ProposalCommitment, PipelineError> {
     commitment_of(&canonical_proposal(proposal)?)
 }
 
-/// Exact-repeat and identity-conflict assessment for one proposal.
+/// Builds the one checked current record from already-normalized bytes.
+///
+/// The single producer of [`ImprovementCurrentProposal`]: the commitment and
+/// the discriminator projection are derived here, together, from the same
+/// normalized proposal, so no consumer can hold a commitment and a projection
+/// that describe different content.
+fn current_proposal_of(
+    normalized: &ImprovementProposal,
+) -> Result<ImprovementCurrentProposal, PipelineError> {
+    Ok(ImprovementCurrentProposal {
+        commitment: commitment_of(normalized)?,
+        discriminator: discriminator_of(normalized),
+    })
+}
+
+/// Derives the discriminator projection of one normalized proposal.
+fn discriminator_of(normalized: &ImprovementProposal) -> ImprovementDiscriminatorProjection {
+    ImprovementDiscriminatorProjection {
+        domain: IMPROVEMENT_DISCRIMINATOR_DOMAIN.to_string(),
+        encoding_version: IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION.to_string(),
+        source_identity: normalized.source_identity.clone(),
+        runtime_identity: normalized.runtime_identity.clone(),
+        data_identity: normalized.data_identity.clone(),
+        target_capability: normalized.target_capability.clone(),
+        target_generation: normalized.target_generation.clone(),
+        mechanism_id: normalized.mechanism.mechanism_id.clone(),
+        hypothesis: normalized.mechanism.hypothesis.clone(),
+        causal_link: normalized.mechanism.causal_link.clone(),
+        expected_delta: normalized.expected_delta.clone(),
+        declared_evidence_refs: normalized.evidence_refs.clone(),
+    }
+}
+
+/// Exact-repeat and identity-conflict assessment for one uncommitted proposal.
 ///
 /// Integrity and semantic progress stay separate. An exact replay reproduces
 /// the complete current commitment under its original logical operation. The
 /// same operation and idempotency key with different content is an identity
-/// conflict, not the old request and not an automatic retry. A retained
-/// commitment written under another domain, encoding revision, or algorithm — a
-/// legacy FNV-1a value, for example — stays an unqualified historical
-/// observation until its owner reconciles it. A different logical operation is
-/// not progress evidence either: a new proposal identity or a different digest
-/// establishes nothing.
+/// conflict, not the old request and not an automatic retry. A retained record
+/// written under another domain, encoding revision, or algorithm — a legacy
+/// FNV-1a value, for example — stays an unqualified historical observation
+/// until its owner reconciles it. A different logical operation is not progress
+/// evidence either: a new proposal identity or a different digest establishes
+/// nothing on its own.
 ///
-/// The comparison itself is [`compare_improvement_commitments`]; this entry
-/// exists for a caller that holds a proposal and has not committed it yet.
+/// This entry exists for a caller that holds a proposal and has not committed
+/// it yet, and it commits those bytes exactly once. A caller that already holds
+/// the checked record must call [`compare_improvement_commitments`] with it
+/// instead of re-committing the proposal here.
 pub fn assess_improvement_replay(
-    prior: &ProposalCommitment,
+    retained: &RetainedImprovementProposal,
     proposal: &ImprovementProposal,
 ) -> Result<ImprovementReplayAssessment, PipelineError> {
     Ok(compare_improvement_commitments(
-        prior,
-        &proposal_digest(proposal)?,
+        retained,
+        &current_proposal_of(&canonical_proposal(proposal)?)?,
     ))
 }
 
-/// Compares a retained prior commitment with the current committed one.
+/// Assesses the current record against the retained prior record, if any.
 ///
-/// The single owner of the integrity decision, over canonical bytes only: no
-/// caller boolean, no legacy value reinterpreted as a current commitment, and
-/// no effect state. Integrity stays separate from semantic progress: a byte
-/// identical repeat under one logical operation is `ExactReplay`, changed
-/// current-encoding content under one operation and idempotency key is
-/// `IdentityConflict`, a prior written under another domain, encoding revision,
-/// or algorithm is `UnestablishedPrior`, and a different logical operation
-/// establishes no progress either. None of these clears an unknown external
-/// effect; effect retry stays with its own owner.
-pub fn compare_improvement_commitments(
-    prior: &ProposalCommitment,
-    current: &ProposalCommitment,
+/// The only construction site of [`ImprovementReplayAssessment::NoRetainedPrior`]:
+/// an absent retained record is a state this crate reports, not a verdict it
+/// infers. Absence is never novelty and never evidence of improvement.
+pub(crate) fn assess_improvement_progress(
+    retained: Option<&RetainedImprovementProposal>,
+    current: &ImprovementCurrentProposal,
 ) -> ImprovementReplayAssessment {
-    if prior.operation_ref != current.operation_ref
-        || prior.idempotency_key != current.idempotency_key
-    {
-        return ImprovementReplayAssessment::NoProgressEstablished {
-            commitment: current.clone(),
-        };
-    }
-    if prior.domain != current.domain
-        || prior.encoding_version != current.encoding_version
-        || prior.algorithm != current.algorithm
-    {
-        return ImprovementReplayAssessment::UnestablishedPrior {
-            prior_domain: prior.domain.clone(),
-            prior_encoding_version: prior.encoding_version.clone(),
-            prior_algorithm: prior.algorithm.clone(),
-        };
-    }
-    if prior.digest == current.digest {
-        return ImprovementReplayAssessment::ExactReplay {
-            commitment: current.clone(),
-        };
-    }
-    ImprovementReplayAssessment::IdentityConflict {
-        operation_ref: current.operation_ref.clone(),
-        idempotency_key: current.idempotency_key.clone(),
+    match retained {
+        Some(retained) => compare_improvement_commitments(retained, current),
+        None => ImprovementReplayAssessment::NoRetainedPrior {
+            commitment: current.commitment.clone(),
+        },
     }
 }
 
-/// Outcome of comparing one current commitment with a retained prior one.
+/// Compares a retained prior record with the current checked record.
+///
+/// The single owner of the integrity decision, over canonical bytes only: no
+/// caller boolean, no legacy value reinterpreted as a current commitment, and
+/// no effect state. Integrity is decided first and stays separate from semantic
+/// progress.
+///
+/// Under one logical operation and idempotency key, a byte identical repeat is
+/// `ExactReplay` and changed current-encoding content is `IdentityConflict`; a
+/// retained value written under another domain, encoding revision, or algorithm
+/// is `UnestablishedPrior` and cannot be matched. Outside that operation, a
+/// different logical operation is not progress evidence: a new proposal
+/// identity or a different digest establishes nothing. Only a current-version
+/// retained projection that differs from the current one, together with
+/// owner-issued evidence the current proposal declares and the retained record
+/// did not, is an `EstablishedNewDiscriminator` — and even that is an ordinary
+/// new candidate, never a progress claim. Without a retained record nothing is
+/// established at all. None of these clears an unknown external effect; effect
+/// retry stays with its own owner.
+pub fn compare_improvement_commitments(
+    retained: &RetainedImprovementProposal,
+    current: &ImprovementCurrentProposal,
+) -> ImprovementReplayAssessment {
+    if let Some(assessment) = same_operation_replay(retained, current) {
+        return assessment;
+    }
+    unestablished_projection(retained, current)
+        .unwrap_or_else(|| changed_discriminator(retained, current))
+}
+
+/// Decides the outcomes that belong to the retained record's own operation.
+///
+/// `None` means the retained record does not describe this logical operation,
+/// which is not a conclusion about progress: that decision belongs to
+/// [`changed_discriminator`].
+fn same_operation_replay(
+    retained: &RetainedImprovementProposal,
+    current: &ImprovementCurrentProposal,
+) -> Option<ImprovementReplayAssessment> {
+    let prior = &retained.commitment;
+    if prior.operation_ref != current.commitment.operation_ref
+        || prior.idempotency_key != current.commitment.idempotency_key
+    {
+        return None;
+    }
+    if prior.domain != current.commitment.domain
+        || prior.encoding_version != current.commitment.encoding_version
+        || prior.algorithm != current.commitment.algorithm
+    {
+        return Some(unestablished_prior(
+            UnestablishedPriorCause::UnknownCommitmentEncoding,
+            prior,
+        ));
+    }
+    if prior.digest == current.commitment.digest {
+        return Some(ImprovementReplayAssessment::ExactReplay {
+            commitment: current.commitment.clone(),
+        });
+    }
+    Some(ImprovementReplayAssessment::IdentityConflict {
+        operation_ref: current.commitment.operation_ref.clone(),
+        idempotency_key: current.commitment.idempotency_key.clone(),
+    })
+}
+
+/// Reports a retained record whose projection cannot be compared to a current
+/// one, and `None` when both projections carry the current identity.
+fn unestablished_projection(
+    retained: &RetainedImprovementProposal,
+    current: &ImprovementCurrentProposal,
+) -> Option<ImprovementReplayAssessment> {
+    if retained.discriminator.domain == current.discriminator.domain
+        && retained.discriminator.encoding_version == current.discriminator.encoding_version
+    {
+        return None;
+    }
+    Some(unestablished_prior(
+        UnestablishedPriorCause::UnknownDiscriminatorEncoding,
+        &retained.commitment,
+    ))
+}
+
+/// Decides whether a changed discriminator is backed by new owner-issued
+/// evidence.
+///
+/// Both conditions are required. A changed projection alone is a different
+/// spelling, and new evidence against an unchanged projection is more of the
+/// same candidate, so either alone reports no progress.
+fn changed_discriminator(
+    retained: &RetainedImprovementProposal,
+    current: &ImprovementCurrentProposal,
+) -> ImprovementReplayAssessment {
+    if retained.discriminator == current.discriminator {
+        return ImprovementReplayAssessment::NoProgressEstablished {
+            commitment: current.commitment.clone(),
+        };
+    }
+    let retained_evidence: BTreeSet<&str> = retained
+        .discriminator
+        .declared_evidence_refs
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let new_evidence: Vec<String> = current
+        .discriminator
+        .declared_evidence_refs
+        .iter()
+        .filter(|value| !retained_evidence.contains(value.as_str()))
+        .cloned()
+        .collect();
+    if new_evidence.is_empty() {
+        return ImprovementReplayAssessment::NoProgressEstablished {
+            commitment: current.commitment.clone(),
+        };
+    }
+    ImprovementReplayAssessment::EstablishedNewDiscriminator {
+        commitment: current.commitment.clone(),
+        new_evidence_refs: new_evidence,
+    }
+}
+
+/// Names one unestablished retained record by its typed cause and identity.
+fn unestablished_prior(
+    cause: UnestablishedPriorCause,
+    prior: &ProposalCommitment,
+) -> ImprovementReplayAssessment {
+    ImprovementReplayAssessment::UnestablishedPrior {
+        cause,
+        prior_domain: prior.domain.clone(),
+        prior_encoding_version: prior.encoding_version.clone(),
+        prior_algorithm: prior.algorithm.clone(),
+    }
+}
+
+/// Typed cause of an unestablished retained record.
+///
+/// The cause is machine state, never the wording of a reason string. Each
+/// variant is a real, distinguishable state of a record that cannot be compared
+/// against a current one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnestablishedPriorCause {
+    /// The retained commitment carries another domain, encoding revision, or
+    /// algorithm, including a legacy FNV-1a value. It is never reinterpreted as
+    /// a current commitment and never matched against current content.
+    UnknownCommitmentEncoding,
+    /// The retained discriminator projection carries another projection domain
+    /// or encoding revision, so a changed discriminator cannot be established
+    /// against it.
+    UnknownDiscriminatorEncoding,
+}
+
+impl UnestablishedPriorCause {
+    /// Returns the stable label of the cause as it appears in a reason.
+    ///
+    /// Derived from the typed cause so the explanation cannot drift away from
+    /// the machine state it reports.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UnknownCommitmentEncoding => "unknown-commitment-encoding",
+            Self::UnknownDiscriminatorEncoding => "unknown-discriminator-encoding",
+        }
+    }
+}
+
+/// Outcome of comparing the current checked record with a retained prior one.
+///
+/// Every variant is derived from the two records. No caller supplies one, and no
+/// variant clears an unknown external effect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub enum ImprovementReplayAssessment {
@@ -841,10 +1149,12 @@ pub enum ImprovementReplayAssessment {
         /// Conflicting idempotency namespace.
         idempotency_key: String,
     },
-    /// The retained commitment is not a current-version commitment. It stays an
+    /// The retained record is not a current-version record. It stays an
     /// unqualified historical observation and requires reconciliation or
     /// revalidation by its owner.
     UnestablishedPrior {
+        /// Why the retained record cannot be compared.
+        cause: UnestablishedPriorCause,
         /// Domain the retained value was written under.
         prior_domain: String,
         /// Encoding revision the retained value was written under.
@@ -852,8 +1162,26 @@ pub enum ImprovementReplayAssessment {
         /// Algorithm the retained value was written under.
         prior_algorithm: String,
     },
-    /// A different logical operation. No progress is established here, and no
-    /// external effect is cleared.
+    /// No retained record was supplied at all. There is no owner-backed
+    /// discriminator evidence, so no progress is established and nothing is
+    /// cleared; absence is not novelty.
+    NoRetainedPrior {
+        /// The current commitment.
+        commitment: ProposalCommitment,
+    },
+    /// A new causal discriminator is established: the current projection
+    /// differs from a current-version retained one and the current proposal
+    /// declares owner-issued evidence the retained record did not. This is an
+    /// ordinary new candidate, never a progress claim.
+    EstablishedNewDiscriminator {
+        /// The current commitment.
+        commitment: ProposalCommitment,
+        /// Owner-issued evidence references the current proposal declares and the
+        /// retained record did not.
+        new_evidence_refs: Vec<String>,
+    },
+    /// No new causal discriminator is established from the available records.
+    /// No progress is established either.
     NoProgressEstablished {
         /// The current commitment.
         commitment: ProposalCommitment,
@@ -916,24 +1244,25 @@ pub fn reconcile_unknown_activation(
 /// Pure orchestrator over borrowed inputs: it builds the private checked view
 /// over the proposal, experiment, evaluation, rollback, and admission records,
 /// refuses a diverged relation before any positive path, requires a gap-free
-/// rollback contract, derives the replay assessment from the one commitment it
-/// computed and the retained prior commitment the admission evidence carries,
-/// then delegates the admission verdict to
-/// `improvement_admission::admit_improvement_candidate` and maps that verdict
-/// through the same checked view. Never performs promotion, activation, canary
-/// cutover, authority issuance, or completion, and never reports an observed
-/// completed rollback.
+/// rollback contract, computes the single commitment and discriminator
+/// projection for the normalized proposal, hands that one record to
+/// `improvement_admission::admit_improvement_candidate`, and maps the resulting
+/// verdict through the same checked view. Never performs promotion, activation,
+/// canary cutover, authority issuance, or completion, and never reports an
+/// observed completed rollback.
 pub fn run_improvement_candidate_pipeline(
     inputs: ImprovementPipelineInputs<'_>,
 ) -> Result<ImprovementTerminalDisposition, PipelineError> {
     let joined = join_improvement_inputs(inputs)?;
+    // The gate receives the record this run committed, never a verdict. A typed
+    // admission refusal, including the identity conflict, crosses this boundary
+    // as itself and is never collapsed into reason text.
     let decision = admit_improvement_candidate(
         joined.candidate,
         joined.admission_evidence,
         joined.policy,
-        joined.replay.as_ref(),
-    )
-    .map_err(|err| PipelineError::AdmissionFailed(err.to_string()))?;
+        &joined.current,
+    )?;
     map_decision(&decision, &joined)
 }
 
@@ -949,13 +1278,12 @@ struct JoinedImprovementInputs<'a> {
     candidate: &'a ImprovementCandidateView,
     admission_evidence: &'a ImprovementEvidenceView,
     policy: &'a ImprovementAdmissionPolicy,
-    /// The single normalized proposal whose bytes were committed.
+    /// The single normalized proposal whose exact bytes were committed.
     normalized: ImprovementProposal,
-    /// The single commitment computed for those bytes.
-    commitment: ProposalCommitment,
-    /// Canonical-byte assessment of that commitment against the retained prior
-    /// commitment, absent only when no prior commitment was retained.
-    replay: Option<ImprovementReplayAssessment>,
+    /// The single commitment computed for those bytes, with the discriminator
+    /// projection of the same bytes. The gate and the handoff read this one
+    /// value; neither recomputes it.
+    current: ImprovementCurrentProposal,
     /// Admitted scope the candidate owner proved for this candidate.
     admitted_scope_ref: String,
 }
@@ -969,7 +1297,7 @@ fn join_improvement_inputs(
     check_experiment_shape(inputs.experiment)?;
     check_evaluation_shape(inputs.evidence)?;
     let normalized = canonical_proposal(inputs.proposal)?;
-    let commitment = commitment_of(&normalized)?;
+    let current = current_proposal_of(&normalized)?;
     check_proposal_candidate_join(inputs.proposal, inputs.candidate)?;
     check_proposal_experiment_join(inputs.experiment, inputs.proposal, inputs.candidate)?;
     check_experiment_evaluation_join(inputs.evidence, inputs.proposal, inputs.experiment)?;
@@ -985,17 +1313,6 @@ fn join_improvement_inputs(
         inputs.policy,
         inputs.proposal,
     )?;
-    // The admission gate never asks whether a repeat happened. It receives the
-    // canonical-byte comparison between the retained prior commitment the
-    // admission evidence carries and the single commitment computed above over
-    // the current normalized bytes, so a caller can supply the prior record but
-    // never a progress verdict. An absent prior is an ordinary new candidate,
-    // not a claim that one is needed.
-    let replay = inputs
-        .admission_evidence
-        .retained_prior_commitment
-        .as_ref()
-        .map(|prior| compare_improvement_commitments(prior, &commitment));
     // A candidate with no owner-proved scope binding carries an empty admitted
     // scope here. That is not a default: the inner admission owns the
     // disposition and reports the named `missing-admitted-scope` gap, and no
@@ -1012,8 +1329,7 @@ fn join_improvement_inputs(
         admission_evidence: inputs.admission_evidence,
         policy: inputs.policy,
         normalized,
-        commitment,
-        replay,
+        current,
         admitted_scope_ref,
     })
 }
@@ -1624,7 +1940,8 @@ fn build_canary_handoff(
         .to_string();
     let handoff = ImprovementCanaryHandoff {
         proposal_id: joined.proposal.proposal_id.clone(),
-        proposal_commitment: joined.commitment.clone(),
+        proposal_commitment: joined.current.commitment.clone(),
+        proposal_discriminator: joined.current.discriminator.clone(),
         candidate_id: joined.proposal.candidate_id.clone(),
         campaign_id: joined.proposal.campaign_id.clone(),
         closure_id: joined.proposal.closure_id.clone(),

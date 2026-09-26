@@ -335,6 +335,11 @@ pub(crate) async fn run_stdio_client(
                 check_response_correlation(request_id, &response)?;
             }
             let framed = format!("{response}\n");
+            correlation.observe_route_context(
+                profile,
+                &connection.publication.runtime_id,
+                &connection.publication.auth_generation,
+            );
             correlation.observe_framed(framed.len());
             let receipt = emit_stdout_frame(framed.as_bytes());
             correlation.observe_emission(&receipt);

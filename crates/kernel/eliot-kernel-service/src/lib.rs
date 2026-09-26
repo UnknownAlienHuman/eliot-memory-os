@@ -57,10 +57,12 @@ mod user_automation_execution_client;
 mod user_automation_failure_history;
 #[cfg(test)]
 mod user_automation_failure_history_tests;
+mod user_automation_orchestration;
 mod user_automation_runtime_handoff;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
+mod wasm_control;
 mod wasm_dispatch;
 mod write_coordinator;
 
@@ -242,6 +244,14 @@ pub use user_automation_execution_client::{
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
 };
+pub use user_automation_orchestration::{
+    USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationError,
+    UserAutomationOrchestrationRecord, UserAutomationRuntimeObligation,
+    UserAutomationRuntimeObligationAnswer, UserAutomationRuntimeObligationDisposition,
+    UserAutomationRuntimeObligationKind, retained_user_automation_obligation,
+    runtime_obligation_operation_id, runtime_obligation_payload_digest,
+    runtime_obligation_request_digest,
+};
 pub use user_automation_runtime_handoff::{
     USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
     UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
@@ -253,15 +263,32 @@ pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,
     UserAutomationOwnerReadProvenance, UserAutomationOwnerSnapshot,
 };
+pub use wasm_control::{
+    ControlAckPhase, ControlDeliveryIdentity, ControlDisposition, ControlDispositionRecord,
+    WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION, WASM_CONTROL_DELIVERY_WIRE_ID,
+    WASM_CONTROL_DELIVERY_WIRE_VERSION, WASM_CONTROL_DISPOSITION_WIRE_ID,
+    WASM_CONTROL_DISPOSITION_WIRE_VERSION, WASM_CONTROL_FILE_PREFIX, WASM_CONTROL_GRANT_WINDOW_MS,
+    WASM_CONTROL_HEAD_WIRE_ID, WASM_CONTROL_HEAD_WIRE_VERSION, WASM_CONTROL_KIND_CANCEL,
+    WASM_CONTROL_KIND_RECONCILE, WASM_CONTROL_KIND_SHUTDOWN, WASM_CONTROL_MAX_DETAIL_BYTES,
+    WASM_CONTROL_MAX_FILE_BYTES, WASM_CONTROL_REPLAY_KEY_DOMAIN, WASM_CONTROL_SPOOL_MAX_DELIVERIES,
+    WASM_CONTROL_SPOOL_RESERVE_SLOTS, WASM_CONTROL_SPOOL_SCAN_CAP, WasmControlAck,
+    WasmControlDelivery, WasmControlDeliveryStatus, WasmControlError, WasmControlKind,
+    WasmControlPublishInputs, WasmControlPublishReceipt, WasmControlSpoolStatus,
+    note_wasm_control_supervised_end, publish_wasm_control_delivery, reconcile_wasm_control_spool,
+};
 pub use wasm_dispatch::{
-    JoinDeny, WASM_DISPATCH_AUTHORITY_PREFIX, WASM_DISPATCH_DERIVATION_DOMAIN,
-    WASM_DISPATCH_GRANT_WINDOW_MS, WASM_DISPATCH_LAUNCH_GRANT_HEAD, WASM_DISPATCH_MATERIAL_WIRE_ID,
+    DeliveryReclaimOutcome, JoinDeny, MAX_DELIVERY_PAYLOAD_BYTES, MAX_DELIVERY_SLOTS,
+    WASM_DELIVERY_IDENTITY_VERSION, WASM_DELIVERY_SLOT_DIR_NAME, WASM_DISPATCH_AUTHORITY_PREFIX,
+    WASM_DISPATCH_DERIVATION_DOMAIN, WASM_DISPATCH_GRANT_WINDOW_MS,
+    WASM_DISPATCH_LAUNCH_GRANT_HEAD, WASM_DISPATCH_MATERIAL_WIRE_ID,
     WASM_DISPATCH_MATERIAL_WIRE_VERSION, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
     WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, WasmAssuranceRecord,
+    WasmDeliveryBackpressure, WasmDeliveryIdentity, WasmDeliveryReclamation,
     WasmDispatchDerivation, WasmDispatchError, WasmDispatchGrant, WasmDispatchMaterial,
     WasmGuestCeilings, WasmJoinGate, WasmJoinTable, WasmManifestRecord, WasmOwnerClaim,
-    WasmPromotionRecord, WasmPublishedBundle, WasmSnapshotRecord, WasmWorkRecord, material_bytes,
-    publish_wasm_dispatch_bundle, publish_wasm_dispatch_material, wasm_dispatch_derivation,
+    WasmPromotionRecord, WasmPublicationState, WasmPublishedBundle, WasmSnapshotRecord,
+    WasmWorkRecord, discover_delivery_publications, material_bytes, publish_wasm_dispatch_bundle,
+    publish_wasm_dispatch_material, wasm_dispatch_derivation,
     wasm_dispatch_derivation_from_epoch_json, wasm_dispatch_grant_for, wasm_join_gate,
 };
 pub use write_coordinator::{

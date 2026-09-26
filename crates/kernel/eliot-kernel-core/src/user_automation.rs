@@ -44,26 +44,29 @@ pub const USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION: &str = "eliot.user-automa
 /// One occurrence key is the `|`-separated, fixed-arity record
 ///
 /// ```text
-/// <encoding>|<zone>|<zone database revision>|<local wall clock>|<offset>
-///   |<resolved UTC instant>|<transition window>|<disposition>|<source digest>
+/// <encoding>|<zone>|<zone database revision>|<requested local>|<resolved local>
+///   |<offset>|<resolved UTC instant>|<transition window>|<disposition>|<source digest>
 /// ```
 ///
 /// of exactly the owner evidence a replay needs. Every field has a closed
 /// grammar, so a rejected value names a missing or malformed piece of evidence
-/// instead of a string that merely resembles a timestamp. A local wall clock is
-/// always accompanied by the instant the pinned zone revision resolved it to,
+/// instead of a string that merely resembles a timestamp. Requested and
+/// resolved local wall clocks are separate so a gap shift is representable
+/// without conflating the nonexistent input with its valid result. Both are
+/// accompanied by the instant the pinned zone revision resolved it to,
 /// the offset that instant carries, the transition evidence that makes a fold or
 /// gap reproducible, and the fold or gap disposition the owner applied. A
 /// database revision therefore cannot silently re-resolve a stored occurrence:
 /// it is part of the record, and of the occurrence identity derived from it.
 ///
-/// The predecessor of this encoding was a local wall clock plus an offset with
-/// none of that evidence. Such a record is a legacy, unverified input and is
-/// refused with [`UserAutomationError::LegacyScheduleEncoding`], so it is never
-/// silently certified under this stronger contract.
-pub const NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V2";
-const OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
-const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V1";
+/// The shape-only predecessor and V2/V3 records require owner re-normalization.
+/// Neither is certified by this successor encoding.
+pub const NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V4";
+const LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3: &str = "ELIOT/I11.12/OCCURRENCE/V3";
+const LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2: &str = "ELIOT/I11.12/OCCURRENCE/V2";
+const SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V3";
+const MANUAL_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
+const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2";
 const FAILURE_FINGERPRINT_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-FAILURE/V1";
 const WAKE_REASON_PREFIX: &str = "user-automation";
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -105,14 +108,13 @@ pub enum UserAutomationError {
     /// Canonical serialization failed while deriving an identity.
     #[error("UserAutomation canonical serialization failed: {0}")]
     Serialization(String),
-    /// A normalized occurrence still carries the retired shape-only encoding.
+    /// A normalized occurrence still carries a retired encoding.
     ///
-    /// That encoding is a legacy, unverified input: it carries no zone
-    /// identity, no pinned database revision, no resolved instant and no
-    /// applied fold or gap disposition, so it is never certified under the
-    /// versioned calendar contract. The owning calendar adapter must
-    /// re-normalize it into a new revision.
-    #[error("normalized occurrence is legacy shape-only and requires re-normalization: {0}")]
+    /// The shape-only predecessor lacks zone evidence. V2 lacks pinned zone
+    /// table identity, and V3 has one ambiguous local-time field that cannot
+    /// represent both a gap request and its shifted result. The owning calendar
+    /// adapter must re-normalize them into a new revision.
+    #[error("normalized occurrence uses a retired encoding and requires re-normalization: {0}")]
     LegacyScheduleEncoding(&'static str),
     /// The named zone is not a member of the pinned zone table.
     ///
@@ -121,15 +123,21 @@ pub enum UserAutomationError {
     /// implementation, and a spelled pair that merely resembles a real one are
     /// all refused here. No zone is ever resolved from its spelling.
     ///
-    /// A zone the pinned release does define, but whose pinned offsets cannot be
-    /// stated exactly in this contract's canonical offset unit, is refused here as
-    /// well rather than answered from a truncated offset. `Africa/Monrovia` is
-    /// the one such zone in this release: it applied `-0:44:30` until 1972, and
-    /// minutes cannot hold that value. The zone is reported here because from this
-    /// boundary the two cases are the same answer: this contract has no
-    /// minute-valued zone evidence to offer for it.
     #[error("normalized occurrence names a zone the pinned zone table does not carry: {0}")]
     UnknownZone(&'static str),
+    /// A named zone is present in the pinned table, but its exact historical
+    /// offset cannot be represented by the minute-valued occurrence wire.
+    #[error(
+        "pinned zone {zone} has an unrepresentable offset of {offset_seconds} seconds: {field}"
+    )]
+    SubMinuteZoneOffset {
+        /// The field that requested the zone lookup.
+        field: &'static str,
+        /// The pinned zone that carries the offset.
+        zone: &'static str,
+        /// Exact table value, before any minute conversion.
+        offset_seconds: i32,
+    },
     /// The pinned zone database revision is not the one this build carries.
     ///
     /// A revision is refused rather than read from an ambient database, so a
@@ -155,10 +163,9 @@ pub enum UserAutomationError {
     ZoneTableIntegrity,
     /// The recorded zone evidence is not what the pinned table applies.
     ///
-    /// The offset, the local wall clock, the transition evidence and the applied
-    /// disposition of an occurrence must all be what the named zone actually
-    /// applies at the recorded instant. This is what proves that a recorded
-    /// offset is one the named zone applies at that local wall clock.
+    /// The offset, requested and resolved local clocks, transition evidence and
+    /// applied disposition must all be what the named zone actually applies at
+    /// the recorded instant.
     #[error("occurrence evidence is not what the pinned zone table applies: {0}")]
     ZoneEvidence(&'static str),
 }
@@ -292,8 +299,8 @@ impl NormalizedSchedule {
         Ok(())
     }
 
-    /// Returns the immutable compiled digest binding this occurrence projection
-    /// to its declared expression and calendar.
+    /// Returns the immutable digest binding this occurrence projection to its
+    /// declared expression, calendar, and exact pinned zone table semantics.
     ///
     /// The expression language is owned elsewhere, so Kernel never reparses it.
     /// The owner compiles the expression once and every occurrence of the
@@ -305,6 +312,10 @@ impl NormalizedSchedule {
             SCHEDULE_SOURCE_DIGEST_DOMAIN,
             &self.expression,
             &self.calendar,
+            user_automation_zones::ZONE_TABLE_FORMAT,
+            user_automation_zones::ZONE_TABLE_OFFSET_UNIT,
+            user_automation_zones::PINNED_ZONE_DATABASE_RELEASE,
+            user_automation_zones::PINNED_ZONE_TABLE_SHA256,
         ))
         .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
         Ok(sha256_hex(&bytes))
@@ -315,9 +326,9 @@ impl NormalizedSchedule {
     ///
     /// The set is the single normalized occurrence contract. Each member
     /// carries the canonical zone identity, the pinned zone database revision,
-    /// the range-checked local civil datetime, the resolved UTC instant and
-    /// applied offset, the applied fold or gap disposition, and the compiled
-    /// source digest. Every member must resolve to exactly the instant its
+    /// the range-checked requested and resolved local civil datetimes, the
+    /// resolved UTC instant and applied offset, the fold or gap disposition,
+    /// and the compiled source digest. Every member must resolve to exactly the instant its
     /// disposition and applied offset select, lie inside the declared start and
     /// end interval, and be strictly later than its predecessor: a duplicate
     /// instant cannot occupy two positions, and the two distinct instants of a
@@ -378,8 +389,8 @@ impl NormalizedSchedule {
     /// Interprets the owner-normalized occurrence set deterministically.
     ///
     /// This is the deterministic calendar interpretation of exactly that set:
-    /// the declared zone identity, the pinned zone database revision, the civil
-    /// local datetimes, the UTC offsets, the resolved instants, the applied
+    /// the declared zone identity, the pinned zone database revision, the
+    /// requested and resolved civil local datetimes, the UTC offsets, the resolved instants, the applied
     /// fold and gap dispositions, the compiled source digest, the start and end
     /// interval, and the chronological order. It admits no occurrence it cannot
     /// derive from the owner-issued evidence and it never resolves a zone, reads
@@ -443,6 +454,14 @@ impl NormalizedSchedule {
         let fields: Vec<&str> = occurrence_key
             .split(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR)
             .collect();
+        if fields
+            .first()
+            .is_some_and(|encoding| is_legacy_normalized_occurrence_encoding(encoding))
+        {
+            return Err(UserAutomationError::LegacyScheduleEncoding(
+                "schedule.next_occurrences",
+            ));
+        }
         if fields.len() != NORMALIZED_OCCURRENCE_FIELD_COUNT {
             return Err(if is_legacy_occurrence_key(occurrence_key) {
                 UserAutomationError::LegacyScheduleEncoding("schedule.next_occurrences")
@@ -465,21 +484,25 @@ impl NormalizedSchedule {
                 "schedule.occurrence_key.zone_database_revision",
             ));
         }
-        if fields[8] != source_digest {
+        if fields[9] != source_digest {
             return Err(UserAutomationError::Invalid(
                 "schedule.occurrence_key.source_digest",
             ));
         }
         let disposition =
-            parse_occurrence_disposition(fields[7], "schedule.occurrence_key.disposition")?;
+            parse_occurrence_disposition(fields[8], "schedule.occurrence_key.disposition")?;
         require_declared_disposition(disposition, self.dst_fold, self.dst_gap)?;
-        let local = parse_civil_wall_clock(fields[3], "schedule.occurrence_key.local")?;
-        let offset_minutes = parse_utc_offset(fields[4], "schedule.occurrence_key.offset")?;
-        let instant_seconds = parse_utc_instant(fields[5], "schedule.occurrence_key.instant")?;
+        let requested_local =
+            parse_civil_wall_clock(fields[3], "schedule.occurrence_key.requested_local")?;
+        let resolved_local =
+            parse_civil_wall_clock(fields[4], "schedule.occurrence_key.resolved_local")?;
+        let offset_minutes = parse_utc_offset(fields[5], "schedule.occurrence_key.offset")?;
+        let instant_seconds = parse_utc_instant(fields[6], "schedule.occurrence_key.instant")?;
         let transition =
-            parse_transition_window(fields[6], disposition, "schedule.occurrence_key.transition")?;
+            parse_transition_window(fields[7], disposition, "schedule.occurrence_key.transition")?;
         require_resolved_instant(
-            local,
+            requested_local,
+            resolved_local,
             offset_minutes,
             disposition,
             transition,
@@ -487,7 +510,8 @@ impl NormalizedSchedule {
         )?;
         require_pinned_zone_evidence(
             &self.timezone,
-            local.unix_seconds(),
+            requested_local.unix_seconds(),
+            resolved_local.unix_seconds(),
             offset_minutes,
             instant_seconds,
             disposition,
@@ -496,11 +520,12 @@ impl NormalizedSchedule {
         Ok(NormalizedOccurrence {
             timezone: self.timezone.clone(),
             zone_database_revision: fields[2].to_owned(),
-            local: fields[3].to_owned(),
+            requested_local: fields[3].to_owned(),
+            resolved_local: fields[4].to_owned(),
             offset_minutes,
             instant_seconds,
             disposition,
-            source_digest: fields[8].to_owned(),
+            source_digest: fields[9].to_owned(),
         })
     }
 }
@@ -529,20 +554,21 @@ pub enum OccurrenceDisposition {
 /// One decoded owner-issued normalized calendar occurrence.
 ///
 /// This is the whole normalized occurrence contract of one bounded projection
-/// member: the canonical zone identity and the pinned zone database revision
-/// the owner normalized against, the valid local civil datetime, the resolved
-/// UTC instant and the applied offset, the applied fold or gap disposition, and
-/// the immutable compiled digest of the source expression and calendar. Kernel
-/// validates this evidence; it never resolves a zone, reads a time zone
-/// database, or reads the ambient machine locale.
+/// member: the canonical zone identity and pinned zone database revision, the
+/// requested and resolved local civil datetimes, the resolved UTC instant and
+/// applied offset, the fold or gap disposition, and the immutable compiled
+/// source digest. Kernel validates this evidence; it never resolves a zone,
+/// reads a time zone database, or reads the ambient machine locale.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedOccurrence {
     /// Canonical owner-normalized zone identity.
     pub timezone: String,
     /// Pinned versioned zone database or platform-owner revision token.
     pub zone_database_revision: String,
-    /// Valid local civil wall clock in `timezone`.
-    pub local: String,
+    /// Owner-requested local civil wall clock, which may be nonexistent for a gap.
+    pub requested_local: String,
+    /// Valid local civil wall clock after applying the recorded disposition.
+    pub resolved_local: String,
     /// Applied UTC offset in signed minutes east of UTC.
     pub offset_minutes: i32,
     /// Resolved UTC instant in seconds since the Unix epoch.
@@ -557,7 +583,7 @@ pub struct NormalizedOccurrence {
 /// contain it, so the record is unambiguously position-addressable.
 const NORMALIZED_OCCURRENCE_FIELD_SEPARATOR: char = '|';
 /// Fixed number of fields in one normalized occurrence key.
-const NORMALIZED_OCCURRENCE_FIELD_COUNT: usize = 9;
+const NORMALIZED_OCCURRENCE_FIELD_COUNT: usize = 10;
 /// Longest accepted normalized occurrence key. The encoding is a fixed record
 /// of short tokens, so a longer value is refused before it is split.
 const MAX_OCCURRENCE_KEY_BYTES: usize = 1024;
@@ -877,46 +903,82 @@ fn require_declared_disposition(
     }
 }
 
-/// Requires the recorded instant to be exactly the one the applied disposition
-/// selects for the recorded local wall clock and applied offset.
-///
-/// For a unique local wall clock the recorded offset is the only offset the
-/// pinned zone revision applies, so the instant must be `local - offset`. For a
-/// fold the zone applies the pre transition offset to the earlier instant and
-/// the post transition offset to the later one, so `FIRST` must carry the pre
-/// transition offset and resolve to `local - pre`, and `SECOND` must carry the
-/// post transition offset and resolve to `local - post`. For a gap the local
-/// wall clock does not exist, so the owner shifts it forward by the transition
-/// step: the applied offset is the post transition offset and the instant is
-/// `local + step - post`, which is the same value as `local - pre`.
-///
-/// An occurrence whose recorded offset is neither side of the recorded
-/// transition, or whose instant does not round-trip through its own offset, is
-/// refused. Kernel resolves nothing: it refuses evidence that is not
-/// self-consistent.
+/// Checks the disposition's offset side and delegates the shared local/instant
+/// relation to [`validate_occurrence_local_relation`].
 fn require_resolved_instant(
-    local: CivilDateTime,
+    requested_local: CivilDateTime,
+    resolved_local: CivilDateTime,
     offset_minutes: i32,
     disposition: OccurrenceDisposition,
     transition: Option<(i32, i32)>,
     instant_seconds: i64,
 ) -> Result<(), UserAutomationError> {
-    let applied = match (disposition, transition) {
-        (OccurrenceDisposition::Unique, None) => offset_minutes,
+    match (disposition, transition) {
+        (OccurrenceDisposition::Unique, None) => {}
         (OccurrenceDisposition::FoldFirst, Some((pre, post)))
-            if pre > post && offset_minutes == pre =>
-        {
-            pre
-        }
+            if pre > post && offset_minutes == pre => {}
         (OccurrenceDisposition::FoldSecond, Some((pre, post)))
-            if pre > post && offset_minutes == post =>
-        {
-            post
-        }
+            if pre > post && offset_minutes == post => {}
         (OccurrenceDisposition::GapShiftForward, Some((pre, post)))
-            if pre < post && offset_minutes == post =>
-        {
-            pre
+            if pre < post && offset_minutes == post => {}
+        _ => {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.transition",
+            ));
+        }
+    }
+    validate_occurrence_local_relation(
+        requested_local,
+        resolved_local,
+        offset_minutes,
+        disposition,
+        transition,
+        instant_seconds,
+    )
+}
+
+/// Validates one shared relation between requested and resolved local evidence.
+///
+/// Unique and folded occurrences keep the same local clock; a gap advances the
+/// resolved local by its exact offset step and the requested/pre and
+/// resolved/post equations must reach the same instant.
+fn validate_occurrence_local_relation(
+    requested_local: CivilDateTime,
+    resolved_local: CivilDateTime,
+    offset_minutes: i32,
+    disposition: OccurrenceDisposition,
+    transition: Option<(i32, i32)>,
+    instant_seconds: i64,
+) -> Result<(), UserAutomationError> {
+    let requested_seconds = requested_local.unix_seconds();
+    let resolved_seconds = resolved_local.unix_seconds();
+    let expected_instant_seconds = match (disposition, transition) {
+        (OccurrenceDisposition::Unique, None)
+        | (OccurrenceDisposition::FoldFirst | OccurrenceDisposition::FoldSecond, Some(_)) => {
+            if requested_seconds != resolved_seconds {
+                return Err(UserAutomationError::Invalid(
+                    "schedule.occurrence_key.resolved_local",
+                ));
+            }
+            requested_seconds - i64::from(offset_minutes) * SECONDS_PER_MINUTE
+        }
+        (OccurrenceDisposition::GapShiftForward, Some((pre, post))) if pre < post => {
+            let gap_seconds = i64::from(post - pre) * SECONDS_PER_MINUTE;
+            let Some(expected_resolved_seconds) = requested_seconds.checked_add(gap_seconds) else {
+                return Err(UserAutomationError::Invalid(
+                    "schedule.occurrence_key.resolved_local",
+                ));
+            };
+            let requested_instant_seconds = requested_seconds - i64::from(pre) * SECONDS_PER_MINUTE;
+            let resolved_instant_seconds = resolved_seconds - i64::from(post) * SECONDS_PER_MINUTE;
+            if resolved_seconds != expected_resolved_seconds
+                || requested_instant_seconds != resolved_instant_seconds
+            {
+                return Err(UserAutomationError::Invalid(
+                    "schedule.occurrence_key.resolved_local",
+                ));
+            }
+            requested_instant_seconds
         }
         _ => {
             return Err(UserAutomationError::Invalid(
@@ -924,7 +986,7 @@ fn require_resolved_instant(
             ));
         }
     };
-    if local.unix_seconds() - i64::from(applied) * SECONDS_PER_MINUTE != instant_seconds {
+    if expected_instant_seconds != instant_seconds {
         return Err(UserAutomationError::Invalid(
             "schedule.occurrence_key.instant",
         ));
@@ -934,34 +996,31 @@ fn require_resolved_instant(
 
 /// Requires the recorded zone evidence to be what the pinned table applies.
 ///
-/// The owner asserts a zone, a local wall clock, an offset, an instant, a
-/// transition pair and a disposition. This is where Kernel decides whether that
-/// assertion is true, by reading the offsets and transitions of the named zone
-/// out of the pinned table. Nothing is taken on the owner's spelling and nothing
-/// is read from an ambient database, so the recorded disposition stays
-/// inspectable and replayable while the decision that admitted it is Kernel's.
+/// The owner asserts requested and resolved local clocks, a zone, an offset, an
+/// instant, a transition pair and a disposition. Kernel checks that assertion
+/// against offsets and transitions in the pinned table. Nothing is taken on the
+/// owner's spelling and nothing is read from an ambient database.
 ///
-/// Given the recorded `(zone, local, offset, instant, transition, disposition)`:
+/// Given the recorded `(zone, requested_local, resolved_local, offset, instant,
+/// transition, disposition)`:
 ///
 /// 1. the zone must be a member of the pinned table and the revision must be the
 ///    pinned one, which the caller has already established;
 /// 2. the offset the zone applies at the recorded instant must equal the recorded
 ///    offset, which alone refuses an in-range offset that merely round-trips
 ///    through its own instant;
-/// 3. the recorded local wall clock must equal the recorded instant rendered in
-///    the offset the zone applies at that instant;
-/// 4. what the local wall clock actually is decides the disposition: a unique
-///    clock admits only `UNIQUE` and needs no transition, a fold admits only
-///    `FOLD_FIRST` or `FOLD_SECOND` and must select the earlier or later of
-///    exactly the two instants the table resolves it to, and a gap admits only
-///    `GAP_SHIFT_FORWARD` and must land on the table's real post-transition
-///    instant;
-/// 5. when a transition pair is recorded, both of its boundaries must equal the
+/// 3. resolved local must equal the recorded instant rendered in the offset the
+///    zone applies at that instant;
+/// 4. requested local decides the disposition: unique and fold clocks remain
+///    equal to resolved local, while a gap must resolve to the table's exact
+///    shifted local and post-transition instant;
+/// 5. when a transition pair is recorded, both boundaries must equal the
 ///    offsets the table actually applies on either side of the transition it
 ///    names.
 fn require_pinned_zone_evidence(
     zone: &str,
-    claimed_local_unix_seconds: i64,
+    requested_local_unix_seconds: i64,
+    resolved_local_unix_seconds: i64,
     claimed_offset_minutes: i32,
     claimed_instant_seconds: i64,
     disposition: OccurrenceDisposition,
@@ -983,14 +1042,14 @@ fn require_pinned_zone_evidence(
             "schedule.occurrence_key.offset",
         ));
     }
-    if claimed_local_unix_seconds
+    if resolved_local_unix_seconds
         != claimed_instant_seconds + i64::from(applied) * SECONDS_PER_MINUTE
     {
         return Err(UserAutomationError::ZoneEvidence(
-            "schedule.occurrence_key.local",
+            "schedule.occurrence_key.resolved_local",
         ));
     }
-    let reality = user_automation_zones::classify_local_clock(zone, claimed_local_unix_seconds)
+    let reality = user_automation_zones::classify_local_clock(zone, requested_local_unix_seconds)
         .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
     let disagree = || UserAutomationError::ZoneEvidence("schedule.occurrence_key.disposition");
     let real_transition = match (disposition, reality) {
@@ -1039,12 +1098,15 @@ fn require_pinned_zone_evidence(
             OccurrenceDisposition::GapShiftForward,
             user_automation_zones::LocalClockReality::Gap {
                 transition: real,
+                shifted_local_unix_seconds,
                 resolved_instant_seconds,
                 post_offset_minutes,
                 ..
             },
         ) => {
-            if resolved_instant_seconds != claimed_instant_seconds || post_offset_minutes != applied
+            if shifted_local_unix_seconds != resolved_local_unix_seconds
+                || resolved_instant_seconds != claimed_instant_seconds
+                || post_offset_minutes != applied
             {
                 return Err(disagree());
             }
@@ -1082,9 +1144,15 @@ fn map_zone_error(
 ) -> UserAutomationError {
     match error {
         user_automation_zones::ZoneTableError::Integrity => UserAutomationError::ZoneTableIntegrity,
-        user_automation_zones::ZoneTableError::UnknownZone
-        | user_automation_zones::ZoneTableError::SubMinuteOffset(_) => {
+        user_automation_zones::ZoneTableError::UnknownZone => {
             UserAutomationError::UnknownZone(field)
+        }
+        user_automation_zones::ZoneTableError::SubMinuteOffset(evidence) => {
+            UserAutomationError::SubMinuteZoneOffset {
+                field,
+                zone: evidence.zone,
+                offset_seconds: evidence.offset_seconds,
+            }
         }
         user_automation_zones::ZoneTableError::OutsideCoverage => {
             UserAutomationError::ZoneTableWindow {
@@ -1123,6 +1191,14 @@ fn is_canonical_zone_database_revision(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ZONE_DATABASE_REVISION_BYTES
         && value == user_automation_zones::PINNED_ZONE_DATABASE_RELEASE
+}
+
+/// Returns whether one versioned occurrence key is a retired V2 or V3 record.
+fn is_legacy_normalized_occurrence_encoding(value: &str) -> bool {
+    matches!(
+        value,
+        LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2 | LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3
+    )
 }
 
 /// Returns whether one occurrence key still carries the retired shape-only
@@ -1734,7 +1810,20 @@ pub enum UserAutomationTrigger {
 impl UserAutomationTrigger {
     fn validate(&self) -> Result<(), UserAutomationError> {
         match self {
-            Self::Scheduled { occurrence_key } => text(occurrence_key, "trigger.occurrence_key"),
+            Self::Scheduled { occurrence_key } => {
+                text(occurrence_key, "trigger.occurrence_key")?;
+                match occurrence_key.split_once(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR) {
+                    Some((encoding, _)) if is_legacy_normalized_occurrence_encoding(encoding) => {
+                        Err(UserAutomationError::LegacyScheduleEncoding(
+                            "trigger.occurrence_key",
+                        ))
+                    }
+                    Some((NORMALIZED_OCCURRENCE_ENCODING, _)) => Ok(()),
+                    _ => Err(UserAutomationError::Invalid(
+                        "trigger.occurrence_key.encoding",
+                    )),
+                }
+            }
             Self::Manual { nonce } => text(nonce, "trigger.nonce"),
         }
     }
@@ -1905,12 +1994,24 @@ impl UserAutomationInvocation {
         text(automation_id, "automation_id")?;
         text(automation_revision, "automation_revision")?;
         trigger.validate()?;
-        let bytes = canonical_json_bytes(&(
-            OCCURRENCE_IDENTITY_DOMAIN,
-            automation_id,
-            automation_revision,
-            trigger,
-        ))
+        let bytes = match trigger {
+            UserAutomationTrigger::Scheduled { .. } => canonical_json_bytes(&(
+                SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN,
+                user_automation_zones::ZONE_TABLE_FORMAT,
+                user_automation_zones::ZONE_TABLE_OFFSET_UNIT,
+                user_automation_zones::PINNED_ZONE_DATABASE_RELEASE,
+                user_automation_zones::PINNED_ZONE_TABLE_SHA256,
+                automation_id,
+                automation_revision,
+                trigger,
+            )),
+            UserAutomationTrigger::Manual { .. } => canonical_json_bytes(&(
+                MANUAL_OCCURRENCE_IDENTITY_DOMAIN,
+                automation_id,
+                automation_revision,
+                trigger,
+            )),
+        }
         .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
         Ok(format!("user-automation-occurrence:{}", sha256_hex(&bytes)))
     }
@@ -2912,7 +3013,7 @@ mod tests {
         let mut schedule = schedule;
         schedule.next_occurrences = vec![format!(
             "{NORMALIZED_OCCURRENCE_ENCODING}|America/New_York|{}\
-             |2026-09-21T12:00:00|-04:00|2026-09-21T16:00:00Z|-|UNIQUE|{source_digest}",
+             |2026-09-21T12:00:00|2026-09-21T12:00:00|-04:00|2026-09-21T16:00:00Z|-|UNIQUE|{source_digest}",
             user_automation_zones::PINNED_ZONE_DATABASE_RELEASE
         )];
         UserAutomationRevision {

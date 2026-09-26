@@ -81,6 +81,8 @@
 //! [`SwarmPlanAttachmentService`]: eliot_governor::SwarmPlanAttachmentService
 //! [`CanonicalSwarmPlanAttachmentStore`]: eliot_governor::CanonicalSwarmPlanAttachmentStore
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use eliot_governor::SwarmAttachmentComposition;
 use eliot_swarm::durable_dispatch::MAX_PLAN_DRAIN_CANCELS;
 use thiserror::Error;
@@ -102,10 +104,11 @@ const _: () = assert!(MAX_DRAIN_CANCELS_PER_PASS == MAX_PLAN_DRAIN_CANCELS);
 /// Upper bound on drain passes inside one [`SwarmComposition::drain_bounded`]
 /// call.
 ///
-/// Every pass either publishes the terminal aggregate, reports blocked
-/// unknown children, or executes at least one cancel; the bound additionally
-/// caps a runner whose cancels never take effect, so a drain call always
-/// terminates.
+/// The loop exits earlier on the terminal aggregate, an unknown block, a
+/// shared-authority halt, or a bounded partial (zero allowance, or a pass
+/// with no new cancel request and no newly observed terminal); the bound
+/// additionally caps a runner whose cancels never take effect, so a drain
+/// call always terminates.
 pub const MAX_DRAIN_PASSES: u32 = 64;
 
 /// Registry verdict for one route class, projected from the `AdapterRegistry`
@@ -265,6 +268,8 @@ pub struct ChildLaunchIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanDrainView {
     /// Exact active children to cancel through the owner-side path this pass.
+    /// Requested, not observed-terminated: the caller services this set even
+    /// when `unknown` is nonempty (issue #2652).
     pub cancel: Vec<String>,
     /// Active children beyond this pass's bound; cancel them on later passes.
     pub pending: Vec<String>,
@@ -293,14 +298,92 @@ pub struct RehydrationReport {
 }
 
 /// Terminal outcome of [`SwarmComposition::drain_bounded`].
+///
+/// Progress and uncertainty travel together (issue #2652 step 5): exact
+/// terminal kinds, requested-not-terminated cancels, retained unknown
+/// children, and typed child-local failures. Cancellation never erases prior
+/// effects and a request `Ok(())` never proves termination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DrainOutcome {
-    /// Accounted terminal children with their exact terminal kinds.
+    /// Accounted terminal children with their exact terminal kinds. Only an
+    /// observed [`ChildState::Terminal`] lands here, so this list alone
+    /// proves settlement.
     pub terminal: Vec<(String, ChildExit)>,
-    /// Slots cancelled through the owner-side path across all passes.
-    pub cancelled: Vec<String>,
+    /// Slots whose cancellation was requested through the owner-side path
+    /// across all passes. Requested, NOT observed-terminated: the owner-side
+    /// `cancel` port returns no acknowledgement detail, so no finer
+    /// requested/acknowledged split is available here; re-observation through
+    /// the runner reconciles each requested slot to terminal or retains it.
+    /// Cancellation never claims rollback of already executed effect (I14.13).
+    pub cancel_requested: Vec<String>,
+    /// Active children beyond the pass bound at finish; empty once
+    /// `terminal_ready` publishes.
+    pub pending: Vec<String>,
+    /// Unknown or stale children retained at finish; empty once
+    /// `terminal_ready` publishes. Unknown is never cleared, never terminal.
+    pub unknown: Vec<String>,
+    /// Typed child-local observe/cancel failures recorded against their exact
+    /// slots without stopping independently eligible siblings.
+    pub local_failures: Vec<ChildLocalFailure>,
     /// Drain passes executed (at least one).
     pub passes: u32,
+}
+
+/// Scope of a failure observed through a slot-scoped drain call.
+///
+/// Narrow structural projection for the drain loops (issue #2652 step 2): no
+/// message text is ever inspected for a safety decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureScope {
+    /// Confined to one child slot. The shared authority (attached plan,
+    /// ledger, fence, route pins) is untouched by the failed slot-scoped
+    /// `observe`/`cancel` call, so independently eligible siblings stay
+    /// eligible and the failure records against its exact slot instead of
+    /// aborting the pass. A pass that records only child-local failures still
+    /// ends without progress, so mass local failure surfaces as a bounded
+    /// partial, never a false terminal.
+    ChildLocal,
+    /// Shared authority, identity, or plan state. Stops new effects
+    /// immediately; everything completed before it stays reported.
+    Global,
+}
+
+/// Slot-scoped drain operation that recorded a child-local failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainFailureOp {
+    /// The failure came from the per-slot observation call.
+    Observe,
+    /// The failure came from the per-slot cancellation call.
+    Cancel,
+}
+
+/// One child-local drain failure recorded against its exact child identity
+/// (issue #2652 step 2).
+///
+/// The detail is opaque operator rendering carried for diagnosis; it is never
+/// parsed for a safety decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildLocalFailure {
+    /// Exact child slot that recorded the failure.
+    pub slot: String,
+    /// Whether observation or cancellation failed for the slot.
+    pub op: DrainFailureOp,
+    /// Opaque failure rendering; never inspected for scope.
+    pub detail: String,
+}
+
+/// Reason a drain call stopped early with a bounded partial instead of
+/// spinning (issue #2652 step 4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainPartialReason {
+    /// The caller allowed zero cancels per pass while live children remain:
+    /// every live child parks in `pending` and the single observe+decide pass
+    /// is the explicit partial outcome.
+    ZeroCancelAllowance,
+    /// A full pass requested no new cancel and observed no new terminal, so
+    /// further passes within this call settle nothing; the caller re-invokes
+    /// on its own cadence after the runner settles.
+    NoProgress,
 }
 
 /// Fail-closed errors from the daemon swarm composition.
@@ -390,17 +473,47 @@ pub enum SwarmCompositionError {
     EmptyDenominator,
     /// Unknown or stale children block the terminal aggregate. They never
     /// become absent, failed, or safe-to-repeat; reconcile them first.
+    /// Carries the progress served before the block (requested cancels,
+    /// observed terminals, pending, recorded local failures): the authorized
+    /// `cancel` set is always served first, so unknown blocks only the
+    /// terminal aggregate, never cancellation of known live siblings.
     #[error("swarm composition terminal blocked by unknown children")]
     TerminalBlocked {
         /// Slots that must reconcile before any terminal aggregate publishes.
         unknown: Vec<String>,
+        /// Progress completed before the block; unknown children retained.
+        progress: Box<DrainOutcome>,
     },
     /// The drain pass bound was exhausted, typically because cancels never
-    /// take effect at the runner. No terminal aggregate published.
+    /// take effect at the runner. No terminal aggregate published; everything
+    /// completed across the executed passes stays reported.
     #[error("swarm composition drain pass bound exhausted after {passes} passes")]
     DrainBoundExhausted {
         /// Passes actually executed.
         passes: u32,
+        /// Progress completed across the executed passes.
+        progress: Box<DrainOutcome>,
+    },
+    /// The drain stopped early with an explicit bounded partial instead of
+    /// spinning: zero cancel allowance, or a full pass with no new cancel
+    /// request and no newly observed terminal. No terminal aggregate
+    /// published; everything completed stays reported.
+    #[error("swarm composition drain stopped early with a bounded partial: {reason:?}")]
+    DrainBudgetPartial {
+        /// Why the call stopped without spinning.
+        reason: DrainPartialReason,
+        /// Progress completed in the executed passes.
+        progress: Box<DrainOutcome>,
+    },
+    /// A shared-authority failure stopped new effects mid-drain. Everything
+    /// completed before it stays reported in `progress`; the exact failure
+    /// stays typed in `cause`.
+    #[error("swarm composition drain halted on a shared-authority failure: {cause}")]
+    DrainHalted {
+        /// The global failure that stopped new effects.
+        cause: Box<SwarmCompositionError>,
+        /// Progress completed before the halt.
+        progress: Box<DrainOutcome>,
     },
     /// The persistence or runner owner failed underneath the composition.
     #[error("swarm composition owner failed: {detail}")]
@@ -408,6 +521,33 @@ pub enum SwarmCompositionError {
         /// Opaque owner failure rendering.
         detail: String,
     },
+}
+
+impl SwarmCompositionError {
+    /// Projects a drain-loop failure to its scope without inspecting message
+    /// text (issue #2652 step 2).
+    ///
+    /// Only [`SwarmCompositionError::OwnerFailure`] returned from a
+    /// slot-scoped [`ChildRunner::observe`]/[`ChildRunner::cancel`] call is
+    /// child-local: the composition's shared authority (attached plan,
+    /// ledger, fence, route pins) is untouched by that call, so the failure
+    /// records against its exact slot and siblings continue. This projection
+    /// is only consulted for those slot-scoped drain calls. Every other
+    /// variant names shared authority, identity, or plan state — revoked
+    /// authorization (`RouteBlocked`), identity or fence drift
+    /// (`StaleLineage`, `InternalContract`, `DuplicateSlot`), an unavailable
+    /// common owner (`StoreFailure`, `ContentionExhausted`,
+    /// `AttachmentRefused`, `AttachConflict`), or plan state
+    /// (`PlanNotAttached`, `ReconcileRequired`, `InvalidInput`,
+    /// `EmptyDenominator`, and the drain exits themselves) — and stops new
+    /// effects immediately with progress kept.
+    #[must_use]
+    pub const fn drain_failure_scope(&self) -> FailureScope {
+        match self {
+            Self::OwnerFailure { .. } => FailureScope::ChildLocal,
+            _ => FailureScope::Global,
+        }
+    }
 }
 
 /// Persistence owner port for launch intents (durable staged-work store).
@@ -432,8 +572,20 @@ pub trait ChildRunner: Send + Sync {
     /// Attempts one launch for a previously persisted intent.
     fn launch(&self, intent: &ChildLaunchIntent) -> Result<(), SwarmCompositionError>;
     /// Observes one child by stable slot.
+    ///
+    /// Failure projection for the drain loops (issue #2652): return
+    /// [`SwarmCompositionError::OwnerFailure`] for a failure confined to this
+    /// slot; a shared-authority, identity, or plan-state failure uses its own
+    /// structural variant so the drain stops new effects with progress kept.
+    /// The composition never parses the detail text.
     fn observe(&self, slot: &str) -> Result<ChildState, SwarmCompositionError>;
     /// Requests cancellation through the external cancel owner.
+    ///
+    /// `Ok(())` reports request submission, never termination: the drain
+    /// records it as requested-not-terminated and reconciles the same slot
+    /// identity through re-observation. Resolve the slot to the
+    /// ledger-persisted intent's cancellation identity in the owner. Same
+    /// failure projection as [`ChildRunner::observe`].
     fn cancel(&self, slot: &str) -> Result<(), SwarmCompositionError>;
 }
 
@@ -705,6 +857,17 @@ fn source_display_chain(error: &dyn std::error::Error) -> Option<String> {
 /// children pass through with their exact [`ChildExit`]; `terminal_ready`
 /// holds only when `cancel`, `pending`, and `unknown` are all empty.
 ///
+/// A nonempty `cancel` set is independently authorized cleanup: the caller
+/// services it even when `unknown` is nonempty — unknown children block only
+/// `terminal_ready`, never cancellation of known live siblings. `cancel`
+/// names requested, not observed-terminated, cancellations.
+///
+/// Frontier note: this pass names the first `bound` running children in the
+/// presented denominator order. [`SwarmComposition::drain_bounded`] rotates
+/// the presented order across passes; a caller that re-presents the same
+/// order on every call starves later eligible children behind a slow first
+/// group.
+///
 /// # Errors
 ///
 /// Returns [`SwarmCompositionError::EmptyDenominator`] for an empty
@@ -717,7 +880,7 @@ pub fn plan_drain(
     if children.is_empty() {
         return Err(SwarmCompositionError::EmptyDenominator);
     }
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for (slot, _) in children {
         if !seen.insert(slot.clone()) {
             return Err(SwarmCompositionError::DuplicateSlot { slot: slot.clone() });
@@ -751,6 +914,50 @@ pub fn plan_drain(
     view.terminal_ready =
         view.cancel.is_empty() && view.pending.is_empty() && view.unknown.is_empty();
     Ok(view)
+}
+
+/// Call-scoped drain budget for one [`SwarmComposition::drain_bounded`] call.
+///
+/// Accumulated settlement (`terminal`), outstanding cancellation requests
+/// (`cancel_requested`), recorded child-local failures, the frontier cursor,
+/// and the executed pass count. This is not a drain database: it dies with
+/// the call, persists nothing, and never replaces the ledger or runner
+/// owners — the ledger stays the source of truth for launched children and
+/// re-observation through the runner stays the poll of outstanding requests.
+struct DrainBudget {
+    /// Exact terminal kinds observed so far, keyed by slot (sorted output).
+    terminal: BTreeMap<String, ChildExit>,
+    /// Slots with an outstanding requested-not-terminated cancel.
+    cancel_requested: BTreeSet<String>,
+    /// Typed child-local failures recorded against their exact slots.
+    local_failures: Vec<ChildLocalFailure>,
+    /// Frontier cursor: denominator offset the next pass presents first.
+    cursor: usize,
+    /// Passes executed so far.
+    passes: u32,
+}
+
+impl DrainBudget {
+    /// Builds the progress + uncertainty payload shared by the terminal
+    /// outcome and every incomplete drain exit (issue #2652 step 5): exact
+    /// terminal kinds, requested-not-terminated cancels, pending and retained
+    /// unknown children from the exiting pass, and typed child-local
+    /// failures. Cancellation never erases prior effects and never proves
+    /// termination.
+    fn snapshot(&self, pending: &[String], unknown: &[String]) -> DrainOutcome {
+        DrainOutcome {
+            terminal: self
+                .terminal
+                .iter()
+                .map(|(slot, kind)| (slot.clone(), *kind))
+                .collect(),
+            cancel_requested: self.cancel_requested.iter().cloned().collect(),
+            pending: pending.to_vec(),
+            unknown: unknown.to_vec(),
+            local_failures: self.local_failures.clone(),
+            passes: self.passes,
+        }
+    }
 }
 
 /// The single daemon swarm composition.
@@ -1142,26 +1349,140 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         })
     }
 
-    /// Drains one attached plan to its terminal aggregate through bounded
-    /// passes.
+    /// Re-observes the whole denominator through the owner for one drain pass.
     ///
-    /// Each pass runs the pure [`plan_drain`] decision over the re-observed
-    /// dispositions of every launched intent, executes the named cancels
-    /// through the owner-side [`ChildRunner::cancel`] path, and re-observes.
-    /// Unknown or stale children block with
-    /// [`SwarmCompositionError::TerminalBlocked`] (no false terminal); the
-    /// loop is additionally bounded by [`MAX_DRAIN_PASSES`]
+    /// This is the poll/reconcile of outstanding cancel requests: nothing is
+    /// reminted here. Child-local observation failures record against their
+    /// exact slot and retain that slot as blocked for the pass; a
+    /// shared-authority failure halts with progress kept.
+    fn observe_drain_denominator(
+        &self,
+        budget: &mut DrainBudget,
+    ) -> Result<Vec<(String, ChildState)>, SwarmCompositionError> {
+        let mut observed = Vec::with_capacity(self.launched.len());
+        for intent in &self.launched {
+            match self.runner.observe(&intent.slot) {
+                Ok(state) => observed.push((intent.slot.clone(), state)),
+                Err(error) => match error.drain_failure_scope() {
+                    FailureScope::ChildLocal => {
+                        budget.local_failures.push(ChildLocalFailure {
+                            slot: intent.slot.clone(),
+                            op: DrainFailureOp::Observe,
+                            detail: error.to_string(),
+                        });
+                        // Unobserved this pass: retain as blocked (never
+                        // terminal, never cleared) so the aggregate stays
+                        // incomplete with the reason recorded above.
+                        observed.push((intent.slot.clone(), ChildState::UnknownBlocked));
+                    }
+                    FailureScope::Global => {
+                        return Err(SwarmCompositionError::DrainHalted {
+                            cause: Box::new(error),
+                            progress: Box::new(budget.snapshot(&[], &[])),
+                        });
+                    }
+                },
+            }
+        }
+        Ok(observed)
+    }
+
+    /// Serves one pass's authorized cancel set through the owner, skipping
+    /// slots with an outstanding request (polled by re-observation, never
+    /// reminted). Returns the count of newly requested cancels.
+    ///
+    /// Child-local cancel failures record against their exact slot without
+    /// stopping siblings; a shared-authority failure halts with progress
+    /// kept. `pending`/`unknown` describe the exiting pass for the halt
+    /// payload only.
+    fn serve_drain_cancels(
+        &self,
+        cancel: &[String],
+        pending: &[String],
+        unknown: &[String],
+        budget: &mut DrainBudget,
+    ) -> Result<usize, SwarmCompositionError> {
+        let mut served_new = 0_usize;
+        for slot in cancel {
+            if budget.cancel_requested.contains(slot) {
+                // Already requested on an earlier pass: the re-observation
+                // already polled that same cancellation identity through the
+                // owner, so poll again next pass rather than reminting.
+                continue;
+            }
+            match self.runner.cancel(slot) {
+                Ok(()) => {
+                    // Submission only: requested-not-terminated.
+                    budget.cancel_requested.insert(slot.clone());
+                    served_new += 1;
+                }
+                Err(error) => match error.drain_failure_scope() {
+                    FailureScope::ChildLocal => {
+                        budget.local_failures.push(ChildLocalFailure {
+                            slot: slot.clone(),
+                            op: DrainFailureOp::Cancel,
+                            detail: error.to_string(),
+                        });
+                    }
+                    FailureScope::Global => {
+                        return Err(SwarmCompositionError::DrainHalted {
+                            cause: Box::new(error),
+                            progress: Box::new(budget.snapshot(pending, unknown)),
+                        });
+                    }
+                },
+            }
+        }
+        Ok(served_new)
+    }
+
+    /// Drains one attached plan to its terminal aggregate through bounded
+    /// passes (issue #2652).
+    ///
+    /// Each pass re-observes the dispositions of every launched intent through
+    /// the owner-side [`ChildRunner::observe`] path — this re-observation is
+    /// the poll/reconcile of already-requested cancels: a slot whose cancel
+    /// was requested on an earlier pass is never reminted while its request
+    /// is outstanding — runs the pure [`plan_drain`] decision over the
+    /// frontier-rotated denominator, then executes the named cancels through
+    /// the owner-side [`ChildRunner::cancel`] path:
+    /// - the authorized `cancel` set is served even when `unknown` is
+    ///   nonempty; unknown or stale children block only the terminal
+    ///   aggregate ([`SwarmCompositionError::TerminalBlocked`]: retained,
+    ///   never cleared, never terminal), never cancellation of known live
+    ///   siblings;
+    /// - a slot-scoped observe/cancel failure
+    ///   ([`FailureScope::ChildLocal`]) records against its exact slot and
+    ///   spares independently eligible siblings, while a shared-authority
+    ///   failure ([`FailureScope::Global`]) stops new effects immediately and
+    ///   everything completed stays reported
+    ///   ([`SwarmCompositionError::DrainHalted`]);
+    /// - a `cancel` `Ok(())` records request submission only
+    ///   (`cancel_requested`, requested-not-terminated); only an observed
+    ///   [`ChildState::Terminal`] with its exact [`ChildExit`] proves
+    ///   settlement, so a lost acknowledgement stays possibly applied until
+    ///   re-observation settles that same slot identity;
+    /// - the presented denominator rotates across passes past newly served
+    ///   slots and already-requested slots are polled rather than reminted,
+    ///   so a slow first group cannot starve later eligible children; a zero
+    ///   allowance, or a pass with no new request and no newly observed
+    ///   terminal, returns an explicit bounded partial
+    ///   ([`SwarmCompositionError::DrainBudgetPartial`]) instead of spinning.
+    ///
+    /// The loop is additionally bounded by [`MAX_DRAIN_PASSES`]
     /// ([`SwarmCompositionError::DrainBoundExhausted`]). A terminal aggregate
     /// publishes only after every child is accounted for — and even then it
     /// is a candidate for the parent scope, never a task finish.
     ///
     /// # Errors
     ///
-    /// Returns [`SwarmCompositionError::PlanNotAttached`],
-    /// [`SwarmCompositionError::EmptyDenominator`],
-    /// [`SwarmCompositionError::TerminalBlocked`],
-    /// [`SwarmCompositionError::DrainBoundExhausted`], or
-    /// [`SwarmCompositionError::OwnerFailure`].
+    /// Returns [`SwarmCompositionError::PlanNotAttached`] or
+    /// [`SwarmCompositionError::EmptyDenominator`] before any owner contact.
+    /// Mid-loop, [`SwarmCompositionError::TerminalBlocked`],
+    /// [`SwarmCompositionError::DrainBudgetPartial`], and
+    /// [`SwarmCompositionError::DrainBoundExhausted`] all carry the completed
+    /// progress, and any other owner failure stops effects as
+    /// [`SwarmCompositionError::DrainHalted`] with progress kept.
     pub fn drain_bounded(
         &self,
         max_cancels_per_pass: usize,
@@ -1172,33 +1493,69 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         if self.launched.is_empty() {
             return Err(SwarmCompositionError::EmptyDenominator);
         }
-        let mut cancelled = Vec::new();
-        let mut passes: u32 = 0;
+        let bound = max_cancels_per_pass.min(MAX_DRAIN_CANCELS_PER_PASS);
+        let denominator = self.launched.len();
+        let mut budget = DrainBudget {
+            terminal: BTreeMap::new(),
+            cancel_requested: BTreeSet::new(),
+            local_failures: Vec::new(),
+            cursor: 0,
+            passes: 0,
+        };
         loop {
-            let mut observed = Vec::with_capacity(self.launched.len());
-            for intent in &self.launched {
-                observed.push((intent.slot.clone(), self.runner.observe(&intent.slot)?));
-            }
-            let view = plan_drain(&observed, max_cancels_per_pass)?;
-            if !view.unknown.is_empty() {
-                return Err(SwarmCompositionError::TerminalBlocked {
-                    unknown: view.unknown,
-                });
+            let mut observed = self.observe_drain_denominator(&mut budget)?;
+            budget.passes += 1;
+            let terminals_before = budget.terminal.len();
+            // Frontier rotation: present the denominator from the cursor so
+            // later eligible children are visited even when an earlier group
+            // stays live across passes.
+            observed.rotate_left(budget.cursor % denominator);
+            let view = plan_drain(&observed, bound).map_err(|error| {
+                SwarmCompositionError::DrainHalted {
+                    cause: Box::new(error),
+                    progress: Box::new(budget.snapshot(&[], &[])),
+                }
+            })?;
+            for (slot, kind) in &view.terminal {
+                budget.terminal.insert(slot.clone(), *kind);
             }
             if view.terminal_ready {
-                return Ok(DrainOutcome {
-                    terminal: view.terminal,
-                    cancelled,
-                    passes: passes + 1,
+                return Ok(budget.snapshot(&[], &[]));
+            }
+            // A zero allowance parks every live child in `pending`: that is
+            // the explicit bounded partial outcome, not a signal to spin.
+            if bound == 0 {
+                return Err(SwarmCompositionError::DrainBudgetPartial {
+                    reason: DrainPartialReason::ZeroCancelAllowance,
+                    progress: Box::new(budget.snapshot(&view.pending, &view.unknown)),
                 });
             }
-            for slot in &view.cancel {
-                self.runner.cancel(slot)?;
-                cancelled.push(slot.clone());
+            let served_new =
+                self.serve_drain_cancels(&view.cancel, &view.pending, &view.unknown, &mut budget)?;
+            budget.cursor = (budget.cursor + served_new) % denominator;
+            // Unknown blocks only the terminal aggregate: the authorized
+            // cancels above were already served, so the incomplete aggregate
+            // returns with every unknown child retained and progress kept.
+            if !view.unknown.is_empty() {
+                return Err(SwarmCompositionError::TerminalBlocked {
+                    unknown: view.unknown.clone(),
+                    progress: Box::new(budget.snapshot(&view.pending, &view.unknown)),
+                });
             }
-            passes += 1;
-            if passes >= MAX_DRAIN_PASSES {
-                return Err(SwarmCompositionError::DrainBoundExhausted { passes });
+            // A full pass with no new request and no newly observed terminal
+            // settles nothing further within this call: bounded partial, not
+            // a spin.
+            if served_new == 0 && budget.terminal.len() == terminals_before {
+                return Err(SwarmCompositionError::DrainBudgetPartial {
+                    reason: DrainPartialReason::NoProgress,
+                    progress: Box::new(budget.snapshot(&view.pending, &view.unknown)),
+                });
+            }
+            if budget.passes >= MAX_DRAIN_PASSES {
+                return Err(SwarmCompositionError::DrainBoundExhausted {
+                    passes: budget.passes,
+                    progress: Box::new(budget.snapshot(&view.pending, &view.unknown)),
+                });
             }
         }
     }

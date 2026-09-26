@@ -17,6 +17,7 @@ proof_entrypoint = "cargo test -p eliot-host-control-endpoint"
 eliot-host-service.workspace = true
 eliot-ipc.workspace = true
 eliot-platform-windows.workspace = true
+eliot-protocol.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

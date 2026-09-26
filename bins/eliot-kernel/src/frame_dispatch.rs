@@ -1777,8 +1777,7 @@ impl KernelComposition {
                 super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                     .map_err(|_| TransportError::SessionFenced)?;
             if operation != request.wire_id
-                || request.wire_version
-                    != super::testd_terminal_completion_route::OWNER_WIRE_VERSION
+                || request.wire_version != eliot_testd_core::TESTD_OWNER_SUBMIT_WIRE_VERSION
             {
                 return Err(TransportError::SessionFenced);
             }

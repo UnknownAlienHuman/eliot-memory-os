@@ -8,6 +8,55 @@ use super::{
     active_phase_b_rebind_recovery_kind, append_reconciled, child_host_epoch, epoch_contract_error,
     fresh_host_epoch, fresh_identity, fresh_lineage_id, initial_activation_record, root_epoch,
 };
+use crate::activation_lifecycle::{ActivationTriggerClass, control_contour_capabilities};
+use crate::journal_append::ActivationIngress;
+
+/// Durable `trigger_class` of an activation generation that Host itself opened
+/// without an installer-approved pending transaction.
+///
+/// I1.5's observable-use vocabulary covers authenticated requests; a bare SCM
+/// demand-start is none of those, it is the Host lifecycle opening its own
+/// control contour. The spelling is frozen here so the creation record and every
+/// reader of it agree, and it is only ever used when no approved transaction
+/// exists to name instead.
+const HOST_LIFECYCLE_TRIGGER_CLASS: &str = "host-runtime-lifecycle";
+/// Durable `requester_principal_session_or_scheduler` of that same
+/// no-transaction Host lifecycle activation.
+const HOST_COMPOSITION_REQUESTER: &str = "host-composition";
+
+/// Derives the I1.5 ingress of the activation generation this open creates.
+///
+/// The record's `trigger_class` and `requester` come from the admission evidence
+/// the open actually holds rather than from one fixed spelling: an
+/// installer-approved activation names the approved transaction that started
+/// it, while a plain SCM demand-start has no approved transaction to name and
+/// stays the Host lifecycle opening its own control contour.
+///
+/// Both drive the same capability requirement. I1.5 starts the Kernel and the
+/// independent Watchdog as sibling activation branches of the control contour,
+/// and the Host readiness fence refuses `ControlReady` without a proven Store
+/// branch, so a generation that is about to run that fence requires all three
+/// capabilities. A narrower observable-use class contributes its own set later,
+/// through the `ActivationTriggerClass` vocabulary.
+fn activation_ingress(
+    pending: Option<&eliot_installation::PendingActivation>,
+) -> ActivationIngress {
+    let (trigger_class, requester) = match pending {
+        Some(pending) => (
+            ActivationTriggerClass::ApprovedMaintenanceJob.as_str(),
+            format!("pending-activation:{}", pending.transaction_id.as_str()),
+        ),
+        None => (
+            HOST_LIFECYCLE_TRIGGER_CLASS,
+            HOST_COMPOSITION_REQUESTER.to_owned(),
+        ),
+    };
+    ActivationIngress {
+        trigger_class,
+        requester,
+        capabilities: control_contour_capabilities(),
+    }
+}
 
 // F-LOG-HOST-6 (#981) epoch-reopen observation helpers.
 //
@@ -361,6 +410,7 @@ pub(super) fn open_production_epoch_from_backend(
                 &activation_generation,
                 ActivationState::Stopped,
                 "host-open",
+                &activation_ingress(pending),
             )?),
         )?;
         host_epoch_observe("host.epoch activation appended");

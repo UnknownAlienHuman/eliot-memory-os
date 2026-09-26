@@ -20,18 +20,24 @@ eliot-profile-full-composition = []
 
 [dependencies]
 eliot-agent-bridge-core.workspace = true
+eliot-agent-opencode.workspace = true
 eliot-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-integration-coverage.workspace = true
 eliot-ipc.workspace = true
+eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true
 eliot-platform-windows.workspace = true
+eliot-process.workspace = true
 eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-runtime.workspace = true
+eliot-user-broker-core.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

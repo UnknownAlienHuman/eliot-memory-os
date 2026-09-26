@@ -3,7 +3,8 @@ use std::fmt;
 
 use eliot_contracts::StateFence;
 use eliot_influence::{
-    BoundedRevocationRequest, ClosureCompleteness, InfluenceEdgeDisposition, QualifiedInfluenceEdge,
+    BoundedRevocationRequest, ClosureCompleteness, InfluenceEdgeDisposition, OmissionCause,
+    QualifiedInfluenceEdge, RevocationOmission,
 };
 use eliot_receipts::{AuthorityBinding, EffectClass, SessionBinding, WorkScopeBinding};
 use eliot_security_contracts::{EffectCeiling, RevocationReason};
@@ -11,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::revocation_history::derive_suppressions;
+use crate::root_transition::{AdmittedRootTransition, AdmittedRootTransitionRecord};
 use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
 
 const REVOCATION_PAGE_EDGE_LIMIT: u64 = 256;
@@ -185,6 +187,72 @@ fn source_effect_rank(ceiling: EffectCeiling) -> u8 {
     }
 }
 
+/// #2875 item 10: the single source-level meaning of "cross-root".
+///
+/// Every authority-root comparison in this module — graph validation,
+/// effective-path construction, closure enumeration, revocation edge
+/// declaration, recovery partition, and transition admission — calls this
+/// function, so comments, traversal, and authority use cannot maintain
+/// different meanings of a root crossing. A normal delegation edge either
+/// stays inside one root or names exact admitted
+/// [`AdmittedRootTransition`] evidence for this parent/child pair; a child can
+/// never choose a new root merely by setting a string while borrowing the
+/// parent's holder and authority.
+fn crosses_authority_root(from_root: &str, to_root: &str) -> bool {
+    from_root != to_root
+}
+
+/// Item-10 edge invariant: one delegation edge is authorized authority
+/// inheritance exactly when it stays inside one root or names exact admitted
+/// [`AdmittedRootTransition`] evidence for this parent/child pair. Shared by
+/// [`GrantGraph::validate_edges`], effective-path construction, revocation
+/// edge declaration, the closure verdict walk, and the recovery partition.
+///
+/// Map membership IS the authority check, and that is sound only because the
+/// map holds admitted evidence exclusively: a member entered
+/// `GrantGraph::transitions` only through
+/// [`AdmittedRootTransition::admit`] or its restore-time re-verification,
+/// which read CURRENT owner state. A decoded structural record never reaches
+/// this map, so this predicate can no longer be satisfied by caller material.
+fn edge_is_authorized(
+    parent: &CapabilityGrant,
+    child: &CapabilityGrant,
+    transitions: &BTreeMap<(GrantId, GrantId), AdmittedRootTransition>,
+) -> bool {
+    !crosses_authority_root(&parent.authority_root_ref, &child.authority_root_ref)
+        || transitions.contains_key(&(parent.grant_id.clone(), child.grant_id.clone()))
+}
+
+/// The four narrowing clauses: issuer is the parent's holder, authority is
+/// a strict subset, `expires_at` is not later, `max_uses` is not larger.
+/// Shared by edge validation, legacy-cross-root migration, and quarantined
+/// record restore, so a crossing — authorized or quarantined — can never
+/// widen authority, effect, or lifetime.
+pub(crate) fn check_narrowing(
+    parent: &CapabilityGrant,
+    child: &CapabilityGrant,
+) -> Result<(), AuthorityError> {
+    if child.issuer != parent.holder
+        || !child.authority.is_strict_subset_of(&parent.authority)
+        || child.expires_at > parent.expires_at
+        || child.max_uses > parent.max_uses
+    {
+        return Err(AuthorityError::GrantNotNarrower(child.grant_id.clone()));
+    }
+    Ok(())
+}
+
+/// Deterministic structural relation ID for one quarantined cross-root edge,
+/// so legacy migration replays exactly: the same snapshot always restores the
+/// same relation identity. This ID is not owner-issued quarantine evidence.
+fn quarantine_relation_id(parent: &GrantId, child: &GrantId) -> String {
+    format!(
+        "cross_root_quarantine:{}:{}",
+        parent.as_str(),
+        child.as_str()
+    )
+}
+
 /// Immutable lifecycle state; narrowing is a new grant revision, not a state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -245,10 +313,84 @@ impl CapabilityGrant {
     }
 }
 
+/// Admits one structural root-transition record against a complete grant map.
+///
+/// This is the STRUCTURAL pass only (issue #2962, step 14): text/edge/root/
+/// issuer/fence/revision/uniqueness correspondence between a record and the
+/// live grants. It proves shape, never provenance. Nothing structural reaches
+/// `GrantGraph::transitions` — a crossing becomes executable authority only
+/// through [`AdmittedRootTransition::admit`], which additionally requires the
+/// retained semantic decision, the validated Kernel activation receipt, and a
+/// CURRENT owner readback.
+fn admit_transition_record(
+    grants: &BTreeMap<GrantId, CapabilityGrant>,
+    record: &crate::root_transition::RootTransitionRecord,
+    revision: u64,
+) -> Result<(), AuthorityError> {
+    record.validate_shape()?;
+    if record.admitted_at_revision > revision {
+        return Err(AuthorityError::InvalidField("root_transition.revision"));
+    }
+    let parent_id = GrantId::new(record.parent_grant_id.clone())?;
+    let child_id = GrantId::new(record.child_grant_id.clone())?;
+    let parent = grants
+        .get(&parent_id)
+        .ok_or(AuthorityError::InvalidField("root_transition.parent"))?;
+    let child = grants
+        .get(&child_id)
+        .ok_or(AuthorityError::InvalidField("root_transition.child"))?;
+    if child.parent_grant_id.as_ref() != Some(&parent_id) {
+        return Err(AuthorityError::InvalidField("root_transition.edge"));
+    }
+    if parent.authority_root_ref != record.from_authority_root_ref
+        || child.authority_root_ref != record.to_authority_root_ref
+    {
+        return Err(AuthorityError::InvalidField("root_transition.roots"));
+    }
+    if parent.holder.as_str() != record.issuer {
+        return Err(AuthorityError::InvalidField("root_transition.issuer"));
+    }
+    if record.binding.state_fence != child.binding.state_fence {
+        return Err(AuthorityError::FenceMismatch);
+    }
+    if !record
+        .binding
+        .authority_epoch
+        .is_same_authority(&child.binding.authority_epoch)
+    {
+        return Err(AuthorityError::EpochMismatch);
+    }
+    Ok(())
+}
+
 pub const GRANT_GRAPH_RECOVERY_SCHEMA: &str = "eliot.authority.grant-graph-recovery";
-pub const GRANT_GRAPH_RECOVERY_VERSION: u16 = 1;
+/// Current grant-graph recovery contract version (issue #2962, step 9).
+///
+/// v1 is a closed legacy version: pre- and post-transition shapes were both
+/// written as v1, and its `root_transitions` carried only self-agreeing
+/// structural fields, so a v1 cross-root entry can never be re-interpreted as
+/// owner-verified authority.
+pub const GRANT_GRAPH_RECOVERY_VERSION: u16 = 2;
+
+/// Legacy grant-graph recovery version. Retained only so a v1 payload can be
+/// migrated deliberately, never silently upgraded to stronger semantics.
+pub const LEGACY_GRANT_GRAPH_RECOVERY_VERSION: u16 = 1;
 
 /// Complete durable state of a grant graph, in deterministic wire form.
+///
+/// `grants` carries admitted authority lineage only: a cross-root edge
+/// without exact admitted [`AdmittedRootTransitionRecord`] evidence never
+/// restores into the authority map.
+///
+/// #2962 versioning: v2 gives both trailing sections an EXPLICIT disposition
+/// and removes the authority-sensitive `#[serde(default)]`. The transition
+/// section carries the complete admitted-evidence commitment (the structural
+/// record plus its canonical request digest, Kernel activation identity and
+/// durable ORS record), so restore re-verifies it against CURRENT grants
+/// instead of trusting copied fields; the quarantine section carries the same
+/// explicit [`QuarantinedCrossRootRecord::disposition`] enum that restore
+/// re-checks. The version is dispatched BEFORE any protected field is read, so
+/// a v1 payload is never interpreted under v2 semantics.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrantGraphRecoverySnapshot {
@@ -257,6 +399,12 @@ pub struct GrantGraphRecoverySnapshot {
     pub revision: u64,
     pub grants: Vec<GrantRecoveryRecord>,
     pub revoked: Vec<String>,
+    /// Admitted root-transition evidence in transition-id order (#2962).
+    /// Never defaulted: a missing section is a refusal, not an empty one.
+    pub admitted_root_transitions: Vec<AdmittedRootTransitionRecord>,
+    /// Inert quarantined cross-root relations in relation-id order (#2875).
+    /// Never defaulted: a missing section is a refusal, not an empty one.
+    pub quarantined_cross_root: Vec<QuarantinedCrossRootRecord>,
 }
 
 /// One complete grant record retained by a recovery snapshot.
@@ -284,16 +432,23 @@ impl GrantGraphRecoverySnapshot {
     /// that would be enforced when this snapshot is restored.
     pub fn validate(&self) -> Result<(), AuthorityError> {
         self.validate_wire()?;
-        GrantGraphRecoverySnapshot::restore_owned(self.revision, &self.grants, self.revoked.clone())
-            .map(|_| ())
+        GrantGraphRecoverySnapshot::restore_owned(self).map(|_| ())
     }
 
     fn validate_wire(&self) -> Result<(), AuthorityError> {
         if self.schema != GRANT_GRAPH_RECOVERY_SCHEMA {
             return Err(AuthorityError::InvalidField("grant_graph_recovery.schema"));
         }
-        if self.version != GRANT_GRAPH_RECOVERY_VERSION {
+        if !matches!(
+            self.version,
+            GRANT_GRAPH_RECOVERY_VERSION | LEGACY_GRANT_GRAPH_RECOVERY_VERSION
+        ) {
             return Err(AuthorityError::InvalidField("grant_graph_recovery.version"));
+        }
+        if self.version != GRANT_GRAPH_RECOVERY_VERSION {
+            return Err(AuthorityError::InvalidField(
+                "grant_graph_recovery.version_legacy_unqualified",
+            ));
         }
         if self.revision == 0 {
             return Err(AuthorityError::InvalidField("grant_graph_revision"));
@@ -318,22 +473,153 @@ impl GrantGraphRecoverySnapshot {
             }
             previous = Some(revoked.as_str());
         }
+        let mut previous = None;
+        for row in &self.admitted_root_transitions {
+            row.record.validate_shape()?;
+            if let Some(previous) = previous
+                && previous >= row.record.transition_id.as_str()
+            {
+                return Err(AuthorityError::InvalidField(
+                    "grant_graph_recovery.admitted_root_transitions",
+                ));
+            }
+            previous = Some(row.record.transition_id.as_str());
+        }
+        let mut previous = None;
+        for record in &self.quarantined_cross_root {
+            validate_text(&record.relation_id, "quarantined_cross_root.relation_id")?;
+            if let Some(previous) = previous
+                && previous >= record.relation_id.as_str()
+            {
+                return Err(AuthorityError::InvalidField(
+                    "grant_graph_recovery.quarantined_cross_root",
+                ));
+            }
+            previous = Some(record.relation_id.as_str());
+        }
         Ok(())
     }
 
-    fn restore_owned(
-        revision: u64,
-        records: &[GrantRecoveryRecord],
-        revoked: Vec<String>,
-    ) -> Result<GrantGraph, AuthorityError> {
-        let grants = records
-            .iter()
-            .map(grant_from_recovery_record)
-            .collect::<Result<Vec<_>, AuthorityError>>()?;
-        let mut graph = GrantGraph::from_grants(grants, revision)?;
-        for revoked in revoked {
-            let grant_id = GrantId::new(revoked)?;
-            if !graph.grants.contains_key(&grant_id) {
+    /// Restores owned graph state: admitted authority, admitted transition
+    /// evidence, and inert quarantined relations (#2875 item 9, #2962).
+    ///
+    /// Grants whose parent edge stays inside one root — or names exact admitted
+    /// transition evidence — restore into the authority map. Grants whose
+    /// parent edge crosses roots without such evidence migrate to inert
+    /// [`QuarantinedCrossRootRelation`] records with their full lineage
+    /// retained, as do their transitive descendants; migration is
+    /// deterministic, so exact replay restores the exact same graph. A
+    /// cross-root edge that is not even a narrowing is not lineage and is
+    /// refused with [`AuthorityError::GrantNotNarrower`]. Explicit
+    /// quarantined records restore as quarantined evidence only: a record
+    /// that is not cross-root, disagrees with its parent's root, or names
+    /// an admitted grant fails closed instead of being silently
+    /// reinterpreted. A legacy cross-root child therefore can never restore
+    /// as active authority.
+    ///
+    /// Admitted transition evidence is NOT re-admitted from its copied fields:
+    /// every row is re-verified by
+    /// [`AdmittedRootTransition::admit_restored`] against the CURRENT grants,
+    /// the CURRENT graph revision, and the fence the child is bound to. An
+    /// evidence row that no longer matches live state migrates its child to
+    /// quarantine rather than activating stale authority.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restore keeps evidence admission, partitioning, quarantine and revocation in one fail-closed sequence"
+    )]
+    fn restore_owned(snapshot: &GrantGraphRecoverySnapshot) -> Result<GrantGraph, AuthorityError> {
+        let mut full_map = BTreeMap::new();
+        for record in &snapshot.grants {
+            let grant = grant_from_recovery_record(record)?;
+            grant.validate_local()?;
+            let grant_id = grant.grant_id.clone();
+            if full_map.insert(grant_id.clone(), grant).is_some() {
+                return Err(AuthorityError::DuplicateGrant(grant_id));
+            }
+        }
+        for grant in full_map.values() {
+            if let Some(parent_id) = &grant.parent_grant_id
+                && !full_map.contains_key(parent_id)
+            {
+                return Err(AuthorityError::MissingParent(parent_id.clone()));
+            }
+        }
+        // Structural pass over the transition section, then the admitted pass:
+        // structural correspondence alone never enters the transition map.
+        for row in &snapshot.admitted_root_transitions {
+            admit_transition_record(&full_map, &row.record, snapshot.revision)?;
+        }
+        let mut transitions: BTreeMap<(GrantId, GrantId), AdmittedRootTransition> = BTreeMap::new();
+        let mut unreadable: BTreeSet<(GrantId, GrantId)> = BTreeSet::new();
+        let mut transition_ids: BTreeSet<&str> = BTreeSet::new();
+        for row in &snapshot.admitted_root_transitions {
+            let record = &row.record;
+            let parent_id = GrantId::new(record.parent_grant_id.clone())?;
+            let child_id = GrantId::new(record.child_grant_id.clone())?;
+            if !transition_ids.insert(record.transition_id.as_str()) {
+                return Err(AuthorityError::IdentityConflict);
+            }
+            let current_fence = full_map
+                .get(&child_id)
+                .map(|child| child.binding.state_fence.clone())
+                .ok_or(AuthorityError::InvalidField("root_transition.child"))?;
+            let admitted = match (full_map.get(&parent_id), full_map.get(&child_id)) {
+                (Some(parent), Some(child)) => AdmittedRootTransition::admit_restored(
+                    row,
+                    parent,
+                    child,
+                    snapshot.revision,
+                    &current_fence,
+                ),
+                _ => Err(AuthorityError::InvalidField("root_transition.edge")),
+            };
+            match admitted {
+                Ok(admitted) => {
+                    if transitions
+                        .insert((parent_id, child_id), admitted)
+                        .is_some()
+                    {
+                        return Err(AuthorityError::IdentityConflict);
+                    }
+                }
+                // Evidence that no longer matches CURRENT state is not authority:
+                // its child becomes inert quarantined evidence instead of a
+                // silently activated crossing.
+                Err(_) => {
+                    unreadable.insert((parent_id, child_id));
+                }
+            }
+        }
+        let probe = GrantGraph {
+            grants: full_map,
+            revoked: BTreeSet::new(),
+            revision: snapshot.revision,
+            transitions,
+            unreadable_transitions: unreadable,
+            quarantined: BTreeMap::new(),
+        };
+        probe.validate_cycles()?;
+        let mut graph = probe.partition_restored()?;
+        let mut explicit: BTreeMap<GrantId, CapabilityGrant> = BTreeMap::new();
+        for record in &snapshot.quarantined_cross_root {
+            let child = grant_from_recovery_record(&record.child)?;
+            child.validate_local()?;
+            if explicit.insert(child.grant_id.clone(), child).is_some() {
+                return Err(AuthorityError::IdentityConflict);
+            }
+        }
+        for record in &snapshot.quarantined_cross_root {
+            graph.restore_quarantine_record(record, &explicit)?;
+        }
+        graph.validate_edges()?;
+        for revoked in &snapshot.revoked {
+            let grant_id = GrantId::new(revoked.clone())?;
+            let known = graph.grants.contains_key(&grant_id)
+                || graph
+                    .quarantined
+                    .values()
+                    .any(|relation| relation.child.grant_id == grant_id);
+            if !known {
                 return Err(AuthorityError::MissingParent(grant_id));
             }
             graph.revoked.insert(grant_id);
@@ -369,6 +655,96 @@ fn grant_from_recovery_record(
     })
 }
 
+pub(crate) fn grant_to_recovery_record(grant: &CapabilityGrant) -> GrantRecoveryRecord {
+    GrantRecoveryRecord {
+        grant_id: grant.grant_id.as_str().to_owned(),
+        parent_grant_id: grant
+            .parent_grant_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        authority_root_ref: grant.authority_root_ref.clone(),
+        issuer: grant.issuer.as_str().to_owned(),
+        holder: grant.holder.as_str().to_owned(),
+        allowed_operations: grant.authority.operations().iter().cloned().collect(),
+        allowed_resources: grant.authority.resources().iter().cloned().collect(),
+        max_effect: grant.authority.max_effect(),
+        inherited_source_ceiling: grant.inherited_source_ceiling,
+        binding: grant.binding.clone(),
+        issued_at: grant.issued_at.value(),
+        expires_at: grant.expires_at.value(),
+        max_uses: grant.max_uses,
+        status: grant.status,
+    }
+}
+
+/// Explicit non-authorizing disposition of a retained cross-root relation
+/// (#2875 item 3). Quarantine is the only disposition such a relation can
+/// carry: no authority consumer takes this type as an input, so a
+/// quarantined relation is inert by construction while its full lineage
+/// stays visible for audit and revocation reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossRootRelationDisposition {
+    Quarantined,
+}
+
+/// One retained cross-root lineage record (#2875 items 3, 5, 8).
+///
+/// Cross-root influence represented separately from active authority
+/// inheritance: exact source and dependent identities, both roots, owner
+/// principals, the dependent's StateFence/Authority Epoch binding, the
+/// revision the relation was quarantined at, and the deterministic relation
+/// ID. Quarantine is not deletion — the full dependent lineage is
+/// retained — but retaining a record never admits it for authority: this
+/// type is never placed in an [`EffectiveCapabilityPath`], a supporting
+/// introduction ref, or the admitted grant map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuarantinedCrossRootRelation {
+    /// Deterministic structural relation ID for this exact edge; not a receipt.
+    pub relation_id: String,
+    /// Crossing source: the delegating parent grant.
+    pub parent_grant_id: GrantId,
+    /// Exact source root; the dependent root travels on `child`.
+    pub parent_authority_root_ref: String,
+    /// Full retained dependent lineage.
+    pub child: CapabilityGrant,
+    /// Graph revision the relation was quarantined at.
+    pub quarantined_at_revision: u64,
+    /// Always quarantined; the type is inert by construction.
+    pub disposition: CrossRootRelationDisposition,
+}
+
+/// Deterministic wire form of one quarantined cross-root relation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantinedCrossRootRecord {
+    pub relation_id: String,
+    pub parent_grant_id: String,
+    pub parent_authority_root_ref: String,
+    pub child: GrantRecoveryRecord,
+    pub quarantined_at_revision: u64,
+    pub disposition: CrossRootRelationDisposition,
+}
+
+/// Migrates one lineage edge to an inert quarantined relation, retaining
+/// the full dependent lineage. The edge must still be a narrowing: a
+/// widening cross-root edge is not lineage and is refused.
+fn migrate_to_quarantine(
+    parent: &CapabilityGrant,
+    child: &CapabilityGrant,
+    revision: u64,
+) -> Result<QuarantinedCrossRootRelation, AuthorityError> {
+    check_narrowing(parent, child)?;
+    Ok(QuarantinedCrossRootRelation {
+        relation_id: quarantine_relation_id(&parent.grant_id, &child.grant_id),
+        parent_grant_id: parent.grant_id.clone(),
+        parent_authority_root_ref: parent.authority_root_ref.clone(),
+        child: child.clone(),
+        quarantined_at_revision: revision,
+        disposition: CrossRootRelationDisposition::Quarantined,
+    })
+}
+
 /// An independently valid path contributing to a holder snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveCapabilityPath {
@@ -399,6 +775,11 @@ impl EffectiveCapabilitySnapshot {
         self.paths
             .iter()
             .any(|path| path.grant_path.contains(grant_id))
+    }
+
+    /// Number of independently supporting effective paths in this snapshot.
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
     }
 
     pub fn validate_context(
@@ -452,6 +833,95 @@ pub struct GrantClosureDelegation {
     pub members: Vec<GrantClosureMemberRef>,
 }
 
+/// One receipt-authorized cross-root descendant in a closure verdict.
+///
+/// The member's authority derives through an admitted root crossing, so it
+/// is enumerated separately from the same-root denominator: the durable
+/// fencing owner (#2100) either fences the identity on its own root or
+/// refuses, and the exact authorizing receipt travels with the member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedCrossRootMember {
+    /// Enumerated grant identity.
+    pub grant_id: GrantId,
+    /// Delegating parent identity; always present on a crossing path.
+    pub parent_grant_id: GrantId,
+    /// The member's own authority root.
+    pub authority_root_ref: String,
+    /// Exact admitted receipt authorizing the nearest crossing above this
+    /// member (its own edge when the member itself crosses).
+    pub authorizing_transition_id: String,
+}
+
+/// One quarantined cross-root dependent encountered by a closure.
+///
+/// The dependent authorizes nothing, but the traversal refused to follow
+/// it. The relation ID is structural forensic detail; it does not authorize
+/// omitting the dependent from a complete #2100 fencing denominator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuarantinedFrontierMember {
+    /// Quarantined dependent identity.
+    pub grant_id: GrantId,
+    /// Crossing source identity.
+    pub parent_grant_id: GrantId,
+    /// Structural relation ID for this edge, retained for forensic reference only.
+    pub relation_id: String,
+}
+
+/// Honest revocation-closure state (#2875 item 6).
+///
+/// A traversal that encounters a cross-scope omission keeps the exact
+/// omission and dependent in the frontier and reports partial/unknown. A
+/// structural quarantine relation ID may accompany that state for forensics,
+/// but it cannot establish complete closure without owner-qualified evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RevocationClosureState {
+    /// Every encountered dependent is in the affected denominator; there are
+    /// no unqualified cross-scope omissions in this state. This graph leaves
+    /// the field empty until qualified quarantine proof is available.
+    Complete { separately_quarantined: Vec<String> },
+    /// Recovery-required: the exact unresolved frontier plus the exact
+    /// engine omissions in engine order. Structurally matching quarantine
+    /// relation IDs may travel alongside as forensic details; they are not
+    /// separate-quarantine receipts.
+    PartialOrUnknown {
+        frontier: Vec<String>,
+        omissions: Vec<RevocationOmission>,
+        separately_quarantined: Vec<String>,
+    },
+}
+
+/// Typed revocation-closure verdict: a complete denominator or an explicit
+/// partial/unknown state, never an omission-labelled success.
+///
+/// The exact verdict the durable descendant-closure fencing owner (#2100)
+/// consumes: the same-root denominator, the receipt-authorized cross-root
+/// descendants with their authorizing receipts, the structural quarantine
+/// frontier with relation IDs for forensics, every traversed transition
+/// receipt, and the honest completeness state reconciling the bounded
+/// engine outcome against the live graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationClosureVerdict {
+    /// Revoked origin.
+    pub origin: GrantId,
+    /// Graph revision the verdict was computed at.
+    pub revision: u64,
+    /// Origin authority root.
+    pub authority_root_ref: String,
+    /// Same-root denominator in parent-before-child order with the target
+    /// first; element-wise equal to [`GrantGraph::delegated_closure`].
+    pub members: Vec<GrantClosureMemberRef>,
+    /// Receipt-authorized cross-root descendants in parent-before-child
+    /// order; every member's authority derives through a crossing.
+    pub authorized_cross_root: Vec<AuthorizedCrossRootMember>,
+    /// Structurally quarantined dependents encountered by the walk. Their
+    /// relation IDs are forensic labels, not proof that omission is complete.
+    pub quarantined_frontier: Vec<QuarantinedFrontierMember>,
+    /// Every transition receipt authorizing a followed crossing, sorted.
+    pub traversed_transitions: Vec<String>,
+    /// Honest completeness state of this closure.
+    pub state: RevocationClosureState,
+}
+
 /// `ELIOT_ARCH_OWNER`: ARCH-AUTH-01
 /// Pure grant-lineage evaluator.
 #[derive(Clone, Debug)]
@@ -459,11 +929,74 @@ pub struct GrantGraph {
     grants: BTreeMap<GrantId, CapabilityGrant>,
     revoked: BTreeSet<GrantId>,
     revision: u64,
+    /// Verified crossing evidence, keyed by the exact parent/child edge. A
+    /// member here is admitted authority and was produced by
+    /// [`AdmittedRootTransition::admit`] or re-verified on restore; a decoded
+    /// structural record can never be placed here.
+    transitions: BTreeMap<(GrantId, GrantId), AdmittedRootTransition>,
+    /// Transition-evidence rows that exist in the durable payload but no longer
+    /// verify against CURRENT state. They authorize nothing; the child they
+    /// name is migrated to an inert quarantined relation, and the edge is
+    /// reported as an explicit unknown instead of being cleared.
+    unreadable_transitions: BTreeSet<(GrantId, GrantId)>,
+    quarantined: BTreeMap<String, QuarantinedCrossRootRelation>,
 }
 
 impl GrantGraph {
+    /// Constructs a graph of ordinary same-root delegation (#2875 item 2).
+    ///
+    /// A child whose `authority_root_ref` differs from its parent's is
+    /// rejected with [`AuthorityError::GrantNotNarrower`] before entering
+    /// the graph; ordinary delegation stays inside one root. A separately
+    /// authorized crossing requires [`Self::with_admitted_transitions`], which
+    /// accepts only evidence a verified owner operation produced.
     pub fn from_grants(
         grants: impl IntoIterator<Item = CapabilityGrant>,
+        revision: u64,
+    ) -> Result<Self, AuthorityError> {
+        Self::assemble(grants, BTreeMap::new(), BTreeSet::new(), revision)
+    }
+
+    /// Constructs a graph from ordinary same-root delegation plus crossings that
+    /// already carry admitted owner evidence.
+    ///
+    /// #2962 step 7: the executable constructor takes
+    /// [`AdmittedRootTransition`] and NOT a structural
+    /// [`RootTransitionRecord`](crate::RootTransitionRecord). Because the
+    /// admitted type has no public field, no `Deserialize` derive, and no
+    /// constructor that skips the semantic-decision, Kernel-activation, and
+    /// CURRENT-owner-readback gate, a caller-built or decoded record cannot
+    /// authorize a cross-root edge. Every crossing still narrows on all four
+    /// narrowing axes, so a transition authorizes the re-root, never widening.
+    pub fn with_admitted_transitions(
+        grants: impl IntoIterator<Item = CapabilityGrant>,
+        admitted: impl IntoIterator<Item = AdmittedRootTransition>,
+        revision: u64,
+    ) -> Result<Self, AuthorityError> {
+        let mut transitions: BTreeMap<(GrantId, GrantId), AdmittedRootTransition> = BTreeMap::new();
+        for evidence in admitted {
+            let record = evidence.record();
+            let parent_id = GrantId::new(record.parent_grant_id.clone())?;
+            let child_id = GrantId::new(record.child_grant_id.clone())?;
+            if transitions
+                .values()
+                .any(|known| known.record().transition_id == record.transition_id)
+                || transitions
+                    .insert((parent_id, child_id), evidence)
+                    .is_some()
+            {
+                return Err(AuthorityError::IdentityConflict);
+            }
+        }
+        Self::assemble(grants, transitions, BTreeSet::new(), revision)
+    }
+
+    /// Shared assembly: every public constructor funnels here, so no path can
+    /// build a graph with an unauthorized crossing.
+    fn assemble(
+        grants: impl IntoIterator<Item = CapabilityGrant>,
+        transitions: BTreeMap<(GrantId, GrantId), AdmittedRootTransition>,
+        unreadable_transitions: BTreeSet<(GrantId, GrantId)>,
         revision: u64,
     ) -> Result<Self, AuthorityError> {
         if revision == 0 {
@@ -477,14 +1010,48 @@ impl GrantGraph {
                 return Err(AuthorityError::DuplicateGrant(grant_id));
             }
         }
+        for ((parent_id, child_id), evidence) in &transitions {
+            let record = evidence.record();
+            admit_transition_record(&by_id, record, revision)?;
+            if record.parent_grant_id != parent_id.as_str()
+                || record.child_grant_id != child_id.as_str()
+            {
+                return Err(AuthorityError::InvalidField("root_transition.edge"));
+            }
+        }
         let graph = Self {
             grants: by_id,
             revoked: BTreeSet::new(),
             revision,
+            transitions,
+            unreadable_transitions,
+            quarantined: BTreeMap::new(),
         };
         graph.validate_cycles()?;
         graph.validate_edges()?;
         Ok(graph)
+    }
+
+    /// Exact admitted transition evidence for one delegation edge, if the
+    /// owner admitted a root crossing on exactly this parent/child pair.
+    pub fn transition_for_edge(
+        &self,
+        parent: &GrantId,
+        child: &GrantId,
+    ) -> Option<&AdmittedRootTransition> {
+        self.transitions.get(&(parent.clone(), child.clone()))
+    }
+
+    /// Quarantine relation retained for one exact edge, if that edge was
+    /// migrated or restored as quarantined evidence.
+    pub fn quarantine_for_edge(
+        &self,
+        parent: &GrantId,
+        child: &GrantId,
+    ) -> Option<&QuarantinedCrossRootRelation> {
+        self.quarantined.values().find(|relation| {
+            &relation.parent_grant_id == parent && relation.child.grant_id == *child
+        })
     }
 
     pub const fn revision(&self) -> u64 {
@@ -510,28 +1077,37 @@ impl GrantGraph {
         self.revoked.insert(grant_id.clone());
     }
 
+    /// Emits the complete durable graph: admitted authority, revoked set,
+    /// admitted transition evidence, and inert quarantined relations. A
+    /// quarantined relation re-emits into the quarantine section only, so
+    /// snapshot/recovery/restart preserve the quarantine invariant and can
+    /// never reactivate a legacy cross-root child as active authority.
+    ///
+    /// The emitted transition section is the COMPLETE admitted-evidence
+    /// commitment of every crossing this graph still authorizes. Evidence that
+    /// failed restore-time verification is re-emitted only as an inert
+    /// quarantined relation: it is never promoted back into the transition
+    /// section, so a dropped or unreadable row cannot be repaired by writing
+    /// the snapshot again.
     pub fn recovery_snapshot(&self) -> Result<GrantGraphRecoverySnapshot, AuthorityError> {
-        let grants = self
-            .grants
+        let grants = self.grants.values().map(grant_to_recovery_record).collect();
+        let mut admitted_root_transitions: Vec<AdmittedRootTransitionRecord> = self
+            .transitions
             .values()
-            .map(|grant| GrantRecoveryRecord {
-                grant_id: grant.grant_id.as_str().to_owned(),
-                parent_grant_id: grant
-                    .parent_grant_id
-                    .as_ref()
-                    .map(|id| id.as_str().to_owned()),
-                authority_root_ref: grant.authority_root_ref.clone(),
-                issuer: grant.issuer.as_str().to_owned(),
-                holder: grant.holder.as_str().to_owned(),
-                allowed_operations: grant.authority.operations().iter().cloned().collect(),
-                allowed_resources: grant.authority.resources().iter().cloned().collect(),
-                max_effect: grant.authority.max_effect(),
-                inherited_source_ceiling: grant.inherited_source_ceiling,
-                binding: grant.binding.clone(),
-                issued_at: grant.issued_at.value(),
-                expires_at: grant.expires_at.value(),
-                max_uses: grant.max_uses,
-                status: grant.status,
+            .map(AdmittedRootTransition::to_recovery_record)
+            .collect();
+        admitted_root_transitions
+            .sort_by(|left, right| left.record.transition_id.cmp(&right.record.transition_id));
+        let quarantined_cross_root = self
+            .quarantined
+            .values()
+            .map(|relation| QuarantinedCrossRootRecord {
+                relation_id: relation.relation_id.clone(),
+                parent_grant_id: relation.parent_grant_id.as_str().to_owned(),
+                parent_authority_root_ref: relation.parent_authority_root_ref.clone(),
+                child: grant_to_recovery_record(&relation.child),
+                quarantined_at_revision: relation.quarantined_at_revision,
+                disposition: relation.disposition,
             })
             .collect();
         let snapshot = GrantGraphRecoverySnapshot {
@@ -544,23 +1120,31 @@ impl GrantGraph {
                 .iter()
                 .map(|id| id.as_str().to_owned())
                 .collect(),
+            admitted_root_transitions,
+            quarantined_cross_root,
         };
         snapshot.validate()?;
         Ok(snapshot)
     }
 
     pub fn from_recovery_snapshot(
-        snapshot: GrantGraphRecoverySnapshot,
+        snapshot: &GrantGraphRecoverySnapshot,
     ) -> Result<Self, AuthorityError> {
         snapshot.validate_wire()?;
-        let GrantGraphRecoverySnapshot {
-            revision,
-            grants,
-            revoked,
-            schema: _,
-            version: _,
-        } = snapshot;
-        GrantGraphRecoverySnapshot::restore_owned(revision, &grants, revoked)
+        GrantGraphRecoverySnapshot::restore_owned(snapshot)
+    }
+
+    /// Declared recovery contract version of one payload, decided BEFORE any
+    /// protected field is interpreted (issue #2962, step 9).
+    ///
+    /// A v1 payload is legacy/unqualified: its transition section carried only
+    /// self-agreeing structural fields, so it can never satisfy v2 restore.
+    /// Dispatch on this value first, exactly as
+    /// [`Self::from_recovery_snapshot_with_revocation_history`] dispatches on
+    /// schema and version before any other wire field.
+    #[must_use]
+    pub const fn recovery_contract_version(snapshot: &GrantGraphRecoverySnapshot) -> u16 {
+        snapshot.version
     }
 
     /// Restores a recovery snapshot under explicit CURRENT revocation-history
@@ -577,25 +1161,64 @@ impl GrantGraph {
     /// exact suppressed set and reasons are reported in the outcome.
     /// Unrelated valid grants restore exactly as the snapshot carries them.
     ///
+    /// The production recheck refuses by named cause through
+    /// [`RevocationHistoryError::BoundedRevocation`], so a caller can tell the
+    /// four failure classes apart instead of reading one untyped refusal:
+    /// [`UnsupportedSchema`](eliot_influence::InfluenceError::UnsupportedSchema)
+    /// for a snapshot whose declared schema or version is not the supported one
+    /// (decided before any other wire field is validated),
+    /// [`UnverifiedRecovery`](eliot_influence::InfluenceError::UnverifiedRecovery)
+    /// for a committed closure whose declared origin this graph cannot relate to
+    /// its own lineage while the closure still names in-graph targets,
+    /// [`IncompleteCoverage`](eliot_influence::InfluenceError::IncompleteCoverage)
+    /// when the bounded evaluator could not prove the whole dependent closure
+    /// inside the declared bounds, and
+    /// [`TargetDrift`](eliot_influence::InfluenceError::TargetDrift) when the
+    /// closure recomputed from the live graph reaches an in-graph target the
+    /// committed closure does not name. The first, third, and fourth of these
+    /// refused before this change as well, under `InvalidSnapshot` or the
+    /// untyped `UnknownHistory`; only the cause is named there. The second is a
+    /// strictly new refusal: a foreign-origin closure naming in-graph targets
+    /// used to restore unrecheckable, and now refuses. Nothing that restored
+    /// before stops restoring, and no field is newly ignored.
+    ///
     /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
     /// preserves its exact prior behavior for previously-admitted callers.
     pub fn from_recovery_snapshot_with_revocation_history(
-        snapshot: GrantGraphRecoverySnapshot,
+        snapshot: &GrantGraphRecoverySnapshot,
         history: Option<&crate::RevocationHistoryEvidence>,
     ) -> Result<GrantRestoreOutcome, RevocationHistoryError> {
+        // Schema identity is decided before any other wire field is validated,
+        // so a snapshot persisted under an unsupported revision refuses by
+        // cause instead of being read as if its protected fields had been
+        // defaulted. The two checks below are the same refusals `validate_wire`
+        // still makes; running them first only names the cause.
+        if snapshot.schema != GRANT_GRAPH_RECOVERY_SCHEMA {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnsupportedSchema("grant_graph_recovery.schema"),
+            ));
+        }
+        if !matches!(
+            snapshot.version,
+            GRANT_GRAPH_RECOVERY_VERSION | LEGACY_GRANT_GRAPH_RECOVERY_VERSION
+        ) {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnsupportedSchema("grant_graph_recovery.version"),
+            ));
+        }
+        if snapshot.version != GRANT_GRAPH_RECOVERY_VERSION {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnsupportedSchema(
+                    "grant_graph_recovery.version_legacy_unqualified",
+                ),
+            ));
+        }
         snapshot
             .validate_wire()
             .map_err(RevocationHistoryError::InvalidSnapshot)?;
         let evidence = history.ok_or(RevocationHistoryError::MissingHistory)?;
         let closures = evidence.require_current()?;
-        let GrantGraphRecoverySnapshot {
-            revision,
-            grants,
-            revoked,
-            schema: _,
-            version: _,
-        } = snapshot;
-        let mut graph = GrantGraphRecoverySnapshot::restore_owned(revision, &grants, revoked)
+        let mut graph = GrantGraphRecoverySnapshot::restore_owned(snapshot)
             .map_err(RevocationHistoryError::InvalidSnapshot)?;
         for grant_id in graph.ordered_grant_ids() {
             let Some(grant) = graph.grant(&grant_id) else {
@@ -606,55 +1229,28 @@ impl GrantGraph {
             }
         }
         let suppressed = derive_suppressions(&graph, &closures);
-        // Fail-closed recheck: every engine-reachable in-graph descendant of
-        // an affected in-graph grant must already be suppressed. The engine
-        // follows only same-root parent links and declares a cross-root
-        // delegation edge with `CrossScope`, so its affected set is contained
-        // in the parent-chain closure `derive_suppressions` resolves and this
-        // holds by construction on complete evidence; a closure that
-        // under-claims its transitive same-root descendants still refuses. A
-        // cross-root dependent is never engine-reachable, so only the
-        // committed closure evidence can name it. Affected references naming
-        // no grant in this graph belong to another graph's denominator and
-        // refuse nothing.
+        // Fail-closed recheck: every verdict-reachable in-graph descendant
+        // of an affected in-graph grant must already be suppressed. The
+        // verdict reconciles the bounded engine outcome against the live
+        // graph: it follows same-root and receipt-authorized parent links,
+        // preserves omitted cross-scope dependents as unresolved frontier
+        // entries, and reports anything less as
+        // partial/unknown — so a partial verdict, or a closure that
+        // under-claims its transitive descendants, still refuses. An
+        // omitted dependent without owner-qualified quarantine evidence is never silently
+        // cleared. Affected references naming no grant in this graph belong
+        // to another graph's denominator and refuse nothing.
         let suppressed_ids: BTreeSet<&str> = suppressed
             .iter()
             .map(|entry| entry.grant_id.as_str())
             .collect();
         for closure in &closures {
-            for affected_ref in &closure.affected {
-                let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
-                    continue;
-                };
-                if graph.grant(grant_id.as_str()).is_none() {
-                    continue;
-                }
-                let outcome = graph
-                    .transitive_revocation_closure(
-                        &grant_id,
-                        &evidence.state_fence,
-                        &eliot_influence::RevocationBounds::default_bounds(),
-                    )
-                    .map_err(map_bounded_history_error)?;
-                if !outcome.complete
-                    || !outcome.frontier.is_empty()
-                    || outcome.omissions.iter().any(|omission| {
-                        matches!(
-                            omission.cause,
-                            eliot_influence::OmissionCause::BoundsExhausted
-                        )
-                    })
-                {
-                    return Err(RevocationHistoryError::UnknownHistory);
-                }
-                for engine_ref in &outcome.affected_refs {
-                    if graph.grant(engine_ref.as_str()).is_some()
-                        && !suppressed_ids.contains(engine_ref.as_str())
-                    {
-                        return Err(RevocationHistoryError::UnknownHistory);
-                    }
-                }
-            }
+            Self::recheck_committed_closure(
+                &graph,
+                closure,
+                &evidence.state_fence,
+                &suppressed_ids,
+            )?;
         }
         for entry in &suppressed {
             if let Ok(grant_id) = GrantId::new(entry.grant_id.clone()) {
@@ -662,6 +1258,105 @@ impl GrantGraph {
             }
         }
         Ok(GrantRestoreOutcome { graph, suppressed })
+    }
+
+    /// Fail-closed recheck of one committed revocation closure against the
+    /// restored graph, naming the cause of every refusal.
+    ///
+    /// Three decisions, all reached from
+    /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history):
+    ///
+    /// 1. the closure's declared origin must be relatable to this graph's own
+    ///    lineage, because `derive_suppressions` will revoke the in-graph
+    ///    targets the closure names and an origin outside the graph cannot be
+    ///    rechecked against live lineage. An in-graph grant origin and an
+    ///    authority-root origin both stay admissible, and a closure naming no
+    ///    in-graph grant still refuses nothing. This is the A0.3 hard boundary
+    ///    "restoration of revoked influence after recovery" refused by cause
+    ///    instead of accepted unrecheckable;
+    /// 2. the bounded evaluator must prove the whole dependent closure inside
+    ///    the declared bounds, otherwise the affected set is a bounded prefix
+    ///    and I15.7's explicit incomplete-coverage refusal applies;
+    /// 3. every in-graph grant the verdict can reach - a same-root member or a
+    ///    receipt-authorized cross-root member - must already be suppressed,
+    ///    otherwise the committed closure under-claims its transitive
+    ///    descendants and the stored target set drifted.
+    ///
+    /// The recheck reads the verdict owner, not the bounded engine directly:
+    /// [`GrantGraph::revocation_closure_verdict`] reconciles the engine outcome
+    /// against the live graph, follows same-root and receipt-authorized parent
+    /// links, preserves omitted cross-scope dependents as unresolved frontier
+    /// entries, and reports anything less as
+    /// [`RevocationClosureState::PartialOrUnknown`] - so a partial verdict, or a
+    /// closure that under-claims its descendants, still refuses, and an omitted
+    /// dependent without owner-qualified quarantine evidence is never silently cleared.
+    ///
+    /// An affected reference naming no grant in this graph belongs to another
+    /// graph's denominator and refuses nothing.
+    fn recheck_committed_closure(
+        graph: &GrantGraph,
+        closure: &crate::revocation_history::ValidatedRevocationClosure,
+        fence: &StateFence,
+        suppressed_ids: &BTreeSet<&str>,
+    ) -> Result<(), RevocationHistoryError> {
+        let origin_is_local = graph.grant(closure.root_ref.as_str()).is_some()
+            || graph
+                .grants
+                .values()
+                .any(|grant| grant.authority_root_ref == closure.root_ref);
+        if !origin_is_local
+            && closure
+                .affected
+                .iter()
+                .any(|reference| graph.grant(reference.as_str()).is_some())
+        {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnverifiedRecovery("recovery.closure_origin"),
+            ));
+        }
+        for affected_ref in &closure.affected {
+            let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
+                continue;
+            };
+            if graph.grant(grant_id.as_str()).is_none() {
+                continue;
+            }
+            let verdict = graph
+                .revocation_closure_verdict(
+                    &grant_id,
+                    fence,
+                    &eliot_influence::RevocationBounds::default_bounds(),
+                )
+                .map_err(map_bounded_history_error)?;
+            // The verdict has exactly two states, so a non-`Complete` verdict IS
+            // the incomplete-coverage cause: the closure could not be proven
+            // whole inside the declared bounds, or an omitted cross-scope
+            // dependent lacked owner-qualified quarantine evidence.
+            if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
+                return Err(RevocationHistoryError::BoundedRevocation(
+                    eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_verdict"),
+                ));
+            }
+            let denied = verdict
+                .members
+                .iter()
+                .map(|member| member.grant_id.as_str())
+                .chain(
+                    verdict
+                        .authorized_cross_root
+                        .iter()
+                        .map(|member| member.grant_id.as_str()),
+                )
+                .any(|denied_ref| {
+                    graph.grant(denied_ref).is_some() && !suppressed_ids.contains(denied_ref)
+                });
+            if denied {
+                return Err(RevocationHistoryError::BoundedRevocation(
+                    eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn revoke(&mut self, grant_id: &GrantId) -> Result<(), AuthorityError> {
@@ -693,6 +1388,13 @@ impl GrantGraph {
     /// authority paths are separate graph entries, and the surviving-path
     /// declaration belongs to the hydration layer that serves the full
     /// closure evidence.
+    ///
+    /// Receipt-authorized cross-root descendants and structural quarantine
+    /// relations are enumerated separately by
+    /// [`revocation_closure_verdict`](Self::revocation_closure_verdict),
+    /// which carries authorizing receipts and forensic relation IDs. A
+    /// structural quarantine label cannot authorize omission for the durable
+    /// fencing owner (#2100).
     pub fn delegated_closure(
         &self,
         grant_id: &GrantId,
@@ -717,7 +1419,7 @@ impl GrantGraph {
                 .values()
                 .filter(|grant| {
                     grant.parent_grant_id.as_ref() == Some(&current)
-                        && grant.authority_root_ref == authority_root_ref
+                        && !crosses_authority_root(&grant.authority_root_ref, &authority_root_ref)
                 })
                 .collect();
             children.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
@@ -743,6 +1445,151 @@ impl GrantGraph {
         })
     }
 
+    /// Partitions a restored full map into admitted authority and migrated
+    /// quarantine (#2875 item 9). Roots admit; a grant whose parent edge is
+    /// authorized (same-root or receipt-covered) and whose parent admitted
+    /// admits with it; anything else — an unauthorized crossing or a
+    /// descendant below one — migrates to an inert quarantined relation
+    /// with its full lineage retained. Deterministic fixpoint over
+    /// grant-id order: exact replay restores the exact same partition.
+    fn partition_restored(mut self) -> Result<Self, AuthorityError> {
+        let mut admitted: BTreeMap<GrantId, CapabilityGrant> = BTreeMap::new();
+        let mut quarantined_ids: BTreeSet<GrantId> = BTreeSet::new();
+        for (id, grant) in &self.grants {
+            if grant.parent_grant_id.is_none() {
+                admitted.insert(id.clone(), grant.clone());
+            }
+        }
+        loop {
+            let mut progressed = false;
+            for (id, grant) in &self.grants {
+                if admitted.contains_key(id) || quarantined_ids.contains(id) {
+                    continue;
+                }
+                let Some(parent_id) = grant.parent_grant_id.as_ref() else {
+                    continue;
+                };
+                let Some(parent) = self.grants.get(parent_id) else {
+                    return Err(AuthorityError::MissingParent(parent_id.clone()));
+                };
+                if quarantined_ids.contains(parent_id) {
+                    let relation = migrate_to_quarantine(parent, grant, self.revision)?;
+                    quarantined_ids.insert(id.clone());
+                    self.quarantined
+                        .insert(relation.relation_id.clone(), relation);
+                    progressed = true;
+                } else if admitted.contains_key(parent_id) {
+                    // Evidence that failed CURRENT verification (`unreadable`)
+                    // authorizes nothing: the edge is refused exactly like an
+                    // absent one, so the child migrates to inert quarantine.
+                    if edge_is_authorized(parent, grant, &self.transitions)
+                        && !self
+                            .unreadable_transitions
+                            .contains(&(parent_id.clone(), grant.grant_id.clone()))
+                    {
+                        admitted.insert(id.clone(), grant.clone());
+                    } else {
+                        let relation = migrate_to_quarantine(parent, grant, self.revision)?;
+                        quarantined_ids.insert(id.clone());
+                        self.quarantined
+                            .insert(relation.relation_id.clone(), relation);
+                    }
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        // Acyclic parents resolve every grant: anything left refuses rather
+        // than silently dropping lineage.
+        if admitted.len() + quarantined_ids.len() != self.grants.len() {
+            return Err(AuthorityError::InvalidField(
+                "grant_graph_recovery.partition",
+            ));
+        }
+        // Drop receipts orphaned by quarantine: a receipt whose parent or
+        // child no longer names an admitted grant is never consulted (all
+        // lookups key on in-map pairs), and retaining it would break
+        // re-emission round-trip (restore_owned re-admits receipts against
+        // the grants section only).
+        self.transitions.retain(|(parent, child), _| {
+            admitted.contains_key(parent) && admitted.contains_key(child)
+        });
+        self.grants = admitted;
+        Ok(self)
+    }
+
+    /// Restores one explicit quarantined record as inert evidence only. The
+    /// record must name a real cross-root edge against its exact parent
+    /// root, still narrow its parent, and name no admitted grant: anything
+    /// else fails closed instead of being silently reinterpreted. Parents
+    /// resolve in the admitted map, migrated quarantine, or the explicit
+    /// section itself, so section order never affects the verdict.
+    fn restore_quarantine_record(
+        &mut self,
+        record: &QuarantinedCrossRootRecord,
+        explicit: &BTreeMap<GrantId, CapabilityGrant>,
+    ) -> Result<(), AuthorityError> {
+        validate_text(&record.relation_id, "quarantined_cross_root.relation_id")?;
+        validate_text(
+            &record.parent_authority_root_ref,
+            "quarantined_cross_root.root",
+        )?;
+        if record.quarantined_at_revision == 0 || record.quarantined_at_revision > self.revision {
+            return Err(AuthorityError::InvalidField(
+                "quarantined_cross_root.revision",
+            ));
+        }
+        let parent_id = GrantId::new(record.parent_grant_id.clone())?;
+        let child = grant_from_recovery_record(&record.child)?;
+        child.validate_local()?;
+        if child.parent_grant_id.as_ref() != Some(&parent_id) {
+            return Err(AuthorityError::InvalidField("quarantined_cross_root.edge"));
+        }
+        if self.grants.contains_key(&child.grant_id) {
+            return Err(AuthorityError::IdentityConflict);
+        }
+        if self
+            .quarantined
+            .values()
+            .any(|known| known.child.grant_id == child.grant_id)
+        {
+            return Err(AuthorityError::IdentityConflict);
+        }
+        let parent: &CapabilityGrant = match self.grants.get(&parent_id) {
+            Some(parent) => parent,
+            None => self
+                .quarantined
+                .values()
+                .find(|known| known.child.grant_id == parent_id)
+                .map(|known| &known.child)
+                .or_else(|| explicit.get(&parent_id))
+                .ok_or_else(|| AuthorityError::MissingParent(parent_id.clone()))?,
+        };
+        if parent.authority_root_ref != record.parent_authority_root_ref {
+            return Err(AuthorityError::InvalidField("quarantined_cross_root.root"));
+        }
+        if !crosses_authority_root(&parent.authority_root_ref, &child.authority_root_ref) {
+            return Err(AuthorityError::InvalidField("quarantined_cross_root.edge"));
+        }
+        check_narrowing(parent, &child)?;
+        if self.quarantined.contains_key(&record.relation_id) {
+            return Err(AuthorityError::IdentityConflict);
+        }
+        let relation = QuarantinedCrossRootRelation {
+            relation_id: record.relation_id.clone(),
+            parent_grant_id: parent_id,
+            parent_authority_root_ref: record.parent_authority_root_ref.clone(),
+            child,
+            quarantined_at_revision: record.quarantined_at_revision,
+            disposition: record.disposition,
+        };
+        self.quarantined
+            .insert(relation.relation_id.clone(), relation);
+        Ok(())
+    }
+
     /// Recomputes the exact transitive revocation closure of one grant
     /// through the pure `eliot-influence` bounded revocation evaluator.
     ///
@@ -755,18 +1602,29 @@ impl GrantGraph {
     /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history);
     /// this method evaluates the current live graph only.
     ///
-    /// Every delegation link on the origin's authority root becomes one
-    /// qualified influence edge with
+    /// Every authorized delegation edge — same-root, or cross-root with an
+    /// exact admitted [`RootTransitionReceipt`] — becomes one qualified
+    /// influence edge with
     /// [`PermittedCurrent`](InfluenceEdgeDisposition::PermittedCurrent)
-    /// disposition: live-graph edges are current by construction. A link that
-    /// leaves the origin's authority root is still declared, with
-    /// [`CrossScope`](InfluenceEdgeDisposition::CrossScope) disposition, so the
-    /// evaluator records a typed cross-scope omission for it instead of the
-    /// link vanishing from the denominator. Such a dependent is quarantined
-    /// from this traversal: it is never followed, never revoked, and never part
-    /// of the affected set, mirroring
+    /// disposition: authorized live-graph edges are current by
+    /// construction, so a receipt-authorized cross-root dependent enters
+    /// the affected set exactly like a same-root one. An edge that is not
+    /// authorized inheritance — and every retained
+    /// [`QuarantinedCrossRootRelation`] — is declared with the dedicated
+    /// cross-scope influence relation
+    /// ([`QualifiedInfluenceEdge::cross_scope`]), so the evaluator records
+    /// a typed cross-scope omission naming the exact source-bound edge
+    /// position instead of the link vanishing from the denominator. Such a
+    /// dependent is never followed, never revoked by this traversal, and
+    /// never part of the affected set, mirroring
     /// [`delegated_closure`](Self::delegated_closure) and the rule that
     /// revocation cannot widen scope.
+    ///
+    /// The engine's `complete` flag means the traversal finished within
+    /// bounds; it does not reconcile omissions. Authority consumers must
+    /// use [`revocation_closure_verdict`](Self::revocation_closure_verdict),
+    /// which binds every omitted dependent to its separate-quarantine
+    /// receipt or reports an explicit partial/unknown state.
     ///
     /// The production recheck runs the evaluator in bounded pages and resumes
     /// only from the exact returned continuation. Per-page limits may end a
@@ -785,11 +1643,9 @@ impl GrantGraph {
         fence: &StateFence,
         bounds: &eliot_influence::RevocationBounds,
     ) -> Result<eliot_influence::BoundedRevocationOutcome, AuthorityError> {
-        let target = self
-            .grants
-            .get(origin)
-            .ok_or_else(|| AuthorityError::MissingParent(origin.clone()))?;
-        let authority_root_ref = target.authority_root_ref.clone();
+        if !self.grants.contains_key(origin) {
+            return Err(AuthorityError::MissingParent(origin.clone()));
+        }
         // `BTreeMap` iteration is grant-id ordered, so edge order is
         // deterministic across restarts and owners.
         let mut edges = Vec::new();
@@ -800,27 +1656,49 @@ impl GrantGraph {
                 // edge to declare and no disposition to record for it here.
                 continue;
             };
-            // Delegation that leaves the origin's authority root is never
-            // followed, and it is never dropped without a trace either. The
-            // edge is declared with the `CrossScope` disposition so the
-            // evaluator records a typed `CrossScope` omission naming the exact
-            // source-bound edge position instead of an absent edge the reader
-            // cannot distinguish from an unexamined one. Revocation cannot
-            // widen scope or effect, so a cross-root dependent is quarantined
-            // from this traversal: it is not propagated, is not revoked, and
-            // never enters the affected set. Quarantine is not erasure — the
-            // grant keeps its full lineage in the snapshot and the omission is
-            // the only evidence that this traversal refused to follow it.
-            let disposition = if grant.authority_root_ref == authority_root_ref {
-                InfluenceEdgeDisposition::PermittedCurrent
-            } else {
-                InfluenceEdgeDisposition::CrossScope
+            let Some(parent) = self.grants.get(parent_id) else {
+                // Admitted maps resolve every parent; an unresolvable edge
+                // is declared cross-scope so the evaluator records a typed
+                // omission for it instead of following unknown lineage.
+                edges.push(QualifiedInfluenceEdge::cross_scope(
+                    parent_id.as_str().to_owned(),
+                    grant.grant_id.as_str().to_owned(),
+                ));
+                continue;
             };
-            edges.push(QualifiedInfluenceEdge {
-                source_ref: parent_id.as_str().to_owned(),
-                dependent_ref: grant.grant_id.as_str().to_owned(),
-                disposition,
-            });
+            // Authorized inheritance — same-root or receipt-covered — is
+            // current by construction and propagates. Anything else is
+            // declared with the dedicated cross-scope influence relation so
+            // the evaluator records a typed `CrossScope` omission naming the
+            // exact source-bound edge position instead of an absent edge the
+            // reader cannot distinguish from an unexamined one. Revocation
+            // cannot widen scope or effect: an omitted dependent is never
+            // followed, never revoked by this traversal, and never enters
+            // the affected set.
+            if edge_is_authorized(parent, grant, &self.transitions) {
+                edges.push(QualifiedInfluenceEdge {
+                    source_ref: parent_id.as_str().to_owned(),
+                    dependent_ref: grant.grant_id.as_str().to_owned(),
+                    disposition: InfluenceEdgeDisposition::PermittedCurrent,
+                });
+            } else {
+                edges.push(QualifiedInfluenceEdge::cross_scope(
+                    parent_id.as_str().to_owned(),
+                    grant.grant_id.as_str().to_owned(),
+                ));
+            }
+        }
+        // Retained quarantined relations are influence evidence, not
+        // authority: each is declared with the dedicated cross-scope
+        // relation so the omission names the exact refused edge while the
+        // full lineage stays visible in the snapshot. Quarantine is not
+        // erasure, and the verdict preserves every such omission and dependent
+        // frontier; relation IDs are forensic details, not closure receipts.
+        for relation in self.quarantined.values() {
+            edges.push(QualifiedInfluenceEdge::cross_scope(
+                relation.parent_grant_id.as_str().to_owned(),
+                relation.child.grant_id.as_str().to_owned(),
+            ));
         }
         let request = BoundedRevocationRequest {
             request_id: format!("transitive-revocation:{}", origin.as_str()),
@@ -885,6 +1763,216 @@ impl GrantGraph {
         Ok(outcome)
     }
 
+    /// Collects the structurally quarantined dependents whose edge source the
+    /// walk reached. Relation IDs remain forensic details in the verdict;
+    /// they do not establish a complete omission for the fencing owner (#2100).
+    fn collect_quarantined_frontier(
+        &self,
+        reached: &BTreeSet<String>,
+    ) -> Vec<QuarantinedFrontierMember> {
+        let mut quarantined_frontier = Vec::new();
+        for relation in self.quarantined.values() {
+            if reached.contains(relation.parent_grant_id.as_str()) {
+                quarantined_frontier.push(QuarantinedFrontierMember {
+                    grant_id: relation.child.grant_id.clone(),
+                    parent_grant_id: relation.parent_grant_id.clone(),
+                    relation_id: relation.relation_id.clone(),
+                });
+            }
+        }
+        quarantined_frontier
+    }
+
+    /// Reconciles one bounded engine outcome against the structural walk
+    /// (#2875 item 6): the engine's affected set must match the reached set
+    /// exactly. Every cross-scope omission remains in the frontier and makes
+    /// the verdict partial/unknown because this graph has no owner-qualified
+    /// quarantine binding. A matching structural relation ID is returned only
+    /// as forensic detail.
+    fn reconcile_engine_outcome(
+        &self,
+        outcome: &eliot_influence::BoundedRevocationOutcome,
+        reached: &BTreeSet<String>,
+        unbound: BTreeSet<String>,
+    ) -> (BTreeSet<String>, BTreeSet<String>, bool) {
+        let mut frontier_refs: BTreeSet<String> = outcome.frontier.iter().cloned().collect();
+        let mut separately_quarantined: BTreeSet<String> = BTreeSet::new();
+        let mut partial = !outcome.complete || !outcome.frontier.is_empty() || !unbound.is_empty();
+        frontier_refs.extend(unbound);
+        let mut affected: BTreeSet<String> = BTreeSet::new();
+        for affected_ref in &outcome.affected_refs {
+            let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
+                frontier_refs.insert(affected_ref.clone());
+                partial = true;
+                continue;
+            };
+            if !self.grants.contains_key(&grant_id) {
+                frontier_refs.insert(affected_ref.clone());
+                partial = true;
+                continue;
+            }
+            affected.insert(affected_ref.clone());
+        }
+        // The engine must agree with the structural walk: revocation
+        // traversal and authority enumeration cannot hold different
+        // denominators for one origin.
+        for missing in reached.symmetric_difference(&affected) {
+            frontier_refs.insert(missing.clone());
+            partial = true;
+        }
+        for omission in &outcome.omissions {
+            match omission.cause {
+                OmissionCause::BoundsExhausted => {
+                    partial = true;
+                }
+                OmissionCause::CrossScope => {
+                    if let (Ok(source), Ok(dependent)) = (
+                        GrantId::new(omission.edge_source.as_str()),
+                        GrantId::new(omission.edge_dependent.as_str()),
+                    ) && let Some(relation) = self.quarantine_for_edge(&source, &dependent)
+                    {
+                        separately_quarantined.insert(relation.relation_id.clone());
+                    }
+                    frontier_refs.insert(omission.edge_dependent.clone());
+                    // A structural relation ID is not owner-issued evidence,
+                    // so no cross-scope omission can close this denominator.
+                    partial = true;
+                }
+                _ => {
+                    frontier_refs.insert(omission.edge_dependent.clone());
+                    partial = true;
+                }
+            }
+        }
+        (frontier_refs, separately_quarantined, partial)
+    }
+
+    /// Computes the honest revocation-closure verdict for one grant (#2875
+    /// items 6, 7): the exact denominator the durable fencing owner (#2100)
+    /// consumes.
+    ///
+    /// The structural walk follows authorized inheritance — same-root and
+    /// receipt-covered edges — from the origin, recording the same-root
+    /// denominator, the receipt-authorized cross-root descendants with
+    /// their authorizing receipts, every traversed transition, and the
+    /// structurally quarantined dependents encountered with their forensic
+    /// relation IDs. The bounded engine outcome is reconciled against that
+    /// walk: completeness requires the engine's affected set to match the
+    /// reached set exactly and contain no cross-scope omissions. Anything less —
+    /// an unfinished traversal, a nonempty frontier, an unbound omission,
+    /// or a denominator mismatch — is an explicit partial/unknown state
+    /// with the exact frontier and omissions, never an omission-labelled
+    /// success.
+    pub fn revocation_closure_verdict(
+        &self,
+        origin: &GrantId,
+        fence: &StateFence,
+        bounds: &eliot_influence::RevocationBounds,
+    ) -> Result<RevocationClosureVerdict, AuthorityError> {
+        let target = self
+            .grants
+            .get(origin)
+            .ok_or_else(|| AuthorityError::MissingParent(origin.clone()))?;
+        let authority_root_ref = target.authority_root_ref.clone();
+        // Structural walk: the stack discipline of `delegated_closure`
+        // (grant-id-ordered children, parent before child), extended
+        // across receipt-authorized crossings. `crossed` marks members
+        // reached through at least one crossing; `authorizing` carries the
+        // nearest crossing receipt above the entry.
+        let mut members = vec![GrantClosureMemberRef {
+            grant_id: target.grant_id.clone(),
+            parent_grant_id: target.parent_grant_id.clone(),
+        }];
+        let mut authorized_cross_root = Vec::new();
+        let mut traversed = BTreeSet::new();
+        let mut unbound: BTreeSet<String> = BTreeSet::new();
+        let mut reached: BTreeSet<String> = BTreeSet::from([origin.as_str().to_owned()]);
+        let mut seen = BTreeSet::new();
+        seen.insert(target.grant_id.clone());
+        let mut frontier: Vec<(GrantId, bool, Option<String>)> =
+            vec![(target.grant_id.clone(), false, None)];
+        while let Some((current, crossed, authorizing)) = frontier.pop() {
+            let Some(node) = self.grants.get(&current) else {
+                continue;
+            };
+            let mut children: Vec<&CapabilityGrant> = self
+                .grants
+                .values()
+                .filter(|grant| grant.parent_grant_id.as_ref() == Some(&current))
+                .collect();
+            children.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
+            for child in children {
+                if !seen.insert(child.grant_id.clone()) {
+                    continue;
+                }
+                if !edge_is_authorized(node, child, &self.transitions) {
+                    // Unauthorized in-map edge: never followed; the active
+                    // dependent stays unresolved and forces partial/unknown.
+                    unbound.insert(child.grant_id.as_str().to_owned());
+                    continue;
+                }
+                let edge_crosses =
+                    crosses_authority_root(&node.authority_root_ref, &child.authority_root_ref);
+                let child_authorizing = if edge_crosses {
+                    let Some(receipt) = self.transition_for_edge(&node.grant_id, &child.grant_id)
+                    else {
+                        unbound.insert(child.grant_id.as_str().to_owned());
+                        continue;
+                    };
+                    traversed.insert(receipt.record().transition_id.clone());
+                    Some(receipt.record().transition_id.clone())
+                } else {
+                    authorizing.clone()
+                };
+                reached.insert(child.grant_id.as_str().to_owned());
+                if crossed || edge_crosses {
+                    let Some(receipt_id) = child_authorizing.clone() else {
+                        unbound.insert(child.grant_id.as_str().to_owned());
+                        continue;
+                    };
+                    authorized_cross_root.push(AuthorizedCrossRootMember {
+                        grant_id: child.grant_id.clone(),
+                        parent_grant_id: node.grant_id.clone(),
+                        authority_root_ref: child.authority_root_ref.clone(),
+                        authorizing_transition_id: receipt_id,
+                    });
+                    frontier.push((child.grant_id.clone(), true, child_authorizing));
+                } else {
+                    members.push(GrantClosureMemberRef {
+                        grant_id: child.grant_id.clone(),
+                        parent_grant_id: child.parent_grant_id.clone(),
+                    });
+                    frontier.push((child.grant_id.clone(), false, None));
+                }
+            }
+        }
+        let quarantined_frontier = self.collect_quarantined_frontier(&reached);
+        let outcome = self.transitive_revocation_closure(origin, fence, bounds)?;
+        let (frontier_refs, separately_quarantined, partial) =
+            self.reconcile_engine_outcome(&outcome, &reached, unbound);
+        let state = if partial {
+            RevocationClosureState::PartialOrUnknown {
+                frontier: frontier_refs.into_iter().collect(),
+                omissions: outcome.omissions,
+                separately_quarantined: separately_quarantined.into_iter().collect(),
+            }
+        } else {
+            RevocationClosureState::Complete {
+                separately_quarantined: separately_quarantined.into_iter().collect(),
+            }
+        };
+        Ok(RevocationClosureVerdict {
+            origin: origin.clone(),
+            revision: self.revision,
+            authority_root_ref,
+            members,
+            authorized_cross_root,
+            quarantined_frontier,
+            traversed_transitions: traversed.into_iter().collect(),
+            state,
+        })
+    }
+
     pub fn snapshot(
         &self,
         snapshot_id: SnapshotId,
@@ -933,6 +2021,13 @@ impl GrantGraph {
                 .grants
                 .get(parent_id)
                 .ok_or_else(|| AuthorityError::MissingParent(parent_id.clone()))?;
+            // #2875 item 10: the same edge invariant as graph validation —
+            // a path step that leaves the authority root without the exact
+            // admitted transition receipt is not an effective path, so a
+            // quarantined relation can never appear in a snapshot.
+            if !edge_is_authorized(parent, cursor, &self.transitions) {
+                return Err(AuthorityError::GrantNotNarrower(cursor.grant_id.clone()));
+            }
             effective = effective.intersection(&parent.authority)?;
             cursor = parent;
         }
@@ -991,41 +2086,39 @@ impl GrantGraph {
         Ok(())
     }
 
-    /// Validates every delegation edge as a narrowing edge, and classifies
-    /// lineage that leaves the parent's authority root instead of refusing it.
+    /// Validates every delegation edge as same-root narrowing, unless an
+    /// exact admitted root-transition receipt authorizes the crossing
+    /// (#2875 items 1, 2, 10).
     ///
-    /// Refused with [`AuthorityError::GrantNotNarrower`] naming the child when
-    /// the child is not narrower than its parent on any of the four narrowing
-    /// axes: issuer is not the parent's holder, authority is not a strict
-    /// subset of the parent's authority, `expires_at` is later than the
-    /// parent's, or `max_uses` exceeds the parent's. A parent naming no grant
-    /// in this graph is still [`AuthorityError::MissingParent`]. These four
-    /// clauses are the fail-closed narrowing boundary of A0.3 "hidden creation
-    /// or expansion of authority", and the classification below does not relax
-    /// one of them: a cross-root dependent must still be narrower than its own
-    /// parent, so a crossing can never expand authority, effect, or lifetime.
+    /// Refused with [`AuthorityError::GrantNotNarrower`] naming the child
+    /// when the child leaves the parent's authority root without the exact
+    /// admitted [`RootTransitionReceipt`] for this parent/child pair (the
+    /// restored root clause: a child cannot choose a new root merely by
+    /// setting a string), or when the child is not narrower than its
+    /// parent on any of the four narrowing axes: issuer is not the
+    /// parent's holder, authority is not a strict subset of the parent's
+    /// authority, `expires_at` is later than the parent's, or `max_uses`
+    /// exceeds the parent's. A parent naming no grant in this graph is
+    /// still [`AuthorityError::MissingParent`]. These clauses are the
+    /// fail-closed narrowing boundary of A0.3 "hidden creation or
+    /// expansion of authority": a transition authorizes the re-root, never
+    /// widening, so a crossing can never expand authority, effect, or
+    /// lifetime.
     ///
-    /// Accepted and classified: a child whose `authority_root_ref` differs from
-    /// its parent's. A cross-root delegation is a real lineage crossing, and
-    /// refusing it here made every graph containing one unconstructable, so the
-    /// typed cross-scope cause could never be produced by the production path.
-    /// The child keeps its own authority root and is never adopted into the
-    /// parent's. Its edge is declared with
-    /// [`CrossScope`](InfluenceEdgeDisposition::CrossScope) by
-    /// [`transitive_revocation_closure`](Self::transitive_revocation_closure),
-    /// so the bounded evaluator records a typed `OmissionCause::CrossScope`
-    /// omission naming the exact edge position and the dependent is never
-    /// followed, never revoked by that traversal, and never enters its
-    /// affected set. Revocation cannot widen scope or effect.
-    ///
-    /// This is incomplete lineage handled as bounded influence rather than as
-    /// memory deletion, which is A12.5 "Incomplete lineage creates scoped
-    /// quarantine or an unknown, not global memory deletion", I12.20
+    /// Cross-root lineage without a receipt never enters this map: recovery
+    /// migrates it to an inert [`QuarantinedCrossRootRelation`] with its
+    /// full lineage retained, which is A12.5 "Incomplete lineage creates
+    /// scoped quarantine or an unknown, not global memory deletion", I12.20
     /// "quarantine the bounded affected scope and open Problem State", and
     /// I15.7 "may be quarantined from agents but retained for forensics"
-    /// (#686: "quarantine is not erasure"). Quarantine is not erasure here
-    /// either: the grant keeps its full lineage in the snapshot, and the
-    /// omission is the evidence that this traversal refused to follow it.
+    /// (#686: "quarantine is not erasure"). The retained relation is
+    /// declared with the dedicated cross-scope influence relation by
+    /// [`transitive_revocation_closure`](Self::transitive_revocation_closure),
+    /// so the bounded evaluator records a typed `OmissionCause::CrossScope`
+    /// omission naming the exact edge position. The verdict retains the
+    /// dependent in its frontier and remains partial; a matching structural
+    /// relation ID is forensic detail only. Revocation cannot widen scope or
+    /// effect.
     fn validate_edges(&self) -> Result<(), AuthorityError> {
         for child in self.grants.values() {
             let Some(parent_id) = &child.parent_grant_id else {
@@ -1035,19 +2128,17 @@ impl GrantGraph {
                 .grants
                 .get(parent_id)
                 .ok_or_else(|| AuthorityError::MissingParent(parent_id.clone()))?;
-            // A delegation that leaves the parent's authority root is a
-            // representable lineage shape, not a narrowing failure. It is
-            // classified where the bounded closure declares each edge, and the
-            // four narrowing clauses below still apply to it, so crossing a
-            // root is quarantined rather than adopted and never widens
-            // authority. See this function's documentation.
-            if child.issuer != parent.holder
-                || !child.authority.is_strict_subset_of(&parent.authority)
-                || child.expires_at > parent.expires_at
-                || child.max_uses > parent.max_uses
+            // Restored root clause (#2875 item 2): ordinary delegation
+            // stays inside one root; only the exact admitted transition
+            // receipt for this edge authorizes a crossing.
+            if crosses_authority_root(&parent.authority_root_ref, &child.authority_root_ref)
+                && self
+                    .transition_for_edge(&parent.grant_id, &child.grant_id)
+                    .is_none()
             {
                 return Err(AuthorityError::GrantNotNarrower(child.grant_id.clone()));
             }
+            check_narrowing(parent, child)?;
         }
         Ok(())
     }
@@ -1301,7 +2392,7 @@ mod recovery_tests {
     fn recovery_roundtrip_preserves_complete_graph_and_revision() -> TestResult {
         let graph = graph()?;
         let snapshot = graph.recovery_snapshot()?;
-        let restored = GrantGraph::from_recovery_snapshot(snapshot.clone())?;
+        let restored = GrantGraph::from_recovery_snapshot(&snapshot)?;
         assert_eq!(restored.revision(), 7);
         assert_eq!(restored.recovery_snapshot()?, snapshot);
         Ok(())
@@ -1314,7 +2405,7 @@ mod recovery_tests {
         let snapshot = graph.recovery_snapshot()?;
         assert_eq!(snapshot.revision, 8);
         assert_eq!(snapshot.revoked, ["grant:child"]);
-        let restored = GrantGraph::from_recovery_snapshot(snapshot.clone())?;
+        let restored = GrantGraph::from_recovery_snapshot(&snapshot)?;
         assert_eq!(restored.revision(), 8);
         assert_eq!(restored.recovery_snapshot()?, snapshot);
         Ok(())
@@ -1327,7 +2418,7 @@ mod recovery_tests {
         let mut zero_revision = base.clone();
         zero_revision.revision = 0;
         assert!(matches!(
-            GrantGraph::from_recovery_snapshot(zero_revision),
+            GrantGraph::from_recovery_snapshot(&zero_revision),
             Err(AuthorityError::InvalidField("grant_graph_revision"))
         ));
 
@@ -1335,21 +2426,21 @@ mod recovery_tests {
         unknown_revocation.revoked.push("grant:unknown".to_owned());
         unknown_revocation.revoked.sort();
         assert!(matches!(
-            GrantGraph::from_recovery_snapshot(unknown_revocation),
+            GrantGraph::from_recovery_snapshot(&unknown_revocation),
             Err(AuthorityError::MissingParent(id)) if id.as_str() == "grant:unknown"
         ));
 
         let mut duplicate = base.clone();
         duplicate.grants.push(duplicate.grants[1].clone());
         assert!(matches!(
-            GrantGraph::from_recovery_snapshot(duplicate),
+            GrantGraph::from_recovery_snapshot(&duplicate),
             Err(AuthorityError::InvalidField("grant_graph_recovery.grants"))
         ));
 
         let mut cycle = base.clone();
         cycle.grants[0].parent_grant_id = Some("grant:child".to_owned());
         assert!(matches!(
-            GrantGraph::from_recovery_snapshot(cycle),
+            GrantGraph::from_recovery_snapshot(&cycle),
             Err(AuthorityError::GrantCycle(_))
         ));
 
@@ -1358,7 +2449,7 @@ mod recovery_tests {
         widened.grants[0].allowed_resources =
             vec!["resource:a".to_owned(), "resource:b".to_owned()];
         widened.grants[0].max_effect = EffectClass::ExternalEffect;
-        let widened_error = GrantGraph::from_recovery_snapshot(widened)
+        let widened_error = GrantGraph::from_recovery_snapshot(&widened)
             .err()
             .ok_or("widened child was accepted")?;
         assert_eq!(
@@ -1374,7 +2465,7 @@ mod recovery_tests {
         let empty_snapshot = empty.recovery_snapshot()?;
         empty_snapshot.validate()?;
         assert_eq!(
-            GrantGraph::from_recovery_snapshot(empty_snapshot.clone())?.recovery_snapshot()?,
+            GrantGraph::from_recovery_snapshot(&empty_snapshot)?.recovery_snapshot()?,
             empty_snapshot
         );
 

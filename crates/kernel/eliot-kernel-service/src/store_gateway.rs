@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::{OperationId, RequestMetadata, StateFence};
+use eliot_contracts::{OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::UserAutomationOperation;
@@ -21,7 +21,8 @@ use eliot_kernel_core::user_automation::{
     UserAutomationConfigurationState, UserAutomationInvocation, UserAutomationRevision,
 };
 use eliot_ors::{
-    RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind, HostRequestRecord, HostRequestState,
+    OpaqueLabel, RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
@@ -31,7 +32,7 @@ use eliot_store_api::{
     PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_request_hash,
-    generated_operation_manifests, verify_canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
 };
 
 use crate::commit_recovery::{
@@ -47,6 +48,17 @@ use crate::store_write_reservation::{
     mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
 };
+use crate::user_automation_execution::{
+    UserAutomationExecutionError, UserAutomationRemovalResult,
+    UserAutomationWakeCancellationTarget, UserAutomationWakePublication,
+    UserAutomationWakeTargetEnumeration, read_retirement_wake_targets,
+};
+use crate::user_automation_orchestration::{
+    USER_AUTOMATION_RUNTIME_CHANNEL, UserAutomationOrchestrationRecord,
+    UserAutomationRuntimeObligation, UserAutomationRuntimeObligationAnswer,
+    UserAutomationRuntimeObligationDisposition, UserAutomationRuntimeObligationKind,
+    retained_user_automation_obligation, runtime_obligation_payload_digest,
+};
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
     StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
@@ -61,6 +73,12 @@ use crate::{
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+
+fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomationExecutionError {
+    UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
+        error.to_string(),
+    ))
+}
 
 #[path = "store_receipt_gateway.rs"]
 mod store_receipt_gateway;
@@ -164,38 +182,31 @@ enum DreamerRetainedOutcome {
 /// The checked pause gate for one admitted Dreamer operation (#2763).
 ///
 /// A derived Ordering Scope is matched against the complete observed record
-/// set, so every open record covering the scope is considered. An operation
-/// that proves no Ordering Scope is not exempted: `OrderingScopeUnresolved`
-/// states the limitation and closes admission whenever any other open record
-/// exists, because an absent scope vector is not evidence of being unpaused.
+/// set, so every open record covering the scope is considered. Because every
+/// closed Dreamer kind now proves at least one scope, a pause is reported
+/// precisely for all of them: the refusal names the scope and the idempotency
+/// key holding it, which is what makes the pause displayable and actionable
+/// rather than a bare Problem State.
+///
+/// What remains unproven is the link *above* the proven set. The kinds that
+/// bind only a `JobLease` or a job id reach their own ordered job-attempt
+/// ledger but not the Work Scope that ledger is ordered inside, and a record
+/// opened by `Submit` or by a lease selection is indexed by work scope without
+/// having to name any job. For those kinds `OrderingScopeUnresolved` keeps the
+/// complete-record closure: an unproven link is not evidence of being
+/// unpaused, so admission stays closed while any other open record exists.
+/// This is a stated limitation, never a bypass.
 fn dreamer_pause_refusal(
     observed: &CheckedPauseObservation,
     identity: &OperationIdentity,
-    ordering_scopes: &[String],
+    proof: &DreamerOrderingScopeProof,
     effect: DreamerOperationEffect,
 ) -> Option<String> {
     if effect != DreamerOperationEffect::Mutation {
         return None;
     }
     let key = identity.idempotency_key.as_str();
-    if ordering_scopes.is_empty() {
-        if observed.any_open_except(key) {
-            return Some(
-                CommitRecoveryError::OrderingScopeUnresolved {
-                    operation: "dreamer-job".to_owned(),
-                    detail: format!(
-                        "no Ordering Scope is derivable for this operation, so its coverage by the \
-                         open unknown-commit record set observed at revision {} cannot be proven \
-                         and dependent durable admission stays closed",
-                        observed.binding().revision
-                    ),
-                }
-                .to_string(),
-            );
-        }
-        return None;
-    }
-    ordering_scopes.iter().find_map(|scope| {
+    let paused = proof.scopes.iter().find_map(|scope| {
         observed.pausing_key_for(scope, key).map(|pausing_key| {
             CommitRecoveryError::ScopePaused {
                 scope: scope.clone(),
@@ -203,7 +214,27 @@ fn dreamer_pause_refusal(
             }
             .to_string()
         })
-    })
+    });
+    if paused.is_some() {
+        return paused;
+    }
+    if !proof.work_scope_proven && observed.any_open_except(key) {
+        return Some(
+            CommitRecoveryError::OrderingScopeUnresolved {
+                operation: "dreamer-job".to_owned(),
+                detail: format!(
+                    "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
+                     its ledger record is ordered inside, so its coverage by the open \
+                     unknown-commit record set observed at revision {} cannot be proven and \
+                     dependent durable admission stays closed",
+                    proof.rendered(),
+                    observed.binding().revision
+                ),
+            }
+            .to_string(),
+        );
+    }
+    None
 }
 
 /// Renders an ORS failure as the fail-closed recovery refusal (I14.24).
@@ -256,9 +287,9 @@ fn dreamer_dispositioned(
 /// ledger contract defines as side-effect-free. An operation called
 /// `Reconcile` records a caller-declared disposition and an operation called
 /// `RequestCancel` transitions a job, so both are mutations here and are
-/// gated like any other. An empty derived scope list is NOT evidence that an
+/// gated like any other. A resolved Ordering Scope set is NOT evidence that an
 /// operation is read-only, which is why this classification does not consult
-/// [`dreamer_ordering_scopes`] at all.
+/// [`dreamer_ordering_scope_proof`] at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DreamerOperationEffect {
     /// A permitted read: the ledger contract defines no ledger transition.
@@ -289,28 +320,60 @@ fn dreamer_operation_effect(operation: &JobOperation) -> DreamerOperationEffect 
     }
 }
 
-/// Ordering Scopes one admitted Dreamer ledger mutation belongs to.
+/// Ordering Scope coverage of one admitted Dreamer mutation.
 ///
-/// A Dreamer ledger is ordered inside its Work Scope, and only the closed
-/// kinds that select a job by scope carry that identity on the request:
-/// `Submit` names its submission's work scope, and `LeaseNext`/`LeaseExact`
-/// name their selector's scope.
+/// The provable set comes from the Dreamer protocol itself
+/// (`JobOperation::ordering_scopes`), so no scope is inferred here, and each
+/// entry is spelled by the owner of that stream: a work scope by its own
+/// `WorkScopeId`, and the one ordered job-attempt ledger by the Store
+/// contract's canonical `dreamer_job_queue_key`. There is no second name for
+/// either stream and no scope-local alias table.
 ///
-/// The remaining closed kinds bind a lease, a job id, or a pure observation
-/// and therefore prove no Ordering Scope. That is now a *stated limitation*
-/// rather than a silent exemption: the caller turns an empty vector into a
-/// fail-closed gate over the complete observed record set rather than into
-/// admission. No scope is ever invented, and an absent scope is never used as
-/// a bypass.
-fn dreamer_ordering_scopes(request: &DurableJobRequest) -> Vec<String> {
-    let scope = match &request.operation {
-        JobOperation::Submit { submission } => submission.work_scope.scope_id.as_str(),
-        JobOperation::LeaseNext { selector } | JobOperation::LeaseExact { selector, .. } => {
-            selector.scope_id.as_str()
+/// `work_scope_proven` records whether the set also reaches the Work Scope the
+/// ledger record is ordered inside. That is the level at which an open record
+/// opened by `Submit` or a lease selection is indexed without naming this
+/// job, so it is exactly the link whose absence keeps the complete-record
+/// closure in force; see [`dreamer_pause_refusal`].
+struct DreamerOrderingScopeProof {
+    /// The complete provable Ordering Scope set, in canonical spelling.
+    scopes: Vec<String>,
+    /// Whether `scopes` also names the Work Scope the ledger is ordered
+    /// inside, as opposed to only this job's own ledger stream.
+    work_scope_proven: bool,
+}
+
+impl DreamerOrderingScopeProof {
+    /// Renders the proven set for a refusal message, never as an empty claim.
+    fn rendered(&self) -> String {
+        if self.scopes.is_empty() {
+            return "none".to_owned();
         }
-        _ => return Vec::new(),
-    };
-    vec![scope.to_owned()]
+        self.scopes.join(", ")
+    }
+}
+
+/// Resolves the Ordering Scopes one admitted Dreamer mutation belongs to.
+///
+/// Every kind of the closed Dreamer vocabulary now proves at least one scope,
+/// so an unknown commit on any of them records a durable, displayable pause
+/// instead of an empty vector that the scope-indexed
+/// [`KernelStoreGateway::paused_ordering_scopes`] view could not show. The
+/// kinds that bind only a `JobLease` or a job id resolve to their own ordered
+/// job-attempt ledger; `Submit` additionally carries its work scope, and the
+/// two lease selections carry their selector's.
+fn dreamer_ordering_scope_proof(request: &DurableJobRequest) -> DreamerOrderingScopeProof {
+    let proven = request.operation.ordering_scopes();
+    let mut scopes = Vec::new();
+    if let Some(work_scope) = proven.work_scope {
+        scopes.push(work_scope.as_str().to_owned());
+    }
+    if let Some((job_id, attempt_id)) = proven.job_ledger {
+        scopes.push(dreamer_job_queue_key(job_id, attempt_id));
+    }
+    DreamerOrderingScopeProof {
+        work_scope_proven: proven.work_scope.is_some(),
+        scopes,
+    }
 }
 
 /// The in-flight synchronization state for one canonical Store gateway.
@@ -1186,6 +1249,22 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string())
     }
 
+    /// Validates the immutable caller-authored operation before Store admission.
+    ///
+    /// This check deliberately excludes `OperationIdentity::canonical_request_hash`:
+    /// the daemon supplies that field empty and the gateway seals it only after
+    /// building the exact canonical transition. This method is pure and makes no
+    /// Store call, so a returned `Contract` error is a pre-Store refusal for this
+    /// attempt.
+    pub fn validate_user_automation_request(
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request
+            .intent
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)
+    }
+
     /// Executes one authenticated `UserAutomation` operator operation as one
     /// post-commit orchestration transition.
     ///
@@ -1208,6 +1287,16 @@ impl KernelStoreGateway {
     /// [`UserAutomationOperatorTransition::recovery`] turns into the caller's
     /// recovery directive.
     ///
+    /// Every runtime effect this operation owns is retained in the
+    /// composition-bound durable outbox under its ORIGINAL owner operation
+    /// identity BEFORE the effect is issued, and the retained record is the
+    /// source of the transition's orchestration record. A replay of the same
+    /// parent operation therefore resumes that record: an answered obligation
+    /// serves its retained owner answer verbatim, and an obligation whose effect
+    /// may already have been issued is reported as reconciling under its
+    /// retained identity instead of being issued a second time. There is no
+    /// cross-store atomic transaction and no process-local retry ledger.
+    ///
     /// `runtime` is `Some` for every operation that owns a wake or execution
     /// handoff. A read-only answer passes `None` and reports both handoff
     /// phases as not applicable; a handoff operation answered without a
@@ -1217,32 +1306,41 @@ impl KernelStoreGateway {
         &self,
         request: UserAutomationServiceRequest,
         runtime: Option<&R>,
-    ) -> Result<UserAutomationOperatorTransition, String>
+    ) -> Result<UserAutomationOperatorTransition, UserAutomationExecutionError>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
+        Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
             self.store.as_ref(),
         ));
-        let sealed = self.seal_user_automation_operation(&store, request).await?;
+        let sealed = self
+            .seal_user_automation_operation(&store, request)
+            .await
+            .map_err(user_automation_gateway_unknown)?;
         let response = Box::pin(UserAutomationService::new(&store).dispatch(sealed.clone()))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(user_automation_gateway_unknown)?;
         if response.identity != sealed.identity
             || response.state_fence != sealed.context.state_fence
         {
-            return Err(
-                "canonical UserAutomation response does not bind to the sealed operation"
-                    .to_owned(),
-            );
+            return Err(user_automation_gateway_unknown(
+                "canonical UserAutomation response does not bind to the sealed operation",
+            ));
         }
         let configuration = UserAutomationConfigurationPhase::from_store_outcome(response.outcome);
+        let mut obligations: Vec<UserAutomationRuntimeObligation> = Vec::new();
         let (wake, execution) = self
-            .user_automation_runtime_handoff(&sealed, &configuration, runtime)
-            .await?;
+            .user_automation_runtime_handoff(&sealed, &configuration, runtime, &mut obligations)
+            .await
+            .map_err(user_automation_gateway_unknown)?;
         let horizon = self
-            .publish_schedule_horizon(&sealed, &configuration, runtime)
-            .await?;
+            .publish_schedule_horizon(&sealed, &configuration, runtime, &mut obligations)
+            .await
+            .map_err(user_automation_gateway_unknown)?;
+        let orchestration =
+            Self::compose_user_automation_orchestration(&sealed, &configuration, obligations)
+                .map_err(user_automation_gateway_unknown)?;
         let transition = UserAutomationOperatorTransition::with_horizon(
             sealed.identity.clone(),
             sealed.context.state_fence.clone(),
@@ -1250,9 +1348,387 @@ impl KernelStoreGateway {
             wake,
             execution,
             horizon,
+            orchestration,
         );
-        transition.validate()?;
+        transition
+            .validate()
+            .map_err(user_automation_gateway_unknown)?;
         Ok(transition)
+    }
+
+    /// Composes the one post-commit orchestration record of a parent operator
+    /// operation from the obligations its legs retained.
+    ///
+    /// The record binds the parent operation, the exact digest of the committed
+    /// canonical receipt, the immutable automation/revision those obligations
+    /// belong to, and the State Fence every phase was observed under. An
+    /// operation that retained no obligation owns no orchestration: that is a
+    /// complete answer about an obligation that never existed, not an empty
+    /// record, so a read-only answer and a `RunNow` answer carry none.
+    fn compose_user_automation_orchestration(
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        obligations: Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<Option<UserAutomationOrchestrationRecord>, String> {
+        if obligations.is_empty() {
+            return Ok(None);
+        }
+        let revision = committed_revision(configuration).ok_or_else(|| {
+            "a committed UserAutomation operation that retained a runtime obligation did not \
+             return a canonical revision"
+                .to_owned()
+        })?;
+        let committed_receipt_digest =
+            committed_receipt_digest(configuration).ok_or_else(|| {
+                "a UserAutomation operation that retained a runtime obligation has no committed \
+             canonical receipt to bind"
+                    .to_owned()
+            })?;
+        Ok(Some(UserAutomationOrchestrationRecord::new(
+            sealed.identity.clone(),
+            sealed.context.state_fence.clone(),
+            revision.automation_id.clone(),
+            revision.revision.clone(),
+            revision.digest().map_err(|error| error.to_string())?,
+            committed_receipt_digest,
+            obligations,
+        )))
+    }
+
+    /// Reads the durable outbox record of one runtime obligation, if the
+    /// composition-bound owner already holds one.
+    ///
+    /// It is read before anything is staged, so a replay of a parent operation
+    /// that already has a record never compares its own live fence, epoch,
+    /// generation and clock against the staged request's era binding — a replay
+    /// legitimately carries a different one.
+    fn read_user_automation_obligation(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> RetainedObligationLookup {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return RetainedObligationLookup::unreadable(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so no \
+                 runtime obligation can be read or retained",
+            ));
+        };
+        let Ok(operation_id) = user_automation_obligation_operation_id(obligation) else {
+            return RetainedObligationLookup::Unreadable {
+                reason: unretained_obligation_reason(
+                    obligation,
+                    "the derived owner operation identity is not a well-formed durable label",
+                ),
+            };
+        };
+        match ors.load_host_request(&operation_id, &obligation.request_digest) {
+            Ok(Some(existing)) => {
+                RetainedObligationLookup::Held(classify_retained_obligation(obligation, existing))
+            }
+            Ok(None) => RetainedObligationLookup::Absent,
+            Err(error) => RetainedObligationLookup::unreadable(unretained_obligation_reason(
+                obligation,
+                format!("the retained obligation could not be read back: {error}"),
+            )),
+        }
+    }
+
+    /// Retains one runtime obligation of a committed operator operation in the
+    /// composition-bound durable outbox, before any owner effect is issued.
+    ///
+    /// This is the existing Kernel operational outbox, not a new one: one
+    /// `eliot_ors::HostRequestRecord` per obligation, first-writer-wins under
+    /// its own durable `operation_id::request_digest` key, with the
+    /// persist-before-ack contract, the anti-blind-retry fence, and the bounded
+    /// answer body an exact replay serves verbatim. The lookup key is derived
+    /// only from immutable content, so the same parent operation finds the same
+    /// record after a restart or a fence change; the fence, epoch, generation
+    /// and observed clock are era binding and are compared only when the record
+    /// is first staged.
+    ///
+    /// An obligation that cannot be retained is a named failure, never a silent
+    /// skip: the caller reports it as an explicit unavailability and issues no
+    /// owner effect at all.
+    ///
+    /// The one window this durable outbox does not close is a process death
+    /// strictly between handing the request to the owner and recording its
+    /// answer: the record is left `Admitted`, which still proves the owner was
+    /// never handed it, so a later attempt of the same parent operation issues it
+    /// again under the same original owner operation identity. Closing that
+    /// window would need an outbox edge from a routed record back to a
+    /// not-issued state, which `eliot_ors::HostRequestState::transition_to` has
+    /// none of; every *reported* response loss is armed by
+    /// [`Self::mark_user_automation_obligation_unknown`] instead.
+    fn retain_user_automation_obligation(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> RetainedObligationLookup {
+        match self.read_user_automation_obligation(obligation) {
+            RetainedObligationLookup::Absent => {}
+            held => return held,
+        }
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return RetainedObligationLookup::unreadable(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so no \
+                 runtime obligation can be retained",
+            ));
+        };
+        let record = match Self::user_automation_obligation_outbox_record(sealed, obligation) {
+            Ok(record) => record,
+            Err(reason) => return RetainedObligationLookup::unreadable(reason),
+        };
+        match ors.stage_host_request(&record) {
+            Ok(staged) => {
+                RetainedObligationLookup::Held(classify_retained_obligation(obligation, staged))
+            }
+            Err(error) => RetainedObligationLookup::unreadable(unretained_obligation_reason(
+                obligation,
+                format!("the obligation intent could not be retained: {error}"),
+            )),
+        }
+    }
+
+    /// Retains the exact owner answer of one runtime obligation as the durable
+    /// record's bounded response body, and completes that record.
+    ///
+    /// The body is what an exact replay of the same parent operation serves
+    /// instead of issuing the effect a second time, so a lost response is
+    /// resumed from the record rather than re-derived from a fresh owner call.
+    fn retain_user_automation_obligation_answer(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+        answer: &UserAutomationRuntimeObligationAnswer,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_answer_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so the \
+                 owner answer cannot be retained"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        let result_response = serde_json::to_value(answer).map_err(|error| {
+            unretained_answer_reason(
+                obligation,
+                format!("the owner answer could not be encoded for retention: {error}"),
+            )
+        })?;
+        let result_digest = canonical_json_bytes(answer)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| {
+                unretained_answer_reason(
+                    obligation,
+                    format!("the owner answer could not be digested for retention: {error}"),
+                )
+            })?;
+        ors.persist_host_request_result(
+            &operation_id,
+            &obligation.request_digest,
+            &result_digest,
+            &result_response,
+        )
+        .map_err(|error| {
+            unretained_answer_reason(
+                obligation,
+                format!("the owner answer could not be retained: {error}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Walks one retained obligation to `Admitted` through the durable outbox's
+    /// own mechanical progression, before the request leaves this boundary.
+    ///
+    /// `Admitted` is the last state that still proves the owner was never handed
+    /// the request, and it is the state the outbox's own answer path continues
+    /// from: persisting a result walks `Admitted -> Routed -> Submitted ->
+    /// ResultReceived` inside one transaction, and an owner that is not available
+    /// leaves the record admitted so a later attempt of the same parent operation
+    /// may still issue it. The outbox has no edge back out of `Routed`, so the
+    /// record is never walked past the point where the effect would become
+    /// irreversible; a lost answer is armed by
+    /// [`Self::mark_user_automation_obligation_unknown`] instead.
+    fn mark_user_automation_obligation_admitted(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so the \
+                 owner effect cannot be marked as admitted"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        match ors
+            .advance_host_request(
+                &operation_id,
+                &obligation.request_digest,
+                HostRequestState::Admitted,
+                None,
+            )
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the obligation could not be advanced to Admitted: {error}"),
+                )
+            })? {
+            Some(_) => Ok(()),
+            None => Err(unretained_obligation_reason(
+                obligation,
+                "the retained obligation record disappeared before the owner effect could be issued"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Arms the anti-blind-retry fence of one retained obligation after its owner
+    /// effect may already have been issued and its answer was lost.
+    ///
+    /// The durable state is the outbox's own `Unknown`, which can only move
+    /// forward to an answer or a terminal disposition through reconciliation
+    /// evidence; it can never return to a state that would re-issue the effect.
+    fn mark_user_automation_obligation_unknown(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so a possible \
+                 owner effect cannot be retained"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        match ors.advance_host_request(
+            &operation_id,
+            &obligation.request_digest,
+            HostRequestState::Unknown,
+            None,
+        ) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(unretained_obligation_reason(
+                obligation,
+                "the retained obligation record disappeared before its possible owner effect could \
+                 be retained"
+                    .to_owned(),
+            )),
+            Err(error) => Err(unretained_obligation_reason(
+                obligation,
+                format!("the possible owner effect could not be retained: {error}"),
+            )),
+        }
+    }
+
+    /// Builds the durable outbox record that retains one runtime obligation.
+    ///
+    /// Every identity is transcribed from the admitted parent request and the
+    /// obligation's own derived key; nothing here is a Store read, a
+    /// reinterpretation of a wake reason, or a second writer. The request and
+    /// cancellation identities are derived from the obligation rather than
+    /// copied from a transport, so two attempts of one parent operation always
+    /// present the same durable request identity.
+    fn user_automation_obligation_outbox_record(
+        sealed: &UserAutomationServiceRequest,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<HostRequestRecord, String> {
+        let observed_unix_ms =
+            u64::try_from(observed_retention_instant(&sealed.context).ok_or_else(|| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the parent request carries no observed wall-clock instant, so the durable \
+                     obligation cannot name a non-zero retention instant",
+                )
+            })?)
+            .map_err(|_| {
+                unretained_obligation_reason(
+                    obligation,
+                    "the observed retention instant of the parent request is not a valid \
+                 non-negative duration",
+                )
+            })?;
+        let fence_digest = canonical_json_bytes(&sealed.context.state_fence)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the State Fence of the obligation could not be digested: {error}"),
+                )
+            })?;
+        let payload_digest =
+            runtime_obligation_payload_digest(&obligation.subject_ids).map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the obligation subject identities are not bindable: {error}"),
+                )
+            })?;
+        let request_id = obligation_label(
+            obligation,
+            format!(
+                "ua-obligation-request:{}:{}",
+                obligation.kind.as_str(),
+                obligation.request_digest
+            ),
+        )?;
+        let request_label = request_id.as_str().to_owned();
+        Ok(HostRequestRecord {
+            contract_version: ORS_CONTRACT_VERSION,
+            operation_id: user_automation_obligation_operation_id(obligation)?,
+            kind: match obligation.kind {
+                UserAutomationRuntimeObligationKind::WakeHorizonPublication => {
+                    HostRequestKind::Invocation
+                }
+                UserAutomationRuntimeObligationKind::WakeCancellation => {
+                    HostRequestKind::Cancellation
+                }
+            },
+            request_id: request_id.clone(),
+            idempotency_key: obligation_label(obligation, sealed.identity.idempotency_key.clone())?,
+            cancellation_id: obligation_label(
+                obligation,
+                format!("{USER_AUTOMATION_RUNTIME_CHANNEL}/{request_label}:cancel"),
+            )?,
+            parent_operation_id: Some(obligation_label(
+                obligation,
+                sealed.identity.operation_id.as_str().to_owned(),
+            )?),
+            request_digest: obligation.request_digest.clone(),
+            payload_digest,
+            connection_ref: obligation_label(
+                obligation,
+                USER_AUTOMATION_RUNTIME_CHANNEL.to_owned(),
+            )?,
+            session_ref: sealed
+                .context
+                .session_id
+                .as_ref()
+                .map(|session_id| obligation_label(obligation, session_id.as_str().to_owned()))
+                .transpose()?,
+            task_ref: sealed
+                .context
+                .task_id
+                .as_ref()
+                .map(|task_id| obligation_label(obligation, task_id.as_str().to_owned()))
+                .transpose()?,
+            scope_ref: None,
+            capability_ref: obligation_label(
+                obligation,
+                obligation.kind.capability_ref().to_owned(),
+            )?,
+            fence_digest,
+            authority_epoch: sealed.context.state_fence.authority_epoch.clone(),
+            generation: sealed.context.state_fence.resource_generation.value(),
+            deadline_unix_ms: observed_unix_ms,
+            state: HostRequestState::Requested,
+            result_digest: None,
+            result_response: None,
+            commit_order: 0,
+        })
     }
 
     /// Reads the complete owner execution projection for one automation through
@@ -1313,11 +1789,16 @@ impl KernelStoreGateway {
     }
 
     /// Routes one committed operator operation to its runtime handoff phases.
+    ///
+    /// Every leg that may issue an owner effect retains its obligation in the
+    /// composition-bound durable outbox first and appends it to `obligations`,
+    /// so the parent transition reports exactly the obligations it retained.
     async fn user_automation_runtime_handoff<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
         configuration: &UserAutomationConfigurationPhase,
         runtime: Option<&R>,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
     ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
@@ -1340,15 +1821,10 @@ impl KernelStoreGateway {
                 )
                 .await
             }
-            UserAutomationOperation::Remove {
-                automation_id,
-                automation_revision,
-            } => retirement_handoff(
-                configuration,
-                Some(automation_id),
-                automation_revision,
-                UserAutomationConfigurationState::Retired,
-            ),
+            UserAutomationOperation::Remove { .. } => {
+                self.remove_handoff(sealed, configuration, runtime, obligations)
+                    .await
+            }
             UserAutomationOperation::Pause {
                 automation_id,
                 automation_revision,
@@ -1366,6 +1842,354 @@ impl KernelStoreGateway {
             )),
             _ => Ok((not_applicable_wake(), not_applicable_execution())),
         }
+    }
+
+    /// Completes the wake handoff of a committed `Remove` against the wake owner.
+    ///
+    /// This is the wake-cancellation half of the complete owner view contract
+    /// (issue #2808, item 8). The retirement is already committed when this leg
+    /// runs, so it never refuses the retirement and never rewrites, drops, or
+    /// reorders its obligations: the admitted Durable Job references and the
+    /// immutable execution history stay in the committed revision, and the exact
+    /// unresolved reconciliation references stay durable in the canonical owner
+    /// and remain readable through the same `Status`/`History` reads.
+    ///
+    /// The leg enumerates the exact owner-issued pending wake targets of the
+    /// committed revision from the wake owner itself, then hands the retirement
+    /// and the cancellation to
+    /// [`UserAutomationService::remove_and_cancel_with_targets`], which reads the
+    /// same complete, fail-closed owner execution view the execution-admission
+    /// boundary reads and refuses the cancellation when that denominator is not
+    /// owner-proven complete. Nothing here derives a wake identity, parses a
+    /// wake reason, or reports a hard-coded cancellation set: the cancelled
+    /// identities are exactly what the wake owner returned.
+    ///
+    /// A target list the wake owner cannot prove is reported as an unresolved
+    /// wake phase, and so is a cancellation whose answer is absent, empty, or
+    /// unknown for a non-empty proven target set. The parent transition then
+    /// yields a recovery directive instead of a known success, and the retired
+    /// automation keeps its not-yet-admitted wakes as an explicit open
+    /// obligation rather than as a proven absence.
+    ///
+    /// A wake owner that reads its own journal for every committed occurrence and
+    /// definitively retains no unadmitted wake is the opposite case: that is a
+    /// complete negative answer, so the phase is resolved, no cancellation is
+    /// requested, and the retirement reports a known result instead of staying
+    /// reconciling forever. Only an owner that could not answer produces an
+    /// unknown.
+    ///
+    /// Once a non-empty exact target set is owner-proven, the cancellation is an
+    /// owner effect and is retained in the composition-bound durable outbox
+    /// before it is issued. Its subject identities are the retired revision's own
+    /// committed occurrence denominator, which is immutable, so a replay of the
+    /// same parent operation finds the same retained record: an answered
+    /// cancellation is served from that record instead of re-issued, and a
+    /// cancellation whose effect may already have been issued is reported as
+    /// reconciling under its original owner operation identity rather than
+    /// repeated, because a later read of the committed retirement is empty of
+    /// the cancelled wakes.
+    async fn remove_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let UserAutomationOperation::Remove {
+            automation_id,
+            automation_revision,
+        } = &sealed.intent.operation
+        else {
+            return Err("the remove handoff requires remove".to_owned());
+        };
+        let revision = committed_retirement_revision(
+            configuration,
+            Some(automation_id),
+            automation_revision,
+            UserAutomationConfigurationState::Retired,
+        )?;
+        // The revision is immutable, so this deterministic recompile of its own
+        // normalized denominator is the exact set the wake walk below asks about,
+        // and it is also the exact immutable subject set the durable cancellation
+        // obligation is bound to.
+        let committed_occurrence_ids = revision
+            .compile_occurrence_identities()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        let committed_occurrences = committed_occurrence_ids.len();
+        let execution = not_applicable_execution();
+        let Some(runtime) = runtime else {
+            return Ok((
+                UserAutomationWakePhase::Unavailable {
+                    reason: unproven_wake_channel_reason(),
+                },
+                execution,
+            ));
+        };
+        // The cancellation obligation is derived from the retired revision's own
+        // immutable occurrence denominator, so its durable key is known before
+        // any target is enumerated. Reading the retained record first is what
+        // makes a lost response resumable: once a cancellation is applied the
+        // owner no longer retains the cancelled wakes, so a replay that
+        // enumerated first would prove an empty target set and never reach the
+        // retained answer under this original owner operation identity.
+        let mut obligation = match Self::retirement_cancellation_obligation(
+            sealed,
+            &revision,
+            &committed_occurrence_ids,
+        ) {
+            Ok(obligation) => obligation,
+            Err(reason) => {
+                return Ok(unresolved_retirement_phases(reason, execution));
+            }
+        };
+        let retained = classify_retained_cancellation(
+            &obligation,
+            &revision.revision,
+            self.read_user_automation_obligation(&obligation),
+        );
+        if let Some(phases) = retained_cancellation_phases(retained, &mut obligation, &execution) {
+            obligations.push(obligation);
+            return Ok(phases);
+        }
+        let targets = match read_retirement_wake_targets(
+            &revision,
+            &sealed.context,
+            &sealed.identity,
+            runtime,
+        )
+        .await
+        {
+            Ok(UserAutomationWakeTargetEnumeration::Proven { targets }) => targets,
+            Ok(UserAutomationWakeTargetEnumeration::Unproven { reason }) => {
+                return Ok(unresolved_retirement_phases(reason, execution));
+            }
+            // A committed revision whose own occurrence denominator does not
+            // compile is a canonical identity defect, not an absent owner.
+            Err(error) => return Err(error.to_string()),
+        };
+        if targets.is_empty() {
+            // The owner read its own journal for every committed occurrence and
+            // definitively retains no unadmitted wake for any of them. That is a
+            // complete negative answer, so the retirement is reported as resolved
+            // and no cancellation is requested: the concrete Host owner refuses
+            // an empty target list by design, and asking it to cancel nothing
+            // would be a request whose only possible answer is a refusal.
+            return Ok((
+                UserAutomationWakePhase::NotApplicable {
+                    reason: format!(
+                        "the wake owner read its own journal for all {committed_occurrences} \
+                         committed occurrence identities of retired revision {} and definitively \
+                         retains no unadmitted pending wake for any of them, so there is nothing \
+                         to cancel",
+                        revision.revision
+                    ),
+                },
+                execution,
+            ));
+        }
+        self.issue_retirement_cancellation(
+            sealed,
+            &revision,
+            &mut obligation,
+            targets,
+            runtime,
+            obligations,
+        )
+        .await
+    }
+
+    /// Derives the durable wake-cancellation obligation of one committed
+    /// retirement, or names why the exact durable key is not derivable.
+    fn retirement_cancellation_obligation(
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        committed_occurrence_ids: &[String],
+    ) -> Result<UserAutomationRuntimeObligation, String> {
+        retained_user_automation_obligation(
+            UserAutomationRuntimeObligationKind::WakeCancellation,
+            &sealed.identity,
+            &revision.automation_id,
+            &revision.revision,
+            &revision.digest().map_err(|error| error.to_string())?,
+            committed_occurrence_ids,
+        )
+        .map_err(|error| unretained_cancellation_reason(&revision.revision, error.to_string()))
+    }
+
+    /// Retains, routes and issues the wake cancellation of one committed
+    /// retirement under its durable owner operation identity, and returns the
+    /// wake phase the owner produced.
+    ///
+    /// The intent is staged under the ORIGINAL owner operation identity before
+    /// the request leaves this boundary, so a response loss at the wake owner or
+    /// the Host transport leaves a record a later attempt of the same parent
+    /// operation resumes instead of re-deriving. A record that answered between
+    /// the earlier read and this staging is the concurrent attempt of the same
+    /// parent operation: its retained disposition is honoured and nothing is
+    /// issued.
+    async fn issue_retirement_cancellation<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        obligation: &mut UserAutomationRuntimeObligation,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        runtime: &R,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let execution = not_applicable_execution();
+        let mut settled = obligation.clone();
+        let retained = classify_retained_cancellation(
+            &settled,
+            &revision.revision,
+            self.retain_user_automation_obligation(sealed, &settled),
+        );
+        if let Some(phases) = retained_cancellation_phases(retained, &mut settled, &execution) {
+            obligations.push(settled);
+            return Ok(phases);
+        }
+        // The retained record is admitted durably before the request leaves this
+        // boundary. The retirement replayed inside the join below is a read of an
+        // already committed fact, so the only effect that request can carry is
+        // the cancellation, and it is the one the record now tracks.
+        if let Err(reason) = self.mark_user_automation_obligation_admitted(&settled) {
+            settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            obligations.push(settled);
+            return Ok(unresolved_retirement_phases(reason, execution));
+        }
+        let removal = match self.cancel_retirement_wakes(sealed, targets, runtime).await {
+            Ok(removal) => removal,
+            // The retirement is committed and durable, so a refusal at this leg
+            // is an unresolved handoff of a committed fact. It is reported as
+            // such, with the exact refusal, instead of being reported as a failed
+            // retirement or as a cancellation that did not happen. Only a lost
+            // owner answer leaves a possibly issued effect: every other refusal
+            // happened before the cancellation left this boundary, so the
+            // obligation stays re-issuable under its retained identity.
+            Err((error, owner_answered_unknown)) => {
+                if owner_answered_unknown
+                    && let Err(arm) = self.mark_user_automation_obligation_unknown(&settled)
+                {
+                    settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                        reason: arm.clone(),
+                    };
+                    obligations.push(settled);
+                    return Ok(unresolved_retirement_phases(arm, execution));
+                }
+                settled.disposition = if owner_answered_unknown {
+                    UserAutomationRuntimeObligationDisposition::Reconciling {
+                        reason: unretained_cancellation_outcome_reason(
+                            &revision.revision,
+                            &settled.owner_operation_id,
+                            &error.to_string(),
+                        ),
+                    }
+                } else {
+                    UserAutomationRuntimeObligationDisposition::Retained
+                };
+                obligations.push(settled);
+                return Ok(unresolved_retirement_phases(
+                    format!(
+                        "revision {} of {} is retired, but its unadmitted wakes were not cancelled \
+                         from the complete owner view: {error}; the not-yet-admitted wakes and the \
+                         exact unresolved reconciliation references of this revision are preserved \
+                         and stay open",
+                        revision.revision, revision.automation_id
+                    ),
+                    execution,
+                ));
+            }
+        };
+        // Reached only with a NON-EMPTY proven target set. An owner that
+        // cancelled none of the targets it was handed contradicted itself, so
+        // that is an unresolved handoff rather than a proven absence.
+        if removal.cancelled_wake_ids.is_empty() {
+            let reason = format!(
+                "the wake owner returned no cancelled identity for the owner-issued targets of \
+                 retired revision {} of {}; an empty answer is not proof that no unadmitted wake \
+                 existed, so the wake handoff stays unknown",
+                revision.revision, revision.automation_id
+            );
+            settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            obligations.push(settled);
+            return Ok(unresolved_retirement_phases(reason, execution));
+        }
+        // The exact owner answer becomes the durable record's retained body, so
+        // a replay of this same parent operation serves it verbatim instead of
+        // issuing a second cancellation whose effect is no longer observable.
+        let cancelled_wake_ids = removal.cancelled_wake_ids;
+        let answer = UserAutomationRuntimeObligationAnswer::WakeCancellation {
+            cancelled_wake_ids: cancelled_wake_ids.clone(),
+        };
+        settled.disposition = match self.retain_user_automation_obligation_answer(&settled, &answer)
+        {
+            // The owner answered and the answer is retained, so the retirement is
+            // fully resolved under its original owner operation identity.
+            Ok(()) => UserAutomationRuntimeObligationDisposition::Answered {
+                answer: Box::new(answer),
+            },
+            // The owner answered and the answer is in hand, but it could not be
+            // retained, so it is not yet a replayable obligation. The retirement
+            // is still a known configuration fact and the exact answer is
+            // reported; the obligation stays open under its original owner
+            // operation identity so a later attempt reconciles it instead of
+            // cancelling again.
+            Err(reason) => UserAutomationRuntimeObligationDisposition::Reconciling { reason },
+        };
+        obligations.push(settled);
+        Ok((
+            UserAutomationWakePhase::Cancelled { cancelled_wake_ids },
+            execution,
+        ))
+    }
+
+    /// Issues the wake cancellation of one committed retirement through the
+    /// existing execution join, and reports whether the refusal left a possibly
+    /// issued owner effect.
+    ///
+    /// The retirement transition is replayed under the same admitted identity
+    /// this route already committed, so the owner view, the retirement and the
+    /// cancellation observe one canonical operation rather than two. The boolean
+    /// is the only classification the caller needs: a lost owner answer means the
+    /// effect may already be applied, while every other refusal happened before
+    /// the cancellation left this boundary.
+    async fn cancel_retirement_wakes<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        runtime: &R,
+    ) -> Result<UserAutomationRemovalResult, (UserAutomationExecutionError, bool)>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        Box::pin(
+            UserAutomationService::new(&CanonicalUserAutomationStore::new(
+                BorrowedCanonicalStoreClient::new(self.store.as_ref()),
+            ))
+            .remove_and_cancel_with_targets(sealed.clone(), targets, runtime),
+        )
+        .await
+        .map_err(|error| {
+            let owner_answered_unknown = matches!(
+                &error,
+                UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
+                    _
+                ))
+            );
+            (error, owner_answered_unknown)
+        })
     }
 
     /// Compiles and publishes the bounded recurring wake horizon this committed
@@ -1387,11 +2211,23 @@ impl KernelStoreGateway {
     /// remaining sets with a replay handle, which is the failure cut of issue
     /// #2806: a committed configuration plus an explicit publication obligation,
     /// never a silent success.
+    ///
+    /// The publication is retained in the composition-bound durable outbox under
+    /// its original owner operation identity before it is issued. The requested
+    /// occurrence identities are a deterministic function of the immutable
+    /// committed revision and the trigger, so a replay of the same parent
+    /// operation finds the same retained record: an answered publication serves
+    /// the owner's retained acknowledgement verbatim, and a publication whose
+    /// effect may already have been issued is reported as an unknown outcome
+    /// under its retained identity instead of being issued a second time. The
+    /// retry handle stays the derived name of the remaining set; the retained
+    /// record is what a restart actually resumes.
     async fn publish_schedule_horizon<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
         configuration: &UserAutomationConfigurationPhase,
         runtime: Option<&R>,
+        obligations: &mut Vec<UserAutomationRuntimeObligation>,
     ) -> Result<Option<UserAutomationHorizonPhase>, String>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
@@ -1426,69 +2262,186 @@ impl KernelStoreGateway {
         let retry_handle = publication
             .retry_handle(&requested_occurrence_ids)
             .map_err(|error| error.to_string())?;
-        let Some(runtime) = runtime else {
-            return Ok(Some(unreached_horizon_phase(
-                &publication,
-                &requested_occurrence_ids,
-                retry_handle,
-                UnreachedHorizonKind::Unavailable,
-                UNREACHED_WAKE_OWNER_REASON,
-            )));
-        };
-        match UserAutomationWakePort::publish_wake_horizon(runtime, publication.clone()).await {
-            Ok(acknowledgement) => {
-                acknowledgement
-                    .validate_for(&publication)
-                    .map_err(|error| error.to_string())?;
-                let publication_operation_id =
-                    Box::new(acknowledgement.publication_operation_id.clone());
-                let outcome = if acknowledgement.acknowledged_all() {
-                    UserAutomationHorizonOutcome::Published {
-                        publication_operation_id,
-                    }
-                } else {
-                    UserAutomationHorizonOutcome::Partial {
-                        publication_operation_id,
-                        reason: format!(
-                            "the schedule owner acknowledged {} of the {} requested occurrences of \
-                             revision {}; the exact remaining set is retained and must be \
-                             replayed under its handle before the horizon counts as published",
-                            acknowledgement.acknowledged_occurrence_ids.len(),
-                            requested_occurrence_ids.len(),
-                            publication.automation_revision
-                        ),
-                    }
-                };
-                Ok(Some(UserAutomationHorizonPhase {
-                    trigger: publication.trigger,
-                    automation_id: publication.automation_id.clone(),
-                    automation_revision: publication.automation_revision.clone(),
-                    revision_digest: publication.revision_digest.clone(),
-                    requested_occurrence_ids,
-                    remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids,
-                    retry_handle: acknowledgement.retry_handle,
-                    outcome,
-                }))
-            }
-            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
-                Ok(Some(unreached_horizon_phase(
+        // The publication is an owner effect, so its intent is retained before
+        // anything is handed to the schedule owner. A record that could not be
+        // retained is a named unavailability: nothing is issued, and the horizon
+        // keeps its exact requested and remaining sets beside it.
+        let mut obligation = match retained_user_automation_obligation(
+            UserAutomationRuntimeObligationKind::WakeHorizonPublication,
+            &sealed.identity,
+            &publication.automation_id,
+            &publication.automation_revision,
+            &publication.revision_digest,
+            &requested_occurrence_ids,
+        ) {
+            Ok(obligation) => obligation,
+            Err(error) => {
+                let reason =
+                    unretained_horizon_reason(&publication.automation_revision, error.to_string());
+                return Ok(Some(unreached_horizon_phase(
                     &publication,
                     &requested_occurrence_ids,
                     retry_handle,
                     UnreachedHorizonKind::Unavailable,
                     &reason,
-                )))
+                )));
             }
-            Err(UserAutomationRuntimeError::UnknownOutcome(reason)) => {
-                Ok(Some(unreached_horizon_phase(
-                    &publication,
-                    &requested_occurrence_ids,
-                    retry_handle,
-                    UnreachedHorizonKind::UnknownOutcome,
-                    &reason,
-                )))
+        };
+        // The retained record is consulted first, so an answered or reconciling
+        // obligation is reported under its original owner operation identity
+        // without publishing the slice a second time.
+        let retained = classify_retained_horizon_publication(
+            &obligation,
+            &publication,
+            self.retain_user_automation_obligation(sealed, &obligation),
+        );
+        if let Some(phase) = retained_horizon_phase(
+            retained,
+            &mut obligation,
+            &publication,
+            &requested_occurrence_ids,
+            &retry_handle,
+        ) {
+            obligations.push(obligation);
+            return Ok(Some(phase));
+        }
+        let phase = self
+            .issue_wake_horizon(
+                &obligation,
+                runtime,
+                &publication,
+                &requested_occurrence_ids,
+                retry_handle,
+            )
+            .await?;
+        obligations.push(phase.0);
+        Ok(Some(phase.1))
+    }
+
+    /// Issues one bounded wake horizon under a durably routed obligation and
+    /// returns the obligation's final disposition beside the horizon phase the
+    /// schedule owner produced.
+    ///
+    /// The retained record is admitted durably before the request leaves this
+    /// boundary, so a lost response arms the anti-blind-retry fence on the
+    /// original owner operation identity instead of leaving an untracked possible
+    /// effect. The exact owner answer becomes the durable record's retained body,
+    /// so a replay of this same parent operation serves it instead of publishing
+    /// the slice a second time. An owner that was never reachable leaves the
+    /// record admitted, because nothing was published and the effect may still be
+    /// issued under the same retained identity.
+    async fn issue_wake_horizon<R>(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+        runtime: Option<&R>,
+        publication: &UserAutomationWakeHorizonPublication,
+        requested_occurrence_ids: &[String],
+        retry_handle: String,
+    ) -> Result<(UserAutomationRuntimeObligation, UserAutomationHorizonPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let mut settled = obligation.clone();
+        let unreached = |kind: UnreachedHorizonKind, reason: &str| {
+            unreached_horizon_phase(
+                publication,
+                requested_occurrence_ids,
+                retry_handle.clone(),
+                kind,
+                reason,
+            )
+        };
+        let mut reconcile = |reason: &str| {
+            settled.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.to_owned(),
+            };
+        };
+        let Some(runtime) = runtime else {
+            // The intent is durably retained and the owner was never composed, so
+            // no effect was issued and the obligation may still be issued under
+            // the retained identity by a later attempt of this parent operation.
+            settled.disposition = UserAutomationRuntimeObligationDisposition::Retained;
+            return Ok((
+                settled,
+                unreached(
+                    UnreachedHorizonKind::Unavailable,
+                    UNREACHED_WAKE_OWNER_REASON,
+                ),
+            ));
+        };
+        if let Err(reason) = self.mark_user_automation_obligation_admitted(obligation) {
+            reconcile(&reason);
+            return Ok((
+                settled,
+                unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
+            ));
+        }
+        match UserAutomationWakePort::publish_wake_horizon(runtime, publication.clone()).await {
+            Ok(acknowledgement) => {
+                acknowledgement
+                    .validate_for(publication)
+                    .map_err(|error| error.to_string())?;
+                let answer = UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+                    acknowledgement: Box::new(acknowledgement.clone()),
+                };
+                settled.disposition =
+                    match self.retain_user_automation_obligation_answer(obligation, &answer) {
+                        Ok(()) => UserAutomationRuntimeObligationDisposition::Answered {
+                            answer: Box::new(answer),
+                        },
+                        Err(reason) => {
+                            reconcile(&reason);
+                            return Ok((
+                                settled,
+                                unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
+                            ));
+                        }
+                    };
+                Ok((
+                    settled,
+                    acknowledged_horizon_phase(
+                        publication,
+                        requested_occurrence_ids,
+                        &acknowledgement,
+                    ),
+                ))
             }
-            Err(error) => Err(error.to_string()),
+            // No schedule owner was reachable, so nothing was published. The
+            // intent stays durably retained under its owner operation identity
+            // and the effect may still be issued under it.
+            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
+                settled.disposition = UserAutomationRuntimeObligationDisposition::Retained;
+                Ok((
+                    settled,
+                    unreached(UnreachedHorizonKind::Unavailable, &reason),
+                ))
+            }
+            // The owner may have retained the slice and the answer was lost, so
+            // the durable record is armed and a later attempt of this parent
+            // operation reconciles it instead of publishing the slice again. A
+            // typed refusal or a foreign answer is never a lost response, and
+            // repeating the same request would be refused the same way, so it is
+            // armed the same way rather than re-issued.
+            Err(error) => {
+                let detail = error.to_string();
+                if let Err(arm) = self.mark_user_automation_obligation_unknown(obligation) {
+                    reconcile(&arm);
+                    return Ok((
+                        settled,
+                        unreached(UnreachedHorizonKind::UnknownOutcome, &arm),
+                    ));
+                }
+                let reason = unretained_horizon_outcome_reason(
+                    &publication.automation_revision,
+                    &obligation.owner_operation_id,
+                    &detail,
+                );
+                reconcile(&reason);
+                Ok((
+                    settled,
+                    unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
+                ))
+            }
         }
     }
 
@@ -1770,7 +2723,7 @@ impl KernelStoreGateway {
             idempotency_key: request.request_identity.operation.idempotency_key.clone(),
             canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
         };
-        let ordering_scopes = dreamer_ordering_scopes(&request);
+        let scope_proof = dreamer_ordering_scope_proof(&request);
         let effect = dreamer_operation_effect(&request.operation);
 
         // Durable recovery state must be available for mutating work even
@@ -1796,7 +2749,7 @@ impl KernelStoreGateway {
             }
         } {
             match self
-                .reconcile_retained_dreamer_operation(&identity, &ordering_scopes, record)
+                .reconcile_retained_dreamer_operation(&identity, &scope_proof.scopes, record)
                 .await
                 .map_err(|error| error.to_string())?
             {
@@ -1855,8 +2808,7 @@ impl KernelStoreGateway {
             if let Some(error) = observed.unavailable_error() {
                 return Err(error.to_string());
             }
-            if let Some(refusal) =
-                dreamer_pause_refusal(&observed, &identity, &ordering_scopes, effect)
+            if let Some(refusal) = dreamer_pause_refusal(&observed, &identity, &scope_proof, effect)
             {
                 return Err(refusal);
             }
@@ -1868,7 +2820,7 @@ impl KernelStoreGateway {
                 // record is resolved by reading its exact mutation receipt.
                 // A ledger `Status` alone could never settle it.
                 if retried_under_retained_record {
-                    self.settle_after_same_identity_retry(&identity, &ordering_scopes)
+                    self.settle_after_same_identity_retry(&identity, &scope_proof.scopes)
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -1876,10 +2828,10 @@ impl KernelStoreGateway {
             }
             Err(DreamerCommitEvidence::Refused(error)) => Err(error.to_string()),
             Err(DreamerCommitEvidence::Reconciled(receipt)) => Err(self
-                .reconcile_dreamer_commit(&identity, &ordering_scopes, &receipt)?
+                .reconcile_dreamer_commit(&identity, &scope_proof.scopes, &receipt)?
                 .to_string()),
             Err(DreamerCommitEvidence::Unknown) => Err(self
-                .preserve_dreamer_operation(&identity, &ordering_scopes)?
+                .preserve_dreamer_operation(&identity, &scope_proof.scopes)?
                 .to_string()),
         };
         drop(lease);
@@ -2456,6 +3408,443 @@ impl KernelStoreGateway {
     }
 }
 
+/// Composes the phase pair of a committed retirement whose wake handoff could
+/// not be proven.
+///
+/// The retirement itself is a committed, durable fact, so every unprovable step
+/// after it is reported as an unresolved wake handoff of that fact rather than
+/// as a failed retirement or as a cancellation that silently did nothing. The
+/// parent transition then yields a recovery directive instead of a known
+/// success, and the exact reason travels with it.
+fn unresolved_retirement_phases(
+    reason: String,
+    execution: UserAutomationExecutionPhase,
+) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+    (
+        UserAutomationWakePhase::UnknownOutcome { reason },
+        execution,
+    )
+}
+
+/// What the composition-bound durable outbox already holds for one runtime
+/// obligation of the current parent operator operation.
+///
+/// It is the durable answer to "may this effect be issued?": only `Retained`
+/// may, because only that state proves the owner was never handed the request.
+/// Every other state is either already answered, or a possible effect that must
+/// be reconciled by its original owner operation identity.
+enum RetainedUserAutomationObligation {
+    /// The obligation is durably retained and its owner effect has not been
+    /// issued, so it may be issued now under the retained identity.
+    Retained,
+    /// The durable record already holds this obligation's exact owner answer as
+    /// its bounded response body.
+    Answered {
+        /// The retained bounded owner answer body, served verbatim on replay.
+        result_response: serde_json::Value,
+    },
+    /// The durable record proves the owner effect was issued and its answer is
+    /// not durably known, so repeating it is not safe.
+    Reconciling {
+        /// Closed reason the obligation cannot be issued or answered again.
+        reason: String,
+    },
+}
+
+/// Classifies one durable outbox record into what this boundary may do next.
+///
+/// The mapping is mechanical over the outbox's own states: `Requested` and
+/// `Admitted` still prove the owner was never handed the request, the result
+/// states carry the retained answer, and every state at or past `Routed` proves
+/// the request left this boundary. Nothing here interprets owner meaning, and an
+/// unowned or unrecognised state fails closed as reconciling rather than as a
+/// permission.
+fn classify_retained_obligation(
+    obligation: &UserAutomationRuntimeObligation,
+    record: HostRequestRecord,
+) -> RetainedUserAutomationObligation {
+    let reconciling = |state: HostRequestState| RetainedUserAutomationObligation::Reconciling {
+        reason: format!(
+            "the retained runtime obligation {} is durably recorded as {state:?}, so the schedule \
+             or wake owner may already have acted; a later read of the committed configuration is \
+             empty of that effect, so reconcile this original owner operation identity instead \
+             of repeating it",
+            obligation.owner_operation_id
+        ),
+    };
+    match (record.state, record.result_response) {
+        (HostRequestState::Requested | HostRequestState::Admitted, None) => {
+            RetainedUserAutomationObligation::Retained
+        }
+        (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result_response)) => {
+            RetainedUserAutomationObligation::Answered { result_response }
+        }
+        (state, _) => reconciling(state),
+    }
+}
+
+/// The answer of the composition-bound durable outbox about one runtime
+/// obligation.
+///
+/// `Absent` is a complete answer that no record is held for this exact derived
+/// key, not a gap in coverage: the owner is the sole writer of that table and
+/// the key is a pure function of the obligation's immutable bindings.
+enum RetainedObligationLookup {
+    /// No record is held for this exact obligation identity.
+    Absent,
+    /// The owner holds a record, already classified over its durable states.
+    Held(RetainedUserAutomationObligation),
+    /// The owner could not be read or the intent could not be retained, so
+    /// nothing about this obligation is proven.
+    Unreadable {
+        /// Closed reason the durable owner could not answer.
+        reason: String,
+    },
+}
+
+impl RetainedObligationLookup {
+    /// Builds the answer of a lookup that failed.
+    fn unreadable(reason: String) -> Self {
+        Self::Unreadable { reason }
+    }
+}
+
+/// What the durable outbox already holds for the wake-cancellation obligation of
+/// one committed retirement.
+///
+/// It is the answer to "may this cancellation be issued?": only `Issue` may,
+/// because only that state proves the owner was never handed the request.
+enum RetainedCancellation {
+    /// The cancellation may be issued now under the retained owner operation
+    /// identity, because the durable record proves the owner never received it.
+    Issue,
+    /// The retirement is already answered by the owner's retained answer, which
+    /// is served verbatim instead of issuing the cancellation again.
+    Answered {
+        /// Exact wake identities the owner reported as cancelled.
+        cancelled_wake_ids: Vec<String>,
+    },
+    /// The wake handoff is unresolved under the retained owner operation
+    /// identity and must be reconciled; repeating the effect is not safe.
+    Unresolved {
+        /// Closed reason the cancellation is neither issued nor answered.
+        reason: String,
+    },
+    /// No durable owner was reachable, so nothing was retained and nothing is
+    /// issued.
+    Unavailable {
+        /// Closed reason the obligation could not be read or retained.
+        reason: String,
+    },
+}
+
+/// Projects one durable-outbox classification of a wake-cancellation obligation.
+fn classify_retained_cancellation(
+    obligation: &UserAutomationRuntimeObligation,
+    automation_revision: &str,
+    retained: RetainedObligationLookup,
+) -> RetainedCancellation {
+    match retained {
+        RetainedObligationLookup::Absent
+        | RetainedObligationLookup::Held(RetainedUserAutomationObligation::Retained) => {
+            RetainedCancellation::Issue
+        }
+        RetainedObligationLookup::Unreadable { reason } => {
+            RetainedCancellation::Unavailable { reason }
+        }
+        RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling {
+            reason,
+        }) => RetainedCancellation::Unresolved { reason },
+        RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
+            result_response,
+        }) => match decode_retained_cancellation_answer(
+            result_response,
+            automation_revision,
+            &obligation.owner_operation_id,
+        ) {
+            Ok(cancelled_wake_ids) => RetainedCancellation::Answered { cancelled_wake_ids },
+            Err(reason) => RetainedCancellation::Unresolved { reason },
+        },
+    }
+}
+
+/// Projects one retained-cancellation classification into the wake phase of a
+/// committed retirement, or `None` when the effect may be issued now.
+fn retained_cancellation_phases(
+    classification: RetainedCancellation,
+    obligation: &mut UserAutomationRuntimeObligation,
+    execution: &UserAutomationExecutionPhase,
+) -> Option<(UserAutomationWakePhase, UserAutomationExecutionPhase)> {
+    match classification {
+        RetainedCancellation::Issue => None,
+        RetainedCancellation::Answered { cancelled_wake_ids } => {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Answered {
+                answer: Box::new(UserAutomationRuntimeObligationAnswer::WakeCancellation {
+                    cancelled_wake_ids: cancelled_wake_ids.clone(),
+                }),
+            };
+            Some((
+                UserAutomationWakePhase::Cancelled { cancelled_wake_ids },
+                execution.clone(),
+            ))
+        }
+        RetainedCancellation::Unresolved { reason } => {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            Some(unresolved_retirement_phases(reason, execution.clone()))
+        }
+        RetainedCancellation::Unavailable { reason } => {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Unavailable {
+                reason: reason.clone(),
+            };
+            Some((
+                UserAutomationWakePhase::Unavailable { reason },
+                execution.clone(),
+            ))
+        }
+    }
+}
+
+/// What the durable outbox already holds for the wake-horizon publication
+/// obligation of one committed revision.
+enum RetainedHorizonPublication {
+    /// The slice may be published now under the retained owner operation
+    /// identity, because the durable record proves the owner never received it.
+    Issue,
+    /// The publication is already answered by the owner's retained
+    /// acknowledgement, which is served verbatim instead of publishing again.
+    Answered {
+        /// The owner's own acknowledgement, re-validated against this request.
+        acknowledgement: Box<UserAutomationWakePublication>,
+    },
+    /// The publication may already have been applied and must be reconciled
+    /// under the retained owner operation identity.
+    Unresolved {
+        /// Closed reason the publication is neither issued nor answered.
+        reason: String,
+    },
+    /// No durable owner was reachable, so nothing was retained and nothing is
+    /// issued.
+    Unavailable {
+        /// Closed reason the obligation could not be read or retained.
+        reason: String,
+    },
+}
+
+/// Projects one durable-outbox classification of a wake-horizon obligation.
+fn classify_retained_horizon_publication(
+    obligation: &UserAutomationRuntimeObligation,
+    publication: &UserAutomationWakeHorizonPublication,
+    retained: RetainedObligationLookup,
+) -> RetainedHorizonPublication {
+    match retained {
+        RetainedObligationLookup::Absent
+        | RetainedObligationLookup::Held(RetainedUserAutomationObligation::Retained) => {
+            RetainedHorizonPublication::Issue
+        }
+        RetainedObligationLookup::Unreadable { reason } => {
+            RetainedHorizonPublication::Unavailable { reason }
+        }
+        RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling {
+            reason,
+        }) => RetainedHorizonPublication::Unresolved { reason },
+        RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
+            result_response,
+        }) => match decode_retained_horizon_answer(
+            result_response,
+            publication,
+            &obligation.owner_operation_id,
+        ) {
+            Ok(acknowledgement) => RetainedHorizonPublication::Answered { acknowledgement },
+            Err(reason) => RetainedHorizonPublication::Unresolved { reason },
+        },
+    }
+}
+
+/// Projects one retained-horizon classification into the bounded horizon phase,
+/// or `None` when the slice may be published now.
+fn retained_horizon_phase(
+    classification: RetainedHorizonPublication,
+    obligation: &mut UserAutomationRuntimeObligation,
+    publication: &UserAutomationWakeHorizonPublication,
+    requested_occurrence_ids: &[String],
+    retry_handle: &str,
+) -> Option<UserAutomationHorizonPhase> {
+    match classification {
+        RetainedHorizonPublication::Issue => None,
+        RetainedHorizonPublication::Answered { acknowledgement } => {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Answered {
+                answer: Box::new(
+                    UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+                        acknowledgement: acknowledgement.clone(),
+                    },
+                ),
+            };
+            Some(acknowledged_horizon_phase(
+                publication,
+                requested_occurrence_ids,
+                acknowledgement.as_ref(),
+            ))
+        }
+        RetainedHorizonPublication::Unresolved { reason } => {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                reason: reason.clone(),
+            };
+            Some(unreached_horizon_phase(
+                publication,
+                requested_occurrence_ids,
+                retry_handle.to_owned(),
+                UnreachedHorizonKind::UnknownOutcome,
+                &reason,
+            ))
+        }
+        RetainedHorizonPublication::Unavailable { reason } => {
+            obligation.disposition = UserAutomationRuntimeObligationDisposition::Unavailable {
+                reason: reason.clone(),
+            };
+            Some(unreached_horizon_phase(
+                publication,
+                requested_occurrence_ids,
+                retry_handle.to_owned(),
+                UnreachedHorizonKind::Unavailable,
+                &reason,
+            ))
+        }
+    }
+}
+
+/// Returns the durable outbox operation identity of one runtime obligation.
+fn user_automation_obligation_operation_id(
+    obligation: &UserAutomationRuntimeObligation,
+) -> Result<eliot_ors::OperationIdentity, String> {
+    eliot_ors::OperationIdentity::new(obligation.owner_operation_id.clone()).map_err(|error| {
+        unretained_obligation_reason(
+            obligation,
+            format!("the derived owner operation identity is not a well-formed label: {error}"),
+        )
+    })
+}
+
+/// Builds one durable outbox label, naming the obligation when the value is not
+/// a well-formed label.
+fn obligation_label(
+    obligation: &UserAutomationRuntimeObligation,
+    value: String,
+) -> Result<OpaqueLabel, String> {
+    OpaqueLabel::new(value).map_err(|error| {
+        unretained_obligation_reason(
+            obligation,
+            format!("the durable obligation identity is not well formed: {error}"),
+        )
+    })
+}
+
+/// Returns the observed non-negative retention instant of the parent request.
+///
+/// The durable outbox record requires a non-zero instant. This contour owns no
+/// caller deadline of its own, so it retains the instant at which the parent
+/// operator request observed time, and the obligation cannot be retained at all
+/// when that request observed none: an unbound instant would have to be
+/// invented.
+fn observed_retention_instant(context: &RequestMetadata) -> Option<i64> {
+    context
+        .clock
+        .valid_time_ms
+        .or(context.clock.known_time_ms)
+        .filter(|observed| *observed > 0)
+}
+
+/// Decodes the retained wake-cancellation answer of one durable obligation, or
+/// names why the retained body is not this operation's answer.
+fn decode_retained_cancellation_answer(
+    result_response: serde_json::Value,
+    automation_revision: &str,
+    owner_operation_id: &str,
+) -> Result<Vec<String>, String> {
+    let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation { cancelled_wake_ids }) =
+        serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
+    else {
+        return Err(unretained_cancellation_answer_reason(
+            automation_revision,
+            owner_operation_id,
+        ));
+    };
+    Ok(cancelled_wake_ids)
+}
+
+/// Decodes and re-validates the retained schedule-owner acknowledgement of one
+/// durable horizon obligation, or names why the retained body is not this
+/// operation's answer.
+fn decode_retained_horizon_answer(
+    result_response: serde_json::Value,
+    publication: &UserAutomationWakeHorizonPublication,
+    owner_operation_id: &str,
+) -> Result<Box<UserAutomationWakePublication>, String> {
+    let Ok(UserAutomationRuntimeObligationAnswer::WakeHorizonPublication { acknowledgement }) =
+        serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response)
+    else {
+        return Err(unretained_horizon_answer_reason(
+            &publication.automation_revision,
+            owner_operation_id,
+        ));
+    };
+    acknowledgement
+        .validate_for(publication)
+        .map_err(|error| error.to_string())?;
+    Ok(acknowledgement)
+}
+
+/// Projects the schedule owner's acknowledgement into the bounded horizon phase
+/// this operation reports.
+fn acknowledged_horizon_phase(
+    publication: &UserAutomationWakeHorizonPublication,
+    requested_occurrence_ids: &[String],
+    acknowledgement: &UserAutomationWakePublication,
+) -> UserAutomationHorizonPhase {
+    let publication_operation_id = Box::new(acknowledgement.publication_operation_id.clone());
+    let outcome = if acknowledgement.acknowledged_all() {
+        UserAutomationHorizonOutcome::Published {
+            publication_operation_id,
+        }
+    } else {
+        UserAutomationHorizonOutcome::Partial {
+            publication_operation_id,
+            reason: format!(
+                "the schedule owner acknowledged {} of the {} requested occurrences of revision \
+                 {}; the exact remaining set is retained and must be replayed under its handle \
+                 before the horizon counts as published",
+                acknowledgement.acknowledged_occurrence_ids.len(),
+                requested_occurrence_ids.len(),
+                publication.automation_revision
+            ),
+        }
+    };
+    UserAutomationHorizonPhase {
+        trigger: publication.trigger,
+        automation_id: publication.automation_id.clone(),
+        automation_revision: publication.automation_revision.clone(),
+        revision_digest: publication.revision_digest.clone(),
+        requested_occurrence_ids: requested_occurrence_ids.to_vec(),
+        remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids.clone(),
+        retry_handle: acknowledgement.retry_handle.clone(),
+        outcome,
+    }
+}
+
+/// Returns the exact digest of the canonical receipt a committed or replayed
+/// mutation produced, which the orchestration record binds beside its
+/// obligations. A read-only answer has no receipt and owns no obligation.
+fn committed_receipt_digest(configuration: &UserAutomationConfigurationPhase) -> Option<String> {
+    match configuration {
+        UserAutomationConfigurationPhase::Committed { receipt, .. }
+        | UserAutomationConfigurationPhase::Replayed { receipt, .. } => {
+            Some(receipt_evidence_digest(receipt))
+        }
+        UserAutomationConfigurationPhase::Read { .. } => None,
+    }
+}
+
 /// Returns the canonical revision a committed configuration mutation produced.
 fn committed_revision(
     configuration: &UserAutomationConfigurationPhase,
@@ -2534,28 +3923,24 @@ fn unreached_horizon_phase(
     }
 }
 
-/// Completes the retirement handoff for `Remove` and `Pause`.
+/// Completes the retirement handoff for `Pause`.
 ///
-/// The committed document is checked against the requested automation,
-/// revision, and the exact configuration state that operation must produce, so
-/// the phase is only derived from the exact revision this identity committed.
+/// A `Pause` stops the revision admitting new occurrences but this contour owns
+/// no proof of which already published wakes its owner still retains, so the
+/// phase stays unresolved rather than asserting a cancellation it cannot
+/// enumerate.
 fn retirement_handoff(
     configuration: &UserAutomationConfigurationPhase,
     automation_id: Option<&str>,
     automation_revision: &str,
     expected_state: UserAutomationConfigurationState,
 ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String> {
-    let Some(revision) = committed_revision(configuration) else {
-        return Err("retirement did not return a canonical revision".to_owned());
-    };
-    if revision.revision != automation_revision
-        || automation_id.is_some_and(|id| revision.automation_id != id)
-        || committed_configuration_state(configuration) != Some(expected_state)
-    {
-        return Err(
-            "committed UserAutomation revision does not match the retirement request".to_owned(),
-        );
-    }
+    let revision = committed_retirement_revision(
+        configuration,
+        automation_id,
+        automation_revision,
+        expected_state,
+    )?;
     let committed_occurrences = revision
         .compile_occurrence_identities()
         .map_err(|error| error.to_string())?
@@ -2568,6 +3953,33 @@ fn retirement_handoff(
         ),
         not_applicable_execution(),
     ))
+}
+
+/// Returns the committed revision a retirement committed, after checking it
+/// against the exact request this identity asked for.
+///
+/// The committed document is checked against the requested automation,
+/// revision, and the exact configuration state that operation must produce, so
+/// both retirement phases are only derived from the exact revision this
+/// identity committed.
+fn committed_retirement_revision(
+    configuration: &UserAutomationConfigurationPhase,
+    automation_id: Option<&str>,
+    automation_revision: &str,
+    expected_state: UserAutomationConfigurationState,
+) -> Result<UserAutomationRevision, String> {
+    let Some(revision) = committed_revision(configuration) else {
+        return Err("retirement did not return a canonical revision".to_owned());
+    };
+    if revision.revision != automation_revision
+        || automation_id.is_some_and(|id| revision.automation_id != id)
+        || committed_configuration_state(configuration) != Some(expected_state)
+    {
+        return Err(
+            "committed UserAutomation revision does not match the retirement request".to_owned(),
+        );
+    }
+    Ok(revision.clone())
 }
 
 /// Wake phase for an operation that owns no wake publication or cancellation.
@@ -2684,6 +4096,116 @@ fn unproven_durable_job_material_reason(occurrence_id: &str, automation_revision
          owner-read, but the Durable Job owner was never asked: no owner-issued submission material \
          exists for it, because the qualified artifact content reference and the job admission \
          receipt are issued by that owner and are not derivable from the canonical Store commit"
+    )
+}
+
+/// Reason used when one runtime obligation could not be retained durably.
+///
+/// It names the obligation and its original owner operation identity, so an
+/// operator reads which exact effect was not retained rather than a generic
+/// outage, and no owner effect is issued without that record.
+fn unretained_obligation_reason(
+    obligation: &UserAutomationRuntimeObligation,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!(
+        "the {} runtime obligation of this committed operation was not retained under its owner \
+         operation identity {}: {detail}; no owner effect was issued and the effect stays owed \
+         durably",
+        obligation.kind.as_str(),
+        obligation.owner_operation_id
+    )
+}
+
+/// Reason used when the exact owner answer of one runtime obligation could not
+/// be retained, so it is not yet a replayable obligation.
+fn unretained_answer_reason(
+    obligation: &UserAutomationRuntimeObligation,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!(
+        "the owner answer of the {} runtime obligation under owner operation identity {} was not \
+         retained: {detail}; the effect that produced it is not repeatable, so this original owner \
+         operation identity must be reconciled before it is released",
+        obligation.kind.as_str(),
+        obligation.owner_operation_id
+    )
+}
+
+/// Reason used when the exact durable key of a horizon publication could not be
+/// derived from its own immutable bindings.
+fn unretained_horizon_reason(automation_revision: &str, detail: impl std::fmt::Display) -> String {
+    format!(
+        "the bounded wake horizon of revision {automation_revision} could not be bound to a durable \
+         owner operation identity: {detail}; the compiled slice was not handed to the schedule \
+         owner and every one of its occurrences stays owed"
+    )
+}
+
+/// Reason used when a retained horizon answer does not bind to the exact
+/// publication it is resumed under.
+fn unretained_horizon_answer_reason(automation_revision: &str, owner_operation_id: &str) -> String {
+    format!(
+        "the retained wake horizon answer of owner operation identity {owner_operation_id} does not \
+         bind to the exact publication of revision {automation_revision} this attempt compiled, so \
+         it is another operation's answer and the horizon stays unknown under its own retained \
+         identity"
+    )
+}
+
+/// Reason used when a horizon publication's owner effect may already have been
+/// issued and its answer was lost.
+fn unretained_horizon_outcome_reason(
+    automation_revision: &str,
+    owner_operation_id: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "the schedule owner may have retained the horizon of revision {automation_revision} and its \
+         answer was lost: {detail}; that possible effect is recorded under owner operation identity \
+         {owner_operation_id}, so reconcile that identity instead of publishing the slice again"
+    )
+}
+
+/// Reason used when the exact durable key of a wake cancellation could not be
+/// derived from its own immutable bindings.
+fn unretained_cancellation_reason(
+    automation_revision: &str,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!(
+        "the unadmitted-wake cancellation of retired revision {automation_revision} could not be \
+         bound to a durable owner operation identity: {detail}; the owner-proven targets were not \
+         handed to the wake owner and every one of them stays owed"
+    )
+}
+
+/// Reason used when a retained cancellation answer does not bind to the exact
+/// retirement it is resumed under.
+fn unretained_cancellation_answer_reason(
+    automation_revision: &str,
+    owner_operation_id: &str,
+) -> String {
+    format!(
+        "the retained cancellation answer of owner operation identity {owner_operation_id} does not \
+         bind to the exact retirement of revision {automation_revision} this attempt replayed, so it \
+         is another operation's answer and the cancellation stays unknown under its own retained \
+         identity"
+    )
+}
+
+/// Reason used when a wake cancellation may already have been applied and its
+/// owner answer was lost.
+fn unretained_cancellation_outcome_reason(
+    automation_revision: &str,
+    owner_operation_id: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "the wake owner may already have cancelled the unadmitted pending wakes of retired revision \
+         {automation_revision} and its answer was lost: {detail}; that possible effect is recorded \
+         under owner operation identity {owner_operation_id}, whose cancelled wake identities are \
+         absent from every later read, so reconcile that identity instead of cancelling again"
     )
 }
 

@@ -211,7 +211,10 @@ pub use notification_state_emit::{
     emit_blocked_automation_notification, notification_already_recorded,
     read_notification_ordering_head,
 };
-pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
+pub use owner_feed::{
+    KernelOwnerPublishPort, OwnerFeedPlan, OwnerFeedTrigger, capture_owner_feed_plan,
+    maintain_owner_feed,
+};
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
     OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -403,12 +406,19 @@ pub fn governed_improvement_pipeline_owner() -> &'static str {
 
 /// Routes one improvement candidate through the Governor-owned pipeline.
 ///
-/// Production caller of [`improvement_candidate_route::route_improvement_candidate`]
-/// (and transitively of `eliot_maintenance::run_improvement_candidate_pipeline`
-/// and `admit_improvement_candidate`). Pure thin forwarder for the
-/// candidate → experiment → independent evaluation → rejected-or-canary-admitted
-/// path (#1100/#18/#20); Kernel activation (#11) stays a handoff, never executed
-/// here.
+/// #2703: this function IS a caller of
+/// [`improvement_candidate_route::route_improvement_candidate`] (and
+/// transitively of `eliot_maintenance::run_improvement_candidate_pipeline` and
+/// `admit_improvement_candidate`), but it is NOT itself called from any live
+/// request path: `ImprovementRouteRequest` is never constructed in `bins/` or
+/// `crates/`. The typed result mapping behind this call is exhaustive and
+/// correct; the missing link is a production request source, which is #1145's
+/// owner scope. Do not cite this function as evidence that the improvement
+/// pipeline is wired into the daemon.
+///
+/// It remains a pure thin forwarder for the candidate → experiment → independent
+/// evaluation → rejected-or-canary-admitted path (#1100/#18/#20); Kernel
+/// activation (#11) stays a handoff, never executed here.
 pub fn govern_improvement_candidate(
     request: improvement_candidate_route::ImprovementRouteRequest<'_>,
 ) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
@@ -872,6 +882,17 @@ impl DaemonComposition {
         // another task, `WorkScope`, or a moved fence with
         // `TASK_SCOPE_INCOMPATIBLE`. Neither rejection changes a task or
         // reaches the store, and no task is ever silently selected.
+        //
+        // This method has zero production call sites, so the typed evidence
+        // leg is not yet on a live path: the daemon runtime driver never calls
+        // it. The blocking symbol is the compiled receipt — the repository's
+        // only production constructor of it,
+        // `eliot_workscope::ColdStartController::compile`, is reached only
+        // through `eliot_workscope::OnboardingSingleFlight::compile_and_publish`
+        // and therefore only through
+        // `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`,
+        // which also has zero call sites. See `task_binding_admission`'s
+        // "Measured reachability" section for the full measurement.
         let admission = crate::task_binding_admission::admit_canonical_write(
             envelope.operation_id.as_str().to_owned(),
             &identity.request.metadata,
@@ -879,18 +900,26 @@ impl DaemonComposition {
             readiness.receipt,
             readiness.fence,
         )?;
-        // Issue #1929: a capture admitted cold is still durably retained. The
-        // decision is projected here so operators can see which submissions
-        // carry no task binding and are therefore inert for task memory,
-        // support, influence, and finish until a later governed binding
-        // transition.
+        // Issue #1929: the durable retention of a cold unbound capture is NOT
+        // this log line, and not this daemon. `ColdUnbound` here records only
+        // the admission decision. The retention owner is the store, which
+        // admits the same capture as `GateDisposition::ColdUnbound` in
+        // `eliot_store_surreal::task_binding_gate::gate_apply` so the write
+        // proceeds instead of being rejected, and whose adapter builds one
+        // `EvidenceRecord` per `CaptureObservation` regardless of task binding
+        // (`eliot_store_surreal_adapter` `plan::evidence_records`, bound into
+        // the `write_receipt` row by `apply::atomic_write`). A later governed
+        // binding transition reads those bytes back through the `GetEvidencePack`
+        // named read. Until then they are inert for task memory, support,
+        // influence, and finish, and this line is only the operator-visible
+        // projection of that fact.
         if let crate::task_binding_admission::TaskBindingAdmission::ColdUnbound(candidate) =
             &admission
         {
             tracing::info!(
                 candidate_id = %crate::diagnostics::sanitize_identity(&candidate.candidate_id),
                 reason_ref = %candidate.reason_ref,
-                "cold unbound observation candidate admitted at the daemon edge: no task activation, support/influence promotion, or finish relevance"
+                "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
         }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
@@ -1210,10 +1239,17 @@ impl DaemonComposition {
     }
 
     /// Returns a bounded status projection.
+    ///
+    /// #2703: this projection deliberately does NOT reference
+    /// `governed_improvement_pipeline_owner`. A previous revision bound it to
+    /// `let _improvement_owner = ...` and dropped it, which constructed a value
+    /// and discarded it — the construct-and-drop shape that is not a
+    /// production caller. The owner identity is reported for real, from
+    /// `daemon_runtime`'s startup diagnostic, so nothing is lost by removing
+    /// the dead reference here.
     #[must_use]
     pub fn status(&self) -> DaemonStatus {
         let snapshot = self.kernel_snapshot();
-        let _improvement_owner = governed_improvement_pipeline_owner();
         DaemonStatus {
             service: SERVICE_NAME.to_owned(),
             protocol: PROTOCOL_VERSION.to_owned(),
@@ -2442,6 +2478,28 @@ impl DaemonComposition {
     /// never mints a receipt of its own: `ScopeAttachIngress` is the only
     /// accepted input and its `receipt_ref` is a reference the Governor binds,
     /// not an authority the daemon asserts.
+    ///
+    /// # Not yet reached (issue #1929)
+    ///
+    /// This method currently has zero call sites, and it cannot acquire one
+    /// without inventing authority, so it is reported here rather than wired to
+    /// a synthetic caller. Three measured reasons:
+    ///
+    /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
+    ///   fails closed unless a `WorkScope` owner is already retained, and this
+    ///   method is the only daemon path that installs one;
+    /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
+    ///   no authenticated authorization reference, so three of the nine
+    ///   `ScopeAttachIngress` fields would have to be fabricated;
+    /// - the daemon knows only its own config and state directories, which are
+    ///   not a user `WorkScope`. Attaching one of them as a scope would create
+    ///   a `WorkScope` binding the user never declared.
+    ///
+    /// The legitimate owner is the attach-transport ingress
+    /// `eliot_governor::GovernorComposition` already documents as blocked
+    /// ("attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
+    /// discovery or onboarding lease"). A startup attach was deliberately not
+    /// added to manufacture a caller.
     pub fn admit_scope_attach(
         &mut self,
         ingress: &task_binding_admission::ScopeAttachIngress,

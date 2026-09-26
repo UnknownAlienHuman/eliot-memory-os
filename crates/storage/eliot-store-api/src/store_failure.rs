@@ -612,6 +612,54 @@ impl StoreFailure {
         let mut failure = Self::base(&context);
         let (disposition, reason_code, mutation, retry, recovery, conflict_observation) =
             match &error {
+                StoreError::AutomationContinuation(kind) => {
+                    use crate::AutomationContinuationFailure;
+
+                    match kind {
+                        AutomationContinuationFailure::LegacyRefresh => (
+                            StoreFailureDisposition::MigrationRequired,
+                            "AUTOMATION_CONTINUATION_V1_REFRESH",
+                            StoreMutationDisposition::NotApplicable,
+                            StoreRetryDirective::MigrateThenRetryNewIdentity,
+                            StoreRecoveryAction::RefreshRevisionHeads,
+                            None,
+                        ),
+                        AutomationContinuationFailure::InvalidOrUnknown => (
+                            StoreFailureDisposition::DeterministicRejection,
+                            "AUTOMATION_CONTINUATION_INVALID",
+                            StoreMutationDisposition::NotApplicable,
+                            StoreRetryDirective::DoNotRetry,
+                            StoreRecoveryAction::None,
+                            None,
+                        ),
+                        AutomationContinuationFailure::StaleSnapshot => conflict(
+                            "AUTOMATION_CONTINUATION_STALE",
+                            StoreRecoveryAction::RefreshRevisionHeads,
+                            StoreConflictObservation {
+                                revision_key_and_expected_observed_values: Some(
+                                    "AUTOMATION_CONTINUATION_STALE".to_owned(),
+                                ),
+                                ..Default::default()
+                            },
+                        ),
+                        AutomationContinuationFailure::Expired => (
+                            StoreFailureDisposition::DeterministicRejection,
+                            "AUTOMATION_CONTINUATION_EXPIRED",
+                            StoreMutationDisposition::NotApplicable,
+                            StoreRetryDirective::NewIdentityAfterCondition,
+                            StoreRecoveryAction::RefreshRevisionHeads,
+                            None,
+                        ),
+                        AutomationContinuationFailure::CapacityPressure => (
+                            StoreFailureDisposition::Backpressured,
+                            "AUTOMATION_CONTINUATION_CAPACITY",
+                            StoreMutationDisposition::NotApplicable,
+                            StoreRetryDirective::NewIdentityAfterCondition,
+                            StoreRecoveryAction::WaitForCapacity,
+                            None,
+                        ),
+                    }
+                }
                 StoreError::InvalidField { .. } => deterministic("INVALID_FIELD"),
                 StoreError::Empty { .. } => deterministic("EMPTY_FIELD"),
                 StoreError::Duplicate { .. } => deterministic("DUPLICATE_IDENTITY"),

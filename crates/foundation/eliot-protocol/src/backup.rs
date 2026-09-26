@@ -320,6 +320,34 @@ impl BackupOperationKind {
             Self::AdmitCutover => "ADMIT_CUTOVER",
         }
     }
+
+    /// Returns the stable wire identity of this operation's request shape.
+    ///
+    /// This is the single total operation-to-wire lookup of the backup
+    /// control family. It is exhaustive over every variant and returns the
+    /// existing `BACKUP_*_WIRE_ID` constant by reference, so the operation
+    /// vocabulary and the wire identities can never be edited apart: a new
+    /// canonical variant is a compile error here until it is given its own
+    /// constant, and no consumer needs a second wire table or a string
+    /// round-trip.
+    ///
+    /// [`as_str`](Self::as_str) remains a distinct domain: it is the
+    /// operation *name*, not the wire identity, and neither is derived from
+    /// the other by string rewriting.
+    #[must_use]
+    pub const fn wire_id(self) -> &'static str {
+        match self {
+            Self::RequestCapture => BACKUP_CAPTURE_REQUEST_WIRE_ID,
+            Self::ReadSnapshotPage => BACKUP_SNAPSHOT_PAGE_READ_WIRE_ID,
+            Self::VerifyArchive => BACKUP_ARCHIVE_VERIFICATION_WIRE_ID,
+            Self::PrepareIsolatedRestore => BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID,
+            Self::RestoreStep => BACKUP_RESTORE_STEP_WIRE_ID,
+            Self::ReconcileRestore => BACKUP_RESTORE_RECONCILE_WIRE_ID,
+            Self::RestoreStatus => BACKUP_RESTORE_STATUS_WIRE_ID,
+            Self::CompleteRehearsal => BACKUP_REHEARSAL_COMPLETE_WIRE_ID,
+            Self::AdmitCutover => BACKUP_CUTOVER_ADMISSION_WIRE_ID,
+        }
+    }
 }
 
 impl fmt::Display for BackupOperationKind {

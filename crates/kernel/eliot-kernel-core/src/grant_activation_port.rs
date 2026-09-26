@@ -6124,6 +6124,30 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         self.revoke_introduction_durable(&rich, &active_epoch)
             .map_err(|error| map_thin_error(&error))
     }
+
+    /// Mechanically activates one authenticated root crossing (`#2962`).
+    ///
+    /// Fail-closed by construction: the presented binding is checked against
+    /// the presented epoch BEFORE the ledger is touched, so inconsistent or
+    /// stale caller material is rejected without any mutation.
+    ///
+    /// Named missing owner: the durable mechanical record for a root
+    /// crossing. ORS has no admitted `commit_root_transition` operation yet, and
+    /// this port will not synthesize a crossing receipt from process-local
+    /// state — a crossing whose mechanical activation is not durably recorded
+    /// is not activation at all (I6.10: a canonical proposal stays inactive
+    /// until its activation receipt exists). The refusal names the exact owner
+    /// that must be admitted, so the frontend reports
+    /// `P07PortError::Unavailable` and the crossing stays inadmissible until
+    /// that owner exists. A crossing is never authorized by a decoded record,
+    /// a recomputed digest, or a locally recomputed receipt.
+    fn activate_root_transition(
+        &self,
+        _request: &eliot_authority::RootTransitionActivationRequest,
+    ) -> Result<eliot_authority::RootTransitionActivationReceipt, eliot_authority::P07PortError>
+    {
+        Err(eliot_authority::P07PortError::Unavailable)
+    }
 }
 
 #[cfg(test)]

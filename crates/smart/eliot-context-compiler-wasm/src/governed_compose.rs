@@ -6,8 +6,11 @@
 //! compilation refuses before any value surfaces:
 //!
 //! ```text
-//! produce_learning_candidate (owner-verified permit + ACTIVE backlog entry)
-//! → retrieve_governed (overlay liveness, backlog backing, cross-task admission)
+//! produce_learning_candidate (owner-verified permit + ACTIVE backlog entry
+//!   + the distinct cross-task carryover when the compilation is for
+//!   another task)
+//! → retrieve_governed (overlay liveness, backlog backing, cross-task
+//!   carryover)
 //! → admit_context_with_learning (ticket re-verification + per-mark screen + admit)
 //! → assemble_active_view_with_learning (delivery re-verification + project)
 //! → GovernedCompilation (retrieval decision + admission + optional view)
@@ -39,7 +42,8 @@ use eliot_context_contracts::{
     SerializedContextMeasurement,
 };
 use eliot_improvement::candidate_bounds::{
-    BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
+    BoundsError, CrossTaskCarryover, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef,
+    retrieve_governed,
 };
 use eliot_improvement::{
     CarriageMark, LearningProduction, PresentedLearning, bounds_to_context_error,
@@ -76,14 +80,40 @@ pub enum ComposeError {
     Assembly(AssemblyError),
 }
 
+/// Both surfaces must cite the same distinct cross-task admission, or neither
+/// may cite one.
+///
+/// The producer and the retrieval/carriage screens are separate owners of the
+/// two cross-task checks, so a caller that threaded one carryover into
+/// production and another into the screens would let a stale record produce an
+/// atom for a task the screens never checked. Identity is the owner-issued
+/// pair, not the object identity: both the cross-task ticket digest and the
+/// record's `admission_id` must agree, because either alone can be copied onto
+/// a different record.
+fn same_cross_task_carryover(
+    production: Option<&CrossTaskCarryover<'_>>,
+    presented: Option<&CrossTaskCarryover<'_>>,
+) -> bool {
+    match (production, presented) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.cross_task_permit().digest() == right.cross_task_permit().digest()
+                && left.record().admission_id == right.record().admission_id
+        }
+        _ => false,
+    }
+}
+
 /// Compose one governed learning compilation from producer output.
 ///
 /// `production` carries everything the producer needs (including the
-/// owner-verified permit and the production backlog); `presented` carries
-/// the same issuance plus the overlay, registry, cross-task admission,
-/// and requesting identity for the screens. Both verified handles must
-/// cite the exact same issuance digest. `input` is the caller-built
-/// ordinary admission input the produced atom joins.
+/// owner-verified local permit, the distinct cross-task carryover when the
+/// compilation is for another task, and the production backlog); `presented`
+/// carries the same issuance plus the same carryover, the overlay, registry,
+/// and requesting identity for the screens. Both verified handles must cite the
+/// exact same issuance digest, and the carryover must be the same one on both
+/// sides. `input` is the caller-built ordinary admission input the produced
+/// atom joins.
 ///
 /// The wall clock is sourced LIVE from the host owner clock
 /// ([`OffsetDateTime::now_utc`]) inside this function: any
@@ -103,7 +133,9 @@ pub fn compose_governed_compilation<F>(
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
-    if production.verified.permit().digest() != presented.verified.permit().digest() {
+    if production.verified.permit().digest() != presented.verified.permit().digest()
+        || !same_cross_task_carryover(production.cross_task, presented.cross_task)
+    {
         return Err(ComposeError::PermitMismatch);
     }
     let live_now_secs = u64::try_from(OffsetDateTime::now_utc().unix_timestamp().max(0))
@@ -139,7 +171,7 @@ where
         overlay,
         reusable: Some(&reusable),
         draft_delta_present: false,
-        cross_task_admission: presented.cross_task_admission,
+        cross_task: presented.cross_task,
         backlog: presented.backlog,
         verified: presented.verified,
         now: datetime_from_unix(presented.now_unix_secs).map_err(ComposeError::Retrieval)?,
@@ -200,7 +232,7 @@ pub enum HonorError {
 /// 4. when the result carries learning-marked atoms (or the request
 ///    carried tickets), the full owner carriage gate
 ///    ([`check_governed_carriage`]) runs with the live Governor,
-///    registry, overlay, and cross-task admission — epoch/generation
+///    registry, overlay, and cross-task carryover — epoch/generation
 ///    rotation, dead overlays, revoked backlog entries, and unadmitted
 ///    cross-task use refuse here even if the producing contour passed
 ///    them structurally.

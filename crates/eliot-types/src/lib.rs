@@ -33,6 +33,7 @@ pub mod secret_boundary;
 pub mod semantic_memory;
 pub mod service;
 pub mod skill;
+pub mod strict_json;
 pub mod task_execution;
 pub mod ul;
 pub mod verification;
@@ -273,18 +274,19 @@ pub use memory::{
     MailboxMessageStatus, MailboxRecipient, MemoryConfidence, MemoryHandlePreview,
     MemoryWriteEnvelope, MemoryWriteEnvelopeInput, MemoryWriteEnvelopeValidated, OperationStatus,
     PatchRequest, PatchRun, PatchRunStatus, PathRef, ProbeRecordCommand, ProjectRevisionSummary,
-    RECALL_RECEIPT_REASON_LIMIT, RECALL_RECEIPT_TEXT_LIMIT, ReadConsistencyMode, RecallDisposition,
-    RecallDispositionInputs, RecallL0Request, RecallL0Response, RecallReceipt, RecoveryAction,
-    RejectedCandidateTrace, RelationInput, RelationSummary, RelationType, RiskTier,
-    SemanticCommand, SemanticCommandKind, ServerRecallVerdict, SourceSnapshotInput,
-    SymbolChangeIntent, SymbolEvidence, TaintClass, TaskAcceptanceEvidenceKind, TaskAcceptanceItem,
-    TaskContract, TaskContractInput, TaskContractStatus, TaskContractWriteCommand,
-    TokenBudgetReport, ToolObservation, ToolObservationInput, ToolObservationRecordCommand,
-    TruncationInfo, UlArtifactBatchRecordCommand, UlMemoryArtifact, UnderstandingProof,
-    UnderstandingProofReceipt, UnifiedDiff, VerificationRecordCommand, VerificationResult,
-    VerificationRun, VerificationRunInput, VerifierArtifactRef, VerifierArtifactScope,
-    VerifierCommandKind, VerifierEffectTrace, VerifierEvidence, VerifierPlan, VerifierRequirement,
-    VerifierRun, VerifierRunRef, VerifierStatus, Visibility, WorkConflict, WorkConflictKind,
+    RECALL_RECEIPT_REASON_LIMIT, RECALL_RECEIPT_TEXT_LIMIT, ReadConsistencyMode,
+    RecallConflictObservation, RecallDisposition, RecallDispositionInputs, RecallL0Request,
+    RecallL0Response, RecallReceipt, RecoveryAction, RejectedCandidateTrace, RelationInput,
+    RelationSummary, RelationType, RiskTier, SemanticCommand, SemanticCommandKind,
+    ServerRecallVerdict, SourceSnapshotInput, SymbolChangeIntent, SymbolEvidence, TaintClass,
+    TaskAcceptanceEvidenceKind, TaskAcceptanceItem, TaskContract, TaskContractInput,
+    TaskContractStatus, TaskContractWriteCommand, TokenBudgetReport, ToolObservation,
+    ToolObservationInput, ToolObservationRecordCommand, TruncationInfo,
+    UlArtifactBatchRecordCommand, UlMemoryArtifact, UnderstandingProof, UnderstandingProofReceipt,
+    UnifiedDiff, VerificationRecordCommand, VerificationResult, VerificationRun,
+    VerificationRunInput, VerifierArtifactRef, VerifierArtifactScope, VerifierCommandKind,
+    VerifierEffectTrace, VerifierEvidence, VerifierPlan, VerifierRequirement, VerifierRun,
+    VerifierRunRef, VerifierStatus, Visibility, WorkConflict, WorkConflictKind,
     WorkConflictResolution, WorkItem, WorkItemStatus, WorkLease, WorkLeaseDecision,
     WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseState, WorkScope, WorktreeLease,
     WorktreeLeaseKind, WorktreeLeaseRequest, WorktreeLeaseState, WriteReceipt, WriteReceiptRef,
@@ -412,6 +414,9 @@ pub use skill::{
     SkillMergeProposal, SkillNeedEstimate, SkillNeedVerdict, SkillOrderingRule, SkillOutputSpec,
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
+};
+pub use strict_json::{
+    StrictJsonError, StrictJsonErrorKind, strict_json_has_no_duplicate_members, strict_json_value,
 };
 pub use task_execution::{
     TaskExecutionAction, TaskExecutionArtifact, TaskExecutionClass, TaskExecutionClassSource,

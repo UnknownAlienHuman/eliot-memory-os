@@ -8,62 +8,21 @@
 //!
 //! The wire contract and request/response envelope remain owned by the
 //! canonical `#954` vocabulary (`eliot-protocol/src/backup.rs`) and the
-//! envelope mapping owned alongside `runtime_control.rs`. The operation
-//! names and wire-ID strings below are pinned copies of those canonical
-//! values, not a new operation family and not a new pipe family.
+//! envelope mapping owned alongside `runtime_control.rs`. This module
+//! consumes that vocabulary instead of restating it: the operation family,
+//! its `as_str()` spellings and its operation-to-wire identities are used
+//! from their single owner, so this registration table cannot drift into a
+//! second operation family or a second pipe family.
 
-/// Closed backup operation vocabulary, pinned by value to the canonical
-/// `#954` `BackupOperationKind` (`eliot-protocol/src/backup.rs`).
+/// The closed backup operation vocabulary, consumed from its canonical
+/// `#954` owner (`eliot-protocol/src/backup.rs`).
 ///
-/// Kept local because this cell takes no new Cargo dependency; variant
-/// names, `as_str` spellings, and `wire_id` strings must match the
-/// canonical vocabulary exactly.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BackupOperationKind {
-    RequestCapture,
-    ReadSnapshotPage,
-    VerifyArchive,
-    PrepareIsolatedRestore,
-    RestoreStep,
-    ReconcileRestore,
-    RestoreStatus,
-    CompleteRehearsal,
-    AdmitCutover,
-}
-
-impl BackupOperationKind {
-    /// Returns the stable wire name of this operation, pinned to `#954`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RequestCapture => "REQUEST_CAPTURE",
-            Self::ReadSnapshotPage => "READ_SNAPSHOT_PAGE",
-            Self::VerifyArchive => "VERIFY_ARCHIVE",
-            Self::PrepareIsolatedRestore => "PREPARE_ISOLATED_RESTORE",
-            Self::RestoreStep => "RESTORE_STEP",
-            Self::ReconcileRestore => "RECONCILE_RESTORE",
-            Self::RestoreStatus => "RESTORE_STATUS",
-            Self::CompleteRehearsal => "COMPLETE_REHEARSAL",
-            Self::AdmitCutover => "ADMIT_CUTOVER",
-        }
-    }
-
-    /// Returns the stable wire ID of this operation, pinned to `#954`.
-    #[must_use]
-    pub const fn wire_id(self) -> &'static str {
-        match self {
-            Self::RequestCapture => "eliot.protocol.backup.capture-request",
-            Self::ReadSnapshotPage => "eliot.protocol.backup.snapshot-page-read",
-            Self::VerifyArchive => "eliot.protocol.backup.archive-verification",
-            Self::PrepareIsolatedRestore => "eliot.protocol.backup.isolated-restore-prepare",
-            Self::RestoreStep => "eliot.protocol.backup.restore-step",
-            Self::ReconcileRestore => "eliot.protocol.backup.restore-reconcile",
-            Self::RestoreStatus => "eliot.protocol.backup.restore-status",
-            Self::CompleteRehearsal => "eliot.protocol.backup.rehearsal-complete",
-            Self::AdmitCutover => "eliot.protocol.backup.cutover-admission",
-        }
-    }
-}
+/// This cell takes a direct `eliot-protocol` dependency precisely so the
+/// operation names and wire identities are never pinned copies: variant
+/// names, `as_str()` spellings and [`BackupOperationKind::wire_id`] are the
+/// owner's own definitions, and a new canonical variant becomes a compile
+/// error here until this registration table has reviewed it.
+pub use eliot_protocol::backup::BackupOperationKind;
 
 /// One Host-accepted backup owner method.
 ///
@@ -78,32 +37,30 @@ pub struct AcceptedOwnerMethod {
     pub needs_cutover_admission: bool,
 }
 
+impl AcceptedOwnerMethod {
+    /// Binds one accepted operation to its canonical wire identity.
+    ///
+    /// The wire identity is always [`BackupOperationKind::wire_id`] of `op`,
+    /// so a registered row can never carry a copied or drifted literal.
+    const fn new(op: BackupOperationKind, needs_cutover_admission: bool) -> Self {
+        Self {
+            op,
+            wire_id: op.wire_id(),
+            needs_cutover_admission,
+        }
+    }
+}
+
 /// Host-supported subset only: isolated-restore preparation, separately
 /// admitted cutover, and restore status/reconciliation reads. Capture
 /// operations (`RequestCapture`, `ReadSnapshotPage`, `VerifyArchive`),
 /// owner phase steps (`RestoreStep`), and rehearsal completion
 /// (`CompleteRehearsal`) are not owned by the Host and are excluded.
 const ACCEPTED_HOST_BACKUP_METHODS: &[AcceptedOwnerMethod] = &[
-    AcceptedOwnerMethod {
-        op: BackupOperationKind::PrepareIsolatedRestore,
-        wire_id: "eliot.protocol.backup.isolated-restore-prepare",
-        needs_cutover_admission: false,
-    },
-    AcceptedOwnerMethod {
-        op: BackupOperationKind::AdmitCutover,
-        wire_id: "eliot.protocol.backup.cutover-admission",
-        needs_cutover_admission: true,
-    },
-    AcceptedOwnerMethod {
-        op: BackupOperationKind::RestoreStatus,
-        wire_id: "eliot.protocol.backup.restore-status",
-        needs_cutover_admission: false,
-    },
-    AcceptedOwnerMethod {
-        op: BackupOperationKind::ReconcileRestore,
-        wire_id: "eliot.protocol.backup.restore-reconcile",
-        needs_cutover_admission: false,
-    },
+    AcceptedOwnerMethod::new(BackupOperationKind::PrepareIsolatedRestore, false),
+    AcceptedOwnerMethod::new(BackupOperationKind::AdmitCutover, true),
+    AcceptedOwnerMethod::new(BackupOperationKind::RestoreStatus, false),
+    AcceptedOwnerMethod::new(BackupOperationKind::ReconcileRestore, false),
 ];
 
 /// Returns the Host-supported backup owner-method table.

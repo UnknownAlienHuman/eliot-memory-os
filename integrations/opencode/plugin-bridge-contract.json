@@ -9,7 +9,8 @@
     "configuration": {
       "server_root_env": "ELIOT_OPENCODE_BRIDGE_URL",
       "bearer_token_env": "ELIOT_OPENCODE_BRIDGE_TOKEN",
-      "endpoint": "/v1/host-events"
+      "endpoint": "/v1/host-events",
+      "credential_materialization": "user_broker_materialized_child_projection_only__manually_set_env_is_not_an_admitted_installation_path"
     },
     "admission": [
       "http_only",
@@ -70,8 +71,37 @@
     "applies_when": "attached_task_and_mutating_tool",
     "tool_identity_ref": "tool_identity.mutating_tools",
     "failure_mode": "fail_closed",
-    "explicit_allow_decisions": ["recorded", "allow", "allowed", "pass"],
-    "explicit_deny_decision": "deny"
+    "explicit_allow_decisions": ["allow"],
+    "explicit_deny_decision": "deny",
+    "legacy_unverified_decisions": ["recorded", "allowed", "pass"],
+    "permit_requires": "host_event_response.verified_permit"
+  },
+  "host_event_response": {
+    "response_version": "eliot.opencode.host-event-response.v1",
+    "decisions": {
+      "allow": "verified_permit_for_this_exact_effect_only",
+      "deny": "verified_owner_refusal_with_closed_reason_code",
+      "recorded": "durable_observation_only_never_a_permit"
+    },
+    "verified_permit": [
+      "response_version_is_eliot.opencode.host-event-response.v1",
+      "event_id_and_effect_digest_equal_the_gate_request",
+      "installation_authority_epoch_and_state_fence_equal_the_projected_bindings",
+      "decision_is_allow",
+      "expires_at_ms_is_a_future_safe_integer",
+      "policy_revision_and_decision_receipt_are_present",
+      "response_commitment_verifies"
+    ],
+    "response_commitment": {
+      "algorithm": "hmac_sha256_hex_rfc2104",
+      "key": "broker_minted_request_credential_bytes",
+      "message": "utf8_of_json_array_response_version_event_id_effect_digest_decision_disposition_reason_code_installation_id_bridge_generation_authority_epoch_state_fence_policy_revision_authority_revision_expires_at_ms_event_receipt_decision_receipt_replayed",
+      "field_order": ["response_version", "event_id", "effect_digest", "decision", "disposition", "reason_code", "installation_id", "bridge_generation", "authority_epoch", "state_fence", "policy_revision", "authority_revision", "expires_at_ms", "event_receipt", "decision_receipt", "replayed"],
+      "absent_optionals": "null",
+      "encoders": ["serde_json_value_array", "JSON.stringify_array"]
+    },
+    "legacy_ceiling": "a_bare_decision_object_without_response_version_bindings_expiry_and_commitment_is_unverified_and_cannot_authorize_a_mutating_tool",
+    "deny_rendering": "locally_rendered_text_from_closed_reason_code_only"
   },
   "tool_identity": {
     "version": "eliot.opencode.tools.v1",

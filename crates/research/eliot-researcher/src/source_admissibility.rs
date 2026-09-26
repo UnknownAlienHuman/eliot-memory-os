@@ -11,12 +11,35 @@
 //! quarantine, is owned by [`crate::evidence_portfolio::SourceRecord`]. This
 //! module references that record rather than restating it, and adds only the
 //! eligibility decision an inquiry evidence set needs.
+//!
+//! # The two records, and which half is missing
+//!
+//! A positive admitted source has to show two distinct linked records. This
+//! module owns the first:
+//!
+//! 1. [`SourceAdmissibilityRecord`] — the Researcher's own decision for one
+//!    inquiry evidence set, committed to its own bytes and re-proved by
+//!    `validate_integrity`.
+//! 2. [`GovernorSourceTransitionRequest`] — the restricted proposal handed to
+//!    the Governor, also committed to its own bytes.
+//!
+//! The second half of the pair — the actual Governor/Kernel/Store commit
+//! receipt — is **the owner's and does not exist yet** in this repository: the
+//! Kernel's research-provider surface publishes exactly four operations
+//! (`dispatch`, `status`, `cancel`, `reconcile`) and none of them is a
+//! source-admission transition, so there is no named Governor transition this
+//! module could submit to. This domain therefore stops at a validated,
+//! tamper-evident proposal and never fabricates the owner half, never states a
+//! `pending`/`rejected`/`conflict`/`committed` outcome on the owner's behalf,
+//! and never re-reads a receipt it does not have. Anything beyond
+//! [`SourceAdmissibilityRecord::transition_request`] on the canonical path is
+//! BLOCKED on that transition existing.
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_research_exchange_api::{AllowedReferenceManifest, AnchorPrecision, DisclosureClass};
 
 use crate::evidence_portfolio::{SourceRecord, freeze, push_count, push_field, text};
@@ -259,19 +282,33 @@ pub struct SourceAdmissibilityRecord {
 
 /// Declared identity domain of [`SourceAdmissibilityRecord`].
 ///
-/// Bumped `v1` -> `v2` for two reasons, both of which change the bytes:
+/// Bumped `v2` -> `v3` because the preimage now binds the State Fence.
 ///
-/// 1. the preimage binds the source record's own canonical digest, and that
-///    digest moved to a new declared domain with a complete field set, so the
-///    same decision shape hashes differently than it did under `v1`;
-/// 2. an absent independence root was spelled as the sentinel string
-///    `unknown_lineage`, which collided with a real root carrying that name.
-///    Absence is now bound as its own declared state.
+/// The `v2` preimage named the inquiry, the evidence set, the profile, the
+/// source record, the scope, the eligibility, the taint, the independence root,
+/// the limits, the reasons and the assessment instant — and then published a
+/// `state_fence` field that no byte of the preimage covered. A decision read
+/// back after the fact could therefore carry a *different* fence than the one
+/// it was taken under and still re-prove its own digest: `validate_integrity`
+/// would report the substituted fence as the decision that was made. That is
+/// the same class of defect #2873 fixed for `SourceRecord`, where a hand-written
+/// field list named ten of the record's twenty-nine fields, and it is why the
+/// fence is now inside the preimage.
+///
+/// Two earlier bumps, kept here because the domain string is the only place a
+/// reader can find the whole history:
+///
+/// - `v1` -> `v2` for two reasons, both of which change the bytes: the preimage
+///   began binding the source record's own canonical digest, and that digest
+///   moved to a new declared domain with a complete field set; and an absent
+///   independence root was spelled as the sentinel string `unknown_lineage`,
+///   which collided with a real root carrying that name.
+/// - `v1` is the first spelling.
 ///
 /// A named constant rather than an inline literal, so a consumer or a migration
 /// check can name the domain it must reject instead of matching on a string
 /// buried in a function body.
-pub const SOURCE_ADMISSIBILITY_DIGEST_DOMAIN: &str = "source-admissibility/v2";
+pub const SOURCE_ADMISSIBILITY_DIGEST_DOMAIN: &str = "source-admissibility/v3";
 
 impl SourceAdmissibilityRecord {
     /// Decides whether one vetted source may enter one inquiry evidence set.
@@ -362,7 +399,7 @@ impl SourceAdmissibilityRecord {
     /// computable canonical commitment. A Governor-facing request must not carry
     /// an invented or empty source identity, so this refuses instead.
     pub fn transition_request(&self) -> Result<GovernorSourceTransitionRequest, InquiryError> {
-        Ok(GovernorSourceTransitionRequest {
+        let mut request = GovernorSourceTransitionRequest {
             request_kind: GovernorSourceTransitionRequest::REQUEST_KIND.to_owned(),
             inquiry_id: self.inquiry_id.clone(),
             evidence_set_id: self.evidence_set_id.clone(),
@@ -377,7 +414,10 @@ impl SourceAdmissibilityRecord {
             state_fence: self.state_fence.clone(),
             candidate_only: true,
             canonical_write_authorized: false,
-        })
+            request_digest: String::new(),
+        };
+        request.request_digest = request.compute_digest()?;
+        Ok(request)
     }
 
     /// Canonical digest over the whole decision shape.
@@ -444,6 +484,24 @@ impl SourceAdmissibilityRecord {
             "assessment_time_ms",
             &self.assessment_time_ms.to_string(),
         );
+        // The fence is bound as the typed value it is, through the shared
+        // canonical serializer, so its five components are bound by their own
+        // contract spellings rather than by whatever a `Debug` render or a
+        // hand-written field list happened to name. This is what makes
+        // `state_fence` a fact about the decision instead of a free field
+        // printed beside it: a decision whose fence was rewritten after the
+        // fact no longer re-proves its own digest.
+        let fence =
+            canonical_json_bytes(&self.state_fence).map_err(|_| InquiryError::Unencodable {
+                field: "admissibility.state_fence",
+            })?;
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &String::from_utf8(fence).map_err(|_| InquiryError::Unencodable {
+                field: "admissibility.state_fence",
+            })?,
+        );
         Ok(freeze(&preimage))
     }
 
@@ -472,6 +530,26 @@ impl SourceAdmissibilityRecord {
 ///
 /// The domain records the decision; the Governor applies it. The request carries
 /// no canonical-write authority and cannot finish a task.
+///
+/// # Why this request carries its own digest
+///
+/// This record is the boundary artefact: it is the only thing the Researcher
+/// hands across, and it is the half of the pair that a Governor, a Kernel or a
+/// Store reads. Every identity in it — the inquiry, the evidence set, the
+/// profile revision, the source handle, the source record's own digest, the
+/// eligibility, the exact scope and the State Fence — is a *fact about a
+/// decision*, and a request whose fields were rewritten after it was built
+/// would carry those facts without carrying any trace of the rewrite. So the
+/// request commits to its own bytes.
+///
+/// Without that commitment the acceptance requirement this record exists for is
+/// not reachable: "forged source eligibility … cannot change canonical state"
+/// holds at the *receiving* authority only if the request the Researcher emitted
+/// is itself tamper-evident, because the receiving authority has no other way to
+/// tell the decision the Researcher made from a request someone edited in
+/// flight. `request_digest` is the half of the two-record pair that lives on this
+/// side of the boundary; the other half — the Governor/Kernel/Store commit
+/// receipt — is the owner's and does not exist yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernorSourceTransitionRequest {
     /// Closed request-kind discriminator.
@@ -502,11 +580,149 @@ pub struct GovernorSourceTransitionRequest {
     pub candidate_only: bool,
     /// Always false: this domain never authorizes a canonical write.
     pub canonical_write_authorized: bool,
+    /// Digest over every field above, and over the State Fence as its own
+    /// canonical encoding.
+    pub request_digest: String,
 }
 
 impl GovernorSourceTransitionRequest {
     /// Closed request-kind discriminator for a source transition.
     pub const REQUEST_KIND: &'static str = "inquiry_source_admissibility";
+
+    /// Declared identity domain of this request.
+    ///
+    /// `v1` is the first spelling and the only one: the request committed to its
+    /// own bytes from the beginning, so there is no earlier domain to reject. It
+    /// is a named constant rather than an inline literal so a receiving
+    /// authority can name the domain it must accept instead of matching on a
+    /// string buried in a function body.
+    pub const REQUEST_DIGEST_DOMAIN: &'static str = "inquiry-source-admission-request/v1";
+
+    /// Canonical digest over the whole request shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::Unencodable`] when the bound State Fence has no
+    /// canonical encoding. A request that cannot commit to its own fence has no
+    /// request identity, so this refuses rather than hashing a shortened
+    /// preimage.
+    ///
+    /// The field list below is hand-written, so it is coupled to the struct
+    /// above by hand rather than by the compiler — the same hazard #2873 fixed
+    /// for `SourceRecord`. It is stated here rather than left implicit: a field
+    /// added to the struct without a line in this preimage would be published
+    /// beside a digest that does not cover it, and `validate_integrity` would
+    /// report the edited request as the one that was made.
+    fn compute_digest(&self) -> Result<String, InquiryError> {
+        let mut preimage = String::from(Self::REQUEST_DIGEST_DOMAIN);
+        push_field(&mut preimage, "request_kind", &self.request_kind);
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
+        push_field(&mut preimage, "profile_id", &self.profile_id);
+        push_field(
+            &mut preimage,
+            "profile_revision",
+            &self.profile_revision.to_string(),
+        );
+        push_field(&mut preimage, "profile_digest", &self.profile_digest);
+        push_field(&mut preimage, "source_handle", &self.source_handle);
+        push_field(
+            &mut preimage,
+            "source_record_digest",
+            &self.source_record_digest,
+        );
+        push_field(&mut preimage, "eligibility", self.eligibility.wire_name());
+        push_field(
+            &mut preimage,
+            "admissibility_digest",
+            &self.admissibility_digest,
+        );
+        push_field(&mut preimage, "scope", &self.scope);
+        let fence =
+            canonical_json_bytes(&self.state_fence).map_err(|_| InquiryError::Unencodable {
+                field: "source_transition_request.state_fence",
+            })?;
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &String::from_utf8(fence).map_err(|_| InquiryError::Unencodable {
+                field: "source_transition_request.state_fence",
+            })?,
+        );
+        push_field(
+            &mut preimage,
+            "candidate_only",
+            if self.candidate_only { "true" } else { "false" },
+        );
+        push_field(
+            &mut preimage,
+            "canonical_write_authorized",
+            if self.canonical_write_authorized {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        Ok(freeze(&preimage))
+    }
+
+    /// Re-proves this request's own digest over the bytes actually present.
+    ///
+    /// This is the readback check a constructor cannot perform. A request
+    /// reloaded or relayed after the fact still has individually well-formed
+    /// fields — a rewritten scope, a rewritten eligibility, a rewritten fence
+    /// and a rewritten source handle are all individually legal values — and
+    /// only recomputing the commitment over the bytes present can say that it is
+    /// no longer the request that was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one, and [`InquiryError::Unencodable`] when the
+    /// fence has no canonical encoding.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.compute_digest()? != self.request_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "source_transition_request.request_digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for GovernorSourceTransitionRequest {
+    /// Renders the request as one bounded, secret-free key/value line.
+    ///
+    /// Only identities, digests, the closed eligibility spelling, the scope and
+    /// the two authority flags appear. No source content, provider prose or
+    /// credential is reproduced, and the line names the request kind and its own
+    /// digest so a reader can match it against the decision it came from.
+    ///
+    /// This is the Researcher half of the two records a positive admitted source
+    /// must show. It deliberately prints no commit receipt, because this domain
+    /// has none: the Governor/Kernel/Store receipt is the owner's, and printing
+    /// a placeholder for it would be exactly the false proof claim A0.3 forbids.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "request_kind={} inquiry={} evidence_set={} profile={}@{} \
+             source={} source_record={} admissibility={} eligibility={} \
+             scope={} request={} candidate_only={} canonical_write_authorized={}",
+            self.request_kind,
+            self.inquiry_id,
+            self.evidence_set_id,
+            self.profile_id,
+            self.profile_revision,
+            self.source_handle,
+            self.source_record_digest,
+            self.admissibility_digest,
+            self.eligibility.wire_name(),
+            self.scope,
+            self.request_digest,
+            self.candidate_only,
+            self.canonical_write_authorized,
+        )
+    }
 }
 
 /// Derives the highest anchor precision a vetted record may be cited at.

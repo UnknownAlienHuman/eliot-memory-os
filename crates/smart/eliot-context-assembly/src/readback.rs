@@ -80,6 +80,14 @@ pub fn gate_citation(
         .validate()
         .map_err(|_| unsupported("readback.reopened.invalid"))?;
 
+    // An index/vector preview stays a non-authoritative preview. A preview
+    // that claims a revision other than the admitted one describes bytes this
+    // gate has not read back, so the read is replanned instead of citing the
+    // convenient bytes the preview happens to carry.
+    if request.preview.claimed_revision != request.admitted.revision {
+        return Err(replan("readback.preview.revision_drift"));
+    }
+
     if request.view != reopened.view {
         return Err(replan("readback.view.mismatch"));
     }
@@ -107,11 +115,11 @@ pub fn gate_citation(
     }
 
     verify_full_source(&request.admitted, &reopened.bytes)?;
-    let excerpt = resolve_anchor(&request.anchor, &reopened.bytes)?;
+    let (anchor, excerpt) = resolve_anchor(&request.anchor, &reopened.bytes)?;
 
     let citation = ProjectedCitation {
         source_revision: request.admitted.clone(),
-        anchor: request.anchor.clone(),
+        anchor,
         view: request.view.clone(),
         workspace_revision: request.workspace_revision.clone(),
         fence: request.fence.clone(),
@@ -145,9 +153,20 @@ fn verify_full_source(
     Ok(())
 }
 
-fn resolve_anchor(anchor: &SourceAnchorHandle, bytes: &[u8]) -> Result<Vec<u8>, ReadbackRefusal> {
-    let start = usize::try_from(anchor.byte_offset)
-        .map_err(|_| unsupported("readback.anchor.offset_overflow"))?;
+fn resolve_anchor(
+    anchor: &SourceAnchorHandle,
+    bytes: &[u8],
+) -> Result<(SourceAnchorHandle, Vec<u8>), ReadbackRefusal> {
+    // An owner that does not use raw byte offsets records the native
+    // coordinate mapping on the anchor handle; that mapping — not the
+    // uninterpreted raw offset — then decides where the excerpt starts.
+    // Either way the excerpt length and digest stay owner-issued and are
+    // verified against the reopened bytes below.
+    let start = match anchor.native_mapping.as_deref() {
+        Some(mapping) => native_mapping_offset(mapping, bytes)?,
+        None => usize::try_from(anchor.byte_offset)
+            .map_err(|_| unsupported("readback.anchor.offset_overflow"))?,
+    };
     let length = usize::try_from(anchor.byte_length)
         .map_err(|_| unsupported("readback.anchor.length_overflow"))?;
     let end = start
@@ -163,5 +182,72 @@ fn resolve_anchor(anchor: &SourceAnchorHandle, bytes: &[u8]) -> Result<Vec<u8>, 
             Some(anchor.anchor_id.clone()),
         ));
     }
-    Ok(excerpt)
+    let resolved = match u64::try_from(start) {
+        Ok(resolved_offset) => {
+            let mut resolved = anchor.clone();
+            resolved.byte_offset = resolved_offset;
+            resolved
+        }
+        Err(_) => anchor.clone(),
+    };
+    Ok((resolved, excerpt))
+}
+
+/// Resolves one closed native coordinate mapping to a byte offset in the
+/// reopened bytes.
+///
+/// The grammar is the owner-facing `line:<n>;column:<n>` pair, both one-based
+/// and counted over the reopened bytes' own `LF` line breaks. No other
+/// syntax is admitted, and a mapping that does not address a position inside
+/// the reopened bytes is a typed refusal, never a silent fall back to the raw
+/// offset the owner does not use.
+fn native_mapping_offset(mapping: &str, bytes: &[u8]) -> Result<usize, ReadbackRefusal> {
+    let (line, column) = parse_native_mapping(mapping)?;
+    let line_index = line - 1;
+    let mut line_start = 0usize;
+    for _ in 0..line_index {
+        let next = bytes[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| line_start + index + 1)
+            .ok_or_else(|| unsupported("readback.anchor.mapping_unresolvable"))?;
+        line_start = next;
+    }
+    if line_start > bytes.len() {
+        return Err(unsupported("readback.anchor.mapping_unresolvable"));
+    }
+    let line_end = bytes[line_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |index| line_start + index);
+    let offset = line_start
+        .checked_add(column - 1)
+        .filter(|offset| *offset <= line_end)
+        .ok_or_else(|| unsupported("readback.anchor.mapping_unresolvable"))?;
+    Ok(offset)
+}
+
+/// Parses the closed `line:<n>;column:<n>` native coordinate mapping.
+fn parse_native_mapping(mapping: &str) -> Result<(usize, usize), ReadbackRefusal> {
+    let mut line: Option<usize> = None;
+    let mut column: Option<usize> = None;
+    for field in mapping.split(';') {
+        let (name, value) = field
+            .split_once(':')
+            .ok_or_else(|| unsupported("readback.anchor.mapping_invalid"))?;
+        let parsed = value
+            .parse::<usize>()
+            .ok()
+            .filter(|parsed| *parsed > 0)
+            .ok_or_else(|| unsupported("readback.anchor.mapping_invalid"))?;
+        match name {
+            "line" if line.is_none() => line = Some(parsed),
+            "column" if column.is_none() => column = Some(parsed),
+            _ => return Err(unsupported("readback.anchor.mapping_invalid")),
+        }
+    }
+    match (line, column) {
+        (Some(line), Some(column)) => Ok((line, column)),
+        _ => Err(unsupported("readback.anchor.mapping_invalid")),
+    }
 }

@@ -67,6 +67,7 @@ mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
 mod reactive_admission;
+mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
@@ -137,7 +138,10 @@ pub use observation_reconciliation::{
     WatchdogEntryKind,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
-pub use owner_closure_feed::{OwnerPublishPort, publish_owner_feed, synchronize_owner_feed};
+pub use owner_closure_feed::{
+    OwnerPublishPort, publish_owner_feed, synchronize_owner_feed,
+    synchronize_owner_feed_with_canonical_receipts,
+};
 pub use owner_closure_provider::{
     AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
     OWNER_HYDRATION_SNAPSHOT_SCHEMA, OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider,
@@ -147,6 +151,7 @@ pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,
     assess_reactive_risk, bind_atom_risk,
 };
+pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
 pub use scope_identity_admission::{
     BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
     HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,

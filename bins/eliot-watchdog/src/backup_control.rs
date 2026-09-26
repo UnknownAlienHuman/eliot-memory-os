@@ -192,72 +192,56 @@ impl BackupControlRegistration {
     }
 }
 
-/// Closed backup operation vocabulary mirrored from the protocol wire
-/// (`crates/foundation/eliot-protocol/src/backup.rs`, `BackupOperationKind`).
+/// The closed backup operation vocabulary, consumed from its canonical owner.
 ///
-/// Local mirror so this composition root adds no new Cargo dependency and no
-/// transport semantics; wire names match the protocol exactly.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum BackupOperationKind {
-    RequestCapture,
-    ReadSnapshotPage,
-    VerifyArchive,
-    PrepareIsolatedRestore,
-    RestoreStep,
-    ReconcileRestore,
-    RestoreStatus,
-    CompleteRehearsal,
-    AdmitCutover,
-}
-
-impl BackupOperationKind {
-    /// Returns the stable wire name of this operation.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RequestCapture => "REQUEST_CAPTURE",
-            Self::ReadSnapshotPage => "READ_SNAPSHOT_PAGE",
-            Self::VerifyArchive => "VERIFY_ARCHIVE",
-            Self::PrepareIsolatedRestore => "PREPARE_ISOLATED_RESTORE",
-            Self::RestoreStep => "RESTORE_STEP",
-            Self::ReconcileRestore => "RECONCILE_RESTORE",
-            Self::RestoreStatus => "RESTORE_STATUS",
-            Self::CompleteRehearsal => "COMPLETE_REHEARSAL",
-            Self::AdmitCutover => "ADMIT_CUTOVER",
-        }
-    }
-}
+/// The nine-variant operation family, its `as_str()` spellings and its
+/// operation-to-wire mapping are owned by `eliot-protocol`
+/// (`crates/foundation/eliot-protocol/src/backup.rs`). This composition root
+/// already depends on that crate, so the vocabulary is re-exported rather than
+/// mirrored: the Watchdog owns only which operations it *recognizes* and what
+/// it does with each one, never a second spelling of the family.
+pub use eliot_protocol::backup::BackupOperationKind;
 
 /// One Watchdog-accepted backup method: wire identity plus closed operation.
 ///
 /// Limited to the Watchdog-supported subset; rehearsal never maps to cutover
 /// and `ADMIT_CUTOVER` / `PREPARE_ISOLATED_RESTORE` are never present here.
+///
+/// [`wire_id`](Self::wire_id) is always the canonical wire identity of
+/// [`op`](Self::op), taken from the owner's total
+/// [`BackupOperationKind::wire_id`] lookup, so the record can never carry a
+/// copied or drifted literal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AcceptedWatchdogBackupMethod {
-    /// Stable protocol wire identity (mirrors `BACKUP_*_WIRE_ID`).
+    /// Stable protocol wire identity, derived from `op`.
     pub wire_id: &'static str,
     /// Closed operation bound to the wire identity.
     pub op: BackupOperationKind,
 }
 
-/// Closed Watchdog-supported backup method table.
+impl AcceptedWatchdogBackupMethod {
+    /// Binds one recognized operation to its canonical wire identity.
+    const fn new(op: BackupOperationKind) -> Self {
+        Self {
+            wire_id: op.wire_id(),
+            op,
+        }
+    }
+}
+
+/// Closed Watchdog-recognized backup method table.
+///
+/// Membership is recognition, not executable capability: `VERIFY_ARCHIVE` and
+/// `RESTORE_STATUS` are recognized here precisely so
+/// [`BackupControlHandle::dispatch`] can refuse them with an explicit typed
+/// refusal instead of dropping them silently. The wire identity of every row
+/// is derived from the canonical owner, so this table holds no
+/// `eliot.protocol.backup.*` literal.
 static ACCEPTED_WATCHDOG_BACKUP_METHODS: [AcceptedWatchdogBackupMethod; 4] = [
-    AcceptedWatchdogBackupMethod {
-        wire_id: "eliot.protocol.backup.snapshot-page-read",
-        op: BackupOperationKind::ReadSnapshotPage,
-    },
-    AcceptedWatchdogBackupMethod {
-        wire_id: "eliot.protocol.backup.archive-verification",
-        op: BackupOperationKind::VerifyArchive,
-    },
-    AcceptedWatchdogBackupMethod {
-        wire_id: "eliot.protocol.backup.restore-status",
-        op: BackupOperationKind::RestoreStatus,
-    },
-    AcceptedWatchdogBackupMethod {
-        wire_id: "eliot.protocol.backup.restore-reconcile",
-        op: BackupOperationKind::ReconcileRestore,
-    },
+    AcceptedWatchdogBackupMethod::new(BackupOperationKind::ReadSnapshotPage),
+    AcceptedWatchdogBackupMethod::new(BackupOperationKind::VerifyArchive),
+    AcceptedWatchdogBackupMethod::new(BackupOperationKind::RestoreStatus),
+    AcceptedWatchdogBackupMethod::new(BackupOperationKind::ReconcileRestore),
 ];
 
 /// Returns the closed Watchdog-supported backup method table.
@@ -414,6 +398,12 @@ impl BackupControlHandle {
     /// exists — so the correct outcome until a real archive verifier and a real
     /// restore-status projection exist is refusal, never a fabricated success.
     ///
+    /// The disposition match is exhaustive over the whole canonical operation
+    /// vocabulary, with no wildcard arm: a new canonical variant is a compile
+    /// error here until the Watchdog's disposition for it is reviewed, and the
+    /// five operations outside the closed recognized subset are refused
+    /// explicitly before any owner effect.
+    ///
     /// # Errors
     ///
     /// Returns [`BackupControlError::Rejected`] when the handle is not started,
@@ -444,55 +434,73 @@ impl BackupControlHandle {
                     .to_owned(),
             ));
         }
-        match (accepted.op, request) {
-            (
-                BackupOperationKind::ReadSnapshotPage,
-                WatchdogBackupRequest::ReadSnapshotPage { fence, page_index },
-            ) => self
-                .port
-                .read_page(fence, *page_index)
-                .map(WatchdogBackupOutcome::SnapshotPage)
-                .map_err(BackupControlError::OwnerRefused),
-            (
-                BackupOperationKind::ReconcileRestore,
-                WatchdogBackupRequest::ReconcileRestore {
+        match accepted.op {
+            BackupOperationKind::ReadSnapshotPage => {
+                let WatchdogBackupRequest::ReadSnapshotPage { fence, page_index } = request else {
+                    return Err(BackupControlError::Rejected(format!(
+                        "watchdog backup control rejects a {} request dispatched as {}",
+                        request_operation_name(request),
+                        accepted.op.as_str()
+                    )));
+                };
+                self.port
+                    .read_page(fence, *page_index)
+                    .map(WatchdogBackupOutcome::SnapshotPage)
+                    .map_err(BackupControlError::OwnerRefused)
+            }
+            BackupOperationKind::ReconcileRestore => {
+                let WatchdogBackupRequest::ReconcileRestore {
                     source_installation,
                     dest_installation,
                     active_installation,
                     steps,
-                },
-            ) => self
-                .port
-                .import_isolated(
-                    source_installation,
-                    dest_installation,
-                    active_installation,
-                    steps,
-                )
-                .map(WatchdogBackupOutcome::Restore)
-                .map_err(BackupControlError::OwnerRefused),
-            (BackupOperationKind::VerifyArchive | BackupOperationKind::RestoreStatus, _) => {
+                } = request
+                else {
+                    return Err(BackupControlError::Rejected(format!(
+                        "watchdog backup control rejects a {} request dispatched as {}",
+                        request_operation_name(request),
+                        accepted.op.as_str()
+                    )));
+                };
+                self.port
+                    .import_isolated(
+                        source_installation,
+                        dest_installation,
+                        active_installation,
+                        steps,
+                    )
+                    .map(WatchdogBackupOutcome::Restore)
+                    .map_err(BackupControlError::OwnerRefused)
+            }
+            BackupOperationKind::VerifyArchive | BackupOperationKind::RestoreStatus => {
                 Err(BackupControlError::Rejected(format!(
                     "watchdog backup control refuses {}; this owner holds no domain attestation for it and a transport acknowledgement never establishes success",
                     accepted.op.as_str()
                 )))
             }
-            _ => Err(BackupControlError::Rejected(format!(
-                "watchdog backup control rejects a {} request dispatched as {}",
-                request_operation_name(request),
+            BackupOperationKind::RequestCapture
+            | BackupOperationKind::PrepareIsolatedRestore
+            | BackupOperationKind::RestoreStep
+            | BackupOperationKind::CompleteRehearsal
+            | BackupOperationKind::AdmitCutover => Err(BackupControlError::Rejected(format!(
+                "watchdog backup control rejects {}; it is outside the closed recognized subset and fails before any owner effect",
                 accepted.op.as_str()
             ))),
         }
     }
 }
 
-/// Returns the closed operation name a request variant belongs to.
+/// Returns the canonical operation name a request variant belongs to.
 const fn request_operation_name(request: &WatchdogBackupRequest<'_>) -> &'static str {
     match request {
-        WatchdogBackupRequest::ReadSnapshotPage { .. } => "READ_SNAPSHOT_PAGE",
-        WatchdogBackupRequest::ReconcileRestore { .. } => "RECONCILE_RESTORE",
-        WatchdogBackupRequest::VerifyArchive => "VERIFY_ARCHIVE",
-        WatchdogBackupRequest::RestoreStatus => "RESTORE_STATUS",
+        WatchdogBackupRequest::ReadSnapshotPage { .. } => {
+            BackupOperationKind::ReadSnapshotPage.as_str()
+        }
+        WatchdogBackupRequest::ReconcileRestore { .. } => {
+            BackupOperationKind::ReconcileRestore.as_str()
+        }
+        WatchdogBackupRequest::VerifyArchive => BackupOperationKind::VerifyArchive.as_str(),
+        WatchdogBackupRequest::RestoreStatus => BackupOperationKind::RestoreStatus.as_str(),
     }
 }
 

@@ -8,7 +8,9 @@
 # operation name, the binding shape, and the deadline via an injected clock,
 # invokes the operation scriptblock, and validates the result carries no
 # forbidden authority (testDenominator/providerChoice/command/argv/executable/
-# shellCommand/testPassed/markPassed/verdictOverride).
+# shellCommand/testPassed/markPassed/verdictOverride). The dispatcher clones the
+# caller binding into dispatcher-local scope, snapshots the proven run identity
+# before invoking the implementation, and rejects any post-invocation mutation.
 #
 # Fail-closed rules enforced here:
 # - Exact Store class (STORE) plus provider revision plus lock identity
@@ -24,6 +26,9 @@
 #   (resourceKey/runId/testClass/providerRevision/owner/generation) and never
 #   carries shellCommand/executablePath/rawArgv/url/credential/environmentMap/
 #   outputPath. Plan performs no filesystem, process, port, or network action.
+#   When the requirement carries requiredReceipts (store-receipt/git-receipt
+#   descriptors bound by testClass+providerRevision+runId), Plan consumes and
+#   binds the accepted set and Allocate re-validates it before deriving roots.
 # - Allocate mints unique owned data/log/secret roots under the admitted run
 #   root with the owner marker eliot-harness-owned-root-v1, derives
 #   namespace/database from the run identity, and reserves a loopback endpoint
@@ -88,6 +93,7 @@ $Script:StoreDigest = '13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e
 $Script:StoreRequiredSchemaDigest = 'c238689ab71773c1b1ecffe8052a7dcd1b82c4e0feb509cf0b55c38596fcbb5c'
 $Script:StoreOwnedRootMarker = 'eliot-harness-owned-root-v1'
 $Script:StoreLoopback = '127.0.0.1'
+$Script:StoreGitReceiptRevision = 'eliot.integration.git-provider.v1'
 
 $Script:StoreClosedOperations = @(
     'ValidateRequirement',
@@ -378,9 +384,19 @@ function Invoke-StoreProviderOperation {
     }
     [void](Test-StoreBindingShape -Binding $Binding)
     [void](Resolve-StoreDeadline -Binding $Binding -Clock $Clock -Operation $Operation)
+    $localBinding = @{}
+    foreach ($key in @($Binding.Keys)) {
+        $localBinding[$key] = $Binding[$key]
+    }
+    $provenRunId = [string]$localBinding['runId']
+    $provenBinding = @{
+        runId            = $provenRunId
+        testClass        = [string]$localBinding['testClass']
+        providerRevision = [string]$localBinding['providerRevision']
+    }
     $context = @{
         operation = $Operation
-        binding   = $Binding
+        binding   = $localBinding
         arguments = $Arguments
     }
     $raw = $null
@@ -404,7 +420,11 @@ function Invoke-StoreProviderOperation {
         throw [System.InvalidOperationException]::new(
             "STORE-PROVIDER-FAILED:$Operation : provider result must be a hashtable.")
     }
-    [void](Test-StoreProviderResultClosed -Result $result -Binding $Binding)
+    if ([string]$localBinding['runId'] -cne $provenRunId) {
+        throw [System.InvalidOperationException]::new(
+            'STORE-PROVIDER-FORBIDDEN: provider mutated the binding run identity.')
+    }
+    [void](Test-StoreProviderResultClosed -Result $result -Binding $provenBinding)
     return $result
 }
 
@@ -499,6 +519,11 @@ function Invoke-StorePlan {
     $runId = [string]$Binding['runId']
     $owner = [string]$Binding['owner']
     $gen = [int]$Binding['generation']
+    $consumedReceipts = @()
+    if ($Requirement.ContainsKey('requiredReceipts') -and $null -ne $Requirement['requiredReceipts']) {
+        $consumedReceipts = @($Requirement['requiredReceipts'])
+        [void](Test-StoreRequiredReceiptSet -RequiredReceipts $consumedReceipts -RunId $runId)
+    }
     $resources = @(
         @{ resourceKey = 'surreal-data'; testClass = $Script:StoreTestClass; providerRevision = $Script:StoreProviderRevision; runId = $runId; owner = $owner; generation = $gen },
         @{ resourceKey = 'surreal-logs'; testClass = $Script:StoreTestClass; providerRevision = $Script:StoreProviderRevision; runId = $runId; owner = $owner; generation = $gen },
@@ -523,6 +548,7 @@ function Invoke-StorePlan {
         generation       = $gen
         resources        = $resources
         mutationFree     = $true
+        requiredReceipts = $consumedReceipts
     }
 }
 
@@ -667,6 +693,101 @@ function New-StoreEphemeralCredential {
     }
 }
 
+function Test-StoreProviderReceipt {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Receipt
+    )
+    foreach ($field in @('testClass', 'providerRevision', 'runId', 'digest', 'issuer')) {
+        if (-not $Receipt.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Receipt[$field])) {
+            throw [System.ArgumentException]::new("STORE-INVALID-RECEIPT: provider receipt is missing '$field'.")
+        }
+    }
+    $class = [string]$Receipt['testClass']
+    if ($class -cne 'STORE' -and $class -cne 'GIT') {
+        throw [System.InvalidOperationException]::new(
+            "STORE-RECEIPT-CLASS: provider receipt class '$class' is not an accepted dependency lane.")
+    }
+    $expectedRevision = $Script:StoreProviderRevision
+    $expectedIssuer = 'store-provider-owner'
+    if ($class -ceq 'GIT') {
+        $expectedRevision = $Script:StoreGitReceiptRevision
+        $expectedIssuer = 'git-provider-owner'
+    }
+    if ([string]$Receipt['providerRevision'] -cne $expectedRevision) {
+        throw [System.InvalidOperationException]::new(
+            'STORE-RECEIPT-REVISION: provider receipt revision is not the accepted lane revision.')
+    }
+    if ([string]$Receipt['runId'] -cnotmatch '^[0-9a-f]{32}$') {
+        throw [System.ArgumentException]::new('STORE-INVALID-RECEIPT: receipt runId must be 32 lowercase hex.')
+    }
+    [void](Test-StoreDigestFormat -Digest ([string]$Receipt['digest']))
+    if ([string]$Receipt['issuer'] -cne $expectedIssuer) {
+        throw [System.InvalidOperationException]::new(
+            'STORE-RECEIPT-UNFABRICABLE: receipt issuer is not the lane owner; self-minted receipts are rejected.')
+    }
+    return $true
+}
+
+function Test-StoreRequiredReceiptSet {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$RequiredReceipts,
+        [Parameter(Mandatory)]
+        [string]$RunId
+    )
+    $seen = @{}
+    foreach ($entry in @($RequiredReceipts)) {
+        if ($null -eq $entry -or $entry -isnot [hashtable]) {
+            throw [System.ArgumentException]::new('STORE-INVALID-RECEIPT: required receipt entry must be a hashtable.')
+        }
+        foreach ($key in @($entry.Keys)) {
+            if ([string]$key -cnotin @('kind', 'testClass', 'providerRevision', 'runId', 'digest', 'issuer')) {
+                throw [System.ArgumentException]::new(
+                    "STORE-INVALID-RECEIPT: required receipt carries an unexpected field '$key'.")
+            }
+        }
+        foreach ($field in @('kind', 'testClass', 'providerRevision', 'runId')) {
+            if (-not $entry.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$entry[$field])) {
+                throw [System.ArgumentException]::new("STORE-INVALID-RECEIPT: required receipt is missing '$field'.")
+            }
+        }
+        $kind = [string]$entry['kind']
+        $class = [string]$entry['testClass']
+        $paired = (($kind -ceq 'store-receipt' -and $class -ceq 'STORE') -or ($kind -ceq 'git-receipt' -and $class -ceq 'GIT'))
+        if (-not $paired) {
+            throw [System.InvalidOperationException]::new(
+                "STORE-RECEIPT-KIND: required receipt kind '$kind' does not pair with class '$class'.")
+        }
+        $expectedRevision = $Script:StoreProviderRevision
+        if ($class -ceq 'GIT') {
+            $expectedRevision = $Script:StoreGitReceiptRevision
+        }
+        if ([string]$entry['providerRevision'] -cne $expectedRevision) {
+            throw [System.InvalidOperationException]::new(
+                'STORE-RECEIPT-REVISION: required receipt revision is not the accepted lane revision.')
+        }
+        if ([string]$entry['runId'] -cne $RunId) {
+            throw [System.InvalidOperationException]::new(
+                'STORE-RECEIPT-FOREIGN: required receipt run identity does not match the binding.')
+        }
+        if ($seen.ContainsKey($kind)) {
+            throw [System.InvalidOperationException]::new(
+                "STORE-RECEIPT-DUPLICATE: required receipt kind '$kind' appears more than once.")
+        }
+        $seen[$kind] = $true
+        if ($entry.ContainsKey('digest') -or $entry.ContainsKey('issuer')) {
+            [void](Test-StoreProviderReceipt -Receipt $entry)
+        }
+    }
+    return $true
+}
+
 function Get-StoreRedactedText {
     [CmdletBinding()]
     [OutputType([psobject])]
@@ -764,6 +885,11 @@ function Invoke-StoreAllocate {
         [scriptblock]$PortReservation
     )
     [void](Test-StoreBindingShape -Binding $Binding)
+    $consumedReceipts = @()
+    if ($Plan.ContainsKey('requiredReceipts') -and $null -ne $Plan['requiredReceipts']) {
+        $consumedReceipts = @($Plan['requiredReceipts'])
+        [void](Test-StoreRequiredReceiptSet -RequiredReceipts $consumedReceipts -RunId ([string]$Binding['runId']))
+    }
     if ([string]$Plan['runId'] -cne [string]$Binding['runId']) {
         throw [System.InvalidOperationException]::new('STORE-ALLOCATION-MISMATCH: plan run identity does not match binding.')
     }
@@ -848,6 +974,7 @@ function Invoke-StoreAllocate {
         owner          = $owner
         generation     = $gen
         allocationSeed = $nonce
+        requiredReceipts = $consumedReceipts
     }
 }
 
@@ -1435,6 +1562,8 @@ Export-ModuleMember -Function @(
     'Resolve-StoreOwnedPath',
     'Get-StoreChildEnv',
     'New-StoreEphemeralCredential',
+    'Test-StoreProviderReceipt',
+    'Test-StoreRequiredReceiptSet',
     'Get-StoreRedactedText',
     'Invoke-StoreAllocate',
     'Invoke-StoreStart',

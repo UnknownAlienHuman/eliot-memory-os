@@ -761,6 +761,7 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
         engine_binding.clone(),
         component_digest.clone(),
         configuration_digest.clone(),
+        operation_id,
     );
     let ports = RuntimePorts::new(
         Box::new(admission.clone()),
@@ -777,6 +778,7 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
         engine_binding.clone(),
         component_digest.clone(),
         configuration_digest.clone(),
+        operation_id,
     );
     let mut runner = must(
         WasmHostRunner::with_wasmtime_engine(
@@ -932,7 +934,7 @@ fn compose_negative(
     engine_binding: &EngineBinding,
     isolated: bool,
 ) -> (WasmHostRunner, AdmittedGeneration) {
-    let (executor, staged) = if let Some(operation_id) = stage_operation_id {
+    let (executor, staged, stage_id) = if let Some(operation_id) = stage_operation_id {
         let mut authority = test_authority();
         let fence = must(FencingToken::new(
             test_epoch(),
@@ -943,7 +945,7 @@ fn compose_negative(
         let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(FakePort::new(
             authority, fence,
         ))));
-        (executor, Some(staged))
+        (executor, Some(staged), Some(operation_id))
     } else {
         let authority = test_authority();
         let fence = must(FencingToken::new(
@@ -954,7 +956,7 @@ fn compose_negative(
         let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(FakePort::new(
             authority, fence,
         ))));
-        (executor, None)
+        (executor, None, None)
     };
     let sink = Arc::new(RecordingSink::default());
     let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
@@ -975,6 +977,7 @@ fn compose_negative(
             engine_binding.clone(),
             slot_digest,
             Sha256Digest::of_bytes(JOINED_COMPONENT_CONFIGURATION),
+            stage_id.as_deref().unwrap_or("unstaged-negative"),
         );
         RuntimePorts::new(
             Box::new(admission),
@@ -1012,6 +1015,7 @@ fn compose_negative(
             engine_binding.clone(),
             invoked_digest,
             Sha256Digest::of_bytes(JOINED_COMPONENT_CONFIGURATION),
+            stage_id.as_deref().unwrap_or("unstaged-negative"),
         ))
     } else {
         Box::new(must(

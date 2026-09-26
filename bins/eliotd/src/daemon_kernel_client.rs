@@ -54,6 +54,47 @@ use super::{
     unix_ms, unix_ms_i64,
 };
 
+/// #791 (W4/W17): the typed detail reported when the daemon's shutdown request
+/// abandons a front-door exchange whose outcome this client cannot observe.
+#[cfg(windows)]
+const SHUTDOWN_ABANDONED_EXCHANGE: &str =
+    "Kernel front-door exchange abandoned by the daemon shutdown request";
+
+/// #791 (W4/W17): the cancellation future a cancel-aware front-door send
+/// observes. It resolves only when the daemon's shutdown request is published
+/// or when the client is released and its shutdown sender is dropped — the two
+/// real observations of "this write is no longer required". It never resolves
+/// on a timer, so a send with no shutdown request keeps the transport's own
+/// `operation_timeout` as its only deadline.
+#[cfg(windows)]
+struct FrontDoorCancellation {
+    /// Polled only for a request already published before this send started.
+    observed: tokio::sync::watch::Receiver<bool>,
+    /// Resolves once a shutdown request is published, and also once the
+    /// sending half is dropped because this client is being released.
+    changed: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+#[cfg(windows)]
+impl std::future::Future for FrontDoorCancellation {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        // A request already published before the send started is observed
+        // immediately, so a shutdown racing a just-connected exchange still
+        // cancels that send. `changed` then resolves for a request published
+        // later, and also for a dropped sender — the client being released.
+        if *this.observed.borrow_and_update() {
+            return std::task::Poll::Ready(());
+        }
+        this.changed.as_mut().poll(context)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerBundleReadbackWire {
@@ -93,6 +134,18 @@ pub struct DaemonKernelClient {
     /// until the first validated handshake, so pre-handshake reads stay
     /// fail-closed to "no live session".
     validated_session_binding: Mutex<Option<String>>,
+    /// #791 (W4/W17): the daemon's own shutdown request, carried as the
+    /// broadcast a cancel-aware front-door send can observe. The only writer
+    /// is [`request_shutdown`](Self::request_shutdown), which the production
+    /// `ctrl_c` shutdown path calls; dropping this client drops the sender,
+    /// and a dropped sender is observed as cancellation too. Never a local
+    /// literal and never a per-send reinterpretation of a timeout: a pending
+    /// send that observes it settles as `UnknownOutcome`, never as a
+    /// delivered frame.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Receiving half of [`shutdown_tx`](Self::shutdown_tx), cloned per send
+    /// so one in-flight exchange never consumes the shutdown request.
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Already-validated Kernel-issued owner session facts for the single live
@@ -827,6 +880,10 @@ impl DaemonKernelClient {
         // #740: handshake span. Transport connect/session validation is not
         // semantic readiness; readiness is reported separately.
         let _span = tracing::info_span!("eliotd.kernel_handshake").entered();
+        // #791 (W4/W17): one shutdown broadcast per client. The sending half
+        // is retained so `request_shutdown` can publish; the receiving half is
+        // cloned per exchange so a cancel-aware send observes the same signal.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let client = Self {
             launch: config.launch.clone(),
             connection_id: format!(
@@ -840,6 +897,8 @@ impl DaemonKernelClient {
             kernel_binding: config.kernel_binding.clone(),
             request_counter: Arc::new(AtomicU64::new(1)),
             validated_session_binding: Mutex::new(None),
+            shutdown_tx,
+            shutdown_rx,
         };
         #[cfg(windows)]
         {
@@ -860,6 +919,98 @@ impl DaemonKernelClient {
             Err(super::DaemonError::Kernel(
                 KernelClientError::Unsupported.to_string(),
             ))
+        }
+    }
+
+    /// #791 (W4/W17): publishes the daemon's shutdown request so any pending
+    /// front-door send observes it and settles as `UnknownOutcome` rather than
+    /// holding the process open until its per-operation transport timeout.
+    ///
+    /// Broadcast, not a one-shot consume: every in-flight and future send reads
+    /// the same request, so a cancellation racing an already-completed write is
+    /// still never reported as a delivered frame. The production caller is the
+    /// `ctrl_c` shutdown arm of `daemon_runtime::run_loop`.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    /// #791 (W4/W17): the per-exchange cancellation future handed to the
+    /// cancel-aware front-door send.
+    ///
+    /// A fresh clone is taken per send so concurrent and subsequent exchanges
+    /// all observe the same shutdown request, and a dropped sender — the client
+    /// being released — is observed as cancellation by `changed()`. Completes
+    /// only on a shutdown request; never a timeout stand-in and never a
+    /// fabricated success.
+    fn front_door_cancellation(&self) -> FrontDoorCancellation {
+        // Two independent clones of the same broadcast: one is polled only to
+        // observe a request published before this send started, the other is
+        // owned by the pending-change future. Neither consumes the request, so
+        // concurrent and subsequent sends each observe it.
+        let observed = self.shutdown_rx.clone();
+        let mut shutdown = self.shutdown_rx.clone();
+        let changed = Box::pin(async move {
+            let _ = shutdown.changed().await;
+        });
+        FrontDoorCancellation { observed, changed }
+    }
+
+    /// #791 (W4/W17): one cancel-aware front-door request send.
+    ///
+    /// Identical to the former `send_frame` call apart from the cancellation
+    /// signal: the frame, the negotiated limits, the delivery assertion and
+    /// every error mapping are unchanged, so a send that completes before any
+    /// shutdown request is byte-identical to the old write. Only a send still
+    /// pending when the daemon's shutdown is requested now settles as
+    /// `UnknownOutcome` — the outcome the write may already have reached the
+    /// peer, never a `Delivered` claim this client cannot prove.
+    #[cfg(windows)]
+    async fn send_frame_with_shutdown(
+        &self,
+        transport: &mut NamedPipeTransport,
+        frame: &Frame,
+        limits: TransportLimits,
+    ) -> Result<DeliveryOutcome, KernelClientError> {
+        transport
+            .send_frame_with_cancel(frame, limits, self.front_door_cancellation())
+            .await
+            .map_err(|error| KernelClientError::Transport(error.to_string()))
+    }
+
+    /// #791 (W4/W17): receives one front-door response, abandoning the
+    /// exchange on the same shutdown request the send observes.
+    ///
+    /// Without this leg a send could observe shutdown while the following
+    /// receive still waited for the peer, so the cancellation would not
+    /// actually end the exchange. The frame itself is unchanged; the abandoned
+    /// exchange reports the daemon's existing unknown-outcome error, never a
+    /// response and never a decoded claim.
+    #[cfg(windows)]
+    async fn receive_frame_or_shutdown(
+        &self,
+        transport: &mut NamedPipeTransport,
+        limits: TransportLimits,
+    ) -> Result<Frame, KernelClientError> {
+        let mut shutdown = self.shutdown_rx.clone();
+        if *shutdown.borrow() {
+            return Err(KernelClientError::Unknown(
+                SHUTDOWN_ABANDONED_EXCHANGE.to_owned(),
+            ));
+        }
+        tokio::select! {
+            result = transport.receive_frame(limits) => {
+                result.map_err(|error| KernelClientError::Unknown(error.to_string()))
+            }
+            changed = shutdown.changed() => {
+                // A dropped sender is the same observation: this client is
+                // being released, so the exchange is abandoned rather than
+                // left to block. A request racing a completed receive is
+                // discarded, never reported as a Kernel response.
+                let _ = changed;
+                Err(KernelClientError::Unknown(
+                    SHUTDOWN_ABANDONED_EXCHANGE.to_owned(),
+                ))
+            }
         }
     }
 
@@ -1133,20 +1284,18 @@ impl DaemonKernelClient {
             payload: ProtocolPayload::Json(operation_payload(operation, payload)?),
             trace_context: BTreeMap::new(),
         };
-        if transport
-            .send_frame(&frame, limits)
-            .await
-            .map_err(|error| KernelClientError::Transport(error.to_string()))?
+        if self
+            .send_frame_with_shutdown(&mut transport, &frame, limits)
+            .await?
             != DeliveryOutcome::Delivered
         {
             return Err(KernelClientError::Unknown(
                 "Kernel request delivery was not proven".to_owned(),
             ));
         }
-        let response = transport
-            .receive_frame(limits)
-            .await
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        let response = self
+            .receive_frame_or_shutdown(&mut transport, limits)
+            .await?;
         response
             .validate()
             .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
@@ -1241,20 +1390,18 @@ impl DaemonKernelClient {
         let hello = client_hello(&self.kernel_binding)?;
         let frame = eliot_ipc::client_hello_frame(&self.connection_id, &hello)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-        if transport
-            .send_frame(&frame, limits)
-            .await
-            .map_err(|error| KernelClientError::Transport(error.to_string()))?
+        if self
+            .send_frame_with_shutdown(&mut transport, &frame, limits)
+            .await?
             != DeliveryOutcome::Delivered
         {
             return Err(KernelClientError::Unknown(
                 "Kernel hello delivery was not proven".to_owned(),
             ));
         }
-        let response = transport
-            .receive_frame(limits)
-            .await
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        let response = self
+            .receive_frame_or_shutdown(&mut transport, limits)
+            .await?;
         if is_pre_admission_pending_rejection(&response, &self.connection_id) {
             return Err(KernelClientError::PreAdmissionPending);
         }
@@ -1778,6 +1925,11 @@ impl DaemonKernelClient {
             snapshot: self.snapshot.clone(),
             request_counter: Arc::clone(&self.request_counter),
             validated_session_binding: Mutex::new(self.validated_session_binding()),
+            // #791 (W4/W17): the clone shares the same shutdown broadcast, so
+            // a request published on the owning client is observed by a
+            // transport this clone drives, exactly as on the original.
+            shutdown_tx: self.shutdown_tx.clone(),
+            shutdown_rx: self.shutdown_rx.clone(),
         })
     }
 }
@@ -2211,6 +2363,7 @@ mod tests {
         let epoch = test_epoch(1)?;
         let generation =
             ResourceGeneration::new(1).map_err(|error| format!("generation: {error}"))?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Ok(DaemonKernelClient {
             launch: GovernorLaunchConfig {
                 instance_id: "test-eliotd".to_owned(),
@@ -2248,6 +2401,8 @@ mod tests {
             },
             request_counter: Arc::new(AtomicU64::new(1)),
             validated_session_binding: Mutex::new(None),
+            shutdown_tx: shutdown_tx.clone(),
+            shutdown_rx: shutdown_rx.clone(),
         })
     }
 

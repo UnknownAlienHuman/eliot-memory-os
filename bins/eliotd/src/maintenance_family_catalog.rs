@@ -278,14 +278,37 @@ pub enum MaintenanceAdmissionBlocker {
     /// and `crate::maintenance_trigger_evaluator::UNRESOLVED_AUTHORITIES`
     /// already holds `budget_available` at `false` for that reason.
     BudgetAuthority,
-    /// The only Durable Job wire `eliotd` reaches is `eliot.kernel.dreamer-job`
-    /// (`bins/eliotd/src/dreamer_admission.rs::DREAMER_JOB_WIRE_ID`). Its
+    /// The maintenance execution owner EXISTS and is reachable in the build;
+    /// what is missing is that its governed plan inputs are unpublished, so the
+    /// request cannot be formed.
+    ///
+    /// `eliot-dreamer` admits the class at the taxonomy level
+    /// (`bins/eliot-dreamer/src/lib.rs::refuse_unsupported_job_class` returns
+    /// `Ok(())` for it, and `dispatch_class` returns
+    /// `ClassArm::MaintenanceAdmitted`) but REFUSES it at the dispatch stage:
+    /// `bins/eliot-dreamer/src/dispatch_stage.rs::dispatch_admitted` matches
+    /// `JobClass::Maintenance` and returns
+    /// `DreamerError::InvalidAdmission(MAINTENANCE_INPUTS_REFUSAL)`.
+    ///
+    /// The reason recorded there is the exact unavailable dependency: the native
+    /// owner is `eliot-dreamer-maintenance-plan`'s `propose_maintenance_plan`
+    /// (`crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs`, a workspace
+    /// member), and it takes its own Governor-owned plan inputs -
+    /// `MaintenanceObjective`, `TriggerEvidence`, `BudgetSlice`, `MaintenancePolicy`,
+    /// `PriorHistory` and the planned-operation/expected-delta/verifier material.
+    /// None of that is constructible from admitted binary material, and no owner
+    /// publishes it to `eliotd`, so synthesizing it here would be self-issued
+    /// authority. This is therefore a PUBLICATION gap over an existing owner, not
+    /// a missing capability.
+    ///
+    /// Secondary and still true: the only Durable Job wire `eliotd` reaches is
+    /// `eliot.kernel.dreamer-job`
+    /// (`bins/eliotd/src/dreamer_admission.rs::DREAMER_JOB_WIRE_ID`), whose
     /// `JobOperation::Submit` validates an `AdmissionRef` and two
     /// `OpaqueContentRef`s bound to one `WorkScopeBinding`
-    /// (`crates/foundation/eliot-protocol/src/dreamer_job.rs::JobSubmission::validate`),
-    /// and no maintenance admission owner mints them for a
-    /// `MaintenanceFamily`; submitting one would fabricate a Dreamer semantic
-    /// job.
+    /// (`crates/foundation/eliot-protocol/src/dreamer_job.rs::JobSubmission::validate`).
+    /// Those refs are a consequence of the publication gap above, not its cause,
+    /// so they are recorded as secondary rather than as the blocker.
     MaintenanceJobWire,
 }
 
@@ -304,7 +327,7 @@ impl MaintenanceAdmissionBlocker {
                 "maintenance budget_ref/max_attempts: no budget or quota owner publishes them to eliotd (UNRESOLVED_AUTHORITIES holds budget_available=false)"
             }
             Self::MaintenanceJobWire => {
-                "eliot.kernel.dreamer-job is the only Durable Job wire eliotd reaches (bins/eliotd/src/dreamer_admission.rs::DREAMER_JOB_WIRE_ID) and its JobOperation::Submit requires an AdmissionRef plus two OpaqueContentRef bound to one WorkScopeBinding; no maintenance admission owner mints them for a MaintenanceFamily"
+                "eliot-dreamer refuses JobClass::Maintenance at dispatch (bins/eliot-dreamer/src/dispatch_stage.rs::dispatch_admitted -> DreamerError::InvalidAdmission(MAINTENANCE_INPUTS_REFUSAL)) although the class is admitted at the taxonomy level (bins/eliot-dreamer/src/lib.rs::refuse_unsupported_job_class returns Ok() and dispatch_class returns ClassArm::MaintenanceAdmitted): the native owner eliot_dreamer_maintenance_plan::propose_maintenance_plan exists as a workspace member but its Governor-owned plan inputs (MaintenanceObjective, TriggerEvidence, BudgetSlice, MaintenancePolicy, PriorHistory) are published by no owner to eliotd and are not constructible from admitted binary material, so no maintenance admission owner can form the request; this is a publication gap over an existing owner, not a missing capability. Secondary: eliot.kernel.dreamer-job (bins/eliotd/src/dreamer_admission.rs::DREAMER_JOB_WIRE_ID) is the only Durable Job wire eliotd reaches and its JobOperation::Submit requires an AdmissionRef plus two OpaqueContentRef bound to one WorkScopeBinding - a consequence of the publication gap, not its cause"
             }
         }
     }

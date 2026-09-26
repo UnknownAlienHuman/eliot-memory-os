@@ -46,7 +46,8 @@ use eliot_context_contracts::{
 };
 use eliot_governor::{Governor, LearningAdmissionClaim, issue_learning_admission};
 use eliot_improvement::candidate_bounds::{
-    BoundsError, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef, retrieve_governed,
+    BoundsError, CrossTaskCarryover, GovernedRetrieval, RetrievalDecision, ReusableCandidateRef,
+    retrieve_governed,
 };
 use eliot_improvement::{CarriageMark, bounds_to_context_error};
 use eliot_improvement::{
@@ -133,6 +134,30 @@ fn live_issuance(
     Ok(now)
 }
 
+/// Both surfaces must cite the same distinct cross-task admission, or neither
+/// may cite one.
+///
+/// The producer and the retrieval/carriage screens are separate owners of the
+/// two cross-task checks, so a caller that threaded one carryover into
+/// production and another into the screens would let a stale record produce an
+/// atom for a task the screens never checked. Identity is the owner-issued
+/// pair, not the object identity: both the cross-task ticket digest and the
+/// record's `admission_id` must agree, because either alone can be copied onto
+/// a different record.
+fn same_cross_task_carryover(
+    production: Option<&CrossTaskCarryover<'_>>,
+    presented: Option<&CrossTaskCarryover<'_>>,
+) -> bool {
+    match (production, presented) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.cross_task_permit().digest() == right.cross_task_permit().digest()
+                && left.record().admission_id == right.record().admission_id
+        }
+        _ => false,
+    }
+}
+
 /// Trusted native governed admission: run the complete owner-bound
 /// learning compilation in the host process.
 ///
@@ -140,8 +165,10 @@ fn live_issuance(
 /// arrives bound from the authenticated owner channel (see
 /// [`GovernorGrant`]). Unmarked ordinary inputs compile exactly as the
 /// underlying screens decide; marked influence passes only with a live
-/// issuance, live overlay, active backlog backing, and (cross-task) fresh
-/// admission. Any failure refuses the whole compilation.
+/// issuance, live overlay, active backlog backing, and — when the compilation
+/// is for a task other than the local admission's target — the same distinct
+/// owner-issued cross-task carryover on both the producer and the screens. Any
+/// failure refuses the whole compilation.
 #[allow(clippy::too_many_arguments)]
 pub fn admit_governed_host<F>(
     governor: &Governor,
@@ -158,6 +185,9 @@ where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
     let now = live_issuance(governor, claim, &production, &presented)?;
+    if !same_cross_task_carryover(production.cross_task, presented.cross_task) {
+        return Err(HostAdmitError::IssuanceMismatch);
+    }
     let presented = PresentedLearning {
         now_unix_secs: now,
         ..presented
@@ -190,7 +220,7 @@ where
         overlay,
         reusable: Some(&reusable),
         draft_delta_present: false,
-        cross_task_admission: presented.cross_task_admission,
+        cross_task: presented.cross_task,
         backlog: presented.backlog,
         verified: presented.verified,
         now: datetime_from_unix(now)

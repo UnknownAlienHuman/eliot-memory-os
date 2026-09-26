@@ -132,17 +132,14 @@ fn record(handle: &str) -> SourceRecord {
 }
 
 // Fixture for the owner-bound absence preconditions: the two former
-// caller-supplied booleans are no longer inputs, so the cases below present the
-// evidence those flags stood in for.
-fn no_match_evaluation(members: &[String], frozen_scope_digest: &str) -> NoMatchEvaluation {
-    NoMatchEvaluation {
-        predicate_id: "predicate-700".to_owned(),
-        frozen_scope_digest: frozen_scope_digest.to_owned(),
-        index_revision: "index-rev-1".to_owned(),
-        no_match_members: members.to_vec(),
-    }
-}
-
+// caller-supplied booleans are no longer inputs, and the caller-authored
+// `NoMatchEvaluation` that replaced them is gone with them. `Proven` now needs a
+// real vetted record behind every closing member, an authorized manifest that
+// commits those exact records, and an owner-issued per-member result whose
+// identity is recomputed from the predicate and revisions actually in force.
+// This helper therefore supplies no evaluation and no manifest, which is the
+// fail-closed state the ordinary Researcher route is in; building the positive
+// evidence is the fixture work item 10 of #2893 owns.
 fn preconditions(
     account: &CoverageAccount,
     evaluation: Option<NoMatchEvaluation>,
@@ -151,6 +148,7 @@ fn preconditions(
     AbsencePreconditions::derive(
         account,
         &BTreeMap::new(),
+        None,
         1_700_000_300_000,
         frozen_scope_digest,
         evaluation,
@@ -496,17 +494,20 @@ fn absence_requires_complete_authoritative_lookup() {
             )
             .expect("record");
     }
-    assert_eq!(
-        assess_absence(
-            &proven,
-            &preconditions(
-                &proven,
-                Some(no_match_evaluation(&members, DIGEST_A)),
-                DIGEST_A
-            )
-        ),
-        AbsenceVerdict::Proven
-    );
+    // Corrected by #2893: the synthetic shape this case used to assert as
+    // `Proven` — closed `Observed` members, an empty `SourceRecord` map and a
+    // caller-authored member list — can no longer prove a predicate ran. Every
+    // member is retained with the specific unmet join instead.
+    let verdict = assess_absence(&proven, &preconditions(&proven, None, DIGEST_A));
+    let AbsenceVerdict::Unproven { reason } = verdict else {
+        panic!("a caller-authored member list over an empty record map must not prove absence");
+    };
+    for member in &members {
+        assert!(
+            reason.contains(&format!("{member}=missing_vetted_record")),
+            "reason must retain member {member} and its specific unmet join: {reason}"
+        );
+    }
     let mut gapped = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
     for member in &members {
         let disposition = if member == "primary#0" {
@@ -519,14 +520,7 @@ fn absence_requires_complete_authoritative_lookup() {
             .expect("record");
     }
     assert!(matches!(
-        assess_absence(
-            &gapped,
-            &preconditions(
-                &gapped,
-                Some(no_match_evaluation(&members, DIGEST_A)),
-                DIGEST_A
-            )
-        ),
+        assess_absence(&gapped, &preconditions(&gapped, None, DIGEST_A)),
         AbsenceVerdict::Unproven { .. }
     ));
     let mut exhausted = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
@@ -543,29 +537,11 @@ fn absence_requires_complete_authoritative_lookup() {
         .note_frontier("route budget ended early")
         .expect("frontier");
     assert!(matches!(
-        assess_absence(
-            &exhausted,
-            &preconditions(
-                &exhausted,
-                Some(no_match_evaluation(&members, DIGEST_A)),
-                DIGEST_A
-            )
-        ),
+        assess_absence(&exhausted, &preconditions(&exhausted, None, DIGEST_A)),
         AbsenceVerdict::PartialExhaustion { .. }
     ));
     assert!(matches!(
-        assess_absence(&proven, &preconditions(&proven, None, DIGEST_A)),
-        AbsenceVerdict::Unproven { .. }
-    ));
-    assert!(matches!(
-        assess_absence(
-            &proven,
-            &preconditions(
-                &proven,
-                Some(no_match_evaluation(&members, DIGEST_B)),
-                DIGEST_A
-            )
-        ),
+        assess_absence(&gapped, &preconditions(&gapped, None, DIGEST_B)),
         AbsenceVerdict::Unproven { .. }
     ));
 }

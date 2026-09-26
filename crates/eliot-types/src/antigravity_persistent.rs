@@ -182,10 +182,7 @@ pub struct AntigravityPersistentLaunchContract {
 impl AntigravityPersistentLaunchContract {
     pub fn validate(&self) -> Result<(), String> {
         if self.contract_version != ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION {
-            return Err(format!(
-                "contract_version {} != expected {}",
-                self.contract_version, ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION
-            ));
+            return Err("contract_version mismatch".to_owned());
         }
         if self.shell {
             return Err("persistent launch must be shell-free (shell=false)".to_owned());
@@ -209,7 +206,7 @@ impl AntigravityPersistentLaunchContract {
                 return Err("arg must not be empty".to_owned());
             }
             if contains_shell_interpolation(arg) {
-                return Err(format!("shell interpolation rejected in arg: {arg}"));
+                return Err("shell interpolation rejected in arg".to_owned());
             }
             // Forbid dangerous flag.
             if arg == "--dangerously-skip-permissions" {
@@ -224,17 +221,17 @@ impl AntigravityPersistentLaunchContract {
         // Env allowlist.
         for (name, value) in &self.env {
             if !is_allowed_env_name(name) {
-                return Err(format!("env var not allowlisted: {name}"));
+                return Err("env var not allowlisted".to_owned());
             }
             if contains_shell_interpolation(value) {
-                return Err(format!("shell interpolation in env value for {name}"));
+                return Err("shell interpolation in env value".to_owned());
             }
             if name.to_ascii_uppercase().contains("TOKEN")
                 || name.to_ascii_uppercase().contains("SECRET")
                 || name.to_ascii_uppercase().contains("PASSWORD")
                 || name.to_ascii_uppercase().contains("CREDENTIAL")
             {
-                return Err(format!("secret-like env var rejected: {name}"));
+                return Err("secret-like env var rejected".to_owned());
             }
         }
         self.bounds.validate()?;
@@ -266,12 +263,10 @@ pub struct AntigravityPersistentFrame {
 impl AntigravityPersistentFrame {
     pub fn validate(&self, max_frame_bytes: usize) -> Result<(), String> {
         if self.frame_version != ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION {
-            return Err(format!(
-                "frame_version {} != expected {}",
-                self.frame_version, ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION
-            ));
+            return Err("frame_version mismatch".to_owned());
         }
-        let bytes = serde_json::to_vec(self).map_err(|e| format!("frame serialize failed: {e}"))?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| "frame serialization failed".to_owned())?;
         if bytes.len() > max_frame_bytes {
             return Err(format!(
                 "frame oversized {} > {}",
@@ -307,7 +302,8 @@ impl AntigravityPersistentFrame {
     }
 
     pub fn to_ndjson_line(&self) -> Result<String, String> {
-        let mut line = serde_json::to_string(self).map_err(|e| format!("serialize failed: {e}"))?;
+        let mut line =
+            serde_json::to_string(self).map_err(|_| "serialization failed".to_owned())?;
         line.push('\n');
         Ok(line)
     }
@@ -324,8 +320,7 @@ impl AntigravityPersistentFrame {
         if trimmed.is_empty() {
             return Err("empty frame".to_owned());
         }
-        let frame: Self =
-            serde_json::from_str(trimmed).map_err(|e| format!("malformed frame: {e}"))?;
+        let frame: Self = serde_json::from_str(line).map_err(|_| "malformed frame".to_owned())?;
         frame.validate(max_frame_bytes)?;
         Ok(frame)
     }

@@ -16,12 +16,13 @@ use eliot_contracts::{
     canonical_json_bytes, contract_identity as foundation_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
-    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OperationManifestDigest,
-    OrderingHead, OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
-    RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreConflictObservation,
-    StoreError, StoreFailure, StoreFailureDisposition, StoreHealth, StoreMutationDisposition,
-    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt, bind_issue18_digests,
+    AutomationContinuationFailure, CanonicalRequestView, CanonicalStoreClient, EffectClass,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
+    PreparedTransition, ReadConsistency, RevisionHead, RevisionHeadExpectation, ScopeId,
+    ScopeRevisionView, SecurityContext, StoreConflictObservation, StoreError, StoreFailure,
+    StoreFailureDisposition, StoreHealth, StoreMutationDisposition, StoreRecoveryAction,
+    StoreRetryDirective, TransitionClass, WriteReceipt, bind_issue18_digests,
     render_semantic_source_revisions,
 };
 use schemars::JsonSchema;
@@ -186,9 +187,11 @@ impl<'a> StoreRecoveryProjection<'a> {
     /// evidence, conflict, delay, and diagnostic detail are unrepresentable in
     /// `StoreError` and stay `None`. Unknown stays unknown
     /// (`MissingReceiptEnvelope` projects to unknown-outcome reconciliation,
-    /// never to retryable `Unavailable`); capacity collapse
-    /// (Backpressure/Deadline/Migration have no `StoreError` variants) is a
-    /// Contract Challenge remainder, not a silent retry claim.
+    /// never to retryable `Unavailable`); continuation backpressure and
+    /// continuation migration keep their own `Backpressured`/`MigrationRequired`
+    /// projections, while a deadline ceiling (`DeadlineExceeded` still has no
+    /// `StoreError` variant) remains a Contract Challenge remainder rather than
+    /// a silent retry claim.
     pub fn for_store_error(error: &StoreError) -> StoreRecoveryProjection<'static> {
         use StoreFailureDisposition::{Unavailable, UnknownOutcome};
         use StoreMutationDisposition::{NotAttempted, Unknown};
@@ -230,6 +233,7 @@ impl<'a> StoreRecoveryProjection<'a> {
             StoreError::OrderingConflict => {
                 conflict_parts("ORDERING_CONFLICT", RefreshRevisionHeads)
             }
+            StoreError::AutomationContinuation(failure) => automation_continuation_parts(*failure),
             StoreError::InvalidProjection => internal_defect_parts("INVALID_PROJECTION"),
             StoreError::InvalidOutbox => internal_defect_parts("INVALID_OUTBOX"),
             StoreError::InvalidReceipt => internal_defect_parts("INVALID_RECEIPT"),
@@ -334,6 +338,61 @@ fn internal_defect_parts(reason_code: &'static str) -> StoreErrorProjectionParts
         StoreRetryDirective::ManualRecovery,
         StoreRecoveryAction::EscalateInternalDefect,
     )
+}
+
+/// Parts for one typed user-automation continuation failure.
+///
+/// This is the ceiling mirror of the `StoreError::AutomationContinuation` arm
+/// of `StoreFailure::from_store_error`, field for field, and keeps each
+/// [`AutomationContinuationFailure`] member a separate disposition. Migration,
+/// deterministic rejection, staleness, expiry and capacity pressure authorize
+/// different next actions, so none of them is projected onto another's token,
+/// and no member is projected onto `Unavailable` or a generic defect.
+fn automation_continuation_parts(
+    failure: AutomationContinuationFailure,
+) -> StoreErrorProjectionParts {
+    use StoreFailureDisposition::{Backpressured, DeterministicRejection, MigrationRequired};
+    use StoreMutationDisposition::NotApplicable;
+    use StoreRecoveryAction::{RefreshRevisionHeads, WaitForCapacity};
+    use StoreRetryDirective::{DoNotRetry, MigrateThenRetryNewIdentity, NewIdentityAfterCondition};
+
+    match failure {
+        AutomationContinuationFailure::LegacyRefresh => (
+            MigrationRequired,
+            "AUTOMATION_CONTINUATION_V1_REFRESH",
+            NotApplicable,
+            MigrateThenRetryNewIdentity,
+            RefreshRevisionHeads,
+        ),
+        AutomationContinuationFailure::InvalidOrUnknown => (
+            DeterministicRejection,
+            "AUTOMATION_CONTINUATION_INVALID",
+            NotApplicable,
+            DoNotRetry,
+            StoreRecoveryAction::None,
+        ),
+        AutomationContinuationFailure::StaleSnapshot => (
+            StoreFailureDisposition::Conflict,
+            "AUTOMATION_CONTINUATION_STALE",
+            NotApplicable,
+            NewIdentityAfterCondition,
+            RefreshRevisionHeads,
+        ),
+        AutomationContinuationFailure::Expired => (
+            DeterministicRejection,
+            "AUTOMATION_CONTINUATION_EXPIRED",
+            NotApplicable,
+            NewIdentityAfterCondition,
+            RefreshRevisionHeads,
+        ),
+        AutomationContinuationFailure::CapacityPressure => (
+            Backpressured,
+            "AUTOMATION_CONTINUATION_CAPACITY",
+            NotApplicable,
+            NewIdentityAfterCondition,
+            WaitForCapacity,
+        ),
+    }
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), CanonicalError> {

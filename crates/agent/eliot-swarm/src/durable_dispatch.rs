@@ -18,7 +18,8 @@
 //! dispatched launch still requires the owner-side persist-before-launch path
 //! ([`super::durable_work::DurableWorkStore`] append, then
 //! [`super::durable_work::WorkExecutor`] launch). Unknown outcomes stay
-//! unknown here; only an exact-digest replay is idempotent.
+//! unknown here; replay is idempotent only after the stored launch digest is
+//! validated against its intent.
 
 use eliot_agent_api::WorkLeaseId;
 use eliot_agent_contracts::{AgentAttemptId, RevisionId, WorkItem, WorkItemId};
@@ -617,19 +618,26 @@ pub fn dispatch_child(
 /// Same child identity with the same payload digest is idempotent; same
 /// identity with a changed payload is [`SwarmError::PayloadConflict`]
 /// (changed input requires a new identity and explicit parent revision, never
-/// a silent relaunch). A different identity is
+/// a silent relaunch). The stored digest must match the prior intent before
+/// either replay or identity verdict is returned; an incoherent prior is
+/// [`SwarmError::Contract`]. A different identity is
 /// [`ReplayVerdict::ForeignIdentity`].
 pub fn verify_exact_replay(
     prior: &DispatchedLaunch,
     candidate: &LaunchIntent,
 ) -> Result<ReplayVerdict, SwarmError> {
+    let prior_digest = digest(&prior.intent)?;
+    if prior_digest != prior.lineage.launch_digest {
+        return Err(SwarmError::Contract);
+    }
+
     let same_identity = prior.intent.operation_id == candidate.operation_id
         && prior.intent.attempt_id == candidate.attempt_id
         && prior.intent.work_id == candidate.work_id;
     if !same_identity {
         return Ok(ReplayVerdict::ForeignIdentity);
     }
-    if digest(candidate)? == prior.lineage.launch_digest {
+    if digest(candidate)? == prior_digest {
         return Ok(ReplayVerdict::Idempotent);
     }
     Err(SwarmError::PayloadConflict)

@@ -5,6 +5,7 @@ mod client;
 mod endpoint;
 mod gate;
 mod http;
+mod ingress;
 mod sse;
 mod types;
 
@@ -23,6 +24,30 @@ pub use gate::{
 pub use http::{
     BasicAuth, HttpMethod, HttpRequest, HttpResponse, LoopbackHttpClient, LoopbackHttpError,
     SseConnection,
+};
+pub use ingress::{
+    ActionGate, ActionGateDecision, ActionGateError, ActionGateRequest, CredentialResolver,
+    DECISION_ALLOW, DECISION_DENY, DECISION_RECORDED, DISPOSITION_DENIED,
+    DISPOSITION_INVALID_REQUEST, DISPOSITION_RECOVERY_REQUIRED, DISPOSITION_STALE_OR_CONFLICT,
+    DISPOSITION_UNAVAILABLE_OR_CAPACITY, DecisionReplay, EffectDecisionIdentity,
+    HOST_EVENTS_BODY_TIMEOUT, HOST_EVENTS_ERROR_VERSION, HOST_EVENTS_HEAD_TIMEOUT,
+    HOST_EVENTS_PATH, HOST_EVENTS_PAYLOAD_TYPE, HOST_EVENTS_PRODUCER_ID,
+    HOST_EVENTS_RESPONSE_VERSION, HOST_EVENTS_STREAM_ID, HostEventAdmission,
+    HostEventAdmissionError, HostEventAdmissionFailure, HostEventAdmissionReceipt,
+    HostEventDelivery, HostEventGap, HostEventKind, HostEventPorts, HostEventReject,
+    HostEventResponseFields, HostEventSubmission, HostEventsBindError, HostEventsListener,
+    HostEventsShutdown, HttpOutcome, IntroductionStore, MAX_BEARER_BYTES, MAX_EVENT_ID_BYTES,
+    MAX_HOST_EVENT_BODY_BYTES, MAX_HOST_EVENT_HEAD_BYTES, MAX_HOST_EVENT_HEADERS,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_PASSIVE_EVENT_FIELDS, ParsedHostEventHead,
+    REASON_AUTHENTICATION_REQUIRED, REASON_AUTHORITY_REQUIRED, REASON_BUSY,
+    REASON_CAPABILITY_GRANT_REVOKED, REASON_CAPABILITY_INTRODUCTION_REQUIRED,
+    REASON_CAPABILITY_UNAVAILABLE, REASON_DB_UNAVAILABLE, REASON_DEADLINE_EXCEEDED,
+    REASON_IDENTITY_CONFLICT, REASON_INVALID_ARGUMENT, REASON_POLICY_DENIED,
+    REASON_PROTOCOL_INCOMPATIBLE, REASON_ROUTE_UNAVAILABLE, REASON_SCOPE_CONFLICT,
+    REASON_STALE_AUTHORITY_EPOCH, REASON_STALE_STATE_FENCE, REASON_STORAGE_BACKPRESSURE,
+    UnconfiguredActionGate, authority_epoch_text, classify_decision_replay, effect_request_hash,
+    encode_host_event_response, handle_host_event, parse_http_head, response_commitment,
+    response_commitment_message, verify_response_commitment,
 };
 pub use sse::{ReconnectCursor, SseDecodeError, SseDecoder, SseEvent, SseLimits};
 pub use types::*;

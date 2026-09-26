@@ -130,7 +130,8 @@ LET $result = IF $existing_receipt != NONE {
     rejected_reason: NONE,
     created_at: $envelope.created_at
   };
-  SELECT * FROM ONLY type::record('observability_receipt', $receipt_id)
+  -- OMIT id: ObservabilityWriteReceipt decodes the CONTENT keys; the schemaless record id is not part of the receipt contract.
+  SELECT * OMIT id FROM ONLY type::record('observability_receipt', $receipt_id)
 };
 
 COMMIT TRANSACTION;

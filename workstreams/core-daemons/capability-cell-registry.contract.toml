@@ -1,7 +1,7 @@
 schema = "eliot.capability-cell-registry-implementation.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
-status = "READY_FOR_IMPLEMENTATION"
-implementation_support = "ROUTING_METADATA_PRESENT_EXECUTABLE_REGISTRY_MISSING"
+status = "DAEMON_DECLARATIONS_PRESENT_EXECUTABLE_REGISTRY_PENDING"
+implementation_support = "ROUTING_METADATA_PRESENT_DAEMON_CELLS_DECLARED_EXECUTABLE_REGISTRY_MISSING"
 evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
 proof_ceiling = "CAPABILITY_CELL_REGISTRY_SOURCE_EDGE_CANDIDATE"
 issue = 13
@@ -49,6 +49,93 @@ paths = ["bins/eliot-kernel", "crates/kernel/eliot-kernel-core", "crates/kernel/
 id = "governor_daemon"
 process = "eliotd.exe"
 paths = ["bins/eliotd", "crates/governor"]
+
+# Issue #18 required work 1, implemented through this #13 contract: the real
+# `eliotd` capability cells and the one mutable-state owner of each. The
+# canonical source of this projection is
+# `bins/eliotd/Cargo.toml::[package.metadata.eliot]` (`functional_cell_refs` and
+# `functional_cell_state_owners`); this table repeats it so the migration input
+# is readable from the contract alone, and both stay in one-to-one agreement.
+# I2.23: a cell with an undeclared state owner is a registry defect.
+[[declared_functional_cell]]
+cell = "governor.daemon.composition"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::DaemonComposition"
+mutable_state_owner = "eliotd::DaemonComposition"
+source_evidence = "bins/eliotd/src/lib.rs:461"
+state_evidence = "bins/eliotd/src/lib.rs:461-553"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.startup-binding"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::StartupCapabilityBindings"
+mutable_state_owner = "eliotd::StartupCapabilityBindings"
+source_evidence = "bins/eliotd/src/startup_capability_bindings.rs:336"
+state_evidence = "bins/eliotd/src/startup_capability_bindings.rs:336-388"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.poll-contour"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::daemon_runtime"
+mutable_state_owner = "eliotd::daemon_runtime::run"
+source_evidence = "bins/eliotd/src/daemon_runtime.rs:452"
+state_evidence = "bins/eliotd/src/daemon_runtime.rs:452-490"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.kernel-transport"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::DaemonKernelClient"
+mutable_state_owner = "eliotd::DaemonKernelClient"
+source_evidence = "bins/eliotd/src/daemon_kernel_client.rs:1"
+state_evidence = "bins/eliotd/src/daemon_runtime.rs:461"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.operator-replay"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::controlboard_adapters::SharedOperatorReplay"
+mutable_state_owner = "eliotd::controlboard_adapters::SharedOperatorReplay"
+source_evidence = "bins/eliotd/src/lib.rs:481"
+state_evidence = "bins/eliotd/src/lib.rs:813"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.skill-catalogue"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::skill_lifecycle_adapters::CatalogueHandle"
+mutable_state_owner = "eliot_skill::SkillCatalogue"
+source_evidence = "bins/eliotd/src/lib.rs:534"
+state_evidence = "bins/eliotd/src/lib.rs:816-818"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.capability-admission"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::capability_evidence_wiring::GovernorCapabilityAdmission"
+mutable_state_owner = "eliotd::capability_evidence_wiring::GovernorCapabilityAdmission"
+source_evidence = "bins/eliotd/src/lib.rs:542"
+state_evidence = "bins/eliotd/src/lib.rs:819"
+runtime_bundle = "eliotd"
+stateless = false
+
+[[declared_functional_cell]]
+cell = "governor.daemon.learning-closure"
+declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
+source_owner = "eliotd::close_attempt_learning"
+mutable_state_owner = "eliot_governor::LearningClosureService"
+source_evidence = "bins/eliotd/src/lib.rs:552"
+state_evidence = "bins/eliotd/src/lib.rs:820"
+runtime_bundle = "eliotd"
+stateless = false
 
 [[inventory_family]]
 id = "watchdog"

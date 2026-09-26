@@ -12,9 +12,10 @@ use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, SourceId, Sta
 use eliot_cue_contracts::{
     CONTRACT_REVISION, CanonicalCueId, CanonicalCueIdentity, ClosedSnapshotRow,
     ConversionDisposition, CueComparisonKey, CueContractError, CueKind, CueProjectionDenominator,
-    CueSnapshot, CueSourceValue, Digest, MatchMode, NormalizationProfile, RebuildIdentity,
-    RelationEdge, RelationEdgeId, SnapshotEdgeWeight, SnapshotId, SnapshotMember, SourceHandle,
-    TargetHandle, cue_row_id,
+    CueProjectionOmission, CueProjectionOmissionKind, CueProjectionOmissionReason, CueSnapshot,
+    CueSourceValue, Digest, MatchMode, NormalizationProfile, RebuildIdentity, RelationEdge,
+    RelationEdgeId, SnapshotEdgeWeight, SnapshotId, SnapshotMember, SourceHandle, TargetHandle,
+    cue_row_id,
 };
 use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -45,7 +46,7 @@ fn provenance() -> Provenance {
         capture_route: "unit-test".to_owned(),
         scope: "scope-1".to_owned(),
         raw_handle: None,
-        revision: None,
+        revision: Some("7".to_owned()),
     }
 }
 
@@ -95,7 +96,7 @@ fn key(scope: &str, kind: CueKind, mode: MatchMode, value: &str) -> CueCompariso
 }
 
 fn row(member: SnapshotMember, key: CueComparisonKey) -> ClosedSnapshotRow {
-    ClosedSnapshotRow::new(member, key)
+    ClosedSnapshotRow::new_at_revision(member, key, source(), 7).expect("valid closed row")
 }
 
 fn sealed_snapshot(members: Vec<SnapshotMember>) -> CueSnapshot {
@@ -124,7 +125,7 @@ fn edge(id: &str, from: &str, to: &str) -> RelationEdge {
 }
 
 fn weight(id: &str, milli: u16) -> SnapshotEdgeWeight {
-    SnapshotEdgeWeight::new(RelationEdgeId::new(id).expect("edge id"), milli)
+    SnapshotEdgeWeight::new_at_revision(RelationEdgeId::new(id).expect("edge id"), milli, 7)
 }
 
 fn denominator(
@@ -133,7 +134,26 @@ fn denominator(
     omitted_rows: usize,
     omitted_edges: usize,
 ) -> CueProjectionDenominator {
+    let row_omissions = (0..omitted_rows)
+        .map(|index| {
+            CueProjectionOmission::new(
+                format!("omitted-row-{index}"),
+                CueProjectionOmissionKind::Row,
+                CueProjectionOmissionReason::OwnerBound,
+            )
+        })
+        .collect();
+    let edge_omissions = (0..omitted_edges)
+        .map(|index| {
+            CueProjectionOmission::new(
+                format!("omitted-edge-{index}"),
+                CueProjectionOmissionKind::Edge,
+                CueProjectionOmissionReason::OwnerBound,
+            )
+        })
+        .collect();
     CueProjectionDenominator::new(rows, edges, omitted_rows, omitted_edges, 7)
+        .with_omissions(row_omissions, edge_omissions)
 }
 
 #[test]
@@ -424,13 +444,13 @@ fn conversion_dispositions_validate_and_never_admit() -> TestResult {
 
     let rejected = ConversionDisposition::V2Rejected {
         legacy_row_id: "cue:0123456789abcdef0123456789abcdef".to_owned(),
-        reason: "unsupported-kind".to_owned(),
+        reason: "unsupported_legacy_identity".to_owned(),
     };
     rejected.validate()?;
     assert!(
         ConversionDisposition::V2Rejected {
             legacy_row_id: String::new(),
-            reason: "unsupported-kind".to_owned(),
+            reason: "unsupported_legacy_identity".to_owned(),
         }
         .validate()
         .is_err()

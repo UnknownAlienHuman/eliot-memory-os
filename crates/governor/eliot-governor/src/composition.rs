@@ -24,6 +24,7 @@ use crate::owner_closure_feed::{
     OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
 use crate::scope_identity_admission::{
     ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
 };
@@ -92,11 +93,12 @@ use eliot_workscope::{
     AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    IdentityEvidence, IdentityLegOutcome, LeaseJoin, MaterialAdmission, MaterialReadinessInputs,
-    ObservedScopeResources, OnboardingLease, OnboardingSingleFlight, PrivacyBoundary,
-    PrivacyProfile, ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect,
-    ResolutionAuthentication, ResolutionRequest, ScanDisclosureStore, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
+    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -3498,6 +3500,12 @@ pub struct GovernorComposition<P: ?Sized> {
     /// cold-start legs below coalesces on exact workspace identity, privacy
     /// boundary and governing-source generation.
     cold_start: OnboardingSingleFlight,
+    /// Latest quarantined/withheld scope-identity observation (issue #1787).
+    /// A `CanonicalWrite` mismatch retains its conflicting evidence here while
+    /// the binding, task state, and project memory stay preserved; a later
+    /// authorized rebind reconciles against it. Read with
+    /// [`Self::last_scope_quarantine`].
+    scope_quarantine: Option<QuarantinedScopeRecord>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -4118,6 +4126,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
             cold_start: OnboardingSingleFlight::new(),
+            scope_quarantine: None,
         })
     }
 
@@ -4125,6 +4134,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Returns the latest quarantined/withheld scope-identity observation
+    /// (issue #1787).
+    ///
+    /// The `CanonicalWrite` guard retains the conflicting evidence here when
+    /// it withholds a write; `None` means no mismatch has been observed since
+    /// construction. The retained binding is never replaced by this record.
+    #[must_use]
+    pub const fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
+        self.scope_quarantine.as_ref()
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -4824,7 +4844,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// retains the authorization evidence alongside the new binding; persist
     /// the owner with [`Self::install_admitted_work_scope_owner`]. The prior
     /// identity stays preserved inside the receipt; the retained binding, task
-    /// state, and project memory are untouched on any failure.
+    /// state, and project memory are untouched on any failure. Live status:
+    /// reachable from the daemon `admit_scope_attach` entry; no live attach
+    /// transport calls that entry yet (BLOCKED-BY attach-transport).
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     #[allow(
@@ -4951,13 +4973,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// generation, privacy, and source-generation facts, so the guard can
     /// prove a scope mismatch without ever minting authority from the claim.
     /// A quarantined or non-identity-clear report fails the write before any
-    /// canonical commit; an identity-clear observation proceeds because the
-    /// guard proved no mismatch (source-closure enforcement lives at
-    /// issuance and admission, where sources exist). With no retained binding
-    /// there is nothing to revalidate and the write proceeds unchanged, so
-    /// pre-bootstrap genesis writes keep working.
+    /// canonical commit and retains the conflicting evidence as the
+    /// [`QuarantinedScopeRecord`] returned by [`Self::last_scope_quarantine`];
+    /// an identity-clear observation proceeds because the guard proved no
+    /// mismatch (source-closure enforcement lives at issuance and admission,
+    /// where sources exist). With no retained binding there is nothing to
+    /// revalidate and the write proceeds unchanged, so pre-bootstrap genesis
+    /// writes keep working.
     pub fn check_canonical_write_work_scope(
-        &self,
+        &mut self,
         scope_id: &str,
     ) -> Result<Option<TriggerReport>, CompositionError> {
         let Some(owner) = self.owners.work_scope.as_ref() else {
@@ -4986,9 +5010,21 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             // Issue #1787: the mismatch carries its withholding proof instead
             // of a bare error — trigger, identity legs, verdict, and the
             // expected/observed instance pair — while the retained binding,
-            // task state, and project memory stay preserved. No source closure
-            // exists on this edge, so no receipt is minted here; source
-            // closure is enforced at issuance and admission.
+            // task state, and project memory stay preserved. The conflicting
+            // evidence is additionally retained as a durable
+            // [`QuarantinedScopeRecord`] (no source closure exists on this
+            // edge, so no receipt is minted here; source closure is enforced
+            // at issuance and admission). Record retention never fails the
+            // withhold: when the record itself is malformed the original
+            // proof-carrying error still returns.
+            if let Ok(record) = QuarantinedScopeRecord::for_report(
+                &snapshot.binding,
+                &observed,
+                &report,
+                fence.resource_generation.value(),
+            ) {
+                self.scope_quarantine = Some(record);
+            }
             return Err(CompositionError::Recovery(format!(
                 "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard withheld at trigger {:?} (identity {:?}, verdict {:?}; expected instance {} observed instance {}); retained binding preserved, write withheld",
                 snapshot.binding.scope.scope_ref,
@@ -5088,31 +5124,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Runs one I4.4.1 cold-start trigger's discovery pass through the
     /// privacy-bounded scanner (issue #1790, cold-start trigger production
-    /// caller).
+    /// caller; issue #2900, installation-bound durable owner).
     ///
     /// Owning thin entry for attach/onboarding ingress: the caller names the
     /// trigger (first project open, attach/launch, unknown workspace,
     /// onboarding request, stale generation, or resume without a current
-    /// task) and supplies the discovery lease, lease key, disclosure store,
-    /// privacy boundary, scan evidence and identity inputs the trigger's
-    /// scanner pass requires. The pass runs
-    /// [`ColdStartController::run_trigger_scan`]: the trigger's read set is
-    /// authorized against the discovery lease and bound to the scan evidence
-    /// first, and only then does [`BootstrapScanner::scan`] run. No trigger
-    /// reaches the scanner past an unadmitted or unattested read.
+    /// task) and supplies the discovery lease, lease key, owner-bound
+    /// disclosure store, owner binding, privacy boundary, scan evidence and
+    /// identity inputs the trigger's scanner pass requires. The store is the
+    /// installation-bound durable owner, never a caller-chosen directory or
+    /// an in-memory fallback: the pass in [`ColdStartController::run_trigger_scan`]
+    /// authorizes the trigger's read set against the discovery lease and
+    /// binds it to the scan evidence first, admits the owner binding, and
+    /// only then does [`BootstrapScanner::scan`] run and durably persist the
+    /// receipt through the owner. No trigger reaches the scanner past an
+    /// unadmitted or unattested read, and no trigger scan completes without
+    /// the owner receipt.
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the scanner inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
     /// discovery lease).
     #[allow(
         clippy::too_many_arguments,
-        reason = "trigger scan carries the trigger, lease, key, store, privacy, evidence, and identity inputs in one fail-closed entry"
+        reason = "trigger scan carries the trigger, lease, key, owner store, owner binding, privacy, evidence, and identity inputs in one fail-closed entry"
     )]
     pub fn run_cold_start_trigger_scan(
         trigger: ColdStartTrigger,
         discovery_lease: &mut DiscoveryReadLease,
         lease_key: &DiscoveryLeaseKey,
-        store: &mut impl ScanDisclosureStore,
+        store: &mut InstallationScanDisclosureStore,
+        binding: &ScanDisclosureOwnerBinding,
         candidate_privacy: PrivacyClass,
         privacy_boundary: Option<&PrivacyBoundary>,
         evidence: &BootstrapScanEvidence,
@@ -5127,6 +5168,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             discovery_lease,
             lease_key,
             store,
+            binding,
             candidate_privacy,
             privacy_boundary,
             evidence,
@@ -5137,6 +5179,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             now,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Quarantines one loose `scan-disclosure-*.json` capture left by the
+    /// retired caller-chosen directory implementation (issue #2900,
+    /// migration ingress).
+    ///
+    /// Owning thin entry for attach/onboarding ingress: the caller hands over
+    /// the suspected filename and its bytes, and the installation-bound store
+    /// classifies the file without adopting it. A matching filename alone is
+    /// not owner provenance, so even well-formed bytes stay quarantined for
+    /// the migration owner instead of becoming readable evidence.
+    pub fn quarantine_loose_scan_disclosure_capture(
+        store: &InstallationScanDisclosureStore,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<LooseScanQuarantine, CompositionError> {
+        store
+            .quarantine_loose_capture(file_name, bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
     /// Joins one I4.4.1 trigger to the retained cold-start single-flight
@@ -5192,14 +5253,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
     /// the retained registry (issue #1790, cold-start compilation production
-    /// caller).
+    /// caller; issue #2900, durable scan receipt reference).
     ///
     /// The trigger that creates the lease compiles exactly one
     /// [`eliot_workscope::OnboardingReadinessReceipt`] through
     /// [`ColdStartController::compile`] before the first scope-sensitive work
     /// and publishes it as the lease terminal, so compatible concurrent
     /// attaches receive the same receipt and no worker independently creates
-    /// a second `WorkScope` or "latest task" while the lease is active. An
+    /// a second `WorkScope` or "latest task" while the lease is active. A
+    /// supplied scan handle binds the terminal receipt to the exact durable
+    /// scan receipt that fed the compilation; without one the scan evidence
+    /// reference stays explicitly empty, never an in-memory or loose-file
+    /// fallback. An
     /// already-terminal lease returns its `JoinedTerminal` surface without
     /// recompiling; a lease owned by an in-flight trigger returns `Joined`
     /// without a second compilation.
@@ -5238,6 +5303,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -5270,6 +5336,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 projection_generation,
                 privacy,
                 task,
+                scan_receipt,
                 now,
             )
             .map_err(|error| CompositionError::Recovery(error.to_string()))
@@ -9207,6 +9274,7 @@ mod tests {
                 1,
                 &privacy,
                 task,
+                None,
                 1,
             )
             .expect("readiness receipt");
@@ -9556,6 +9624,13 @@ mod tests {
             &self,
             _request: &IntroductionRevocationRequest,
         ) -> Result<AuthorityRevocationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+
+        fn activate_root_transition(
+            &self,
+            _request: &eliot_authority::RootTransitionActivationRequest,
+        ) -> Result<eliot_authority::RootTransitionActivationReceipt, P07PortError> {
             Err(P07PortError::Unavailable)
         }
     }

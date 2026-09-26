@@ -235,6 +235,10 @@ pub(crate) struct HostRequestOperationRef {
     /// while the durable ORS record owns lifecycle state.
     pub(crate) observe_envelope: Option<HostRequestEnvelope>,
     pub(crate) observe_tool: Option<serde_json::Value>,
+    /// Unique in-flight admission reservation. Reservations count against the
+    /// bounded Observe queue, but carry no executable payload and cannot be
+    /// claimed until the durable admission handoff completes.
+    pub(crate) observe_reservation: Option<u64>,
     /// Governed attempt ownership for the queued observe pair. Reuses the
     /// shared [`LocalReadAttemptState`] vehicle (generation, boot-unique
     /// identity, owner session); the wire capability disambiguates through
@@ -812,6 +816,16 @@ impl KernelComposition {
                 Err(_) => {
                     if check_task_controller_admission(envelope, tool).is_ok() {
                         self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
+                    } else if check_local_state_admission(envelope, tool).is_ok() {
+                        // #2564 I4 state-carrier seam: validated `eliot.state`
+                        // pairs attempt the shared local-read carrier for the
+                        // outbound-only eliotd poller. The carrier enqueue
+                        // gate and the claim gate are query-only today, so the
+                        // attempt is refused without side effects (the gate is
+                        // the first statement of the enqueue fn, before any
+                        // mutation); the serve leg that admits state pairs is
+                        // #2565's dispatch lane.
+                        let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
                     }
                 }
             }
@@ -1309,13 +1323,20 @@ impl KernelComposition {
     /// The parent must be a known current-generation operation. Cancellation
     /// is attempted first; when the parent already passed the cancellable
     /// window the parent is fenced to `Unknown` instead so its outcome is
-    /// reconciled rather than assumed. Parent advancement is best-effort: an
-    /// illegal transition only means the parent lifecycle already moved on.
+    /// reconciled rather than assumed. Store failures are returned so a failed
+    /// durable transition never looks like cancellation succeeded.
     fn advance_host_request_parent(
         &self,
         envelope: &HostRequestEnvelope,
         descriptor: &AgentBridgeAdmissionDescriptor,
     ) -> Result<(), TransportError> {
+        // Serialize cancellation's parent transition against Observe queue
+        // publication. Submit admission uses the same transition-read then
+        // pending-owner order for its final durable-state reread and fill.
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
         let (parent_operation, parent_digest) = parent_operation_key(envelope)?;
         let parent = self
             .generation_gateway
@@ -1325,6 +1346,7 @@ impl KernelComposition {
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
         if parent.state.is_terminal() {
+            self.retire_observe_pair_under_transition(parent_operation.as_str(), &parent_digest);
             return Ok(());
         }
         match self.generation_gateway.ors.advance_host_request(
@@ -1333,16 +1355,33 @@ impl KernelComposition {
             HostRequestState::Cancelled,
             None,
         ) {
+            Ok(Some(_)) => {
+                self.retire_observe_pair_under_transition(
+                    parent_operation.as_str(),
+                    &parent_digest,
+                );
+                Ok(())
+            }
+            Ok(None) => Err(TransportError::UnknownRequest),
             Err(OrsError::InvalidTransition) => {
-                let _ = self.generation_gateway.ors.advance_host_request(
+                match self.generation_gateway.ors.advance_host_request(
                     &parent_operation,
                     &parent_digest,
                     HostRequestState::Unknown,
                     None,
-                );
-                Ok(())
+                ) {
+                    Ok(Some(_)) => {
+                        self.retire_observe_pair_under_transition(
+                            parent_operation.as_str(),
+                            &parent_digest,
+                        );
+                        Ok(())
+                    }
+                    Ok(None) => Err(TransportError::UnknownRequest),
+                    Err(_) => Err(TransportError::SessionFenced),
+                }
             }
-            Ok(_) | Err(_) => Ok(()),
+            Err(_) => Err(TransportError::SessionFenced),
         }
     }
 
@@ -1437,6 +1476,7 @@ impl KernelComposition {
                 local_read_attempt: LocalReadAttemptState::default(),
                 observe_envelope: None,
                 observe_tool: None,
+                observe_reservation: None,
                 observe_attempt: LocalReadAttemptState::default(),
                 campaign_packet_envelope: None,
                 campaign_packet_tool: None,
@@ -1572,6 +1612,7 @@ impl KernelComposition {
                 local_read_attempt,
                 observe_envelope: None,
                 observe_tool: None,
+                observe_reservation: None,
                 observe_attempt: LocalReadAttemptState::default(),
                 campaign_packet_envelope: None,
                 campaign_packet_tool: None,
@@ -2075,6 +2116,22 @@ const MAX_OBSERVE_TOOL_BYTES: usize = 64 * 1024;
 /// nonce: a capability minted for a local-read lifecycle can never match an
 /// observe claim record and vice versa.
 static OBSERVE_ENQUEUE_SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static OBSERVE_RESERVATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+enum ObserveQueueReservation {
+    ExistingQueued,
+    Reserved { token: u64, had_reference: bool },
+}
+
+fn next_observe_reservation() -> Result<u64, TransportError> {
+    OBSERVE_RESERVATION_ID
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |current| current.checked_add(1),
+        )
+        .map_err(|_| TransportError::Backpressure)
+}
 
 /// Disposition of one daemon observe-poller deferral.
 ///
@@ -2127,79 +2184,97 @@ pub(crate) fn check_observe_tool_linkage(
 }
 
 impl KernelComposition {
-    /// Queues one admitted observe pair for the daemon observe poller.
-    ///
-    /// Production entry: takes its own transition guard, so the submit arms
-    /// call it after admission without holding ingress state. Best-effort
-    /// companion to admission — callers use
-    /// [`Self::maybe_enqueue_observe_pair_for_submit`] and never fail
-    /// admission on it (the ORS record is already staged above).
-    pub(crate) fn enqueue_observe_pair(
+    /// Admits a host request and atomically hands linked Observe input to the
+    /// bounded daemon queue before the caller may acknowledge it.
+    pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
-        tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        self.enqueue_observe_pair_under_transition(envelope, tool)
-    }
-
-    /// Enqueues the retained observe bytes for an admitted record.
-    ///
-    /// Runs after admission from the submit arms when the payload carried
-    /// linked `eliot.observe` tool bytes and the durable record carries no
-    /// result yet. Digest-only submits, other capabilities, non-Invocation
-    /// kinds, and already-resulted records never queue. Never fails the
-    /// caller: the admission receipt is already owned by then.
-    pub(crate) fn maybe_enqueue_observe_pair_for_submit(
-        &self,
-        envelope: &HostRequestEnvelope,
-        record: &HostRequestRecord,
         tool: Option<&serde_json::Value>,
-    ) {
-        let Some(tool) = tool else {
-            return;
-        };
-        if envelope.identity.capability != OBSERVE_CAPABILITY
-            || envelope.kind != HostRequestKind::Invocation
-            || record.result_digest.is_some()
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        if envelope.identity.capability == OBSERVE_CAPABILITY
+            && let Some(tool) = tool
         {
-            return;
+            check_observe_tool_linkage(envelope, tool)?;
         }
-        if check_observe_tool_linkage(envelope, tool).is_err() {
-            return;
+        let is_observe = envelope.identity.capability == OBSERVE_CAPABILITY
+            && envelope.kind == HostRequestKind::Invocation;
+        let Some(tool) = tool.filter(|_| is_observe) else {
+            return self.admit_host_request_envelope_under_transition(envelope);
+        };
+        self.host_request_connection_gate_under_transition(envelope)?;
+
+        let operation = OperationIdentity::new(host_request_operation_id(envelope))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let existing = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if existing.as_ref().is_some_and(|record| {
+            record.state.is_terminal()
+                || matches!(
+                    record.state,
+                    HostRequestState::Submitted
+                        | HostRequestState::PossiblyEffected
+                        | HostRequestState::Unknown
+                        | HostRequestState::Reconciling
+                )
+        }) {
+            let admitted = self.admit_host_request_envelope_under_transition(envelope)?;
+            self.remove_observe_pair_if_not_executable(
+                admitted.1.operation_id.as_str(),
+                &envelope.envelope_sha256,
+                &admitted.1,
+            )?;
+            return Ok(admitted);
         }
-        let _ = self.enqueue_observe_pair(envelope, tool);
+
+        let operation_id = operation.as_str().to_owned();
+        let reservation = self.reserve_observe_queue_slot(envelope, &operation_id)?;
+
+        let admitted = match self.admit_host_request_envelope_under_transition(envelope) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if let ObserveQueueReservation::Reserved {
+                    token,
+                    had_reference,
+                } = reservation
+                {
+                    self.rollback_observe_reservation(
+                        &operation_id,
+                        &envelope.envelope_sha256,
+                        token,
+                        had_reference,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        match reservation {
+            ObserveQueueReservation::ExistingQueued => {
+                self.finish_existing_observe_replay(envelope, admitted)
+            }
+            ObserveQueueReservation::Reserved {
+                token,
+                had_reference,
+            } => self.fill_observe_reservation(envelope, tool, token, had_reference, admitted),
+        }
     }
 
-    /// Queues one linked observe pair under the held transition guard.
-    ///
-    /// Only linkage-checked `eliot.observe` pairs arrive here. An exact
-    /// replay (same operation and digest already queued) is idempotent and
-    /// never duplicates; when the bounded queue is full the oldest queued
-    /// observe pair is evicted (daemon-leg memory only — the durable ORS
-    /// record is untouched). Local-read pairs are never counted or evicted
-    /// here.
-    fn enqueue_observe_pair_under_transition(
+    fn reserve_observe_queue_slot(
         &self,
         envelope: &HostRequestEnvelope,
-        tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
-        if envelope.identity.capability != OBSERVE_CAPABILITY
-            || envelope.kind != HostRequestKind::Invocation
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        check_observe_tool_linkage(envelope, tool)?;
+        operation_id: &str,
+    ) -> Result<ObserveQueueReservation, TransportError> {
         let _admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        let operation_id = host_request_operation_id(envelope);
         let existing_connection = index.iter().find_map(|(connection_id, refs)| {
             refs.iter()
                 .find(|candidate| {
@@ -2208,67 +2283,245 @@ impl KernelComposition {
                 })
                 .map(|_| connection_id.clone())
         });
-        if let Some(existing_connection) = existing_connection.as_deref() {
-            if existing_connection != envelope.connection_id {
-                return Err(TransportError::IdentityConflict);
-            }
-            if index
-                .get(existing_connection)
-                .into_iter()
-                .flatten()
-                .any(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                        && candidate.observe_envelope.is_some()
-                })
-            {
-                return Ok(());
-            }
+        if existing_connection
+            .as_deref()
+            .is_some_and(|connection_id| connection_id != envelope.connection_id)
+        {
+            return Err(TransportError::IdentityConflict);
         }
-        let queued = index
-            .values()
+        if let Some(position) = index
+            .get(&envelope.connection_id)
+            .into_iter()
             .flatten()
-            .filter(|candidate| candidate.observe_envelope.is_some())
-            .count();
-        if queued >= MAX_QUEUED_OBSERVE_PAIRS {
-            for refs in index.values_mut() {
-                if let Some(position) = refs
-                    .iter()
-                    .position(|candidate| candidate.observe_envelope.is_some())
-                {
-                    refs.remove(position);
-                    break;
-                }
+            .position(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == envelope.envelope_sha256
+            })
+        {
+            let candidate = index
+                .get(&envelope.connection_id)
+                .and_then(|refs| refs.get(position))
+                .ok_or(TransportError::SessionFenced)?;
+            if candidate.observe_envelope.is_some() {
+                return Ok(ObserveQueueReservation::ExistingQueued);
             }
+            if candidate.observe_reservation.is_some() {
+                return Err(TransportError::Backpressure);
+            }
+            Self::require_observe_queue_capacity(&index)?;
+            let token = next_observe_reservation()?;
+            index
+                .get_mut(&envelope.connection_id)
+                .and_then(|refs| refs.get_mut(position))
+                .ok_or(TransportError::SessionFenced)?
+                .observe_reservation = Some(token);
+            return Ok(ObserveQueueReservation::Reserved {
+                token,
+                had_reference: true,
+            });
         }
-        let refs = index.entry(envelope.connection_id.clone()).or_default();
-        let observe_attempt = LocalReadAttemptState {
-            enqueue_salt: OBSERVE_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            ..LocalReadAttemptState::default()
-        };
-        if let Some(candidate) = refs.iter_mut().find(|candidate| {
-            candidate.operation_id == operation_id
-                && candidate.request_digest == envelope.envelope_sha256
-        }) {
-            candidate.observe_envelope = Some(envelope.clone());
-            candidate.observe_tool = Some(tool.clone());
-            candidate.observe_attempt = observe_attempt;
-        } else {
-            refs.push(HostRequestOperationRef {
-                operation_id,
+
+        Self::require_observe_queue_capacity(&index)?;
+        let token = next_observe_reservation()?;
+        index
+            .entry(envelope.connection_id.clone())
+            .or_default()
+            .push(HostRequestOperationRef {
+                operation_id: operation_id.to_owned(),
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: None,
                 local_read_tool: None,
                 local_read_attempt: LocalReadAttemptState::default(),
-                observe_envelope: Some(envelope.clone()),
-                observe_tool: Some(tool.clone()),
-                observe_attempt,
+                observe_envelope: None,
+                observe_tool: None,
+                observe_reservation: Some(token),
+                observe_attempt: LocalReadAttemptState::default(),
                 campaign_packet_envelope: None,
                 campaign_packet_tool: None,
                 campaign_packet_attempt: LocalReadAttemptState::default(),
                 task_controller_envelope: None,
                 task_controller_tool: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
+            });
+        Ok(ObserveQueueReservation::Reserved {
+            token,
+            had_reference: false,
+        })
+    }
+
+    fn require_observe_queue_capacity(
+        index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
+    ) -> Result<(), TransportError> {
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| {
+                candidate.observe_envelope.is_some() || candidate.observe_reservation.is_some()
+            })
+            .count();
+        if queued >= MAX_QUEUED_OBSERVE_PAIRS {
+            Err(TransportError::Backpressure)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rollback_observe_reservation(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        token: u64,
+        had_reference: bool,
+    ) {
+        let Ok(_admission_owner) = self.agent_activation_pending.lock() else {
+            return;
+        };
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            if let Some(position) = refs.iter().position(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.observe_reservation == Some(token)
+            }) {
+                if had_reference {
+                    refs[position].observe_reservation = None;
+                } else {
+                    refs.remove(position);
+                }
+                break;
+            }
+        }
+    }
+
+    fn fill_observe_reservation(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        token: u64,
+        had_reference: bool,
+        admitted: (HostRequestAdmissionReceipt, HostRequestRecord),
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation = admitted.1.operation_id.clone();
+        let current = match self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &envelope.envelope_sha256)
+        {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                drop(admission_owner);
+                self.rollback_observe_reservation(
+                    admitted.1.operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                return Err(TransportError::UnknownRequest);
+            }
+            Err(_) => {
+                drop(admission_owner);
+                self.rollback_observe_reservation(
+                    admitted.1.operation_id.as_str(),
+                    &envelope.envelope_sha256,
+                    token,
+                    had_reference,
+                );
+                return Err(TransportError::SessionFenced);
+            }
+        };
+        let executable = matches!(
+            current.state,
+            HostRequestState::Admitted | HostRequestState::Routed
+        ) && current.result_digest.is_none()
+            && current.result_response.is_none();
+        let retained_result = current.state == HostRequestState::ResultReceived
+            && current.result_digest.is_some()
+            && current.result_response.is_some();
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let refs = index
+            .get_mut(&envelope.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        let position = refs
+            .iter()
+            .position(|candidate| {
+                candidate.operation_id.as_str() == admitted.1.operation_id.as_str()
+                    && candidate.request_digest == envelope.envelope_sha256
+                    && candidate.observe_reservation == Some(token)
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        if executable {
+            let candidate = &mut refs[position];
+            candidate.observe_reservation = None;
+            candidate.observe_envelope = Some(envelope.clone());
+            candidate.observe_tool = Some(tool.clone());
+            candidate.observe_attempt = LocalReadAttemptState {
+                enqueue_salt: OBSERVE_ENQUEUE_SALT
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                ..LocalReadAttemptState::default()
+            };
+        } else if had_reference {
+            refs[position].observe_reservation = None;
+        } else {
+            refs.remove(position);
+        }
+        if executable {
+            Ok(admitted)
+        } else if retained_result {
+            Ok((admitted.0, current))
+        } else {
+            Err(TransportError::SessionFenced)
+        }
+    }
+
+    fn finish_existing_observe_replay(
+        &self,
+        envelope: &HostRequestEnvelope,
+        admitted: (HostRequestAdmissionReceipt, HostRequestRecord),
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        self.remove_observe_pair_if_not_executable(
+            admitted.1.operation_id.as_str(),
+            &envelope.envelope_sha256,
+            &admitted.1,
+        )?;
+        Ok(admitted)
+    }
+
+    fn remove_observe_pair_if_not_executable(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+        record: &HostRequestRecord,
+    ) -> Result<(), TransportError> {
+        if matches!(
+            record.state,
+            HostRequestState::Admitted | HostRequestState::Routed
+        ) && record.result_digest.is_none()
+            && record.result_response.is_none()
+        {
+            return Ok(());
+        }
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.observe_envelope.is_some())
             });
         }
         Ok(())
@@ -2284,9 +2537,12 @@ impl KernelComposition {
     /// capability (lost-answer retry without a new identity); a claim by a
     /// different owner reassigns the attempt (generation bump, fresh identity,
     /// new owner), so the superseded capability can never complete. `None` is
-    /// a null poll, not an error. Pure queue memory: no store IO, so
-    /// already-resulted pairs are retired by the submit/defer legs rather
-    /// than re-checked here. Local-read pairs are never served here.
+    /// a null poll, not an error. The exact ORS row must still be Admitted or
+    /// Routed with no result before an attempt is minted or returned. Closed
+    /// queue entries are pruned from this bounded volatile index while their
+    /// durable rows stay untouched. Store read errors fail closed without
+    /// discarding the pair or its possible-effect evidence. Local-read pairs
+    /// are never served here.
     pub(crate) fn claim_observe_pair(
         &self,
         session: &Session,
@@ -2311,19 +2567,52 @@ impl KernelComposition {
         // Deterministic order: `BTreeMap` iterates connections sorted, pairs
         // stay in enqueue (fifo) order within one connection.
         for refs in index.values_mut() {
-            for candidate in refs.iter_mut() {
+            let mut position = 0;
+            while position < refs.len() {
                 let (Some(envelope), Some(tool)) = (
-                    candidate.observe_envelope.as_ref(),
-                    candidate.observe_tool.as_ref(),
+                    refs[position].observe_envelope.as_ref(),
+                    refs[position].observe_tool.as_ref(),
                 ) else {
+                    position += 1;
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    position += 1;
                     continue;
                 }
                 if envelope.identity.capability != OBSERVE_CAPABILITY {
+                    return Err(TransportError::SessionFenced);
+                }
+                let operation_id = OperationIdentity::new(refs[position].operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let request_digest = refs[position].request_digest.clone();
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, &request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(stored) = stored else {
+                    return Err(TransportError::UnknownRequest);
+                };
+                let expected = requested_host_request_record(envelope)?;
+                if stored.operation_id != operation_id
+                    || stored.request_digest != request_digest
+                    || !stored.same_binding(&expected)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let executable = matches!(
+                    stored.state,
+                    HostRequestState::Admitted | HostRequestState::Routed
+                ) && stored.result_digest.is_none()
+                    && stored.result_response.is_none();
+                if !executable {
+                    refs.remove(position);
                     continue;
                 }
+                let envelope = envelope.clone();
+                let tool = tool.clone();
+                let candidate = &mut refs[position];
                 if !candidate.observe_attempt.is_owned_by(session) {
                     let generation = candidate
                         .observe_attempt
@@ -2344,11 +2633,11 @@ impl KernelComposition {
                     };
                 }
                 let attempt = self.local_read_attempt_capability(
-                    envelope,
+                    &envelope,
                     &candidate.operation_id,
                     &candidate.observe_attempt,
                 )?;
-                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+                return Ok(Some((envelope, tool, attempt)));
             }
         }
         Ok(None)
@@ -3007,21 +3296,12 @@ impl KernelComposition {
                 // Observe bytes ride this same entry (issue #2565): when the
                 // payload carries them for the admitted `eliot.observe`
                 // capability, the pure linkage gate runs before any staging,
-                // and the retained bytes enqueue for the daemon observe
-                // flight after admission — before the acknowledgement below.
+                // and the bounded reservation helper completes admission and
+                // payload handoff before the acknowledgement below.
                 // Digest-only submits keep the legacy shape untouched.
                 let observe_tool = payload.get("tool").cloned();
-                if let Some(ref tool) = observe_tool
-                    && envelope.identity.capability == OBSERVE_CAPABILITY
-                {
-                    check_observe_tool_linkage(&envelope, tool)?;
-                }
-                let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
-                self.maybe_enqueue_observe_pair_for_submit(
-                    &envelope,
-                    &record,
-                    observe_tool.as_ref(),
-                );
+                let (receipt, record) =
+                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
                 host_request_admitted_response(&receipt, &record)
             }
             AGENT_HOST_REQUEST_CANCEL_OPERATION => {
@@ -3322,14 +3602,19 @@ impl KernelComposition {
                 // foreign digest or cursor leaks.
                 return self.bridge_event_conflict_response(event, evidence, envelope_sha);
             }
-            Err(error) => {
-                return Err(match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
-                    _ => TransportError::SessionFenced,
-                });
+            Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                return Ok(bridge_event_capacity_response(
+                    pressure,
+                    "stream_id",
+                    &event.stream_id,
+                    "event_id",
+                    &event.event_id,
+                ));
             }
+            Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
+                return Err(TransportError::Backpressure);
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
         };
         // An elapsed absolute deadline is staged honestly, then
         // reported as a timeout instead of an admission: the durable
@@ -3362,20 +3647,28 @@ impl KernelComposition {
             "envelope_sha256": envelope_sha,
             "staging_connection": session.connection_id,
         });
-        self.generation_gateway
+        let handoff_result = self
+            .generation_gateway
             .ors
-            .record_bridge_event_handoff_checked(&handoff)
-            .map_err(|error| match error {
-                OrsError::DuplicateConflict => TransportError::IdentityConflict,
-                // Capacity exhaustion is typed backpressure with the
-                // exhausted dimension (issue #2731, item 6): the handoff
-                // table is a bounded delivery budget, never an
-                // authentication failure.
-                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                    TransportError::Backpressure
+            .record_bridge_event_handoff_checked(&handoff);
+        if let Err(error) = handoff_result {
+            match error {
+                OrsError::DuplicateConflict => return Err(TransportError::IdentityConflict),
+                OrsError::BridgeEventCapacityExceeded(pressure) => {
+                    return Ok(bridge_event_capacity_response(
+                        pressure,
+                        "stream_id",
+                        &event.stream_id,
+                        "event_id",
+                        &event.event_id,
+                    ));
                 }
-                _ => TransportError::SessionFenced,
-            })?;
+                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                    return Err(TransportError::Backpressure);
+                }
+                _ => return Err(TransportError::SessionFenced),
+            }
+        }
         Ok(bridge_event_forward_response(&outcome, true))
     }
 
@@ -3513,12 +3806,28 @@ impl KernelComposition {
         let outcome = self
             .generation_gateway
             .ors
-            .record_bridge_event_gap_checked(&gap)
-            .map_err(|error| match error {
-                OrsError::DuplicateConflict => TransportError::IdentityConflict,
-                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
-                _ => TransportError::SessionFenced,
-            })?;
+            .record_bridge_event_gap_checked(&gap);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                let gap_id = gap
+                    .get("gap_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(TransportError::SessionFenced)?;
+                return Ok(bridge_event_capacity_response(
+                    pressure,
+                    "gap_id",
+                    gap_id,
+                    "stream_id",
+                    gap.get("stream_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                ));
+            }
+            Err(OrsError::DuplicateConflict) => return Err(TransportError::IdentityConflict),
+            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         let accepted = outcome
             .get("accepted")
             .and_then(serde_json::Value::as_bool)
@@ -3548,14 +3857,17 @@ impl KernelComposition {
     /// atomicity claim. A lost answer replays safely: acknowledgement
     /// advances monotonically and handoff reconcile converges.
     ///
-    /// Reconcile-key preimage contract (issue #2731, I5.27 identity over
-    /// canonical bytes): `reconcile_key` is the SHA-256 hex of the canonical
-    /// JSON bytes of the reconciliation object BEFORE attaching
-    /// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`,
-    /// so the preimage is the answer minus exactly those three post-key
-    /// legs. The consumer strips all three before re-hashing; covering any
-    /// post-key leg in the digest refuses every answer and discards the
-    /// maintenance receipt while its store-side effect already committed.
+    /// Reconcile-key preimage contract (issues #2731/#2732, I5.27 identity
+    /// over canonical bytes): `reconcile_key` is the SHA-256 hex of the
+    /// canonical JSON bytes of the reconciliation object BEFORE attaching
+    /// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`.
+    /// `reconcile_key_version: 1` identifies this exact preimage contract;
+    /// `requested_recovery_scope` plus the ORS-owned window, status,
+    /// continuation selectors, revision/floor/upper bounds, and returned
+    /// facts are observation legs and remain in the preimage. The consumer
+    /// strips exactly the key and the two later mutation-receipt legs before
+    /// re-hashing. Pure read calls report truthful zero/empty mutation legs
+    /// without running either mutation.
     ///
     /// Issue #2731 runs the bounded handoff maintenance after the reconcile
     /// loop on the same recovery path: per presented namespace it retires
@@ -3563,6 +3875,10 @@ impl KernelComposition {
     /// identity stands) and repairs retained events missing their handoff
     /// under the original identity, each with a finite budget and a
     /// continuation the next legitimate recovery entry resumes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "owner resolution, atomic ack, pure read, and keyed answer share one serialization guard"
+    )]
     fn answer_bridge_event_reconcile(
         &self,
         session: &Session,
@@ -3570,8 +3886,8 @@ impl KernelComposition {
         frame_fence: &eliot_contracts::StateFence,
     ) -> Result<serde_json::Value, TransportError> {
         // Existing transition serialization first: the read guard is held
-        // across owner resolution and the batch commit below, so bridge
-        // profile fencing (the revocation path) cannot interleave
+        // across the owner read and any consumed-frontier batch commit, so
+        // bridge profile fencing (the revocation path) cannot interleave
         // unnoticed. No caller above holds this guard; the service-state
         // read inside takes only its own short-lived lock.
         let _transition = self.agent_bridge_transition_read()?;
@@ -3587,6 +3903,12 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let evidence = bridge_owner_evidence(session, frame_fence)?;
+        // Continuation selectors are pure reads. They cannot carry a
+        // consumed frontier because acknowledging one would mutate the
+        // durable cursor before the bounded owner page is accepted.
+        if scope.recovery_scope.is_some() && !scope.consumed.is_empty() {
+            return Err(TransportError::SessionFenced);
+        }
         // Contradictory duplicates fail the whole scope before any store
         // mutation; the batch re-validates the same rule for its callers.
         reject_contradictory_consumed(&scope.consumed)?;
@@ -3594,45 +3916,51 @@ impl KernelComposition {
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
         });
+        let pure_read = scope.recovery_scope.is_some();
         // Resolve every consumed entry to its admitted namespace before
         // mutating: any foreign, stale, or ambiguous item rejects the
-        // whole scope with nothing changed.
+        // whole scope with nothing changed. An explicit continuation read
+        // remains mutation-free and does not run handoff maintenance. An
+        // ordinary reconcile with no consumed entries still reaches owner
+        // maintenance for its presented namespace inventory.
         let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
         let mut batch_namespaces: Vec<(String, String, u64, u64, u64)> =
             Vec::with_capacity(scope.consumed.len());
-        for (stream_id, sequence) in &scope.consumed {
-            let item = self
-                .generation_gateway
-                .ors
-                .resolve_bridge_ack_item(&presenter, stream_id)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let namespace = item
-                .get("namespace")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(TransportError::SessionFenced)?;
-            let revision = item
-                .get("revision")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or(TransportError::SessionFenced)?;
-            let incarnation = item
-                .get("incarnation")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or(TransportError::SessionFenced)?;
-            batch_namespaces.push((
-                namespace.to_owned(),
-                stream_id.clone(),
-                *sequence,
-                revision,
-                incarnation,
-            ));
-            batch_items.push(serde_json::json!({
-                "namespace": namespace,
-                "expected_revision": revision,
-                "expected_incarnation": incarnation,
-                "sequence": sequence,
-                "owner_authority_lineage": evidence.authority_lineage,
-                "owner_principal": evidence.principal,
-            }));
+        if !pure_read {
+            for (stream_id, sequence) in &scope.consumed {
+                let item = self
+                    .generation_gateway
+                    .ors
+                    .resolve_bridge_ack_item(&presenter, stream_id)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let namespace = item
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(TransportError::SessionFenced)?;
+                let revision = item
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(TransportError::SessionFenced)?;
+                let incarnation = item
+                    .get("incarnation")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(TransportError::SessionFenced)?;
+                batch_namespaces.push((
+                    namespace.to_owned(),
+                    stream_id.clone(),
+                    *sequence,
+                    revision,
+                    incarnation,
+                ));
+                batch_items.push(serde_json::json!({
+                    "namespace": namespace,
+                    "expected_revision": revision,
+                    "expected_incarnation": incarnation,
+                    "sequence": sequence,
+                    "owner_authority_lineage": evidence.authority_lineage,
+                    "owner_principal": evidence.principal,
+                }));
+            }
         }
         // One ORS write transaction applies the accepted batch; validation
         // precedes commit inside it, so any failure leaves every cursor
@@ -3653,14 +3981,36 @@ impl KernelComposition {
         let mut reconciliation = self
             .generation_gateway
             .ors
-            .reconcile_bridge_events_for_owner(&presenter, live_generation)
-            .map_err(|_| TransportError::SessionFenced)?;
+            .reconcile_bridge_events_for_owner(
+                &presenter,
+                live_generation,
+                scope.recovery_scope.as_ref(),
+            )
+            .map_err(|error| match error {
+                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                    TransportError::Backpressure
+                }
+                _ => TransportError::SessionFenced,
+            })?;
         reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
         reconciliation["live_generation"] = serde_json::Value::from(live_generation);
+        reconciliation["reconcile_key_version"] = serde_json::Value::from(1_u64);
+        reconciliation["requested_recovery_scope"] = scope
+            .recovery_scope
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
         let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
             .map_err(|_| TransportError::SessionFenced)?;
         let reconcile_key = eliot_contracts::sha256_hex(&key_bytes);
         reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key.clone());
+        if pure_read {
+            reconciliation["handoffs_reconciled"] = serde_json::Value::from(0_u64);
+            reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
+            return Ok(serde_json::json!({ "status": "known", "value": {
+                "accepted": true,
+                "reconciliation": reconciliation,
+            } }));
+        }
         let mut handoffs_reconciled = 0_u64;
         for (namespace, _, sequence, _, _) in &batch_namespaces {
             let marked = self
@@ -3674,12 +4024,68 @@ impl KernelComposition {
                 .unwrap_or(0);
         }
         reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
-        let handoff_maintenance = self.maintain_bridge_event_handoffs(&batch_namespaces)?;
+        // Drive maintenance from the authenticated owner inventory as well
+        // as this request's consumed frontiers. Quiet streams still need
+        // bounded repair/retirement slices after their cursor stops moving.
+        // Resolve each stream again after acknowledgement so maintenance
+        // uses its current owner namespace, revision, and incarnation.
+        let handoff_maintenance = self.maintain_bridge_event_handoffs_for_owner(
+            &presenter,
+            &reconciliation,
+            &batch_namespaces,
+        )?;
         reconciliation["handoff_maintenance"] = serde_json::Value::Array(handoff_maintenance);
         Ok(serde_json::json!({ "status": "known", "value": {
             "accepted": true,
             "reconciliation": reconciliation,
         } }))
+    }
+
+    /// Resolves current owner namespaces after acknowledgement and runs their
+    /// existing bounded maintenance slices.
+    fn maintain_bridge_event_handoffs_for_owner(
+        &self,
+        presenter: &serde_json::Value,
+        reconciliation: &serde_json::Value,
+        batch_namespaces: &[(String, String, u64, u64, u64)],
+    ) -> Result<Vec<serde_json::Value>, TransportError> {
+        let mut stream_ids: std::collections::BTreeSet<String> = batch_namespaces
+            .iter()
+            .map(|(_, stream_id, _, _, _)| stream_id.clone())
+            .collect();
+        let streams = reconciliation
+            .get("streams")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(TransportError::SessionFenced)?;
+        for stream in streams {
+            let stream_id = stream
+                .get("stream_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            stream_ids.insert(stream_id.to_owned());
+        }
+        let mut namespaces = Vec::with_capacity(stream_ids.len());
+        for stream_id in stream_ids {
+            let item = self
+                .generation_gateway
+                .ors
+                .resolve_bridge_ack_item(presenter, &stream_id)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let namespace = item
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            let revision = item
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            let incarnation = item
+                .get("incarnation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            namespaces.push((namespace.to_owned(), stream_id, revision, incarnation));
+        }
+        self.maintain_bridge_event_handoffs(&namespaces)
     }
 
     /// Runs the bounded handoff maintenance for one reconciled scope on the
@@ -3698,11 +4104,11 @@ impl KernelComposition {
     /// preimage contract on [`Self::answer_bridge_event_reconcile`]).
     fn maintain_bridge_event_handoffs(
         &self,
-        batch_namespaces: &[(String, String, u64, u64, u64)],
+        maintenance_namespaces: &[(String, String, u64, u64)],
     ) -> Result<Vec<serde_json::Value>, TransportError> {
         let mut handoff_maintenance: Vec<serde_json::Value> =
-            Vec::with_capacity(batch_namespaces.len());
-        for (namespace, stream_id, _, revision, incarnation) in batch_namespaces {
+            Vec::with_capacity(maintenance_namespaces.len());
+        for (namespace, stream_id, revision, incarnation) in maintenance_namespaces {
             let maintenance_request = serde_json::json!({
                 "namespace": namespace,
                 "expected_revision": revision,
@@ -3721,13 +4127,25 @@ impl KernelComposition {
             let repaired = self
                 .generation_gateway
                 .ors
-                .repair_bridge_event_handoffs_checked(&maintenance_request)
-                .map_err(|error| match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
-                    _ => TransportError::SessionFenced,
-                })?;
+                .repair_bridge_event_handoffs_checked(&maintenance_request);
+            let repaired = match repaired {
+                Ok(repaired) => repaired,
+                Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                    handoff_maintenance.push(serde_json::json!({
+                        "stream_id": stream_id,
+                        "retired": retired.get("retired")
+                            .and_then(serde_json::Value::as_u64).unwrap_or(0),
+                        "retirement_continuation": retired.get("retirement_continuation")
+                            .and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        "capacity_pressure": pressure,
+                    }));
+                    continue;
+                }
+                Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
+                    return Err(TransportError::Backpressure);
+                }
+                Err(_) => return Err(TransportError::SessionFenced),
+            };
             handoff_maintenance.push(serde_json::json!({
                 "stream_id": stream_id,
                 "retired": retired.get("retired").and_then(serde_json::Value::as_u64).unwrap_or(0),
@@ -4246,16 +4664,161 @@ pub(crate) fn bridge_gap_from_payload(
     }))
 }
 
-/// Consumed-frontier scope carried by one event reconcile request: the
-/// bridge-owned delivered frontier per stream. Applied monotonically at or
-/// below the durable cursor before enumeration.
+/// Scope carried by one event reconcile request. Consumed frontiers advance
+/// monotonically at or below the durable cursor; an optional owner-issued
+/// recovery selector asks for one bounded continuation page and is read-only.
 pub(crate) struct BridgeReconcileScope {
     pub(crate) consumed: Vec<(String, u64)>,
+    pub(crate) recovery_scope: Option<serde_json::Value>,
 }
 
-/// Decodes the reconcile scope: a bounded list of `{stream_id, sequence}`
-/// consumed-frontier entries. The list may be empty (pure ownership/cursor
-/// read); anything malformed fails the whole scope.
+const MAX_BRIDGE_RECOVERY_STREAMS: u64 = 4;
+const MAX_BRIDGE_RECOVERY_EVENTS: u64 = 128;
+const MAX_BRIDGE_RECOVERY_GAPS: u64 = 256;
+const MAX_BRIDGE_RECONCILE_TEXT_BYTES: usize = 1024;
+
+/// Requires a closed field set for one versioned recovery selector. In
+/// particular, a future field cannot silently weaken this route's bounds.
+fn bridge_recovery_scope_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+) -> Result<(), TransportError> {
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn bridge_recovery_scope_text<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, TransportError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                && !text.chars().any(char::is_control)
+        })
+        .ok_or(TransportError::SessionFenced)
+}
+
+fn bridge_recovery_scope_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, TransportError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(TransportError::SessionFenced)
+}
+
+/// Validates one bounded, versioned owner continuation selector. The raw
+/// object is forwarded unchanged to ORS only after this closed typed parse.
+fn validate_bridge_recovery_scope(value: &serde_json::Value) -> Result<(), TransportError> {
+    let object = value.as_object().ok_or(TransportError::SessionFenced)?;
+    if bridge_recovery_scope_u64(object, "version")? != 1 {
+        return Err(TransportError::SessionFenced);
+    }
+    let kind = bridge_recovery_scope_text(object, "kind")?;
+    let window_key = bridge_recovery_scope_text(object, "window_key")?;
+    if window_key.len() != 64
+        || !window_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TransportError::SessionFenced);
+    }
+
+    match kind {
+        "streams" => {
+            bridge_recovery_scope_fields(
+                object,
+                &[
+                    "version",
+                    "kind",
+                    "window_key",
+                    "after_stream",
+                    "stream_limit",
+                ],
+            )?;
+            bridge_recovery_scope_text(object, "after_stream")?;
+            let limit = bridge_recovery_scope_u64(object, "stream_limit")?;
+            if limit == 0 || limit > MAX_BRIDGE_RECOVERY_STREAMS {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        "stream" => {
+            bridge_recovery_scope_fields(
+                object,
+                &[
+                    "version",
+                    "kind",
+                    "window_key",
+                    "stream_id",
+                    "after_sequence",
+                    "upper_sequence",
+                    "expected_revision",
+                    "retention_floor",
+                    "event_limit",
+                    "gap_offset",
+                    "gap_limit",
+                ],
+            )?;
+            let stream_id = bridge_recovery_scope_text(object, "stream_id")?;
+            if stream_id.contains("::") {
+                return Err(TransportError::SessionFenced);
+            }
+            let after_sequence = bridge_recovery_scope_u64(object, "after_sequence")?;
+            let upper_sequence = bridge_recovery_scope_u64(object, "upper_sequence")?;
+            let expected_revision = bridge_recovery_scope_u64(object, "expected_revision")?;
+            let retention_floor = bridge_recovery_scope_u64(object, "retention_floor")?;
+            let event_limit = bridge_recovery_scope_u64(object, "event_limit")?;
+            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
+            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
+            if expected_revision == 0
+                || after_sequence > upper_sequence
+                || retention_floor > upper_sequence
+                || event_limit == 0
+                || event_limit > MAX_BRIDGE_RECOVERY_EVENTS
+                || gap_limit == 0
+                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
+                || gap_offset.checked_add(gap_limit).is_none()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        "unscoped_gaps" => {
+            bridge_recovery_scope_fields(
+                object,
+                &[
+                    "version",
+                    "kind",
+                    "window_key",
+                    "after_gap_scope",
+                    "gap_offset",
+                    "gap_limit",
+                ],
+            )?;
+            bridge_recovery_scope_text(object, "after_gap_scope")?;
+            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
+            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
+            if gap_limit == 0
+                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
+                || gap_offset.checked_add(gap_limit).is_none()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        _ => return Err(TransportError::SessionFenced),
+    }
+    Ok(())
+}
+
+/// Decodes the bounded consumed-frontier list and optional exact recovery
+/// selector. Initial/open reads omit the selector. Continuation selectors
+/// are closed version-1 objects and cannot be combined with acknowledgements.
 pub(crate) fn bridge_reconcile_scope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<BridgeReconcileScope, TransportError> {
@@ -4275,6 +4838,7 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
             .and_then(serde_json::Value::as_str)
             .filter(|text| {
                 !text.trim().is_empty()
+                    && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
                     && !text.chars().any(char::is_control)
                     && !text.contains("::")
             })
@@ -4286,7 +4850,20 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
             .ok_or(TransportError::SessionFenced)?;
         consumed.push((stream_id.to_owned(), sequence));
     }
-    Ok(BridgeReconcileScope { consumed })
+    let recovery_scope = match payload.get("recovery_scope") {
+        Some(value) => {
+            validate_bridge_recovery_scope(value)?;
+            Some(value.clone())
+        }
+        None => None,
+    };
+    if recovery_scope.is_some() && !consumed.is_empty() {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(BridgeReconcileScope {
+        consumed,
+        recovery_scope,
+    })
 }
 
 /// Typed answer for one staged durable event: the store outcome plus the
@@ -4296,6 +4873,33 @@ fn bridge_event_forward_response(outcome: &serde_json::Value, accepted: bool) ->
     let mut value = outcome.clone();
     if let Some(object) = value.as_object_mut() {
         object.insert("accepted".to_owned(), serde_json::Value::Bool(accepted));
+    }
+    serde_json::json!({ "status": "known", "value": value })
+}
+
+/// Returns typed capacity pressure through the ordinary correlated result
+/// frame. The connection remains admitted; the pressure report preserves the
+/// exact ORS resource and acceptance phase.
+fn bridge_event_capacity_response(
+    pressure: eliot_contracts::BridgeEventCapacityPressure,
+    first_key: &str,
+    first_value: &str,
+    second_key: &str,
+    second_value: &str,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "accepted": false,
+        "capacity_pressure": pressure,
+    });
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            first_key.to_owned(),
+            serde_json::Value::String(first_value.to_owned()),
+        );
+        object.insert(
+            second_key.to_owned(),
+            serde_json::Value::String(second_value.to_owned()),
+        );
     }
     serde_json::json!({ "status": "known", "value": value })
 }
@@ -4487,6 +5091,111 @@ pub(crate) fn check_local_read_admission(
     tool: &serde_json::Value,
 ) -> Result<LocalReadAdmission, TransportError> {
     local_read_admission_from_tool(envelope, tool)
+}
+
+/// Closed local-state selectors for one admitted `eliot.state` tool.
+///
+/// The trusted envelope scope (work scope else session — never an MCP
+/// argument) plus the exact `include` projection-field list from the
+/// `StateInput` arguments. An absent `include` is the default projection
+/// (authenticated discovery with no field filter); entries mirror the MCP
+/// contract's `unique_non_blank` rule exactly, so a blank, control-bearing,
+/// or duplicated field fails closed here rather than travelling to the
+/// Governor state owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalStateSelectors {
+    pub(crate) scope_id: ScopeId,
+    pub(crate) include: Vec<String>,
+}
+
+/// Derives the closed local-state selectors from one linked envelope+tool pair.
+///
+/// Returns the real selectors for `eliot.state`: the pair rides the shared
+/// admitted-pair carrier (queued for the outbound-only eliotd poller by
+/// [`KernelComposition::invoke_read_host_request`]) instead of hitting the
+/// query-only stub. Fails closed as `SessionFenced` for any other tool name,
+/// for a capability mismatch, for a non-object `arguments`, for a present
+/// `include` that is not an array of unique non-blank control-free field
+/// names, and for a missing or blank trusted scope. Mirrors the MCP
+/// `StateInput` contract field-for-field without taking an MCP edge; linkage
+/// (capability + payload digest) must already be proven by the caller through
+/// [`HostRequestInvokeReadPayload`]. Pure: deriving selectors performs no
+/// store IO.
+pub(crate) fn local_state_selectors_from_tool(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalStateSelectors, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if name != "eliot.state" || envelope.identity.capability != name {
+        return Err(TransportError::SessionFenced);
+    }
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    let include = match arguments.get("include") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut include = Vec::with_capacity(items.len());
+            for item in items {
+                let field = item
+                    .as_str()
+                    .filter(|field| {
+                        !field.trim().is_empty() && !field.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
+                if !seen.insert(field) {
+                    return Err(TransportError::SessionFenced);
+                }
+                include.push(field.to_owned());
+            }
+            include
+        }
+        Some(_) => return Err(TransportError::SessionFenced),
+    };
+    let scope_text = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|scope| !scope.trim().is_empty())
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
+    Ok(LocalStateSelectors { scope_id, include })
+}
+
+/// Validates one local-state admission before any store read (no IO).
+///
+/// Runs the exact invoke-read linkage gate ([`HostRequestInvokeReadPayload`])
+/// plus the closed state-selector derivation, so a changed payload digest, a
+/// forged descriptor or capability, or a malformed `include` list is rejected
+/// before the caller performs any Gateway IO or queues the pair for the
+/// eliotd poller. Pure: validation performs no IO by construction, which is
+/// the rejection-before-reading proof.
+pub(crate) fn check_local_state_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalStateSelectors, TransportError> {
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    local_state_selectors_from_tool(envelope, tool)
 }
 
 /// Serves an exact replay of a resulted operation without re-dispatch (no IO).

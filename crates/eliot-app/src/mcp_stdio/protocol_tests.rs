@@ -2246,6 +2246,7 @@ fn operator_memory_projection_exposes_rank_suppression_and_exact_resolution_fiel
             no_useful_memory: false,
             query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
         },
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: eliot_types::TruncationInfo {
             truncated: false,
             limit: 50,
@@ -2348,6 +2349,7 @@ fn operator_memory_projection_surfaces_no_useful_memory() {
             query_mode: "query_aware_semantic_lexical_relational_v2".to_owned(),
             ..Default::default()
         },
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: eliot_types::TruncationInfo {
             truncated: false,
             limit: 50,

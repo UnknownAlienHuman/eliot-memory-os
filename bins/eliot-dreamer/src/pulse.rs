@@ -25,13 +25,20 @@
 //!   `eliot_context_candidates::construct_context_candidates_with_canonical`;
 //! - packet: `eliot_dreamer_orientation::build_projection`.
 //!
-//! Fail-closed sequencing: the CC-002 outcome and CC-004 projection set are
+//! Fail-closed sequencing (issue #2901): production composes only from the
+//! versioned [`ProductionOrientationInputs`](crate::production_orientation::ProductionOrientationInputs)
+//! carrier, whose CC-002 outcome and CC-004 projection set are mandatory and
 //! validated first (schema, bundle-digest binding, job binding, mutual fence
-//! compatibility). A stage whose caller-supplied inputs are absent records an
-//! explicit pending disposition and never blocks the packet; a stage whose
-//! inputs are present but whose owner refuses fails the whole pulse, so a
-//! partial pulse is never thinned into a packet silently. Error payloads are
-//! bounded static fields; nothing secret flows.
+//! compatibility, one coherent identity closure). Missing prerequisites yield
+//! a typed blocked result, never a packet. [`run_orientation_pulse`] remains a
+//! generic partial composer only behind an explicit [`PulseDenominator`]: a
+//! stage whose caller-supplied inputs are absent records an explicit pending
+//! disposition and never blocks the packet; a stage whose inputs are present
+//! but whose owner refuses fails that composition, so a partial pulse is never
+//! thinned into a packet silently. The packet-only compatibility wrapper
+//! ([`run_compat_orientation_pulse`]) is not the production pulse and cannot
+//! satisfy the #41 Product Pulse acceptance. Error payloads are bounded static
+//! fields; nothing secret flows.
 //!
 //! Binding notes: the resolved epistemic position is resolver policy output,
 //! never a Governor-issued handle, so it is reported as its own stage and the
@@ -64,7 +71,8 @@ use eliot_dreamer_contracts::grounding::GroundedDreamDraft as GroundedClaimDraft
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
     ModelRouteDisposition, ModelRouteOutcome, ValidatedCandidate, ValidatedCurationItem,
-    ValidatedDreamDraft, ValidatedGroundingCandidate, bundle_digest_of,
+    ValidatedDreamDraft, ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes,
+    digest_hex,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationError, OrientationPolicy,
@@ -78,6 +86,8 @@ use eliot_epistemic::{
     CurrentEpistemicPosition as ResolvedEpistemicPosition, PositionRequest, resolve,
 };
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
+
+use crate::OrientationStageDisposition;
 
 /// Caller-supplied classification stage inputs (owner-built, never inferred).
 pub(crate) struct ClassificationStage<'a> {
@@ -165,38 +175,269 @@ pub(crate) struct CandidateStage<'a> {
     pub policy: &'a CandidatePolicy,
 }
 
-/// One pulse stage outcome: either executed with owner output, or explicitly
-/// pending with the static reason naming the missing owner value.
-pub(crate) struct PulseStage<T> {
-    /// Whether the owner entry point ran for this pulse.
-    pub executed: bool,
+/// Closed identity of one pulse denominator member, in composition order.
+///
+/// Dependency order: every member consumes caller-supplied owner records,
+/// never another member's output value, so no member has a stage predecessor
+/// to enforce in the composer. Predecessor discipline lives in the owner
+/// entries (each validates its own inputs and refuses lookalikes) and in the
+/// production identity closure: candidates additionally require the CC-004
+/// boundary (refused without it), and the packet requires the full joined
+/// closure before it may project. [`PulseStageId::ORDER`] is the
+/// deterministic composition order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PulseStageId {
+    Classification,
+    CueActivation,
+    EpistemicPosition,
+    Understanding,
+    Grounding,
+    Rivals,
+    Conflict,
+    Probes,
+    Candidates,
+    Packet,
+}
+
+impl PulseStageId {
+    /// Expected members in deterministic composition order.
+    pub const ORDER: [PulseStageId; 10] = [
+        PulseStageId::Classification,
+        PulseStageId::CueActivation,
+        PulseStageId::EpistemicPosition,
+        PulseStageId::Understanding,
+        PulseStageId::Grounding,
+        PulseStageId::Rivals,
+        PulseStageId::Conflict,
+        PulseStageId::Probes,
+        PulseStageId::Candidates,
+        PulseStageId::Packet,
+    ];
+
+    /// Closed wire spelling for the ledger record.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Classification => "classification",
+            Self::CueActivation => "cue_activation",
+            Self::EpistemicPosition => "epistemic_position",
+            Self::Understanding => "understanding",
+            Self::Grounding => "grounding",
+            Self::Rivals => "rivals",
+            Self::Conflict => "conflict",
+            Self::Probes => "probes",
+            Self::Candidates => "candidates",
+            Self::Packet => "packet",
+        }
+    }
+
+    /// Owning entry path invoked for this member.
+    pub fn owner_entry(self) -> &'static str {
+        match self {
+            Self::Classification => "eliot_dreamer_classification::classify",
+            Self::CueActivation => "eliot_cue_activation::evaluate_activation",
+            Self::EpistemicPosition => "eliot_epistemic::resolve",
+            Self::Understanding => "eliot_context_assembly::assemble_active_view",
+            Self::Grounding => "eliot_dreamer_claim_grounding::ground_draft_with_controls",
+            Self::Rivals => "eliot_dreamer_rival_model::structure_rival_models",
+            Self::Conflict => "eliot_dreamer_conflict_analysis::analyze_conflict",
+            Self::Probes => "eliot_dreamer_probe_plan::plan_discriminative_probes",
+            Self::Candidates => {
+                "eliot_context_candidates::construct_context_candidates_with_canonical"
+            }
+            Self::Packet => "eliot_dreamer_orientation::build_projection",
+        }
+    }
+
+    /// Required owner-record descriptor consumed by this member.
+    pub fn expected_input(self) -> &'static str {
+        match self {
+            Self::Classification => "owner classification input",
+            Self::CueActivation => "owner cue snapshot",
+            Self::EpistemicPosition => "admitted epistemic records",
+            Self::Understanding => "admitted context set with route measurement",
+            Self::Grounding => "owner grounding request",
+            Self::Rivals => "validated rival declarations",
+            Self::Conflict => "admitted conflict inputs",
+            Self::Probes => "rival and affordance probe inputs",
+            Self::Candidates => "owner candidate request with CC-004 projection set",
+            Self::Packet => "joined pulse closure with admitted packet inputs",
+        }
+    }
+
     /// Static reason naming the missing owner value when not executed.
-    pub pending_reason: Option<&'static str>,
+    pub fn missing_reason(self) -> &'static str {
+        match self {
+            Self::Classification => "pulse classification requires owner classification input",
+            Self::CueActivation => "pulse cue activation requires owner cue snapshot",
+            Self::EpistemicPosition => "pulse epistemic position requires admitted records",
+            Self::Understanding => "pulse understanding view requires admitted context set",
+            Self::Grounding => "pulse claim grounding requires grounding request",
+            Self::Rivals => "pulse rival models require validated rival declarations",
+            Self::Conflict => "pulse conflict analysis requires admitted conflict inputs",
+            Self::Probes => "pulse probe plan requires rival and affordance inputs",
+            Self::Candidates => "pulse context candidates require owner candidate request",
+            Self::Packet => "pulse packet requires the joined pulse closure",
+        }
+    }
+
+    /// Static owner-refusal reason when inputs were present but refused.
+    pub fn refusal_reason(self) -> &'static str {
+        match self {
+            Self::Classification => "pulse classification owner refused",
+            Self::CueActivation => "pulse cue activation owner refused",
+            Self::EpistemicPosition => "pulse epistemic position owner refused",
+            Self::Understanding => "pulse understanding view owner refused",
+            Self::Grounding => "pulse claim grounding owner refused",
+            Self::Rivals => "pulse rival models owner refused",
+            Self::Conflict => "pulse conflict analysis owner refused",
+            Self::Probes => "pulse probe plan owner refused",
+            Self::Candidates => "pulse context candidates owner refused",
+            Self::Packet => "pulse packet projection refused",
+        }
+    }
+
+    /// Static reopen condition for a member that did not execute.
+    pub fn recovery(self) -> &'static str {
+        match self {
+            Self::Classification => "reopen when the classification owner supplies its input",
+            Self::CueActivation => "reopen when the cue owner supplies its snapshot",
+            Self::EpistemicPosition => "reopen when admitted epistemic records arrive",
+            Self::Understanding => "reopen when the admitted context set arrives",
+            Self::Grounding => "reopen when the grounding owner supplies its request",
+            Self::Rivals => "reopen when validated rival declarations arrive",
+            Self::Conflict => "reopen when admitted conflict inputs arrive",
+            Self::Probes => "reopen when rival and affordance inputs arrive",
+            Self::Candidates => "reopen when the candidate request and CC-004 set arrive",
+            Self::Packet => "reopen when the joined pulse closure is available",
+        }
+    }
+}
+
+/// Canonical identity of the mandatory ten-member denominator.
+pub(crate) const PULSE_DENOMINATOR_IDENTITY: &str = "orientation-pulse-denominator:v1:classification,cue_activation,epistemic_position,understanding,grounding,rivals,conflict,probes,candidates,packet";
+
+/// Explicit composition denominator: the expected member set plus the
+/// boundary policy the composition answers to.
+pub(crate) struct PulseDenominator {
+    /// Canonical denominator identity carried by the result.
+    pub identity: &'static str,
+    /// Expected members in composition order.
+    pub members: &'static [PulseStageId],
+    /// Whether CC-002/CC-004 boundaries are mandatory prerequisites.
+    pub boundaries_required: bool,
+}
+
+/// Mandatory production denominator: all ten members plus both boundaries.
+pub(crate) const MANDATORY_DENOMINATOR: PulseDenominator = PulseDenominator {
+    identity: PULSE_DENOMINATOR_IDENTITY,
+    members: &PulseStageId::ORDER,
+    boundaries_required: true,
+};
+
+/// Compatibility denominator: same ten members, boundaries optional, absent
+/// stage inputs record pending instead of blocking. Packet-only compositions
+/// under this denominator are candidate-only compatibility output and cannot
+/// satisfy the #41 Product Pulse acceptance.
+pub(crate) const COMPAT_DENOMINATOR: PulseDenominator = PulseDenominator {
+    identity: PULSE_DENOMINATOR_IDENTITY,
+    members: &PulseStageId::ORDER,
+    boundaries_required: false,
+};
+
+/// Proof ceiling for an executed member: candidate-only, never promoted.
+pub(crate) const CEILING_CANDIDATE_ONLY: &str = "candidate_only";
+/// Proof ceiling for a member that did not execute: nothing proved.
+pub(crate) const CEILING_BLOCKED: &str = "blocked";
+
+/// Whether conflict owner output qualifies toward a complete pulse.
+///
+/// Always false until #2869 (source/evidence provenance and proof ceilings)
+/// and #2870 (canonical pair orientation, one-digest invariant) land: an
+/// executed conflict stage stays unqualified and caps the overall pulse at
+/// partial. Owned here, flipped only by that repair wave.
+pub(crate) const CONFLICT_OUTPUT_QUALIFIED: bool = false;
+
+/// One pulse stage outcome with typed disposition and commitments.
+pub(crate) struct PulseStage<T> {
+    /// Denominator member identity.
+    pub id: PulseStageId,
+    /// Typed member disposition.
+    pub disposition: OrientationStageDisposition,
+    /// Input commitment when the member consumed its owner record.
+    pub input_commitment: Option<String>,
+    /// Output commitment when the member executed.
+    pub output_commitment: Option<String>,
+    /// Static reason naming the missing owner value or refusal.
+    pub reason: Option<&'static str>,
     /// Owner output, present exactly when executed.
     pub output: Option<T>,
 }
 
 impl<T> PulseStage<T> {
-    fn executed(output: T) -> Self {
+    fn executed(id: PulseStageId, output: T, output_commitment: Option<String>) -> Self {
         Self {
-            executed: true,
-            pending_reason: None,
+            id,
+            disposition: OrientationStageDisposition::Executed,
+            input_commitment: Some(id.expected_input().to_owned()),
+            output_commitment,
+            reason: None,
             output: Some(output),
         }
     }
 
-    fn pending(reason: &'static str) -> Self {
+    fn pending(id: PulseStageId) -> Self {
+        Self::pending_reason(id, id.missing_reason())
+    }
+
+    fn pending_reason(id: PulseStageId, reason: &'static str) -> Self {
         Self {
-            executed: false,
-            pending_reason: Some(reason),
+            id,
+            disposition: OrientationStageDisposition::Pending,
+            input_commitment: None,
+            output_commitment: None,
+            reason: Some(reason),
             output: None,
         }
     }
+
+    /// Records a production member that cannot proceed.
+    pub(crate) fn blocked(id: PulseStageId, reason: &'static str) -> Self {
+        Self {
+            id,
+            disposition: OrientationStageDisposition::Blocked,
+            input_commitment: None,
+            output_commitment: None,
+            reason: Some(reason),
+            output: None,
+        }
+    }
+
+    /// Whether this member holds the compatibility contract: pending with a
+    /// reason and no output.
+    fn is_pending_compat(&self) -> bool {
+        self.disposition == OrientationStageDisposition::Pending
+            && self.reason.is_some()
+            && self.output.is_none()
+    }
+}
+
+/// Canonical content digest over one owner output value.
+///
+/// Returns `None` only when canonical serialization fails, which the caller
+/// treats as an owner defect.
+pub(crate) fn output_digest<T: serde::Serialize>(value: &T) -> Option<String> {
+    canonical_bytes(value).ok().map(|bytes| digest_hex(&bytes))
 }
 
 /// Complete Orientation pulse request: CC-002/CC-004 boundary values, the
 /// always-required packet inputs, and optional per-stage owner inputs.
+///
+/// The explicit denominator names the member set this composition answers
+/// to; production never builds this request directly (it composes from the
+/// versioned carrier with mandatory boundaries instead).
 pub(crate) struct OrientationPulseRequest<'a, F> {
+    /// Explicit composition denominator carried by the result.
+    pub denominator: &'static PulseDenominator,
     /// CC-002 routed model outcome the pulse accounts for.
     pub model_outcome: Option<&'a ModelRouteOutcome>,
     /// CC-004 canonical projection set the pulse consumes.
@@ -231,18 +472,11 @@ pub(crate) struct OrientationPulseRequest<'a, F> {
     pub candidates: Option<CandidateStage<'a>>,
 }
 
-impl<T> PulseStage<T> {
-    /// Production invariant for one non-packet stage: not executed, with an
-    /// explicit pending reason and no output.
-    fn expect_pending(&self) {
-        debug_assert!(!self.executed);
-        debug_assert!(self.pending_reason.is_some());
-        debug_assert!(self.output.is_none());
-    }
-}
-
-/// Complete Orientation pulse: one disposition per stage plus the packet.
+/// Complete Orientation pulse: the expected denominator, one disposition
+/// per stage, plus the packet.
 pub(crate) struct OrientationPulse {
+    /// Explicit denominator this composition answered to.
+    pub denominator: &'static PulseDenominator,
     /// Classification stage outcome.
     pub classification: PulseStage<ClassificationResult>,
     /// Cue-activation stage outcome.
@@ -263,6 +497,27 @@ pub(crate) struct OrientationPulse {
     pub candidates: PulseStage<ContextCandidateSetResult>,
     /// Candidate-only Orientation packet.
     pub packet: OrientationPacketCandidate,
+}
+
+impl OrientationPulse {
+    /// Verifies the compatibility contract: a boundaries-optional
+    /// denominator with every non-packet member pending.
+    ///
+    /// This is a compatibility-seam self-check, not a production invariant:
+    /// production answers to the mandatory denominator with typed
+    /// complete/partial/blocked results instead.
+    pub(crate) fn verify_compat(&self) {
+        debug_assert!(!self.denominator.boundaries_required);
+        debug_assert!(self.classification.is_pending_compat());
+        debug_assert!(self.cue_activation.is_pending_compat());
+        debug_assert!(self.epistemic_position.is_pending_compat());
+        debug_assert!(self.understanding.is_pending_compat());
+        debug_assert!(self.grounding.is_pending_compat());
+        debug_assert!(self.rivals.is_pending_compat());
+        debug_assert!(self.conflict.is_pending_compat());
+        debug_assert!(self.probes.is_pending_compat());
+        debug_assert!(self.candidates.is_pending_compat());
+    }
 }
 
 /// Fail-closed pulse error with bounded static refusal fields.
@@ -298,30 +553,44 @@ pub(crate) enum PulseError {
     /// Context-candidate mapper refused.
     #[error("pulse context candidates refused")]
     Candidates,
+    /// The production carrier observed cancellation before composition.
+    #[error("pulse cancelled")]
+    Cancelled,
+    /// The production carrier deadline passed before composition.
+    #[error("pulse deadline exceeded")]
+    DeadlineExceeded,
     /// Orientation projector refused; maps through the existing denial table.
     #[error("pulse packet refused")]
     Packet(#[from] OrientationError),
 }
 
 impl PulseError {
-    /// Converts a production-pulse error back to the projector error.
+    /// Converts a pulse error back to the projector error.
     ///
-    /// The production path supplies no stage inputs and no boundary values, so
-    /// only the packet stage can fail there; any other variant indicates a
-    /// wiring defect and maps to the internal projector failure.
+    /// Every variant keeps a distinct refusal: boundary failures name their
+    /// static field, each stage refusal names its stage, cancellation and
+    /// deadline name their gate, and only the packet owner itself can report
+    /// an internal projector failure. Nothing collapses to a generic
+    /// `Internal`, so malformed, partial, timeout, cancellation, privacy
+    /// refusal, budget exhaustion, stale source, missing owner, and owner
+    /// rejection stay independently visible through dispatch.
     pub(crate) fn into_orientation_error(self) -> OrientationError {
         match self {
             Self::Packet(error) => error,
             Self::Boundary(field) => OrientationError::Binding(field),
-            Self::Classification
-            | Self::CueActivation
-            | Self::Epistemic
-            | Self::Understanding
-            | Self::Grounding
-            | Self::Rivals
-            | Self::Conflict
-            | Self::Probes
-            | Self::Candidates => OrientationError::Internal,
+            Self::Classification => OrientationError::Invalid("pulse classification owner refused"),
+            Self::CueActivation => OrientationError::Invalid("pulse cue activation owner refused"),
+            Self::Epistemic => OrientationError::Invalid("pulse epistemic position owner refused"),
+            Self::Understanding => {
+                OrientationError::Invalid("pulse understanding view owner refused")
+            }
+            Self::Grounding => OrientationError::Invalid("pulse claim grounding owner refused"),
+            Self::Rivals => OrientationError::Invalid("pulse rival models owner refused"),
+            Self::Conflict => OrientationError::Invalid("pulse conflict analysis owner refused"),
+            Self::Probes => OrientationError::Invalid("pulse probe plan owner refused"),
+            Self::Candidates => OrientationError::Invalid("pulse context candidates owner refused"),
+            Self::Cancelled => OrientationError::Cancelled,
+            Self::DeadlineExceeded => OrientationError::RevalidationRequired,
         }
     }
 }
@@ -336,11 +605,11 @@ fn no_understanding<'a>() -> Option<UnderstandingStage<'a, NoMeasurement>> {
     None
 }
 
-fn fences_compatible(left: &StateFence, right: &StateFence) -> bool {
+pub(crate) fn fences_compatible(left: &StateFence, right: &StateFence) -> bool {
     left.is_compatible_with(right) && right.is_compatible_with(left)
 }
 
-fn check_model_boundary(
+pub(crate) fn check_model_boundary(
     outcome: &ModelRouteOutcome,
     bundle: &DreamInputBundle,
 ) -> Result<(), PulseError> {
@@ -367,7 +636,7 @@ fn check_model_boundary(
     Ok(())
 }
 
-fn check_projection_boundary(
+pub(crate) fn check_projection_boundary(
     projections: &CanonicalProjectionSet,
     bundle: &DreamInputBundle,
 ) -> Result<(), PulseError> {
@@ -380,133 +649,136 @@ fn check_projection_boundary(
     Ok(())
 }
 
-fn run_classification_stage(
+pub(crate) fn run_classification_stage(
     stage: Option<&ClassificationStage>,
 ) -> Result<PulseStage<ClassificationResult>, PulseError> {
     stage.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse classification requires owner classification input",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::Classification)),
         |inputs| {
-            classify(inputs.input, inputs.context, inputs.policy)
-                .map(PulseStage::executed)
-                .map_err(|_| PulseError::Classification)
+            let output = classify(inputs.input, inputs.context, inputs.policy)
+                .map_err(|_| PulseError::Classification)?;
+            let commitment = output_digest(&output).ok_or(PulseError::Classification)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Classification,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_cue_stage(
+pub(crate) fn run_cue_stage(
     stage: Option<&CueActivationStage>,
 ) -> Result<PulseStage<CueActivationEvaluation>, PulseError> {
     stage.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse cue activation requires owner cue snapshot",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::CueActivation)),
         |inputs| {
-            evaluate_activation(inputs.candidate, inputs.request, inputs.profile)
-                .map(PulseStage::executed)
-                .map_err(|_| PulseError::CueActivation)
+            let output = evaluate_activation(inputs.candidate, inputs.request, inputs.profile)
+                .map_err(|_| PulseError::CueActivation)?;
+            let commitment = output_digest(&output).ok_or(PulseError::CueActivation)?;
+            Ok(PulseStage::executed(
+                PulseStageId::CueActivation,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_epistemic_stage(
+pub(crate) fn run_epistemic_stage(
     position_request: Option<&PositionRequest>,
 ) -> Result<PulseStage<ResolvedEpistemicPosition>, PulseError> {
     position_request.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse epistemic position requires admitted records",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::EpistemicPosition)),
         |inputs| {
-            resolve(inputs)
-                .map(PulseStage::executed)
-                .map_err(|_| PulseError::Epistemic)
+            let output = resolve(inputs).map_err(|_| PulseError::Epistemic)?;
+            let commitment = output_digest(&output).ok_or(PulseError::Epistemic)?;
+            Ok(PulseStage::executed(
+                PulseStageId::EpistemicPosition,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_understanding_stage<F>(
+pub(crate) fn run_understanding_stage<F>(
     stage: Option<UnderstandingStage<'_, F>>,
 ) -> Result<PulseStage<ActiveUnderstandingViewResult>, PulseError>
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
     stage.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse understanding view requires admitted context set",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::Understanding)),
         |inputs| {
-            assemble_active_view(
+            let output = assemble_active_view(
                 inputs.admitted,
                 inputs.recipe,
                 inputs.quality,
                 inputs.policy,
                 inputs.measure,
             )
-            .map(PulseStage::executed)
-            .map_err(|_| PulseError::Understanding)
+            .map_err(|_| PulseError::Understanding)?;
+            // The owner result carries no Serialize form; commit the exact
+            // owner-produced serialized bytes instead.
+            let commitment = digest_hex(&output.serialized_bytes);
+            Ok(PulseStage::executed(
+                PulseStageId::Understanding,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_grounding_stage(
+pub(crate) fn run_grounding_stage(
     grounding_request: Option<&GroundingRequest>,
 ) -> Result<PulseStage<GroundedClaimDraft>, PulseError> {
     grounding_request.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse claim grounding requires grounding request",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::Grounding)),
         |inputs| {
-            ground_draft_with_controls(inputs.clone())
-                .map(PulseStage::executed)
-                .map_err(|_| PulseError::Grounding)
+            let output =
+                ground_draft_with_controls(inputs.clone()).map_err(|_| PulseError::Grounding)?;
+            let commitment = output_digest(&output).ok_or(PulseError::Grounding)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Grounding,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_rival_stage(
+pub(crate) fn run_rival_stage(
     stage: Option<&RivalStage>,
 ) -> Result<PulseStage<StructuredRivalModelSet>, PulseError> {
     stage.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse rival models require validated rival declarations",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::Rivals)),
         |inputs| {
-            structure_rival_models(
+            let output = structure_rival_models(
                 inputs.bundle,
                 inputs.validated_draft,
                 inputs.current_position,
                 inputs.policy,
             )
-            .map(PulseStage::executed)
-            .map_err(|_| PulseError::Rivals)
+            .map_err(|_| PulseError::Rivals)?;
+            let commitment = output_digest(&output).ok_or(PulseError::Rivals)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Rivals,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_conflict_stage(
+pub(crate) fn run_conflict_stage(
     stage: Option<&ConflictStage>,
 ) -> Result<PulseStage<ConflictAnalysisCandidate>, PulseError> {
     stage.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse conflict analysis requires admitted conflict inputs",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::Conflict)),
         |inputs| {
-            analyze_conflict(
+            let output = analyze_conflict(
                 inputs.item,
                 inputs.draft,
                 inputs.grounded,
@@ -514,30 +786,43 @@ fn run_conflict_stage(
                 inputs.supplements,
                 inputs.policy,
             )
-            .map(PulseStage::executed)
-            .map_err(|_| PulseError::Conflict)
+            .map_err(|_| PulseError::Conflict)?;
+            // The owner candidate carries no Serialize form; commit the
+            // owner-issued candidate digest instead (#2870 qualifies the
+            // one-digest invariant behind it).
+            let commitment = output.candidate_digest.clone();
+            Ok(PulseStage::executed(
+                PulseStageId::Conflict,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_probe_stage(
+pub(crate) fn run_probe_stage(
     params: Option<ProbePlanParams<'_>>,
 ) -> Result<PulseStage<ProbePlan>, PulseError> {
     params.map_or_else(
-        || {
-            Ok(PulseStage::pending(
-                "pulse probe plan requires rival and affordance inputs",
-            ))
-        },
+        || Ok(PulseStage::pending(PulseStageId::Probes)),
         |inputs| {
-            plan_discriminative_probes(inputs)
-                .map(PulseStage::executed)
-                .map_err(|_| PulseError::Probes)
+            let output = plan_discriminative_probes(inputs).map_err(|_| PulseError::Probes)?;
+            let commitment = output_digest(&output).ok_or(PulseError::Probes)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Probes,
+                output,
+                Some(commitment),
+            ))
         },
     )
 }
 
-fn run_candidate_stage(
+/// Pending reason when the candidate stage has owner inputs but the CC-004
+/// projection boundary is absent.
+pub(crate) const CANDIDATES_REQUIRE_PROJECTIONS: &str =
+    "pulse context candidates require CC-004 projection set";
+
+pub(crate) fn run_candidate_stage(
     projections: Option<&CanonicalProjectionSet>,
     stage: Option<&CandidateStage>,
 ) -> Result<PulseStage<ContextCandidateSetResult>, PulseError> {
@@ -547,7 +832,7 @@ fn run_candidate_stage(
                 set: projection_set.clone(),
                 measurements: inputs.measurements.to_vec(),
             };
-            construct_context_candidates_with_canonical(
+            let output = construct_context_candidates_with_canonical(
                 inputs.request,
                 inputs.recipe,
                 &canonical,
@@ -557,30 +842,42 @@ fn run_candidate_stage(
                 inputs.evidence,
                 inputs.policy,
             )
-            .map(PulseStage::executed)
-            .map_err(|_| PulseError::Candidates)
+            .map_err(|_| PulseError::Candidates)?;
+            let commitment = output_digest(&output).ok_or(PulseError::Candidates)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Candidates,
+                output,
+                Some(commitment),
+            ))
         }
-        (None, Some(_)) => Ok(PulseStage::pending(
-            "pulse context candidates require CC-004 projection set",
+        (None, Some(_)) => Ok(PulseStage::pending_reason(
+            PulseStageId::Candidates,
+            CANDIDATES_REQUIRE_PROJECTIONS,
         )),
-        (_, None) => Ok(PulseStage::pending(
-            "pulse context candidates require owner candidate request",
-        )),
+        (_, None) => Ok(PulseStage::pending(PulseStageId::Candidates)),
     }
 }
 
-/// Runs the end-to-end Orientation pulse through the named owner entries.
+/// Runs the generic partial Orientation pulse through the named owner entries.
 ///
-/// Boundary values validate first; each present stage executes in pulse order
-/// and any owner refusal fails the pulse before the packet; absent stage
+/// This composer stays behind the explicit request denominator: supplied
+/// boundary values validate first; each present stage executes in pulse order
+/// and any owner refusal fails the composition before the packet; absent stage
 /// inputs record explicit pending dispositions. The packet always projects
 /// from the caller-supplied validated candidate, bundle, handles, and policy.
+/// Production never calls this directly; it composes from the versioned
+/// carrier with mandatory boundaries instead.
 pub(crate) fn run_orientation_pulse<F>(
     request: OrientationPulseRequest<'_, F>,
 ) -> Result<OrientationPulse, PulseError>
 where
     F: FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
 {
+    if request.denominator.boundaries_required
+        && (request.model_outcome.is_none() || request.projections.is_none())
+    {
+        return Err(PulseError::Boundary("production boundaries required"));
+    }
     if let Some(outcome) = request.model_outcome {
         check_model_boundary(outcome, request.bundle)?;
     }
@@ -607,6 +904,7 @@ where
     )?;
 
     Ok(OrientationPulse {
+        denominator: request.denominator,
         classification,
         cue_activation,
         epistemic_position,
@@ -620,19 +918,21 @@ where
     })
 }
 
-/// Runs the production Orientation pulse: packet inputs only, every other
-/// stage explicitly pending until its owner values land.
+/// Runs the packet-only compatibility pulse: packet inputs only, every other
+/// stage explicitly pending.
 ///
-/// This is the production call site for the pulse composer: dispatch reaches
-/// the projector only through this function, so the packet path is byte-stable
-/// while the composition wiring stays live in-binary.
-pub(crate) fn run_production_orientation_pulse(
+/// This is the compatibility call site for the pulse composer, retained so the
+/// packet path stays byte-stable while production moves to typed
+/// complete/partial/blocked results. It is not the production pulse and its
+/// output cannot satisfy the #41 Product Pulse acceptance.
+pub(crate) fn run_compat_orientation_pulse(
     admitted_job: &AdmittedOrientationJob,
     validated_candidate: &ValidatedCandidate,
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
 ) -> Result<OrientationPulse, PulseError> {
-    let pulse = run_orientation_pulse(OrientationPulseRequest {
+    run_orientation_pulse(OrientationPulseRequest {
+        denominator: &COMPAT_DENOMINATOR,
         model_outcome: None,
         projections: None,
         admitted_job,
@@ -649,15 +949,5 @@ pub(crate) fn run_production_orientation_pulse(
         conflict: None,
         probes: None,
         candidates: None,
-    })?;
-    pulse.classification.expect_pending();
-    pulse.cue_activation.expect_pending();
-    pulse.epistemic_position.expect_pending();
-    pulse.understanding.expect_pending();
-    pulse.grounding.expect_pending();
-    pulse.rivals.expect_pending();
-    pulse.conflict.expect_pending();
-    pulse.probes.expect_pending();
-    pulse.candidates.expect_pending();
-    Ok(pulse)
+    })
 }

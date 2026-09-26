@@ -10,6 +10,11 @@
 //! rollback-capable; cutover happens only on independent evidence plus a
 //! new generation receipt.
 //!
+//! Refusal is terminal under the oracle rule (W3): a refused cutover is
+//! rejected by the old generation, and a diverged shadow comparison
+//! escalates to a Human or independent route. The old generation can
+//! reject a candidate but can never certify itself permanently correct.
+//!
 //! This module is pure planning/authority semantics: it records phase
 //! transitions and receipts but performs no process, filesystem, or
 //! network effects. The Governor owns these semantics; the Kernel owns
@@ -574,7 +579,8 @@ pub fn verify_finish_adversarial(record: &AdversarialSuiteRecord) -> Result<(), 
     Ok(())
 }
 
-/// The five I18.31 bootstrap phases, in cutover order.
+/// The five I18.31 bootstrap phases in cutover order, plus the terminal
+/// oracle-conflict state.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapPhase {
@@ -590,6 +596,9 @@ pub enum BootstrapPhase {
     Canary,
     /// Terminal phase: independent evidence plus a new generation receipt.
     Cutover,
+    /// Terminal state: an oracle conflict was raised and resolved under
+    /// the oracle rule (W3). The machine accepts no further evidence.
+    OracleConflict,
 }
 
 /// One comparison axis checked between shadow and last-known-good.
@@ -884,6 +893,11 @@ impl GenerationReceipt {
 }
 
 /// Unresolved oracle conflict between the old generation and a candidate.
+///
+/// Raised by the bootstrap machine itself on real rejection events:
+/// [`SelfChangeBootstrap::cutover_or_reject`] on a refused cutover, and
+/// [`SelfChangeBootstrap::record_comparison_or_escalate`] on a diverged
+/// shadow comparison.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OracleConflict {
     /// The changed surface under dispute.
@@ -988,6 +1002,31 @@ pub enum OracleResolution {
         /// The deciding arbiter.
         to: ConflictArbiter,
     },
+}
+
+/// A refused bootstrap carried to its terminal oracle-rule outcome (W3).
+///
+/// The conflict binds the admitted surface and generation pair, so the
+/// refusal it records cannot name a bootstrap it did not come from. The
+/// resolution stays exhaustive — rejection by the old generation, or
+/// escalation to a Human/independent route — and permanent
+/// self-certification stays unrepresentable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedOracleConflict {
+    /// The raised conflict, bound to the refused bootstrap.
+    pub conflict: OracleConflict,
+    /// The terminal oracle-rule resolution.
+    pub resolution: OracleResolution,
+}
+
+/// Outcome of [`SelfChangeBootstrap::record_comparison_or_escalate`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ComparisonOutcome {
+    /// The comparison was clean; the machine advanced to canary.
+    Advanced,
+    /// The comparison diverged; the conflict was raised and escalated,
+    /// and the machine is terminal.
+    Escalated(ResolvedOracleConflict),
 }
 
 /// Failures raised while admitting or advancing a self-change bootstrap.
@@ -1119,6 +1158,9 @@ pub enum SelfChangeError {
         /// The admitted partial-proof case.
         case: String,
     },
+    /// The bootstrap raised an oracle conflict and is terminal.
+    #[error("bootstrap raised an oracle conflict and accepts no further evidence")]
+    OracleConflictTerminal,
     /// A text field is blank or carries control characters.
     #[error("{field} must be non-blank and free of control characters")]
     InvalidText {
@@ -1135,6 +1177,10 @@ pub enum SelfChangeError {
 /// Created by [`SelfChangeBootstrap::admit`], advanced one phase at a time,
 /// and consumed by [`SelfChangeBootstrap::cutover`]. Every transition
 /// fails closed on out-of-order, out-of-scope, or insufficient evidence.
+/// Refusal is terminal under the oracle rule (W3): a refused cutover is
+/// rejected via [`SelfChangeBootstrap::cutover_or_reject`], and a
+/// diverged comparison escalates via
+/// [`SelfChangeBootstrap::record_comparison_or_escalate`].
 #[derive(Clone, Debug)]
 pub struct SelfChangeBootstrap {
     surface: SelfChangeSurface,
@@ -1146,6 +1192,7 @@ pub struct SelfChangeBootstrap {
     comparison: Option<ShadowComparisonRecord>,
     canary: Option<CanaryRecord>,
     special_case: Option<(SpecialCase, EvidenceDigest)>,
+    conflict: Option<ResolvedOracleConflict>,
 }
 
 impl SelfChangeBootstrap {
@@ -1177,6 +1224,7 @@ impl SelfChangeBootstrap {
             comparison: None,
             canary: None,
             special_case: None,
+            conflict: None,
         })
     }
 
@@ -1190,6 +1238,17 @@ impl SelfChangeBootstrap {
     #[must_use]
     pub const fn phase(&self) -> BootstrapPhase {
         self.phase
+    }
+
+    /// The terminal oracle-conflict outcome, once the machine raises one.
+    ///
+    /// `None` while the bootstrap advances normally; `Some` after
+    /// [`SelfChangeBootstrap::record_comparison_or_escalate`] escalates a
+    /// diverged comparison. A rejected cutover consumes the machine, so
+    /// its outcome travels on the [`ResolvedOracleConflict`] return.
+    #[must_use]
+    pub fn oracle_conflict(&self) -> Option<&ResolvedOracleConflict> {
+        self.conflict.as_ref()
     }
 
     /// Records last-known-good evidence: the unchanged external
@@ -1224,7 +1283,10 @@ impl SelfChangeBootstrap {
     }
 
     /// Records the shadow comparison. It must be in scope, name the
-    /// admitted generations, and match on every axis.
+    /// admitted generations, and match on every axis. Use
+    /// [`SelfChangeBootstrap::record_comparison_or_escalate`] when a
+    /// diverged comparison must escalate under the oracle rule instead
+    /// of returning [`SelfChangeError::ComparisonDiverged`].
     ///
     /// # Errors
     ///
@@ -1247,6 +1309,50 @@ impl SelfChangeBootstrap {
         Ok(())
     }
 
+    /// Records the shadow comparison, escalating divergence (W3).
+    ///
+    /// A clean comparison advances to canary exactly like
+    /// [`SelfChangeBootstrap::record_comparison`]. A diverged comparison
+    /// is substantive oracle disagreement — neither generation can decide
+    /// it unilaterally — so the machine raises the [`OracleConflict`]
+    /// bound to this bootstrap, escalates it to `arbiter`, moves to the
+    /// terminal [`BootstrapPhase::OracleConflict`], and stores the
+    /// [`ResolvedOracleConflict`] for [`SelfChangeBootstrap::oracle_conflict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelfChangeError::PhaseOrder`], [`SelfChangeError::SurfaceMismatch`],
+    /// or [`SelfChangeError::GenerationMismatch`] for driver-side misuse;
+    /// the machine is untouched then. Divergence never errors: it
+    /// escalates.
+    pub fn record_comparison_or_escalate(
+        &mut self,
+        record: ShadowComparisonRecord,
+        arbiter: ConflictArbiter,
+    ) -> Result<ComparisonOutcome, SelfChangeError> {
+        match self.record_comparison(record) {
+            Ok(()) => Ok(ComparisonOutcome::Advanced),
+            Err(SelfChangeError::ComparisonDiverged { axes }) => {
+                let detail = format!("shadow comparison diverges on axes {axes:?}");
+                let conflict = Self::bind_conflict(
+                    self.surface,
+                    self.old_generation,
+                    self.candidate_generation,
+                    &detail,
+                );
+                let resolution = conflict.escalate(arbiter);
+                let outcome = ResolvedOracleConflict {
+                    conflict,
+                    resolution,
+                };
+                self.phase = BootstrapPhase::OracleConflict;
+                self.conflict = Some(outcome.clone());
+                Ok(ComparisonOutcome::Escalated(outcome))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Records the canary. It must be in scope, name the admitted
     /// generations, and demonstrate rollback capability.
     ///
@@ -1266,17 +1372,21 @@ impl SelfChangeBootstrap {
     }
 
     /// Records special-case evidence (W2). Allowed once the comparison
-    /// phase opens; the case must guard the admitted surface.
+    /// phase opens; the case must guard the admitted surface. A machine
+    /// terminal under the oracle rule accepts no further evidence.
     ///
     /// # Errors
     ///
     /// Returns [`SelfChangeError::PhaseOrder`], [`SelfChangeError::UnexpectedSpecialCase`],
-    /// or [`SelfChangeError::DuplicateSpecialCase`].
+    /// [`SelfChangeError::DuplicateSpecialCase`], or [`SelfChangeError::OracleConflictTerminal`].
     pub fn record_special_case(
         &mut self,
         case: SpecialCase,
         evidence: EvidenceDigest,
     ) -> Result<(), SelfChangeError> {
+        if self.phase == BootstrapPhase::OracleConflict {
+            return Err(SelfChangeError::OracleConflictTerminal);
+        }
         if self.phase < BootstrapPhase::Comparison {
             return Err(SelfChangeError::PhaseOrder {
                 expected: BootstrapPhase::Comparison,
@@ -1296,6 +1406,9 @@ impl SelfChangeBootstrap {
     /// Cuts over to the candidate generation, minting the generation
     /// receipt. Requires the full phase sequence, a rollback-capable
     /// canary, and special-case evidence when the surface requires it.
+    /// Use [`SelfChangeBootstrap::cutover_or_reject`] when a refusal must
+    /// reject the candidate under the oracle rule instead of returning
+    /// the bare refusal.
     ///
     /// # Errors
     ///
@@ -1332,6 +1445,66 @@ impl SelfChangeBootstrap {
             canary: canary.evidence,
             special_case: self.special_case,
         })
+    }
+
+    /// Cuts over, rejecting the candidate on any refusal (W3).
+    ///
+    /// Success mints the [`GenerationReceipt`] exactly like
+    /// [`SelfChangeBootstrap::cutover`]. A refusal is a real
+    /// candidate-rejection event: the machine raises the
+    /// [`OracleConflict`] bound to this bootstrap and the old generation
+    /// exercises its one unilateral power — [`OracleConflict::reject`] —
+    /// so the returned [`ResolvedOracleConflict`] carries both the
+    /// conflict and its terminal rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolved conflict — never a bare refusal — when
+    /// cutover refuses.
+    pub fn cutover_or_reject(self) -> Result<GenerationReceipt, ResolvedOracleConflict> {
+        let surface = self.surface;
+        let old_generation = self.old_generation;
+        let candidate_generation = self.candidate_generation;
+        match self.cutover() {
+            Ok(receipt) => Ok(receipt),
+            Err(refusal) => {
+                let reason = format!("cutover refused: {refusal}");
+                let conflict =
+                    Self::bind_conflict(surface, old_generation, candidate_generation, &reason);
+                let resolution = conflict.reject(reason);
+                Err(ResolvedOracleConflict {
+                    conflict,
+                    resolution,
+                })
+            }
+        }
+    }
+
+    /// Binds an oracle conflict to one admitted bootstrap identity (W3).
+    ///
+    /// Generations advance by the [`SelfChangeBootstrap::admit`]
+    /// invariant — the only constructor, with private fields — so the
+    /// generation check always holds. The detail is machine-built; control
+    /// characters are stripped and a blank result falls back to the
+    /// surface name, so the text check always holds too.
+    fn bind_conflict(
+        surface: SelfChangeSurface,
+        old_generation: u64,
+        candidate_generation: u64,
+        detail: &str,
+    ) -> OracleConflict {
+        let clean: String = detail.chars().filter(|c| !c.is_control()).collect();
+        let detail = if clean.trim().is_empty() {
+            format!("oracle conflict on {name}", name = surface.as_str())
+        } else {
+            clean
+        };
+        OracleConflict {
+            surface,
+            old_generation,
+            candidate_generation,
+            detail,
+        }
     }
 
     fn require_phase(&self, expected: BootstrapPhase) -> Result<(), SelfChangeError> {

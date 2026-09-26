@@ -219,6 +219,11 @@ pub struct SourceAnchorHandle {
     /// Digest of the exact excerpt bytes.
     pub excerpt_sha256: String,
     /// Native coordinate mapping when the owner does not use raw offsets.
+    ///
+    /// Closed owner-facing grammar `line:<n>;column:<n>`, both one-based and
+    /// counted over the reopened bytes' own `LF` line breaks. The mapping
+    /// names where the excerpt starts; the excerpt length and digest stay on
+    /// this handle. An owner that uses raw byte offsets leaves this `None`.
     pub native_mapping: Option<String>,
 }
 

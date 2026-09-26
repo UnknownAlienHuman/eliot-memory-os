@@ -1,10 +1,14 @@
 //! Versioned candidate envelope for deterministic cue snapshot builds.
 
+use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 use eliot_receipts::WorkScopeId;
 use serde::Serialize;
 use std::collections::BTreeSet;
 
-use crate::{AdmittedCueBindingProjection, CueContractError, CueSnapshot, Digest, RelationEdge};
+use crate::{
+    AdmittedCueBindingProjection, CueContractError, CueSnapshot, CueSnapshotClosure, Digest,
+    RelationEdge,
+};
 
 /// Independent A-10 envelope revision; the existing cue vocabulary remains 2.0.0.
 pub const INDEX_CONTRACT_REVISION: &str = "1.0.0";
@@ -36,7 +40,11 @@ pub struct CueSnapshotBuildCandidate {
 }
 
 impl CueSnapshotBuildCandidate {
-    /// Seals a bounded deterministic build candidate under one work scope.
+    /// Seals an explicitly open compatibility candidate under one work scope.
+    ///
+    /// This entry point is not a publication claim. Callers that need a
+    /// self-validating published record must use [`Self::seal_closed`] and
+    /// [`Self::validate_published`].
     pub fn seal(
         scope_id: WorkScopeId,
         snapshot: CueSnapshot,
@@ -64,6 +72,57 @@ impl CueSnapshotBuildCandidate {
         };
         value.build_digest = value.recompute_digest()?;
         Ok(value)
+    }
+
+    /// Seals a candidate whose snapshot carries its complete immutable closure.
+    ///
+    /// The closure is attached before the snapshot digest and the candidate
+    /// digest are computed. Consequently `validate`, rebuild, and wire
+    /// round-trips cannot silently drop denominator, row, endpoint, weight, or
+    /// fanout state.
+    pub fn seal_closed(
+        scope_id: WorkScopeId,
+        mut snapshot: CueSnapshot,
+        admitted_bindings: Vec<AdmittedCueBindingProjection>,
+        relation_edges: Vec<RelationEdge>,
+        closure: CueSnapshotClosure,
+    ) -> Result<Self, CueContractError> {
+        if !same_edge_set(&closure.relation_edges, &relation_edges) {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        if let Some(existing) = snapshot.retained_closure()
+            && existing != &closure
+        {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        snapshot = snapshot.with_closure(closure);
+        snapshot.rebuild.digest = snapshot.canonical_digest()?;
+        let value = Self::seal(scope_id, snapshot, admitted_bindings, relation_edges)?;
+        value.validate_published()?;
+        Ok(value)
+    }
+
+    /// Returns whether this candidate carries a self-validating snapshot
+    /// closure.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.snapshot.is_closed()
+    }
+
+    /// Returns the retained closure, if this candidate is closed.
+    #[must_use]
+    pub fn retained_closure(&self) -> Option<&CueSnapshotClosure> {
+        self.snapshot.retained_closure()
+    }
+
+    /// Validates a candidate only when it is explicitly self-closed. Open
+    /// compatibility candidates remain inspectable through `validate`, but
+    /// cannot be presented as published snapshots.
+    pub fn validate_published(&self) -> Result<(), CueContractError> {
+        if !self.is_closed() {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        }
+        self.validate()
     }
 
     pub fn validate(&self) -> Result<(), CueContractError> {
@@ -113,6 +172,29 @@ impl CueSnapshotBuildCandidate {
                 .cmp(&b.canonical.canonical_cue_id)
                 .then(a.target.cmp(&b.target))
         });
+        if let Some(closure) = &mut snapshot.closure {
+            closure.rows.sort_by(|left, right| {
+                left.member
+                    .canonical
+                    .canonical_cue_id
+                    .cmp(&right.member.canonical.canonical_cue_id)
+                    .then(left.member.target.cmp(&right.member.target))
+            });
+            closure
+                .relation_edges
+                .sort_by(|left, right| left.relation_edge_id.cmp(&right.relation_edge_id));
+            closure
+                .edge_weights
+                .sort_by(|left, right| left.edge.cmp(&right.edge));
+            closure
+                .denominator
+                .row_omissions
+                .sort_by(|left, right| left.identity.cmp(&right.identity));
+            closure
+                .denominator
+                .edge_omissions
+                .sort_by(|left, right| left.identity.cmp(&right.identity));
+        }
         let mut projections = self.admitted_bindings.clone();
         for projection in &mut projections {
             projection
@@ -166,6 +248,19 @@ fn validate_parts(
     let members = validate_members(snapshot, scope_id)?;
     validate_projections(snapshot, projections, scope_id, &members)?;
     validate_edges(snapshot, edges, scope_id)?;
+    if let Some(closure) = snapshot.retained_closure()
+        && (!same_edge_set(&closure.relation_edges, edges)
+            || closure.rows.iter().any(|row| {
+                row.key.scope != scope_id.as_str()
+                    || row.source.provenance.scope != scope_id.as_str()
+            })
+            || closure
+                .relation_edges
+                .iter()
+                .any(|edge| edge.evidence.provenance.scope != scope_id.as_str()))
+    {
+        return Err(CueContractError::SnapshotNotRebuildable);
+    }
     Ok(())
 }
 
@@ -212,6 +307,13 @@ fn validate_members(
                 field: "index.source.scope",
             });
         }
+        if snapshot.is_closed()
+            && !crate::version::source_revision_matches(source, snapshot.source_revision)
+        {
+            return Err(CueContractError::Foundation {
+                field: "index.source.revision",
+            });
+        }
     }
     Ok(members)
 }
@@ -235,6 +337,15 @@ fn validate_projections(
     }
     for projection in projections {
         projection.validate()?;
+        if !supported_freshness(projection.candidate.freshness)
+            || !supported_freshness(projection.normalized.observed.context.evidence.freshness)
+            || !supported_status(projection.normalized.observed.context.evidence.status)
+            || !projection.normalized.observed.context.lifecycle.is_active()
+        {
+            return Err(CueContractError::Foundation {
+                field: "index.currentness",
+            });
+        }
         if !candidates.insert(projection.candidate.binding_candidate_id.clone()) {
             return Err(CueContractError::DuplicateIdentity {
                 field: "index.candidates",
@@ -253,6 +364,11 @@ fn validate_projections(
             });
         }
         for comparison_key in &projection.normalized.comparison_keys {
+            if comparison_key.profile != snapshot.rebuild.normalization_profile {
+                return Err(CueContractError::Foundation {
+                    field: "index.comparison_profile",
+                });
+            }
             if let Some(existing) = comparison_keys.insert(
                 comparison_key.comparison_key_id.clone(),
                 comparison_key.clone(),
@@ -290,6 +406,9 @@ fn validate_projections(
         if sources.get(&source_key) != Some(&source) {
             return Err(CueContractError::SnapshotNotRebuildable);
         }
+        if let Some(closure) = snapshot.retained_closure() {
+            validate_retained_projection_row(closure, projection, scope_id)?;
+        }
         matched_sources.insert(source_key);
     }
     if matched.len() != members.len()
@@ -297,6 +416,50 @@ fn validate_projections(
         || matched_sources.len() != sources.len()
     {
         return Err(CueContractError::SnapshotNotRebuildable);
+    }
+    Ok(())
+}
+
+fn validate_retained_projection_row(
+    closure: &CueSnapshotClosure,
+    projection: &AdmittedCueBindingProjection,
+    scope_id: &WorkScopeId,
+) -> Result<(), CueContractError> {
+    let source = &projection.normalized.observed.source;
+    if !crate::version::source_revision_matches(source, closure.denominator.source_revision) {
+        return Err(CueContractError::Foundation {
+            field: "index.source.revision",
+        });
+    }
+    let row = closure
+        .rows
+        .iter()
+        .find(|row| {
+            row.member.canonical.canonical_cue_id == projection.candidate.canonical.canonical_cue_id
+                && row.member.target == projection.candidate.target
+        })
+        .ok_or(CueContractError::SnapshotNotRebuildable)?;
+    let primary = projection
+        .normalized
+        .comparison_keys
+        .first()
+        .ok_or(CueContractError::SnapshotNotRebuildable)?;
+    let expected_member = crate::SnapshotMember::new(
+        projection.candidate.canonical.clone(),
+        projection.candidate.target.clone(),
+    );
+    row.validate()?;
+    if row.member != expected_member
+        || &row.source != source
+        || row.key.scope != scope_id.as_str()
+        || row.key.kind != projection.candidate.canonical.kind
+        || row.key.mode != primary.match_mode
+        || row.key.normalized_value != primary.key_value
+        || row.source_revision != closure.denominator.source_revision
+    {
+        return Err(CueContractError::Foundation {
+            field: "index.row.source",
+        });
     }
     Ok(())
 }
@@ -314,6 +477,12 @@ fn validate_edges(
     let mut edge_ids = BTreeSet::new();
     for edge in edges {
         edge.validate()?;
+        if !supported_freshness(edge.evidence.freshness) || !supported_status(edge.evidence.status)
+        {
+            return Err(CueContractError::Foundation {
+                field: "index.edge.currentness",
+            });
+        }
         if !edge_ids.insert(edge.relation_edge_id.clone()) {
             return Err(CueContractError::DuplicateIdentity {
                 field: "index.edges",
@@ -334,6 +503,40 @@ fn validate_edges(
                 field: "index.edge.scope",
             });
         }
+        if snapshot.is_closed()
+            && !crate::version::revision_marker_matches(
+                edge.evidence.provenance.revision.as_deref(),
+                snapshot.source_revision,
+            )
+        {
+            return Err(CueContractError::Foundation {
+                field: "index.edge.revision",
+            });
+        }
     }
     Ok(())
+}
+
+fn supported_status(value: EpistemicStatus) -> bool {
+    matches!(
+        value,
+        EpistemicStatus::Observed | EpistemicStatus::Supported | EpistemicStatus::Verified
+    )
+}
+
+fn supported_freshness(value: EvidenceFreshness) -> bool {
+    matches!(
+        value,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    )
+}
+
+fn same_edge_set(left: &[RelationEdge], right: &[RelationEdge]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_by(|a, b| a.relation_edge_id.cmp(&b.relation_edge_id));
+    right.sort_by(|a, b| a.relation_edge_id.cmp(&b.relation_edge_id));
+    left == right
 }

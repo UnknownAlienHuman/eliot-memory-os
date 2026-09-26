@@ -4,6 +4,14 @@
 //! Host journal.  It copies the retained [`WakeRecord`] and changes its
 //! lifecycle state to `Cancelled`; all timing, capability, safety, budget,
 //! evidence, Host fence, and existing operation fields remain journal-owned.
+//!
+//! The read path keeps a proven absence distinct from an unreadable owner.  A
+//! successful journal snapshot that holds no such wake is
+//! [`UserAutomationRuntimeError::NotRetained`], a complete negative answer; a
+//! journal that could not be read is
+//! [`UserAutomationRuntimeError::Unavailable`], which proves nothing.  The two
+//! are different facts and a caller that must decide whether a retirement has
+//! anything left to cancel cannot be given the same value for both.
 
 use eliot_contracts::sha256_hex;
 use eliot_host_state::{
@@ -65,7 +73,13 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
             found = Some(readback);
         }
         found.ok_or_else(|| {
-            UserAutomationRuntimeError::Unavailable(
+            // The snapshot above was read successfully, so this is a complete
+            // negative answer from the sole owner of this journal: it retains no
+            // such record. It is deliberately not `Unavailable`, which is what
+            // the journal read failure above maps to. A caller must be able to
+            // tell "there is nothing here to cancel" from "I could not read what
+            // is here", because only the first is a proof.
+            UserAutomationRuntimeError::NotRetained(
                 "exact UserAutomation wake is not retained by the Host journal".to_owned(),
             )
         })

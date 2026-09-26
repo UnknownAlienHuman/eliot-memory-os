@@ -465,6 +465,20 @@ pub const GRANT_CLOSURE_VERSION: u16 = 1;
 /// Governor produces this complete parent-before-child declaration at one
 /// graph revision. Kernel consumes it as an immutable mechanical projection;
 /// it never derives semantic membership from process-local state.
+///
+/// N3 refusal rule (#2100 item N3): Governor never emits this declaration
+/// unless the revocation-closure verdict for the target is honestly
+/// complete with no receipt-authorized cross-root descendants. A
+/// partial/unknown verdict, or a complete verdict with cross-root
+/// descendants the single-root v1 shape cannot fence on their own roots
+/// with their authorizing receipts, refuses instead of emitting a
+/// silently-incomplete closure. The quarantined frontier is consumed by
+/// that complete gate — every omission bound to a verified
+/// separate-quarantine receipt — and its inert identities never appear in
+/// `members`. This refusal rule is the smaller conforming option: carrying
+/// the verdict's cross-root sections on the wire would require a schema-v2
+/// shape plus multi-root fencing on the Kernel port, so multi-root
+/// closures stay explicit recovery-required refusals until that follow-up.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrantClosureDeclaration {

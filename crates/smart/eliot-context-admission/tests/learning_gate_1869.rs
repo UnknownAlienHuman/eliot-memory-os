@@ -406,7 +406,7 @@ fn presented_1869<'a>(
         ticket: verified.permit().ticket(),
         overlay: Some(overlay),
         backlog,
-        cross_task_admission: None,
+        cross_task: None,
         requesting_campaign_id: CAMPAIGN_1869,
         requesting_task_id: TASK_1869,
         now_unix_secs: now,
@@ -422,7 +422,7 @@ fn marked_atom_admitted_with_owner_issued_permit() {
         verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
     let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
     // Host preflight alone passes on covered input.
-    screen_admission_input_learning(&input, &verified, NOW_1869)
+    screen_admission_input_learning(&input, &verified, None, NOW_1869)
         .expect("covered input passes preflight");
     let overlay = live_overlay_1869(&fence);
     let backlog = BoundedBacklog::default();

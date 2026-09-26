@@ -24,6 +24,7 @@
 //! caller-provided screen hook (see `dispatch_drive`), which the
 //! integration owner wires to that exact screen call.
 
+use eliot_contracts::{EpochId, StateFence, sha256_hex};
 use eliot_wasm_runtime::Sha256Digest;
 
 use crate::cli_contract::Profile;
@@ -37,13 +38,27 @@ pub const WASM_HOST_MATERIAL_FILE_NAME: &str = "eliot-wasm-host.admitted-dispatc
 pub const WASM_HOST_GUEST_ARTIFACT_FILE_NAME: &str = "eliot-wasm-host.guest-artifact.bin";
 /// Colocated guest input file name staged with the material.
 pub const WASM_HOST_GUEST_INPUT_FILE_NAME: &str = "eliot-wasm-host.guest-input.bin";
-/// Kernel control-request file name staged beside the delivery set while the
-/// loop runs. One `WasmHostRequestFrame` JSON document naming the running
-/// operation; the loop's installed control reader polls it for external
-/// Cancel/Reconcile/Shutdown. Same loader-derived directory rule as the
-/// delivery set; the owner publisher stays the authority for the staged
-/// value.
+/// Legacy single-fixed-file control name (issue #2896 item 13).
+///
+/// The pre-stream external control handoff: one mutable `WasmHostRequestFrame`
+/// JSON document with no owner sequence, delivery generation, or receipt. The
+/// versioned owner publisher never writes this name; it persists only so an
+/// already-staged file is treated as unadmitted legacy evidence rather than
+/// silently certified or silently erased. The reader joins it to the running
+/// operation only while the versioned spool holds no delivery for this
+/// generation (serialized owner rule: the sequenced stream always wins), and
+/// retires it only after admission plus successful worker enqueue, by
+/// exact-name byte-verified delete. Anything it cannot join stays in place
+/// for its owner.
 pub const WASM_HOST_CONTROL_FILE_NAME: &str = "eliot-wasm-host.control-request.json";
+/// Durable served marker (#2786 step 7): written atomically after a terminal
+/// outcome publishes, removed only when its own identity fully reclaims. A
+/// crash between publish and reclaim leaves staged bytes plus this marker,
+/// so restart classifies terminal-unacknowledged as replay instead of
+/// re-executing. Single fixed name, overwritten by every serve: no
+/// accumulation is possible, and a stale marker (naming a replaced set)
+/// never matches the staged identity.
+pub const WASM_HOST_SERVED_FILE_NAME: &str = "eliot-wasm-host.served.json";
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
 /// Material envelope wire version, matched exactly with the publisher.
@@ -51,6 +66,497 @@ pub const WASM_DISPATCH_MATERIAL_WIRE_VERSION: u16 = 1;
 /// Material staging allocation guard: guest inputs are small framed
 /// vectors, never dumps.
 pub const DISPATCH_MATERIAL_MAX_BYTES: u64 = 64 * 1024;
+
+/// Control-delivery envelope wire identity, mirrored exactly with the owner
+/// publisher (`eliot-kernel-service::wasm_control`).
+pub const WASM_CONTROL_DELIVERY_WIRE_ID: &str = "eliot.wasm.control-delivery";
+/// Control-delivery envelope wire version, mirrored exactly with the owner.
+pub const WASM_CONTROL_DELIVERY_WIRE_VERSION: u16 = 1;
+/// Control-ack envelope wire identity, mirrored exactly with the owner.
+pub const WASM_CONTROL_ACK_WIRE_ID: &str = "eliot.wasm.control-ack";
+/// Control-ack envelope wire version, mirrored exactly with the owner.
+pub const WASM_CONTROL_ACK_WIRE_VERSION: u16 = 1;
+/// Spool filename prefix. The full delivery name appends
+/// `{generation}-{sequence:06}` plus the kind suffix, so two owner controls
+/// can never overwrite each other through one mutable pathname.
+pub const WASM_CONTROL_FILE_PREFIX: &str = "eliot-wasm-host.control-g";
+/// Bounded spool rows per running operation and generation: the reader
+/// validates at most this many deliveries per poll and holds no per-file
+/// memory beyond one pending and one accepted slot.
+pub const WASM_CONTROL_SPOOL_MAX_DELIVERIES: usize = 8;
+/// Bounded spool file bytes: a larger staged file is refused before parsing,
+/// never truncated.
+pub const WASM_CONTROL_MAX_FILE_BYTES: u64 = 64 * 1024;
+/// Bounded directory entries advanced per poll. The reader resumes its cursor
+/// on the next tick and retains at most this many same-generation names of
+/// each slot class, so foreign entries cannot hide a later control delivery.
+pub const WASM_CONTROL_SPOOL_SCAN_CAP: usize = 64;
+/// Delivery validity window in milliseconds, mirroring the sixty-second
+/// dispatch-grant contour: freshness opens at the origin decision, never at
+/// derivation or observation time.
+pub const WASM_CONTROL_GRANT_WINDOW_MS: u64 = 60_000;
+/// Deterministic replay-key/digest domain, mirroring the dispatch derivation
+/// domain pattern so control identities can never collide with dispatch ones.
+pub const WASM_CONTROL_REPLAY_KEY_DOMAIN: &str = "eliot-wasm-host-control/v1";
+/// Bounded ack/refusal detail text: refusal evidence stays small.
+pub const WASM_CONTROL_MAX_DETAIL_BYTES: usize = 512;
+/// Cancel spelling shared with the owner publisher.
+pub const WASM_CONTROL_KIND_CANCEL: &str = "cancel";
+/// Reconcile spelling shared with the owner publisher.
+pub const WASM_CONTROL_KIND_RECONCILE: &str = "reconcile";
+/// Shutdown spelling shared with the owner publisher.
+pub const WASM_CONTROL_KIND_SHUTDOWN: &str = "shutdown";
+
+/// Owner-issued control kind, mirrored field-for-field with the publisher.
+/// The closed lowercase spelling is part of the digest and replay-key input,
+/// so it must match exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WasmControlKind {
+    /// Contain an uncertain outcome through the runtime owner.
+    Cancel,
+    /// Reconcile an uncertain outcome through its owners.
+    Reconcile,
+    /// Close admission and drain.
+    Shutdown,
+}
+
+impl WasmControlKind {
+    /// Returns the closed wire spelling shared with the owner publisher.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancel => WASM_CONTROL_KIND_CANCEL,
+            Self::Reconcile => WASM_CONTROL_KIND_RECONCILE,
+            Self::Shutdown => WASM_CONTROL_KIND_SHUTDOWN,
+        }
+    }
+}
+
+/// Versioned control-delivery identity binding, mirrored field-for-field with
+/// the owner publisher. Field declaration order is load-bearing: it fixes the
+/// canonical digest bytes, so it must stay identical on both sides.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlDeliveryIdentity {
+    /// Exact decided operation identity.
+    pub operation_id: String,
+    /// Invocation identity, always equal to `operation_id`.
+    pub invocation_id: String,
+    /// Admitted claim identity from the staged dispatch material.
+    pub claim_id: String,
+    /// Exact running process generation (non-zero).
+    pub generation: u64,
+    /// Control kind in the closed lifecycle spelling.
+    pub control_kind: WasmControlKind,
+    /// Monotonic owner sequence within this operation/generation spool.
+    pub owner_sequence: u64,
+    /// Live authority epoch bound at publication.
+    pub authority_epoch: EpochId,
+    /// Live state fence bound at publication.
+    pub state_fence: StateFence,
+    /// Admitted work-scope identity from the staged material work record.
+    pub work_scope: String,
+    /// Authenticated publisher principal digest from the owner binding.
+    pub principal_digest: String,
+    /// Publishing transport connection (correlation only).
+    pub session_connection: String,
+    /// Publishing transport session epoch (correlation only).
+    pub session_epoch: u64,
+    /// Dispatch-grant digest from the staged material.
+    pub dispatch_grant_digest: String,
+    /// Origin-control challenge identity funding this publication.
+    pub publisher_challenge_id: String,
+    /// Origin-control operation class funding this publication.
+    pub publisher_operation: String,
+    /// Origin-control decision time in Unix milliseconds.
+    pub publisher_decided_at_unix_ms: u64,
+    /// Delivery expiry in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Deterministic replay key over domain, operation, generation, kind,
+    /// and sequence; retries and restarts reconcile this key.
+    pub replay_key: String,
+    /// Digest of the previous retained delivery in sequence order, `None`
+    /// at sequence zero; ordering evidence, not consensus.
+    pub previous_delivery_digest: Option<String>,
+}
+
+/// Owner-published control delivery envelope, mirrored with the publisher.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WasmControlDelivery {
+    /// Envelope wire identity (`WASM_CONTROL_DELIVERY_WIRE_ID`).
+    pub wire_id: String,
+    /// Envelope wire version (`WASM_CONTROL_DELIVERY_WIRE_VERSION`).
+    pub wire_version: u16,
+    /// Versioned identity binding.
+    pub identity: ControlDeliveryIdentity,
+    /// Lowercase SHA-256 over the canonical envelope bytes; acks bind to it.
+    pub delivery_digest: String,
+}
+
+/// Child-to-owner acknowledgement phase, mirrored with the publisher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlAckPhase {
+    /// The child admitted the delivery and enqueued it to the worker owner
+    /// (worker completion is reported separately).
+    Enqueued,
+    /// The child observed the exact outcome of the accepted control.
+    Completed,
+    /// The child refused the delivery (admission failure evidence).
+    Refused,
+}
+
+/// Child-staged acknowledgement for one delivery, mirrored with the owner.
+/// The owner joins it by replay key and delivery digest during reconcile.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WasmControlAck {
+    /// Ack wire identity (`WASM_CONTROL_ACK_WIRE_ID`).
+    pub wire_id: String,
+    /// Ack wire version (`WASM_CONTROL_ACK_WIRE_VERSION`).
+    pub wire_version: u16,
+    /// Replay key of the acknowledged delivery.
+    pub replay_key: String,
+    /// Operation identity of the acknowledged delivery.
+    pub operation_id: String,
+    /// Generation of the acknowledged delivery.
+    pub generation: u64,
+    /// Owner sequence of the acknowledged delivery.
+    pub owner_sequence: u64,
+    /// Digest of the acknowledged delivery.
+    pub delivery_digest: String,
+    /// Acknowledgement phase in the closed spelling.
+    pub phase: ControlAckPhase,
+    /// Bounded refusal/observation detail; required for `refused`.
+    pub detail: Option<String>,
+    /// Exact outcome digest for `completed`, when the child reports one.
+    pub outcome_digest: Option<String>,
+}
+
+/// Spool filename class the child acts on. Owner-private sidecars
+/// (disposition, head) and staging temps share the prefix but are never
+/// read, parsed, or deleted by the child; they are simply not deliveries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlFileClass {
+    /// Immutable owner delivery.
+    Delivery,
+    /// Child acknowledgement.
+    Ack,
+}
+
+/// Typed control-delivery refusal. Stable field names only — no digests,
+/// paths, or payloads echoed. The field doubles as the bounded refused-ack
+/// detail, so the owner always gets typed evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlRefusal {
+    /// Stable field name.
+    pub field: &'static str,
+}
+
+impl ControlRefusal {
+    /// Builds the refusal for one stable field name.
+    #[must_use]
+    pub const fn new(field: &'static str) -> Self {
+        Self { field }
+    }
+}
+
+impl std::fmt::Display for ControlRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "WASM_CONTROL_REFUSED:{}", self.field)
+    }
+}
+
+impl std::error::Error for ControlRefusal {}
+
+/// Computes the deterministic replay key over the control identity.
+#[must_use]
+pub fn control_replay_key(
+    operation_id: &str,
+    generation: u64,
+    kind: WasmControlKind,
+    sequence: u64,
+) -> String {
+    sha256_hex(
+        format!(
+            "{WASM_CONTROL_REPLAY_KEY_DOMAIN}|{operation_id}|{generation}|{}|{sequence}",
+            kind.as_str()
+        )
+        .as_bytes(),
+    )
+}
+
+/// Computes the delivery digest over the canonical envelope bytes. The input
+/// shape matches the publisher exactly: wire fields plus the identity in
+/// declaration order.
+pub fn control_delivery_digest(
+    identity: &ControlDeliveryIdentity,
+) -> Result<String, ControlRefusal> {
+    #[derive(serde::Serialize)]
+    struct DigestInput<'a> {
+        wire_id: &'a str,
+        wire_version: u16,
+        identity: &'a ControlDeliveryIdentity,
+    }
+    let bytes = serde_json::to_vec(&DigestInput {
+        wire_id: WASM_CONTROL_DELIVERY_WIRE_ID,
+        wire_version: WASM_CONTROL_DELIVERY_WIRE_VERSION,
+        identity,
+    })
+    .map_err(|_| ControlRefusal::new("control-digest"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Returns the exact delivery filename for one generation and sequence.
+#[must_use]
+pub fn control_delivery_name(generation: u64, sequence: u64) -> String {
+    format!("{WASM_CONTROL_FILE_PREFIX}{generation}-{sequence:06}.json")
+}
+
+/// Returns the exact ack filename for one generation and sequence.
+#[must_use]
+pub fn control_ack_name(generation: u64, sequence: u64) -> String {
+    format!("{WASM_CONTROL_FILE_PREFIX}{generation}-{sequence:06}.ack.json")
+}
+
+/// Parses one spool filename into its generation, sequence, and class.
+/// Returns `None` for names outside the delivery/ack vocabulary — including
+/// owner-private sidecars, staging temps, and non-canonical padding — so two
+/// names can never address one sequence and the child never touches files
+/// outside its exact names.
+#[must_use]
+// Spool names are an exact-octet vocabulary (item 8): case-insensitive
+// matching would alias distinct sequences, so the comparisons below stay
+// byte-exact by contract, and the canonical-form check rejects twins.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+pub fn parse_control_name(name: &str) -> Option<(u64, u64, ControlFileClass)> {
+    let rest = name.strip_prefix(WASM_CONTROL_FILE_PREFIX)?;
+    if rest.ends_with(".tmp") || rest.ends_with(".disposition.json") || rest.ends_with(".head.json")
+    {
+        return None;
+    }
+    let (class, rest) = if let Some(rest) = rest.strip_suffix(".ack.json") {
+        (ControlFileClass::Ack, rest)
+    } else {
+        let rest = rest.strip_suffix(".json")?;
+        (ControlFileClass::Delivery, rest)
+    };
+    let (generation, sequence) = rest.rsplit_once('-')?;
+    let generation = generation.parse::<u64>().ok()?;
+    let sequence = sequence.parse::<u64>().ok()?;
+    if generation == 0 || !control_sequence_is_canonical(sequence, rest) {
+        return None;
+    }
+    Some((generation, sequence, class))
+}
+
+/// Reports whether the sequence renders in exactly the canonical zero-padded
+/// form the publisher stages (`{sequence:06}`).
+fn control_sequence_is_canonical(sequence: u64, rest: &str) -> bool {
+    rest.rsplit_once('-').is_some_and(|(_, text)| {
+        !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && text == format!("{sequence:06}")
+    })
+}
+
+/// Reads one control spool file under the allocation guard: the length is
+/// checked before and after the read so a concurrently grown file is refused
+/// rather than truncated. Returns [`MaterialError::Missing`] for an absent
+/// file and [`MaterialError::TooLarge`] before allocating over the ceiling —
+/// never a partial read.
+pub fn read_control_bytes(path: &std::path::Path) -> Result<Vec<u8>, MaterialError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            MaterialError::Missing
+        } else {
+            MaterialError::Unreadable(error.kind().to_string())
+        }
+    })?;
+    if metadata.len() == 0 || metadata.len() > WASM_CONTROL_MAX_FILE_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    if bytes.is_empty() || bytes.len() as u64 > WASM_CONTROL_MAX_FILE_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Stages one child-owned control file atomically: write-temp-then-rename, so
+/// the owner never observes partial JSON. The child stages only its own exact
+/// ack names; deliveries and owner sidecars are never written here.
+pub fn stage_control_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), MaterialError> {
+    if bytes.is_empty() || bytes.len() as u64 > WASM_CONTROL_MAX_FILE_BYTES {
+        return Err(MaterialError::TooLarge);
+    }
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = std::path::PathBuf::from(temp);
+    std::fs::write(&temp, bytes)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    std::fs::rename(&temp, path)
+        .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+    Ok(())
+}
+
+/// Retires the legacy fixed control file only when its current bytes still
+/// match the admitted digest: a replacement staged after admission owns the
+/// name now and must never be deleted through this path. Returns whether the
+/// file was removed.
+pub fn retire_legacy_control(path: &std::path::Path, admitted_digest: &str) -> bool {
+    let Ok(bytes) = read_control_bytes(path) else {
+        return false;
+    };
+    if sha256_hex(&bytes) != admitted_digest {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
+}
+
+/// The exact running-operation binding one control delivery must join.
+/// Assembled once from the admitted dispatch material and the sealed
+/// invocation; every field below is compared, none of it is minted.
+#[derive(Clone, Debug)]
+pub struct ExpectedControlBinding {
+    /// Exact decided operation identity.
+    pub operation_id: String,
+    /// Sealed invocation identity.
+    pub invocation_id: String,
+    /// Admitted claim identity.
+    pub claim_id: String,
+    /// Exact running process generation.
+    pub generation: u64,
+    /// Grant digest funding the running operation.
+    pub grant_digest: String,
+    /// Admitted work-scope identity.
+    pub work_scope: String,
+    /// Canonical live-authority-epoch JSON bound at admission, parsed once.
+    pub authority_epoch: serde_json::Value,
+}
+
+/// Parses and self-validates one staged delivery envelope: wire identity,
+/// closed shapes, digest self-consistency, and replay-key self-consistency.
+/// Binding against the running operation happens in
+/// [`join_control_delivery`]; ordering against the retained stream is the
+/// reader's cursor, which additionally checks the previous-digest link.
+pub fn parse_control_delivery(bytes: &[u8]) -> Result<WasmControlDelivery, ControlRefusal> {
+    let delivery: WasmControlDelivery =
+        serde_json::from_slice(bytes).map_err(|_| ControlRefusal::new("control-envelope"))?;
+    if delivery.wire_id != WASM_CONTROL_DELIVERY_WIRE_ID
+        || delivery.wire_version != WASM_CONTROL_DELIVERY_WIRE_VERSION
+    {
+        return Err(ControlRefusal::new("control-wire"));
+    }
+    let identity = &delivery.identity;
+    require_control_digest(&delivery.delivery_digest, "control-digest")?;
+    require_control_digest(&identity.replay_key, "control-replay-key")?;
+    require_control_digest(&identity.dispatch_grant_digest, "control-grant")?;
+    require_control_digest(&identity.principal_digest, "control-principal")?;
+    if let Some(previous) = identity.previous_delivery_digest.as_ref() {
+        require_control_digest(previous, "control-previous")?;
+    }
+    require_control_nonblank(&identity.operation_id, "control-operation")?;
+    require_control_nonblank(&identity.invocation_id, "control-invocation")?;
+    require_control_nonblank(&identity.claim_id, "control-claim")?;
+    require_control_nonblank(&identity.work_scope, "control-scope")?;
+    require_control_nonblank(&identity.session_connection, "control-session")?;
+    require_control_nonblank(&identity.publisher_challenge_id, "control-publisher")?;
+    require_control_nonblank(&identity.publisher_operation, "control-publisher")?;
+    if identity.generation == 0 {
+        return Err(ControlRefusal::new("control-generation"));
+    }
+    if identity.publisher_decided_at_unix_ms == 0 {
+        return Err(ControlRefusal::new("control-decided-at"));
+    }
+    if identity.owner_sequence > u64::from(u32::MAX) {
+        return Err(ControlRefusal::new("control-sequence"));
+    }
+    let expected_key = control_replay_key(
+        &identity.operation_id,
+        identity.generation,
+        identity.control_kind,
+        identity.owner_sequence,
+    );
+    if expected_key != identity.replay_key {
+        return Err(ControlRefusal::new("control-replay-key"));
+    }
+    let expected_digest = control_delivery_digest(identity)?;
+    if expected_digest != delivery.delivery_digest {
+        return Err(ControlRefusal::new("control-digest"));
+    }
+    Ok(delivery)
+}
+
+/// Joins one self-validated delivery to the exact running operation:
+/// generation freshness, identity triple, grant, scope, authority epoch, and
+/// the origin-decision deadline window. Publisher authentication stays with
+/// the existing owner admission receipt; this join checks correlation, shape,
+/// and expiry, and refuses anything else with a typed field the owner can
+/// reconcile.
+pub fn join_control_delivery(
+    delivery: &WasmControlDelivery,
+    expected: &ExpectedControlBinding,
+    now_unix_ms: u64,
+) -> Result<(), ControlRefusal> {
+    let identity = &delivery.identity;
+    if identity.generation < expected.generation {
+        return Err(ControlRefusal::new("control-generation-stale"));
+    }
+    if identity.generation > expected.generation {
+        return Err(ControlRefusal::new("control-generation-future"));
+    }
+    if identity.operation_id != expected.operation_id {
+        return Err(ControlRefusal::new("control-operation"));
+    }
+    if identity.invocation_id != expected.invocation_id {
+        return Err(ControlRefusal::new("control-invocation"));
+    }
+    if identity.claim_id != expected.claim_id {
+        return Err(ControlRefusal::new("control-claim"));
+    }
+    if identity.dispatch_grant_digest != expected.grant_digest {
+        return Err(ControlRefusal::new("control-grant"));
+    }
+    if identity.work_scope != expected.work_scope {
+        return Err(ControlRefusal::new("control-scope"));
+    }
+    let epoch = serde_json::to_value(&identity.authority_epoch)
+        .map_err(|_| ControlRefusal::new("control-authority-epoch"))?;
+    if epoch != expected.authority_epoch {
+        return Err(ControlRefusal::new("control-authority-epoch"));
+    }
+    let decided = identity.publisher_decided_at_unix_ms;
+    let deadline = identity.deadline_unix_ms;
+    if deadline <= decided || deadline > decided.saturating_add(WASM_CONTROL_GRANT_WINDOW_MS) {
+        return Err(ControlRefusal::new("control-deadline"));
+    }
+    if now_unix_ms > deadline {
+        return Err(ControlRefusal::new("control-expired"));
+    }
+    Ok(())
+}
+
+fn require_control_nonblank(value: &str, field: &'static str) -> Result<(), ControlRefusal> {
+    if value.trim().is_empty() {
+        return Err(ControlRefusal::new(field));
+    }
+    Ok(())
+}
+
+fn require_control_digest(value: &str, field: &'static str) -> Result<(), ControlRefusal> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ControlRefusal::new(field));
+    }
+    Ok(())
+}
 
 /// Fail-closed material errors. Stable codes only — no paths, digests, or
 /// payloads echoed.
@@ -596,11 +1102,592 @@ pub fn read_staged_bytes(path: &std::path::Path) -> Result<Vec<u8>, MaterialErro
     Ok(bytes)
 }
 
-/// Removes a consumed staging file. Best-effort by contract: the drive
-/// consumes each staged set once, so a leftover is a fresh-drive signal,
-/// never silent reuse.
-pub fn consume_staged(path: &std::path::Path) {
-    let _ = std::fs::remove_file(path);
+/// Typed per-file reclamation outcome (#2786 step 5). `NotFound`,
+/// sharing-violation, access-denial, and `Preserved` are distinct
+/// outcomes, never success: the caller preserves them as a bounded
+/// residual instead of overwriting the primary execution result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReclaimOutcome {
+    /// The claimed file was removed.
+    Reclaimed,
+    /// The fixed name held bytes that did not verify against the claim;
+    /// they were restored (or left to a successor) and never deleted.
+    Preserved,
+    /// No file was present; an already-reclaimed or never-staged path.
+    NotFound,
+    /// The file is open without delete sharing (Windows `ERROR_SHARING_VIOLATION`).
+    SharingViolation,
+    /// Removal was denied by ACL or platform policy.
+    AccessDenied,
+    /// Removal failed with another platform error kind (kind string only).
+    Other(String),
+}
+
+impl ReclaimOutcome {
+    /// Whether this outcome removed the claimed bytes.
+    #[must_use]
+    pub const fn reclaimed(&self) -> bool {
+        matches!(self, Self::Reclaimed)
+    }
+
+    /// Stable code for this outcome.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Reclaimed => "RECLAIM_RECLAIMED",
+            Self::Preserved => "RECLAIM_PRESERVED",
+            Self::NotFound => "RECLAIM_NOT_FOUND",
+            Self::SharingViolation => "RECLAIM_SHARING_VIOLATION",
+            Self::AccessDenied => "RECLAIM_ACCESS_DENIED",
+            Self::Other(_) => "RECLAIM_OTHER",
+        }
+    }
+}
+
+impl std::fmt::Display for ReclaimOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(kind) => {
+                write!(formatter, "RECLAIM_OTHER:{kind}")
+            }
+            other => formatter.write_str(other.code()),
+        }
+    }
+}
+
+/// Removes one claimed staging file, reporting the exact platform outcome.
+/// Callers present the exact claimed identity before calling: this removes
+/// only the path the claim bound, never a generic current pathname.
+pub fn consume_staged(path: &std::path::Path) -> ReclaimOutcome {
+    match std::fs::remove_file(path) {
+        Ok(()) => ReclaimOutcome::Reclaimed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReclaimOutcome::NotFound,
+        Err(error) if error.raw_os_error() == Some(32) => ReclaimOutcome::SharingViolation,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            ReclaimOutcome::AccessDenied
+        }
+        Err(error) => ReclaimOutcome::Other(error.kind().to_string()),
+    }
+}
+
+/// Owner-issued delivery identity bound at claim time (#2786 steps 1/3).
+///
+/// Derived verbatim from the staged envelope plus re-proven digests against
+/// the existing `WasmPublishedBundle`/`WasmJoinGate` wire shape (sibling
+/// kernel half unmerged; no field is generated locally). A directory/path is
+/// only a locator: this identity — claim, operation, generation, launch
+/// nonce, grant and fence generation, artifact/input digests, admission and
+/// expiry window, authority epoch — is what the claim binds. Envelope digest
+/// and publication incarnation/revision await the kernel publisher half.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedDeliveryIdentity {
+    /// Admitted claim identity.
+    pub claim_id: String,
+    /// Admitted operation identity.
+    pub operation_id: String,
+    /// Claiming generation (non-zero).
+    pub generation: u64,
+    /// Claim-bound launch nonce.
+    pub launch_nonce: String,
+    /// Owner-issued grant digest (hex).
+    pub grant_digest: String,
+    /// Grant fence generation.
+    pub fence_generation: u64,
+    /// Re-proven artifact digest (hex).
+    pub artifact_digest: String,
+    /// Re-proven input digest (hex).
+    pub input_digest: String,
+    /// Durable admission time in Unix milliseconds.
+    pub admitted_at_unix_ms: u64,
+    /// Grant expiry in Unix milliseconds.
+    pub expires_at: u64,
+    /// Canonical live-authority-epoch JSON bound at admission.
+    pub authority_epoch_json: String,
+}
+
+impl StagedDeliveryIdentity {
+    /// Captures the delivery identity from validated material.
+    #[must_use]
+    pub fn from_material(material: &ValidatedDispatchMaterial) -> Self {
+        Self {
+            claim_id: material.claim_id.clone(),
+            operation_id: material.operation_id.clone(),
+            generation: material.generation,
+            launch_nonce: material.launch_nonce.clone(),
+            grant_digest: material.grant.grant_digest.as_str().to_owned(),
+            fence_generation: material.grant.fence_generation,
+            artifact_digest: material.ceilings.artifact_digest.as_str().to_owned(),
+            input_digest: material.ceilings.input_digest.as_str().to_owned(),
+            admitted_at_unix_ms: material.admitted_at_unix_ms,
+            expires_at: material.grant.expires_at,
+            authority_epoch_json: material.authority_epoch_json.clone(),
+        }
+    }
+
+    /// Captures the delivery identity from a parsed envelope input,
+    /// before payload bytes are attached. Field-for-field with
+    /// [`from_material`](Self::from_material): the envelope claim selects
+    /// the operation, never the colocated bytes.
+    #[must_use]
+    pub fn from_input(input: &DispatchMaterialInput) -> Self {
+        Self {
+            claim_id: input.claim_id.clone(),
+            operation_id: input.operation_id.clone(),
+            generation: input.generation,
+            launch_nonce: input.launch_nonce.clone(),
+            grant_digest: input.grant_digest.clone(),
+            fence_generation: input.grant_fence_generation,
+            artifact_digest: input.ceilings.artifact_digest.clone(),
+            input_digest: input.ceilings.input_digest.clone(),
+            admitted_at_unix_ms: input.admitted_at_unix_ms,
+            expires_at: input.grant_expires_at,
+            authority_epoch_json: input.authority_epoch_json.clone(),
+        }
+    }
+
+    /// Whether staged material still names this exact identity, including
+    /// the grant/artifact/input digests (preserved #2895 comparison).
+    #[must_use]
+    pub fn matches_material(&self, material: &ValidatedDispatchMaterial) -> bool {
+        self == &Self::from_material(material)
+    }
+}
+
+/// Exact-generation claim (#2786 step 3): the pre-read envelope identity
+/// a claim-first read binds before the payload files are trusted.
+/// Rechecked against owner state before reclamation. Same-delivery replay
+/// matches this claim and returns the retained result; it never
+/// recaptures current files as the old operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryClaim {
+    /// Claimed delivery identity.
+    identity: StagedDeliveryIdentity,
+}
+
+impl DeliveryClaim {
+    /// Claims the exact ready generation named by claim-first material.
+    /// The material bound only because its envelope snapshot survived the
+    /// payload reads unchanged, so this claim is that pre-read identity.
+    #[must_use]
+    pub fn from_material(material: &ValidatedDispatchMaterial) -> Self {
+        Self {
+            identity: StagedDeliveryIdentity::from_material(material),
+        }
+    }
+
+    /// Borrows the claimed identity.
+    #[must_use]
+    pub fn identity(&self) -> &StagedDeliveryIdentity {
+        &self.identity
+    }
+
+    /// Releases the claimed identity for served-set retention.
+    #[must_use]
+    pub fn into_identity(self) -> StagedDeliveryIdentity {
+        self.identity
+    }
+
+    /// Whether staged material still names the claimed generation.
+    #[must_use]
+    pub fn matches(&self, material: &ValidatedDispatchMaterial) -> bool {
+        self.identity.matches_material(material)
+    }
+}
+
+/// Claimed reclamation result (#2786 steps 5/6): execution outcome, result
+/// publication, owner acknowledgement, and physical reclamation stay
+/// separate. Only an identity-matching staged set is reclaimed; a
+/// replacement, an already-gone set, or an unreadable set is left untouched
+/// with its exact identity preserved. Durable owner-side retirement awaits
+/// the kernel publisher half; this child-side transition presents the exact
+/// claimed identity against the same staged owner state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimedReclamation {
+    /// The claimed generation was reclaimed with per-file outcomes.
+    Reclaimed(DeliveryReclamation),
+    /// A replacement generation owns the fixed names; left untouched.
+    ReplacementPreserved { claimed: StagedDeliveryIdentity },
+    /// No staged set remains; nothing to reclaim.
+    AlreadyGone { claimed: StagedDeliveryIdentity },
+    /// Staged set unreadable or invalid; identity+data retained for recovery.
+    RetainedForRecovery { claimed: StagedDeliveryIdentity },
+}
+
+/// Per-file reclamation detail for one claimed generation (bounded: exactly
+/// the three staged names, payloads first and envelope last so a crash
+/// mid-reclaim leaves the envelope identity for recovery).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryReclamation {
+    /// Reclaimed delivery identity.
+    pub identity: StagedDeliveryIdentity,
+    /// Guest artifact file outcome.
+    pub artifact: ReclaimOutcome,
+    /// Guest input file outcome.
+    pub input: ReclaimOutcome,
+    /// Material envelope file outcome.
+    pub material: ReclaimOutcome,
+}
+
+impl DeliveryReclamation {
+    /// Whether every claimed file was removed. A partial outcome is a
+    /// bounded residual/maintenance obligation, never a primary-result
+    /// overwrite.
+    #[must_use]
+    pub fn fully_reclaimed(&self) -> bool {
+        self.artifact.reclaimed() && self.input.reclaimed() && self.material.reclaimed()
+    }
+}
+
+/// Aside suffix for claim-by-rename reclamation. Distinct from the owner
+/// publisher's `.partial` names by construction, so the two sides never
+/// share a staging name; the publisher never touches aside names.
+const RECLAIM_ASIDE_SUFFIX: &str = ".reclaiming";
+
+/// Aside path for one fixed staging name under the claimed identity: the
+/// fixed name is only a locator, and this claimed-identity name is the
+/// only path ever deleted. The claim fragment is filename-sanitized and
+/// truncated; the process id scopes forensics, never authority.
+fn reclaim_aside_path(
+    install_dir: &std::path::Path,
+    file_name: &str,
+    claim: &StagedDeliveryIdentity,
+) -> std::path::PathBuf {
+    let fragment: String = claim
+        .claim_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    install_dir.join(format!(
+        ".{file_name}.g{:020}.{fragment}.{}{RECLAIM_ASIDE_SUFFIX}",
+        claim.generation,
+        std::process::id()
+    ))
+}
+
+/// Removes orphaned aside files for one fixed staging name. Every aside
+/// predates this call, so under the single-driver rule (one child driver
+/// per install directory; the publisher never writes aside names) each
+/// one is a crash-window orphan whose fixed set already moved on. Bounded
+/// scan; failures are ignored because a leftover aside is inert evidence,
+/// never a live name. Callers run this only while the fixed name exists.
+fn remove_stale_reclaim_asides(install_dir: &std::path::Path, file_name: &str) {
+    let prefix = format!(".{file_name}.");
+    let Ok(entries) = std::fs::read_dir(install_dir) else {
+        return;
+    };
+    for entry in entries.flatten().take(64) {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        if text.starts_with(&prefix) && text.ends_with(RECLAIM_ASIDE_SUFFIX) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Restores aside bytes to their fixed name only when no successor owns
+/// it. The hard-link attempt is the atomic restore-if-absent path: it
+/// fails when the publisher already staged a successor, so a replacement
+/// is never clobbered. When the fixed name holds a successor, the aside
+/// bytes are already superseded (the owner slot retains them immutably)
+/// and the aside is removed so incidents cannot accumulate. When the
+/// fixed name is absent and the filesystem lacks hard links, a plain
+/// rename restores: safe on Windows (rename fails over an existing
+/// destination), with a narrow clobber window against a concurrent
+/// publisher on Unix. That window is the honest residual of filesystems
+/// without atomic restore-if-absent.
+fn restore_aside_if_absent(aside: &std::path::Path, fixed: &std::path::Path) {
+    if std::fs::hard_link(aside, fixed).is_ok() {
+        let _ = std::fs::remove_file(aside);
+        return;
+    }
+    if std::fs::symlink_metadata(fixed).is_ok() {
+        let _ = std::fs::remove_file(aside);
+        return;
+    }
+    let _ = std::fs::rename(aside, fixed);
+}
+
+/// Reclaims one fixed staging name by claim: renames the fixed name aside
+/// under the claimed-identity name, re-verifies the aside bytes against
+/// the claim, and deletes only the verified aside. A fixed name that went
+/// missing answers `NotFound`; aside bytes that fail verification are
+/// restored when no successor owns the name and answer `Preserved` — a
+/// replacement landing between the set pre-check and this removal is
+/// never deleted. Deletion targets the claimed aside path only, never a
+/// generic current pathname.
+#[must_use]
+pub fn reclaim_claimed_file(
+    install_dir: &std::path::Path,
+    file_name: &str,
+    claim: &StagedDeliveryIdentity,
+    verify: impl FnOnce(&[u8]) -> bool,
+) -> ReclaimOutcome {
+    let fixed = install_dir.join(file_name);
+    match std::fs::symlink_metadata(&fixed) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ReclaimOutcome::NotFound;
+        }
+        Err(_) => {}
+        Ok(_) => remove_stale_reclaim_asides(install_dir, file_name),
+    }
+    let aside = reclaim_aside_path(install_dir, file_name, claim);
+    match std::fs::rename(&fixed, &aside) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ReclaimOutcome::NotFound;
+        }
+        Err(error) if error.raw_os_error() == Some(32) => {
+            return ReclaimOutcome::SharingViolation;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return ReclaimOutcome::AccessDenied;
+        }
+        Err(error) => return ReclaimOutcome::Other(error.kind().to_string()),
+        Ok(()) => {}
+    }
+    let Ok(bytes) = read_staged_bytes(&aside) else {
+        restore_aside_if_absent(&aside, &fixed);
+        return ReclaimOutcome::Other("aside-unreadable".to_owned());
+    };
+    if !verify(&bytes) {
+        restore_aside_if_absent(&aside, &fixed);
+        return ReclaimOutcome::Preserved;
+    }
+    consume_staged(&aside)
+}
+
+/// Reclaims exactly the claimed generation from the install directory.
+///
+/// The set pre-check re-reads the staged set through the claim-first
+/// loader and compares the full identity (claim, operation, generation,
+/// nonce, grant/fence, digests, window, epoch); anything else is a
+/// replacement left untouched. Each removal then re-verifies on its own:
+/// the fixed name is renamed aside under the claimed-identity name and
+/// only aside bytes that still verify against the claim are deleted, so
+/// a replacement B landing after the pre-check is restored, never
+/// deleted. No single-owner condition is asserted — the owner publisher
+/// stages replacements and retires expired sets concurrently by design —
+/// which is exactly why every deletion re-verifies after the move.
+/// Residual windows: the Unix restore path without hard-link support
+/// (see `restore_aside_if_absent`), and a crash between rename-aside
+/// and restore/delete orphaning one aside (removed on the next reclaim;
+/// the fixed set heals on the owner's next publication). The sibling
+/// kernel half fixes the analogous publisher-side race; coordination is
+/// by protocol (aside names never collide with publisher partials).
+#[must_use]
+pub fn reclaim_claimed_delivery(
+    claim: &DeliveryClaim,
+    install_dir: &std::path::Path,
+) -> ClaimedReclamation {
+    let staged = match read_dispatch_material_from(install_dir) {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            return ClaimedReclamation::AlreadyGone {
+                claimed: claim.identity().clone(),
+            };
+        }
+        Err(_) => {
+            return ClaimedReclamation::RetainedForRecovery {
+                claimed: claim.identity().clone(),
+            };
+        }
+    };
+    if !claim.matches(&staged) {
+        return ClaimedReclamation::ReplacementPreserved {
+            claimed: claim.identity().clone(),
+        };
+    }
+    let identity = claim.identity();
+    let artifact = reclaim_claimed_file(
+        install_dir,
+        WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+        identity,
+        |bytes| Sha256Digest::of_bytes(bytes).as_str() == identity.artifact_digest.as_str(),
+    );
+    let input = reclaim_claimed_file(
+        install_dir,
+        WASM_HOST_GUEST_INPUT_FILE_NAME,
+        identity,
+        |bytes| Sha256Digest::of_bytes(bytes).as_str() == identity.input_digest.as_str(),
+    );
+    let material = reclaim_claimed_file(
+        install_dir,
+        WASM_HOST_MATERIAL_FILE_NAME,
+        identity,
+        |bytes| match parse_envelope(bytes) {
+            Ok(input) => StagedDeliveryIdentity::from_input(&input) == *identity,
+            Err(_) => false,
+        },
+    );
+    // Any preserved file means a replacement owns the fixed names now:
+    // already-removed files were exactly-claimed verified bytes, and the
+    // current names are left untouched for the next drive.
+    if matches!(artifact, ReclaimOutcome::Preserved)
+        || matches!(input, ReclaimOutcome::Preserved)
+        || matches!(material, ReclaimOutcome::Preserved)
+    {
+        return ClaimedReclamation::ReplacementPreserved {
+            claimed: identity.clone(),
+        };
+    }
+    // The served marker retires only with its own fully gone set: while any
+    // staged file resists removal, the marker stays so the next drive
+    // replays instead of re-executing a partially reclaimed set. A marker
+    // naming another identity is never touched here.
+    if reclamation_gone(&artifact)
+        && reclamation_gone(&input)
+        && reclamation_gone(&material)
+        && let Some(mark) = read_served_marker(install_dir)
+        && mark.names(claim.identity())
+    {
+        let _ = std::fs::remove_file(install_dir.join(WASM_HOST_SERVED_FILE_NAME));
+    }
+    ClaimedReclamation::Reclaimed(DeliveryReclamation {
+        identity: claim.identity().clone(),
+        artifact,
+        input,
+        material,
+    })
+}
+
+/// Restart/discovery classification (#2786 step 7): restart discovers owner
+/// publication/claim state through staged identity plus served retention, not
+/// arbitrary files alone. Legacy v1 fixed-name sets are an explicit
+/// compatibility state — consumed only under full admission with the staged
+/// identity verbatim, never reinterpreted as a fresh generation with new
+/// identity. Terminal-unacknowledged sets reconcile through the durable
+/// served marker; cross-operation owner ack/retirement stays with the
+/// kernel publisher half.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StagedDeliveryState {
+    /// Staged set matches served state: replay, no second guest effect.
+    Replay { identity: StagedDeliveryIdentity },
+    /// Legacy v1 fixed-name set: explicit compat, full admission only.
+    LegacyV1FixedName { identity: StagedDeliveryIdentity },
+}
+
+/// Classifies staged material against served retention. Same identity — or
+/// the same grant digest under any differing generation/operation/digests —
+/// is a replay of spent one-shot authority, never a fresh execution. The
+/// durable marker extends the same rule across restart: a staged set the
+/// marker names is terminal-unacknowledged (a crash between publish and
+/// reclaim), so it replays instead of re-executing.
+#[must_use]
+pub fn classify_staged_delivery(
+    material: &ValidatedDispatchMaterial,
+    served: Option<&StagedDeliveryIdentity>,
+    marker: Option<&ServedDeliveryMarker>,
+) -> StagedDeliveryState {
+    let identity = StagedDeliveryIdentity::from_material(material);
+    match served {
+        Some(prior) if prior == &identity => StagedDeliveryState::Replay { identity },
+        Some(prior) if prior.grant_digest == identity.grant_digest => {
+            StagedDeliveryState::Replay { identity }
+        }
+        _ => match marker {
+            Some(mark) if mark.names(&identity) => StagedDeliveryState::Replay { identity },
+            Some(mark) if mark.grant_digest == identity.grant_digest => {
+                StagedDeliveryState::Replay { identity }
+            }
+            _ => StagedDeliveryState::LegacyV1FixedName { identity },
+        },
+    }
+}
+
+/// Durable served record: the identity this drive served to a published
+/// terminal outcome. Decisions match on identity only; `served_at_unix_ms`
+/// is informational (wall-clock at write, never a derivation input).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServedDeliveryMarker {
+    /// Served operation identity.
+    pub operation_id: String,
+    /// Served generation.
+    pub generation: u64,
+    /// Served claim identity.
+    pub claim_id: String,
+    /// Served grant digest (hex).
+    pub grant_digest: String,
+    /// Wall-clock milliseconds when the marker was written.
+    pub served_at_unix_ms: u64,
+}
+
+impl ServedDeliveryMarker {
+    /// Captures the served record for one claimed identity.
+    #[must_use]
+    pub fn from_identity(identity: &StagedDeliveryIdentity, served_at_unix_ms: u64) -> Self {
+        Self {
+            operation_id: identity.operation_id.clone(),
+            generation: identity.generation,
+            claim_id: identity.claim_id.clone(),
+            grant_digest: identity.grant_digest.clone(),
+            served_at_unix_ms,
+        }
+    }
+
+    /// Whether this marker names exactly the staged identity.
+    #[must_use]
+    pub fn names(&self, identity: &StagedDeliveryIdentity) -> bool {
+        self.operation_id == identity.operation_id
+            && self.generation == identity.generation
+            && self.claim_id == identity.claim_id
+            && self.grant_digest == identity.grant_digest
+    }
+}
+
+/// Reads the durable served marker, if any. Absent, oversize, or
+/// unparseable answers `None`: an unreadable marker must not wedge
+/// execution; the staged-identity behavior is the fallback. Bounded read:
+/// a legitimate marker is a few hundred bytes.
+#[must_use]
+pub fn read_served_marker(install_dir: &std::path::Path) -> Option<ServedDeliveryMarker> {
+    let bytes = std::fs::read(install_dir.join(WASM_HOST_SERVED_FILE_NAME)).ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Writes the served marker atomically (process-scoped partial, flushed,
+/// then renamed): the reader never observes partial JSON. Best-effort
+/// durability signal: the serve already happened exactly once, so callers
+/// proceed on failure — without a marker only crash-recovery replay is
+/// lost, never the correctness of this serve.
+pub fn write_served_marker(
+    install_dir: &std::path::Path,
+    identity: &StagedDeliveryIdentity,
+    served_at_unix_ms: u64,
+) -> std::io::Result<()> {
+    let marker = ServedDeliveryMarker::from_identity(identity, served_at_unix_ms);
+    let bytes =
+        serde_json::to_vec(&marker).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let partial = install_dir.join(format!(
+        ".{}.{}.partial",
+        WASM_HOST_SERVED_FILE_NAME,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&partial);
+    std::fs::write(&partial, &bytes)?;
+    std::fs::File::open(&partial)?.sync_all()?;
+    std::fs::rename(&partial, install_dir.join(WASM_HOST_SERVED_FILE_NAME))?;
+    Ok(())
+}
+
+/// Whether one staged file is gone: removed by this reclaim, or already
+/// absent. Any other outcome keeps the set identifiable for recovery.
+fn reclamation_gone(outcome: &ReclaimOutcome) -> bool {
+    matches!(
+        outcome,
+        ReclaimOutcome::Reclaimed | ReclaimOutcome::NotFound
+    )
 }
 
 /// Wire mirror of the owner-published grant record, field-for-field with
@@ -884,10 +1971,27 @@ fn parse_envelope(bytes: &[u8]) -> Result<DispatchMaterialInput, MaterialError> 
 }
 
 /// Reads and validates one staged dispatch material set from the install
-/// directory: the envelope file parses and binds, then the colocated
-/// guest artifact/input files read bounded and re-hash against the bound
-/// digests. A missing envelope is `Ok(None)` — the caller keeps its
-/// fail-closed path; anything present but invalid fails closed.
+/// directory, claim-first: the small envelope file (claim/identity plus
+/// digests) is snapshotted and parsed BEFORE the payload files read, the
+/// payload digests re-hash against that pre-read claim at bind, and the
+/// envelope is re-read and confirmed byte-identical before anything
+/// binds. The fixed names are dumb locators; the pre-read claim selects
+/// the operation. A missing envelope is `Ok(None)` — the caller keeps its
+/// fail-closed path; anything present but invalid, or an envelope that
+/// moved during the payload reads, fails closed and never executes.
+/// Identical payload bytes across generations are why the envelope
+/// re-confirm exists: digests alone cannot tell them apart.
+///
+/// Honest residual — cases this ordering cannot exclude, by protocol, not
+/// by omission: no cross-process reservation or lease exists on the child
+/// side, so (a) a replacement staged entirely BEFORE the snapshot reads
+/// as one consistent set (it is the live set at read time), and (b) a
+/// replacement staged entirely AFTER the bind executes from pinned
+/// in-memory bytes while the fixed names advance (the
+/// execution-bytes-pinned invariant; reclamation re-checks before
+/// deleting). Publication serialization stays with the owner publisher
+/// half (retire-or-backpressure); the claim orders the read, not the
+/// publisher.
 ///
 /// # Errors
 ///
@@ -906,6 +2010,14 @@ pub fn read_dispatch_material_from(
     input.artifact_bytes =
         read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))?;
     input.input_bytes = read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))?;
+    // Envelope re-confirm BEFORE binding: a replacement staged during the
+    // payload reads aborts here, never executes — even when the payload
+    // bytes are identical across generations. Any drift, disappearance,
+    // or re-read fault is a torn set, never absence.
+    match read_staged_bytes(&material_path) {
+        Ok(current) if current == envelope_bytes => {}
+        _ => return Err(MaterialError::DigestMismatch),
+    }
     bind_dispatch_material(input).map(Some)
 }
 
@@ -924,6 +2036,39 @@ pub fn read_dispatch_material() -> Result<Option<ValidatedDispatchMaterial>, Mat
         return Ok(None);
     };
     read_dispatch_material_from(directory)
+}
+
+/// Claim-first read returning the pre-read claim with the material bound
+/// under it: one call, one snapshot, so the claim the loop serves and
+/// reclaims is the identity that selected the operation — never a copy
+/// derived after the fact from whatever the names happen to hold.
+///
+/// # Errors
+///
+/// Returns [`MaterialError`] exactly as [`read_dispatch_material_from`].
+pub fn read_claimed_dispatch_material_from(
+    install_dir: &std::path::Path,
+) -> Result<Option<(DeliveryClaim, ValidatedDispatchMaterial)>, MaterialError> {
+    read_dispatch_material_from(install_dir)
+        .map(|staged| staged.map(|material| (DeliveryClaim::from_material(&material), material)))
+}
+
+/// Claim-first read from the executable directory (`current_exe`, never
+/// argv/stdin/env). `None` when no material was delivered or the loader
+/// path is unavailable.
+///
+/// # Errors
+///
+/// Returns [`MaterialError`] when staged files are present but invalid.
+pub fn read_claimed_dispatch_material()
+-> Result<Option<(DeliveryClaim, ValidatedDispatchMaterial)>, MaterialError> {
+    let Some(path) = admitted_material_path() else {
+        return Ok(None);
+    };
+    let Some(directory) = path.parent() else {
+        return Ok(None);
+    };
+    read_claimed_dispatch_material_from(directory)
 }
 
 /// Binds one typed material input into validated dispatch material.

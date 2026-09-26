@@ -129,6 +129,10 @@ sync-skills:
 # success is never Review/release proof. The dependency list below is the
 # retained just-quick baseline pinned by scripts/docs_closure_audit.py
 # (DOC-GATE-JUST); it runs each bounded gate once.
+# Quarantined legacy verification lane (issue #1813 W6): the cargo recipes below execute
+# directly with no governed profile receipt. Thin-invoker migration to the same named
+# profile awaits W4 stage-execution provisions; until then no governed claim rests on
+# these gates.
 quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
 # Complete locked Review profile, sole definition in scripts/verify.ps1.

@@ -575,6 +575,51 @@ def read_cohort_lock(lock_path: Path | str) -> CohortLock:
     )
 
 
+def locked_catalogue_rows(
+    lock_path: Path | str,
+    discovered: Optional[Mapping[int, c.WorkUnitDescriptor]] = None,
+) -> Dict[int, c.CatalogueRow]:
+    """Project the committed lock onto catalogue rows, preserving its edges.
+
+    Pure projection over the closed lock schema `read_cohort_lock` already owns
+    (no second parser, no second discovery rule). Every locked row is returned
+    with the disposition, body digest, unit and `prerequisites` the lock
+    actually declares, bound to the caller's freshly decoded descriptor when
+    one exists for that issue.
+
+    Without a lock the projection is empty: a root that ships no lock has
+    declared no row, no disposition and no prerequisite edge, and the caller
+    keeps its own discovered denominator unchanged. Prerequisite edges are
+    never dropped here; a row that declares a prerequisite keeps it so the
+    selected plan can demand the matching accepted evidence.
+    """
+    try:
+        lock = read_cohort_lock(lock_path)
+    except CohortError:
+        return {}
+    supplied = dict(discovered) if discovered else {}
+    rows: Dict[int, c.CatalogueRow] = {}
+    try:
+        repo = c.RepositoryIdentity(lock.repository_owner, lock.repository_name)
+        for entry in lock.rows:
+            descriptor = supplied.get(entry.issue)
+            if descriptor is not None and type(descriptor) is not c.WorkUnitDescriptor:
+                raise CohortError(CohortProblem.INTERNAL_ERROR, "supplied assigned descriptor mistyped")
+            rows[entry.issue] = c.CatalogueRow(
+                issue=c.IssueIdentity(repo, entry.issue),
+                unit=c.WorkUnitIdentity(entry.unit),
+                body_sha256=entry.body_sha256,
+                disposition=c.CatalogueDisposition(entry.disposition),
+                descriptor=descriptor,
+                prerequisites=tuple(c.IssueIdentity(repo, n) for n in entry.prerequisites),
+            )
+    except CohortError:
+        raise
+    except c.ContractViolation as exc:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    return rows
+
+
 def verify_cohort_lock(
     lock_path: Path | str,
     work_units_dir: Path | str,

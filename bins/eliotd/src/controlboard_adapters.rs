@@ -50,15 +50,24 @@
 //! through a second client.
 //!
 //! Production edges out of this module (Implements #1187 W1/A1):
-//! [`is_controlboard_read_tool`] routes one Kernel-admitted claimed
-//! `eliot.query` pair naming the broker-owned operator read capability, and
-//! [`serve_controlboard_view`] builds one board over one immutable snapshot
-//! through [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard),
-//! performs exactly one authenticated role-filtered read on it, and binds the
-//! canonical view — or the board's exact typed refusal, including a
-//! `PlanGap` naming the missing owner — into the existing submit-leg result
-//! body. The composition is the single production owner of these ports; no
-//! other caller builds a board.
+//! [`is_controlboard_read_tool`] is the only production selector for this module
+//! and [`serve_controlboard_view`] is the only production seam that builds a
+//! board: through
+//! [`DaemonComposition::controlboard`](super::DaemonComposition::controlboard) it
+//! builds one board over one immutable snapshot, performs exactly one
+//! authenticated role-filtered read on it, and binds the canonical view — or the
+//! board's exact typed refusal, including a `PlanGap` naming the missing owner —
+//! into the existing submit-leg result body. The composition is the single owner
+//! of these ports; no other caller builds a board.
+//!
+//! Both edges are reached from one Kernel-admitted claimed pair whose tool name
+//! is [`CONTROLBOARD_READ_CAPABILITY`]. `HostRequestInvokeReadPayload::validate`
+//! proves that name equals the admitted `envelope.identity.capability`, so this
+//! predicate reads the capability identity itself and cannot be satisfied by a
+//! pair admitted for any other capability. No such pair is queued or claimed
+//! today: the gate inventory is recorded at the branch in
+//! `daemon_runtime::run_local_read_poll`, which is the exact place that
+//! inventory has to be re-verified.
 
 #![forbid(unsafe_code)]
 
@@ -139,20 +148,29 @@ pub(crate) fn controlboard_over_snapshot(
 /// `crates/surfaces/eliot-user-broker-core/src/lib.rs` (`OPERATOR_CAPABILITIES`)
 /// is the admission owner that issues it and
 /// `crates/meta/eliot-runtime-status/src/controlboard_projection.rs` names it as
-/// the `capability` binding example. The daemon is neither: it routes one
-/// already-admitted claimed pair on the capability identity the Kernel itself
-/// validated, and mints no capability of its own. A third import edge would add
-/// a dependency without changing a byte on the wire or widening any authority.
+/// the `capability` binding example. The daemon is neither: it selects only a
+/// claimed pair whose capability identity the Kernel itself already validated,
+/// and it mints no capability of its own. A third import edge would add a
+/// dependency without changing a byte on the wire or widening any authority.
+///
+/// Today no pair carrying this capability is queued or claimed, so the constant
+/// names the wire identity the daemon would route, not a request that currently
+/// arrives.
 pub const CONTROLBOARD_READ_CAPABILITY: &str = "controlboard.read";
 
 /// Routes one claimed pair tool to the composed `ControlBoard` read.
 ///
 /// Thin predicate in the same shape as
 /// [`is_skill_tool`](super::skill_dispatch::is_skill_tool): the local-read
-/// poller serves such pairs locally through
-/// [`serve_controlboard_view`] instead of forwarding them on the Kernel
-/// `local_read` leg, which serves store reads only. Anything else keeps the
-/// existing forward path byte-identical.
+/// poller would serve such pairs locally through [`serve_controlboard_view`]
+/// instead of forwarding them on the Kernel `local_read` leg, which serves store
+/// reads only. Anything else keeps the existing forward path byte-identical.
+///
+/// The Kernel's protocol linkage gate proves the tool name equals the admitted
+/// `envelope.identity.capability`, so this is a capability-identity test, not a
+/// free-text one: it can never be true for a pair admitted under another
+/// capability, and it grants nothing to a caller that lacks the capability
+/// because the Kernel is the only party that can admit such a pair at all.
 #[must_use]
 pub fn is_controlboard_read_tool(tool: &serde_json::Value) -> bool {
     tool.as_object()

@@ -416,7 +416,7 @@ fn presented_1869<'a>(
         ticket: verified.permit().ticket(),
         overlay: Some(overlay),
         backlog,
-        cross_task_admission: None,
+        cross_task: None,
         requesting_campaign_id: CAMPAIGN_1869,
         requesting_task_id: TASK_1869,
         now_unix_secs: now,

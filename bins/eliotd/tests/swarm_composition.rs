@@ -508,15 +508,22 @@ fn cancel_drain_reaches_terminal_ready_then_unknown_blocks_false_terminal() {
             ("slot-b".to_owned(), ChildExit::CancelledAfterEffect),
         ]
     );
-    assert_eq!(outcome.cancelled.len(), 2);
+    assert_eq!(outcome.cancel_requested.len(), 2);
     assert!(outcome.passes >= 1);
 
     // One child goes unreachable with possible effect: the same drain now
     // blocks the terminal aggregate instead of publishing a false terminal.
     runner.set_state("slot-b", ChildState::UnknownBlocked);
     match composition.drain_bounded(16).expect_err("unknown blocks") {
-        SwarmCompositionError::TerminalBlocked { unknown } => {
+        SwarmCompositionError::TerminalBlocked { unknown, progress } => {
             assert_eq!(unknown, vec!["slot-b".to_owned()]);
+            // Progress already made stays reported with the block: slot-a was
+            // observed terminal in the same call.
+            assert!(
+                progress
+                    .terminal
+                    .contains(&("slot-a".to_owned(), ChildExit::CancelledAfterEffect))
+            );
         }
         other => panic!("unknown must block the terminal, got {other:?}"),
     }

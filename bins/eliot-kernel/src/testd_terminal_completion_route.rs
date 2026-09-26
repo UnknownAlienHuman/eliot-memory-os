@@ -56,7 +56,8 @@ pub(crate) const OWNER_PENDING_TERMINALS_OPERATION: &str =
     reason = "wired by the MGR-A daemon dispatch arms (REPORT-325)"
 )]
 pub(crate) const OWNER_ACK_TERMINAL_OPERATION: &str = "eliot.kernel.testd-owner-ack-terminal";
-/// Wire revision shared by every `TestD` owner operation.
+/// Wire revision retained by terminal-completion and daemon-side owner routes.
+/// Productive owner-submit uses its submit-specific v2 contract.
 pub(crate) const OWNER_WIRE_VERSION: u16 = eliot_testd_core::TESTD_OWNER_WIRE_VERSION;
 
 pub(crate) type OwnerSubmitRequest = TestdOwnerSubmitRequest;

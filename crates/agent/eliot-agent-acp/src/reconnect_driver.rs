@@ -22,7 +22,11 @@
 //! The driver depends only on [`HostEventPersistenceOwner`](crate::HostEventPersistenceOwner),
 //! so the A/store physical-durability binding drives reconnect unchanged.
 
-use crate::{EventKey, HostEventPersistenceOwner, IngestError, ReplayItem};
+use crate::{
+    BestEffortDropGap, DurableHostEventJournal, EventKey, HostEventPersistenceOwner, IngestError,
+    ReplayItem,
+};
+use eliot_agent_api::CommittedHostEventIntake;
 
 /// Outcome of one reconnect drive over a single stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,4 +82,57 @@ pub fn drive_reconnect<O: HostEventPersistenceOwner>(
         }
     }
     Ok(outcome)
+}
+
+/// Observed reconnect drive over the concrete journal (issue #371 W7/A28, I7.23).
+///
+/// [`drive_reconnect`] is generic over [`HostEventPersistenceOwner`] so the
+/// A/store physical-durability binding can drive reconnect unchanged; this
+/// wrapper runs the same drive against the in-memory [`DurableHostEventJournal`]
+/// and then projects every delivered committed record through
+/// `DurableHostEventJournal::to_coordinator_intake` while surfacing
+/// `DurableHostEventJournal::drop_gaps` for the stream. The intake conversions
+/// feed coordinator observation (`observe_committed_intake` over
+/// [`CommittedHostEventIntake`]); the gaps keep best-effort drops as exact
+/// coverage instead of fabricating observation or advancing
+/// acknowledgement/cursor state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservedReconnectOutcome {
+    /// The underlying reconnect drive outcome (commits, deliveries, acks).
+    pub drive: ReconnectOutcome,
+    /// Intake conversions for the delivered committed records, ascending.
+    pub intakes: Vec<CommittedHostEventIntake>,
+    /// Best-effort drop gaps recorded for the stream, in record order.
+    pub gaps: Vec<BestEffortDropGap>,
+}
+
+/// Drives reconnect for one stream and projects the delivered committed
+/// records to coordinator intake views plus the stream drop gaps.
+///
+/// Delivery/acknowledgement semantics are exactly [`drive_reconnect`]'s; after
+/// a successful drive, each delivered sequence converts via
+/// `DurableHostEventJournal::to_coordinator_intake` (the drive commits staged
+/// items before delivery, so every delivered record is committed and converts)
+/// and the stream's `DurableHostEventJournal::drop_gaps` are collected
+/// unchanged.
+pub fn drive_reconnect_observed(
+    owner: &mut DurableHostEventJournal,
+    stream_id: &str,
+    deliver: impl FnMut(&ReplayItem) -> bool,
+) -> Result<ObservedReconnectOutcome, IngestError> {
+    let drive = drive_reconnect(owner, stream_id, deliver)?;
+    let mut intakes = Vec::with_capacity(drive.delivered.len());
+    for sequence in &drive.delivered {
+        let key = EventKey {
+            stream_id: stream_id.to_owned(),
+            sequence: *sequence,
+        };
+        intakes.push(owner.to_coordinator_intake(&key)?);
+    }
+    let gaps = owner.drop_gaps(stream_id);
+    Ok(ObservedReconnectOutcome {
+        drive,
+        intakes,
+        gaps,
+    })
 }

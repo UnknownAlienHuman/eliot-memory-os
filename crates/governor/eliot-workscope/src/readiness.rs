@@ -794,6 +794,7 @@ mod tests {
             1,
             &privacy(),
             task,
+            None,
             1,
         ) {
             Ok(value) => value,

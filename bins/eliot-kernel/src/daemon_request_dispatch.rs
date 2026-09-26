@@ -30,8 +30,8 @@ use eliot_kernel_service::{
     advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
-    OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
-    ProcessExecutionView, ProcessLifecycle,
+    OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
@@ -97,6 +97,18 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 /// Response `kind` of the bounded notification inbox projection.
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
+
+/// Authenticated P-07 root-transition activation route (`#2962`).
+///
+/// A DISTINCT Kernel-owned front-door operation: the presented payload is the
+/// complete typed root-transition operation, and the reply is the
+/// transition-specific activation receipt. It is never an `activate_grant`
+/// overload, and the dispatcher never reads transition fields out of an
+/// untyped map.
+pub(crate) const ACTIVATE_ROOT_TRANSITION_OPERATION: &str = "activate_root_transition";
+
+/// Typed receipt kind answered by the root-transition activation arm.
+pub(crate) const ROOT_TRANSITION_RECEIPT_KIND: &str = "authority_root_transition_receipt";
 
 /// Authenticated P-07 read route answering the completed canonical second
 /// phases of one authority root (issue #2100, `R6`).
@@ -459,6 +471,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
         "revoke_introduction" => "revoke_introduction",
+        ACTIVATE_ROOT_TRANSITION_OPERATION => ACTIVATE_ROOT_TRANSITION_OPERATION,
         QUERY_GRANT_CLOSURE_LINKS_OPERATION => QUERY_GRANT_CLOSURE_LINKS_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
@@ -574,6 +587,44 @@ struct GrantActivationOperation {
 struct GrantRevocationOperation {
     grant_id: String,
     snapshot_id: String,
+    binding: eliot_receipts::AuthorityBinding,
+    subject: eliot_receipts::AuthorityRequestSubject,
+}
+
+/// Closed P-07 root-transition activation operation (`#2962`).
+///
+/// This is a DISTINCT front-door operation, not an `activate_grant` overload:
+/// it carries the complete typed root-transition operation — operation
+/// identity, idempotency key, both grant identities AND their immutable
+/// commitments, both authority roots, the graph snapshot and its
+/// predecessor/expected-next revisions, policy revision, deadline, effect
+/// ceiling, semantic decision reference, canonical request digest, the
+/// presented authority binding, and the presented principal/session/scope
+/// subject. The dispatcher decodes it closed, rechecks binding and subject
+/// against the authenticated session, and routes it through the retained
+/// P-07 owner port; it never mints authority and never reads the transition
+/// fields out of an untyped map. Unknown or absent fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootTransitionActivationOperation {
+    operation_id: String,
+    idempotency_key: String,
+    transition_id: String,
+    parent_grant_id: String,
+    child_grant_id: String,
+    parent_grant_commitment: String,
+    child_grant_commitment: String,
+    from_authority_root_ref: String,
+    to_authority_root_ref: String,
+    issuer: String,
+    graph_snapshot_id: String,
+    predecessor_graph_revision: u64,
+    expected_next_graph_revision: u64,
+    policy_revision: String,
+    deadline_unix_ms: u64,
+    effect_ceiling: eliot_receipts::EffectClass,
+    semantic_decision_ref: String,
+    canonical_request_digest: String,
     binding: eliot_receipts::AuthorityBinding,
     subject: eliot_receipts::AuthorityRequestSubject,
 }
@@ -756,7 +807,8 @@ fn p07_binding_agrees_with_session(
 fn map_p07_port_error(error: &eliot_authority::P07PortError) -> TransportError {
     match error {
         eliot_authority::P07PortError::UnknownOutcome { .. } => TransportError::UnknownOutcome,
-        eliot_authority::P07PortError::InvalidBinding => TransportError::IdentityConflict,
+        eliot_authority::P07PortError::InvalidBinding
+        | eliot_authority::P07PortError::IdentityConflict => TransportError::IdentityConflict,
         eliot_authority::P07PortError::NotAdmitted | eliot_authority::P07PortError::Unavailable => {
             TransportError::SessionFenced
         }
@@ -2231,21 +2283,12 @@ impl KernelComposition {
                 // changed binding under a known identity conflicts, an unknown
                 // parent is unknown, and an elapsed deadline times out there.
                 // Observe bytes ride this entry exactly like the bridge
-                // front-door submit arm (issue #2565): linkage before
-                // staging, retention enqueue after admission.
+                // front-door submit arm (issue #2565): linkage and a bounded
+                // queue reservation precede admission and payload handoff.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let observe_tool = payload.get("tool").cloned();
-                if let Some(ref tool) = observe_tool
-                    && envelope.identity.capability == host_request_route::OBSERVE_CAPABILITY
-                {
-                    host_request_route::check_observe_tool_linkage(&envelope, tool)?;
-                }
-                let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
-                self.maybe_enqueue_observe_pair_for_submit(
-                    &envelope,
-                    &record,
-                    observe_tool.as_ref(),
-                );
+                let (receipt, record) =
+                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
@@ -2295,8 +2338,9 @@ impl KernelComposition {
                 ))
             }
             "initialize_owner_revision" => {
-                let operation: OwnerRevisionOperation = serde_json::from_value(payload.clone())
-                    .map_err(|_| TransportError::SessionFenced)?;
+                let operation: OwnerRevisionOperation =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
                 if operation.state_fence != session.module_generation.state_fence {
                     return Err(TransportError::SessionFenced);
                 }
@@ -2383,7 +2427,7 @@ impl KernelComposition {
             }
             QUERY_GRANT_CLOSURE_LINKS_OPERATION => {
                 let query: eliot_kernel_service::GrantClosureCanonicalLinksQuery =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 // The live session fence binds the served view, exactly as the
                 // authority-history read binds it: a query presented under any
@@ -2411,7 +2455,7 @@ impl KernelComposition {
             }
             "activate_grant" => {
                 let operation: GrantActivationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
@@ -2443,7 +2487,7 @@ impl KernelComposition {
             }
             "revoke_grant" => {
                 let operation: GrantRevocationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.grant_id.trim().is_empty() || operation.snapshot_id.trim().is_empty() {
                     return Err(TransportError::SessionFenced);
@@ -2470,7 +2514,7 @@ impl KernelComposition {
             }
             "activate_introduction" => {
                 let operation: IntroductionActivationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.introduction_id.trim().is_empty()
                     || operation.snapshot_id.trim().is_empty()
@@ -2508,7 +2552,7 @@ impl KernelComposition {
             }
             "revoke_introduction" => {
                 let operation: IntroductionRevocationOperation =
-                    serde_json::from_value(payload.clone())
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                         .map_err(|_| TransportError::SessionFenced)?;
                 if operation.introduction_id.trim().is_empty()
                     || operation.snapshot_id.trim().is_empty()
@@ -2534,6 +2578,68 @@ impl KernelComposition {
                     serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
                 Ok(serde_json::json!({
                     "kind": "authority_revocation_receipt",
+                    "value": value,
+                }))
+            }
+            ACTIVATE_ROOT_TRANSITION_OPERATION => {
+                let operation: RootTransitionActivationOperation =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                // Binding and subject are rechecked against the authenticated
+                // session BEFORE the retained owner is touched, so a stale or
+                // cross-session crossing never reaches the port.
+                p07_binding_agrees_with_session(&operation.binding, &operation.subject, session)?;
+                self.admit_material_authority_for_fence(
+                    GovernanceProfile::full(),
+                    &session.module_generation.state_fence,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                let record = eliot_authority::RootTransitionRecord {
+                    transition_id: operation.transition_id,
+                    operation_id: operation.operation_id,
+                    idempotency_key: operation.idempotency_key,
+                    parent_grant_id: operation.parent_grant_id,
+                    child_grant_id: operation.child_grant_id,
+                    parent_grant_commitment: operation.parent_grant_commitment,
+                    child_grant_commitment: operation.child_grant_commitment,
+                    from_authority_root_ref: operation.from_authority_root_ref,
+                    to_authority_root_ref: operation.to_authority_root_ref,
+                    issuer: operation.issuer,
+                    graph_snapshot_id: operation.graph_snapshot_id,
+                    predecessor_graph_revision: operation.predecessor_graph_revision,
+                    expected_next_graph_revision: operation.expected_next_graph_revision,
+                    admitted_at_revision: operation.expected_next_graph_revision,
+                    policy_revision: operation.policy_revision,
+                    deadline_unix_ms: operation.deadline_unix_ms,
+                    effect_ceiling: operation.effect_ceiling,
+                    semantic_decision_ref: operation.semantic_decision_ref,
+                    binding: operation.binding,
+                };
+                // The presented canonical request digest must be the one this
+                // exact operation produces: a recomputed digest is authority
+                // readback over the presented bytes, not caller assertion.
+                let request = eliot_authority::RootTransitionActivationRequest::new(
+                    record,
+                    operation.subject,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                if request.canonical_request_digest() != operation.canonical_request_digest {
+                    return Err(TransportError::IdentityConflict);
+                }
+                let owner = self.retained_p07_owner()?;
+                let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+                let receipt = eliot_authority::P07AuthorityPort::activate_root_transition(
+                    bound.port(),
+                    &request,
+                )
+                .map_err(|error| map_p07_port_error(&error))?;
+                receipt
+                    .validate(&request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let value =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": ROOT_TRANSITION_RECEIPT_KIND,
                     "value": value,
                 }))
             }
@@ -3125,96 +3231,48 @@ impl KernelComposition {
         request_id: RequestId,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let route: UserAutomationOperatorRoute =
-            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
-        if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
-            return Err(TransportError::SessionFenced);
+        let request = Self::build_user_automation_operator_request(session, &request_id, payload)?;
+        match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
+            Ok(()) => {}
+            Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
+                return Ok(Self::user_automation_precommit_refusal_response(
+                    &request, &error,
+                ));
+            }
+            Err(_) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "user_automation_request_validation_outcome_unavailable".to_owned(),
+                    ),
+                ));
+            }
         }
-        let identity = route.request_identity;
-        identity
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if identity.request.metadata.request_id != request_id
-            || identity.request.state_fence != session.module_generation.state_fence
-            || route.payload.idempotency_key != identity.idempotency_key
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
-        let principal = authenticated_user_automation_principal(session)?;
-        let operation_id = eliot_contracts::OperationId::new(format!(
-            "user-automation-operation:{}",
-            route.payload.idempotency_key
-        ))
-        .map_err(|_| TransportError::SessionFenced)?;
-        let intent = eliot_kernel_core::UserAutomationOperatorIntent {
-            intent_id: format!("user-automation-intent:{}", route.payload.idempotency_key),
-            principal_ref: principal.clone(),
-            state_fence: session.module_generation.state_fence.clone(),
-            operation: route.payload.operation,
-        };
-        let request = eliot_kernel_service::UserAutomationServiceRequest {
-            context: identity.request.metadata.clone(),
-            authenticated_principal: principal,
-            identity: OperationIdentity {
-                operation_id,
-                idempotency_key: route.payload.idempotency_key,
-                canonical_request_hash: String::new(),
-            },
-            intent,
-        };
-        // The existing authenticated Host execution channel is composed for
-        // exactly the operations that own a wake or execution handoff, so a
-        // read-only answer never depends on the Host contour. The composed
-        // `UserAutomationOperatorRuntime` is the concrete runtime port the
-        // post-commit transition calls; no second transport or route is created.
-        let runtime_channel = match self
-            .user_automation_operator_runtime_channel(
-                &request.intent.operation,
-                &session.module_generation.state_fence,
-            )
+        let transition = match self
+            .dispatch_user_automation_operator_transition(session, &request)
             .await
         {
-            Ok(channel) => channel,
-            Err(error) => {
-                return Ok(Self::user_automation_runtime_error_response(error));
-            }
+            Ok(transition) => transition,
+            Err(response) => return Ok(response),
         };
-        let runtime = runtime_channel
-            .as_ref()
-            .map(eliot_kernel_service::UserAutomationOperatorRuntime::new);
-        let gateway = self.retained_store_gateway()?;
-        let transition =
-            Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
-                .await
-                .map_err(|_error| {
-                    // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
-                    // observation only. The single designated terminal for
-                    // this failed operation is emitted by
-                    // `execute_daemon_request_observed`; a second terminal
-                    // here would inflate one store failure into two.
-                    observe_daemon_request(
-                        "kernel.daemon_user_automation_operator_store",
-                        "fenced",
-                    );
-                    TransportError::SessionFenced
-                })?;
         // The Human inspect surface shows the deterministic schedule
         // projection before activation: the same normalized occurrence set the
         // trigger contract uses, compiled here into the immutable
         // revision-bound occurrence identities. A schedule the compiler cannot
         // compile fails closed instead of projecting a guessed occurrence.
-        let occurrences =
-            Self::user_automation_inspection_occurrences(&transition).map_err(|_error| {
-                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
-                // observation only; `execute_daemon_request_observed` owns
-                // the single designated terminal for this failed operation.
-                observe_daemon_request(
-                    "kernel.daemon_user_automation_occurrence_projection",
-                    "fenced",
-                );
-                TransportError::SessionFenced
-            })?;
+        let Ok(occurrences) = Self::user_automation_inspection_occurrences(&transition) else {
+            // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+            // observation only; `execute_daemon_request_observed` owns
+            // the single designated terminal for this failed operation.
+            observe_daemon_request(
+                "kernel.daemon_user_automation_occurrence_projection",
+                "unknown",
+            );
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "user_automation_occurrence_projection_requires_reconciliation".to_owned(),
+                ),
+            ));
+        };
         let recovery = transition.recovery();
         let known = transition.is_known();
         if !known {
@@ -3233,11 +3291,207 @@ impl KernelComposition {
                 "configuration": transition.configuration,
                 "wake": transition.wake,
                 "horizon": transition.horizon,
+                // The one post-commit orchestration record of this parent
+                // operation: the runtime obligations retained durably before any
+                // owner effect was issued, each with its original owner
+                // operation identity and its durable disposition. It is absent
+                // exactly when the operation owns no runtime obligation.
+                "orchestration": transition.orchestration,
                 "execution": transition.execution,
                 "occurrences": occurrences,
             },
             "recovery": recovery,
         }))
+    }
+
+    #[cfg(windows)]
+    fn build_user_automation_operator_request(
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<eliot_kernel_service::UserAutomationServiceRequest, TransportError> {
+        let route: UserAutomationOperatorRoute =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        let identity = route.request_identity;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if &identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+            || route.payload.idempotency_key != identity.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
+        let principal = authenticated_user_automation_principal(session)?;
+        let operation_id = eliot_contracts::OperationId::new(format!(
+            "user-automation-operation:{}",
+            route.payload.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let intent = eliot_kernel_core::UserAutomationOperatorIntent {
+            intent_id: format!("user-automation-intent:{}", route.payload.idempotency_key),
+            principal_ref: principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+            operation: route.payload.operation,
+        };
+        Ok(eliot_kernel_service::UserAutomationServiceRequest {
+            context: identity.request.metadata.clone(),
+            authenticated_principal: principal,
+            identity: OperationIdentity {
+                operation_id,
+                idempotency_key: route.payload.idempotency_key,
+                canonical_request_hash: String::new(),
+            },
+            intent,
+        })
+    }
+
+    /// Composes the existing Host runtime and executes the canonical operator
+    /// transition. An error is already projected as the route's structured
+    /// response; unknown post-Store failures remain reconcilable.
+    #[cfg(windows)]
+    async fn dispatch_user_automation_operator_transition(
+        &self,
+        session: &Session,
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> Result<eliot_kernel_service::UserAutomationOperatorTransition, serde_json::Value> {
+        // The existing authenticated Host execution channel is composed for
+        // exactly the operations that own a wake or execution handoff, so a
+        // read-only answer never depends on the Host contour. This reuses the
+        // existing route and transport rather than creating new authority.
+        let runtime_channel = self
+            .user_automation_operator_runtime_channel(
+                &request.intent.operation,
+                &session.module_generation.state_fence,
+            )
+            .await
+            .map_err(Self::user_automation_runtime_error_response)?;
+        let runtime = runtime_channel
+            .as_ref()
+            .map(eliot_kernel_service::UserAutomationOperatorRuntime::new);
+        let Ok(gateway) = self.retained_store_gateway() else {
+            return Err(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Unavailable(
+                    "canonical UserAutomation Store owner is unavailable".to_owned(),
+                ),
+            ));
+        };
+        match Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
+            .await
+        {
+            Ok(transition) => Ok(transition),
+            Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => Err(
+                Self::user_automation_precommit_refusal_response(request, &error),
+            ),
+            Err(_error) => {
+                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+                // observation only. The single designated terminal for
+                // this failed operation is emitted by
+                // `execute_daemon_request_observed`; a second terminal
+                // here would inflate one store failure into two.
+                observe_daemon_request("kernel.daemon_user_automation_operator_store", "unknown");
+                Err(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "user_automation_operator_transition_requires_reconciliation".to_owned(),
+                    ),
+                ))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn user_automation_precommit_refusal_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+        error: &eliot_kernel_core::user_automation::UserAutomationError,
+    ) -> serde_json::Value {
+        use eliot_kernel_core::user_automation::UserAutomationError;
+
+        let (code, field) = match error {
+            UserAutomationError::ZoneTableIntegrity => {
+                return Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Unavailable(
+                        "pinned UserAutomation zone table integrity failure".to_owned(),
+                    ),
+                );
+            }
+            UserAutomationError::Invalid("schedule.occurrence_key.encoding") => (
+                "unsupported_contract_version",
+                Some("schedule.occurrence_key.encoding"),
+            ),
+            UserAutomationError::LegacyScheduleEncoding(field) => ("legacy_encoding", Some(*field)),
+            UserAutomationError::SubMinuteZoneOffset { field, .. } => {
+                ("unrepresentable_zone_offset", Some(*field))
+            }
+            UserAutomationError::ZoneDatabaseRevision(field) => {
+                ("stale_normalization_revision", Some(*field))
+            }
+            UserAutomationError::Invalid("schedule.occurrence_key.source_digest") => (
+                "stale_normalization_revision",
+                Some("schedule.occurrence_key.source_digest"),
+            ),
+            UserAutomationError::Receipt(_) | UserAutomationError::ReceiptBinding => {
+                ("invalid_or_moved_receipt", None)
+            }
+            UserAutomationError::Invalid(field)
+            | UserAutomationError::LimitExceeded(field)
+            | UserAutomationError::UnknownZone(field)
+            | UserAutomationError::ZoneEvidence(field)
+            | UserAutomationError::ZoneTableWindow { field, .. } => {
+                ("semantic_rejection", Some(*field))
+            }
+            UserAutomationError::InvalidSupersession => {
+                ("semantic_rejection", Some("revision.supersedes"))
+            }
+            UserAutomationError::Config(_)
+            | UserAutomationError::RevisionMismatch
+            | UserAutomationError::OccurrenceMismatch
+            | UserAutomationError::FailureProjectionMissing
+            | UserAutomationError::FailureFingerprintMismatch
+            | UserAutomationError::Serialization(_) => ("semantic_rejection", None),
+        };
+        let mut refusal = serde_json::Map::new();
+        refusal.insert("code".to_owned(), serde_json::json!(code));
+        if let Some(field) = field {
+            refusal.insert("field".to_owned(), serde_json::json!(field));
+        }
+        if let UserAutomationError::SubMinuteZoneOffset {
+            zone,
+            offset_seconds,
+            ..
+        } = error
+        {
+            refusal.insert("zone".to_owned(), serde_json::json!(zone));
+            refusal.insert(
+                "offset_seconds".to_owned(),
+                serde_json::json!(offset_seconds),
+            );
+        }
+        // The caller key was already capped at 256 UTF-8 bytes. The request ID
+        // and StateFence have closed validated shapes. Refusal fields are static
+        // contract names; the optional zone is a pinned table member.
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "kind": "user_automation_refusal",
+                "schema_version": 1,
+                "operation": {
+                    "operation_id": request.identity.operation_id.as_str(),
+                    "request_id": &request.context.request_id,
+                    "idempotency_key": request.identity.idempotency_key.as_str(),
+                },
+                "state_fence": &request.context.state_fence,
+                "attempt_state": "store_not_called",
+                "refusal": refusal,
+            },
+            "recovery": {
+                "kind": "unknown_outcome",
+                "reason": "prior_attempt_may_have_committed",
+            },
+        })
     }
 
     /// Composes the existing authenticated Host execution channel for the
@@ -4202,20 +4456,32 @@ impl KernelComposition {
             .await
         {
             Ok(readback) => readback,
-            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
+            // The owner read its own journal and definitively retains no such
+            // record. That is a complete negative answer about this delivery, so
+            // it is refused with the same typed cause as before rather than with
+            // an ad-hoc body: a duplicate or superseded delivery is refused here,
+            // before any effect owner is contacted.
+            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
                 return UserAutomationDueWakeRead::Answer(
-                        Self::user_automation_due_wake_refused_response(
-                            &UserAutomationDueWakeRejection::new(
-                                eliot_kernel_service::UserAutomationDueWakeRejectionCause::WakeNotRetained,
-                                occurrence_id.to_owned(),
-                                format!(
-                                    "the schedule owner retains no pending wake for this \
-                                     occurrence: {reason}"
-                                ),
+                    Self::user_automation_due_wake_refused_response(
+                        &UserAutomationDueWakeRejection::new(
+                            eliot_kernel_service::UserAutomationDueWakeRejectionCause::WakeNotRetained,
+                            occurrence_id.to_owned(),
+                            format!(
+                                "the schedule owner read its own journal and definitively retains \
+                                 no pending wake for this occurrence: {reason}"
                             ),
                         ),
-                    );
+                    ),
+                );
             }
+            // `Unavailable` on this route is now only a journal the owner could
+            // not read, which proves nothing about this occurrence. No
+            // `UserAutomationDueWakeRejectionCause` expresses "the owner could
+            // not answer", and reusing `WakeNotRetained` here would assert a
+            // proven absence that was never proven, so it keeps the existing
+            // generic projection: an unknown answer with a recovery directive,
+            // which is fail-closed and cannot be read as a normal empty result.
             Err(error) => {
                 return UserAutomationDueWakeRead::Answer(
                     Self::user_automation_runtime_error_response(error),
@@ -4607,6 +4873,30 @@ impl KernelComposition {
         error: UserAutomationRuntimeError,
     ) -> serde_json::Value {
         match error {
+            // A complete negative answer from the owner: it read its own state
+            // and definitively retains no such record. This is a known outcome,
+            // not an unknown one, so it is reported as a definitive
+            // non-acceptance with nothing left to reconcile. It is deliberately
+            // not folded into `unavailable`, which means the owner could not
+            // answer at all.
+            //
+            // The due-wake readback does not reach this arm: it refuses a proven
+            // absence itself with the typed
+            // `UserAutomationDueWakeRejectionCause::WakeNotRetained`, because its
+            // consumer is the wake-owner contract and not this JSON projection.
+            // This arm serves the remaining readback call sites that forward an
+            // owner error verbatim: the `USER_AUTOMATION_RUNTIME_OPERATION`
+            // route's `ReadPendingWake` operation, and the run-now trigger
+            // preflight readback.
+            UserAutomationRuntimeError::NotRetained(reason) => serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": false,
+                    "outcome": "not_retained",
+                    "reason": reason,
+                },
+                "recovery": null,
+            }),
             UserAutomationRuntimeError::Unavailable(reason) => serde_json::json!({
                 "status": "unknown",
                 "value": { "outcome": "unavailable" },
@@ -4643,7 +4933,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: OriginChallengeIssueOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         validate_origin_session_fence(session, operation.request.state_fence())?;
         let (owner, _) =
             super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
@@ -4681,7 +4972,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: OriginControlDecideOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let presentation_bytes = serde_json::to_vec(&operation.presentation)
             .map_err(|_| TransportError::SessionFenced)?;
         let presentation = OriginControlPresentation::from_json_bytes(&presentation_bytes)
@@ -4710,17 +5002,58 @@ impl KernelComposition {
         let grant = gateway
             .decide_origin_control(&presentation)
             .map_err(|_| TransportError::SessionFenced)?;
+        // Graceful WASM half (`#2896`): when the decided operation is a
+        // supervised WASM-host parent, the owner first offers a versioned
+        // Shutdown delivery through its replayable control spool, so the
+        // host loop can close admission before the gateway kill lands. A
+        // foreign image skips this half with the response unchanged; a
+        // proven WASM operation that cannot stage or retain its control
+        // fails closed before the kill.
+        let wasm_control = Self::publish_wasm_host_control(
+            session,
+            &owner,
+            &operation.operation_id,
+            presentation.request(),
+            &grant,
+            eliot_kernel_service::WasmControlKind::Shutdown,
+        )?;
         let cancelled = gateway
             .cancel_with_origin_grant(&owner, operation.operation_id, &grant)
             .await
             .map_err(|_| TransportError::SessionFenced)?;
+        let mut value = serde_json::json!({
+            "kind": "origin_control_kill",
+            "grant": grant,
+            "cancelled": cancelled,
+        });
+        // Post-kill control projection is honest-degraded, never fatal:
+        // the kill receipt is authoritative, so a spool fault here marks
+        // the control unrecorded instead of losing the receipt.
+        match wasm_control {
+            WasmHostControlOutcome::Foreign => {}
+            WasmHostControlOutcome::NotStaged { reason } => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "control".to_owned(),
+                        serde_json::json!({"staged": false, "reason": reason}),
+                    );
+                }
+            }
+            WasmHostControlOutcome::Published {
+                receipt,
+                install_dir,
+            } => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "control".to_owned(),
+                        wasm_host_control_projection(&install_dir, &receipt),
+                    );
+                }
+            }
+        }
         Ok(serde_json::json!({
             "status": "known",
-            "value": {
-                "kind": "origin_control_kill",
-                "grant": grant,
-                "cancelled": cancelled,
-            },
+            "value": value,
             "recovery": null,
         }))
     }
@@ -4731,7 +5064,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let query: ActiveGenerationRegistryQuery =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let projection = self
             .active_generation_registry_query(&query, &session.module_generation.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -5022,7 +5356,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreRecoveryOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.request.validate() {
             return Ok(Self::store_error_response_text(
                 "store_recovery",
@@ -5063,7 +5398,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreInitializeGenesisOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         operation
             .context
             .validate()
@@ -5118,7 +5454,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreApplyOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if operation.context.request_id != request_id {
             return Err(TransportError::SessionFenced);
         }
@@ -5546,7 +5883,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: NotificationStateReadOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &operation.state_fence)?;
         let page = self
             .read_notification_page(&NotificationPageQuery::from_read_operation(&operation))
@@ -5796,7 +6134,8 @@ impl KernelComposition {
         // Closed decode first: unknown fields never reach the read leg, and a
         // read without the Kernel-issued attempt capability never decodes.
         let operation: LocalReadOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         let envelope = operation.envelope;
         let tool = operation.tool;
         let attempt = operation.attempt;
@@ -5962,7 +6301,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: WasmDispatchBundleOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         // Guest byte vectors must each fit one transport frame
         // (`eliot_protocol::MAX_FRAME_BYTES`): anything larger could not
         // have arrived intact, and unbounded staging buffers are refused.
@@ -6052,15 +6392,60 @@ impl KernelComposition {
             artifact_bytes: operation.artifact_bytes,
             input_bytes: operation.input_bytes,
         };
+        // Publisher concurrency (#2786 step 4): sessions run as `JoinSet`
+        // tasks on the multi-threaded `#[tokio::main]` runtime, so two
+        // `publish_wasm_dispatch_bundle` calls can interleave on different
+        // threads — no single-publisher ownership is claimed. The
+        // publisher serializes replacements only through the live-envelope
+        // gate (claim-by-rename plus per-step re-verification), not a
+        // lock; the residual per-file window is stated at the reclaim.
         let mut joins = eliot_kernel_service::WasmJoinTable::default();
-        let bundle = eliot_kernel_service::publish_wasm_dispatch_bundle(
+        let bundle = match eliot_kernel_service::publish_wasm_dispatch_bundle(
             host_executable_path.as_str(),
             host_artifact_digest.as_str(),
             install_dir,
             &claim,
             &mut joins,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        ) {
+            Ok(bundle) => bundle,
+            // Typed bounded backpressure (#2786 step 4): another live
+            // delivery owns the fixed names, so this publication is
+            // refused without touching a byte. The exact retry condition
+            // is retained in the response, never collapsed into a fence.
+            Err(eliot_kernel_service::WasmDispatchError::Backpressure(live)) => {
+                return Ok(serde_json::json!({
+                    "kind": "wasm_dispatch_backpressure",
+                    "value": {
+                        "live_generation": live.live_generation,
+                        "live_operation_id": live.live_operation_id,
+                        "live_expires_at": live.live_expires_at,
+                        "retry_condition": live.retry_condition,
+                    },
+                }));
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
+        // Launch-gate admission (#2786 step 8): the staged bundle executes
+        // only against its matching owner join/grant. Expiry is re-verified
+        // at launch instant (closing the validation-to-start window), so
+        // this is a real expiry gate (`Stale` can fire here); anything else
+        // fails closed before the child starts. The join table above is
+        // function-local and dropped after this op, so the one-shot
+        // consumption by this admission is per-op only and buys zero
+        // cross-call replay protection: a repeated call with the same
+        // delivery re-arms the join through the same-delivery replay path
+        // and relaunches the guest (a second guest effect). Cross-call
+        // duplicate suppression depends on the host-half claim dedup, not
+        // on this table.
+        joins
+            .admit_claim(
+                bundle.material.claim_id.as_str(),
+                bundle.material.operation_id.as_str(),
+                bundle.join.invocation_digest.as_str(),
+                bundle.delivery.envelope_digest.as_str(),
+                unix_ms(),
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         let material_digest = sha256_hex(
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -6212,6 +6597,128 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
+    /// Publishes one graceful owner control for a decided WASM-host
+    /// operation (`#2896`): the production Kernel call behind external
+    /// Cancel/Reconcile/Shutdown delivery, reached from
+    /// [`Self::origin_control_decide_operation`] after the origin grant
+    /// issues and before the gateway kill lands.
+    ///
+    /// The publisher authenticates through the existing process/control
+    /// owner contract, never through path correlation alone: the image
+    /// path is the executor-observed physical binding already matched
+    /// against the inspected running process, the install directory is
+    /// that path's parent, and every delivery identity re-binds the
+    /// staged dispatch material this daemon published (claim, operation,
+    /// generation, grant, work scope), the live session (epoch, fence,
+    /// principal, connection), and the origin grant funding the decision
+    /// (challenge, operation class, decision time). The running image
+    /// bytes re-hash to the staged grant digest — the same fail-closed
+    /// contour as launch — and the child-sealed request digest is never
+    /// minted here; the child cross-checks the operation/invocation/grant
+    /// triple against its own sealed binding.
+    ///
+    /// A foreign image answers `Foreign` with the decide response
+    /// unchanged. A WASM-host image whose delivery set is absent,
+    /// oversize, malformed, or disagreeing answers `NotStaged` with an
+    /// honest reason while the kill proceeds. A bound operation stages
+    /// through [`eliot_kernel_service::publish_wasm_control_delivery`]:
+    /// same-kind retries re-offer the retained identity, and any staging
+    /// or retention fault fails the decision closed before the kill.
+    fn publish_wasm_host_control(
+        session: &Session,
+        owner: &ProcessOwnerBinding,
+        operation_id: &OperationId,
+        request: &OriginChallengeRequest,
+        grant: &OriginControlGrant,
+        control_kind: eliot_kernel_service::WasmControlKind,
+    ) -> Result<WasmHostControlOutcome, TransportError> {
+        let image_path = std::path::Path::new(request.physical().image_path());
+        if !image_path.is_absolute()
+            || image_path.file_name().and_then(|name| name.to_str())
+                != Some(WASM_HOST_IMAGE_FILE_NAME)
+        {
+            return Ok(WasmHostControlOutcome::Foreign);
+        }
+        let install_dir = image_path.parent().ok_or(TransportError::SessionFenced)?;
+        // Owner readback of the staged dispatch material: the delivery
+        // set is consumed only at loop end, so a running operation still
+        // stages it. Anything else marks not-staged honestly; no binding
+        // is ever inferred from the image path alone.
+        let material_path = install_dir.join(eliot_kernel_service::WASM_HOST_MATERIAL_FILE_NAME);
+        let Ok(material_bytes) = std::fs::read(&material_path) else {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "delivery-set-absent",
+            });
+        };
+        if material_bytes.len() > eliot_protocol::MAX_FRAME_BYTES {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "delivery-set-oversize",
+            });
+        }
+        let material: eliot_kernel_service::WasmDispatchMaterial =
+            match serde_json::from_slice(&material_bytes) {
+                Ok(material) => material,
+                Err(_) => {
+                    return Ok(WasmHostControlOutcome::NotStaged {
+                        reason: "delivery-set-malformed",
+                    });
+                }
+            };
+        if material.operation_id != operation_id.as_str() {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "operation-mismatch",
+            });
+        }
+        if material.generation != request.generation().get() {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "generation-mismatch",
+            });
+        }
+        if !material
+            .authority_epoch
+            .is_same_authority(&session.authority_epoch)
+        {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "epoch-mismatch",
+            });
+        }
+        let Ok(observed_image) = std::fs::read(image_path) else {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "image-unreadable",
+            });
+        };
+        if sha256_hex(&observed_image) != material.grant.host_artifact_digest {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "image-diverged",
+            });
+        }
+        let inputs = eliot_kernel_service::WasmControlPublishInputs {
+            install_dir: install_dir.to_path_buf(),
+            operation_id: operation_id.as_str().to_owned(),
+            claim_id: material.claim_id.clone(),
+            generation: material.generation,
+            control_kind,
+            authority_epoch: session.authority_epoch.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+            work_scope: material.work.work_scope.clone(),
+            principal_digest: owner.principal_digest().to_owned(),
+            session_connection: session.connection_id.clone(),
+            session_epoch: session.session_epoch,
+            dispatch_grant_digest: material.grant.grant_digest.clone(),
+            publisher_challenge_id: grant.challenge_id().to_owned(),
+            publisher_operation: grant.operation().operation_label().to_owned(),
+            publisher_grant_digest: grant.grant_digest().to_owned(),
+            decided_at_unix_ms: grant.decided_at_unix_ms(),
+            now_unix_ms: unix_ms(),
+        };
+        let receipt = eliot_kernel_service::publish_wasm_control_delivery(&inputs)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(WasmHostControlOutcome::Published {
+            receipt,
+            install_dir: install_dir.to_path_buf(),
+        })
+    }
+
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
     /// D4b): the production caller of
     /// `eliot_kernel_service::bind_notify_launch_grant`, the
@@ -6242,7 +6749,8 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: NotifyLaunchGrantOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         validate_store_session_fence(session, &session.module_generation.state_fence)?;
         self.admit_material_authority_for_fence(
             GovernanceProfile::full(),
@@ -6485,6 +6993,84 @@ impl KernelComposition {
             "recovery": null,
         })
     }
+}
+
+/// Closed outcome of the graceful WASM control half of one
+/// origin-control decision (`#2896`).
+enum WasmHostControlOutcome {
+    /// The decided image is not a WASM host: plain gateway kill with
+    /// the decide response unchanged.
+    Foreign,
+    /// A WASM-host image whose delivery set cannot bind a control.
+    /// The kill proceeds; the response carries the honest marker.
+    NotStaged {
+        /// Stable reason code (never a path or digest).
+        reason: &'static str,
+    },
+    /// A versioned control was offered through the owner spool.
+    Published {
+        /// Staged delivery receipt.
+        receipt: eliot_kernel_service::WasmControlPublishReceipt,
+        /// Spool root the delivery staged into.
+        install_dir: std::path::PathBuf,
+    },
+}
+
+/// Projects the post-kill control status for one published WASM
+/// control (`#2896` item 12): the supervised-termination note lands
+/// first (a decisive ack still wins over `Unknown`), then a fresh
+/// spool reconcile reports every retained delivery and its
+/// terminal-or-open disposition.
+///
+/// Never fails the decide response: the kill receipt is authoritative,
+/// so a spool fault degrades to an honest `unrecorded` marker instead
+/// of losing the receipt.
+fn wasm_host_control_projection(
+    install_dir: &std::path::Path,
+    receipt: &eliot_kernel_service::WasmControlPublishReceipt,
+) -> serde_json::Value {
+    let now = unix_ms();
+    let noted = eliot_kernel_service::note_wasm_control_supervised_end(
+        install_dir,
+        receipt.operation_id.as_str(),
+        receipt.generation,
+        receipt.owner_sequence,
+        "origin-kill-acknowledged",
+        now,
+    )
+    .is_ok();
+    let spool = eliot_kernel_service::reconcile_wasm_control_spool(
+        install_dir,
+        receipt.operation_id.as_str(),
+        receipt.generation,
+        now,
+    );
+    let (spool_value, spool_ok) = match spool {
+        Ok(status) => (
+            serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            true,
+        ),
+        Err(_) => (serde_json::Value::Null, false),
+    };
+    let mut control = serde_json::json!({
+        "staged": true,
+        "publish": receipt,
+        "spool": spool_value,
+    });
+    if (!noted || !spool_ok)
+        && let Some(object) = control.as_object_mut()
+    {
+        if !noted {
+            object.insert(
+                "termination_note".to_owned(),
+                serde_json::json!("unrecorded"),
+            );
+        }
+        if !spool_ok {
+            object.insert("spool_note".to_owned(), serde_json::json!("unrecorded"));
+        }
+    }
+    control
 }
 
 #[cfg(windows)]
