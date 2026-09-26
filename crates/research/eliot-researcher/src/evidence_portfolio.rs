@@ -1598,41 +1598,48 @@ pub struct NoMatchEvaluation {
 /// The owner-bound preconditions one exact negative claim is assessed against.
 ///
 /// Every field is derived from the exact coverage accounting, the vetted source
-/// records behind it and the frozen scope snapshot the claim is scoped to, so a
-/// caller supplies evidence and never a verdict. The record names which
-/// precondition is unmet, and its digest binds the preconditions to that exact
-/// evidence.
+/// records behind it and the frozen scope snapshot the claim is scoped to, and
+/// every field is private: a precondition set can only be produced by
+/// [`AbsencePreconditions::derive`] over a real [`CoverageAccount`], never
+/// written by a caller. [`assess_absence`] then re-proves the digest before it
+/// reads any of the content and re-checks the bound account digest against the
+/// account it is handed, so a set that was not derived over that account is
+/// refused instead of believed. A caller supplies evidence and never a verdict.
+///
+/// The record names which precondition is unmet through the bounded reason
+/// [`AbsenceVerdict::Unproven`] retains, and its digest binds the preconditions
+/// to that exact evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbsencePreconditions {
     /// Digest of the frozen scope snapshot the claim is scoped to.
-    pub frozen_scope_digest: String,
+    frozen_scope_digest: String,
     /// Digest of the exact accounting the preconditions were derived over.
-    pub account_digest: String,
+    account_digest: String,
     /// Declared members that were never examined at all.
-    pub unexamined: Vec<String>,
+    unexamined: Vec<String>,
     /// Declared members examined with a disposition that did not close them,
     /// paired with that disposition's stable spelling.
-    pub unclosed: Vec<(String, &'static str)>,
+    unclosed: Vec<(String, &'static str)>,
     /// Declared members carrying an explicit exclusion. An exclusion is not a
     /// successful search, so an excluded member can never support a negative.
-    pub excluded: Vec<String>,
+    excluded: Vec<String>,
     /// Closed members whose source or index is no longer current.
-    pub incompatible: Vec<String>,
+    incompatible: Vec<String>,
     /// Declared members the accounting closed intact.
-    pub closed: Vec<String>,
+    closed: Vec<String>,
     /// Candidates observed outside the frozen scope. They are counted so an
     /// empty eligible set stays distinguishable from an enumeration that never
     /// ran; they close no member and narrow no denominator.
-    pub observed_outside_scope: usize,
+    observed_outside_scope: usize,
     /// Frontier where a bounded enumeration stopped, when one applied.
-    pub frontier: Option<String>,
+    frontier: Option<String>,
     /// The bounded predicate evaluation bound to the requested query, when one
     /// exists. The research plane records acquisition dispositions, not
     /// per-member query predicate results, so an inquiry record binds none and
     /// the negative stays unproven.
-    pub evaluation: Option<NoMatchEvaluation>,
+    evaluation: Option<NoMatchEvaluation>,
     /// Digest over the preconditions.
-    pub digest: String,
+    digest: String,
 }
 
 impl AbsencePreconditions {
@@ -1774,7 +1781,34 @@ impl AbsencePreconditions {
 /// bounded enumeration that stopped is partial exhaustion. Every rejected claim
 /// names the retained fact that rejected it, so no verdict rests on a
 /// caller-supplied flag.
-pub fn assess_absence(preconditions: &AbsencePreconditions) -> AbsenceVerdict {
+///
+/// `account` is the accounting the preconditions are claimed to describe. It is
+/// required so the preconditions cannot be re-bound to a different accounting
+/// than the one they were derived over, and it is the only trusted account the
+/// assessment has. A precondition set that does not re-prove its own digest, or
+/// whose bound account digest is not this account's, is refused as
+/// [`AbsenceVerdict::Unproven`] before any of its content is read: a claim that
+/// cannot be re-proved is not proved.
+pub fn assess_absence(
+    account: &CoverageAccount,
+    preconditions: &AbsencePreconditions,
+) -> AbsenceVerdict {
+    if preconditions.compute_digest() != preconditions.digest {
+        return AbsenceVerdict::Unproven {
+            reason: "absence: the preconditions do not re-prove their own digest, so this set is \
+                     not owner-bound evidence and proves nothing"
+                .to_owned(),
+        };
+    }
+    let account_digest = account.digest();
+    if preconditions.account_digest != account_digest {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the preconditions are bound to coverage account {account_digest}, not to \
+                 the account presented with them, so the two cannot be swapped"
+            ),
+        };
+    }
     if let Some(frontier) = &preconditions.frontier {
         return AbsenceVerdict::PartialExhaustion {
             frontier: frontier.clone(),

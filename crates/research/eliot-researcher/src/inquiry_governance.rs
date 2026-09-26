@@ -2195,7 +2195,7 @@ impl CoverageReceipt {
             frozen_scope_digest,
             None,
         )?;
-        let absence_verdict = assess_absence(&absence_preconditions);
+        let absence_verdict = assess_absence(account, &absence_preconditions);
         let counter_search_status = if profile.hypothesis_policy.requires_counter_search() {
             CounterSearchStatus::RequiredAndOpen
         } else {
@@ -2325,6 +2325,11 @@ impl CoverageReceipt {
             "absence_verdict",
             absence_wire(&self.absence_verdict),
         );
+        // The class spelling is bounded; the reason is digested as its own
+        // field, so the digest binds *why* the negative was refused.
+        if let Some(reason) = absence_reason(&self.absence_verdict) {
+            push_field(&mut preimage, "absence_reason", reason);
+        }
         push_field(
             &mut preimage,
             "denominator_kind",
@@ -3723,7 +3728,7 @@ impl std::fmt::Display for InquiryGovernance {
              admitted_inquiry={} admitted_denominator={} stop_rule={} output_contract={} \
              independence_ok={} admissibility={} eligible={} unadmitted_refs={} portfolio={} \
              expected_members={} open_members={} accounted={} all_closed={} enumeration={} \
-             observed_outside={} denominator_kind={} absence={} \
+             observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} compilation_inputs={} freeze={} debts={} \
              disposition={} terminal_denominator_kind={} may_close={} \
@@ -3757,6 +3762,8 @@ impl std::fmt::Display for InquiryGovernance {
             self.coverage_receipt.observed_outside_scope.len(),
             self.coverage_receipt.denominator_kind,
             absence_wire(&self.coverage_receipt.absence_verdict),
+            absence_reason(&self.coverage_receipt.absence_verdict)
+                .unwrap_or(absence_wire(&self.coverage_receipt.absence_verdict)),
             anchor_wire(self.precision.supported_precision),
             self.precision.residue.len(),
             self.obligations.len(),
@@ -4357,6 +4364,19 @@ fn absence_wire(verdict: &AbsenceVerdict) -> &'static str {
         AbsenceVerdict::Proven => "proven",
         AbsenceVerdict::Unproven { .. } => "unproven",
         AbsenceVerdict::PartialExhaustion { .. } => "partial_exhaustion",
+    }
+}
+
+/// Bounded reason an absence claim was left unproven, when one applies.
+///
+/// Only [`AbsenceVerdict::Unproven`] retains a reason. The class spelling stays
+/// bounded, so the reason travels beside it as its own retained fact rather than
+/// inside the wire name, and a verdict that retained no reason contributes no
+/// field.
+fn absence_reason(verdict: &AbsenceVerdict) -> Option<&str> {
+    match verdict {
+        AbsenceVerdict::Unproven { reason } => Some(reason),
+        AbsenceVerdict::Proven | AbsenceVerdict::PartialExhaustion { .. } => None,
     }
 }
 

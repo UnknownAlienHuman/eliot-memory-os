@@ -481,11 +481,14 @@ fn absence_requires_complete_authoritative_lookup() {
             .expect("record");
     }
     assert_eq!(
-        assess_absence(&preconditions(
+        assess_absence(
             &proven,
-            Some(no_match_evaluation(&members, DIGEST_A)),
-            DIGEST_A
-        )),
+            &preconditions(
+                &proven,
+                Some(no_match_evaluation(&members, DIGEST_A)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::Proven
     );
     let mut gapped = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
@@ -500,11 +503,14 @@ fn absence_requires_complete_authoritative_lookup() {
             .expect("record");
     }
     assert!(matches!(
-        assess_absence(&preconditions(
+        assess_absence(
             &gapped,
-            Some(no_match_evaluation(&members, DIGEST_A)),
-            DIGEST_A
-        )),
+            &preconditions(
+                &gapped,
+                Some(no_match_evaluation(&members, DIGEST_A)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::Unproven { .. }
     ));
     let mut exhausted = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
@@ -521,23 +527,29 @@ fn absence_requires_complete_authoritative_lookup() {
         .note_frontier("route budget ended early")
         .expect("frontier");
     assert!(matches!(
-        assess_absence(&preconditions(
+        assess_absence(
             &exhausted,
-            Some(no_match_evaluation(&members, DIGEST_A)),
-            DIGEST_A
-        )),
+            &preconditions(
+                &exhausted,
+                Some(no_match_evaluation(&members, DIGEST_A)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::PartialExhaustion { .. }
     ));
     assert!(matches!(
-        assess_absence(&preconditions(&proven, None, DIGEST_A)),
+        assess_absence(&proven, &preconditions(&proven, None, DIGEST_A)),
         AbsenceVerdict::Unproven { .. }
     ));
     assert!(matches!(
-        assess_absence(&preconditions(
+        assess_absence(
             &proven,
-            Some(no_match_evaluation(&members, DIGEST_B)),
-            DIGEST_A
-        )),
+            &preconditions(
+                &proven,
+                Some(no_match_evaluation(&members, DIGEST_B)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::Unproven { .. }
     ));
 }
