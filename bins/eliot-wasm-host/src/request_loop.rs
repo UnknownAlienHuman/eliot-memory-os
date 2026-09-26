@@ -40,10 +40,12 @@
 //!   the delivery-set path uses, so one admission path serves both sources.
 //!   Only an identity-matching Cancel/Reconcile/Shutdown is consumed;
 //!   anything else is left for its own delivery.
-//! - **Emission and cleanup are bounded.** One result frame gets a bounded
-//!   stdout wait and then fails closed, never reusing the contended stream,
-//!   and the staged set is consumed only while it still names the served
-//!   generation, so a replacement staged mid-run is never deleted.
+//! - **Emission and cleanup are bounded.** Each result event is validated
+//!   and gets a bounded caller wait on stdout; a caller timeout retains
+//!   the helper for tracked termination and never reuses the contended
+//!   stream while it runs, and the staged set is consumed only while it
+//!   still names the served generation, so a replacement staged mid-run is
+//!   never deleted.
 //!
 //! The experimental describe path and the one-shot guest-child protocol are
 //! separate modes reachable only through their own CLI branches; the
@@ -91,6 +93,34 @@ pub const OP_SHUTDOWN: &str = "wasm_host_shutdown";
 /// Result-frame wire identity, matched exactly with the request wire so one
 /// correlated receipt answers one request.
 pub const WASM_HOST_RESULT_WIRE_ID: &str = "eliot.wasm.host-result";
+/// Result-event wire version (#2787). Independent of the request constant:
+/// the result family is its own versioned contract, so a request-shape
+/// revision never silently re-versions emitted results and a result-shape
+/// revision never admits foreign requests. Version 1 is the one schema
+/// [`WasmHostResultFrame`] serializes; every stdout object carrying
+/// [`WASM_HOST_RESULT_WIRE_ID`] satisfies it, and consumers reject any other
+/// version. (Prior emissions carried the request constant by defect.)
+pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 1;
+/// Closed observation phase: the frame observes guest execution.
+pub const RESULT_PHASE_EXECUTE: &str = "execute";
+/// Closed observation phase: the frame observes containment of an uncertain
+/// attempt through the runtime owner.
+pub const RESULT_PHASE_CONTAIN: &str = "contain";
+/// Closed observation phase: the frame observes reconciliation of an
+/// uncertain attempt through its owners.
+pub const RESULT_PHASE_RECONCILE: &str = "reconcile";
+/// Closed observation phase: the frame refuses before execution. Admission
+/// denials currently surface as the process exit path (stderr plus exit
+/// status), not as stdout frames, so no producer emits this phase today; it
+/// stays in the closed vocabulary so a future pre-execution denial frame
+/// cannot masquerade as an execution observation.
+pub const RESULT_PHASE_DENY: &str = "deny";
+/// Bound on the retained/emitted result-event sequence per operation
+/// (#2787). The follow-up taxonomy admits at most one initial observation
+/// plus one follow-up observation per operation, so two events is the
+/// structural maximum; the bound leaves headroom for future bounded phases
+/// without permitting unbounded growth, and emission fails closed past it.
+pub const MAX_RESULT_SEQUENCE: u64 = 8;
 
 /// Bounded result-byte budget: the largest result frame the loop publishes.
 pub const MAX_RESULT_FRAME_BYTES: usize = 64 * 1024;
@@ -122,6 +152,14 @@ pub enum LoopError {
     ChannelUnavailable,
     /// The result frame exceeded the admitted result-byte budget.
     ResultTooLarge,
+    /// A result frame failed its own consistency validation before
+    /// emission (#2787: digest/length/hex agreement, omission semantics,
+    /// engine/claim/operation bindings, phase versus command, sequence
+    /// bound). A frame that cannot prove itself is never emitted.
+    ResultInvalid {
+        /// Stable field name.
+        field: &'static str,
+    },
 }
 
 impl LoopError {
@@ -132,6 +170,7 @@ impl LoopError {
             Self::RequestDenied { .. } => "REQUEST_LOOP_DENIED",
             Self::ChannelUnavailable => "REQUEST_LOOP_CHANNEL_UNAVAILABLE",
             Self::ResultTooLarge => "REQUEST_LOOP_RESULT_TOO_LARGE",
+            Self::ResultInvalid { .. } => "REQUEST_LOOP_RESULT_INVALID",
         }
     }
 }
@@ -406,17 +445,53 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
     Ok(())
 }
 
-/// Correlated owner-backed result frame. Bounded serialization only: the
-/// guest output travels as lowercase hex under the admitted output
-/// ceiling, and a frame that would exceed the result budget is published
-/// with the payload omitted and its digest retained.
+/// Correlated owner-backed result event (#2787: the one versioned result
+/// contract). Bounded serialization only: the guest output travels as
+/// lowercase hex under the admitted output ceiling, and a frame that would
+/// exceed the result budget is published with the payload omitted and its
+/// digest retained.
+///
+/// This is the only schema ever emitted under [`WASM_HOST_RESULT_WIRE_ID`]:
+/// there is no second parallel result DTO. Allowed stream sequences per
+/// operation, all under [`WASM_HOST_RESULT_WIRE_VERSION`] with gapless
+/// `sequence` values from 0 and exactly one `terminal: true` event closing
+/// the stream:
+/// - one terminal success/refusal event (healthy execution, worker
+///   refusal);
+/// - one nonterminal `Unknown` execution event followed by one terminal
+///   containment/reconciliation event carrying its own command/phase
+///   identity, with the original uncertainty preserved, never rewritten;
+/// - a publication failure surfaces through the loop error and the retained
+///   observation, never as an ad hoc fallback object.
+///
+/// Consumers reject mixed versions, duplicate terminal events, sequence
+/// gaps, and contradictory identities. Absence stays absence per I5.16:
+/// `None` serializes absent, measured zero stays numeric zero, Booleans stay
+/// Booleans, and no formatting helper feeds stringified values back into
+/// this contract.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
+// Four JSON Booleans are the versioned wire shape (#2787 step 4: Booleans
+// stay Booleans); an enum would break the Boolean contract.
+#[allow(clippy::struct_excessive_bools)]
 pub struct WasmHostResultFrame {
     /// Result wire identity.
     pub wire_id: &'static str,
-    /// Result wire version.
+    /// Result wire version ([`WASM_HOST_RESULT_WIRE_VERSION`]).
     pub wire_version: u16,
+    /// Closed observation phase (`execute`, `contain`, `reconcile`, `deny`):
+    /// what this event observes. A Cancel/Reconcile outcome carries its own
+    /// phase and never masquerades as a new Invoke result.
+    pub phase: String,
+    /// Worker command this event observes (`execute`, `cancel`,
+    /// `reconcile`); `None` when the frame refuses before any worker
+    /// command ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_command: Option<String>,
+    /// Bounded event sequence number within the operation, from 0, gapless.
+    pub sequence: u64,
+    /// Whether this event closes the operation's result stream.
+    pub terminal: bool,
     /// Operation this frame answers.
     pub operation: String,
     /// Admitted claim identity.
@@ -435,29 +510,50 @@ pub struct WasmHostResultFrame {
     pub artifact_digest: String,
     /// Proven input digest.
     pub input_digest: String,
-    /// Seated engine mode identity.
-    pub engine_implementation_id: String,
-    /// Seated engine exact version.
-    pub engine_version: String,
+    /// Opaque #2786 delivery identity passthrough. `None` until the
+    /// delivery/acknowledgement lane binds it; carried as an opaque string,
+    /// never interpreted here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    /// Seated engine mode identity; `None` when no engine observation
+    /// exists (a refusal invents no engine evidence).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_implementation_id: Option<String>,
+    /// Seated engine exact version; `None` when no engine observation
+    /// exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
     /// Classified disposition.
     pub disposition: String,
     /// Typed error code, when the invocation did not succeed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// SHA-256 of the guest output bytes.
+    /// SHA-256 of the guest output bytes; present only when output bytes
+    /// were actually observed (or retained under omission).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<String>,
     /// Guest output byte count actually observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_bytes: Option<u64>,
-    /// Lowercase-hex guest output, omitted when the frame budget is spent.
+    /// Lowercase-hex guest output, present only when output bytes were
+    /// actually observed: absent output stays absent (never empty hex), an
+    /// observed empty vector serializes as `""`, and a budget-omitted
+    /// payload is `None` with `output_omitted` set.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_hex: Option<String>,
     /// True when the output payload was omitted under the frame budget.
     pub output_omitted: bool,
     /// Child-observed fuel consumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuel_consumed: Option<u64>,
     /// Child-observed peak memory bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
     /// Child-observed table elements.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub table_elements: Option<u64>,
     /// Child-observed epoch ticks.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epoch_ticks: Option<u64>,
     /// Lifecycle verdicts evaluated from the retained result.
     pub verdict_shadow: String,
@@ -465,8 +561,10 @@ pub struct WasmHostResultFrame {
     pub verdict_rollback: String,
     pub verdict_cutover: String,
     /// Seated trap / cancel / drain / rollback verdicts for the same run.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trap: Option<String>,
     pub cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<String>,
     pub rollback_candidate: bool,
 }
@@ -519,9 +617,20 @@ fn usage_frames(result: &InvocationResult) -> (Option<u64>, Option<u64>, Option<
 }
 
 /// Projects one classified invocation result onto the correlated frame.
+///
+/// The observed worker command fixes the frame's operation, phase, and
+/// worker-command identities: a Cancel outcome answers [`OP_CANCEL`] in the
+/// `contain` phase, a Reconcile outcome answers [`OP_RECONCILE`] in the
+/// `reconcile` phase, and neither ever masquerades as a new Invoke result.
+/// Absent output stays absent: `output_hex` is present only when output
+/// bytes were actually observed, so no-output, observed-empty, and
+/// budget-omitted stay distinct. Sequence and terminal disposition are
+/// assigned by the loop when the frame joins the retained sequence, not
+/// here.
 fn project_result(
     binding: &AdmittedBinding,
     engine: &EngineBinding,
+    command: WorkerCommand,
     result: &InvocationResult,
 ) -> WasmHostResultFrame {
     let (shadow, canary, rollback, cutover) = lifecycle_frame(evaluate_lifecycle_verdicts(result));
@@ -530,8 +639,12 @@ fn project_result(
     let (fuel_consumed, peak_memory_bytes, table_elements, epoch_ticks) = usage_frames(result);
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID,
-        wire_version: WASM_HOST_REQUEST_WIRE_VERSION,
-        operation: OP_INVOKE.to_owned(),
+        wire_version: WASM_HOST_RESULT_WIRE_VERSION,
+        phase: command_phase(command).to_owned(),
+        worker_command: Some(command_name(command).to_owned()),
+        sequence: 0,
+        terminal: false,
+        operation: command_operation(command).to_owned(),
         claim_id: binding.claim_id.clone(),
         operation_id: binding.operation_id.clone(),
         invocation_id: binding.invocation_id.clone(),
@@ -540,8 +653,9 @@ fn project_result(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        engine_implementation_id: engine.implementation_id.clone(),
-        engine_version: engine.exact_version.clone(),
+        delivery_id: None,
+        engine_implementation_id: Some(engine.implementation_id.clone()),
+        engine_version: Some(engine.exact_version.clone()),
         disposition: disposition_text(result.receipt.disposition),
         error: result
             .receipt
@@ -553,7 +667,7 @@ fn project_result(
             .as_ref()
             .map(|bytes| Sha256Digest::of_bytes(bytes).as_str().to_owned()),
         output_bytes: result.output.as_ref().map(|bytes| bytes.len() as u64),
-        output_hex: Some(hex(&result.output.clone().unwrap_or_default())),
+        output_hex: result.output.as_ref().map(|bytes| hex(bytes)),
         output_omitted: false,
         fuel_consumed,
         peak_memory_bytes,
@@ -582,22 +696,209 @@ fn enforce_frame_budget(
         .is_some_and(|observed| observed > max_output_bytes);
     let within =
         serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() <= MAX_RESULT_FRAME_BYTES);
-    if over_ceiling || !within {
+    // Omission drops a payload that exists: a frame with no observed output
+    // has nothing to omit, so `output_omitted` stays false and the size
+    // refusal (if any) surfaces at publish instead of inventing evidence.
+    if (over_ceiling || !within) && frame.output_hex.is_some() {
         frame.output_hex = None;
         frame.output_omitted = true;
     }
     frame
 }
 
-/// Terminal frame for a request that never reached execution.
+/// Decodes the lowercase hex the loop emits. `None` on any shape or digit
+/// fault; used only to check a frame's own digest/length agreement.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = hex_value(bytes[index])?;
+        let low = hex_value(bytes[index + 1])?;
+        out.push(high * 16 + low);
+        index += 2;
+    }
+    Some(out)
+}
+
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Stable invalid-frame fault constructor.
+fn invalid(field: &'static str) -> LoopError {
+    LoopError::ResultInvalid { field }
+}
+
+/// Validates one result frame's internal consistency before emission
+/// (#2787 step 5): wire identity/version, closed operation/phase/command
+/// vocabulary and their agreement, sequence bound, output
+/// digest/length/hex agreement and omission semantics, and engine-evidence
+/// bindings. A frame that cannot prove itself is never emitted; a refusal
+/// carries its exact phase with no invented engine, usage, or output
+/// evidence, and an unknown outcome stays unknown — local serialization
+/// success upgrades nothing.
+fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    if frame.wire_id != WASM_HOST_RESULT_WIRE_ID {
+        return Err(invalid("wire-id"));
+    }
+    if frame.wire_version != WASM_HOST_RESULT_WIRE_VERSION {
+        return Err(invalid("wire-version"));
+    }
+    if frame.sequence >= MAX_RESULT_SEQUENCE {
+        return Err(invalid("sequence-bound"));
+    }
+    let operation_known = matches!(
+        frame.operation.as_str(),
+        OP_INVOKE | OP_CANCEL | OP_RECONCILE | OP_SHUTDOWN
+    );
+    if !operation_known {
+        return Err(invalid("operation"));
+    }
+    let phase_known = matches!(
+        frame.phase.as_str(),
+        RESULT_PHASE_EXECUTE | RESULT_PHASE_CONTAIN | RESULT_PHASE_RECONCILE | RESULT_PHASE_DENY
+    );
+    if !phase_known {
+        return Err(invalid("phase"));
+    }
+    // Phase versus command: the observed command fixes the phase, and each
+    // operation answers in its own phase, so a Cancel/Reconcile outcome can
+    // never masquerade as a new Invoke result.
+    let phase_matches_command = match frame.worker_command.as_deref() {
+        Some("execute") => frame.phase == RESULT_PHASE_EXECUTE && frame.operation == OP_INVOKE,
+        Some("cancel") => frame.phase == RESULT_PHASE_CONTAIN && frame.operation == OP_CANCEL,
+        Some("reconcile") => {
+            frame.phase == RESULT_PHASE_RECONCILE && frame.operation == OP_RECONCILE
+        }
+        Some(_) => false,
+        None => frame.phase == RESULT_PHASE_DENY,
+    };
+    if !phase_matches_command {
+        return Err(invalid("phase-command"));
+    }
+    if frame.claim_id.is_empty()
+        || frame.operation_id.is_empty()
+        || frame.invocation_id.is_empty()
+        || frame.request_digest.is_empty()
+        || frame.grant_digest.is_empty()
+        || frame.component_id.is_empty()
+        || frame.artifact_digest.is_empty()
+        || frame.input_digest.is_empty()
+    {
+        return Err(invalid("claim-binding"));
+    }
+    // Output agreement: hex present ⟹ digest and length agree with the
+    // decoded bytes; omitted ⟹ hex absent with digest and length retained;
+    // neither ⟹ no output evidence at all. Each state is distinct.
+    match (
+        frame.output_hex.as_deref(),
+        frame.output_digest.as_deref(),
+        frame.output_bytes,
+        frame.output_omitted,
+    ) {
+        (Some(text), Some(digest), Some(length), false) => {
+            let Some(bytes) = unhex(text) else {
+                return Err(invalid("output-hex"));
+            };
+            let observed = u64::try_from(bytes.len()).map_err(|_| invalid("output-length"))?;
+            if observed != length {
+                return Err(invalid("output-length"));
+            }
+            if Sha256Digest::of_bytes(&bytes).as_str() != digest {
+                return Err(invalid("output-digest"));
+            }
+        }
+        (None, Some(_), Some(_), true) | (None, None, None, false) => {}
+        _ => return Err(invalid("output-omitted")),
+    }
+    // Engine-evidence binding: an executed observation names its seated
+    // engine; a worker refusal or a pre-execution denial carries none and
+    // invents none. Mixed or empty engine halves are never valid.
+    match (
+        frame.worker_command.as_deref(),
+        frame.engine_implementation_id.as_deref(),
+        frame.engine_version.as_deref(),
+    ) {
+        (Some(_), Some(engine), Some(version)) if !engine.is_empty() && !version.is_empty() => {}
+        (_, None, None) => {}
+        _ => return Err(invalid("engine-binding")),
+    }
+    // A frame with no engine observation is a refusal, so it names its
+    // refusal code; an error-free frame always names its engine.
+    if frame.engine_implementation_id.is_none() && frame.error.is_none() {
+        return Err(invalid("refusal-code"));
+    }
+    // Refusals carry no invented usage or output evidence — both
+    // pre-execution denials (no worker command) and worker refusals (a
+    // command with no engine binding): no engine observation means no
+    // usage or output was measured. Executed observations keep whatever
+    // the child actually reported, including absence.
+    if frame.engine_implementation_id.is_none()
+        && (frame.fuel_consumed.is_some()
+            || frame.peak_memory_bytes.is_some()
+            || frame.table_elements.is_some()
+            || frame.epoch_ticks.is_some()
+            || frame.output_digest.is_some()
+            || frame.output_bytes.is_some()
+            || frame.output_hex.is_some()
+            || frame.output_omitted)
+    {
+        return Err(invalid("denial-evidence"));
+    }
+    validate_lifecycle_vocabulary(frame)
+}
+
+/// Lifecycle verdict applicability: verdicts are the closed
+/// `verified`/`rejected` vocabulary from the owning dispatch-drive
+/// evaluator, never lifecycle strings manufacturing success; the
+/// classified disposition is the closed `InvocationDisposition`
+/// vocabulary. Both producers emit only these spellings.
+fn validate_lifecycle_vocabulary(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    for verdict in [
+        frame.verdict_shadow.as_str(),
+        frame.verdict_canary.as_str(),
+        frame.verdict_rollback.as_str(),
+        frame.verdict_cutover.as_str(),
+    ] {
+        if verdict != "verified" && verdict != "rejected" {
+            return Err(invalid("lifecycle-verdict"));
+        }
+    }
+    match frame.disposition.as_str() {
+        "Succeeded" | "Rejected" | "Unavailable" | "Unknown" => {}
+        _ => return Err(invalid("disposition-vocabulary")),
+    }
+    Ok(())
+}
+
+/// Terminal frame for a worker command the runtime refused, or for a
+/// request refused before execution. The frame carries the exact operation
+/// and phase of what was attempted — never a hardcoded Invoke — the stable
+/// refusal code, and no invented engine, usage, or output evidence.
+/// Sequence and terminal disposition are assigned by the loop when the
+/// frame joins the retained sequence, not here.
 fn denial_frame(
     binding: &AdmittedBinding,
     operation: &str,
-    error: LoopError,
+    phase: &str,
+    worker_command: Option<WorkerCommand>,
+    error_code: &str,
 ) -> WasmHostResultFrame {
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID,
-        wire_version: WASM_HOST_REQUEST_WIRE_VERSION,
+        wire_version: WASM_HOST_RESULT_WIRE_VERSION,
+        phase: phase.to_owned(),
+        worker_command: worker_command.map(|command| command_name(command).to_owned()),
+        sequence: 0,
+        terminal: false,
         operation: operation.to_owned(),
         claim_id: binding.claim_id.clone(),
         operation_id: binding.operation_id.clone(),
@@ -607,10 +908,11 @@ fn denial_frame(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        engine_implementation_id: String::new(),
-        engine_version: String::new(),
+        delivery_id: None,
+        engine_implementation_id: None,
+        engine_version: None,
         disposition: "Rejected".to_owned(),
-        error: Some(error.code().to_owned()),
+        error: Some(error_code.to_owned()),
         output_digest: None,
         output_bytes: None,
         output_hex: None,
@@ -655,12 +957,18 @@ pub trait WasmHostRequestChannel {
         Ok(None)
     }
 
-    /// Publishes one correlated result frame.
+    /// Publishes one correlated result frame: the one stdout emission
+    /// owner for the ordinary result stream (#2787 step 2).
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::ChannelUnavailable`] or
-    /// [`LoopError::ResultTooLarge`] when the frame cannot be written.
+    /// Returns [`LoopError::ResultInvalid`] when the frame fails its own
+    /// consistency validation, [`LoopError::ChannelUnavailable`] when the
+    /// stream cannot be written (or stays contended past a caller timeout),
+    /// or [`LoopError::ResultTooLarge`] when the frame exceeds the budget.
+    /// Success is an observed local write plus flush, not owner
+    /// acceptance; failure retains the observed result in the loop for
+    /// drain accounting, never an ad hoc fallback.
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError>;
 }
 
@@ -744,16 +1052,34 @@ impl KernelControlReader {
     }
 }
 
-/// Emits one serialized frame on stdout with the bounded output wait.
+/// Outcome of one bounded stdout emission (#2787 owner comment on #2895).
+/// A missed caller wait is reported as what it is — the caller gave up
+/// waiting — never as bounded termination of the writer: the helper may
+/// still be blocked holding the stdout lock, so its handle is retained for
+/// tracked termination instead of dropped.
+enum BoundedEmission {
+    /// The helper confirmed `write_all` plus `flush` inside the wait.
+    Written,
+    /// The helper confirmed the write plus flush failed.
+    WriteFailed,
+    /// The caller wait elapsed first. The retained helper handle is still
+    /// owned here: the caller must reap it once finished and must never
+    /// claim the writer stopped.
+    CallerTimedOut { helper: std::thread::JoinHandle<()> },
+}
+
+/// Emits one serialized frame on stdout with the bounded caller wait.
 ///
 /// The write plus flush runs on a single named helper thread so a stalled
 /// reader cannot wedge the control thread past [`OUTPUT_DEADLINE`]. At most
 /// one frame is ever outstanding — the synchronous loop never pipelines a
-/// second — and a missed deadline fails closed: the helper still holds the
-/// stdout lock, so the caller must never touch the stream again.
-fn emit_frame_bounded(framed: Vec<u8>) -> Result<(), LoopError> {
+/// second. The deadline is a caller-side observation window, not a bound on
+/// the writer: on timeout the helper handle is returned (never dropped),
+/// and the contended stream stays untouched until the helper is reaped
+/// finished.
+fn emit_frame_bounded(framed: Vec<u8>) -> Result<BoundedEmission, LoopError> {
     let (done_tx, done_rx) = channel::<bool>();
-    let spawn = std::thread::Builder::new()
+    let helper = std::thread::Builder::new()
         .name("eliot-wasm-host-stdout-write".to_owned())
         .spawn(move || {
             let stdout = std::io::stdout();
@@ -764,13 +1090,18 @@ fn emit_frame_bounded(framed: Vec<u8>) -> Result<(), LoopError> {
                 .and_then(|()| output.flush())
                 .is_ok();
             let _ = done_tx.send(ok);
-        });
-    if spawn.is_err() {
-        return Err(LoopError::ChannelUnavailable);
-    }
+        })
+        .map_err(|_| LoopError::ChannelUnavailable)?;
     match done_rx.recv_timeout(OUTPUT_DEADLINE) {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(LoopError::ChannelUnavailable),
+        Ok(true) => {
+            let _ = helper.join();
+            Ok(BoundedEmission::Written)
+        }
+        Ok(false) => {
+            let _ = helper.join();
+            Ok(BoundedEmission::WriteFailed)
+        }
+        Err(_) => Ok(BoundedEmission::CallerTimedOut { helper }),
     }
 }
 
@@ -787,6 +1118,11 @@ pub struct DeliverySetChannel {
     delivered: bool,
     control: Option<KernelControlReader>,
     emission_broken: bool,
+    /// stdout helper retained past a caller timeout (#2787). The handle is
+    /// reaped once finished — tracked termination — and while it runs the
+    /// contended stream is never reused, so at most one frame is ever
+    /// outstanding and wire order is preserved.
+    pending_helper: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DeliverySetChannel {
@@ -799,6 +1135,7 @@ impl DeliverySetChannel {
             delivered: false,
             control: None,
             emission_broken: false,
+            pending_helper: None,
         }
     }
 
@@ -828,22 +1165,65 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     }
 
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+        // Internal consistency first: a frame that cannot prove itself is
+        // never emitted, and a publication failure retains the observed
+        // result through the loop's drain accounting, never an ad hoc
+        // fallback. A successful write plus flush below is an observed
+        // local stream write, not proof the owner durably accepted the
+        // result.
+        validate_frame(frame)?;
         if self.emission_broken {
-            // A previous emission missed its output deadline; the helper
-            // thread still holds the stdout lock, so the contended stream
-            // is never reused — every later frame fails closed here.
+            // A previous emission confirmed its write failed; the stream
+            // state is unusable, so every later frame fails closed here.
+            return Err(LoopError::ChannelUnavailable);
+        }
+        // Tracked helper termination: reap a retained helper only once it
+        // actually finished — a reaped handle is joined, never dropped
+        // running. While it still runs, the contended stream is never
+        // reused: the caller timeout is reported as a timeout, never as
+        // bounded writer termination.
+        if self
+            .pending_helper
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(helper) = self.pending_helper.take()
+        {
+            let _ = helper.join();
+        }
+        if self.pending_helper.is_some() {
             return Err(LoopError::ChannelUnavailable);
         }
         let bytes = serde_json::to_vec(frame).map_err(|_| LoopError::ResultTooLarge)?;
         if bytes.len() > MAX_RESULT_FRAME_BYTES {
             return Err(LoopError::ResultTooLarge);
         }
-        match emit_frame_bounded(bytes) {
-            Ok(()) => Ok(()),
-            Err(error) => {
+        match emit_frame_bounded(bytes)? {
+            BoundedEmission::Written => Ok(()),
+            BoundedEmission::WriteFailed => {
                 self.emission_broken = true;
-                Err(error)
+                Err(LoopError::ChannelUnavailable)
             }
+            BoundedEmission::CallerTimedOut { helper } => {
+                self.pending_helper = Some(helper);
+                Err(LoopError::ChannelUnavailable)
+            }
+        }
+    }
+}
+
+impl Drop for DeliverySetChannel {
+    /// Reaps the retained stdout helper when — and only when — it already
+    /// finished. A still-blocked helper is never joined here: joining it
+    /// could wedge teardown forever, and the drop must not claim a
+    /// termination it did not observe.
+    fn drop(&mut self) {
+        if self
+            .pending_helper
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(helper) = self.pending_helper.take()
+        {
+            let _ = helper.join();
         }
     }
 }
@@ -855,6 +1235,40 @@ enum WorkerCommand {
     Cancel,
     Reconcile,
     Shutdown,
+}
+
+/// Closed `worker_command` name the result event records for one observed
+/// worker command.
+fn command_name(command: WorkerCommand) -> &'static str {
+    match command {
+        WorkerCommand::Execute => "execute",
+        WorkerCommand::Cancel => "cancel",
+        WorkerCommand::Reconcile => "reconcile",
+        WorkerCommand::Shutdown => "shutdown",
+    }
+}
+
+/// Operation a result event answers for one observed worker command. A
+/// Shutdown outcome never projects a frame (the loop returns `None` for
+/// it); the arm exists so the mapping stays total.
+fn command_operation(command: WorkerCommand) -> &'static str {
+    match command {
+        WorkerCommand::Execute => OP_INVOKE,
+        WorkerCommand::Cancel => OP_CANCEL,
+        WorkerCommand::Reconcile => OP_RECONCILE,
+        WorkerCommand::Shutdown => OP_SHUTDOWN,
+    }
+}
+
+/// Observation phase a result event carries for one observed worker
+/// command. Shutdown never projects a frame; see [`command_operation`].
+fn command_phase(command: WorkerCommand) -> &'static str {
+    match command {
+        WorkerCommand::Execute => RESULT_PHASE_EXECUTE,
+        WorkerCommand::Cancel => RESULT_PHASE_CONTAIN,
+        WorkerCommand::Reconcile => RESULT_PHASE_RECONCILE,
+        WorkerCommand::Shutdown => RESULT_PHASE_DENY,
+    }
 }
 
 /// One reply from the tracked engine worker.
@@ -993,13 +1407,18 @@ pub struct BoundedRequestLoop {
     engine: EngineBinding,
     live: Arc<LiveAuthority>,
     max_in_flight: usize,
-    /// Exact retained results keyed by the sealed request digest, so an
-    /// exact replay is a readback and performs no new execution.
-    retained: BTreeMap<String, WasmHostResultFrame>,
+    /// Exact retained result-event sequences keyed by the sealed request
+    /// digest (#2787 step 3). Each observation appends; history is never
+    /// rewritten, so an initial `Unknown` and its later control outcome
+    /// both survive, and an exact replay republishes the same bounded
+    /// sequence without executing again. Bounded by [`MAX_RESULT_SEQUENCE`].
+    retained: BTreeMap<String, Vec<WasmHostResultFrame>>,
     /// Command queued by the last transition, not yet handed to the worker.
     queued: Option<WorkerCommand>,
-    /// Retained frame to republish when a request is an exact replay.
-    replay: Option<WasmHostResultFrame>,
+    /// Retained sequence to republish when a request is an exact replay.
+    replay: Option<Vec<WasmHostResultFrame>>,
+    /// Next event sequence number for this operation, from 0, gapless.
+    next_sequence: u64,
     phase: LoopPhase,
     lifecycle: LifecycleFlags,
     published: Option<WasmHostResultFrame>,
@@ -1019,6 +1438,7 @@ impl BoundedRequestLoop {
             retained: BTreeMap::new(),
             queued: None,
             replay: None,
+            next_sequence: 0,
             phase: LoopPhase::Running,
             lifecycle: LifecycleFlags {
                 outstanding: None,
@@ -1122,8 +1542,9 @@ impl BoundedRequestLoop {
             WasmHostRequest::Invoke(invoke) => {
                 check_invoke(&self.binding, &self.live, invoke)?;
                 if let Some(retained) = self.retained.get(&invoke.request_digest) {
-                    // Exact retained-result replay: legitimate result
-                    // readback, never a new execution and never a new effect.
+                    // Exact retained-sequence replay: legitimate result
+                    // readback of the same bounded event sequence, never a
+                    // new execution and never a new effect.
                     self.replay = Some(retained.clone());
                     return Ok(());
                 }
@@ -1175,49 +1596,65 @@ impl BoundedRequestLoop {
         if outcome.command == WorkerCommand::Shutdown {
             return None;
         }
-        let frame = match outcome.result {
+        // The observed command fixes the frame's operation/phase identity:
+        // a Cancel outcome answers `OP_CANCEL` in the `contain` phase, a
+        // Reconcile outcome answers `OP_RECONCILE` in the `reconcile` phase.
+        // Control outcomes never masquerade as Invoke results.
+        let command = outcome.command;
+        let mut frame = match outcome.result {
             Ok(result) => {
-                let projected = project_result(&self.binding, &self.engine, &result);
+                let projected = project_result(&self.binding, &self.engine, command, &result);
                 enforce_frame_budget(projected, self.binding.max_output_bytes)
             }
             Err(code) => {
-                let field = if code == "NO_ATTEMPT" {
-                    "attempt-identity"
-                } else {
-                    "execution-refused"
-                };
-                let denial = denial_frame(&self.binding, OP_INVOKE, denied(field));
+                let denial = denial_frame(
+                    &self.binding,
+                    command_operation(command),
+                    command_phase(command),
+                    Some(command),
+                    code.as_str(),
+                );
                 enforce_frame_budget(denial, self.binding.max_output_bytes)
             }
         };
-        self.retained
-            .insert(frame.request_digest.clone(), frame.clone());
+        frame.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
         self.lifecycle.one_shot_spent = true;
         if frame.disposition == UNCERTAIN_DISPOSITION {
-            self.settle_uncertain(frame.clone());
+            self.settle_uncertain(&mut frame);
         } else {
             self.queued = None;
+            frame.terminal = true;
             self.published = Some(frame.clone());
         }
+        self.retained
+            .entry(frame.request_digest.clone())
+            .or_default()
+            .push(frame.clone());
         Some(frame)
     }
 
     /// Chooses the single bounded next step for an uncertain outcome:
     /// containment once authority closed, one reconciliation pass while it
     /// is live, and terminal retention once either has been spent. The
-    /// uncertain frame is published either way, so the outcome is never
-    /// hidden behind the follow-up step.
-    fn settle_uncertain(&mut self, frame: WasmHostResultFrame) {
+    /// uncertain frame is nonterminal while its follow-up is queued and
+    /// terminal once the follow-up is spent, and it is published either
+    /// way, so the outcome is never hidden behind the follow-up step and
+    /// the original uncertainty is never rewritten.
+    fn settle_uncertain(&mut self, frame: &mut WasmHostResultFrame) {
         match self.lifecycle.follow_up {
             FollowUp::None if !self.live.is_live() => {
                 let _ = self.queue_control(OP_CANCEL);
+                frame.terminal = false;
             }
             FollowUp::None => {
                 let _ = self.queue_control(OP_RECONCILE);
+                frame.terminal = false;
             }
             FollowUp::Contained | FollowUp::Reconciled => {
                 self.queued = None;
-                self.published = Some(frame);
+                frame.terminal = true;
+                self.published = Some(frame.clone());
             }
         }
     }
@@ -1395,8 +1832,14 @@ fn drive_loop(
         }
         if let Some(replay) = state.replay.clone() {
             state.replay = None;
-            state.published = Some(replay.clone());
-            channel.publish(&replay)?;
+            // Exact replay republishes the retained bounded sequence in
+            // order — same events, same sequence numbers, same terminal —
+            // without executing again. The terminal projection is the last
+            // retained event.
+            for event in &replay {
+                channel.publish(event)?;
+            }
+            state.published = replay.last().cloned();
             state.begin_drain();
             break;
         }

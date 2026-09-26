@@ -105,66 +105,16 @@ fn main() {
     // No fallback to the experimental describe path or the guest-child
     // protocol exists here: a refusal stays a refusal.
     match run_ordinary_request_loop() {
-        Ok(frame) => {
-            emit_receipt(&[
-                ("status", "ordinary-request-complete"),
-                ("wire_id", frame.wire_id),
-                ("operation", &frame.operation),
-                ("claim", &frame.claim_id),
-                ("operation_id", &frame.operation_id),
-                ("invocation", &frame.invocation_id),
-                ("request_digest", &frame.request_digest),
-                ("grant_digest", &frame.grant_digest),
-                ("component", &frame.component_id),
-                ("artifact_digest", &frame.artifact_digest),
-                ("input_digest", &frame.input_digest),
-                ("engine", &frame.engine_implementation_id),
-                ("engine_version", &frame.engine_version),
-                ("disposition", &frame.disposition),
-                ("error", frame.error.as_deref().unwrap_or("")),
-                (
-                    "output_digest",
-                    frame.output_digest.as_deref().unwrap_or(""),
-                ),
-                ("output_bytes", &frame.output_bytes.unwrap_or(0).to_string()),
-                (
-                    "output_omitted",
-                    if frame.output_omitted {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                ),
-                (
-                    "fuel_consumed",
-                    &frame.fuel_consumed.unwrap_or(0).to_string(),
-                ),
-                (
-                    "peak_memory_bytes",
-                    &frame.peak_memory_bytes.unwrap_or(0).to_string(),
-                ),
-                (
-                    "table_elements",
-                    &frame.table_elements.unwrap_or(0).to_string(),
-                ),
-                ("epoch_ticks", &frame.epoch_ticks.unwrap_or(0).to_string()),
-                ("verdict_shadow", &frame.verdict_shadow),
-                ("verdict_canary", &frame.verdict_canary),
-                ("verdict_rollback", &frame.verdict_rollback),
-                ("verdict_cutover", &frame.verdict_cutover),
-                ("trap", frame.trap.as_deref().unwrap_or("")),
-                ("cancelled", if frame.cancelled { "true" } else { "false" }),
-                ("drain", frame.drain.as_deref().unwrap_or("")),
-                (
-                    "rollback_candidate",
-                    if frame.rollback_candidate {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                ),
-            ]);
-        }
+        // The ordinary result publisher already emitted the versioned
+        // result-event stream on stdout; this branch emits no second
+        // summary object (#2787 step 2). Reader audit (2026-09-26): no
+        // process or Kernel reader of `eliot.wasm.host-result` or
+        // `ordinary-request-complete` exists anywhere in the repository —
+        // the only references were the crate's own re-export and this
+        // removed call — so no diagnostic moved to stderr and no consumer
+        // migration was required. `emit_receipt` stays for the separate
+        // experimental describe mode only.
+        Ok(_) => {}
         Err(error) => {
             emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
             std::process::exit(ADMISSION_REQUIRED_EXIT);
