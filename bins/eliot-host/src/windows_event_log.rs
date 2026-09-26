@@ -4,7 +4,10 @@
 //! (`eliot_platform_windows`, landed `bf37d3e1` / #1706): admitted
 //! start/stop/failure events map to the fixed source, event ids, severity,
 //! and one redacted insertion string, and delivery goes through
-//! `report_local_event`. The wrapper registers no source, edits no registry,
+//! `report_local_event`. [`report_admitted_event`] is the production entry
+//! point the Host diagnostics facade calls for every projected request that
+//! an owner already proved, and it is the only path that reaches
+//! [`report_event`]. The wrapper registers no source, edits no registry,
 //! and performs no elevation; it acquires no Event Log FFI and never fakes
 //! delivery through another sink. Production delivery smoke on isolated
 //! Windows stays an honest residual for the test phase.
@@ -32,7 +35,7 @@ use eliot_platform_windows::{
     AdmittedEventLogEvent, EventLogError, is_event_log_supported, report_local_event,
 };
 
-use crate::host_diagnostics::BoundedDetail;
+use crate::host_diagnostics::{BoundedDetail, HostRequestEvidence};
 
 /// Fixed Event Log source named by the #984 consumer contract.
 ///
@@ -114,6 +117,27 @@ impl AdmittedEvent {
             Self::ServiceStart | Self::ServiceStop => EventLogSeverity::Information,
             Self::ServiceFailure => EventLogSeverity::Error,
         }
+    }
+}
+
+impl AdmittedEvent {
+    /// Whether one projected evidence class actually supports this event.
+    ///
+    /// The Event Log admits an event only when the owner's own evidence
+    /// proves it happened: a start once the serving process started, a stop
+    /// once the durable effect committed, a failure once the request failed.
+    /// Evidence that asserts no completed operation (sighted, admitted,
+    /// ready, cancelled, unknown) never admits an Event Log record, so the
+    /// sink is never asked to state an outcome the owner did not produce
+    /// (I14.20).
+    #[must_use]
+    pub const fn is_admitted_by(self, evidence: HostRequestEvidence) -> bool {
+        matches!(
+            (self, evidence),
+            (Self::ServiceStart, HostRequestEvidence::ProcessStarted)
+                | (Self::ServiceStop, HostRequestEvidence::DurableCommitted)
+                | (Self::ServiceFailure, HostRequestEvidence::Failed)
+        )
     }
 }
 
@@ -214,6 +238,19 @@ impl EventLogDelivery {
             | Self::DegradedApplicationAccepted { event } => *event,
         }
     }
+
+    /// Stable outcome name for a bounded diagnostic record.
+    ///
+    /// The two arms stay named apart so a reader can never read the
+    /// registered-source acceptance as the explicitly admitted degraded
+    /// Application profile, which this wrapper never substitutes silently.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::RegisteredSourceAccepted { .. } => "registered_source_accepted",
+            Self::DegradedApplicationAccepted { .. } => "degraded_application_accepted",
+        }
+    }
 }
 
 /// Typed Event Log wrapper failures.
@@ -249,6 +286,25 @@ pub enum WindowsEventLogError {
     /// The queue is shut down; further admission is rejected without
     /// changing the drop count.
     Closed,
+}
+
+impl WindowsEventLogError {
+    /// Stable outcome name for a bounded diagnostic record.
+    ///
+    /// Names the typed outcome only: no message text and no insertion
+    /// contents cross this boundary, so an operator-facing record can name
+    /// the disposition without echoing what was submitted.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EventLogUnavailable => "event_log_unavailable",
+            Self::InvalidRecord => "invalid_record",
+            Self::SourceUnavailable { .. } => "source_unavailable",
+            Self::ReportRefused { .. } => "report_refused",
+            Self::QueueFull => "queue_full",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 impl fmt::Display for WindowsEventLogError {
@@ -332,6 +388,28 @@ fn to_platform_event(event: AdmittedEvent) -> AdmittedEventLogEvent {
         AdmittedEvent::ServiceStop => AdmittedEventLogEvent::ServiceStop,
         AdmittedEvent::ServiceFailure => AdmittedEventLogEvent::ServiceFailure,
     }
+}
+
+/// Reports one admitted Host event to the Windows Event Log.
+///
+/// This is the wrapper's production delivery entry point: the caller states
+/// the admitted event it already decided and one bounded nonsecret
+/// correlation (a frozen stage, operation, or terminal code), and the wrapper
+/// builds the record, submits it through [`report_event`], and returns the
+/// typed delivery disposition. Only the start/stop/failure events
+/// [`AdmittedEvent`] admits are ever mapped, so this is the sole way a Host
+/// event reaches the fixed source, event id, and severity.
+///
+/// The call is synchronous and may block inside the OS port, so callers
+/// belong on lifecycle boundaries rather than hot paths. It never logs
+/// through the sink (no recursion), never spawns a worker, and never changes
+/// the caller's Host result: the returned outcome is a diagnostic
+/// disposition, not a semantic one.
+pub fn report_admitted_event(
+    event: AdmittedEvent,
+    correlation: &str,
+) -> Result<EventLogDelivery, WindowsEventLogError> {
+    report_event(&EventLogRecord::new(event, correlation))
 }
 
 /// Maps #984's typed port failure to the wrapper's typed outcome.
