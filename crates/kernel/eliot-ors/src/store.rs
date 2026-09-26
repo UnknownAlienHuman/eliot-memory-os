@@ -9802,12 +9802,16 @@ impl RedbRecoveryStore {
     /// string. Expected revision/incarnation are validated against the
     /// owner row in the same transaction, so an owner change between
     /// resolution and commit fails closed with
-    /// [`OrsError::StaleWriterEpoch`]. At most
-    /// [`MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY`] rows retire per call;
-    /// `retirement_continuation` resumes the next legitimate recovery entry.
-    /// If no safe retirement exists the table stays full and admission keeps
-    /// answering backpressure — cursors are never reset and missing evidence
-    /// is never declared complete.
+    /// [`OrsError::StaleWriterEpoch`]. Receipt-complete rows retire
+    /// unconditionally: they carry a receiver receipt and are covered by the
+    /// acked cursor, so a per-recovery cap would strand a quiet stream's
+    /// remaining rows (the bridge presents a stream only while its frontier
+    /// advances past the last presented sequence, so a bounded loop never
+    /// re-drives their retirement). The `budget` leg is accepted for wire
+    /// compatibility but does not bound the retirement. If no safe retirement
+    /// exists the table stays full and admission keeps answering
+    /// backpressure — cursors are never reset and missing evidence is never
+    /// declared complete.
     pub fn retire_bridge_event_handoffs_checked(
         &self,
         request: &serde_json::Value,
@@ -9855,12 +9859,18 @@ impl RedbRecoveryStore {
             reason: "handoff retirement budget must fit the platform word",
         })?;
         let write = self.database.begin_write().map_err(storage)?;
+        // The `budget` leg is accepted for wire compatibility but no longer
+        // bounds receipt-complete retirement: eligible rows carry a receiver
+        // receipt and are covered by the acked cursor, so they are safe to
+        // retire unconditionally and a per-recovery cap would strand a quiet
+        // stream's remaining rows (the bridge presents a stream only while
+        // its frontier advances, so a bounded loop never re-drives them).
+        let _ = budget;
         let outcome = Self::retire_bridge_handoffs_in(
             &write,
             &namespace,
             expected_revision,
             expected_incarnation,
-            budget,
         )?;
         write.commit().map_err(storage)?;
         Ok(outcome)
@@ -10039,15 +10049,15 @@ impl RedbRecoveryStore {
     /// receipt are never touched: unknown or pending work is never evicted
     /// to admit new work, and a torn record/handoff identity mismatch fails
     /// closed by skipping the row instead of guessing. Deletes are by exact
-    /// key, so the charge releases exactly once. At most `budget` rows
-    /// delete or terminalize per call; `retirement_continuation` reports
-    /// whether eligible rows remain for the next legitimate recovery entry.
+    /// key, so the charge releases exactly once. Every eligible row is
+    /// processed in this call — receipt-complete retirement is unbounded so
+    /// a quiet stream's remaining rows are never stranded by a per-recovery
+    /// cap; `retirement_continuation` is always false.
     fn retire_bridge_handoffs_in(
         write: &redb::WriteTransaction,
         namespace: &str,
         expected_revision: u64,
         expected_incarnation: u64,
-        budget: usize,
     ) -> Result<serde_json::Value, OrsError> {
         let owner = Self::load_bridge_owner_row_in(write, namespace)?;
         if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
@@ -10080,11 +10090,13 @@ impl RedbRecoveryStore {
         let mut retired = 0_u64;
         let mut terminalized = 0_u64;
         let mut terminalized_boundary = compacted;
-        let mut spent = 0_usize;
+        // Receipt-complete rows are safe to retire unconditionally: they carry
+        // a receiver receipt and are covered by the acked cursor, so no
+        // per-recovery budget strands a quiet stream's remaining rows (the
+        // bridge presents a stream only while its frontier advances past the
+        // last presented sequence, so a bounded loop would never re-drive
+        // their retirement). Every eligible row is processed in this call.
         for (_, key, row) in &eligible {
-            if spent >= budget {
-                break;
-            }
             let record_key = format!("{}::{}", access.namespace, row.event_id);
             let record: Option<BridgeEventRow> = {
                 let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
@@ -10098,7 +10110,6 @@ impl RedbRecoveryStore {
                 let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
                 handoffs.remove(key.as_str()).map_err(storage)?;
                 retired += 1;
-                spent += 1;
                 continue;
             };
             record.validate()?;
@@ -10126,7 +10137,6 @@ impl RedbRecoveryStore {
                 handoffs.remove(key.as_str()).map_err(storage)?;
             }
             terminalized += 1;
-            spent += 1;
             terminalized_boundary = terminalized_boundary.max(row.sequence);
         }
         if terminalized_boundary > compacted {
@@ -10143,7 +10153,9 @@ impl RedbRecoveryStore {
             "namespace": access.namespace,
             "retired": retired,
             "terminalized": terminalized,
-            "retirement_continuation": eligible.len() as u64 > spent as u64,
+            // Every eligible row is processed in this call (receipt-complete
+            // retirement is unbounded), so no continuation is pending.
+            "retirement_continuation": false,
         }))
     }
 
