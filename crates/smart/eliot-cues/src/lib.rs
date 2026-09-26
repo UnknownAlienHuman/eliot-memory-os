@@ -256,7 +256,6 @@ impl V1SnapshotMigration {
         )?;
         let parsed = parsed_ids
             .into_iter()
-            .map(|(id, row)| (id, row))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut seen = std::collections::BTreeSet::new();
         for row in &self.rows {
