@@ -4113,7 +4113,12 @@ impl RedbRecoveryStore {
         if matches!(
             record.kind,
             crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
-        ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
+        ) && (record.correlation_projection.is_none()
+            || (record.session_ref.is_none()
+                && matches!(
+                    record.correlation_projection.as_ref(),
+                    Some(HostCorrelationProjection::McpJsonRpc { .. })
+                )))
         {
             return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
         }
