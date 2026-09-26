@@ -6215,7 +6215,7 @@ impl KernelComposition {
             &receipt,
             &record,
             &envelope,
-            selectors.as_ref(),
+            Some(&selectors),
         )? {
             return Ok(replayed);
         }

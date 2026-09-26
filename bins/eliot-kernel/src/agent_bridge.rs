@@ -377,7 +377,11 @@ impl KernelComposition {
             bridge_generation: admission.generation,
             state_fence: admission.state_fence.clone(),
             kernel_principal_binding: kernel_policy.session_principal_binding.clone(),
-            kernel_authority_epoch: kernel_policy.module_generation.state_fence.authority_epoch,
+            kernel_authority_epoch: kernel_policy
+                .module_generation
+                .state_fence
+                .authority_epoch
+                .clone(),
             kernel_generation: kernel_policy.module_generation.generation,
             kernel_artifact_sha256,
             kernel_config_snapshot_sha256,
