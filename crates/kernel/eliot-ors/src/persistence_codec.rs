@@ -24,6 +24,7 @@ use crate::OperationalPhase;
 use crate::OrsError;
 use crate::ProcessEvidenceRecord;
 use crate::ProcessStartReplayRecord;
+use crate::ProcessStreamRecoveryProjection;
 use crate::RecoveryInboxDisposition;
 use crate::RecoveryPayload;
 use crate::RecoveryPayloadEnvelope;
@@ -438,6 +439,19 @@ impl PersistedValue for AuthorityHandoffRecord {
 
 impl PersistedValue for ProcessEvidenceRecord {
     const RECORD_TYPE: &'static str = "process_evidence";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Issue #269: the process-stream recovery projection rides the same ORS codec
+/// as every other record family. There is no second codec, no second table
+/// owner and no separate journal for stdout/stderr: `contract_version` is the
+/// existing ORS contract version, and `validate()` is the single fail-closed
+/// gate that also makes a synthetic `raw:` locator unrepresentable.
+impl PersistedValue for ProcessStreamRecoveryProjection {
+    const RECORD_TYPE: &'static str = "process_stream_recovery";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
