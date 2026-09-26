@@ -183,16 +183,11 @@ fn run() -> Result<String, Failure> {
     // the operation before it is reported, so the receipt distinguishes an
     // owner-attested classification from a local guess.
     let failure = bridge.last_failure();
-    let outcome =
-        failure.map_or(eliot_mod_research::ProviderOutcome::Unknown, |terminal| {
-            terminal.outcome
-        });
-    let reconciliation = reconcile_with_owner(
-        &client,
-        &admitted,
-        bridge.last_cancellation(),
-        outcome,
-    );
+    let outcome = failure.map_or(eliot_mod_research::ProviderOutcome::Unknown, |terminal| {
+        terminal.outcome
+    });
+    let reconciliation =
+        reconcile_with_owner(&client, &admitted, bridge.last_cancellation(), outcome);
     let no_effect_proven = bridge
         .last_cancellation()
         .is_some_and(|receipt| receipt.no_effect_proven);
@@ -400,7 +395,9 @@ fn ask_control_operation(
     attempts: &mut Vec<OwnerReconciliationAttempt>,
     client: &ResearchKernelClient,
     operation: &'static str,
-    send: impl FnOnce(&ResearchKernelClient) -> Result<
+    send: impl FnOnce(
+        &ResearchKernelClient,
+    ) -> Result<
         eliot_kernel_service::ResearchProviderDispatchReceipt,
         ResearchKernelClientError,
     >,

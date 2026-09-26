@@ -525,7 +525,9 @@ impl ReconciliationEvidence {
     /// is why the receipt keeps an explicit unknown rather than a completion.
     #[must_use]
     pub fn owner_confirmed(&self) -> bool {
-        self.attempts.iter().any(OwnerReconciliationAttempt::is_owner_answered)
+        self.attempts
+            .iter()
+            .any(OwnerReconciliationAttempt::is_owner_answered)
     }
 
     /// Returns the owner's disposition for one control operation, if served.
@@ -551,7 +553,7 @@ impl ReconciliationEvidence {
         !no_effect_proven
             && !self
                 .disposition_of(eliot_kernel_service::RESEARCH_PROVIDER_CANCEL_OPERATION)
-                .is_some_and(|disposition| disposition.admits())
+                .is_some_and(eliot_kernel_service::ResearchProviderDisposition::admits)
     }
 
     /// Renders the attempts as a bounded, secret-free summary.

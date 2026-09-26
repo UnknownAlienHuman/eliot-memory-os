@@ -40,8 +40,8 @@ pub use dispatch_authority::{
 };
 pub use evidence::{
     CancellationEvidence, OwnerReconciliationAttempt, ProviderEvidenceRecord,
-    ProviderExecutionReceipt, RawProviderEvidence, RedactedEvidence, RedactionReceipt,
-    ReconciliationEvidence, StreamOmission, StreamRecord, sha256_hex,
+    ProviderExecutionReceipt, RawProviderEvidence, ReconciliationEvidence, RedactedEvidence,
+    RedactionReceipt, StreamOmission, StreamRecord, sha256_hex,
 };
 pub use execution::{
     BOUND_RUN_DEADLINE, ProviderBridge, ProviderExecution, ProviderOutcome, RequestPortError,
