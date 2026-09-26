@@ -51,6 +51,7 @@ use schemars::JsonSchema;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 // `EVIDENCE_PACK_MAX_RECORDS` is the canonical bound owned by the
 // `GetEvidencePack` catalogue row in `eliot-store-api`; imported above.
@@ -1902,12 +1903,11 @@ fn audit_range_payload(
 /// explicit absence.
 #[allow(clippy::too_many_lines)]
 fn automation_state_payload(
-    state: &MemoryState,
+    state: &mut MemoryState,
     query: &NamedReadRequest,
     fence: &StateFence,
-) -> Result<Value, serde_json::Error> {
-    let decoded = validate_automation_read_params(&query.parameters)
-        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+) -> Result<Value, StoreError> {
+    let decoded = validate_automation_read_params(&query.parameters)?;
     let limit = usize::from(decoded.max_records.max(1));
     match decoded.query.as_str() {
         AUTOMATION_QUERY_LIST => {
@@ -1933,11 +1933,16 @@ fn automation_state_payload(
                 "revision": currents.len(),
                 "state_fence": fence,
             }))
+            .map_err(|error| StoreError::Serialization(error.to_string()))
         }
         AUTOMATION_QUERY_CURRENT => {
-            let id = decoded.automation_id.clone().ok_or_else(|| {
-                serde_json::Error::custom("exact automation selector is required")
-            })?;
+            let id = decoded
+                .automation_id
+                .clone()
+                .ok_or(StoreError::InvalidField {
+                    field: "automation_id",
+                    reason: "exact automation selector is required",
+                })?;
             let (current, revision) = match state.automation_currents.get(&id) {
                 Some(row)
                     if row.state_fence == *fence
@@ -1962,40 +1967,59 @@ fn automation_state_payload(
                 "revision": revision,
                 "state_fence": fence,
             }))
+            .map_err(|error| StoreError::Serialization(error.to_string()))
         }
         AUTOMATION_QUERY_HISTORY => {
-            let id = decoded.automation_id.clone().ok_or_else(|| {
-                serde_json::Error::custom("exact automation selector is required")
-            })?;
+            let id = decoded
+                .automation_id
+                .clone()
+                .ok_or(StoreError::InvalidField {
+                    field: "automation_id",
+                    reason: "exact automation selector is required",
+                })?;
             automation_history_payload(
                 state,
                 fence,
                 &id,
-                limit,
+                decoded.max_records,
+                decoded.include_retired,
                 decoded.requested_revision.as_deref(),
                 decoded.cursor.as_ref(),
             )
         }
         AUTOMATION_QUERY_INVOCATIONS => {
-            let id = decoded.automation_id.clone().ok_or_else(|| {
-                serde_json::Error::custom("exact automation selector is required")
-            })?;
+            let id = decoded
+                .automation_id
+                .clone()
+                .ok_or(StoreError::InvalidField {
+                    field: "automation_id",
+                    reason: "exact automation selector is required",
+                })?;
             automation_invocations_payload(
                 state,
                 fence,
                 &id,
-                limit,
+                decoded.max_records,
+                decoded.include_retired,
                 decoded.requested_occurrence_id.as_deref(),
                 decoded.cursor.as_ref(),
             )
         }
         AUTOMATION_QUERY_FAILURE => {
-            let id = decoded.automation_id.clone().ok_or_else(|| {
-                serde_json::Error::custom("exact automation selector is required")
-            })?;
+            let id = decoded
+                .automation_id
+                .clone()
+                .ok_or(StoreError::InvalidField {
+                    field: "automation_id",
+                    reason: "exact automation selector is required",
+                })?;
             automation_failure_payload(state, fence, &id)
+                .map_err(|error| StoreError::Serialization(error.to_string()))
         }
-        _ => Err(serde_json::Error::custom("unknown automation query")),
+        _ => Err(StoreError::InvalidField {
+            field: "query",
+            reason: "unknown automation query",
+        }),
     }
 }
 
@@ -2049,16 +2073,33 @@ fn automation_page_slice<T>(
 /// first page from the start, continued page strictly after the verified
 /// exclusive row identity, identical semantics on both.
 fn automation_history_payload(
-    state: &MemoryState,
+    state: &mut MemoryState,
     fence: &StateFence,
     automation_id: &str,
-    limit: usize,
+    max_records: u16,
+    include_retired: bool,
     requested_revision: Option<&str>,
-    cursor: Option<&eliot_store_api::AutomationPageCursor>,
-) -> Result<Value, serde_json::Error> {
+    cursor: Option<&eliot_store_api::AutomationContinuationRef>,
+) -> Result<Value, StoreError> {
+    let limit = usize::from(max_records.max(1));
     let mut revisions = Vec::new();
     let mut truncated = false;
     let mut last_row_id: Option<String> = None;
+    let read_revision = automation_page_read_revision(state)?;
+    let continuation_request = MemoryAutomationContinuationRequest {
+        query: eliot_store_api::AutomationContinuationQuery::History,
+        include_retired,
+        automation_id,
+        read_revision: &read_revision,
+        state_fence: fence,
+        max_records,
+    };
+    let boundary = automation_verified_boundary(state, cursor, &continuation_request)?;
+    if cursor.is_some() && requested_revision.is_some() {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
     if let Some(requested_revision) = requested_revision {
         if let Some(row) = state.automation_revisions.values().find(|row| {
             row.automation_id == automation_id
@@ -2080,7 +2121,10 @@ fn automation_history_payload(
             if row.automation_id != automation_id || row.state_fence != *fence {
                 continue;
             }
-            if cursor.is_some_and(|cursor| row.revision.as_str() <= cursor.after_row_id.as_str()) {
+            if boundary
+                .as_deref()
+                .is_some_and(|tail| row.revision.as_str() <= tail)
+            {
                 continue;
             }
             // The scan stops as soon as it holds the one-over eligible probe
@@ -2106,17 +2150,14 @@ fn automation_history_payload(
             .collect();
     }
     let returned = revisions.len();
-    let read_revision = automation_page_read_revision(state)?;
     let mut completeness = automation_page_completeness(&read_revision, returned, truncated);
     if truncated {
         completeness = automation_page_with_continuation(
+            state,
             completeness,
-            AUTOMATION_QUERY_HISTORY,
-            automation_id,
-            &read_revision,
-            fence,
+            &continuation_request,
             last_row_id.as_deref(),
-            limit,
+            cursor.map(eliot_store_api::AutomationContinuationRef::identifier),
         )?;
     }
     Ok(json!({
@@ -2134,16 +2175,33 @@ fn automation_history_payload(
 /// is a paged denominator read served by the same shared slicing rule the
 /// revision page uses, first and continued alike.
 fn automation_invocations_payload(
-    state: &MemoryState,
+    state: &mut MemoryState,
     fence: &StateFence,
     automation_id: &str,
-    limit: usize,
+    max_records: u16,
+    include_retired: bool,
     requested_occurrence_id: Option<&str>,
-    cursor: Option<&eliot_store_api::AutomationPageCursor>,
-) -> Result<Value, serde_json::Error> {
+    cursor: Option<&eliot_store_api::AutomationContinuationRef>,
+) -> Result<Value, StoreError> {
+    let limit = usize::from(max_records.max(1));
     let mut invocations = Vec::new();
     let mut truncated = false;
     let mut last_row_id: Option<String> = None;
+    let read_revision = automation_page_read_revision(state)?;
+    let continuation_request = MemoryAutomationContinuationRequest {
+        query: eliot_store_api::AutomationContinuationQuery::Invocations,
+        include_retired,
+        automation_id,
+        read_revision: &read_revision,
+        state_fence: fence,
+        max_records,
+    };
+    let boundary = automation_verified_boundary(state, cursor, &continuation_request)?;
+    if cursor.is_some() && requested_occurrence_id.is_some() {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
     if let Some(requested_occurrence_id) = requested_occurrence_id {
         if let Some(row) = state
             .automation_invocations
@@ -2165,8 +2223,9 @@ fn automation_invocations_payload(
             if row.automation_id != automation_id || row.state_fence != *fence {
                 continue;
             }
-            if cursor
-                .is_some_and(|cursor| row.occurrence_id.as_str() <= cursor.after_row_id.as_str())
+            if boundary
+                .as_deref()
+                .is_some_and(|tail| row.occurrence_id.as_str() <= tail)
             {
                 continue;
             }
@@ -2193,17 +2252,14 @@ fn automation_invocations_payload(
             .collect();
     }
     let returned = invocations.len();
-    let read_revision = automation_page_read_revision(state)?;
     let mut completeness = automation_page_completeness(&read_revision, returned, truncated);
     if truncated {
         completeness = automation_page_with_continuation(
+            state,
             completeness,
-            AUTOMATION_QUERY_INVOCATIONS,
-            automation_id,
-            &read_revision,
-            fence,
+            &continuation_request,
             last_row_id.as_deref(),
-            limit,
+            cursor.map(eliot_store_api::AutomationContinuationRef::identifier),
         )?;
     }
     Ok(json!({
@@ -2219,13 +2275,13 @@ fn automation_invocations_payload(
 /// The value is the owner-issued read revision a page reports and a
 /// continuation is bound to. It changes whenever a commit advances any head,
 /// which is exactly when an outstanding continuation must stop being valid.
-fn automation_page_read_revision(state: &MemoryState) -> Result<String, serde_json::Error> {
+fn automation_page_read_revision(state: &MemoryState) -> Result<String, StoreError> {
     let heads: Vec<(String, u64)> = state
         .revision_heads
         .values()
         .map(|head| (head.key.as_str().to_owned(), head.revision))
         .collect();
-    audit_heads_digest(&heads).map_err(|error| serde_json::Error::custom(error.to_string()))
+    audit_heads_digest(&heads).map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
 /// Builds the owner-issued denominator completeness metadata for one page.
@@ -2243,37 +2299,611 @@ fn automation_page_completeness(read_revision: &str, returned: usize, truncated:
     })
 }
 
+/// Private owner record for one authenticated automation-page continuation.
+///
+/// The client receives only the opaque identifier. These exact bindings,
+/// including the boundary of the page actually returned, remain in the
+/// existing `MemoryState` owner map.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MemoryAutomationContinuationRecord {
+    query: eliot_store_api::AutomationContinuationQuery,
+    include_retired: bool,
+    automation_id: String,
+    read_revision: String,
+    state_fence: StateFence,
+    order: eliot_store_api::AutomationContinuationOrder,
+    exclusive_returned_tail: String,
+    max_records: u16,
+    issuer_identity: String,
+    issuer_generation: u64,
+    creation_revision: u64,
+    created_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    successor_identifier: Option<String>,
+    metadata_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MemoryAutomationContinuationRequest<'a> {
+    query: eliot_store_api::AutomationContinuationQuery,
+    include_retired: bool,
+    automation_id: &'a str,
+    read_revision: &'a str,
+    state_fence: &'a StateFence,
+    max_records: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MemoryAutomationContinuationEntry {
+    Active(Box<MemoryAutomationContinuationRecord>),
+    Terminal {
+        failure: eliot_store_api::AutomationContinuationFailure,
+        terminal_revision: u64,
+        expires_at_unix_ms: u64,
+        metadata_bytes: usize,
+    },
+}
+
+struct PreparedMemoryAutomationContinuation {
+    identifier: String,
+    record: MemoryAutomationContinuationRecord,
+    next_creation_revision: u64,
+    parent_metadata_bytes: Option<usize>,
+    wire: String,
+}
+
+const MEMORY_AUTOMATION_CONTINUATION_ISSUER: &str = "eliot-store-memory";
+
+fn memory_continuation_error(
+    failure: eliot_store_api::AutomationContinuationFailure,
+) -> StoreError {
+    StoreError::AutomationContinuation(failure)
+}
+
+fn memory_continuation_now_ms() -> Result<u64, StoreError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::Unavailable)?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| StoreError::Unavailable)
+}
+
+fn memory_continuation_order(
+    query: eliot_store_api::AutomationContinuationQuery,
+) -> eliot_store_api::AutomationContinuationOrder {
+    use eliot_store_api::{
+        AutomationContinuationDirection as Direction, AutomationContinuationOrder,
+        AutomationContinuationOrderKey as Key, AutomationContinuationQuery as Query,
+    };
+    AutomationContinuationOrder {
+        key: match query {
+            Query::History => Key::Revision,
+            Query::Invocations => Key::OccurrenceId,
+        },
+        direction: Direction::Ascending,
+    }
+}
+
+fn memory_continuation_metadata_bytes(
+    identifier: &str,
+    record: &MemoryAutomationContinuationRecord,
+) -> Result<usize, StoreError> {
+    let fence_bytes = serde_json::to_vec(&record.state_fence)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let strings = [
+        identifier.len(),
+        record.automation_id.len(),
+        record.read_revision.len(),
+        fence_bytes.len(),
+        record.exclusive_returned_tail.len(),
+        record.issuer_identity.len(),
+        record.successor_identifier.as_ref().map_or(0, String::len),
+    ];
+    let variable_bytes = strings.into_iter().try_fold(0_usize, usize::checked_add);
+    let fixed_bytes = 4_usize
+        .checked_mul(std::mem::size_of::<u64>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+        .and_then(|bytes| bytes.checked_add(5))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Option<String>>()))
+        .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<usize>()));
+    variable_bytes
+        .and_then(|bytes| fixed_bytes.and_then(|fixed| bytes.checked_add(fixed)))
+        .ok_or_else(|| {
+            memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+            )
+        })
+}
+
+fn memory_continuation_terminal_bytes(identifier: &str) -> Result<usize, StoreError> {
+    identifier
+        .len()
+        .checked_add(2 * std::mem::size_of::<u64>())
+        .and_then(|bytes| bytes.checked_add(1))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<usize>()))
+        .ok_or_else(|| {
+            memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+            )
+        })
+}
+
+fn memory_continuation_terminalize(
+    state: &mut MemoryState,
+    identifier: &str,
+    failure: eliot_store_api::AutomationContinuationFailure,
+    now_ms: u64,
+) -> Result<(), StoreError> {
+    let Some(MemoryAutomationContinuationEntry::Active(_)) =
+        state.automation_continuations.get(identifier)
+    else {
+        return Ok(());
+    };
+    let terminal_revision = state.next_continuation_terminal_revision;
+    let next_terminal_revision = terminal_revision.checked_add(1).ok_or_else(|| {
+        memory_continuation_error(eliot_store_api::AutomationContinuationFailure::CapacityPressure)
+    })?;
+    let expires_at_unix_ms = now_ms
+        .checked_add(eliot_store_api::AUTOMATION_CONTINUATION_TTL_MS)
+        .ok_or_else(|| {
+            memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+            )
+        })?;
+    let metadata_bytes = memory_continuation_terminal_bytes(identifier)?;
+    state.automation_continuations.remove(identifier);
+    state.automation_continuations.insert(
+        identifier.to_owned(),
+        MemoryAutomationContinuationEntry::Terminal {
+            failure,
+            terminal_revision,
+            expires_at_unix_ms,
+            metadata_bytes,
+        },
+    );
+    state.next_continuation_terminal_revision = next_terminal_revision;
+    memory_continuation_trim_terminals(state);
+    Ok(())
+}
+
+fn memory_continuation_trim_terminals(state: &mut MemoryState) {
+    loop {
+        let (count, bytes) = state.automation_continuations.values().fold(
+            (0_usize, 0_usize),
+            |(count, bytes), entry| match entry {
+                MemoryAutomationContinuationEntry::Terminal { metadata_bytes, .. } => (
+                    count.saturating_add(1),
+                    bytes.saturating_add(*metadata_bytes),
+                ),
+                MemoryAutomationContinuationEntry::Active(_) => (count, bytes),
+            },
+        );
+        if count <= eliot_store_api::AUTOMATION_CONTINUATION_MAX_TERMINAL_TOMBSTONES
+            && bytes <= eliot_store_api::AUTOMATION_CONTINUATION_MAX_TERMINAL_METADATA_BYTES
+        {
+            return;
+        }
+        let oldest_identifier = state
+            .automation_continuations
+            .iter()
+            .filter_map(|(identifier, entry)| match entry {
+                MemoryAutomationContinuationEntry::Terminal {
+                    terminal_revision, ..
+                } => Some((*terminal_revision, identifier.clone())),
+                MemoryAutomationContinuationEntry::Active(_) => None,
+            })
+            .min()
+            .map(|(_, identifier)| identifier);
+        let Some(oldest_identifier) = oldest_identifier else {
+            return;
+        };
+        state.automation_continuations.remove(&oldest_identifier);
+    }
+}
+
+/// Reclaims expired and stale active records deterministically, then reclaims
+/// expired tombstones. A still-valid active reference is never selected by the
+/// terminal-only size/count eviction rule.
+fn memory_continuation_reclaim(
+    state: &mut MemoryState,
+    request: &MemoryAutomationContinuationRequest<'_>,
+    now_ms: u64,
+) -> Result<(), StoreError> {
+    let expired_terminals: Vec<String> = state
+        .automation_continuations
+        .iter()
+        .filter_map(|(identifier, entry)| match entry {
+            MemoryAutomationContinuationEntry::Terminal {
+                expires_at_unix_ms, ..
+            } if *expires_at_unix_ms <= now_ms => Some(identifier.clone()),
+            MemoryAutomationContinuationEntry::Active(_)
+            | MemoryAutomationContinuationEntry::Terminal { .. } => None,
+        })
+        .collect();
+    for identifier in expired_terminals {
+        state.automation_continuations.remove(&identifier);
+    }
+
+    let terminalize: Vec<(String, eliot_store_api::AutomationContinuationFailure)> = state
+        .automation_continuations
+        .iter()
+        .filter_map(|(identifier, entry)| match entry {
+            MemoryAutomationContinuationEntry::Active(record)
+                if now_ms >= record.expires_at_unix_ms =>
+            {
+                Some((
+                    identifier.clone(),
+                    eliot_store_api::AutomationContinuationFailure::Expired,
+                ))
+            }
+            MemoryAutomationContinuationEntry::Active(record)
+                if (record.read_revision != request.read_revision
+                    || record.state_fence != *request.state_fence)
+                    && record.query == request.query
+                    && record.include_retired == request.include_retired
+                    && record.automation_id == request.automation_id =>
+            {
+                Some((
+                    identifier.clone(),
+                    eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+                ))
+            }
+            MemoryAutomationContinuationEntry::Active(_)
+            | MemoryAutomationContinuationEntry::Terminal { .. } => None,
+        })
+        .collect();
+    for (identifier, failure) in terminalize {
+        memory_continuation_terminalize(state, &identifier, failure, now_ms)?;
+    }
+    Ok(())
+}
+
+/// Resolves and verifies an echoed reference before the caller applies its
+/// returned tail to the ordered row scan.
+fn automation_verified_boundary(
+    state: &mut MemoryState,
+    reference: Option<&eliot_store_api::AutomationContinuationRef>,
+    request: &MemoryAutomationContinuationRequest<'_>,
+) -> Result<Option<String>, StoreError> {
+    use eliot_store_api::{
+        AutomationContinuationBinding, AutomationContinuationReadBinding,
+        verify_automation_continuation,
+    };
+    let now_ms = memory_continuation_now_ms()?;
+    memory_continuation_reclaim(state, request, now_ms)?;
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let identifier = reference.identifier();
+    let Some(entry) = state.automation_continuations.get(identifier) else {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    };
+    let MemoryAutomationContinuationEntry::Active(record) = entry else {
+        let MemoryAutomationContinuationEntry::Terminal { failure, .. } = entry else {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        };
+        return Err(memory_continuation_error(*failure));
+    };
+    let retained = AutomationContinuationBinding {
+        identifier,
+        read_operation: NamedReadOperation::GetUserAutomationState,
+        query: record.query,
+        include_retired: record.include_retired,
+        automation_id: &record.automation_id,
+        read_revision: &record.read_revision,
+        state_fence: &record.state_fence,
+        order: record.order,
+        exclusive_returned_tail: &record.exclusive_returned_tail,
+        max_records: record.max_records,
+        issuer_identity: &record.issuer_identity,
+        issuer_generation: record.issuer_generation,
+        creation_revision: record.creation_revision,
+        created_at_unix_ms: record.created_at_unix_ms,
+        expires_at_unix_ms: record.expires_at_unix_ms,
+    };
+    let request = AutomationContinuationReadBinding {
+        read_operation: NamedReadOperation::GetUserAutomationState,
+        query: request.query,
+        include_retired: request.include_retired,
+        automation_id: request.automation_id,
+        read_revision: request.read_revision,
+        state_fence: request.state_fence,
+        order: memory_continuation_order(request.query),
+        max_records: request.max_records,
+        issuer_identity: MEMORY_AUTOMATION_CONTINUATION_ISSUER,
+        issuer_generation: state.continuation_issuer_generation,
+    };
+    match verify_automation_continuation(reference, retained, request, now_ms) {
+        Ok(verified) => Ok(Some(verified.exclusive_returned_tail().to_owned())),
+        Err(error) => {
+            if let StoreError::AutomationContinuation(
+                failure @ (eliot_store_api::AutomationContinuationFailure::Expired
+                | eliot_store_api::AutomationContinuationFailure::StaleSnapshot),
+            ) = &error
+            {
+                memory_continuation_terminalize(state, identifier, *failure, now_ms)?;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Mints the successor after page slicing, using the exact last returned row.
+/// Replaying a retained page returns its previously minted successor identifier.
+fn memory_automation_continuation_mint(
+    state: &mut MemoryState,
+    request: &MemoryAutomationContinuationRequest<'_>,
+    exclusive_returned_tail: &str,
+    parent_identifier: Option<&str>,
+) -> Result<String, StoreError> {
+    let now_ms = memory_continuation_now_ms()?;
+    memory_continuation_reclaim(state, request, now_ms)?;
+    if let Some(wire) =
+        memory_continuation_existing_successor(state, parent_identifier, exclusive_returned_tail)?
+    {
+        return Ok(wire);
+    }
+    let prepared = memory_continuation_prepare_mint(
+        state,
+        request,
+        exclusive_returned_tail,
+        parent_identifier,
+        now_ms,
+    )?;
+    memory_continuation_commit_mint(state, prepared, parent_identifier)
+}
+
+fn memory_continuation_existing_successor(
+    state: &MemoryState,
+    parent_identifier: Option<&str>,
+    exclusive_returned_tail: &str,
+) -> Result<Option<String>, StoreError> {
+    let Some(parent_identifier) = parent_identifier else {
+        return Ok(None);
+    };
+    let Some(MemoryAutomationContinuationEntry::Active(parent)) =
+        state.automation_continuations.get(parent_identifier)
+    else {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    };
+    let Some(successor_identifier) = &parent.successor_identifier else {
+        return Ok(None);
+    };
+    let successor_is_valid = match state.automation_continuations.get(successor_identifier) {
+        Some(MemoryAutomationContinuationEntry::Active(successor)) => {
+            if successor.exclusive_returned_tail != exclusive_returned_tail {
+                return Err(memory_continuation_error(
+                    eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+                ));
+            }
+            successor.query == parent.query
+                && successor.include_retired == parent.include_retired
+                && successor.automation_id == parent.automation_id
+                && successor.read_revision == parent.read_revision
+                && successor.state_fence == parent.state_fence
+                && successor.order == parent.order
+                && successor.max_records == parent.max_records
+                && successor.issuer_identity == parent.issuer_identity
+                && successor.issuer_generation == parent.issuer_generation
+                && successor.creation_revision > parent.creation_revision
+                && successor.created_at_unix_ms >= parent.created_at_unix_ms
+                && successor.created_at_unix_ms < parent.expires_at_unix_ms
+                && successor.expires_at_unix_ms == parent.expires_at_unix_ms
+        }
+        Some(MemoryAutomationContinuationEntry::Terminal { failure, .. }) => {
+            return Err(memory_continuation_error(*failure));
+        }
+        None => false,
+    };
+    if !successor_is_valid {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    let reference = eliot_store_api::AutomationContinuationRef::from_owner_identifier(
+        successor_identifier.clone(),
+    )?;
+    reference.to_wire().map(Some)
+}
+
+fn memory_continuation_expiry(
+    state: &MemoryState,
+    parent_identifier: Option<&str>,
+    now_ms: u64,
+) -> Result<u64, StoreError> {
+    if let Some(parent_identifier) = parent_identifier {
+        let Some(MemoryAutomationContinuationEntry::Active(parent)) =
+            state.automation_continuations.get(parent_identifier)
+        else {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        };
+        if now_ms >= parent.expires_at_unix_ms {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::Expired,
+            ));
+        }
+        Ok(parent.expires_at_unix_ms)
+    } else {
+        now_ms
+            .checked_add(eliot_store_api::AUTOMATION_CONTINUATION_TTL_MS)
+            .ok_or_else(|| {
+                memory_continuation_error(
+                    eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+                )
+            })
+    }
+}
+
+fn memory_continuation_prepare_mint(
+    state: &MemoryState,
+    request: &MemoryAutomationContinuationRequest<'_>,
+    exclusive_returned_tail: &str,
+    parent_identifier: Option<&str>,
+    now_ms: u64,
+) -> Result<PreparedMemoryAutomationContinuation, StoreError> {
+    use eliot_store_api::{AutomationContinuationRef, AutomationContinuationVersion};
+    let identifier = loop {
+        let candidate = Uuid::new_v4().to_string();
+        if !state.automation_continuations.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    let reference = AutomationContinuationRef::from_owner_identifier(identifier.clone())?;
+    if reference.version() != AutomationContinuationVersion::V2 {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+        ));
+    }
+    let wire = reference.to_wire()?;
+    let expires_at_unix_ms = memory_continuation_expiry(state, parent_identifier, now_ms)?;
+    let creation_revision = state.next_continuation_creation_revision;
+    let next_creation_revision = creation_revision.checked_add(1).ok_or_else(|| {
+        memory_continuation_error(eliot_store_api::AutomationContinuationFailure::CapacityPressure)
+    })?;
+    let mut record = MemoryAutomationContinuationRecord {
+        query: request.query,
+        include_retired: request.include_retired,
+        automation_id: request.automation_id.to_owned(),
+        read_revision: request.read_revision.to_owned(),
+        state_fence: request.state_fence.clone(),
+        order: memory_continuation_order(request.query),
+        exclusive_returned_tail: exclusive_returned_tail.to_owned(),
+        max_records: request.max_records,
+        issuer_identity: MEMORY_AUTOMATION_CONTINUATION_ISSUER.to_owned(),
+        issuer_generation: state.continuation_issuer_generation,
+        creation_revision,
+        created_at_unix_ms: now_ms,
+        expires_at_unix_ms,
+        successor_identifier: None,
+        metadata_bytes: 0,
+    };
+    record.metadata_bytes = memory_continuation_metadata_bytes(&identifier, &record)?;
+    let active_usage = state.automation_continuations.values().fold(
+        (0_usize, 0_usize),
+        |(count, bytes), entry| match entry {
+            MemoryAutomationContinuationEntry::Active(record) => (
+                count.saturating_add(1),
+                bytes.saturating_add(record.metadata_bytes),
+            ),
+            MemoryAutomationContinuationEntry::Terminal { .. } => (count, bytes),
+        },
+    );
+    let parent_metadata_bytes = if let Some(parent_identifier) = parent_identifier {
+        let Some(MemoryAutomationContinuationEntry::Active(parent)) =
+            state.automation_continuations.get(parent_identifier)
+        else {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        };
+        if parent.successor_identifier.is_some() {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        Some(parent.metadata_bytes.checked_add(identifier.len()).ok_or(
+            memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+            ),
+        )?)
+    } else {
+        None
+    };
+    let parent_extra_bytes = parent_metadata_bytes.map_or(0, |_| identifier.len());
+    let next_active_count = active_usage.0.checked_add(1);
+    let next_active_bytes = active_usage
+        .1
+        .checked_add(record.metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(parent_extra_bytes));
+    if next_active_count
+        .is_none_or(|count| count > eliot_store_api::AUTOMATION_CONTINUATION_MAX_ACTIVE_RECORDS)
+        || next_active_bytes.is_none_or(|bytes| {
+            bytes > eliot_store_api::AUTOMATION_CONTINUATION_MAX_ACTIVE_METADATA_BYTES
+        })
+    {
+        return Err(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+        ));
+    }
+
+    Ok(PreparedMemoryAutomationContinuation {
+        identifier,
+        record,
+        next_creation_revision,
+        parent_metadata_bytes,
+        wire,
+    })
+}
+
+fn memory_continuation_commit_mint(
+    state: &mut MemoryState,
+    prepared: PreparedMemoryAutomationContinuation,
+    parent_identifier: Option<&str>,
+) -> Result<String, StoreError> {
+    let identifier = prepared.identifier.clone();
+    let parent_metadata_bytes = match (parent_identifier, prepared.parent_metadata_bytes) {
+        (Some(_), Some(bytes)) => Some(bytes),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        (None, None) => None,
+    };
+    if let Some(parent_identifier) = parent_identifier {
+        let parent_metadata_bytes = parent_metadata_bytes.ok_or(memory_continuation_error(
+            eliot_store_api::AutomationContinuationFailure::CapacityPressure,
+        ))?;
+        let Some(MemoryAutomationContinuationEntry::Active(parent)) =
+            state.automation_continuations.get_mut(parent_identifier)
+        else {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        };
+        if parent.successor_identifier.is_some() {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown,
+            ));
+        }
+        parent.successor_identifier = Some(identifier.clone());
+        parent.metadata_bytes = parent_metadata_bytes;
+    }
+    state.next_continuation_creation_revision = prepared.next_creation_revision;
+    state.automation_continuations.insert(
+        prepared.identifier,
+        MemoryAutomationContinuationEntry::Active(Box::new(prepared.record)),
+    );
+    Ok(prepared.wire)
+}
+
 /// Mints and attaches the owner continuation for one truncated automation page.
 ///
 /// A truncated page that carried no successor cursor would be indistinguishable
 /// from a terminator, so the owner refuses rather than serving a page whose
 /// remainder has no address.
 fn automation_page_with_continuation(
+    state: &mut MemoryState,
     mut completeness: Value,
-    query: &str,
-    automation_id: &str,
-    read_revision: &str,
-    fence: &StateFence,
+    request: &MemoryAutomationContinuationRequest<'_>,
     last_row_id: Option<&str>,
-    max_records: usize,
-) -> Result<Value, serde_json::Error> {
-    let last_row_id = last_row_id.ok_or_else(|| {
-        serde_json::Error::custom("truncated automation page served no row to continue from")
+    parent_identifier: Option<&str>,
+) -> Result<Value, StoreError> {
+    let last_row_id = last_row_id.ok_or(StoreError::InvalidField {
+        field: "automation_page.tail",
+        reason: "truncated automation page served no row to continue from",
     })?;
-    let max_records = u16::try_from(max_records).map_err(|_| {
-        serde_json::Error::custom("automation page bound is not representable as a cursor bound")
-    })?;
-    let next_cursor = eliot_store_api::automation_cursor_mint(
-        query,
-        automation_id,
-        read_revision,
-        fence,
-        last_row_id,
-        max_records,
-    )
-    .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let next_cursor =
+        memory_automation_continuation_mint(state, request, last_row_id, parent_identifier)?;
     let object = completeness.as_object_mut().ok_or_else(|| {
-        serde_json::Error::custom("automation completeness metadata is not an object")
+        StoreError::Serialization("automation completeness metadata is not an object".to_owned())
     })?;
     object.insert(
         eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR.to_owned(),
@@ -2845,7 +3475,7 @@ impl MemoryStore {
         // 688-B: the pack handler also suppresses evidence-backed erased pairs
         // (see `evidence_pack_payload`); suppression never guesses.
         Self::enforce_catalogue_gate(query)?;
-        let state = self.lock_state()?;
+        let mut state = self.lock_state()?;
         let fence = match state.fences.clone() {
             Some(fence) => fence,
             None => query.state_fence.clone(),
@@ -2854,6 +3484,87 @@ impl MemoryStore {
             return Err(StoreError::FenceMismatch);
         }
         let revision_heads = state.revision_heads.values().cloned().collect::<Vec<_>>();
+        if query.operation == NamedReadOperation::GetUserAutomationState {
+            let payload = automation_state_payload(&mut state, query, &fence)?;
+            let response = NamedReadResponse {
+                operation: query.operation,
+                state_fence: fence,
+                revision_heads,
+                payload,
+            };
+            response.validate()?;
+            return Ok(response);
+        }
+        let payload = Self::named_read_payload(&state, query, &fence, &revision_heads)?;
+
+        let response = NamedReadResponse {
+            operation: query.operation,
+            state_fence: fence,
+            revision_heads,
+            payload,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    fn named_read_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+        revision_heads: &[RevisionHead],
+    ) -> Result<Value, StoreError> {
+        if let Some(payload) = Self::named_read_core_payload(state, query, fence, revision_heads)? {
+            return Ok(payload);
+        }
+        let payload = match query.operation {
+            NamedReadOperation::GetEvidencePack => {
+                let payload = Self::evidence_pack_payload(state, query, fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetTaskState => {
+                let payload = Self::task_state_payload(state, query, fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetAttentionAndProblems => {
+                let payload = Self::attention_problems_payload(state, query, fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                let payload = Self::understanding_inputs_payload(state, query, fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                let payload = Self::capability_evidence_payload(state, query, fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetNotificationState => notify_payload(state, query, fence),
+            NamedReadOperation::GetReactiveInjectionState => {
+                reactive_ledger_payload(state, query, fence)
+            }
+            NamedReadOperation::GetResourceSnapshot => {
+                resource_snapshot_payload(state, query, fence)
+            }
+            NamedReadOperation::GetExperienceBankRange => {
+                experience_range_payload(state, query, fence, true)
+            }
+            NamedReadOperation::GetAgentFeedbackRange => {
+                experience_range_payload(state, query, fence, false)
+            }
+            NamedReadOperation::GetAuditRange => audit_range_payload(state, query, fence),
+            _ => serde_json::to_value(json!({
+                "operation": format!("{:?}", query.operation),
+                "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
+            })),
+        };
+        payload.map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    fn named_read_core_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+        revision_heads: &[RevisionHead],
+    ) -> Result<Option<Value>, StoreError> {
         let payload = match query.operation {
             NamedReadOperation::GetCurrentEpistemicPosition => {
                 let scope = query
@@ -2873,7 +3584,7 @@ impl MemoryStore {
                     .transpose()?;
                 serde_json::to_value(view)
             }
-            NamedReadOperation::GetRevisionHeads => serde_json::to_value(&revision_heads),
+            NamedReadOperation::GetRevisionHeads => serde_json::to_value(revision_heads),
             NamedReadOperation::GetOrderingHeads => {
                 serde_json::to_value(state.ordering_heads.values().collect::<Vec<_>>())
             }
@@ -2908,59 +3619,12 @@ impl MemoryStore {
                     "state_fence": fence,
                 }))
             }
-            NamedReadOperation::GetEvidencePack => {
-                let payload = Self::evidence_pack_payload(&state, query, &fence)?;
-                serde_json::to_value(&payload)
-            }
-            NamedReadOperation::GetTaskState => {
-                let payload = Self::task_state_payload(&state, query, &fence)?;
-                serde_json::to_value(&payload)
-            }
-            NamedReadOperation::GetAttentionAndProblems => {
-                let payload = Self::attention_problems_payload(&state, query, &fence)?;
-                serde_json::to_value(&payload)
-            }
-            NamedReadOperation::GetUnderstandingProjectionInputs => {
-                let payload = Self::understanding_inputs_payload(&state, query, &fence)?;
-                serde_json::to_value(&payload)
-            }
-            NamedReadOperation::GetCapabilityEvidenceState => {
-                let payload = Self::capability_evidence_payload(&state, query, &fence)?;
-                serde_json::to_value(&payload)
-            }
-            NamedReadOperation::GetNotificationState => notify_payload(&state, query, &fence),
-            NamedReadOperation::GetReactiveInjectionState => {
-                reactive_ledger_payload(&state, query, &fence)
-            }
-            NamedReadOperation::GetResourceSnapshot => {
-                resource_snapshot_payload(&state, query, &fence)
-            }
-            NamedReadOperation::GetUserAutomationState => {
-                automation_state_payload(&state, query, &fence)
-            }
-            NamedReadOperation::GetExperienceBankRange => {
-                experience_range_payload(&state, query, &fence, true)
-            }
-            NamedReadOperation::GetAgentFeedbackRange => {
-                experience_range_payload(&state, query, &fence, false)
-            }
-            NamedReadOperation::GetAuditRange => audit_range_payload(&state, query, &fence),
-            _ => serde_json::to_value(json!({
-                "operation": format!("{:?}", query.operation),
-                "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
-            })),
+            _ => return Ok(None),
         };
-        let payload = payload.map_err(|error| StoreError::Serialization(error.to_string()))?;
-        let response = NamedReadResponse {
-            operation: query.operation,
-            state_fence: fence,
-            revision_heads,
-            payload,
-        };
-        response.validate()?;
-        Ok(response)
+        payload
+            .map(Some)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
     }
-
     /// Builds the versioned exact evidence-pack payload for one request.
     ///
     /// Reads only actually captured observations: the `CaptureObservation`
@@ -3911,6 +4575,15 @@ struct MemoryState {
     /// only through the closed failure leg under the held transaction
     /// lock; latest write wins.
     automation_last_failure: BTreeMap<String, String>,
+    /// Private owner-issued continuation records. Client references contain
+    /// only opaque identifiers; the row boundary stays in these records.
+    automation_continuations: BTreeMap<String, MemoryAutomationContinuationEntry>,
+    /// Random per-store incarnation binding for retained continuation records.
+    continuation_issuer_generation: u64,
+    /// Monotonic record creation revision used for deterministic reclamation.
+    next_continuation_creation_revision: u64,
+    /// Monotonic tombstone revision used to evict the oldest terminal entries.
+    next_continuation_terminal_revision: u64,
     /// Immutable experience-bank rows keyed by joined `(handle, revision)`
     /// (issue #223). Verbatim Governor-admitted record documents with
     /// presented digests, driven only through the closed experience legs
@@ -3924,11 +4597,13 @@ struct MemoryState {
 }
 
 impl PartialEq for MemoryState {
-    /// Field-wise equality including notification records.
+    /// Canonical-state equality including notification records.
     ///
     /// [`NotificationStore`] carries no `PartialEq` itself, so records
     /// compare by value in deterministic dedup-key order; every other field
-    /// compares directly. Replay-identity tests depend on this equality.
+    /// in the canonical state compares directly. The random store incarnation
+    /// and private continuation retention are operational read state, so they
+    /// do not change equality used by replay-identity checks.
     fn eq(&self, other: &Self) -> bool {
         self.epistemic_positions == other.epistemic_positions
             && self.fences == other.fences
@@ -3963,6 +4638,10 @@ impl PartialEq for MemoryState {
 
 impl Default for MemoryState {
     fn default() -> Self {
+        let incarnation_bytes = Uuid::new_v4().into_bytes();
+        let mut generation_bytes = [0_u8; std::mem::size_of::<u64>()];
+        let generation_length = generation_bytes.len();
+        generation_bytes.copy_from_slice(&incarnation_bytes[..generation_length]);
         Self {
             epistemic_positions: BTreeMap::new(),
             fences: None,
@@ -3987,6 +4666,10 @@ impl Default for MemoryState {
             automation_invocations: BTreeMap::new(),
             automation_failures: BTreeMap::new(),
             automation_last_failure: BTreeMap::new(),
+            automation_continuations: BTreeMap::new(),
+            continuation_issuer_generation: u64::from_be_bytes(generation_bytes).max(1),
+            next_continuation_creation_revision: 1,
+            next_continuation_terminal_revision: 1,
             experience_bank_rows: BTreeMap::new(),
             experience_feedback_rows: BTreeMap::new(),
             next_commit_sequence: 1,

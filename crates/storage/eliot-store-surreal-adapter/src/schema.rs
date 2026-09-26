@@ -70,6 +70,10 @@ pub(crate) mod table {
     /// row per `automation_id` naming the most recently committed
     /// failure key. Last write wins; no compare-and-set.
     pub(crate) const AUTOMATION_LAST_FAILURE: &str = "automation_last_failure";
+    /// Bounded, owner-issued page continuations and their quota guard (issue #2859).
+    /// Rows are schemaless and created only by the truncated-page issuance path;
+    /// named reads never define this table as a side effect.
+    pub(crate) const AUTOMATION_CONTINUATION: &str = "automation_continuation";
     /// Immutable experience-bank row per handle + owner revision
     /// (issue #223). One row per joined `(handle, revision)` key
     /// carrying the verbatim Governor-admitted bank-record document.
@@ -104,10 +108,11 @@ pub(crate) mod table {
     /// - It does not prove a name listed here is a physical table. Nothing
     ///   machine-links these consts to this module's DDL strings, so a declared
     ///   name that no baseline DDL ever creates is dispositioned and passed
-    ///   like any other. `automation_failure` and `automation_last_failure` are
-    ///   exactly that today: declared, dispositioned, and created by no
-    ///   generation's DDL.
-    pub(crate) const ALL_TABLES: [&str; 23] = [
+    ///   like any other. `automation_failure`, `automation_last_failure`, and
+    ///   `automation_continuation` are declared without generation DDL;
+    ///   continuations create their schemaless table only during explicit
+    ///   truncated-page issuance.
+    pub(crate) const ALL_TABLES: [&str; 24] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -129,6 +134,7 @@ pub(crate) mod table {
         AUTOMATION_INVOCATION,
         AUTOMATION_FAILURE,
         AUTOMATION_LAST_FAILURE,
+        AUTOMATION_CONTINUATION,
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
     ];

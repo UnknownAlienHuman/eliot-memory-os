@@ -48,9 +48,9 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OrderingScopeId, PreparedTransition, RevisionHead, ScopeId, SecurityContext,
     StateFence, StoreError, TransitionClass, USER_AUTOMATION_SCOPE, WriteReceipt,
-    WriteReceiptStatus, audit_heads_digest, automation_create_params, automation_cursor_verify,
-    automation_edit_params, automation_invocation_read_request, automation_mutation_request,
-    automation_read_request, automation_revision_read_request, automation_run_now_params,
+    WriteReceiptStatus, audit_heads_digest, automation_create_params, automation_edit_params,
+    automation_invocation_read_request, automation_mutation_request, automation_read_request,
+    automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, canonical_json_bytes, canonical_request_hash,
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
 };
@@ -784,31 +784,10 @@ fn denominator_coverage(
     })
 }
 
-/// Returns the verified continuation for one truncated page of a denominator.
-///
-/// The cursor is re-proved against this exact automation, query, owner-issued
-/// read revision, admission fence and page bound before it is echoed, so an
-/// owner that minted a cursor for another denominator, another head snapshot or
-/// another page bound cannot redirect the walk. A commit between pages advances
-/// the head set, so the re-proof fails closed and the walk restarts under the
-/// successor read rather than continuing over a set that moved.
-fn denominator_page_cursor(
-    cursor: &str,
-    query: &str,
-    automation_id: &str,
-    coverage: &AutomationDenominatorCoverage,
-    fence: &StateFence,
-    max_records: u16,
-) -> Result<String, StoreError> {
-    automation_cursor_verify(
-        cursor,
-        query,
-        automation_id,
-        &coverage.read_revision,
-        fence,
-        max_records,
-    )?;
-    Ok(cursor.to_owned())
+/// Echoes the Store owner's opaque continuation for the next denominator page.
+/// The owner validates the retained binding before it applies any row boundary.
+fn denominator_page_cursor(cursor: &str) -> String {
+    cursor.to_owned()
 }
 
 /// Returns the exact occurrence identity one stored invocation row carries.
@@ -1144,14 +1123,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                     reason: "history page is not owner-proven complete",
                 });
             };
-            cursor = Some(denominator_page_cursor(
-                next,
-                QUERY_HISTORY,
-                automation_id,
-                &coverage,
-                &fence,
-                eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
-            )?);
+            cursor = Some(denominator_page_cursor(next));
         };
         let revision_id = first_revision.ok_or(StoreError::InvalidField {
             field: "automation.revision",
@@ -1402,14 +1374,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                     walk.denominator_revision.clone(),
                 );
             };
-            walk.cursor = Some(denominator_page_cursor(
-                next,
-                QUERY_INVOCATIONS,
-                automation_id,
-                &page.coverage,
-                fence,
-                eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
-            )?);
+            walk.cursor = Some(denominator_page_cursor(next));
         }
     }
 
