@@ -5211,6 +5211,45 @@ fn degradation(observation: &InquiryObservation, account: &CoverageAccount) -> R
 /// Planning is receding-horizon: only what current observations can determine is
 /// materialised, and an information-dependent future stays `Stub` until the
 /// upstream result arrives.
+///
+/// # Why a revoked member's obligation is invalidated rather than re-materialised
+///
+/// I21.5: "Invalidated obligations are not deleted: they retain the invalidating
+/// cause, spent resources and any reusable artifacts, so that repeated planning
+/// cost becomes visible." Exactly one member class on this path is decidable now
+/// rather than pending, and leaving it pending is a real defect rather than a
+/// conservative default.
+///
+/// [`coverage_account`] opens the denominator over the manifest's source,
+/// evidence and artifact handles and does not apply the manifest's revocation
+/// list, while [`AllowedReferenceManifest::allows`] documents that a handle the
+/// manifest admits *and* lists as stale or revoked is never admitted. Such a
+/// member therefore stays an open denominator member on every run, and the very
+/// same handle delivered as a candidate is refused outright by
+/// [`crate::source_admissibility::SourceAdmissibilityReason::ManifestEntryRevoked`].
+/// A fresh work obligation for it each run is the repeated planning cost I21.5
+/// names, and no admission of this manifest can ever satisfy it.
+///
+/// The obligation is therefore retained as `INVALIDATED` with that cause instead
+/// of staying `STUB`. The member is **not** removed from the denominator: the
+/// coverage receipt, the coverage research debt, the preserved explicit unknown
+/// and the preserved next probe all keep reading it as unresolved, so nothing
+/// here narrows a completeness or absence claim, and the obligation stays in
+/// [`TaskGraphCompilationInputs`] and in the next probe's obligation references so
+/// the spent planning stays visible.
+///
+/// `resources_spent` is `0` and `reusable_artifacts` is empty because the
+/// obligation is materialised and invalidated inside one record and was never
+/// dispatched; both are the honest values for this transition, not defaults
+/// standing in for a measurement. Nothing is asserted here that the observation
+/// does not carry: the trigger is the run-bound manifest's own revocation list,
+/// which this crate already reads on the candidate path.
+///
+/// MEASURED, and stated so no one reads more into this than it is: no admitted
+/// material that exists today carries a handle in both the admissible and the
+/// revoked list, so this branch is not exercised by any fixture on the
+/// `eliot-mod-research` path. It fires only for an admitted manifest the contract
+/// explicitly permits in exactly that state.
 fn open_obligations(
     observation: &InquiryObservation,
     profile: &InquiryProtocolProfile,
@@ -5218,7 +5257,7 @@ fn open_obligations(
 ) -> Result<Vec<InquiryObligation>, InquiryError> {
     let mut obligations = Vec::new();
     for member in account.open_members() {
-        obligations.push(InquiryObligation::new(InquiryObligationParams {
+        let mut obligation = InquiryObligation::new(InquiryObligationParams {
             obligation_id: format!("obl-{member}"),
             parent_question: observation.question.clone(),
             goal: format!("resolve admitted reference {member} inside the frozen scope"),
@@ -5233,7 +5272,25 @@ fn open_obligations(
             stop_condition: StopRuleKind::BudgetOrDeadlineExhausted.wire_name(),
             status: InquiryObligationStatus::Stub,
             profile,
-        })?);
+        })?;
+        if observation
+            .reference_manifest
+            .stale_or_revoked_handles
+            .iter()
+            .any(|revoked| revoked == &member)
+        {
+            obligation.invalidate(
+                &format!(
+                    "the run-bound manifest lists reference {member} as stale or revoked, so no \
+                     admission of this manifest can resolve it; the member is retained as an open \
+                     denominator member and this obligation is retained as INVALIDATED with the \
+                     cause instead of being re-materialised as pending work on every run"
+                ),
+                0,
+                Vec::new(),
+            )?;
+        }
+        obligations.push(obligation);
     }
     Ok(obligations)
 }
