@@ -25,6 +25,7 @@
 use std::sync::{Arc, Mutex};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_contracts::RequestId;
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_native_worker_core::{
     CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
@@ -1011,7 +1012,7 @@ impl<T: KernelReplayTransport> DurableReplayPort for KernelReplayPort<T> {
     fn lookup_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         require_bound_stream(&self.claim, &self.stream_id(), stream_id)?;
@@ -1026,7 +1027,7 @@ impl<T: KernelReplayTransport> DurableReplayPort for KernelReplayPort<T> {
     fn begin_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         require_bound_stream(&self.claim, &self.stream_id(), stream_id)?;
@@ -1439,7 +1440,7 @@ impl DurableCheckpointPort for KernelCheckpointPort {
         request: &DurableCheckpointRequest,
     ) -> Result<CheckpointProviderOutcome, ProviderFailure> {
         let now = unix_ms().map_err(provider_error)?;
-        let checkpoint_id = NativeCheckpointId::new(request.request_id().to_owned())
+        let checkpoint_id = NativeCheckpointId::new(request.request_id().as_str().to_owned())
             .or_else(|_| {
                 NativeCheckpointId::new(format!(
                     "native-worker-checkpoint-{}",
@@ -1475,7 +1476,7 @@ impl DurableCheckpointPort for KernelCheckpointPort {
             CheckpointReceiptFacts::new(
                 receipt_id,
                 request.checkpoint_ref(),
-                request.request_id(),
+                request.request_id().clone(),
                 request.stream_id(),
                 request.producer_generation(),
                 request.authority_epoch().clone(),

@@ -28,8 +28,8 @@ use eliot_agent_claude::{
     ClaudePermissionMode, ClaudeRequestKind, ClaudeSidecarLaunchPlan, ClaudeSidecarRequest,
 };
 use eliot_contracts::{
-    DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence, TaskId,
-    sha256_hex,
+    DecisionId, EpochId, EpochLineageId, RequestId, ResourceGeneration, SessionId, StateFence,
+    TaskId, sha256_hex,
 };
 use eliot_native_worker::adapter_registry::{
     ACP_FACTORY_ID, AdapterIdentity, AdapterRegistry, CLAUDE_FACTORY_ID, CODEX_FACTORY_ID,
@@ -210,7 +210,7 @@ fn hello() -> WorkerHello {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-claim-1".to_owned(),
-        request_id: "start-claim-1".to_owned(),
+        request_id: load(RequestId::new("start-claim-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
         artifact_manifest_digest: "manifest-digest-1".to_owned(),

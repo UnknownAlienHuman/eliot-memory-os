@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, AuthorizedEffect, BudgetEnvelope, ProposedEffect, WorkLeaseId};
 use eliot_contracts::{
-    CapabilityCellId, DecisionId, EpochId, ResourceGeneration, SessionId, StateFence, TaskId,
-    canonical_json_bytes, sha256_hex,
+    CapabilityCellId, DecisionId, EpochId, RequestId, ResourceGeneration, SessionId, StateFence,
+    TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
     SecretRef,
 };
+use eliot_protocol::AckPhase;
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
 use schemars::JsonSchema;
@@ -81,13 +82,20 @@ impl WorkerLifecycle {
 }
 
 /// Client half of the native-worker handshake.
+///
+/// Request correlation uses the shared ELIOT-owned [`RequestId`] contract
+/// (the same identity type carried by EBP `Frame.request_id` in
+/// `eliot-protocol`, I7.2), never a worker-local string: the wire form is the
+/// identical transparent string, but validation and lineage come from the
+/// owner. `connection_id` stays the transport-owner opaque string, matching
+/// EBP `Frame.connection_id`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerHello {
     pub protocol_version: String,
     pub encoding_profile: String,
     pub connection_id: String,
-    pub request_id: String,
+    pub request_id: RequestId,
     pub trace_context: BTreeMap<String, String>,
     pub deadline_unix_ms: u64,
     pub artifact_manifest_digest: String,
@@ -109,7 +117,6 @@ impl WorkerHello {
         }
         for (field, value) in [
             ("connection_id", &self.connection_id),
-            ("request_id", &self.request_id),
             ("artifact_manifest_digest", &self.artifact_manifest_digest),
             ("launch_nonce", &self.launch_nonce),
             ("route_ref", &self.route_ref),
@@ -118,6 +125,9 @@ impl WorkerHello {
                 return Err(WorkerError::InvalidHandshake(field));
             }
         }
+        // request_id carries the shared RequestId contract: blank and
+        // control-bearing values are rejected at the Deserialize boundary by
+        // RequestId::new, so no worker-local shape check remains here.
         if self.worker_generation == 0
             || self.deadline_unix_ms == 0
             || self.requested_capabilities.is_empty()
@@ -146,13 +156,16 @@ impl WorkerHello {
 }
 
 /// Server half returned only after admission and the P-03 start receipt agree.
+///
+/// `request_id` echoes the shared [`RequestId`] presented by the client
+/// hello; `connection_id` echoes the transport-owner opaque string.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerReady {
     pub protocol_version: String,
     pub encoding_profile: String,
     pub connection_id: String,
-    pub request_id: String,
+    pub request_id: RequestId,
     pub admission_revision: String,
     pub stream_id: String,
     pub process_start_receipt: ProcessStartReceipt,
@@ -207,20 +220,12 @@ pub struct ReconnectRequest {
     pub replay_after_sequence: u64,
 }
 
-/// Explicit cursor phases; transport receipt cannot impersonate application.
-#[derive(
-    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AckPhase {
-    Received,
-    Durable,
-    Normalized,
-    Applied,
-    Rejected,
-    Unknown,
-}
-
+/// Native-worker acknowledgement receipt: explicit cursor phases, so a
+/// transport receipt cannot impersonate application.
+///
+/// `phase` is the shared EBP acknowledgement phase owned by
+/// `eliot-protocol` (I7.2 `EventAckReceipt` phases), not a worker-local
+/// duplicate, so every contour advances cursors through one contract.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventAckReceipt {
@@ -235,13 +240,17 @@ pub struct EventAckReceipt {
 }
 
 /// Native worker frame. Every request carries the complete EBP correlation/fence context.
+///
+/// `request_id` is the shared ELIOT-owned [`RequestId`] (same identity type
+/// as EBP `Frame.request_id`, I7.2); `connection_id` is the transport-owner
+/// opaque string, matching EBP `Frame.connection_id`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerFrame {
     pub protocol_version: String,
     pub encoding_profile: String,
     pub connection_id: String,
-    pub request_id: String,
+    pub request_id: RequestId,
     pub trace_context: BTreeMap<String, String>,
     pub deadline_unix_ms: u64,
     pub authority_epoch: EpochId,
@@ -262,7 +271,6 @@ impl WorkerFrame {
         }
         for (field, value) in [
             ("connection_id", &self.connection_id),
-            ("request_id", &self.request_id),
             ("admission_revision", &self.admission_revision),
         ] {
             if value.trim().is_empty() {
@@ -363,6 +371,9 @@ pub enum WorkerEventPayload {
 }
 
 /// Exact event content handed to the durable replay owner.
+///
+/// `request_id` is the shared ELIOT-owned [`RequestId`], binding the event
+/// to the exact EBP request correlation identity (I7.2).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerEventDraft {
@@ -370,7 +381,7 @@ pub struct WorkerEventDraft {
     producer_id: String,
     producer_generation: u64,
     authority_epoch: EpochId,
-    request_id: String,
+    request_id: RequestId,
     causal_predecessor_refs: Vec<String>,
     delivery_class: DeliveryClass,
     ack_required: bool,
@@ -388,7 +399,7 @@ impl WorkerEventDraft {
         producer_id: String,
         producer_generation: u64,
         authority_epoch: EpochId,
-        request_id: String,
+        request_id: RequestId,
         causal_predecessor_refs: Vec<String>,
         delivery_class: DeliveryClass,
         ack_required: bool,
@@ -421,7 +432,7 @@ impl WorkerEventDraft {
     }
 
     #[must_use]
-    pub fn request_id(&self) -> &str {
+    pub fn request_id(&self) -> &RequestId {
         &self.request_id
     }
 
@@ -456,6 +467,10 @@ impl WorkerEventDraft {
 }
 
 /// Durable/control event envelope returned by the injected replay owner.
+///
+/// `request_id` is the shared ELIOT-owned [`RequestId`]: replay binding is
+/// proved against the exact EBP request correlation identity, never a
+/// worker-local string.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerEventEnvelope {
@@ -465,7 +480,7 @@ pub struct WorkerEventEnvelope {
     pub authority_epoch: EpochId,
     pub event_id: String,
     pub sequence: u64,
-    pub request_id: String,
+    pub request_id: RequestId,
     pub causal_predecessor_refs: Vec<String>,
     pub delivery_class: DeliveryClass,
     pub ack_required: bool,

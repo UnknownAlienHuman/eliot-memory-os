@@ -16,7 +16,7 @@ use eliot_agent_api::{
 };
 use eliot_contracts::{
     ClockReading, DecisionId, EpochId, EpochLineageId, IntegrationRevision, LowercaseSha256,
-    PolicyRevision, TaskId, TaskRevision, sha256_hex,
+    PolicyRevision, RequestId, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
@@ -402,7 +402,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 struct ReplayState {
     next_sequence: u64,
-    requests: BTreeMap<(String, String), String>,
+    requests: BTreeMap<(String, RequestId), String>,
     events: Vec<WorkerEventEnvelope>,
     acknowledgements: Vec<EventAckReceipt>,
     checkpoints: usize,
@@ -422,14 +422,14 @@ impl DurableReplayPort for FakeReplay {
     fn lookup_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         let state = self
             .state
             .lock()
             .map_err(|_| ProviderFailure::new("replay", "lock"))?;
-        let key = (stream_id.to_owned(), request_id.to_owned());
+        let key = (stream_id.to_owned(), request_id.clone());
         let Some(recorded) = state.requests.get(&key) else {
             return Ok(DurableRequestDecision::New);
         };
@@ -440,7 +440,7 @@ impl DurableReplayPort for FakeReplay {
             state
                 .events
                 .iter()
-                .filter(|event| event.stream_id == stream_id && event.request_id == request_id)
+                .filter(|event| event.stream_id == stream_id && event.request_id == *request_id)
                 .cloned()
                 .collect(),
         ))
@@ -449,14 +449,14 @@ impl DurableReplayPort for FakeReplay {
     fn begin_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| ProviderFailure::new("replay", "lock"))?;
-        let key = (stream_id.to_owned(), request_id.to_owned());
+        let key = (stream_id.to_owned(), request_id.clone());
         if let Some(recorded) = state.requests.get(&key) {
             if recorded != fingerprint {
                 return Ok(DurableRequestDecision::Conflict);
@@ -465,7 +465,7 @@ impl DurableReplayPort for FakeReplay {
                 state
                     .events
                     .iter()
-                    .filter(|event| event.stream_id == stream_id && event.request_id == request_id)
+                    .filter(|event| event.stream_id == stream_id && event.request_id == *request_id)
                     .cloned()
                     .collect(),
             ));
@@ -547,7 +547,7 @@ impl DurableCheckpointPort for FakeReplay {
             CheckpointReceiptFacts::new(
                 format!("checkpoint-receipt-{}", state.checkpoints),
                 checkpoint_ref,
-                request.request_id(),
+                request.request_id().clone(),
                 request.stream_id(),
                 request.producer_generation(),
                 request.authority_epoch().clone(),
@@ -731,7 +731,7 @@ fn hello(connection: &str, request: &str) -> WorkerHello {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: connection.to_owned(),
-        request_id: request.to_owned(),
+        request_id: RequestId::new(request).expect("fixture request id"),
         trace_context: [("trace_id".to_owned(), "trace-1".to_owned())]
             .into_iter()
             .collect(),
@@ -754,7 +754,7 @@ fn frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-1".to_owned(),
-        request_id: request_id.to_owned(),
+        request_id: RequestId::new(request_id).expect("fixture request id"),
         trace_context: [("trace_id".to_owned(), format!("trace-{request_id}"))]
             .into_iter()
             .collect(),

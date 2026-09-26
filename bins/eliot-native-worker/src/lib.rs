@@ -1348,6 +1348,7 @@ pub mod admitted_material {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use eliot_contracts::RequestId;
     use eliot_native_worker_core::{
         ActionEnvelopeCarrier, ClaimAdmissionRequest, NativeWorkerClaim, ReadinessSubmission,
         WorkerHello,
@@ -2112,7 +2113,9 @@ pub mod admitted_material {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
             connection_id: format!("native-worker-conn-{binding_digest}"),
-            request_id: format!("native-worker-start-{binding_digest}"),
+            request_id: RequestId::new(format!("native-worker-start-{binding_digest}")).map_err(
+                |error| AdmittedMaterialError::Contract(truncate_detail(&error.to_string())),
+            )?,
             trace_context: std::collections::BTreeMap::from([(
                 "eliot.dispatch_nonce".to_owned(),
                 file.nonce.clone(),
@@ -2339,7 +2342,7 @@ mod tests {
 
     use eliot_cli::kernel_client::KernelClientError;
     use eliot_contracts::{
-        DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+        DecisionId, EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence, TaskId,
     };
     use eliot_native_worker_core::{
         AttemptId, BudgetEnvelope, JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -2441,7 +2444,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
             connection_id: "connection-1".to_owned(),
-            request_id: "request-1".to_owned(),
+            request_id: load(RequestId::new("request-1")),
             trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-1".to_owned())]),
             deadline_unix_ms: 5_000,
             artifact_manifest_digest: "manifest-digest-1".to_owned(),

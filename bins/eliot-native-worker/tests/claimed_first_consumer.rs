@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use eliot_contracts::{
-    ClockReading, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence,
-    TaskId, WorkLeaseId, sha256_hex,
+    ClockReading, DecisionId, EpochId, EpochLineageId, RequestId, ResourceGeneration, SessionId,
+    StateFence, TaskId, WorkLeaseId, sha256_hex,
 };
 use eliot_native_worker::{NativeWorker, NativeWorkerError};
 use eliot_native_worker_core::{
@@ -169,7 +169,7 @@ impl CapabilityAdmissionPort for TestAdmission {
 #[derive(Clone)]
 struct TestReplay {
     next_sequence: Arc<Mutex<u64>>,
-    requests: Arc<Mutex<BTreeMap<(String, String), String>>>,
+    requests: Arc<Mutex<BTreeMap<(String, RequestId), String>>>,
     events: Arc<Mutex<Vec<WorkerEventEnvelope>>>,
     acknowledgements: Arc<Mutex<Vec<EventAckReceipt>>>,
 }
@@ -189,11 +189,11 @@ impl DurableReplayPort for TestReplay {
     fn lookup_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         let state = lock(&self.requests);
-        let key = (stream_id.to_owned(), request_id.to_owned());
+        let key = (stream_id.to_owned(), request_id.clone());
         let Some(recorded) = state.get(&key) else {
             return Ok(DurableRequestDecision::New);
         };
@@ -203,7 +203,7 @@ impl DurableReplayPort for TestReplay {
         Ok(DurableRequestDecision::Replay(
             lock(&self.events)
                 .iter()
-                .filter(|event| event.stream_id == stream_id && event.request_id == request_id)
+                .filter(|event| event.stream_id == stream_id && event.request_id == *request_id)
                 .cloned()
                 .collect(),
         ))
@@ -212,11 +212,11 @@ impl DurableReplayPort for TestReplay {
     fn begin_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         let mut state = lock(&self.requests);
-        let key = (stream_id.to_owned(), request_id.to_owned());
+        let key = (stream_id.to_owned(), request_id.clone());
         if let Some(recorded) = state.get(&key) {
             if recorded != fingerprint {
                 return Ok(DurableRequestDecision::Conflict);
@@ -224,7 +224,7 @@ impl DurableReplayPort for TestReplay {
             return Ok(DurableRequestDecision::Replay(
                 lock(&self.events)
                     .iter()
-                    .filter(|event| event.stream_id == stream_id && event.request_id == request_id)
+                    .filter(|event| event.stream_id == stream_id && event.request_id == *request_id)
                     .cloned()
                     .collect(),
             ));
@@ -270,7 +270,7 @@ impl DurableCheckpointPort for TestReplay {
             CheckpointReceiptFacts::new(
                 "checkpoint-receipt-1",
                 request.checkpoint_ref(),
-                request.request_id(),
+                request.request_id().clone(),
                 request.stream_id(),
                 request.producer_generation(),
                 request.authority_epoch().clone(),
@@ -583,7 +583,7 @@ fn hello() -> WorkerHello {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-claim-1".to_owned(),
-        request_id: "start-claim-1".to_owned(),
+        request_id: load(RequestId::new("start-claim-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
         artifact_manifest_digest: "manifest-digest-1".to_owned(),
