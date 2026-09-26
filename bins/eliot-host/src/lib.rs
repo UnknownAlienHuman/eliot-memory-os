@@ -673,7 +673,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::resume_pending_activation_after_phase_b",
         owner_state: "pending activation",
         event: "host.resume-pending requested",
-        caller: "HostComposition::open",
+        caller: "HostComposition::open; HostComposition::finalize_phase_b_request",
         test: "891/case-7",
     },
     HostLifecycleBoundary {
@@ -681,7 +681,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::resume_pending_activation_after_phase_b",
         owner_state: "pending activation",
         event: "host-resume-pending-failed",
-        caller: "HostComposition::open",
+        caller: "HostComposition::open; HostComposition::finalize_phase_b_request",
         test: "891/case-14",
     },
     HostLifecycleBoundary {
@@ -689,7 +689,7 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
         source_item: "HostComposition::resume_pending_activation_after_phase_b",
         owner_state: "resumed activation",
         event: "host.resume-pending admitted",
-        caller: "HostComposition::open",
+        caller: "HostComposition::open; HostComposition::finalize_phase_b_request",
         test: "891/case-7",
     },
     HostLifecycleBoundary {
@@ -6258,7 +6258,11 @@ impl HostComposition {
                         "Agent Bridge client declaration",
                     )?;
                 }
-                composition.resume_pending_activation_after_phase_b()?;
+                if let Err(error) = composition.resume_pending_activation_after_phase_b() {
+                    // The resume boundary already emitted this terminal failure.
+                    host_terminal.disarm();
+                    return Err(error);
+                }
             }
             // Phase A deliberately has no authority descriptor. Keep this
             // Host owner alive in a fenced, non-admissible state until the
@@ -6515,6 +6519,7 @@ impl HostComposition {
         // F-LOG-HOST-1: prepared receipt vs ready completion; Unknown never
         // false-success. Single terminal for the Unknown outcome.
         host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_REQUESTED);
+        let mut resume_terminal_emitted = false;
         let result = (|| {
             intent
                 .validate()
@@ -6594,7 +6599,8 @@ impl HostComposition {
                     .agent_bridge_final
                     .clone_from(&final_receipt.agent_bridge);
             }
-            self.resume_pending_activation_after_phase_b()?;
+            self.resume_pending_activation_after_phase_b()
+                .inspect_err(|_| resume_terminal_emitted = true)?;
             Ok(final_receipt.clone())
         })();
         if let Ok(receipt) = result {
@@ -6605,7 +6611,9 @@ impl HostComposition {
             }
         } else {
             host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_UNKNOWN);
-            host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_FINALIZE_TERMINAL);
+            if !resume_terminal_emitted {
+                host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_FINALIZE_TERMINAL);
+            }
             HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("phase-b-finalize", "FinalizePhaseB", intent),
             }
@@ -8746,14 +8754,16 @@ impl HostComposition {
         )?;
         let disposition = match route {
             ScmStoreRecoveryRoute::Recovered => {
-                return Ok(self.reconcile_branch_readiness_at(
+                let disposition = self.reconcile_branch_readiness_at(
                     &active.manifest.generation,
                     kernel_artifact,
                     store_artifact,
                     &materialized_config_digest,
                     HostBranchDisposition::LiveAwaitingReadiness,
                     std::time::Instant::now(),
-                ));
+                );
+                host_terminal.disarm();
+                return Ok(disposition);
             }
             ScmStoreRecoveryRoute::Fenced(disposition) => {
                 if let Err(error) = self.persist_degraded_process_observation(
@@ -8767,6 +8777,7 @@ impl HostComposition {
                         readiness_failure_kind(&error),
                         std::time::Instant::now(),
                     );
+                    host_terminal.disarm();
                     return Ok(HostBranchDisposition::ReadinessDegraded);
                 }
                 if active.manifest.runtime_launch.profile == InstallationProfile::SystemService {
@@ -8786,6 +8797,7 @@ impl HostComposition {
                         }
                         HostBranchDisposition::LiveAwaitingReadiness
                         | HostBranchDisposition::Healthy => {
+                            host_terminal.disarm();
                             return Ok(HostBranchDisposition::ReadinessDegraded);
                         }
                     };
@@ -8801,6 +8813,7 @@ impl HostComposition {
                         directive,
                     )?;
                 }
+                host_terminal.disarm();
                 return Ok(disposition);
             }
             ScmStoreRecoveryRoute::Continue(disposition) => disposition,
