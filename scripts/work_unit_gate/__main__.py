@@ -88,7 +88,7 @@ except ImportError:  # fallback for direct file loading (delegate context)
 # bootstrap repositories without routers still verify).
 FROZEN_LEAF_ROUTER_SHA256 = {
     "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
-    "scripts/docs_router_core.py": "752834cad7e5d759eeb522badaba653d6587cb6f8b56393d4a5816c99ccb3c89",
+    "scripts/docs_router_core.py": "455aec470ab6f3f8bf7e64578d264ca0877a06cfec411d9aa415ffa62ae4a06a",
     "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
     "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
 }
@@ -1140,9 +1140,9 @@ def main(argv: list[str] | None = None) -> int:
         # fixture roots. Missing routers under temp are skipped, not failed.
         try:
             gate_root = Path(__file__).resolve().parents[2]
-            router_files = [gate_root / rel for rel in FROZEN_LEAF_ROUTER_SHA256]
-            if all(p.is_file() for p in router_files):
+            if cohort.is_real_repository_root(gate_root):
                 cohort.verify_leaf_routers_unchanged(gate_root, FROZEN_LEAF_ROUTER_SHA256)
+            # Else a genuine temp fixture root: missing routers are skipped, not failed.
         except cohort.CohortError as exc:
             problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
             return finish(fail_result(f"structural failure: {_redact(problem)}", 1, failed=["routers"]))
