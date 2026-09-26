@@ -447,7 +447,9 @@ fn daemon_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownOutcome => "daemon_unknown_outcome",
         TransportError::IdentityConflict => "daemon_identity_conflict",
         TransportError::Cancelled => "daemon_cancelled",
-        TransportError::Backpressure => "daemon_backpressure",
+        TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
+            "daemon_backpressure"
+        }
         TransportError::InvalidLimits => "daemon_invalid_limits",
         TransportError::UnauthenticatedPeer => "daemon_unauthenticated_peer",
         TransportError::InvalidPipeName => "daemon_invalid_pipe",
