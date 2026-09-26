@@ -151,12 +151,29 @@ pub fn check_at_trigger(
 }
 
 impl TriggerReport {
+    /// Returns true only when this report carries an identity-clear
+    /// `Allow` verdict and a `MATCHED` receipt. The caller verifies freshness
+    /// against the current owner snapshot and fence.
+    #[must_use]
+    pub fn is_matched(&self) -> bool {
+        self.identity == IdentityLegOutcome::IdentityClear
+            && self.verdict == GuardVerdict::Allow
+            && self
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.disposition == ScopeBindingDisposition::Matched)
+    }
+
     /// Validates a trigger report without re-running the guard.
     ///
     /// # Errors
     ///
-    /// Returns an error when a present receipt is malformed.
+    /// Returns an error when the report claims `Allow` without an
+    /// identity-clear `MATCHED` receipt or when a present receipt is malformed.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
+        if self.verdict == GuardVerdict::Allow && !self.is_matched() {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
         if let Some(receipt) = &self.receipt {
             text(&receipt.expected_scope_ref, "report.expected_scope_ref")?;
             text(&receipt.observed_scope_ref, "report.observed_scope_ref")?;
@@ -174,26 +191,28 @@ impl TriggerReport {
     }
 }
 
-/// Durable record of one withheld or quarantined scope-identity observation
-/// (issue #1787, quarantine persistence).
+/// In-process record of one withheld or quarantined scope-identity observation
+/// (issue #1787, W6 partial projection; this type is not durable by itself).
 ///
-/// When a trigger evaluation withholds or quarantines, the conflicting
-/// evidence is preserved here instead of living only in a transient error
-/// string: the expected (retained) and observed scope, instance, root, and
-/// generation references, the trigger, the identity-leg outcome, and the
-/// verdict, bound to the fence generation the evaluation ran under. The
-/// retained binding, task state, and project memory are untouched; only this
-/// record is retained, so a later authorized rebind/relocation reconciles
-/// against the exact conflicting evidence. The record proves a mismatch; it
+/// When a trigger evaluation detects an identity mismatch, this record holds
+/// the expected and observed scope, lineage, instance, root, and generation
+/// references, the trigger, identity-leg outcome, and verdict. The retained
+/// binding, task state, and project memory remain untouched. The type carries
+/// no persistence or restart-recovery guarantee; a caller may keep it only as
+/// an in-process diagnostic projection. The record proves a mismatch; it
 /// never admits the observed scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuarantinedScopeRecord {
     pub expected_scope_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_lineage_ref: Option<String>,
     pub expected_instance_ref: String,
     pub expected_root_identity: String,
     pub expected_generation: u64,
     pub observed_scope_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_lineage_ref: Option<String>,
     pub observed_instance_ref: String,
     pub observed_root_identity: String,
     pub observed_generation: u64,
@@ -236,12 +255,14 @@ impl QuarantinedScopeRecord {
             &observed.scope.root_identity,
             "quarantine.observed_root_identity",
         )?;
-        Ok(Self {
+        let record = Self {
             expected_scope_ref: expected.scope.scope_ref.clone(),
+            expected_lineage_ref: expected.scope.lineage_ref.clone(),
             expected_instance_ref: expected.scope.instance_ref.clone(),
             expected_root_identity: expected.scope.root_identity.clone(),
             expected_generation: expected.scope.generation,
             observed_scope_ref: observed.scope.scope_ref.clone(),
+            observed_lineage_ref: observed.scope.lineage_ref.clone(),
             observed_instance_ref: observed.scope.instance_ref.clone(),
             observed_root_identity: observed.scope.root_identity.clone(),
             observed_generation: observed.scope.generation,
@@ -249,7 +270,9 @@ impl QuarantinedScopeRecord {
             identity: report.identity,
             verdict: report.verdict,
             fence_generation,
-        })
+        };
+        record.validate()?;
+        Ok(record)
     }
 
     /// Validates the retained conflicting-evidence references.
@@ -259,6 +282,9 @@ impl QuarantinedScopeRecord {
     /// Returns an error when any carried reference is blank.
     pub fn validate(&self) -> Result<(), WorkScopeError> {
         text(&self.expected_scope_ref, "quarantine.expected_scope_ref")?;
+        if let Some(lineage) = &self.expected_lineage_ref {
+            text(lineage, "quarantine.expected_lineage_ref")?;
+        }
         text(
             &self.expected_instance_ref,
             "quarantine.expected_instance_ref",
@@ -268,6 +294,9 @@ impl QuarantinedScopeRecord {
             "quarantine.expected_root_identity",
         )?;
         text(&self.observed_scope_ref, "quarantine.observed_scope_ref")?;
+        if let Some(lineage) = &self.observed_lineage_ref {
+            text(lineage, "quarantine.observed_lineage_ref")?;
+        }
         text(
             &self.observed_instance_ref,
             "quarantine.observed_instance_ref",
