@@ -1790,10 +1790,11 @@ fn settle_health_heartbeat_completion(
 ) -> Result<(), String> {
     *flight = HealthHeartbeatFlight::Idle;
     *supervision_progress = completion.supervision_progress;
-    if apply_deferred_activity && completion.result.is_ok() {
-        if let Some(producer) = supervision_progress.as_mut() {
-            producer.note_deferred_activity(deferred_activity.claims, deferred_activity.applied);
-        }
+    if apply_deferred_activity
+        && completion.result.is_ok()
+        && let Some(producer) = supervision_progress.as_mut()
+    {
+        producer.note_deferred_activity(deferred_activity.claims, deferred_activity.applied);
     }
     deferred_activity.clear();
     completion.result
@@ -2124,7 +2125,8 @@ fn start_activation_dispatch(
 /// existing final shutdown, without leaking detached work.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the shutdown drain polls every flight's own borrowed state in one select; bundling them would hide which flight is outstanding"
+    clippy::too_many_lines,
+    reason = "the shutdown drain polls every flight's borrowed state in one select and retains its bounded deadline"
 )]
 async fn drain_flights_on_shutdown(
     kernel: &Arc<DaemonKernelClient>,
@@ -2237,16 +2239,11 @@ async fn drain_flights_on_shutdown(
                 settle_maintenance_completion(maintenance_flight);
             }
             heartbeat_completion = next_health_heartbeat_completion(health_heartbeat_flight) => {
-                // Shutdown was requested before entering the drain. An
-                // UnknownOutcome or shutdown error from the heartbeat is
-                // expected here; discard deferred observations because this
-                // process will not send a later supervision tick.
-                let _ = settle_health_heartbeat_completion(
+                discard_shutdown_heartbeat_completion(
                     heartbeat_completion,
                     health_heartbeat_flight,
                     supervision_progress,
                     deferred_activity,
-                    false,
                 );
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -2266,6 +2263,24 @@ async fn drain_flights_on_shutdown(
             }
         }
     }
+}
+
+/// Shutdown was requested before the drain. A heartbeat may return a Kernel
+/// shutdown error, so only its producer is recovered; deferred observations
+/// are discarded because this process will send no later supervision tick.
+fn discard_shutdown_heartbeat_completion(
+    completion: HealthHeartbeatCompletion,
+    flight: &mut HealthHeartbeatFlight,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    deferred_activity: &mut DeferredSupervisionActivity,
+) {
+    let _ = settle_health_heartbeat_completion(
+        completion,
+        flight,
+        supervision_progress,
+        deferred_activity,
+        false,
+    );
 }
 
 /// Resolves the activation disposition when the shared shutdown budget ends.
