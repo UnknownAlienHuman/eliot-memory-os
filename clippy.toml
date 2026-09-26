@@ -1,0 +1,36 @@
+# Root Clippy policy: sole-ProcessExecutor process-spawn boundary (issue #748).
+#
+# `disallowed-methods` entries ONLY. This file must stay 1:1 with
+# PROCESS_LINT_METHODS in scripts/audit-architecture-boundaries.py; the
+# boundary oracle cross-checks both directions (missing or unsupported
+# entries are `process_lint_policy_drift`). Raw Win32 launch APIs
+# (CreateProcess/ShellExecute) are NOT lintable by the pinned Clippy
+# (extern-block calls produce no diagnostic) and stay oracle-owned.
+#
+# Normative: docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md
+# (direct std::process::Command / tokio::process::Command launch forbidden
+# outside minimal bootstrap, the ProcessExecutor implementation, and
+# explicitly marked test-only fixtures). Canonical contract owner:
+# crates/kernel/eliot-process (ProcessExecutor trait, DispatchPermit);
+# mechanics owners: crates/instrument/eliot-process-executor and
+# crates/kernel/eliot-platform-windows (see process_owner records in
+# config/architecture-boundaries.toml).
+#
+# Activation: `disallowed_methods` fires at default lint levels (verified on
+# pinned clippy 0.1.97 with no [lints] overrides), so landing this file
+# starts warning on every unannotated direct spawn. Full `-D warnings`
+# clearance arrives with the controller-owned item-level annotations
+# (issue #748 annotation substep); this file carries no annotation itself.
+# Narrow escape hatch per item: #[allow(clippy::disallowed_methods)] with a
+# documented owner/operation/removal condition, removed with the launch.
+
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "std::process::Command::spawn", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "std::process::Command::output", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "std::process::Command::status", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "tokio::process::Command::new", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "tokio::process::Command::spawn", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "tokio::process::Command::output", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+  { path = "tokio::process::Command::status", reason = "direct process spawn outside the sole ProcessExecutor owner is forbidden (I10.8.2; contract crates/kernel/eliot-process; issue #748); allow narrowly per item with owner/operation/removal condition" },
+]
