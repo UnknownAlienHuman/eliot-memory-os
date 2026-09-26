@@ -246,12 +246,40 @@ impl GenerationRouter {
         Ok(())
     }
 
+    /// Authorizes one presented lineage-aware epoch against the active tuple.
+    ///
+    /// This is the router's single #59 exact-epoch-rejection guard, shared by
+    /// every admission entry point so the rule cannot be reimplemented per
+    /// caller. Only the exact active [`EpochId`] tuple is authority: a sequence
+    /// inside the router's own lineage that is not the active one stays a plain
+    /// [`KernelError::FenceMismatch`], so a lower fenced epoch and an
+    /// unactivated future epoch remain typed exactly as issue #59 fixed them. An
+    /// epoch from another lineage is unrelated rather than ordered, and reports
+    /// both complete tuples as [`KernelError::StaleEpochTuple`]. The presented
+    /// scalar sequence is never read, so no caller can coerce a lineaged epoch
+    /// back to a counter.
+    fn authorize_presented_epoch(&self, presented: &EpochId) -> Result<(), KernelError> {
+        if presented.is_same_authority(&self.epoch) {
+            return Ok(());
+        }
+        Err(if presented.lineage_id == self.epoch.lineage_id {
+            KernelError::FenceMismatch
+        } else {
+            KernelError::StaleEpochTuple {
+                observed: presented.clone(),
+                active: self.epoch.clone(),
+            }
+        })
+    }
+
     /// Resolves the active route for an exact, current fence.
     ///
     /// The presented epoch is the canonical [`EpochId`] tuple. Exact tuple
     /// equality is the only authorization rule: the fence's own scalar epoch
     /// is never read here, so a cross-lineage same-sequence fence cannot be
     /// admitted and no caller can coerce a lineaged epoch back to a counter.
+    /// The epoch decision is the router's one shared #59 exact-epoch guard,
+    /// which also decides [`Self::route_for_supervised_generation`].
     ///
     /// # Errors
     ///
@@ -268,27 +296,56 @@ impl GenerationRouter {
             .routes
             .get(fence.route_scope())
             .ok_or(KernelError::RouteMismatch)?;
-        // #59 regression guard: only the exact active tuple is authority. A
-        // sequence inside the router's own lineage that is not the active one
-        // stays a plain `FenceMismatch`, so a lower fenced epoch and an
-        // unactivated future epoch remain typed exactly as issue #59 fixed
-        // them. An epoch from another lineage is unrelated rather than
-        // ordered, and reports both complete tuples.
-        if !fence_epoch.is_same_authority(&self.epoch) {
-            return Err(if fence_epoch.lineage_id == self.epoch.lineage_id {
-                KernelError::FenceMismatch
-            } else {
-                KernelError::StaleEpochTuple {
-                    observed: fence_epoch.clone(),
-                    active: self.epoch.clone(),
-                }
-            });
-        }
+        self.authorize_presented_epoch(fence_epoch)?;
         if fence.route_scope() != route.route_scope() {
             return Err(KernelError::FenceMismatch);
         }
         if !route.authority_epoch().is_same_authority(fence_epoch)
             || route.active_generation() != fence.resource_generation()
+        {
+            return Err(KernelError::FenceMismatch);
+        }
+        Ok(route)
+    }
+
+    /// Resolves the active route for a presented supervised-generation tuple.
+    ///
+    /// This is a *sibling* of [`Self::route_for_fence`], not an overload of it.
+    /// A [`RouteFence`] additionally carries one physical process generation
+    /// ([`RouteFence::generation`]) and one correlation nonce
+    /// ([`RouteFence::nonce`]), and a supervised child launch descriptor holds
+    /// neither: it presents a route scope, a [`ResourceGeneration`], a
+    /// lineage-aware [`EpochId`], and a launch nonce that is a public argv
+    /// correlation value rather than a fence nonce. Reusing
+    /// [`Self::route_for_fence`] for such a caller would require inventing the
+    /// missing fence identity, and a fabricated fence is precisely the
+    /// authority expansion an exact fence must never grant.
+    ///
+    /// The rule is therefore shared, not reimplemented: the presented epoch is
+    /// decided by the router's one shared #59 exact-epoch guard that also
+    /// decides [`Self::route_for_fence`], and the presented generation is
+    /// compared for exact equality against the active route's generation
+    /// exactly as a fence's resource generation is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::RouteMismatch`] for an unknown route,
+    /// [`KernelError::StaleEpochTuple`] when the presented tuple is not the
+    /// router's active tuple, or [`KernelError::FenceMismatch`] when the
+    /// presented generation disagrees with the active route's generation.
+    pub fn route_for_supervised_generation(
+        &self,
+        route_scope: &RouteScope,
+        resource_generation: ResourceGeneration,
+        presented_epoch: &EpochId,
+    ) -> Result<&GenerationRoute, KernelError> {
+        let route = self
+            .routes
+            .get(route_scope)
+            .ok_or(KernelError::RouteMismatch)?;
+        self.authorize_presented_epoch(presented_epoch)?;
+        if !route.authority_epoch().is_same_authority(presented_epoch)
+            || route.active_generation() != resource_generation
         {
             return Err(KernelError::FenceMismatch);
         }
