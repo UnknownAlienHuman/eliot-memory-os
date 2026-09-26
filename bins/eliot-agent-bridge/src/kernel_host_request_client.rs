@@ -197,6 +197,7 @@ struct ParentLink {
     capability: String,
     payload_digest: String,
     request_base: String,
+    correlation_projection: Option<HostCorrelationProjection>,
 }
 
 impl ParentLink {
@@ -206,6 +207,7 @@ impl ParentLink {
             capability: envelope.identity.capability.clone(),
             payload_digest: envelope.identity.payload_sha256.clone(),
             request_base: envelope.identity.request_id.as_str().to_owned(),
+            correlation_projection: envelope.identity.correlation_projection.clone(),
         }
     }
 
@@ -222,6 +224,7 @@ impl ParentLink {
         capability: &str,
         payload_digest: &str,
         request_base: &str,
+        correlation_projection: HostCorrelationProjection,
     ) -> Result<Self, PortFailure> {
         if handle.is_empty()
             || capability.trim().is_empty()
@@ -238,11 +241,18 @@ impl ParentLink {
         {
             return Err(unknown_handle());
         }
+        if correlation_projection.domain() != HostCorrelationDomain::Request
+            || correlation_projection.validate().is_err()
+            || reject_kernel_operational_correlation(&correlation_projection).is_err()
+        {
+            return Err(unknown_handle());
+        }
         Ok(Self {
             handle: handle.to_owned(),
             capability: capability.to_owned(),
             payload_digest: payload_digest.to_owned(),
             request_base: request_base.to_owned(),
+            correlation_projection: Some(correlation_projection),
         })
     }
 }
@@ -254,14 +264,13 @@ impl ParentLink {
 /// admitted-unbound and a future task-bound caller resolves under a
 /// different key rather than silently adopting this one.
 fn logical_invocation_key(
-    request: &HostInvocationRequest,
+    projection: &HostCorrelationProjection,
     session: &str,
-    _payload_digest: &str,
 ) -> Result<String, PortFailure> {
-    let projection = request
-        .correlation_projection
-        .as_ref()
-        .ok_or_else(request_failure)?;
+    if projection.domain() != HostCorrelationDomain::Request {
+        return Err(request_failure());
+    }
+    reject_kernel_operational_correlation(projection)?;
     projection_key(LOGICAL_KIND_INVOCATION, session, projection)
 }
 
@@ -728,6 +737,7 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => *record,
             LogicalOwnerOutcome::Absent
             | LogicalOwnerOutcome::Conflict
+            | LogicalOwnerOutcome::LegacyUnresolved
             | LogicalOwnerOutcome::Unavailable => return Err(resource_source_refused()),
         };
         if record.operation_id != handle
@@ -792,7 +802,11 @@ impl KernelHostRequestClient {
             // durable record; never resubmit under a new identity here.
             return Err(PortFailure::IdempotencyConflict);
         }
-        let logical_key = logical_invocation_key(request, session_id, payload_digest)?;
+        let projection = request
+            .correlation_projection
+            .as_ref()
+            .ok_or_else(request_failure)?;
+        let logical_key = logical_invocation_key(projection, session_id)?;
         let resolve_label = resolve_request_label(correlation);
         let resolve_envelope = build_resolve_envelope(
             &resolve_label,
@@ -1016,20 +1030,33 @@ impl KernelHostRequestClient {
                 if record.correlation_projection.is_none() {
                     return Err(PortFailure::LegacyCorrelationUnresolved);
                 }
-                let (capability, payload_digest, request_base) = match (
+                let (capability, payload_digest, request_base, correlation_projection) = match (
                     &record.capability_ref,
                     &record.payload_digest,
                     &record.request_id,
+                    &record.correlation_projection,
                 ) {
-                    (Some(capability), Some(payload_digest), Some(request_base)) => (
+                    (
+                        Some(capability),
+                        Some(payload_digest),
+                        Some(request_base),
+                        Some(correlation_projection),
+                    ) => (
                         capability.clone(),
                         payload_digest.clone(),
                         request_base.clone(),
+                        correlation_projection.clone(),
                     ),
                     _ => return Err(unknown_cancel_outcome(&handle)),
                 };
-                ParentLink::from_owner_record(&handle, &capability, &payload_digest, &request_base)
-                    .map_err(|_| unknown_cancel_outcome(&handle))
+                ParentLink::from_owner_record(
+                    &handle,
+                    &capability,
+                    &payload_digest,
+                    &request_base,
+                    correlation_projection,
+                )
+                .map_err(|_| unknown_cancel_outcome(&handle))
             }
             LogicalOwnerOutcome::Absent | LogicalOwnerOutcome::Conflict => {
                 Err(plan_gap_unknown_handle())
@@ -1054,17 +1081,8 @@ impl KernelHostRequestClient {
             return Err(unknown());
         }
         let digest = parse_operation_handle(&parent.handle).map_err(|_| unknown())?;
-        let logical_key = logical_host_request_key(
-            LOGICAL_KIND_INVOCATION,
-            session_id,
-            parent.request_base.as_str(),
-            None,
-            None,
-            None,
-            parent.capability.as_str(),
-            parent.payload_digest.as_str(),
-        )
-        .map_err(|_| unknown())?;
+        let projection = parent.correlation_projection.as_ref().ok_or_else(unknown)?;
+        let logical_key = logical_invocation_key(projection, session_id).map_err(|_| unknown())?;
         let resolve_envelope = build_resolve_envelope(
             &resolve_request_label(&digest),
             Some(parent.handle.as_str()),
@@ -1105,7 +1123,21 @@ impl KernelHostRequestClient {
         {
             return Err(unknown());
         }
-        verify_resolved_key_commitment(&record, &logical_key).map_err(|_| unknown())?;
+        verify_resolved_key_commitment(
+            &record,
+            &ResolvedKeyCommitment {
+                key: &logical_key,
+                occurrence: parent.request_base.as_str(),
+                session: session_id,
+                task_ref: None,
+                scope_ref: None,
+                capability: parent.capability.as_str(),
+                payload_digest: parent.payload_digest.as_str(),
+                parent: None,
+                projection,
+            },
+        )
+        .map_err(|_| unknown())?;
         map_parent_cancellation_disposition(record.state, parent.handle.as_str())
     }
 
@@ -3477,6 +3509,7 @@ mod tests {
             request_digest: None,
             kind: None,
             request_id: None,
+            correlation_projection: None,
             parent_operation_id: None,
             session_ref: None,
             task_ref: None,
@@ -3536,6 +3569,7 @@ mod tests {
             request_digest: None,
             kind: None,
             request_id: None,
+            correlation_projection: None,
             parent_operation_id: None,
             session_ref: None,
             task_ref: None,
