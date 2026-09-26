@@ -1577,28 +1577,31 @@ pub enum StagedDeliveryState {
 /// Classifies staged material against served retention. Same identity — or
 /// the same grant digest under any differing generation/operation/digests —
 /// is a replay of spent one-shot authority, never a fresh execution. The
+/// served set carries every identity this drive served, so an older grant
+/// re-staged after a newer serve still replays instead of re-executing. The
 /// durable marker extends the same rule across restart: a staged set the
 /// marker names is terminal-unacknowledged (a crash between publish and
 /// reclaim), so it replays instead of re-executing.
 #[must_use]
 pub fn classify_staged_delivery(
     material: &ValidatedDispatchMaterial,
-    served: Option<&StagedDeliveryIdentity>,
+    served: &[StagedDeliveryIdentity],
     marker: Option<&ServedDeliveryMarker>,
 ) -> StagedDeliveryState {
     let identity = StagedDeliveryIdentity::from_material(material);
-    match served {
-        Some(prior) if prior == &identity => StagedDeliveryState::Replay { identity },
-        Some(prior) if prior.grant_digest == identity.grant_digest => {
+    if served.contains(&identity)
+        || served
+            .iter()
+            .any(|prior| prior.grant_digest == identity.grant_digest)
+    {
+        return StagedDeliveryState::Replay { identity };
+    }
+    match marker {
+        Some(mark) if mark.names(&identity) => StagedDeliveryState::Replay { identity },
+        Some(mark) if mark.grant_digest == identity.grant_digest => {
             StagedDeliveryState::Replay { identity }
         }
-        _ => match marker {
-            Some(mark) if mark.names(&identity) => StagedDeliveryState::Replay { identity },
-            Some(mark) if mark.grant_digest == identity.grant_digest => {
-                StagedDeliveryState::Replay { identity }
-            }
-            _ => StagedDeliveryState::LegacyV1FixedName { identity },
-        },
+        _ => StagedDeliveryState::LegacyV1FixedName { identity },
     }
 }
 

@@ -520,10 +520,11 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
 ///   observation, never as an ad hoc fallback object.
 ///
 /// Consumers must reject mixed versions, duplicate terminal events, sequence
-/// gaps, and contradictory identities. Absence stays absence per I5.16:
-/// `None` serializes absent, measured zero stays numeric zero, Booleans stay
-/// Booleans, and no formatting helper feeds stringified values back into
-/// this contract.
+/// gaps, and contradictory identities; `validate_result_stream` enforces
+/// exactly that where the loop consumes a retained sequence for replay
+/// republish. Absence stays absence per I5.16: `None` serializes absent,
+/// measured zero stays numeric zero, Booleans stay Booleans, and no
+/// formatting helper feeds stringified values back into this contract.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 // Four JSON Booleans are the versioned wire shape (#2787 step 4: Booleans
@@ -954,6 +955,57 @@ fn validate_lifecycle_vocabulary(frame: &WasmHostResultFrame) -> Result<(), Loop
         _ => return Err(invalid("disposition-vocabulary")),
     }
     Ok(())
+}
+
+/// Validates one consumed result-event sequence (#2787 step 7): every event
+/// proves itself through `validate_frame`, and the sequence proves its
+/// stream shape — one wire identity/version, gapless `sequence` values from
+/// 0, exactly one `terminal: true` event closing the stream, and one
+/// consistent parent identity across every event. Mixed versions, duplicate
+/// terminal events, sequence gaps, and contradictory identities fail closed
+/// here, before any event is acted on or republished.
+fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), LoopError> {
+    let Some(first) = events.first() else {
+        return Err(invalid("result-stream"));
+    };
+    for event in events {
+        validate_frame(event)?;
+    }
+    let mut terminal_seen = false;
+    for (index, event) in events.iter().enumerate() {
+        if event.wire_id != WASM_HOST_RESULT_WIRE_ID {
+            return Err(invalid("wire-id"));
+        }
+        if event.wire_version != WASM_HOST_RESULT_WIRE_VERSION {
+            return Err(invalid("wire-version"));
+        }
+        let expected = u64::try_from(index).map_err(|_| invalid("sequence-gap"))?;
+        if event.sequence != expected {
+            return Err(invalid("sequence-gap"));
+        }
+        if event.request_digest != first.request_digest
+            || event.operation_id != first.operation_id
+            || event.claim_id != first.claim_id
+            || event.invocation_id != first.invocation_id
+            || event.grant_digest != first.grant_digest
+            || event.component_id != first.component_id
+            || event.artifact_digest != first.artifact_digest
+            || event.input_digest != first.input_digest
+        {
+            return Err(invalid("result-identity"));
+        }
+        if event.terminal {
+            if terminal_seen || index + 1 != events.len() {
+                return Err(invalid("terminal"));
+            }
+            terminal_seen = true;
+        }
+    }
+    if terminal_seen {
+        Ok(())
+    } else {
+        Err(invalid("terminal"))
+    }
 }
 
 /// Terminal frame for a worker command the runtime refused, or for a
@@ -2902,7 +2954,10 @@ fn drive_loop(
             // Exact replay republishes the retained bounded sequence in
             // order — same events, same sequence numbers, same terminal —
             // without executing again. The terminal projection is the last
-            // retained event.
+            // retained event. The retained sequence is consumed here, so it
+            // proves its stream shape first: a corrupted retained sequence
+            // fails closed instead of republishing.
+            validate_result_stream(&replay)?;
             for event in &replay {
                 channel.publish(event)?;
             }
@@ -3162,6 +3217,14 @@ impl fmt::Display for OrdinaryDriveError {
 
 impl std::error::Error for OrdinaryDriveError {}
 
+/// Bound on distinct delivery identities one ordinary drive serves.
+///
+/// Each entry is one consumed generation this process executed to a
+/// published terminal; the classifier fences every entry's grant against
+/// re-staging, so the set never evicts — past the bound a fresh identity
+/// fails closed as in-progress with the staged set left for the owner.
+const MAX_SERVED_DELIVERIES_PER_DRIVE: usize = 8;
+
 /// Runs the ordinary governed path for this process: binds the owner
 /// delivery set, resolves the authenticated grant into a local admitted port
 /// set, and serves the bounded request loop to its correlated terminal
@@ -3183,14 +3246,14 @@ impl std::error::Error for OrdinaryDriveError {}
 /// binding, the one-shot permit, the admitted world, the request source,
 /// the result sink, or a request binding fails closed.
 pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError> {
-    let mut served: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
+    let mut served: Vec<crate::dispatch_material::StagedDeliveryIdentity> = Vec::new();
     let mut outcome: Option<OrdinaryOutcome> = None;
     let mut replayed: Option<crate::dispatch_material::StagedDeliveryIdentity> = None;
     // The staged path is the owner's only route into this process, and the
     // previous set was consumed, so any set observed here is either a
     // replacement generation or a same-grant re-stage. Nothing is carried
-    // across iterations except the served delivery identity below, so no
-    // accumulation is possible.
+    // across iterations except the bounded served delivery set below, so no
+    // unbounded accumulation is possible.
     while let Some((claim, material)) =
         read_admitted_material().map_err(OrdinaryDriveError::Drive)?
     {
@@ -3207,26 +3270,37 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             .and_then(|directory| crate::dispatch_material::read_served_marker(&directory));
         match crate::dispatch_material::classify_staged_delivery(
             &material,
-            served.as_ref(),
+            served.as_slice(),
             served_marker.as_ref(),
         ) {
             crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
                 // The classifier also treats a differing identity under the
                 // same spent grant as Replay. Preserve the staged identity;
                 // the final projection may reuse an outcome only when this
-                // identity exactly matches the one served in this process.
-                // A replay without a matching in-process outcome has no
-                // durable result or acknowledgement to authorize reclamation.
-                // Keep the claimed set and served marker as local identity
-                // evidence; the projection below reports DeliveryInProgress
-                // with this exact identity until an owner can reconcile it.
+                // identity exactly matches the latest one served in this
+                // process. A replay without a matching in-process outcome
+                // has no durable result or acknowledgement to authorize
+                // reclamation. Keep the claimed set and served marker as
+                // local identity evidence; the projection below reports
+                // DeliveryInProgress with this exact identity until an owner
+                // can reconcile it.
                 replayed = Some(identity);
                 break;
             }
             crate::dispatch_material::StagedDeliveryState::LegacyV1FixedName { identity } => {
                 // Explicit v1 compatibility: full admission under the staged
                 // identity verbatim, never reinterpreted as a fresh
-                // generation with new identity.
+                // generation with new identity. Bounded served retention:
+                // past the bound a fresh identity fails closed as
+                // in-progress — the staged set stays for the owner — rather
+                // than evicting a spent grant the classifier must remember.
+                if served.len() >= MAX_SERVED_DELIVERIES_PER_DRIVE {
+                    return Err(OrdinaryDriveError::DeliveryInProgress {
+                        operation_id: identity.operation_id,
+                        generation: identity.generation,
+                        claim_id: identity.claim_id,
+                    });
+                }
                 let _admitted_operation = identity.operation_id.len();
             }
         }
@@ -3276,7 +3350,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                         false
                     }
                 };
-                served = Some(claim.into_identity());
+                served.push(claim.into_identity());
                 outcome = Some(ok_frame);
             }
             Err(loop_error) => {
@@ -3284,14 +3358,18 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             }
         }
     }
-    // Only an exact in-process replay may return the retained terminal
-    // frame. A same-grant replay for another identity cannot borrow that
-    // result. Cross-restart terminal-unacknowledged state remains explicitly
-    // in-progress because its marker carries identity, not a result payload.
-    // Only a drive that observed nothing staged reports absence.
+    // Only an exact in-process replay of the latest served identity may
+    // return the retained terminal frame: the drive holds one terminal, so
+    // an older served identity re-staged after a newer serve reports
+    // in-progress with its exact identity instead of borrowing the newer
+    // result or re-executing under its spent grant. A same-grant replay for
+    // another identity cannot borrow that result. Cross-restart
+    // terminal-unacknowledged state remains explicitly in-progress because
+    // its marker carries identity, not a result payload. Only a drive that
+    // observed nothing staged reports absence.
     match (outcome, replayed) {
         (Some(frame), None) => Ok(frame),
-        (Some(frame), Some(identity)) if served.as_ref() == Some(&identity) => Ok(frame),
+        (Some(frame), Some(identity)) if served.last() == Some(&identity) => Ok(frame),
         (_, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
             operation_id: identity.operation_id,
             generation: identity.generation,
