@@ -1,0 +1,14 @@
+{
+  "schema": "eliot-governor-retirement-approval-trust-v1",
+  "release_policy": "UnknownAlienHuman/eliot-memory-os",
+  "release_product": "eliot",
+  "release_policy_revision": "1.0.0",
+  "closure_verifier": "Get-GovernorRetirementConsumerClosure",
+  "closure_rule_set": "tracked-legacy-reference-closure-v1",
+  "revocation_source": "root-owned release policy; an issuer is admitted here only after the owner records the exact issuer identity for the semantic retirement-approval role",
+  "admitted_issuers": [],
+  "issuer_state": "ISSUER_UNAVAILABLE",
+  "issuer_state_reason": "No production release-retirement approval issuer exists on current main. Issue #2968 authorizes the narrow issuer seam and this explicit fail-closed state; it does not authorize inventing a semantic retirement authority. Until the root owner admits exactly one issuer identity here, no detached Governor retirement approval can be actionable and every release of a candidate that still contains the legacy facade stays Retained.",
+  "authenticode_code_signing_policy": "Authenticode Code Signing signers are NOT admitted for the semantic retirement-approval role. The existing Authenticode/RFC3161 finalizer may reuse the existing certificate machinery only as a cryptographic primitive; Code Signing EKU alone never confers semantic retirement authority.",
+  "content_sha256": "cfaa62e97b7354523ad6a51597e55ae506e4bc12b9c7d2615fea0c3e21ddddf1"
+}

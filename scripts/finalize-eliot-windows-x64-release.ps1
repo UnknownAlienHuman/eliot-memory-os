@@ -15,7 +15,9 @@ param(
     [Alias('VerifyBundle')]
     [string]$FinalizerVerifyBundle,
     [Alias('PlanOnly')]
-    [switch]$FinalizerPlanOnly
+    [switch]$FinalizerPlanOnly,
+    [Alias('RetirementApproval')]
+    [string]$FinalizerGovernorRetirementApproval
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,9 +38,78 @@ if (-not (Get-Command Test-ReleaseBundle -CommandType Function -ErrorAction Sile
 
 function Invoke-ReleaseBundleInputVerification {
     param(
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$GovernorRetirementApproval = ''
     )
-    Test-ReleaseBundle $Path
+    Test-ReleaseBundle $Path $GovernorRetirementApproval
+}
+
+# Issue #2968: the Authenticode finalizer is NOT a retirement issuer. Signing
+# the remaining files of an already-selected artifact set can never authorize
+# why omitted artifacts were allowed to be absent. The approval identity is
+# re-resolved here, independently, through the same explicit input and the
+# same root-owned trust policy the builder used, and it is additionally
+# re-verified against the offline approval and trust material the retired
+# bundle carries beside the candidate (no network, no candidate-tree lookup,
+# no copied-body trust). A retired bundle whose approval does not re-verify
+# for the same exact candidate is refused before any signature is applied.
+function Assert-GovernorRetirementApprovalReadback(
+    [string]$Bundle,
+    [string]$SourceCommit,
+    [string]$GovernorRetirementApproval
+) {
+    $context = Resolve-GovernorApprovalContext $repo $SourceCommit $GovernorRetirementApproval
+    $release = Get-Content -LiteralPath (Join-Path $Bundle 'RELEASE.json') -Raw | ConvertFrom-Json
+    $carried = Resolve-GovernorApprovalReferenceOrNull $release
+    $disposition = [string](Read-ObjectProperty $release 'governor_disposition')
+    if (-not [bool]$context.supplied) {
+        if ($carried -or $disposition -clike 'retired*') {
+            throw 'the signed bundle claims a retired governor disposition but no detached owner approval R(C) was supplied to this finalizer; signing cannot manufacture the approval that authorized the omission'
+        }
+        return [pscustomobject]@{ retired = $false; approval_reference = $null; replay = $null }
+    }
+    if ($disposition -clike 'SIMULATED_NOT_ADMITTED*') {
+        throw 'the signed bundle carries a SIMULATED_NOT_ADMITTED governor disposition sketch; a simulation is never admitted into signed evidence'
+    }
+    if ($disposition -cnotlike 'retired*') {
+        throw "a detached retirement approval was supplied but RELEASE.json does not claim the retired governor disposition (changed decision under the same candidate conflicts): $disposition"
+    }
+    $binding = Resolve-GovernorRetirementApprovalBinding $repo $SourceCommit $context.approval_input.body $context.trust_policy $context.issuer
+    if ([string]$binding.kind -cne 'Retired') {
+        throw "the detached owner approval does not verify for candidate ${SourceCommit}: $([string]$binding.reason)"
+    }
+    $recomputed = New-GovernorRetirementApprovalReference $binding ([string]$context.approval_input.sha256) ([string]$context.trust_policy.sha256)
+    [void](Assert-GovernorApprovalReferenceShape $carried $SourceCommit)
+    [void](Assert-GovernorApprovalIdentityAgreement $recomputed $carried 'RELEASE.json')
+    # Step 10: offline re-verification. The retired bundle carries the
+    # immutable approval and the trust policy it was admitted under; the
+    # finalizer re-reads both through the release safe path/handle rules and
+    # re-derives the approval body from those exact bytes. Missing or stale
+    # trust material refuses retirement, and no network is required or used.
+    $bundleTrust = Resolve-GovernorRetirementBundleTrustMaterial `
+        $recomputed `
+        (Join-Path $Bundle $script:GovernorRetirementBundleApprovalFile) `
+        (Join-Path $Bundle $script:GovernorRetirementBundleTrustFile) `
+        'signed bundle retirement approval'
+    if ([string]$bundleTrust.trust_state -cne 'SUPPLIED') {
+        throw "the signed bundle cannot re-verify its detached retirement approval offline: $([string]$bundleTrust.reason)"
+    }
+    $offlineBinding = Resolve-GovernorRetirementApprovalBinding $repo $SourceCommit $bundleTrust.approval_body $context.trust_policy $context.issuer
+    if ([string]$offlineBinding.kind -cne 'Retired') {
+        throw "the approval carried by the signed bundle does not verify: $([string]$offlineBinding.reason)"
+    }
+    $offline = New-GovernorRetirementApprovalReference $offlineBinding ([string]$bundleTrust.approval_file_sha256) ([string]$bundleTrust.trust_file_sha256)
+    if ([string]$offline.content_sha256 -cne [string]$recomputed.content_sha256 -or
+        [string]$offline.candidate_tree -cne [string]$recomputed.candidate_tree -or
+        [string]$offline.closure_digest_sha256 -cne [string]$recomputed.closure_digest_sha256 -or
+        [string]$offline.issuer_evidence_sha256 -cne [string]$recomputed.issuer_evidence_sha256) {
+        throw 'the approval carried by the signed bundle does not re-derive the same approval identity as the re-resolved detached approval'
+    }
+    [pscustomobject]@{
+        retired = $true
+        approval_reference = $offline
+        replay = New-GovernorRetirementReplayRecord $offline $context.approval_input.body
+    }
 }
 
 Set-StrictMode -Version Latest
@@ -611,8 +682,11 @@ function Get-AuthenticodeRoleDefinitions {
     # + #1217 (provider/host-integration route) land.  This script never
     # deletes governor/Codex payload; it refuses to finalize a bundle that
     # contains unmanifested/unsigned executables.  A bundle whose RELEASE.json
-    # carries an owner-evidenced retired governor disposition (issue #2892:
-    # accepted #18 receipt verified by the Test-ReleaseBundle input readback)
+    # carries a retired governor disposition under a detached owner approval
+    # R(C) (issue #2968: verified independently by the
+    # Assert-GovernorRetirementApprovalReadback readback against the exact
+    # source commit, the pinned tree, the root-owned trust policy and the
+    # offline approval/trust material the bundle carries)
     # canonically omits the governor/Codex executables entirely; that absence
     # passes this denominator, while any stray governor/Codex executable
     # still fails closed here.
@@ -646,10 +720,11 @@ function Get-CodeBearingExecutableExtensions {
     # are NOT deleted here.  They fail closed in
     # Assert-CompleteCodeBearingDenominator as unmanifested/unsigned
     # executables until their owners land retirement or an explicit signed
-    # role.  Owner-proven retirement (issue #2892) is implemented in the
+    # role.  Owner-proven retirement (issue #2968) is implemented in the
     # builder: staged bundles carry the retired governor disposition only
-    # from an accepted #18 receipt that verifies for the exact source
-    # commit; source absence alone never retires.  Retired bundles
+    # from a detached owner approval R(C) that verifies for the exact source
+    # commit AND tree against the independently recomputed consumer closure
+    # and an owner-admitted issuer; source absence alone never retires.  Retired bundles
     # canonically omit the governor/Codex executables (absence passes;
     # stray presence still fails closed).
     # Full governor retire/re-home is BLOCKED-BY #18
@@ -1090,7 +1165,8 @@ function New-AuthenticodeSigningPlan(
     [string]$SignToolPath,
     [string]$CertificateStoreLocation,
     [string]$CertificateThumbprint,
-    [string]$TimestampUrl
+    [string]$TimestampUrl,
+    [string]$GovernorRetirementApproval
 ) {
     $source = Assert-ExistingBundleDirectory $UnsignedBundle 'UnsignedBundle'
     $destination = Assert-AbsentOutputBundle $SignedBundle 'SignedBundle'
@@ -1150,6 +1226,12 @@ function New-AuthenticodeSigningPlan(
     # plugin/governor executables, hidden PEs), and enforce
     # Author→Signer→Publisher evidence disjointness at plan time.
     [void](Assert-CompleteCodeBearingDenominator $source)
+    # Issue #2968: independently re-resolve and re-verify the detached owner
+    # approval R(C) against the exact source commit BEFORE any mutation. The
+    # Authenticode role set is chosen by what is present; this gate is what
+    # stops signing from retroactively approving an artifact set whose
+    # omissions were never authorized.
+    $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval
     [void](Assert-AuthorSignerPublisherDisjointness ([pscustomobject][ordered]@{
                 unsigned_bundle = $source
                 signed_bundle = $destination
@@ -1175,6 +1257,8 @@ function New-AuthenticodeSigningPlan(
         signer_eku = $script:AuthenticodeCodeSigningEku
         signing_scope = $script:AuthenticodeSigningScope
         roles = @($roles)
+        governor_retirement_approval = $governorApprovalReadback.approval_reference
+        governor_retirement_approval_replay = $governorApprovalReadback.replay
     }
 }
 
@@ -1184,7 +1268,8 @@ function New-AuthenticodeVerificationPlan(
     [string]$SignToolPath,
     [string]$CertificateStoreLocation,
     [string]$CertificateThumbprint,
-    [string]$TimestampUrl
+    [string]$TimestampUrl,
+    [string]$GovernorRetirementApproval
 ) {
     $source = Assert-ExistingBundleDirectory $UnsignedBundle 'UnsignedBundle'
     $destination = Assert-ExistingBundleDirectory $SignedBundle 'VerifyBundle'
@@ -1194,6 +1279,12 @@ function New-AuthenticodeVerificationPlan(
     $signTool = Assert-ExplicitAbsoluteFile $SignToolPath 'SignToolPath'
     if ($signTool.Name -ine 'signtool.exe') { throw 'SignToolPath must name exact signtool.exe' }
     $store = Assert-ExplicitCertificateStore $CertificateStoreLocation
+    # Issue #2968: the standalone signed-bundle readback re-resolves and
+    # re-verifies the SAME detached approval, so an external verifier never
+    # inherits the signing run's belief about which approval authorized the
+    # omitted artifact set.
+    $release = Get-Content -LiteralPath (Join-Path $source 'RELEASE.json') -Raw | ConvertFrom-Json
+    $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval
     [pscustomobject][ordered]@{
         unsigned_bundle = $source
         signed_bundle = $destination
@@ -1203,6 +1294,8 @@ function New-AuthenticodeVerificationPlan(
         certificate_store_name = $store.store
         certificate_thumbprint = Get-NormalizedThumbprint $CertificateThumbprint 'CertificateThumbprint'
         timestamp_url = Assert-ExplicitRfc3161TimestampUrl $TimestampUrl
+        governor_retirement_approval = $governorApprovalReadback.approval_reference
+        governor_retirement_approval_replay = $governorApprovalReadback.replay
     }
 }
 
@@ -2329,6 +2422,18 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
     # Preserve the exact staged generation_binding through signing so the
     # RELEASE/RUNTIME_ARTIFACTS repetition invoke byte-compares is retained.
     Set-ObjectProperty $release 'generation_binding' $stagedGenerationBinding
+    # Issue #2968: the signed finalization evidence carries the SAME approval
+    # identity that authorized the omitted artifact set, unchanged by signing.
+    # It is copied from the re-verified readback, never re-derived from a
+    # signature over the remaining files.
+    $governorApproval = Read-ObjectProperty $Plan 'governor_retirement_approval'
+    if ($governorApproval) {
+        [void](Assert-GovernorApprovalIdentityAgreement $governorApproval (Resolve-GovernorApprovalReferenceOrNull $release) 'RELEASE.json')
+        Set-ObjectProperty $release 'governor_approval' $governorApproval
+    }
+    elseif (Resolve-GovernorApprovalReferenceOrNull $release) {
+        throw 'the signing plan carries no verified retirement approval identity but RELEASE.json claims one'
+    }
     Set-JsonFile $releasePath $release
 
     $unsignedMarker = Join-Path $Bundle 'SIGNING_REQUIRED.txt'
@@ -2341,6 +2446,9 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
             version = [string]$release.version
             generation_binding = $stagedGenerationBinding
             signature_evidence = $signatureEvidence
+            governor_approval = $governorApproval
+            governor_retirement_approval_replay = (Read-ObjectProperty $Plan 'governor_retirement_approval_replay')
+            governor_retirement_proof_ceiling = if ($governorApproval) { [string]$script:GovernorRetirementProofCeiling } else { $null }
         })
 
     $hashes = Get-ReleaseFileInventory $Bundle -ExcludeChecksumManifest -ExcludePaths @($script:StagingOwnerMarker)
@@ -2353,6 +2461,7 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
             signature_policy = $script:AuthenticodeSigningPolicy
             signed_scope = $script:AuthenticodeSigningScope
             signature_evidence = $signatureEvidence
+            governor_approval = $governorApproval
             files = @($hashes)
         })
     return $signatureEvidence
@@ -2449,6 +2558,33 @@ function Test-FinalizedReleaseBundle(
     $checksumEvidence = $checksum.signature_evidence | ConvertTo-Json -Depth 12 -Compress
     if ($releaseEvidence -cne $runtimeEvidence -or $releaseEvidence -cne $checksumEvidence) {
         throw 'RELEASE.json, RUNTIME_ARTIFACTS.json, and SHA256SUMS.json do not share exact signature evidence'
+    }
+    # Issue #2968: the signed evidence must carry ONE identical approval
+    # identity across RELEASE.json, SHA256SUMS.json and SIGNING_VERIFIED.json,
+    # and that identity must be the one this finalizer re-verified against the
+    # explicit detached approval input before any signature was applied. A
+    # signed bundle that claims a retired disposition, or that carries an
+    # approval other than the verified one, is refused. Signing never changes
+    # the approval identity and never creates one.
+    $finalGovernorApproval = Resolve-GovernorApprovalReferenceOrNull $release
+    $expectedGovernorApproval = Read-ObjectProperty $ExpectedPlan 'governor_retirement_approval'
+    [void](Assert-GovernorApprovalIdentityAgreement $expectedGovernorApproval $finalGovernorApproval 'finalized RELEASE.json')
+    $verifiedApprovalProp = $verified.PSObject.Properties['governor_approval']
+    $verifiedApproval = if ($verifiedApprovalProp) { $verifiedApprovalProp.Value } else { $null }
+    [void](Assert-GovernorApprovalIdentityAgreement $expectedGovernorApproval $verifiedApproval 'SIGNING_VERIFIED.json')
+    $checksumApproval = Resolve-GovernorApprovalReferenceOrNull $checksum
+    [void](Assert-GovernorApprovalIdentityAgreement $expectedGovernorApproval $checksumApproval 'signed SHA256SUMS.json')
+    if ($finalGovernorApproval) {
+        # The offline approval and trust material must still be present and
+        # still hash to the digests the approval identity binds. A retired
+        # bundle that lost or mutated them can no longer be re-verified
+        # offline, so it is refused.
+        $finalApprovalBytes = Read-VerifiedResidentFile (Join-Path $resolved $script:GovernorRetirementBundleApprovalFile) 'signed bundle detached retirement approval'
+        $finalTrustBytes = Read-VerifiedResidentFile (Join-Path $resolved $script:GovernorRetirementBundleTrustFile) 'signed bundle retirement approval trust policy'
+        if ([string]$finalApprovalBytes.sha256 -cne [string](Read-ObjectProperty $finalGovernorApproval 'approval_file_sha256') -or
+            [string]$finalTrustBytes.sha256 -cne [string](Read-ObjectProperty $finalGovernorApproval 'trust_file_sha256')) {
+            throw 'the signed bundle detached retirement approval or its trust policy differs from the digest bound by the carried approval identity'
+        }
     }
     # Part B generation_binding contract (item 1228 of #1227): the finalized
     # bundle must repeat the exact staged block across RELEASE,
@@ -2656,7 +2792,7 @@ function Invoke-ReleaseBundleFinalization {
         # path substitution window before the complete source checkpoint.
         $sourcePin = New-NativeDirectoryPin $Plan.unsigned_bundle $false
         $parentPin = New-NativeDirectoryPin $parent $false $true
-        & $InputValidator $Plan.unsigned_bundle | Out-Null
+        & $InputValidator $Plan.unsigned_bundle $Plan.governor_retirement_approval | Out-Null
         $baseline = New-ReleaseFinalizationBaseline $Plan.unsigned_bundle
         Assert-NativeDirectoryPin $sourcePin 'unsigned source'
         Assert-NativeDirectoryPin $parentPin 'publication parent'
@@ -2688,7 +2824,7 @@ function Invoke-ReleaseBundleFinalization {
         # every path-based scanner and the complete unsigned bundle validator.
         Remove-OwnedStagingMarker $ownership
         Assert-NoReleaseSecrets $staging
-        & $InputValidator $staging | Out-Null
+        & $InputValidator $staging $Plan.governor_retirement_approval | Out-Null
         Assert-InventoryEqual @($baseline.files) @(Get-ReleaseFileInventory $staging) 'validated unsigned staging bundle'
         Assert-SourceBaselineReadback $baseline
 
@@ -2857,8 +2993,9 @@ if ($FinalizerVerifyBundle) {
     }
     $verificationPlan = New-AuthenticodeVerificationPlan `
         $FinalizerUnsignedBundle $FinalizerVerifyBundle $FinalizerSignToolPath `
-        $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl
-    Invoke-ReleaseBundleInputVerification $verificationPlan.unsigned_bundle | Out-Null
+        $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl `
+        $FinalizerGovernorRetirementApproval
+    Invoke-ReleaseBundleInputVerification $verificationPlan.unsigned_bundle $FinalizerGovernorRetirementApproval | Out-Null
     $verificationBaseline = New-ReleaseFinalizationBaseline $verificationPlan.unsigned_bundle
     $verificationCertificate = Resolve-CodeSigningCertificateIdentity $verificationPlan.certificate_store_location $verificationPlan.certificate_thumbprint
     Test-FinalizedReleaseBundle $FinalizerVerifyBundle $null $verificationBaseline $verificationPlan $verificationCertificate | ConvertTo-Json -Depth 12
@@ -2880,7 +3017,8 @@ foreach ($required in @{
 
 $plan = New-AuthenticodeSigningPlan `
     $FinalizerUnsignedBundle $FinalizerSignedBundle $FinalizerSignToolPath `
-    $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl
+    $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl `
+    $FinalizerGovernorRetirementApproval
 if ($FinalizerPlanOnly) {
     $plan | ConvertTo-Json -Depth 8
     exit 0
