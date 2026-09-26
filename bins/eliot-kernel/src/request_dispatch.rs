@@ -422,6 +422,112 @@ fn invalid_reply(command: &str, idempotency_key: &str, field: &str, reason: &str
     )
 }
 
+/// Wire status of an owner cancellation: the capture owner reported that it
+/// cancelled, and this route answers that as its own outcome state.
+///
+/// This is deliberately NOT the `invalid` status. A cancellation is not a
+/// malformed request field, and MAPPING it as one was wrong on the wire:
+/// `undecided_report_reply` named `backup.class` and `capture_error_reply`
+/// named `backup.verify` for the very same owner answer, so a cancellation was
+/// indistinguishable from a caller who typed a bad class token, and the owner's
+/// cleanup state was dropped on the floor in both cases. Issue #963 requires
+/// that "Cancellation retains owner cleanup state", so the cancellation gets a
+/// status of its own, which the operator surface decodes as
+/// `BACKUP_STATE_CANCELLED` (the constant lives in `eliot_cli::backup`; it is
+/// named here in plain text because this crate does not depend on that crate)
+/// rather than as a field-shape failure.
+///
+/// State the limit honestly, because it decides how much this constant is
+/// worth: NO production owner can currently EMIT a cancellation.
+/// `KernelBackupCapture::verify_only` returns only `CaptureState::Complete` or
+/// `CaptureState::Incomplete`, and `KernelCaptureError::Cancelled` and
+/// `KernelCaptureError::Unsupported` are constructed nowhere in the tree. So
+/// this is a correct and exhaustive mapping of the owner's PUBLISHED state
+/// vocabulary, not a demonstrated runtime event: no operator has yet seen a
+/// cancellation misreported, and this route does not pretend otherwise. What
+/// it removes is the wrong answer, so that the first owner able to cancel is
+/// answered as a cancellation with its cleanup state retained.
+const BACKUP_STATUS_CANCELLED: &str = "cancelled";
+
+/// Exact I7.20 reason code for a cancellation whose cleanup this owner never
+/// confirmed.
+///
+/// Taken from the ADDITIVE, already-documented reason-code registry in
+/// `docs/architecture/I07-20-agent-facing-error-contract.md` (route/integration
+/// group); this route invents no new reason code and never renames this one.
+/// `CANCELLATION_UNCONFIRMED` is the honest cause rather than
+/// `PROCESS_TREE_CLEANUP_FAILED` because no cleanup failure was observed: the
+/// owner reported a cancellation and supplied no cleanup evidence at all, so
+/// the correct claim is that cleanup is UNCONFIRMED, not that cleanup failed.
+/// An operator must therefore not treat the target as clean.
+const BACKUP_REASON_CANCELLATION_UNCONFIRMED: &str = "CANCELLATION_UNCONFIRMED";
+
+/// The owner cleanup state this route reports for a cancellation.
+///
+/// Both cancellation carriers are UNIT variants - `CaptureState::Cancelled`
+/// (`backup_capture.rs`) and `KernelCaptureError::Cancelled`
+/// (`backup_capture_ports.rs`) - so the owner supplies NO cleanup evidence:
+/// there is no residue report, no teardown receipt and no handle list to relay.
+/// The only value this route may state is that truth, and stating it as an
+/// explicit field is what keeps the owner cleanup state RETAINED instead of
+/// dropped. Inventing a `clean` or `residual` value here would be a fabricated
+/// cleanup fact, so the vocabulary has exactly this one member until an owner
+/// actually supplies cleanup evidence; a second member is a change to the
+/// owner, not to this reply.
+const BACKUP_OWNER_CLEANUP_NOT_SUPPLIED: &str = "not-supplied";
+
+/// Builds the one typed reply for a capture owner that cancelled.
+///
+/// Four properties are load-bearing, and each is why this is not
+/// [`invalid_reply`]:
+///
+/// - **Same operation identity.** `idempotency_key` is the correlated request
+///   identity the admitted request carried, carried through `backup_reply`
+///   exactly as every other reply on this route does. This route never mints a
+///   fresh identity for a cancellation, so a retry of an uncertain mutation
+///   reconciles the SAME operation instead of silently starting a second
+///   capture.
+/// - **A named cause, not a named field.** `code` is the I7.20 reason code
+///   above, so the operator gets the exact machine-readable cause rather than a
+///   field they must go and fix.
+/// - **The owner's own bounded reason.** `reason` is the OWNER's text passed
+///   through the existing [`bounded_reason`] bound; this route does not
+///   synthesise a second reason vocabulary beside the owner's, and never
+///   renders an owner state as a Rust `Debug` name.
+/// - **The owner cleanup state, retained.** `owner_cleanup_state` is the
+///   constant above, so the operator projection keeps the fact that cleanup was
+///   never confirmed instead of dropping it. It is bounded, owned text: no
+///   secret, no key material, and no archived user data crosses here.
+///
+/// One I7.20 requirement is knowingly NOT met here, and it is recorded rather
+/// than hidden: I7.20 says every non-success response includes a `disposition`,
+/// an exact `reason_code`, the applicable directive and the operation identity.
+/// This reply supplies the reason code, the owner's reason and the operation
+/// identity, but no `disposition` key. That gap is ROUTE-WIDE and pre-existing -
+/// `invalid_reply` and `refused_reply` on this same route carry no disposition
+/// either - so adding one only here would leave the route speaking two
+/// vocabularies, and adding it to the whole route is a wider contract change
+/// than this issue may make on its own. The open point is the route owner:
+/// give every backup reply one `disposition` vocabulary.
+fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
+    backup_reply(
+        BACKUP_VERIFY_OPERATION,
+        BACKUP_STATUS_CANCELLED,
+        idempotency_key,
+        vec![
+            (
+                "code",
+                Value::String(BACKUP_REASON_CANCELLATION_UNCONFIRMED.to_owned()),
+            ),
+            (
+                "owner_cleanup_state",
+                Value::String(BACKUP_OWNER_CLEANUP_NOT_SUPPLIED.to_owned()),
+            ),
+            ("reason", Value::String(bounded_reason(owner_reason))),
+        ],
+    )
+}
+
 /// Handles one backup create frame: validates the bounded capture
 /// descriptors, then refuses with the exact missing capture owner.
 ///
@@ -584,17 +690,29 @@ fn bounded_reason(reason: &str) -> String {
 
 /// Maps one typed capture-owner refusal onto the route's closed reply set.
 ///
-/// The operator surface admits exactly three verify statuses: `ok`, `invalid`,
-/// and a `plan_gap` refusal, and it treats any other `code` on a `refused`
-/// reply as a result mismatch. Verify has no missing owner left to name, so
-/// every owner refusal - an unadmitted caller, an incoherent archive relation,
-/// an unsupported class, a budget or publication failure - is reported as a
-/// typed `invalid` naming the causal class. The reason is the OWNER's own
-/// `Display` text, bounded: this route never invents a second reason vocabulary
-/// next to the owner's, and never renders an owner state as a Rust `Debug`
-/// name on the operator wire.
+/// The operator surface admits exactly four verify statuses: `ok`, `invalid`,
+/// a `plan_gap` refusal, and `cancelled`. It treats any other `code` on a
+/// `refused` or `cancelled` reply as a result mismatch. Verify has no missing
+/// owner left to name, so every other owner refusal - an unadmitted caller, an
+/// incoherent archive relation, an unsupported class, a budget or publication
+/// failure - is reported as a typed `invalid` naming the causal class. The
+/// reason is the OWNER's own `Display` text, bounded: this route never invents
+/// a second reason vocabulary next to the owner's, and never renders an owner
+/// state as a Rust `Debug` name on the operator wire.
+///
+/// [`KernelCaptureError::Cancelled`] is the one refusal that is NOT a
+/// field-shape failure, so it is answered by [`cancellation_reply`] from its
+/// own match arm and names no `field` at all. It previously shared the
+/// `backup.verify` field with [`KernelCaptureError::Unsupported`], which mapped
+/// a cancellation onto the wire as though a request field were malformed and
+/// dropped the owner's unconfirmed cleanup state. That is a mapping defect
+/// fixed, not an observed operator incident: nothing in the tree constructs
+/// `Cancelled` today (see [`BACKUP_STATUS_CANCELLED`]).
 fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Value {
     let field = match error {
+        KernelCaptureError::Cancelled => {
+            return cancellation_reply(idempotency_key, &error.to_string());
+        }
         KernelCaptureError::NotAdmitted => "backup.caller",
         KernelCaptureError::InvalidInput { field, .. }
         | KernelCaptureError::BudgetExceeded { field } => field,
@@ -604,7 +722,7 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
         | KernelCaptureError::OwnerEvidenceInvalid(_)
         | KernelCaptureError::ArchiveInvalid(_)
         | KernelCaptureError::PublicationUnknown(_) => "backup.archive",
-        KernelCaptureError::Cancelled | KernelCaptureError::Unsupported { .. } => "backup.verify",
+        KernelCaptureError::Unsupported { .. } => "backup.verify",
     };
     invalid_reply(
         BACKUP_VERIFY_OPERATION,
@@ -1368,8 +1486,19 @@ fn is_backup_verification_conflict(error: &OrsError) -> bool {
 /// installation backup" - and the owner's `class_ceiling` and `evidence_level`
 /// carry that lower bound explicitly, so reporting it as `invalid` would
 /// misstate a good archive. Only an undecided or refused owner state (`Unknown`,
-/// `Cancelled`, `Unsupported`) keeps the stable-prose refusal, and no other
-/// check is weakened.
+/// `Cancelled`, `Unsupported`) keeps a non-`ok` answer, and no other check is
+/// weakened.
+///
+/// `Cancelled` gets its OWN answer through [`cancellation_reply`] rather than
+/// the `invalid` field-shape envelope the other two undecided states share. It
+/// used to fall into that envelope as `backup.class`, which mapped a
+/// cancellation onto the wire as a malformed class token and dropped the
+/// owner's cleanup state entirely - so a cancellation was indistinguishable
+/// from a bad class string and issue #963's "Cancellation retains owner cleanup
+/// state" could not be honoured by the operator projection. `Unsupported`
+/// deliberately stays on the `invalid` path: an explicitly unsupported
+/// capability IS a statement about the requested class, so the `backup.class`
+/// field is the truthful one for it and is not weakened here.
 fn undecided_report_reply(report: &CaptureReport, idempotency_key: &str) -> Option<Value> {
     if matches!(
         report.state,
@@ -1387,6 +1516,9 @@ fn undecided_report_reply(report: &CaptureReport, idempotency_key: &str) -> Opti
             "capture owner reported a decided state after a decided-state refusal".to_owned()
         }
     };
+    if matches!(report.state, CaptureState::Cancelled) {
+        return Some(cancellation_reply(idempotency_key, &reason));
+    }
     Some(invalid_reply(
         BACKUP_VERIFY_OPERATION,
         idempotency_key,
