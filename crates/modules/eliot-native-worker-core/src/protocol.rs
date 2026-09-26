@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, AuthorizedEffect, BudgetEnvelope, ProposedEffect, WorkLeaseId};
 use eliot_contracts::{
-    DecisionId, EpochId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
-    sha256_hex,
+    CapabilityCellId, DecisionId, EpochId, ResourceGeneration, SessionId, StateFence, TaskId,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
@@ -645,12 +645,15 @@ fn validate_claim_text(value: &str, field: &'static str) -> Result<(), WorkerErr
 /// Closed native-worker registration binding.
 ///
 /// Binds one installation, one worker artifact/config/protocol generation,
-/// one process/start identity, one principal/session, one connection, the
-/// current [`EpochId`]/[`StateFence`], the registration lease
+/// the admitted Module Catalog revision and capability-cell identity for that
+/// generation, one process/start identity, one principal/session, one
+/// connection, the current [`EpochId`]/[`StateFence`], the registration lease
 /// (identity, expiry, and renewal identity), the supported execution-unit
 /// schema version, the resource envelope, and the invalidation set. Kernel
 /// admits at most one current registration per worker generation; anything
-/// else is stale and fenced, never merged.
+/// else is stale and fenced, never merged. A generation admitted under one
+/// catalog revision or cell never accepts work bound to another: advancement
+/// needs a new admission, never a local edit.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerRegistration {
@@ -666,6 +669,20 @@ pub struct NativeWorkerRegistration {
     pub protocol_version: String,
     /// Worker process generation; nonzero and fenced on replacement.
     pub worker_generation: u64,
+    /// Admitted Module Catalog revision this generation is bound to; nonzero.
+    ///
+    /// Mirrors the `catalog_revision` admitted by `eliot-module-registry`:
+    /// a generation admitted under one revision never accepts work bound to
+    /// another. The owner advances the revision through a new admission; the
+    /// worker only refuses disagreement, never repairs it locally.
+    pub module_catalog_revision: u64,
+    /// Capability-cell identity (issue #13 family) this generation is
+    /// admitted as; must equal the executable join's cell exactly.
+    ///
+    /// The [`CapabilityCellId`] namespace binding is structural: a cell
+    /// spelling from another namespace is never equal to a value of this
+    /// family, so only the exact admitted cell satisfies the join.
+    pub capability_cell: CapabilityCellId,
     /// OS process identity observed at start; PID/name/path alone are never
     /// sufficient without the remaining binding.
     pub process_id: u32,
@@ -738,6 +755,9 @@ impl NativeWorkerRegistration {
         {
             return Err(WorkerError::InvalidHandshake("bounded_fields"));
         }
+        if self.module_catalog_revision == 0 {
+            return Err(WorkerError::InvalidHandshake("module_catalog_revision"));
+        }
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
@@ -770,9 +790,9 @@ impl NativeWorkerRegistration {
 /// Worker-side projection of the owner-produced executable binding (T9-02).
 ///
 /// Carries the M1 currentness inputs the start path needs for refusal —
-/// route, adapter, config, facet, grant revision, replay stream, launch
-/// nonce, invocation digest, epoch/generation/fence, and the binding window
-/// — plus the opaque owner-produced `NativeWorkerExecutableBinding` v1
+/// route, adapter, config, facet, cell, grant and catalog revisions, replay
+/// stream, launch nonce, invocation digest, epoch/generation/fence, and the
+/// binding window — plus the opaque owner-produced `NativeWorkerExecutableBinding` v1
 /// digest. Field names reuse the T9-01 names where they exist, matching the
 /// Kernel-side `eliot-kernel-service` projection field-for-field. This is an
 /// identity/epoch/fence/ordering projection only: it carries references and
@@ -793,8 +813,15 @@ pub struct NativeWorkerExecutableBinding {
     pub config_digest: String,
     /// Facet manifest reference.
     pub facet_manifest_ref: String,
+    /// Capability-cell identity (issue #13 family) the owner bound the
+    /// executable to; must equal the presenting registration's cell exactly.
+    pub capability_cell: CapabilityCellId,
     /// Grant-graph revision the binding was compiled against; nonzero.
     pub grant_graph_revision: u64,
+    /// Admitted Module Catalog revision the binding was compiled against;
+    /// nonzero. A catalog change makes the binding stale: it needs a new
+    /// admission, never a local repair.
+    pub module_catalog_revision: u64,
     /// Replay stream identity bound to this claim.
     pub replay_stream_id: String,
     /// Claim-bound launch nonce (16..=256 chars, mirroring T9-01).
@@ -879,6 +906,11 @@ impl NativeWorkerExecutableBinding {
         }
         if self.adapter_revision == 0 || self.grant_graph_revision == 0 {
             return Err(WorkerError::InvalidRequest("executable_binding.revisions"));
+        }
+        if self.module_catalog_revision == 0 {
+            return Err(WorkerError::InvalidRequest(
+                "executable_binding.module_catalog_revision",
+            ));
         }
         if self.generation.value() == 0 {
             return Err(WorkerError::InvalidRequest("executable_binding.generation"));
@@ -1014,17 +1046,20 @@ impl NativeWorkerClaim {
     /// `work_scope_id`, `worker_generation`. The nested `executable_binding`
     /// object is JSON `null` for wire-v1 claims (which predate the join) and
     /// otherwise covers exactly the keys `adapter_id`, `adapter_revision`,
-    /// `authority_epoch`, `config_digest`, `deadline_unix_ms`,
+    /// `authority_epoch`, `capability_cell`, `config_digest`, `deadline_unix_ms`,
     /// `executable_binding_digest`, `executable_wire_version`,
     /// `expires_at_unix_ms`, `facet_manifest_ref`, `generation`,
-    /// `grant_graph_revision`, `launch_nonce`, `process_invocation_digest`,
-    /// `replay_stream_id`, `route_ref`, `state_fence`, with object keys
+    /// `grant_graph_revision`, `launch_nonce`, `module_catalog_revision`,
+    /// `process_invocation_digest`, `replay_stream_id`, `route_ref`, `state_fence`, with object keys
     /// sorted recursively before hashing. This matches the Kernel-side
     /// `NativeWorkerClaimRequest::compute_binding_digest` byte-for-byte: the
     /// worker-side transparent string newtypes and the Kernel-side plain
     /// strings serialize to identical JSON, and the epoch/fence/generation
     /// values on both sides come from the same `eliot-contracts` types, so
-    /// equal logical claims yield equal digests on both sides.
+    /// equal logical claims yield equal digests on both sides. The nested
+    /// join keys must stay mirrored with the Kernel-side projection: a key
+    /// present on only one side changes that side's digest and the join
+    /// refuses fail-closed until the owner record carries it on both sides.
     ///
     /// # Errors
     ///
@@ -1158,10 +1193,10 @@ impl NativeWorkerClaim {
     /// the current owner digest, and every M1 currentness input must agree.
     /// Epoch agreement always goes through `is_same_authority`, never through
     /// a raw sequence comparison. A stale binding — changed route, adapter,
-    /// config, facet, grant revision, nonce, stream, invocation digest, or
-    /// owner digest; advanced epoch; withdrawn authority; expired window;
-    /// fence disagreement — is refused; it needs a new admission, never a
-    /// local repair.
+    /// config, facet, cell, grant or catalog revision, nonce, stream,
+    /// invocation digest, or owner digest; advanced epoch; withdrawn
+    /// authority; expired window; fence disagreement — is refused; it needs
+    /// a new admission, never a local repair.
     ///
     /// Callers run [`NativeWorkerClaim::validate`] first; this gate checks
     /// the join, not the full envelope shape.
@@ -1309,8 +1344,8 @@ impl NativeWorkerClaim {
 /// M1 currentness input must agree exactly. Epoch agreement always goes
 /// through `is_same_authority`, never through a raw sequence comparison.
 /// Checks follow the documented absent-input order (route, adapter, config,
-/// facet, grant, stream, nonce, invocation, digest, wire, epoch,
-/// generation, fence) so the first reported field is the first missing
+/// facet, cell, grant, catalog, stream, nonce, invocation, digest, wire,
+/// epoch, generation, fence) so the first reported field is the first missing
 /// input callers must supply.
 ///
 /// # Errors
@@ -1341,9 +1376,19 @@ fn compare_executable_currentness(
             "executable_binding.facet_manifest_ref",
         ));
     }
+    if presented.capability_cell != current.capability_cell {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.capability_cell",
+        ));
+    }
     if presented.grant_graph_revision != current.grant_graph_revision {
         return Err(WorkerError::InvalidRequest(
             "executable_binding.grant_graph_revision",
+        ));
+    }
+    if presented.module_catalog_revision != current.module_catalog_revision {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.module_catalog_revision",
         ));
     }
     if presented.replay_stream_id != current.replay_stream_id {

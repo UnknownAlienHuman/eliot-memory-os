@@ -62,6 +62,8 @@ fn main() {
 /// - transport open but nothing delivered → 78 `PROVIDER_RUNTIME_DEFERRED`
 ///   (preserved fail-closed);
 /// - delivered but invalid → 78 typed `KERNEL_ADMISSION_REQUIRED` denial;
+/// - validated with a generation catalog-revision or cell mismatch → 78 typed
+///   denial before factory resolution, permit issuance, or any drive submit;
 /// - validated but resolving to no factory (no v2 join, route/nonce/factory
 ///   mismatch) → 78 typed `KERNEL_ADMISSION_REQUIRED` denial, never the
 ///   deferred line;
@@ -90,6 +92,22 @@ fn run() -> i32 {
         Ok(None) => return deny_absent_material(),
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
+    // Issue #22 W1/W7: the presenting generation is bound to one admitted
+    // Module Catalog revision and one capability cell (issue #13 family). A
+    // rewired registration or join refuses fail-closed here, before factory
+    // resolution, permit issuance, or any drive submit.
+    if let Err(error) = eliot_native_worker::require_module_catalog_revision_match(
+        material.admission.registration(),
+        material.admission.claim(),
+    ) {
+        return deny_invalid_material(&error.to_string());
+    }
+    if let Err(error) = eliot_native_worker::require_worker_cell_match(
+        material.admission.registration(),
+        material.admission.claim(),
+    ) {
+        return deny_invalid_material(&error.to_string());
+    }
     // T9-07: the validated route resolves to exactly one factory through
     // the registry seam. An unresolvable route is a refused presentation:
     // typed 78 denial, never the deferred line and never a drive. The
