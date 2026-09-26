@@ -130,7 +130,7 @@ pub use delegation_calibration::{
     PreregisteredCorpusEligibilityService, ProviderReviewPreRegistrationService,
     ProviderUtilityAssessmentService,
 };
-pub use error::EngineError;
+pub use error::{EngineError, SingleInstanceRefusal};
 pub use eval::{
     CanonicalMetaExperimentAssessment, CanonicalMetaExperimentInput, EvalBaselineService,
     EvalCaseInput, EvalCaseService, EvalComparisonService, EvalCoverageService,
@@ -201,8 +201,9 @@ pub use replay::{
 pub use reports::WriterReportService;
 pub use runtime::{
     ExchangeEnvelopeService, HealthService, LifecycleService, LogService, ModuleRegistryService,
-    ReportService, RuntimeLock, ServiceSupervisor, StaticRuntimeService, builtin_manifests,
-    default_runtime_services, shutdown_deadline_after,
+    ReportService, RuntimeLock, ServiceSupervisor, SingleInstanceFileEvidence,
+    SingleInstanceObservations, StaticRuntimeService, builtin_manifests, default_runtime_services,
+    shutdown_deadline_after,
 };
 pub use runtime_supervision::{
     AdapterExecutionContext, CancellationToken, OperationSupervisor, RestartDecision,

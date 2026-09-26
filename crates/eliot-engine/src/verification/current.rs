@@ -15,6 +15,7 @@ use eliot_instrument_api::{
     InstrumentInvocation, RawEvidence, VerificationRun as CurrentVerificationRun,
 };
 use eliot_instrument_nextest::NEXTEST_INSTRUMENT;
+use eliot_instrument_runner::profile::{InstrumentRegistry, ProfileCompiler};
 use eliot_instrument_runner::registry::{
     ProviderRegistry, RegistryFreshness, ResolvedExecutableIdentity,
 };
@@ -60,6 +61,24 @@ impl VerificationRunnerService {
                 "verification plan contains unknown commands",
             ));
         }
+        // Route the invocation profile through the single profile compiler
+        // (#1813), the same admission the governed build lane uses. Governed
+        // admissions reject foreign invocation classes; quarantined legacy
+        // text keeps its current behavior with no governed claim.
+        let instrument_registry =
+            InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
+                rejected(
+                    "verification-runner",
+                    &format!("builtin profile registry is unavailable: {error}"),
+                )
+            })?;
+        let compiled = ProfileCompiler::new(&instrument_registry).compile(&invocation.profile);
+        let _admitted = compiled.require_kind(invocation.kind).map_err(|error| {
+            rejected(
+                "verification-runner",
+                &format!("profile compiler rejected the current invocation: {error}"),
+            )
+        })?;
         let entry = registry
             .resolve_current(invocation, freshness)
             .map_err(|error| {

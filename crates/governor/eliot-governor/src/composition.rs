@@ -3810,10 +3810,17 @@ pub enum AuthorityActionReceipt {
     Activation(AuthorityActivationReceipt),
     /// A validated Kernel revocation receipt.
     Revocation(AuthorityRevocationReceipt),
+    /// The three durable phases of one reconciled grant revocation. A grant
+    /// revocation never reports a single-phase receipt: either the whole saga
+    /// committed and proved its read-backs, or it returns `Err`. The record is
+    /// boxed because it carries the whole committed ORS closure projection,
+    /// which is far larger than the other two terminal receipts; the box is a
+    /// representation choice only and changes no field or proof.
+    ReconciledGrantRevocation(Box<AuthorityRevocationReconciliation>),
 }
 
 /// The three durable phases of one grant revocation saga.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityRevocationReconciliation {
     /// Kernel-issued first-phase revocation receipt.
     pub authority_receipt: AuthorityRevocationReceipt,
@@ -5428,17 +5435,49 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the request from its admitted canonical source; this method is the
     /// single application seam that gives all four authority operations a
     /// production caller without reimplementing receipt reconciliation.
-    pub fn apply_authority_request(
+    ///
+    /// A grant revocation is the only arm with a canonical second phase, so it
+    /// is the only arm that reads `canonical_operation_id`,
+    /// `canonical_request_identity`, `durable_link`, and `closure_source`:
+    /// they are forwarded verbatim to [`Self::revoke_grant_and_reconcile`] in
+    /// the order that method mandates — Kernel/ORS fences the exact graph
+    /// revision first, then the durable closure read-back, then the canonical
+    /// envelope commit, then the ORS second-phase link. The other three arms
+    /// never touch them.
+    ///
+    /// The canonical operation identity and admitted request identity are
+    /// composed by the caller from admitted ingress and are never derived
+    /// from the durable closure, so an exact replay of one operation resolves
+    /// to the same receipt while the same operation under a changed payload
+    /// conflicts at the store instead of reconciling to a different closure.
+    pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
-    ) -> Result<AuthorityActionReceipt, CompositionError> {
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        durable_link: &L,
+        closure_source: &C,
+    ) -> Result<AuthorityActionReceipt, CompositionError>
+    where
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+        C: GrantClosureReceiptPort + ?Sized,
+    {
         match request {
             PresentedAuthorityRequest::GrantActivation(request) => self
                 .activate_grant(&request)
                 .map(AuthorityActionReceipt::Activation),
             PresentedAuthorityRequest::GrantRevocation(request) => self
-                .revoke_grant(&request)
-                .map(AuthorityActionReceipt::Revocation),
+                .revoke_grant_and_reconcile(
+                    &request,
+                    canonical_operation_id,
+                    canonical_request_identity,
+                    durable_link,
+                    closure_source,
+                )
+                .await
+                .map(|reconciliation| {
+                    AuthorityActionReceipt::ReconciledGrantRevocation(Box::new(reconciliation))
+                }),
             PresentedAuthorityRequest::IntroductionActivation(request) => self
                 .activate_introduction(&request)
                 .map(AuthorityActionReceipt::Activation),

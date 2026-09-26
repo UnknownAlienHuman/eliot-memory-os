@@ -290,7 +290,7 @@ fn coherent_read_under_concurrent_append() {
     assert_eq!(fence_after.retained_count(), 4);
     assert_ne!(fence_before.content_digest, fence_after.content_digest);
     fence_before
-        .denominator
+        .denominator()
         .validate_for_count(3)
         .expect("pre-append fence stays coherent");
     read_page(&fence_before, 0, &page_limits(3, 3)).expect("pre-append page still reads");
@@ -304,13 +304,13 @@ fn ordered_retained_entry_denominator_exact() {
     let header = header_for(&entries);
     let fence = capture_fence(&header, &entries, 3, &capture_params(0x9555))
         .expect("capture heartbeat fence");
-    let sequences: Vec<u64> = fence.entries.iter().map(|entry| entry.sequence).collect();
+    let sequences: Vec<u64> = fence.entries().iter().map(|entry| entry.sequence).collect();
     assert_eq!(sequences, vec![1, 2, 3]);
-    assert_eq!(fence.denominator.retained_members, 3);
-    assert_eq!(fence.denominator.gap_members, 0);
-    assert!(fence.denominator.complete);
+    assert_eq!(fence.denominator().retained_members, 3);
+    assert_eq!(fence.denominator().gap_members, 0);
+    assert!(fence.denominator().complete);
     fence
-        .denominator
+        .denominator()
         .validate_for_count(3)
         .expect("exact denominator count");
     let fixture = fixture_value("retained-entries-ordered.json");
@@ -328,22 +328,22 @@ fn ordered_retained_entry_denominator_exact() {
 #[test]
 fn gap_pressure_recovery_visible_and_prevents_false_coverage() {
     let (sensor, dir, fence, _) = capture_mixed("t5", 0x9556);
-    assert_eq!(fence.entries[1].kind, SpoolFenceEntryKind::Gap);
+    assert_eq!(fence.entries()[1].kind, SpoolFenceEntryKind::Gap);
     assert!(matches!(
-        &fence.entries[1].marker,
+        &fence.entries()[1].marker,
         Some(SpoolMarkerDetail::Gap {
             reason: GapRecoveryReason::AdmissionUnavailable,
             coverage_claimed: false,
         })
     ));
-    assert_eq!(fence.entries[2].kind, SpoolFenceEntryKind::Recovery);
-    assert!(fence.entries[2].marker.is_some());
-    assert_eq!(fence.denominator.retained_members, 3);
-    assert_eq!(fence.denominator.gap_members, 2);
-    assert!(!fence.denominator.complete);
-    assert!(fence.denominator.validate_for_count(0).is_err());
+    assert_eq!(fence.entries()[2].kind, SpoolFenceEntryKind::Recovery);
+    assert!(fence.entries()[2].marker.is_some());
+    assert_eq!(fence.denominator().retained_members, 3);
+    assert_eq!(fence.denominator().gap_members, 2);
+    assert!(!fence.denominator().complete);
+    assert!(fence.denominator().validate_for_count(0).is_err());
     fence
-        .denominator
+        .denominator()
         .validate_for_count(3)
         .expect("full count on incomplete denominator");
     let fixture = fixture_value("gap-pressure-recovery-denominator.json");
@@ -589,7 +589,7 @@ fn old_signed_observations_grant_no_active_authority() {
     ] {
         assert!(!debug.contains(secret), "fence leaks {secret}");
     }
-    assert!(fence.entries[0].marker.is_none());
+    assert!(fence.entries()[0].marker.is_none());
     let fixture = fixture_value("isolated-destination-manifest.json");
     assert_eq!(fixture["grants_active_authority"], false);
     cleanup(sensor, &dir);
@@ -817,14 +817,14 @@ fn temp_redb_capture_reopen_import_round_trip_with_noninterference() {
     let steps = vec![
         SpoolRestoreStep {
             step_index: 0,
-            step_digest: fence.entries[0].entry_digest.clone(),
+            step_digest: fence.entries()[0].entry_digest.clone(),
             predecessor_digest: content_digest.clone(),
             operation_id: hex_digest(0xA710),
         },
         SpoolRestoreStep {
             step_index: 1,
-            step_digest: fence.entries[1].entry_digest.clone(),
-            predecessor_digest: fence.entries[0].entry_digest.clone(),
+            step_digest: fence.entries()[1].entry_digest.clone(),
+            predecessor_digest: fence.entries()[0].entry_digest.clone(),
             operation_id: hex_digest(0xA711),
         },
     ];
@@ -903,7 +903,7 @@ fn source_api_guard_and_protected_content_redacted() {
     ] {
         assert!(!debug.contains(secret), "fence leaks {secret}");
     }
-    for entry in &fence.entries {
+    for entry in fence.entries() {
         assert_eq!(entry.entry_digest.len(), 64);
         assert!(entry.marker.is_none());
     }

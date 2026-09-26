@@ -21,6 +21,38 @@ use super::super::{
     phase_b_scm_selector, windows_paths_equal,
 };
 
+// F-LOG-HOST-4 (#979) inspection helpers.
+//
+// Through the #889 facade only
+// (`super::super::host_diagnostics::observe_entrypoint_with_detail`); the
+// Event Log seam stays typed-Unavailable
+// (`super::super::windows_event_log::event_log_sink_status`), never
+// implemented here (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never service
+// names, digests, paths, PIDs, start-times, nonces, or arbitrary error text —
+// so bounding limits size, not sensitivity (I15.4). Sink outcome never alters
+// result/order/status/cleanup. There is no mutable global dedup cache and no
+// terminal guard here: the single designated terminal per failed operation
+// stays with the outer #891/#893 operation that owns the failure decision;
+// these phase observations correlate by stage order only and never emit a
+// terminal. A bare `?` on an already-observed inner boundary propagates
+// without a second record.
+#[cfg(windows)]
+fn watchdog_inspection_note_event_log_unavailable() {
+    let _ = super::super::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn watchdog_inspection_observe(detail: &str) {
+    watchdog_inspection_note_event_log_unavailable();
+    super::super::host_diagnostics::observe_entrypoint_with_detail(
+        super::super::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
 #[cfg(windows)]
 pub fn approved_service_registration_request(
     launch: &RuntimeLaunchDescriptor,
@@ -29,13 +61,17 @@ pub fn approved_service_registration_request(
     expected_image: &PlatformHandle,
 ) -> Result<ServiceRegistrationRequest, HostError> {
     if approval.role() != role || approval.generation() != &launch.generation {
+        // WORK_UNIT_CASE: 979/4 — approval bound to another role/generation, never used.
+        watchdog_inspection_observe("watchdog.inspection approval role rejected");
         return Err(HostError::ProcessContour(
             "SCM registration approval does not match the approved runtime launch".to_owned(),
         ));
     }
-    let request = approval
-        .service_registration_request()
-        .map_err(HostError::Installation)?;
+    let request = approval.service_registration_request().map_err(|error| {
+        // WORK_UNIT_CASE: 979/4 — approval not reconstructible, never used.
+        watchdog_inspection_observe("watchdog.inspection approval unreadable");
+        HostError::Installation(error)
+    })?;
     let expected_name = match role {
         InstallerServiceRole::Host => ELIOT_HOST_SERVICE_NAME,
         InstallerServiceRole::Watchdog => ELIOT_WATCHDOG_SERVICE_NAME,
@@ -45,17 +81,25 @@ pub fn approved_service_registration_request(
         || request.start_mode() != ServiceStartMode::Automatic
         || request.account() != ServiceAccount::LocalService
     {
+        // WORK_UNIT_CASE: 979/4 — non-canonical reconstruction, never used.
+        watchdog_inspection_observe("watchdog.inspection approval non-canonical");
         return Err(HostError::ProcessContour(
             "SCM registration approval reconstructed a non-canonical service request".to_owned(),
         ));
     }
     let bootstrap = request.bootstrap().ok_or_else(|| {
+        // WORK_UNIT_CASE: 979/4 — bootstrap absent, never used.
+        watchdog_inspection_observe("watchdog.inspection approval bootstrap absent");
         HostError::ProcessContour(
             "SCM registration approval did not reconstruct a typed bootstrap".to_owned(),
         )
     })?;
     let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)
-        .map_err(HostError::Installation)?;
+        .map_err(|error| {
+            // WORK_UNIT_CASE: 979/1 — Phase-B SCM selector boundary.
+            watchdog_inspection_observe("watchdog.inspection selector unavailable");
+            HostError::Installation(error)
+        })?;
     if bootstrap.config_descriptor_path() != Path::new(launch.authority_descriptor_path.as_str())
         || bootstrap.config_descriptor_digest() != expected_descriptor_digest.as_str()
         || bootstrap.installation_id() != launch.installation_epoch.installation.as_str()
@@ -65,6 +109,8 @@ pub fn approved_service_registration_request(
             ))
         || bootstrap.registration_nonce().is_none()
     {
+        // WORK_UNIT_CASE: 979/4 — inexact bootstrap binding, never used.
+        watchdog_inspection_observe("watchdog.inspection approval bootstrap inexact");
         return Err(HostError::ProcessContour(
             "SCM registration approval bootstrap is not exact".to_owned(),
         ));
@@ -72,6 +118,8 @@ pub fn approved_service_registration_request(
     // `transaction_plan_generation` is the immutable SCM selector minted in
     // Phase A. The live ORS authority generation may advance in Phase B, so
     // callers must bind that value through the Host receipt before admission.
+    // WORK_UNIT_CASE: 979/4 — approval admitted with exact registration identity.
+    watchdog_inspection_observe("watchdog.inspection approval admitted");
     Ok(request)
 }
 
@@ -81,6 +129,8 @@ pub fn select_watchdog_approval_for_inspection(
     manifest: &CandidateManifest,
 ) -> Result<Option<InstallerServiceRegistrationApproval>, HostError> {
     if manifest.runtime_launch.profile != InstallationProfile::SystemService {
+        // WORK_UNIT_CASE: 979/4 — non-service profile needs no Watchdog approval.
+        watchdog_inspection_observe("watchdog.inspection non-service profile");
         return Ok(None);
     }
     let approval = registry
@@ -89,17 +139,22 @@ pub fn select_watchdog_approval_for_inspection(
             InstallerServiceRole::Watchdog,
         )
         .ok_or_else(|| {
+            // WORK_UNIT_CASE: 979/4 — Watchdog SCM approval absent, never selected.
+            watchdog_inspection_observe("watchdog.inspection approval absent");
             HostError::ProcessContour(
                 "approved generation is missing the installer-owned Watchdog SCM approval"
                     .to_owned(),
             )
         })?;
+    // `?` propagates the already-observed inner approval boundary; no second record.
     approved_service_registration_request(
         &manifest.runtime_launch,
         approval,
         InstallerServiceRole::Watchdog,
         &manifest.runtime_launch.watchdog_executable_path,
     )?;
+    // WORK_UNIT_CASE: 979/4 — Watchdog approval selected with exact identity.
+    watchdog_inspection_observe("watchdog.inspection approval selected");
     Ok(Some(approval.clone()))
 }
 
@@ -171,24 +226,42 @@ where
         InstalledWatchdogRuntimeInspection::Matching {
             state: ServiceState::Running,
             ..
-        } => Ok(()),
-        InstalledWatchdogRuntimeInspection::Matching { state, .. } => Err(
-            HostError::RecoveryRequired(format!(
+        } => {
+            // WORK_UNIT_CASE: 979/5 — SCM Running readback observed, never readiness.
+            watchdog_inspection_observe("watchdog.inspection running observed");
+            Ok(())
+        }
+        InstalledWatchdogRuntimeInspection::Matching { state, .. } => {
+            // WORK_UNIT_CASE: 979/5 — SCM readback is not Running, never readiness.
+            watchdog_inspection_observe("watchdog.inspection not running");
+            Err(HostError::RecoveryRequired(format!(
                 "canonical EliotWatchdog service is not Running (observed {state:?})"
-            )),
-        ),
-        InstalledWatchdogRuntimeInspection::Absent => Err(HostError::Platform(
-            "canonical EliotWatchdog service is not registered; installer/SCM must register both LocalService siblings before starting Host"
-                .to_owned(),
-        )),
-        InstalledWatchdogRuntimeInspection::Mismatched => Err(HostError::Platform(
-            "canonical EliotWatchdog service registration does not match the approved configuration"
-                .to_owned(),
-        )),
-        InstalledWatchdogRuntimeInspection::Unknown => Err(HostError::Platform(
-            "canonical EliotWatchdog service registration is not authoritatively observable"
-                .to_owned(),
-        )),
+            )))
+        }
+        InstalledWatchdogRuntimeInspection::Absent => {
+            // WORK_UNIT_CASE: 979/5 — registration absent, never Running.
+            watchdog_inspection_observe("watchdog.inspection registration absent");
+            Err(HostError::Platform(
+                "canonical EliotWatchdog service is not registered; installer/SCM must register both LocalService siblings before starting Host"
+                    .to_owned(),
+            ))
+        }
+        InstalledWatchdogRuntimeInspection::Mismatched => {
+            // WORK_UNIT_CASE: 979/5 — registration mismatched, never Running.
+            watchdog_inspection_observe("watchdog.inspection registration mismatched");
+            Err(HostError::Platform(
+                "canonical EliotWatchdog service registration does not match the approved configuration"
+                    .to_owned(),
+            ))
+        }
+        InstalledWatchdogRuntimeInspection::Unknown => {
+            // WORK_UNIT_CASE: 979/7 — registration unknown, preserved verbatim.
+            watchdog_inspection_observe("watchdog.inspection registration unknown");
+            Err(HostError::Platform(
+                "canonical EliotWatchdog service registration is not authoritatively observable"
+                    .to_owned(),
+            ))
+        }
     }
 }
 
@@ -248,11 +321,15 @@ pub fn verify_watchdog_scm_running(
     process: Option<&ProcessIdentity>,
 ) -> Result<VerifiedWatchdogScmRunning, HostError> {
     if state != ServiceState::Running {
+        // WORK_UNIT_CASE: 979/5 — SCM readback is not Running, never liveness.
+        watchdog_inspection_observe("watchdog.inspection SCM not running");
         return Err(HostError::RecoveryRequired(format!(
             "canonical EliotWatchdog service is not Running (observed {state:?})"
         )));
     }
     let Some(observed) = process else {
+        // WORK_UNIT_CASE: 979/5 — Running without process identity, never liveness.
+        watchdog_inspection_observe("watchdog.inspection process identity absent");
         return Err(HostError::RecoveryRequired(
             "Watchdog reached Running without a handle-bound process identity".to_owned(),
         ));
@@ -261,11 +338,15 @@ pub fn verify_watchdog_scm_running(
         || observed.start_time_100ns == 0
         || !windows_paths_equal(Path::new(&observed.image_path), registration.binary_path())
     {
+        // WORK_UNIT_CASE: 979/4 — unusable or substituted process identity, never liveness.
+        watchdog_inspection_observe("watchdog.inspection process identity rejected");
         return Err(HostError::RecoveryRequired(
             "Watchdog process identity is unusable or its image is not the approved image"
                 .to_owned(),
         ));
     }
+    // WORK_UNIT_CASE: 979/5 — SCM liveness verified; never supervision evidence.
+    watchdog_inspection_observe("watchdog.inspection SCM running verified");
     Ok(VerifiedWatchdogScmRunning {
         process: observed.clone(),
         wait_hint_ms,

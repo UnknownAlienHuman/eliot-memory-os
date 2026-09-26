@@ -99,11 +99,11 @@ max_required_bytes = 458752
 [[route]]
 id = "instrument-verification"
 description = "Instrument Plane, test execution, evidence envelopes, code understanding, proof breadth, and completion evidence."
-path_globs = ["bins/eliot-testd/**", "scripts/audit-*.py", "scripts/verify-*.py", "tests/**", "crates/**/*instrument*/**", "crates/**/*verification*/**"]
-topic_keywords = ["instrument", "verification", "verifier", "evidence envelope", "proof", "test harness", "code cortex"]
+path_globs = ["bins/eliot-testd/**", "scripts/audit-*.py", "scripts/verify-*.py", "tests/**", "crates/**/*instrument*/**", "crates/**/*verification*/**", "crates/eliot-engine/src/eval*", "crates/eliot-types/src/eval*"]
+topic_keywords = ["instrument", "verification", "verifier", "evidence envelope", "proof", "test harness", "code cortex", "evaluation integrity", "eval receipt", "measurement honesty", "evaluator benchmark"]
 required_handles = [
   "A5.5", "A10.8", "A14.6..A14.8",
-  "I2.17", "I2.20..I2.23", "I10.8..I10.10", "I16.17", "I17", "I18", "APPENDIX-J", "APPENDIX-P",
+  "I2.17", "I2.20..I2.23", "I10.8..I10.10", "I16.17", "I17", "I18", "I18.43", "I18.47", "APPENDIX-J", "APPENDIX-P",
 ]
 optional_handles = ["I10.*", "I17.*", "I18.*"]
 required_files = ["scripts/verify.ps1"]
@@ -266,6 +266,11 @@ expect_routes = ["generic-source", "agent-swarm"]
 [[coverage.example]]
 path = "bins/eliot-testd/src/main.rs"
 topic = "instrument verification"
+expect_routes = ["generic-source", "instrument-verification"]
+
+[[coverage.example]]
+path = "crates/eliot-engine/src/eval.rs"
+topic = "evaluation integrity receipts and measurement honesty"
 expect_routes = ["generic-source", "instrument-verification"]
 
 [[coverage.example]]

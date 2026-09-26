@@ -14,6 +14,7 @@ pub enum UlExamQuestionKind {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlExamQuestion {
     pub question_id: String,
     pub project_id: ProjectId,
@@ -25,6 +26,7 @@ pub struct UlExamQuestion {
 }
 
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlExamAnswer {
     pub question_id: String,
     pub answer_values: Vec<String>,
@@ -32,6 +34,7 @@ pub struct UlExamAnswer {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlExamGrade {
     pub question_id: String,
     pub precision_num: u32,
@@ -42,6 +45,7 @@ pub struct UlExamGrade {
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlExamRecord {
     pub exam_id: String,
     pub project_id: ProjectId,
@@ -82,6 +86,7 @@ impl UlReasoningRoute {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UlReasoningRequest {
     pub idempotency_key: String,
     pub project_id: ProjectId,

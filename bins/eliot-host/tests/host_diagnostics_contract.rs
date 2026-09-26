@@ -3,17 +3,17 @@
 //! Focused contract tests for F-LOG-HOST-0 item 889 (Implements, not Closes).
 //!
 //! These tests prove only the library-compiled facade installation, the
-//! explicitly-absent Event Log seam with its bounded queue/drop policy, the
+//! #984-wired Event Log delivery seam with its bounded queue/drop policy, the
 //! single `main.rs` reference failure, and stdout ownership against the
 //! fixture in `tests/data/host_diagnostics_cases.json`. They do not assert
 //! the full 22-case matrix from the issue (complete inventory, per-identity
 //! distinctions, full canary sweeps, sink-failure noninterference,
 //! allowed-diff review): those cases are deferred to the owning follow-ups
 //! (#891/#893/#985) and recorded here plus in the commit message. Real
-//! Host-wrapper Event Log delivery smoke on isolated Windows needs #984's
-//! accepted safe port and stays an honest residual: this wrapper must
-//! neither acquire Event Log FFI nor fake delivery. A diagnostic record is
-//! evidence only, never lifecycle authority, readiness, or completion.
+//! Host-wrapper Event Log delivery smoke on isolated Windows stays an honest
+//! test-phase residual: this wrapper must neither acquire Event Log FFI nor
+//! fake delivery. A diagnostic record is evidence only, never lifecycle
+//! authority, readiness, or completion.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use eliot_host::host_diagnostics::{
     observe_terminal_error, sink_status,
 };
 use eliot_host::windows_event_log::{
-    AdmittedEvent, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SOURCE, EventLogRecord,
+    AdmittedEvent, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SOURCE, EventLogDelivery, EventLogRecord,
     WindowsEventLogError, WindowsEventLogQueue, event_log_sink_status, report_event,
 };
 use serde_json::Value;
@@ -90,19 +90,29 @@ fn host_diagnostics_install_is_singly_owned() {
         "repeat install must be typed AlreadyOwned"
     );
 
-    // Tracing-stderr delivery is available; the Windows Event Log sink is an
-    // explicitly absent seam (issue #984 still open): typed Unavailable,
-    // never silent delivery elsewhere and never FFI. (Supports 889/15-18.)
+    // Tracing-stderr delivery is available; the facade's own Event Log arm
+    // stays typed-Unavailable (the facade routes to tracing only). #984
+    // landed, so the wrapper seam below attempts real delivery through the
+    // safe port on Windows and stays typed-Unavailable off Windows: never
+    // silent delivery elsewhere and never FFI. (Supports 889/15-18.)
     assert_eq!(sink_status(DiagnosticSink::TracingStderr), Ok(()));
     assert_eq!(
         sink_status(DiagnosticSink::WindowsEventLog),
         Err(eliot_host::host_diagnostics::HostDiagnosticsError::EventLogUnavailable)
     );
-    assert_eq!(
-        event_log_sink_status(),
-        Err(WindowsEventLogError::EventLogUnavailable),
-        "wrapper seam must agree with the facade seam"
-    );
+    if cfg!(windows) {
+        assert_eq!(
+            event_log_sink_status(),
+            Ok(()),
+            "wired wrapper must report the sink attemptable on Windows"
+        );
+    } else {
+        assert_eq!(
+            event_log_sink_status(),
+            Err(WindowsEventLogError::EventLogUnavailable),
+            "off Windows the port stays typed-Unavailable"
+        );
+    }
 
     // Truncation honesty: oversized inputs keep a bounded prefix and record
     // the original length. (Supports 889/10 sizing.)
@@ -264,13 +274,13 @@ fn host_diagnostics_entrypoint_observation_matches_contract_fixture() {
 // WORK_UNIT_CASE: 889/17
 // WORK_UNIT_CASE: 889/18
 #[test]
-fn windows_event_log_wrapper_names_contract_but_stays_unavailable() {
-    // The wrapper names #984's consumer contract (fixed source, event ids,
-    // severity, redacted insertions; admitted start/stop/failure only) but
-    // delivers nothing until #984 lands: typed Unavailable, never FFI and
-    // never a silent fallback. (Cases 889/15 start, 889/16 stop, 889/17
-    // failure mapping and correlation, 889/18 missing/denied stays distinct
-    // and leaves the Host result unchanged.)
+fn windows_event_log_wrapper_reports_through_the_safe_port() {
+    // The wrapper maps #984's consumer contract (fixed source, event ids,
+    // severity, redacted insertions; admitted start/stop/failure only)
+    // through the safe port: typed accepted/refused/unavailable outcomes,
+    // never FFI and never a silent fallback. (Cases 889/15 start, 889/16
+    // stop, 889/17 failure mapping and correlation, 889/18 missing/denied
+    // stays distinct and leaves the Host result unchanged.)
     let fixture = contract_fixture();
     assert_eq!(
         EVENT_LOG_SOURCE,
@@ -301,13 +311,49 @@ fn windows_event_log_wrapper_names_contract_but_stays_unavailable() {
                 .as_str()
                 .expect("fixture must pin the severity")
         );
-        // Mapping proof only: delivery stays honestly unavailable and the
-        // caller's Host result is untouched (Ok stays Ok around the call).
+        // Delivery proof through #984's safe port: on Windows the OS call is
+        // attempted and every outcome stays typed; off Windows the port is
+        // honestly unavailable. The caller's Host result is untouched either
+        // way (Ok stays Ok around the call).
         let host_result: Result<(), &'static str> = Ok(());
-        assert_eq!(
-            report_event(&record),
-            Err(WindowsEventLogError::EventLogUnavailable)
-        );
+        match report_event(&record) {
+            Ok(delivery) => {
+                assert!(
+                    cfg!(windows),
+                    "non-Windows must never report Event Log success"
+                );
+                assert!(
+                    matches!(delivery, EventLogDelivery::RegisteredSourceAccepted { .. }),
+                    "wired delivery must use the registered-source profile, got: {delivery:?}"
+                );
+                assert_eq!(
+                    delivery.event(),
+                    event,
+                    "accepted delivery must correlate to the submitted event"
+                );
+            }
+            Err(WindowsEventLogError::EventLogUnavailable) => {
+                assert!(
+                    !cfg!(windows),
+                    "Windows must attempt the OS port, not answer unavailable"
+                );
+            }
+            Err(
+                WindowsEventLogError::SourceUnavailable { .. }
+                | WindowsEventLogError::ReportRefused { .. },
+            ) => {
+                assert!(
+                    cfg!(windows),
+                    "OS refusal outcomes exist only where the port was attempted"
+                );
+            }
+            Err(WindowsEventLogError::InvalidRecord) => {
+                panic!("bounded redacted fixture insertion must validate")
+            }
+            Err(WindowsEventLogError::QueueFull | WindowsEventLogError::Closed) => {
+                panic!("direct report never touches the admission queue")
+            }
+        }
         assert!(
             host_result.is_ok(),
             "sink outcome must not change Host result"

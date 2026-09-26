@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataRootProfile {
     pub profile_id: String,
     pub mode: DataRootMode,
@@ -34,6 +35,7 @@ pub enum DataRootMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataRootValidation {
     pub profile_id: String,
     pub root: PathRef,
@@ -53,6 +55,7 @@ pub enum DataRootValidationStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataRootCheck {
     pub name: String,
     pub status: DataRootCheckStatus,
@@ -67,7 +70,25 @@ pub enum DataRootCheckStatus {
     Error,
 }
 
+/// Decode-time pin for `BackupManifest::schema_version` (#938, cases 7-8):
+/// a misselected version must not become valid current input. The only
+/// supported value is the crate's own adopted `crate::SCHEMA_VERSION`
+/// (the sole writer emits exactly it); anything else refuses.
+fn deserialize_manifest_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value != crate::SCHEMA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported backup manifest schema_version: {value:?}"
+        )));
+    }
+    Ok(value)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupManifest {
     pub backup_id: String,
     pub created_at: OffsetDateTime,
@@ -75,6 +96,7 @@ pub struct BackupManifest {
     pub backup_root: PathRef,
     pub backup_kind: BackupKind,
     pub governor_version: String,
+    #[serde(deserialize_with = "deserialize_manifest_schema_version")]
     pub schema_version: String,
     pub policy_snapshot_refs: Vec<String>,
     pub config_snapshot_refs: Vec<String>,
@@ -88,7 +110,6 @@ pub struct BackupManifest {
     pub blob_manifest_ref: String,
     #[serde(default)]
     pub blob_payload_root: Option<PathRef>,
-    #[serde(default)]
     pub blob_payloads: Vec<BackupBlobEntry>,
     pub report_manifest_ref: Option<String>,
     pub checksums: Vec<BackupChecksum>,
@@ -98,6 +119,7 @@ pub struct BackupManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupBlobEntry {
     pub relative_path: PathRef,
     pub backup_path: PathRef,
@@ -105,6 +127,7 @@ pub struct BackupBlobEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupInventoryEntry {
     pub backup_id: String,
     pub created_at: OffsetDateTime,
@@ -125,6 +148,7 @@ pub enum BackupKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupChecksum {
     pub algorithm: String,
     pub path: PathRef,
@@ -133,6 +157,7 @@ pub struct BackupChecksum {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupReceipt {
     pub backup_id: String,
     pub status: BackupStatus,
@@ -155,6 +180,7 @@ pub enum BackupStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupReport {
     pub component: String,
     pub manifest: BackupManifest,
@@ -163,6 +189,7 @@ pub struct BackupReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestorePlan {
     pub restore_plan_id: String,
     pub backup_id: String,
@@ -188,6 +215,7 @@ pub enum RestoreMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreCheck {
     pub name: String,
     pub passed: bool,
@@ -195,6 +223,7 @@ pub struct RestoreCheck {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreReceipt {
     pub restore_receipt_id: String,
     pub restore_plan_id: String,
@@ -203,7 +232,6 @@ pub struct RestoreReceipt {
     pub verified_manifest: bool,
     pub verified_checksums: bool,
     pub restored_objects: u64,
-    #[serde(default)]
     pub restored_blobs: u64,
     #[serde(default)]
     pub exact_action_hash: Option<String>,
@@ -214,6 +242,7 @@ pub struct RestoreReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreRollbackReceipt {
     pub rollback_receipt_id: String,
     pub target_data_root: PathRef,
@@ -237,6 +266,7 @@ pub enum RestoreStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreReport {
     pub component: String,
     pub plan: RestorePlan,
@@ -245,6 +275,7 @@ pub struct RestoreReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportBundle {
     pub export_id: String,
     pub project_id: Option<ProjectId>,
@@ -274,6 +305,7 @@ pub enum RedactionProfile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportPlan {
     pub import_plan_id: String,
     pub import_root: PathRef,
@@ -294,6 +326,7 @@ pub enum ImportKind {
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportValidation {
     pub admin_only: bool,
     pub accepted: bool,
@@ -304,6 +337,7 @@ pub struct ImportValidation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoricalImportEnvelope {
     pub import_id: String,
     pub idempotency_key: String,
@@ -318,6 +352,7 @@ pub struct HistoricalImportEnvelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoricalImportQuarantine {
     pub source_ref: PathRef,
     pub source_artifact_id: Option<String>,
@@ -325,6 +360,7 @@ pub struct HistoricalImportQuarantine {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoricalImportPreview {
     pub preview_id: String,
     pub source_root: PathRef,
@@ -349,6 +385,7 @@ pub enum HistoricalImportStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoricalImportReceipt {
     pub receipt_id: String,
     pub preview_id: String,
@@ -362,6 +399,7 @@ pub struct HistoricalImportReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobManifest {
     pub manifest_id: String,
     pub generated_at: OffsetDateTime,
@@ -372,6 +410,7 @@ pub struct BlobManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobManifestEntry {
     pub blob_hash: String,
     pub path: PathRef,
@@ -389,12 +428,14 @@ pub enum BlobRetentionClass {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobReachabilityRef {
     pub blob_hash: String,
     pub canonical_record_ref: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobRetentionRef {
     pub blob_hash: String,
     pub canonical_record_ref: String,
@@ -402,6 +443,7 @@ pub struct BlobRetentionRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobReferenceSnapshot {
     pub snapshot_id: String,
     pub source_store: String,
@@ -416,6 +458,7 @@ pub struct BlobReferenceSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobGcPlan {
     pub gc_plan_id: String,
     pub generated_at: OffsetDateTime,
@@ -426,15 +469,13 @@ pub struct BlobGcPlan {
     pub unreachable_deletable: Vec<String>,
     pub protected: Vec<String>,
     pub estimated_reclaim_bytes: u64,
-    #[serde(default)]
     pub scan_sequence: u8,
-    #[serde(default)]
     pub approval_hash: String,
-    #[serde(default)]
     pub deletion_candidates: Vec<BlobDeletionCandidate>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobDeletionCandidate {
     pub blob_hash: String,
     pub path: PathRef,
@@ -443,6 +484,7 @@ pub struct BlobDeletionCandidate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobGcReceipt {
     pub gc_receipt_id: String,
     pub gc_plan_id: String,
@@ -464,6 +506,7 @@ pub enum BlobGcStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobReport {
     pub component: String,
     pub manifest: Option<BlobManifest>,
@@ -473,6 +516,7 @@ pub struct BlobReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceJob {
     pub job_id: String,
     pub job_kind: MaintenanceJobKind,
@@ -515,6 +559,7 @@ pub enum MaintenanceJobStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentRecord {
     pub incident_id: String,
     pub severity: IncidentSeverity,
@@ -571,6 +616,7 @@ pub enum IncidentKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentReport {
     pub component: String,
     pub incidents: Vec<IncidentRecord>,
@@ -580,6 +626,7 @@ pub struct IncidentReport {
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DoctorReport {
     pub component: String,
     pub data_root_validation: DataRootValidation,
@@ -599,6 +646,7 @@ pub struct DoctorReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationsCheck {
     pub name: String,
     pub passed: bool,
@@ -607,6 +655,7 @@ pub struct OperationsCheck {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationsDoctorReport {
     pub component: String,
     pub status: String,
@@ -616,6 +665,7 @@ pub struct OperationsDoctorReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductionCutoverManifest {
     pub manifest_id: String,
     pub status: String,

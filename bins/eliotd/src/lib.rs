@@ -54,11 +54,13 @@ mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
+pub mod improvement_candidate_route;
 pub mod improvement_intake;
 mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
 pub mod notification_board_attach;
 mod observation_adapters;
@@ -167,6 +169,10 @@ pub use freshness_admission::{
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
+};
+pub use improvement_candidate_route::{
+    ImprovementRouteRequest, check_improvement_repeat, improvement_operation_owners,
+    improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -351,6 +357,30 @@ fn unix_ms_i64() -> i64 {
 #[must_use]
 pub fn closure_debt_pending(terminal: bool) -> bool {
     terminal
+}
+
+/// Returns the Governor maintenance owner for the improvement candidate route.
+///
+/// Production caller of [`improvement_candidate_route::improvement_route_owner`];
+/// keeps the candidate → experiment → evaluation → admission path rooted in the
+/// daemon composition root without adding policy semantics here.
+#[must_use]
+pub fn governed_improvement_pipeline_owner() -> &'static str {
+    improvement_candidate_route::improvement_route_owner()
+}
+
+/// Routes one improvement candidate through the Governor-owned pipeline.
+///
+/// Production caller of [`improvement_candidate_route::route_improvement_candidate`]
+/// (and transitively of `eliot_maintenance::run_improvement_candidate_pipeline`
+/// and `admit_improvement_candidate`). Pure thin forwarder for the
+/// candidate → experiment → independent evaluation → rejected-or-canary-admitted
+/// path (#1100/#18/#20); Kernel activation (#11) stays a handoff, never executed
+/// here.
+pub fn govern_improvement_candidate(
+    request: improvement_candidate_route::ImprovementRouteRequest<'_>,
+) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
+    improvement_candidate_route::route_improvement_candidate(request)
 }
 
 /// Readiness/status projection emitted by the daemon. It is derived only
@@ -887,6 +917,7 @@ impl DaemonComposition {
     #[must_use]
     pub fn status(&self) -> DaemonStatus {
         let snapshot = self.kernel_snapshot();
+        let _improvement_owner = governed_improvement_pipeline_owner();
         DaemonStatus {
             service: SERVICE_NAME.to_owned(),
             protocol: PROTOCOL_VERSION.to_owned(),

@@ -27,7 +27,16 @@ public abstract record UserAutomationOperation
     /// follow the owner's admission and approval policy and retain one
     /// operation identity until a terminal receipt; reads execute immediately
     /// inside existing authority and retain nothing.
-    public abstract bool IsEffect { get; }
+    ///
+    /// This is a local routing classifier, not part of the operation. It is a
+    /// method rather than a property because System.Text.Json serializes a
+    /// public getter by default: the owner-side
+    /// `UserAutomationOperation` is `deny_unknown_fields`, so a serialized
+    /// `isEffect` member would make every request undecodable. A method has no
+    /// serialized surface at all, which keeps the exclusion exact for the
+    /// abstract declaration, all ten derived records, the polymorphic
+    /// `UserAutomationOperation` contract and the outer request at once.
+    public abstract bool IsEffect();
 }
 
 public sealed record UserAutomationCreateOperation(
@@ -36,7 +45,7 @@ public sealed record UserAutomationCreateOperation(
 {
     public override void Validate() => Revision.Validate();
 
-    public override bool IsEffect => true;
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationListOperation(
@@ -45,7 +54,7 @@ public sealed record UserAutomationListOperation(
 {
     public override void Validate() { }
 
-    public override bool IsEffect => false;
+    public override bool IsEffect() => false;
 }
 
 public sealed record UserAutomationStatusOperation(
@@ -54,7 +63,7 @@ public sealed record UserAutomationStatusOperation(
 {
     public override void Validate() => UserAutomationContract.RequireText(AutomationId, "automation_id");
 
-    public override bool IsEffect => false;
+    public override bool IsEffect() => false;
 }
 
 public sealed record UserAutomationHistoryOperation(
@@ -63,7 +72,7 @@ public sealed record UserAutomationHistoryOperation(
 {
     public override void Validate() => UserAutomationContract.RequireText(AutomationId, "automation_id");
 
-    public override bool IsEffect => false;
+    public override bool IsEffect() => false;
 }
 
 public sealed record UserAutomationPauseOperation(
@@ -73,7 +82,7 @@ public sealed record UserAutomationPauseOperation(
 {
     public override void Validate() => UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
 
-    public override bool IsEffect => true;
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationResumeOperation(
@@ -83,7 +92,7 @@ public sealed record UserAutomationResumeOperation(
 {
     public override void Validate() => UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
 
-    public override bool IsEffect => true;
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationEditOperation(
@@ -103,7 +112,7 @@ public sealed record UserAutomationEditOperation(
         }
     }
 
-    public override bool IsEffect => true;
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationRunNowOperation(
@@ -118,7 +127,7 @@ public sealed record UserAutomationRunNowOperation(
         UserAutomationContract.RequireText(Nonce, "nonce");
     }
 
-    public override bool IsEffect => true;
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationRemoveOperation(
@@ -128,7 +137,7 @@ public sealed record UserAutomationRemoveOperation(
 {
     public override void Validate() => UserAutomationContract.RequireIdentity(AutomationId, AutomationRevision);
 
-    public override bool IsEffect => true;
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationInspectLastFailureOperation(
@@ -137,7 +146,7 @@ public sealed record UserAutomationInspectLastFailureOperation(
 {
     public override void Validate() => UserAutomationContract.RequireText(AutomationId, "automation_id");
 
-    public override bool IsEffect => false;
+    public override bool IsEffect() => false;
 }
 
 /// Exact authenticated UserAutomation front-door payload. The named route
@@ -175,6 +184,218 @@ public sealed record UserAutomationOperatorRequest(
     {
         Operation.Validate();
         OperatorIntentContract.RequireOperationId(IdempotencyKey);
+    }
+}
+
+/// One typed UserAutomation request read from a retained user-local envelope,
+/// together with whether the retained bytes still encode the superseded local
+/// read/effect classifier.
+///
+/// Retained bytes are read, never rewritten. The current closed profile is the
+/// authority on the exact field set: a request that decodes through it carries
+/// nothing beyond the contract, because it refuses every unmapped member. Only
+/// one deviation is tolerated, and only here: the single known member the
+/// superseded generation emitted for the local classifier. That member is
+/// non-authoritative recovery metadata — the read/effect classification is
+/// re-derived from the decoded typed operation, never trusted from the old
+/// bytes — and its presence never makes the envelope sendable. This profile is
+/// never used to read or write a live request, so the live wire keeps refusing
+/// unknown fields.
+public sealed record UserAutomationRetainedRequest(
+    UserAutomationOperatorRequest Request,
+    bool CarriesSupersededLocalClassifier)
+{
+    /// The exact member name the superseded generation produced for the local
+    /// `IsEffect` property under the closed Web naming policy.
+    public const string SupersededLocalClassifierMember = "isEffect";
+
+    /// The outer request is exactly these two members. It is stated here rather
+    /// than read back off the request type so the retained envelope is checked
+    /// against the wire contract, not against its own reader.
+    private static readonly string[] RequestMemberNames = ["operation", "idempotency_key"];
+
+    /// The one tolerated deviation, scoped to retained local recovery bytes.
+    /// `OperatorJson.Reader` itself is untouched, so no unrelated surface
+    /// inherits the tolerance. `Skip` is applied only to the retained bytes
+    /// after the single known member has been removed, and
+    /// `RequireSameMembersAndValues` then proves the result is exactly today's
+    /// canonical encoding — so anything this profile skipped is refused there.
+    private static readonly JsonSerializerOptions SupersededShapeJson = new(OperatorJson.Reader)
+    {
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip
+    };
+
+    /// Reads one retained envelope without altering it. The decoded identity is
+    /// the one the bytes already carry; it is never re-derived from today's
+    /// serializer, because a re-encoded payload is a different request
+    /// commitment than the one the retained key names.
+    ///
+    /// Every refusal is reported as one exception type, so a caller can tell
+    /// "these retained bytes are not a closed UserAutomation envelope" from
+    /// "this record is fine" without also handling serializer internals.
+    public static UserAutomationRetainedRequest Read(string envelopeJson)
+    {
+        ArgumentNullException.ThrowIfNull(envelopeJson);
+        UserAutomationRetainedRequest? current;
+        try
+        {
+            current = ReadCurrentShape(envelopeJson);
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException)
+        {
+            // The current shape refused. `NotSupportedException` is how the
+            // polymorphic converter reports a member it cannot bind before it
+            // reaches the discriminator, so it is a shape refusal too.
+            current = null;
+        }
+        if (current is not null)
+        {
+            return current;
+        }
+
+        try
+        {
+            return ReadSupersededShape(envelopeJson);
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException)
+        {
+            throw new InvalidOperationException(
+                "retained UserAutomation request is not a closed UserAutomation envelope",
+                error);
+        }
+    }
+
+    /// The retained bytes decode through the current closed profile, so they
+    /// carry nothing beyond the contract: that profile refuses every unmapped
+    /// member.
+    private static UserAutomationRetainedRequest ReadCurrentShape(string envelopeJson)
+    {
+        using var document = JsonDocument.Parse(envelopeJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("retained UserAutomation request is not one JSON object");
+        }
+        return new UserAutomationRetainedRequest(
+            document.RootElement.Deserialize<UserAutomationOperatorRequest>(OperatorJson.Reader)
+                ?? throw new InvalidOperationException("retained UserAutomation request is empty"),
+            CarriesSupersededLocalClassifier: false);
+    }
+
+    /// The one tolerated deviation: the retained bytes are today's canonical
+    /// encoding of the same typed operation plus the single known local
+    /// classifier the superseded generation wrote. Nothing else is accepted.
+    private static UserAutomationRetainedRequest ReadSupersededShape(string envelopeJson)
+    {
+        using var document = JsonDocument.Parse(envelopeJson);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("retained UserAutomation request is not one JSON object");
+        }
+        RequireExactMembers(root, RequestMemberNames);
+        var operation = root.GetProperty("operation");
+        if (operation.ValueKind != JsonValueKind.Object
+            || !operation.TryGetProperty(SupersededLocalClassifierMember, out var classifier)
+            || classifier.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            throw new InvalidOperationException(
+                "retained UserAutomation request does not carry the known superseded local classifier");
+        }
+
+        // The exact shape today's closed profile accepts: the retained bytes
+        // with the one known local classifier removed and nothing else changed,
+        // so the strict profile then validates the result at every depth.
+        var superseded = JsonSerializer.Deserialize<UserAutomationOperatorRequest>(
+                WithoutSupersededClassifier(root, operation), SupersededShapeJson)
+            ?? throw new InvalidOperationException("retained UserAutomation request is empty");
+
+        // The retained bytes must equal today's canonical encoding of that same
+        // typed operation plus the one classifier, compared member by member so
+        // member order is irrelevant. Anything the closed serializer would not
+        // write itself — an extra field at any depth, a changed value, a
+        // different casing — is refused here.
+        using var canonical = JsonDocument.Parse(
+            JsonSerializer.Serialize(superseded.Operation, OperatorJson.Writer));
+        RequireSameMembersAndValues(operation, canonical.RootElement, classifier);
+        return new UserAutomationRetainedRequest(
+            superseded,
+            CarriesSupersededLocalClassifier: true);
+    }
+
+    /// Rewrites the retained envelope with the one known local classifier
+    /// removed and every other byte, at every depth, copied verbatim.
+    private static string WithoutSupersededClassifier(JsonElement root, JsonElement operation)
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            foreach (var property in root.EnumerateObject())
+            {
+                if (property.NameEquals("operation"))
+                {
+                    writer.WritePropertyName(property.Name);
+                    writer.WriteStartObject();
+                    foreach (var member in operation.EnumerateObject())
+                    {
+                        if (!string.Equals(member.Name, SupersededLocalClassifierMember, StringComparison.Ordinal))
+                        {
+                            member.WriteTo(writer);
+                        }
+                    }
+                    writer.WriteEndObject();
+                    continue;
+                }
+                property.WriteTo(writer);
+            }
+            writer.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    private static void RequireExactMembers(JsonElement element, IEnumerable<string> expected)
+    {
+        var actual = element.EnumerateObject().Select(property => property.Name).ToArray();
+        if (!new HashSet<string>(actual, StringComparer.Ordinal).SetEquals(expected))
+        {
+            throw new InvalidOperationException(
+                "retained UserAutomation request carries members outside the closed contract");
+        }
+    }
+
+    /// Compares the retained operation with the canonical encoding of the same
+    /// typed operation plus the tolerated member, by name and by value. This is
+    /// the whole tolerance boundary: anything today's serializer would not write
+    /// itself is refused here.
+    private static void RequireSameMembersAndValues(
+        JsonElement retained,
+        JsonElement canonical,
+        JsonElement classifier)
+    {
+        if (retained.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException(
+                "retained UserAutomation operation is not one JSON object");
+        }
+        var actual = retained.EnumerateObject()
+            .ToDictionary(property => property.Name, property => property.Value, StringComparer.Ordinal);
+        var expected = canonical.EnumerateObject()
+            .ToDictionary(property => property.Name, property => property.Value, StringComparer.Ordinal);
+        expected[SupersededLocalClassifierMember] = classifier;
+        if (actual.Count != expected.Count)
+        {
+            throw new InvalidOperationException(
+                "retained UserAutomation operation carries members outside the closed contract");
+        }
+        foreach (var (name, value) in expected)
+        {
+            if (!actual.TryGetValue(name, out var retainedValue)
+                || !JsonElement.DeepEquals(retainedValue, value))
+            {
+                throw new InvalidOperationException(
+                    "retained UserAutomation operation differs from the closed contract outside the known local classifier");
+            }
+        }
     }
 }
 

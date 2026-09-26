@@ -31,7 +31,9 @@ use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
     StartupCapabilityBindings,
 };
-use eliotd::startup_readiness::StartupReadinessProjection;
+use eliotd::startup_readiness::{
+    LocalDeltaAdoption, LocalDeltaConflict, LocalReadinessDelta, StartupReadinessProjection,
+};
 use eliotd::testd_terminal_completion::{
     TestdOwnerDrainOutcome, ack_testd_owner_terminal_completion,
     bind_testd_owner_verifier_dispatch, commit_testd_terminal_owner_fact,
@@ -303,15 +305,17 @@ enum LocalReadCompletion {
 
 /// What one settled local-read step produced.
 ///
-/// #2560: the readiness snapshot the step borrowed comes back with the result,
-/// so a demand-driven capability re-evaluation performed inside the flight is
-/// filed into the run loop's single authoritative projection instead of being
-/// kept in a second copy. There is no second owner and no shared handle.
+/// #2647: the step returns its poll outcome plus at most one bounded readiness
+/// delta — only the observation this flight's own attach or re-read actually
+/// produced. An empty claim or an ordinary read with no refresh carries no
+/// delta, so settling it cannot overwrite newer owner observations the loop
+/// recorded while the flight was outstanding. There is no second owner and no
+/// shared handle.
 struct LocalReadStep {
     /// The poll outcome the loop acts on.
     outcome: LocalReadPollOutcome,
-    /// The readiness projection as the step left it.
-    readiness: StartupReadinessProjection,
+    /// The readiness observation this flight produced, if any.
+    delta: Option<LocalReadinessDelta>,
 }
 
 struct LocalReadFlightState {
@@ -395,6 +399,17 @@ pub(super) fn run() -> Result<(), String> {
     // explicit disposition for each. The returned ledger — not control flow —
     // decides what this generation observed.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
+    // #1145: root the Governor-owned improvement candidate route in the
+    // production daemon: report the pipeline owner at startup (diagnostics
+    // only). The candidate → experiment → evaluation → admission path itself
+    // runs through `eliotd::govern_improvement_candidate` on live requests;
+    // this reference keeps the owner identity observable without adding
+    // policy semantics to the composition root.
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.improvement_pipeline_owner",
+        owner = eliotd::governed_improvement_pipeline_owner(),
+    );
     // #2560: the retained ledger answers no readiness question. This projection
     // derives the required set from the composition's own live owners and keeps
     // core control readiness separate from optional capability availability, so
@@ -1018,8 +1033,10 @@ async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut supervision_progress: Option<eliotd::SupervisionProgressProducer>,
-    // #2560: sole owner of the readiness projection; a local-read flight
-    // borrows a snapshot and returns it, so there is one authoritative copy.
+    // #2560/#2647: sole owner of the readiness projection. A local-read
+    // flight prepares from an immutable snapshot and returns only the bounded
+    // delta it actually observed, so there is one authoritative copy and a
+    // late completion can never overwrite newer owner observations.
     mut startup_readiness: StartupReadinessProjection,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
@@ -1381,7 +1398,11 @@ async fn run_health_heartbeat_tick(
         // Generation-scoped retained proofs are re-checked against the observed
         // generation/epoch, so a proof admitted at an earlier generation reads
         // as unavailable instead of staying usable because it was retained.
-        startup_readiness.observe_owner(&guard);
+        // #2647: an identical observation retires no in-flight delta basis;
+        // only a real owner-context change does.
+        startup_readiness
+            .observe_owner(&guard)
+            .map_err(|error| format!("startup readiness owner observation: {error}"))?;
         readiness_verdict = eliotd::startup_readiness::evaluate_startup_readiness(
             startup_readiness,
             &guard.status(),
@@ -1881,8 +1902,9 @@ fn maybe_start_local_read_poll(
 ) {
     if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
         *flight = LocalReadFlight::InFlight(LocalReadFlightState {
-            // #2560: a bounded snapshot travels with the step and comes back
-            // with it. The run loop keeps the only authoritative copy.
+            // #2560/#2647: a bounded immutable snapshot travels with the step
+            // as its decision basis; only an actually observed delta comes
+            // back with it. The run loop keeps the only authoritative copy.
             future: start_local_read_poll(
                 kernel,
                 Arc::clone(composition),
@@ -1920,7 +1942,7 @@ fn settle_local_read_completion(
                 target: "eliotd::diagnostics",
                 event = "eliotd.local_read_settled",
                 outcome = local_read_outcome_name(&step.outcome),
-                readiness = %step.readiness.report(),
+                delta = local_read_delta_name(step.delta.as_ref()),
             );
             *flight = LocalReadFlight::Idle;
             Ok(())
@@ -1929,12 +1951,15 @@ fn settle_local_read_completion(
     }
 }
 
-/// Settles one completed local-read poll step and takes the readiness snapshot
-/// the step borrowed back into the run loop's single authoritative projection.
+/// Settles one completed local-read poll step and adopts the bounded delta the
+/// step observed into the run loop's single authoritative projection (#2647).
 ///
-/// Same settle contract as [`settle_local_read_completion`]; the only difference
-/// is that a demand-driven capability re-evaluation the step performed becomes
-/// the loop's state instead of being dropped with the step.
+/// Same settle contract as [`settle_local_read_completion`]; the only
+/// difference is that a demand-driven capability observation the step produced
+/// is filed through checked adoption — current basis only, one slot, loop
+/// requirements and unrelated slots preserved — instead of replacing the whole
+/// projection. A stale delta is refused without touching readiness, and the
+/// step's own read/submit outcome still settles exactly once either way.
 fn settle_local_read_completion_updating_readiness(
     completion: LocalReadCompletion,
     flight: &mut LocalReadFlight,
@@ -1943,7 +1968,22 @@ fn settle_local_read_completion_updating_readiness(
     let LocalReadCompletion::Settled(Ok(step)) = &completion else {
         return settle_local_read_completion(completion, flight);
     };
-    *startup_readiness = step.readiness.clone();
+    // Adopt the flight's own observation, if it made one, before the outcome
+    // settles. Adoption is synchronous and touches at most one slot; a refused
+    // delta leaves the loop's projection exactly as the heartbeat and earlier
+    // adoptions left it.
+    if let Some(delta) = &step.delta {
+        let adoption = startup_readiness
+            .adopt_local_delta(delta)
+            .map_err(|error| format!("daemon local-read delta adoption: {error}"))?;
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.local_read_delta_adoption",
+            outcome = local_read_outcome_name(&step.outcome),
+            adoption = local_delta_adoption_name(&adoption),
+            readiness = %startup_readiness.report(),
+        );
+    }
     settle_local_read_completion(completion, flight)
 }
 
@@ -1954,6 +1994,26 @@ fn local_read_outcome_name(outcome: &LocalReadPollOutcome) -> &'static str {
         LocalReadPollOutcome::Accepted => "accepted",
         LocalReadPollOutcome::Expired => "expired",
         LocalReadPollOutcome::StaleAttempt => "stale_attempt",
+    }
+}
+
+/// Names the readiness delta one settled local-read step carried, if any.
+fn local_read_delta_name(delta: Option<&LocalReadinessDelta>) -> &'static str {
+    match delta {
+        Some(delta) => delta.capability().as_str(),
+        None => "none",
+    }
+}
+
+/// Names one local-read delta adoption disposition for the loop's own record.
+fn local_delta_adoption_name(adoption: &LocalDeltaAdoption) -> &'static str {
+    match adoption {
+        LocalDeltaAdoption::Adopted { .. } => "adopted",
+        LocalDeltaAdoption::Duplicate => "duplicate",
+        LocalDeltaAdoption::Stale { conflict } => match conflict {
+            LocalDeltaConflict::OwnerContextChanged => "stale_owner_context",
+            LocalDeltaConflict::SlotChanged => "stale_slot",
+        },
     }
 }
 
@@ -1969,7 +2029,7 @@ fn local_read_outcome_name(outcome: &LocalReadPollOutcome) -> &'static str {
 async fn run_local_read_poll(
     kernel: &DaemonKernelClient,
     composition: SharedComposition,
-    mut startup_readiness: StartupReadinessProjection,
+    startup_readiness: StartupReadinessProjection,
 ) -> Result<LocalReadStep, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
@@ -1979,13 +2039,15 @@ async fn run_local_read_poll(
         .await
         .map_err(|error| format!("Kernel local-read pair claim: {error}"))?;
     let Some((envelope, tool, attempt)) = pair else {
+        // #2647: an empty claim observed nothing, so it carries no delta.
         return Ok(LocalReadStep {
             outcome: LocalReadPollOutcome::IdleBackoff,
-            readiness: startup_readiness,
+            delta: None,
         });
     };
-    let step = |outcome: LocalReadPollOutcome, readiness: StartupReadinessProjection| {
-        LocalReadStep { outcome, readiness }
+    let step = |outcome: LocalReadPollOutcome, delta: Option<LocalReadinessDelta>| LocalReadStep {
+        outcome,
+        delta,
     };
     // Issue #2559: the composition guard is held only around the Skill
     // drive, which borrows the Governor owner. Ordinary forwarded reads use
@@ -2009,7 +2071,11 @@ async fn run_local_read_poll(
     // same idempotent submit leg, so a capability refusal is never a dropped
     // pair.
     if eliotd::skill_dispatch::is_skill_tool(&tool) {
-        let refused = skill_capability_refusal(&mut startup_readiness);
+        // #2647: one demand-driven attempt per flight. The attach runs at most
+        // once here; its observation travels with the step whether this demand
+        // is refused or served, and the loop adopts it only while the
+        // snapshot's basis is still current.
+        let (refused, delta) = skill_capability_refusal(&startup_readiness)?;
         if let Some(refusal) = refused {
             let body = eliotd::skill_dispatch::skill_result_body(
                 &envelope,
@@ -2024,10 +2090,8 @@ async fn run_local_read_poll(
                 LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
                 LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
             };
-            return Ok(step(outcome, startup_readiness));
+            return Ok(step(outcome, delta));
         }
-    }
-    if eliotd::skill_dispatch::is_skill_tool(&tool) {
         let body = {
             let guard = composition.lock().await;
             eliotd::skill_dispatch::serve_skill_pair(&guard, kernel, &envelope, &tool, &attempt)
@@ -2038,7 +2102,7 @@ async fn run_local_read_poll(
             LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
             LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
         };
-        return Ok(step(outcome, startup_readiness));
+        return Ok(step(outcome, delta));
     }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
@@ -2048,34 +2112,57 @@ async fn run_local_read_poll(
         LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
         LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
     };
-    Ok(step(outcome, startup_readiness))
+    // #2647: an ordinary forwarded read produces no readiness observation.
+    Ok(step(outcome, None))
 }
 
 /// Re-evaluates the Skill startup capabilities this demand names, and returns
 /// the exact refusal when one of them is still unavailable afterwards (#2560).
 ///
+/// The demand-driven refresh runs against a working copy of the flight's
+/// immutable snapshot, so the refusal decision observes the real attach
+/// outcome without mutating any shared state (#2647). The observation the
+/// attach actually produced — if it ran at all — travels back as the step's
+/// bounded delta, bound to this snapshot's basis; the loop adopts it only
+/// while that basis is still current.
+///
 /// Thin seam over [`eliotd::startup_readiness::reevaluate_demanded_capability`]:
 /// the real owner attach is supplied here because this is the module that owns
 /// it, and the readiness module stays IO-free.
-fn skill_capability_refusal(startup_readiness: &mut StartupReadinessProjection) -> Option<String> {
+fn skill_capability_refusal(
+    snapshot: &StartupReadinessProjection,
+) -> Result<(Option<String>, Option<LocalReadinessDelta>), String> {
+    let mut working = snapshot.clone();
+    let mut observed: Option<Result<RetainedStartupBinding, String>> = None;
     eliotd::startup_readiness::reevaluate_demanded_capability(
-        startup_readiness,
+        &mut working,
         DeclaredStartupCapability::SkillToolSource,
         || {
-            attach_skill_tool_source().map(|admitted_definition_version| {
+            let outcome = attach_skill_tool_source().map(|admitted_definition_version| {
                 RetainedStartupBinding::SkillToolSource {
                     admitted_definition_version,
                 }
-            })
+            });
+            observed = Some(outcome.clone());
+            outcome
         },
-    );
-    eliotd::startup_readiness::refuse_unavailable_capabilities(
-        startup_readiness,
+    )
+    .map_err(|error| format!("daemon skill capability refresh: {error}"))?;
+    let refusal = eliotd::startup_readiness::refuse_unavailable_capabilities(
+        &working,
         &[
             DeclaredStartupCapability::SkillToolSource,
             DeclaredStartupCapability::SkillToolBasis,
         ],
-    )
+    );
+    let delta = observed.map(|observed| {
+        snapshot.prepare_local_delta(eliotd::startup_readiness::CapabilityRefresh {
+            capability: DeclaredStartupCapability::SkillToolSource,
+            reason: eliotd::startup_readiness::StartupRefreshReason::CapabilityDemanded,
+            observed,
+        })
+    });
+    Ok((refusal, delta))
 }
 
 /// Submits one forwarded local-read result body, retrying once with the

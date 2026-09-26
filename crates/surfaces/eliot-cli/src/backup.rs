@@ -33,6 +33,15 @@
 //! [`backup_class`] is the one documented spelling decoder for both
 //! spellings; the Kernel route carries the mirrored decoder for the same
 //! reason, because a binary crate cannot import a surface crate.
+//!
+//! The advertised protocol effect classification and proof ceiling are not
+//! restated here either. [`catalogued_ceiling`] reads them from the closed
+//! `CommandSpec` row through the same catalogue lookup
+//! `CommandResponse::validate_for` uses, and [`respond`] then runs that same
+//! parity check on this path. `eliot backup` does not travel through
+//! `CommandCatalogue::dispatch`, so without both steps the backup surface
+//! would report a classification no catalogue row states and no check would
+//! compare: one classification owner, checked, never a second literal.
 
 use std::fmt::Write as _;
 
@@ -45,7 +54,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use super::{
-    CliError, CommandArguments, CommandId, CommandRequest, CommandResponse, CommandResult,
+    CliError, CommandArguments, CommandCatalogue, CommandId, CommandRequest, CommandResponse,
+    CommandResult,
     kernel_client::{KernelClient, KernelClientError},
 };
 
@@ -638,6 +648,25 @@ fn envelope_gates(response: &Value) -> Result<Vec<String>, BackupClientError> {
         .collect()
 }
 
+/// The closed effect class and proof ceiling the catalogue advertises for one
+/// routed backup command.
+///
+/// The three backup `CommandSpec` rows in `lib.rs` are the single source for
+/// both values. This reads them through the same
+/// `CommandCatalogue::find` lookup `CommandResponse::validate_for` uses, so a
+/// catalogue edit that reclassifies a backup command changes what this surface
+/// reports instead of silently diverging from it, and this module carries no
+/// second effect-class or proof-ceiling literal for any backup command. A
+/// command with no row is an unknown command, exactly as in the dispatch path.
+fn catalogued_ceiling(
+    command: CommandId,
+) -> Result<(EffectClass, ProofCeiling), BackupClientError> {
+    let spec = CommandCatalogue::current()
+        .find(command)
+        .map_err(BackupClientError::Client)?;
+    Ok((spec.effect, spec.proof_ceiling))
+}
+
 fn respond(
     request: &CommandRequest,
     command: CommandId,
@@ -646,7 +675,7 @@ fn respond(
     if outcome.operation_id != request.request.idempotency_key.as_str() {
         return Err(BackupClientError::Client(CliError::CorrelationMismatch));
     }
-    Ok(CommandResponse {
+    let response = CommandResponse {
         request: request.request.clone(),
         command,
         effect: outcome.effect,
@@ -655,7 +684,17 @@ fn respond(
             payload: serde_json::to_value(outcome)
                 .map_err(|_| BackupClientError::Client(CliError::ResultMismatch))?,
         },
-    })
+    };
+    // `eliot backup` reaches the Kernel through its own front door and never
+    // through `CommandCatalogue::dispatch`, so the closed effect-class and
+    // proof-ceiling parity check that binds a catalogue row to its response is
+    // run here rather than assumed. The two values were read from that same
+    // row, so an honest catalogue stays consistent and an edited one refuses
+    // instead of reporting a classification no row states.
+    response
+        .validate_for(CommandCatalogue::current(), request)
+        .map_err(BackupClientError::Client)?;
+    Ok(response)
 }
 
 fn next_action(state: &str, operation: &str, operation_id: &str) -> String {
@@ -744,6 +783,10 @@ pub fn backup_create(
     require_command(request, CommandId::BackupCreate).map_err(BackupClientError::Client)?;
     let params = create_params(request)?;
     let operation_id = request.request.idempotency_key.clone();
+    // Create requests an archive capture, so the classification this operation
+    // may reach is the catalogue's own reversible-mutation row at the
+    // candidate-artifact ceiling — never a read, and never a second literal.
+    let (effect, proof_ceiling) = catalogued_ceiling(CommandId::BackupCreate)?;
     client.set_request_identity(request.request.clone());
     // `transact_json` already sets `operation` as the envelope's routing
     // selector, so the body carries command fields only. Repeating the
@@ -782,8 +825,8 @@ pub fn backup_create(
         // scope above is reported.
         source_identity: None,
         destination_identity: None,
-        effect: EffectClass::ReversibleMutation,
-        proof_ceiling: ProofCeiling::CandidateArtifact,
+        effect,
+        proof_ceiling,
         proof_level: BackupStage::Requested,
         gates_passed: Vec::new(),
         missing_obligations: vec![missing_owner],
@@ -809,6 +852,10 @@ pub fn backup_verify(
     require_command(request, CommandId::BackupVerify).map_err(BackupClientError::Client)?;
     let params = verify_params(request)?;
     let operation_id = request.request.idempotency_key.clone();
+    // Bounded verification is the catalogue's candidate row at the
+    // candidate-artifact ceiling: verification proves an archive, never an
+    // installation change, and the pair is read, never restated.
+    let (effect, proof_ceiling) = catalogued_ceiling(CommandId::BackupVerify)?;
     client.set_request_identity(request.request.clone());
     let payload = json!({
         "bundle_hex": params.bundle_hex.as_str(),
@@ -839,8 +886,8 @@ pub fn backup_verify(
         // installation identity, and the surface never invents one.
         source_identity: None,
         destination_identity: None,
-        effect: EffectClass::Candidate,
-        proof_ceiling: ProofCeiling::CandidateArtifact,
+        effect,
+        proof_ceiling,
         proof_level: BackupStage::Requested,
         gates_passed: Vec::new(),
         missing_obligations: Vec::new(),
@@ -915,6 +962,10 @@ pub fn backup_restore_test(
     require_command(request, CommandId::BackupRestoreTest).map_err(BackupClientError::Client)?;
     let params = restore_test_params(request)?;
     let operation_id = request.request.idempotency_key.clone();
+    // The rehearsal is the catalogue's candidate row at the candidate-artifact
+    // ceiling: a rehearsal is not a cutover, so the pair is read from the same
+    // row the dispatch path compares against, never restated here.
+    let (effect, proof_ceiling) = catalogued_ceiling(CommandId::BackupRestoreTest)?;
     client.set_request_identity(request.request.clone());
     let payload = json!({
         "bundle_hex": params.bundle_hex.as_str(),
@@ -951,8 +1002,8 @@ pub fn backup_restore_test(
         // isolated destination store. Neither is defaulted.
         source_identity: Some(params.capture_operation_id.clone()),
         destination_identity: Some(params.dest_store_id.clone()),
-        effect: EffectClass::Candidate,
-        proof_ceiling: ProofCeiling::CandidateArtifact,
+        effect,
+        proof_ceiling,
         // Gates proven, execution blocked: a rehearsal is never a
         // completed rehearsal, and never a cutover.
         proof_level: BackupStage::Requested,

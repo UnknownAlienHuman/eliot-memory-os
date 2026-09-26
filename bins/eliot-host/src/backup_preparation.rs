@@ -15,11 +15,29 @@
 //! source shutdown, no SCM contact, no registry writes, no archive import, no
 //! cutover. Launch/readiness/effect authority have no representation here by
 //! construction (see case 958/10).
+//!
+//! # Configuration projection
+//!
+//! Preparation is gated by the bounded owner-issued configuration projection
+//! in [`crate::backup_config_projection`], not by a caller assertion.
+//! [`DelegatedPreparation::prepare`] runs
+//! [`OwnerEvidence::project_backup_configuration`] first; its
+//! [`BackupConfigProjection::manifest_digest`] becomes the admitted owner
+//! configuration digest and its [`BackupConfigProjection::projection_digest`]
+//! becomes the admitted [`DestinationAdmission::config_projection_digest`], so
+//! the prepared-destination receipt binds the exact configuration evidence that
+//! was proved. The same step renders the optional forensic audit note through
+//! [`describe_audit_fence`] into
+//! [`DestinationAdmission::audit_fence_note`]; the note stays evidence text
+//! with its non-authoritative ceiling and is never a lease, grant, or
+//! current-state assertion.
 
 use std::path::{Path, PathBuf};
 
 use crate::backup_config_projection::{
-    ApprovedBuildBinding, ProjectionError, bind_approved_build, hash_field,
+    ApprovedBuildBinding, AuditFenceNote, BackupConfigProjection, BackupConfigRequest,
+    ProjectionError, bind_approved_build, describe_audit_fence, hash_field,
+    project_backup_config_owner_bound,
 };
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry,
@@ -37,6 +55,17 @@ use thiserror::Error;
 pub const PREPARATION_VERSION: u32 = 1;
 /// Maximum length of one bounded identity string.
 pub const MAX_IDENTITY_LEN: usize = 256;
+/// Maximum length of the rendered forensic audit note carried in an admission.
+///
+/// A receipt-size bound, not an authority bound: the note has no authority to
+/// check because it can never be a lease, grant, or current-state assertion.
+///
+/// Sized so it can always hold the largest note the projector admits — 64
+/// dispositions of 256 bytes each, their separators, the 64-character note
+/// digest, and the fixed ceiling wording (16 615 bytes). A smaller bound would
+/// let preparation refuse a note the projector had already accepted, which
+/// would report a receipt-size limit as an evidence failure.
+pub const MAX_AUDIT_NOTE_LEN: usize = 16615;
 /// Domain separator for owner-minted destination identities.
 pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
 
@@ -86,6 +115,139 @@ pub enum PreparationError {
     /// Filesystem effect failed after admission (message only).
     #[error("filesystem effect failed at {path}: {reason}")]
     FilesystemEffect { path: String, reason: String },
+}
+
+// F-LOG-HOST-8 (#983) backup preparation diagnostics: observation-only helpers.
+//
+// Through the #889 facade's target and bounded-field helpers only, on the
+// existing subscriber; the Event Log seam stays typed-Unavailable (never
+// implemented here, #984 still open). `EntrypointStage` describes process
+// startup/shutdown, not backup phases, so these observations carry local event
+// names and never reuse that enum.
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static tokens or validated numeric facts
+// (generations, owner-minted destination epochs); never operation/installation
+// strings, paths, digests, nonces, reasons, `redacted_debug()` text, or
+// arbitrary error `Debug`/`Display` (a canary stays absent even inside an
+// alleged identity string). Truncation bounds size, never sensitivity. Before
+// validation only the static attempt record fires. Macro arguments are
+// precomputed pure values; sink outcome never alters call counts, order,
+// results, receipts, rollback, or cleanup, and stdout framing is untouched
+// (facade stderr subscriber). No owner reads, effects, hashing, retries, or
+// mutation are added for logging.
+//
+// Terminal ownership (W4): the leaf emits nonterminal phase/refusal evidence
+// only, with no dedup cache. Child phase records may remain beneath one
+// caller-level record. The single terminal record per failed operation belongs
+// to the outer caller boundary, which owns the one `observe_terminal_error`
+// call. Handoff (caller-owned, not applied here): `prepare_backup_destination`
+// / `backup_dispatch_prepare` and the reconcile/cancel/cleanup holders arm one
+// terminal guard each with a frozen `host-backup-prepare-failed` code;
+// operation failure stays distinct from any process shutdown failure.
+//
+// Explicit no-event list: `DelegatedPreparation::{reconcile, cancel, cleanup}`
+// (pure passthroughs; the inner operation owns the record),
+// `OwnerEvidence::approved_binding` (mapping adapter covered by the inner bind
+// and outer delegate records), `BackupCallerAuth::{check_shapes, authenticate}`
+// (the former surfaces through `authenticate_for_owner`; the latter is the
+// pending-#954 always-refuse stub with no production path),
+// `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
+// /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
+// /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
+// (private steps whose outcome surfaces with its exact category at the owning
+// boundary). No record asserts destination readiness, source retirement, or
+// activation: `destination_epoch` is preparation scope, never authority.
+
+/// Operation tokens for preparation diagnostics (stable, static only).
+const OP_PREPARE: &str = "prepare";
+const OP_RECONCILE: &str = "reconcile";
+const OP_CANCEL: &str = "cancel";
+const OP_CLEANUP: &str = "cleanup";
+const OP_DELEGATE: &str = "delegate_prepare";
+const OP_OWNER_EVIDENCE: &str = "owner_evidence";
+const OP_SOURCE_ROOT: &str = "source_root";
+const OP_STAGING_LEASE: &str = "staging_lease";
+const OP_CALLER_AUTH: &str = "caller_auth";
+
+/// Notes the facade's actual Event Log seam status (typed-unavailable).
+fn backup_prepare_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+/// Projects one [`PreparationError`] to its stable diagnostic category plus a
+/// static facet. Pure and exhaustive; carries no paths, reasons, or
+/// operation/installation strings.
+#[must_use]
+fn preparation_error_category(error: &PreparationError) -> (&'static str, &'static str) {
+    match *error {
+        PreparationError::InvalidRequest { field, .. } => ("invalid_request", field),
+        PreparationError::UnapprovedGeneration { .. } => ("unapproved_generation", "generation"),
+        PreparationError::ArbitraryPath { .. } => ("arbitrary_path", "path"),
+        PreparationError::SourceIsActive => ("source_is_active", "source_root"),
+        PreparationError::ForeignContent { .. } => ("foreign_content", "destination_root"),
+        PreparationError::AliasSubstitution { .. } => ("alias_substitution", "path"),
+        PreparationError::IdentityConflict { .. } => ("identity_conflict", "root_identity"),
+        PreparationError::ConflictField { field } => ("conflict_field", field),
+        PreparationError::UnknownState { .. } => ("unknown_state", "operation"),
+        PreparationError::JournalFault(_) => ("journal_fault", "journal"),
+        PreparationError::PlatformUnsupported => ("platform_unsupported", "platform"),
+        PreparationError::FilesystemEffect { .. } => ("filesystem_effect", "path"),
+    }
+}
+
+/// Observes one nonterminal preparation phase outcome after the decision
+/// exists. `approved_generation` is carried only once validated (else 0), and
+/// `destination_epoch` only from a produced destination (else 0); 0 marks a
+/// fact this boundary does not carry, never a real epoch.
+fn observe_prepare_progress(
+    op: &'static str,
+    phase: &'static str,
+    outcome: &'static str,
+    approved_generation: u64,
+    destination_epoch: u64,
+) {
+    backup_prepare_note_event_log_unavailable();
+    let op = crate::host_diagnostics::bound_field(op);
+    let phase = crate::host_diagnostics::bound_field(phase);
+    let outcome = crate::host_diagnostics::bound_field(outcome);
+    tracing::info!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.prepare_phase",
+        op = op.text(),
+        phase = phase.text(),
+        outcome = outcome.text(),
+        approved_generation = approved_generation,
+        destination_epoch = destination_epoch,
+        "host backup preparation phase observed"
+    );
+}
+
+/// Observes one typed preparation refusal after the decision exists, then hands
+/// the unchanged error back. Terminal ownership stays with the outer caller.
+fn note_prepare_error(
+    op: &'static str,
+    phase: &'static str,
+    error: PreparationError,
+    approved_generation: u64,
+) -> PreparationError {
+    backup_prepare_note_event_log_unavailable();
+    let (category, field) = preparation_error_category(&error);
+    let op = crate::host_diagnostics::bound_field(op);
+    let phase = crate::host_diagnostics::bound_field(phase);
+    let category = crate::host_diagnostics::bound_field(category);
+    let field = crate::host_diagnostics::bound_field(field);
+    tracing::warn!(
+        target: crate::host_diagnostics::HOST_DIAGNOSTICS_TARGET,
+        event = "host.backup.prepare_refusal",
+        op = op.text(),
+        phase = phase.text(),
+        category = category.text(),
+        field = field.text(),
+        approved_generation = approved_generation,
+        "host backup preparation refused"
+    );
+    error
 }
 
 /// Closed preparation class set (issue #958, case 958/18 guard).
@@ -139,8 +301,22 @@ pub struct DestinationAdmission {
     pub approved_generation: u64,
     /// Live authority generation presented by the caller; must equal approved.
     pub authority_generation: u64,
-    /// Config manifest digest the destination must match (hex64).
+    /// Config manifest digest the destination must match (hex64). On the
+    /// delegated path this is the projected owner-issued configuration digest,
+    /// never a caller-presented one.
     pub manifest_digest: String,
+    /// Owner-issued configuration projection digest proved for this request
+    /// (hex64). It binds the owner lease reference, approved generation,
+    /// purge-ledger revision, owner authority state fence, owner-issued
+    /// configuration/build digests and the optional forensic note, so the
+    /// prepared-destination receipt names the exact configuration evidence
+    /// that was proved.
+    pub config_projection_digest: String,
+    /// Optional rendered forensic audit note, with its non-authoritative
+    /// ceiling stated by [`describe_audit_fence`]. It is carried as evidence
+    /// text only and can never act as a lease, grant, or current-state
+    /// assertion; no API converts it into one.
+    pub audit_fence_note: Option<String>,
     /// Opaque owner-issued entropy for fresh identity derivation (bounded text).
     pub authority_nonce: String,
     /// Caller-observed state fence bound into the receipt.
@@ -152,7 +328,8 @@ impl DestinationAdmission {
     pub fn redacted_debug(&self) -> String {
         format!(
             "DestinationAdmission {{ operation_id: {}, class: {:?}, installation: {}, \
-             target: {}:{}, generation: {}, manifest: {}.., nonce_len: {} }}",
+             target: {}:{}, generation: {}, manifest: {}.., config_projection: {}.., \
+             audit_note: {}, nonce_len: {} }}",
             self.operation_id,
             self.class,
             self.source_installation_id,
@@ -160,6 +337,11 @@ impl DestinationAdmission {
             self.target_profile,
             self.approved_generation,
             self.manifest_digest.chars().take(16).collect::<String>(),
+            self.config_projection_digest
+                .chars()
+                .take(16)
+                .collect::<String>(),
+            self.audit_fence_note.is_some(),
             self.authority_nonce.len(),
         )
     }
@@ -187,6 +369,15 @@ pub struct PreparedDestination {
     pub destination_epoch: u64,
     /// Admission receipt digest binding the admitted inputs.
     pub admission_digest: String,
+    /// Owner-issued configuration projection digest this destination was
+    /// admitted under (hex64). Present so the prepared-destination receipt
+    /// states the proved configuration evidence directly instead of only
+    /// through [`PreparedDestination::admission_digest`].
+    pub config_projection_digest: String,
+    /// Optional rendered forensic audit note, with its non-authoritative
+    /// ceiling stated. Evidence text only; never a lease, grant, or
+    /// current-state assertion.
+    pub audit_fence_note: Option<String>,
 }
 
 /// Reconcile disposition for one operation (issue #958, cases 958/12, 958/14).
@@ -255,6 +446,23 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), PreparationError
         return Err(PreparationError::InvalidRequest {
             field,
             reason: "64 lowercase hex chars required".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Bounds the rendered forensic audit note carried in an admission (case 958/3).
+///
+/// The note text is produced by
+/// [`describe_audit_fence`](crate::backup_config_projection::describe_audit_fence)
+/// from already-validated note fields, so this is purely a receipt-size and
+/// printable-text bound. There is deliberately no authority check here because
+/// the note can never be a lease, grant, or current-state assertion.
+fn check_audit_note(note: &str) -> Result<(), PreparationError> {
+    if note.is_empty() || note.len() > MAX_AUDIT_NOTE_LEN || note.chars().any(char::is_control) {
+        return Err(PreparationError::InvalidRequest {
+            field: "audit_fence_note",
+            reason: "bounded printable forensic note text required".to_owned(),
         });
     }
     Ok(())
@@ -336,9 +544,17 @@ fn hash_path(hasher: &mut Sha256, label: &[u8], path: &Path) {
 ///
 /// v2 hashes every field of [`DestinationAdmission`], length-prefixed and
 /// domain-separated, with paths encoded losslessly.
+///
+/// v3 adds the two configuration-projection fields. Leaving them out while
+/// [`conflict_field`] compared them would recreate exactly the v2 defect one
+/// level up: the delegated path proves the owner-issued configuration
+/// projection and then carries `config_projection_digest` and
+/// `audit_fence_note`, so an admission digest that hashed neither would let
+/// two different proved configuration projections reuse one idempotency key
+/// and return the same recorded destination.
 fn admission_digest(admission: &DestinationAdmission) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"eliot.backup.destination-admission.v2\0");
+    hasher.update(b"eliot.backup.destination-admission.v3\0");
     hasher.update(PREPARATION_VERSION.to_le_bytes());
     hash_field(
         &mut hasher,
@@ -372,6 +588,18 @@ fn admission_digest(admission: &DestinationAdmission) -> String {
         b"manifest_digest",
         admission.manifest_digest.as_bytes(),
     );
+    hash_field(
+        &mut hasher,
+        b"config_projection_digest",
+        admission.config_projection_digest.as_bytes(),
+    );
+    match &admission.audit_fence_note {
+        Some(note) => {
+            hash_field(&mut hasher, b"audit_fence_note", b"present");
+            hash_field(&mut hasher, b"audit_fence_note.text", note.as_bytes());
+        }
+        None => hash_field(&mut hasher, b"audit_fence_note", b"absent"),
+    }
     hash_field(
         &mut hasher,
         b"authority_nonce",
@@ -549,6 +777,13 @@ fn validate_admission(admission: &DestinationAdmission) -> Result<(), Preparatio
     check_identity(&admission.target_build, "target_build")?;
     check_identity(&admission.target_profile, "target_profile")?;
     check_digest(&admission.manifest_digest, "manifest_digest")?;
+    check_digest(
+        &admission.config_projection_digest,
+        "config_projection_digest",
+    )?;
+    if let Some(note) = &admission.audit_fence_note {
+        check_audit_note(note)?;
+    }
     check_digest(&admission.state_fence_digest, "state_fence_digest")?;
     check_identity(&admission.authority_nonce, "authority_nonce")?;
     if admission.approved_generation == 0 {
@@ -615,7 +850,7 @@ fn intent_json(admission: &DestinationAdmission, digest: &str, root: &Path) -> s
 /// Names the first differing admission field between the recorded intent and
 /// a changed re-presentation (case 958/13).
 ///
-/// The compared list mirrors the v2 [`admission_digest`] hashed set exactly.
+/// The compared list mirrors the v3 [`admission_digest`] hashed set exactly.
 /// `source_root` was missing here while being the field that decides which
 /// installation is the live source, so a conflict could never name it.
 fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) -> &'static str {
@@ -631,6 +866,8 @@ fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) 
         "approved_generation",
         "authority_generation",
         "manifest_digest",
+        "config_projection_digest",
+        "audit_fence_note",
         "authority_nonce",
         "state_fence_digest",
     ] {
@@ -650,6 +887,8 @@ fn result_json(destination: &PreparedDestination) -> serde_json::Value {
         "destination_id": destination.destination_id,
         "destination_epoch": destination.destination_epoch,
         "admission_digest": destination.admission_digest,
+        "config_projection_digest": destination.config_projection_digest,
+        "audit_fence_note": destination.audit_fence_note,
     })
 }
 
@@ -657,6 +896,13 @@ fn destination_from_result(
     operation_id: &str,
     result: &serde_json::Value,
 ) -> Option<PreparedDestination> {
+    let audit_fence_note = match result.get("audit_fence_note") {
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Null) | None => None,
+        // A present but wrong-typed note is a malformed record, not an absent
+        // one: treating it as absent would let a tampered result round-trip.
+        Some(_) => return None,
+    };
     Some(PreparedDestination {
         operation_id: operation_id.to_owned(),
         root: PathBuf::from(result.get("root")?.as_str()?),
@@ -666,6 +912,8 @@ fn destination_from_result(
         destination_id: result.get("destination_id")?.as_str()?.to_owned(),
         destination_epoch: result.get("destination_epoch")?.as_u64()?,
         admission_digest: result.get("admission_digest")?.as_str()?.to_owned(),
+        config_projection_digest: result.get("config_projection_digest")?.as_str()?.to_owned(),
+        audit_fence_note,
     })
 }
 
@@ -675,43 +923,81 @@ fn destination_from_result(
 /// recorded destination; changed inputs conflict by field) → record intent →
 /// admit parent → create root → pin identity → record result. The source root
 /// is only ever read for comparison, never modified.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the preparation order (validate, replay, intent, admit, effect, identity, result) stays in one boundary so no phase observation can be skipped between neighbors"
+)]
 pub fn prepare_isolated_destination<J: PreparationJournal>(
     journal: &mut J,
     admission: &DestinationAdmission,
 ) -> Result<PreparedDestination, PreparationError> {
-    validate_admission(admission)?;
+    // Static attempt record before validation; the operation id is unvalidated
+    // caller text here and is never logged.
+    observe_prepare_progress(OP_PREPARE, "attempt", "attempted", 0, 0);
+    validate_admission(admission)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "validate", error, 0))?;
+    let generation = admission.approved_generation;
     let digest = admission_digest(admission);
-    if let Some((intent, result)) = journal.load(&admission.operation_id)? {
+    let recorded_entry = journal
+        .load(&admission.operation_id)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "replay_check", error, generation))?;
+    if let Some((intent, result)) = recorded_entry {
         let recorded = intent
             .get("admission_digest")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if recorded != digest {
-            return Err(PreparationError::ConflictField {
-                field: conflict_field(&intent, admission),
-            });
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::ConflictField {
+                    field: conflict_field(&intent, admission),
+                },
+                generation,
+            ));
         }
         if let Some(result) = result {
             if let Some(destination) = destination_from_result(&admission.operation_id, &result) {
-                let live = capture_identity(&destination.root).map_err(|_| {
-                    PreparationError::UnknownState {
+                let live = capture_identity(&destination.root)
+                    .map_err(|_| PreparationError::UnknownState {
                         operation: admission.operation_id.clone(),
                         reason: "recorded root no longer observable; preserved".to_owned(),
-                    }
-                })?;
+                    })
+                    .map_err(|error| {
+                        note_prepare_error(OP_PREPARE, "replay_check", error, generation)
+                    })?;
                 if live != destination.root_identity {
-                    return Err(PreparationError::IdentityConflict {
-                        operation: admission.operation_id.clone(),
-                        recorded: destination.root_identity.identity.clone(),
-                        observed: live.identity.clone(),
-                    });
+                    return Err(note_prepare_error(
+                        OP_PREPARE,
+                        "replay_check",
+                        PreparationError::IdentityConflict {
+                            operation: admission.operation_id.clone(),
+                            recorded: destination.root_identity.identity.clone(),
+                            observed: live.identity.clone(),
+                        },
+                        generation,
+                    ));
                 }
+                // Observed replay, not a second effect: the recorded
+                // destination is re-verified and reused unchanged.
+                observe_prepare_progress(
+                    OP_PREPARE,
+                    "replay_check",
+                    "replay_observed",
+                    generation,
+                    destination.destination_epoch,
+                );
                 return Ok(destination);
             }
-            return Err(PreparationError::UnknownState {
-                operation: admission.operation_id.clone(),
-                reason: "result record malformed; preserved for inspection".to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::UnknownState {
+                    operation: admission.operation_id.clone(),
+                    reason: "result record malformed; preserved for inspection".to_owned(),
+                },
+                generation,
+            ));
         }
         // Intent without result: a crash between intent and result recording.
         // Root absent means nothing exists: fall through and prepare fresh
@@ -722,30 +1008,47 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if !intent_root.is_empty() && Path::new(intent_root).exists() {
-            return Err(PreparationError::UnknownState {
-                operation: admission.operation_id.clone(),
-                reason: "intent without verifiable result and root present; reconcile before retry"
-                    .to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_PREPARE,
+                "replay_check",
+                PreparationError::UnknownState {
+                    operation: admission.operation_id.clone(),
+                    reason:
+                        "intent without verifiable result and root present; reconcile before retry"
+                            .to_owned(),
+                },
+                generation,
+            ));
         }
     }
-    let canonical_parent = admit_staging_parent(admission)?;
+    let canonical_parent = admit_staging_parent(admission)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "admit_parent", error, generation))?;
     let destination_id = derive_destination_id(&admission.operation_id, &admission.authority_nonce);
     let root = canonical_parent.join(format!("dest-{destination_id}"));
     if root.exists() {
-        return Err(PreparationError::ForeignContent {
-            path: root.to_string_lossy().into_owned(),
-        });
+        return Err(note_prepare_error(
+            OP_PREPARE,
+            "create_root",
+            PreparationError::ForeignContent {
+                path: root.to_string_lossy().into_owned(),
+            },
+            generation,
+        ));
     }
-    journal.record_intent(
-        &admission.operation_id,
-        &intent_json(admission, &digest, &root),
-    )?;
-    std::fs::create_dir(&root).map_err(|error| PreparationError::FilesystemEffect {
-        path: root.to_string_lossy().into_owned(),
-        reason: format!("destination creation failed: {error}"),
-    })?;
-    let identity = capture_identity(&root)?;
+    journal
+        .record_intent(
+            &admission.operation_id,
+            &intent_json(admission, &digest, &root),
+        )
+        .map_err(|error| note_prepare_error(OP_PREPARE, "record_intent", error, generation))?;
+    std::fs::create_dir(&root)
+        .map_err(|error| PreparationError::FilesystemEffect {
+            path: root.to_string_lossy().into_owned(),
+            reason: format!("destination creation failed: {error}"),
+        })
+        .map_err(|error| note_prepare_error(OP_PREPARE, "create_root", error, generation))?;
+    let identity = capture_identity(&root)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "capture_identity", error, generation))?;
     let destination = PreparedDestination {
         operation_id: admission.operation_id.clone(),
         root: root.clone(),
@@ -756,8 +1059,21 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             &admission.authority_nonce,
         ),
         admission_digest: digest,
+        config_projection_digest: admission.config_projection_digest.clone(),
+        audit_fence_note: admission.audit_fence_note.clone(),
     };
-    journal.record_result(&admission.operation_id, &result_json(&destination))?;
+    journal
+        .record_result(&admission.operation_id, &result_json(&destination))
+        .map_err(|error| note_prepare_error(OP_PREPARE, "record_result", error, generation))?;
+    // Fresh preparation observed; this asserts a fenced destination only,
+    // never readiness, retirement, or activation.
+    observe_prepare_progress(
+        OP_PREPARE,
+        "complete",
+        "prepared_fresh",
+        generation,
+        destination.destination_epoch,
+    );
     Ok(destination)
 }
 
@@ -773,9 +1089,14 @@ pub fn reconcile_preparation<J: PreparationJournal>(
     journal: &J,
     operation_id: &str,
 ) -> Result<ReconcileDisposition, PreparationError> {
-    check_identity(operation_id, "operation_id")?;
+    check_identity(operation_id, "operation_id")
+        .map_err(|error| note_prepare_error(OP_RECONCILE, "validate", error, 0))?;
     // Intent proves the operation was admitted; its digest binds the inputs.
-    let Some((intent, result)) = journal.load(operation_id)? else {
+    let recorded = journal
+        .load(operation_id)
+        .map_err(|error| note_prepare_error(OP_RECONCILE, "load", error, 0))?;
+    let Some((intent, result)) = recorded else {
+        observe_prepare_progress(OP_RECONCILE, "outcome", "absent", 0, 0);
         return Ok(ReconcileDisposition::Absent);
     };
     let Some(result) = result else {
@@ -788,23 +1109,40 @@ pub fn reconcile_preparation<J: PreparationJournal>(
             .and_then(|value| value.as_str())
             .is_none_or(|root| !Path::new(root).exists());
         if root_absent {
+            observe_prepare_progress(OP_RECONCILE, "outcome", "absent", 0, 0);
             return Ok(ReconcileDisposition::Absent);
         }
+        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
         return Ok(ReconcileDisposition::Uncertain {
             reason: "intent recorded without result and root present; effects unverified"
                 .to_owned(),
         });
     };
     let Some(destination) = destination_from_result(operation_id, &result) else {
+        observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
         return Ok(ReconcileDisposition::Uncertain {
             reason: "result record malformed; preserved for inspection".to_owned(),
         });
     };
     match reverify_recorded_destination(operation_id, &destination) {
-        Ok(()) => Ok(ReconcileDisposition::Current(destination)),
-        Err(error) => Ok(ReconcileDisposition::Uncertain {
-            reason: error.to_string(),
-        }),
+        Ok(()) => {
+            observe_prepare_progress(
+                OP_RECONCILE,
+                "outcome",
+                "current",
+                0,
+                destination.destination_epoch,
+            );
+            Ok(ReconcileDisposition::Current(destination))
+        }
+        Err(error) => {
+            // The failure text names recorded paths; only the uncertain
+            // outcome is observed, never the error content.
+            observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
+            Ok(ReconcileDisposition::Uncertain {
+                reason: error.to_string(),
+            })
+        }
     }
 }
 
@@ -817,22 +1155,37 @@ pub fn cancel_preparation<J: PreparationJournal>(
     journal: &mut J,
     operation_id: &str,
 ) -> Result<(), PreparationError> {
-    match reconcile_preparation(journal, operation_id)? {
+    match reconcile_preparation(journal, operation_id)
+        .map_err(|error| note_prepare_error(OP_CANCEL, "reconcile", error, 0))?
+    {
         ReconcileDisposition::Current(destination) => {
             let mut envelope = result_json(&destination);
             envelope["status"] = serde_json::Value::String("cancelled".to_owned());
             envelope["prior_receipt"] = result_json(&destination);
-            journal.record_result(operation_id, &envelope)?;
+            journal
+                .record_result(operation_id, &envelope)
+                .map_err(|error| note_prepare_error(OP_CANCEL, "record_result", error, 0))?;
+            observe_prepare_progress(OP_CANCEL, "outcome", "cancelled", 0, 0);
             Ok(())
         }
-        ReconcileDisposition::Absent => Err(PreparationError::UnknownState {
-            operation: operation_id.to_owned(),
-            reason: "nothing recorded; nothing to cancel".to_owned(),
-        }),
-        ReconcileDisposition::Uncertain { reason } => Err(PreparationError::UnknownState {
-            operation: operation_id.to_owned(),
-            reason: format!("reconcile first: {reason}"),
-        }),
+        ReconcileDisposition::Absent => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "nothing recorded; nothing to cancel".to_owned(),
+            },
+            0,
+        )),
+        ReconcileDisposition::Uncertain { reason } => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: format!("reconcile first: {reason}"),
+            },
+            0,
+        )),
     }
 }
 
@@ -857,9 +1210,14 @@ pub fn cleanup_preparations<J: PreparationJournal>(
     operation_ids: &[String],
 ) -> Result<CleanupReport, PreparationError> {
     let mut report = CleanupReport::default();
-    let owned = journal.list_operations()?;
+    let owned = journal
+        .list_operations()
+        .map_err(|error| note_prepare_error(OP_CLEANUP, "list", error, 0))?;
     for requested in operation_ids {
         if !owned.contains(requested) {
+            // Refused, never deleted: a caller can never nominate a deletion.
+            // The requested id itself is unowned caller text and is not logged.
+            observe_prepare_progress(OP_CLEANUP, "sweep", "refused_not_owned", 0, 0);
             report.preserved.push((
                 requested.clone(),
                 "operation is not owned by this journal; refused, never deleted".to_owned(),
@@ -870,16 +1228,20 @@ pub fn cleanup_preparations<J: PreparationJournal>(
         if !operation_ids.is_empty() && !operation_ids.contains(operation_id) {
             continue;
         }
-        match reconcile_preparation(journal, operation_id)? {
+        match reconcile_preparation(journal, operation_id)
+            .map_err(|error| note_prepare_error(OP_CLEANUP, "reconcile", error, 0))?
+        {
             ReconcileDisposition::Current(destination) => {
                 remove_reverified_destination(operation_id, &destination, &mut report);
             }
             ReconcileDisposition::Absent => {
+                observe_prepare_progress(OP_CLEANUP, "sweep", "absent", 0, 0);
                 report
                     .preserved
                     .push((operation_id.clone(), "nothing recorded".to_owned()));
             }
             ReconcileDisposition::Uncertain { reason } => {
+                observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);
                 report.preserved.push((operation_id.clone(), reason));
             }
         }
@@ -899,17 +1261,24 @@ fn remove_reverified_destination(
     report: &mut CleanupReport,
 ) {
     if let Err(error) = reverify_recorded_destination(operation_id, destination) {
+        observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
         report
             .preserved
             .push((operation_id.to_owned(), error.to_string()));
         return;
     }
     match std::fs::remove_dir_all(&destination.root) {
-        Ok(()) => report.removed.push(operation_id.to_owned()),
-        Err(error) => report.preserved.push((
-            operation_id.to_owned(),
-            format!("removal failed, preserved: {error}"),
-        )),
+        Ok(()) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "removed", 0, 0);
+            report.removed.push(operation_id.to_owned());
+        }
+        Err(error) => {
+            observe_prepare_progress(OP_CLEANUP, "remove", "preserved", 0, 0);
+            report.preserved.push((
+                operation_id.to_owned(),
+                format!("removal failed, preserved: {error}"),
+            ));
+        }
     }
 }
 
@@ -931,30 +1300,38 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
         .map_err(|_| PreparationError::InvalidRequest {
             field: "source_roots",
             reason: "owner runtime roots violate topology".to_owned(),
-        })?;
-    let canonical = std::fs::canonicalize(roots.installation_root.as_str()).map_err(|error| {
-        PreparationError::FilesystemEffect {
+        })
+        .map_err(|error| note_prepare_error(OP_SOURCE_ROOT, "resolve", error, 0))?;
+    let canonical = std::fs::canonicalize(roots.installation_root.as_str())
+        .map_err(|error| PreparationError::FilesystemEffect {
             path: roots.installation_root.as_str().to_owned(),
             reason: format!("cannot canonicalize owner installation root: {error}"),
-        }
-    })?;
+        })
+        .map_err(|error| note_prepare_error(OP_SOURCE_ROOT, "resolve", error, 0))?;
     if !canonical.is_dir() {
-        return Err(PreparationError::ArbitraryPath {
-            reason: "owner installation root is not a directory".to_owned(),
-        });
+        return Err(note_prepare_error(
+            OP_SOURCE_ROOT,
+            "resolve",
+            PreparationError::ArbitraryPath {
+                reason: "owner installation root is not a directory".to_owned(),
+            },
+            0,
+        ));
     }
+    observe_prepare_progress(OP_SOURCE_ROOT, "resolve", "resolved", 0, 0);
     Ok(canonical)
 }
 
 /// Caller-presented preparation fields for one delegated operation.
 ///
 /// The configuration manifest digest is deliberately absent: the manifest
-/// always comes from the owner-bound [`ApprovedBuildBinding`], so a caller
-/// can never assert a competing manifest. Presented build digests are
-/// subset-checked against the owner artifact set at preparation time.
-/// Numeric generation, lease, purge, and target build/profile stay
-/// caller-presented pending #954 control contracts and HostComposition
-/// delegation, which authenticate the caller.
+/// always comes from the owner-bound [`ApprovedBuildBinding`] through the
+/// configuration projection, so a caller can never assert a competing
+/// manifest. Presented build digests are subset-checked against the owner
+/// artifact set by that same projection. Numeric generation, lease, purge, and
+/// target build/profile stay caller-presented pending #954 control contracts
+/// and `HostComposition` delegation, which authenticate the caller; the
+/// projection binds them and never invents currency for them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PresentedPreparationRequest {
     /// Operation identity (bounded text, unique per preparation).
@@ -973,8 +1350,20 @@ pub struct PresentedPreparationRequest {
     pub approved_generation: u64,
     /// Live authority generation presented by the caller (presented).
     pub authority_generation: u64,
-    /// Presented build digests, each verified against owner artifacts.
+    /// Owner lease reference the requester presents (bounded text; projected
+    /// and bound into the projection digest, never a secret value).
+    pub owner_lease_ref: String,
+    /// Purge-ledger revision the requester presents (projected and bound into
+    /// the projection digest; owner issuance belongs to #954).
+    pub purge_ledger_revision: u64,
+    /// Presented build digests, each verified against owner artifacts by the
+    /// configuration projection.
     pub build_digests: Vec<String>,
+    /// Optional forensic Host state audit note. It is validated, bound into
+    /// the projection digest, and rendered with its non-authoritative ceiling
+    /// into the prepared-destination receipt; it is never a lease, grant, or
+    /// current-state assertion.
+    pub audit_fence_note: Option<AuditFenceNote>,
     /// Opaque owner-issued entropy for fresh identity derivation.
     pub authority_nonce: String,
     /// Caller-observed state fence bound into the receipt.
@@ -1005,31 +1394,55 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// presented request.
     ///
     /// Order: bind the active approved generation from the inspected
-    /// evidence, resolve the manifest-bound owner source root, subset-check
-    /// presented builds against owner artifacts, admit, then prepare
-    /// idempotently. The manifest digest is always the owner configuration
-    /// digest; generation/lease/purge/target evidence stays presented as
-    /// documented at [`PresentedPreparationRequest`].
+    /// evidence, project the bounded owner-issued configuration evidence
+    /// through the owner-bound projector, resolve the manifest-bound owner
+    /// source root, then admit and prepare idempotently. The projection is a
+    /// precondition, not an observation: a stale or mixed lease, generation,
+    /// configuration/build digest, purge revision or forensic note is refused
+    /// before any filesystem observation, and the projected owner
+    /// configuration digest plus the projection digest are admitted so the
+    /// prepared-destination receipt binds the exact configuration evidence
+    /// that was proved. The caller never chooses the manifest digest, the
+    /// projection digest, or the owner lease.
     pub fn prepare(
         &mut self,
         evidence: &OwnerEvidence,
         request: &PresentedPreparationRequest,
     ) -> Result<PreparedDestination, PreparationError> {
-        let binding: ApprovedBuildBinding = evidence.approved_binding()?;
-        let source_root = resolve_owner_source_root(evidence.runtime_roots())?;
+        let binding: ApprovedBuildBinding = evidence
+            .approved_binding()
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "bind_build", error, 0))?;
+        let source_root = resolve_owner_source_root(evidence.runtime_roots())
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "resolve_source", error, 0))?;
         for digest in &request.build_digests {
-            check_digest(digest, "build_digests")?;
+            check_digest(digest, "build_digests")
+                .map_err(|error| note_prepare_error(OP_DELEGATE, "check_build", error, 0))?;
             if !binding
                 .artifact_digests
                 .iter()
                 .any(|artifact| artifact == digest)
             {
-                return Err(PreparationError::InvalidRequest {
-                    field: "build_digests",
-                    reason: "build digest is not an owner-approved artifact".to_owned(),
-                });
+                return Err(note_prepare_error(
+                    OP_DELEGATE,
+                    "check_build",
+                    PreparationError::InvalidRequest {
+                        field: "build_digests",
+                        reason: "build digest is not an owner-approved artifact".to_owned(),
+                    },
+                    0,
+                ));
             }
         }
+        // The owner-issued configuration projection runs AFTER the checks above
+        // so #983's per-step diagnostics keep their existing precedence, and
+        // BEFORE the admission is built so a stale or mixed lease, generation,
+        // configuration/build digest, purge revision or forensic note is refused
+        // before any effect. The projector re-checks the presented build digests
+        // against the owner-issued artifact set, so the loop above is a first
+        // cheap refusal and this is the authoritative one.
+        let projection: BackupConfigProjection = evidence
+            .project_backup_configuration(request, &binding)
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "project_config", error, 0))?;
         let admission = DestinationAdmission {
             operation_id: request.operation_id.clone(),
             class: request.class,
@@ -1040,11 +1453,20 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
             target_profile: request.target_profile.clone(),
             approved_generation: request.approved_generation,
             authority_generation: request.authority_generation,
-            manifest_digest: binding.config_digest.clone(),
+            manifest_digest: projection.manifest_digest.clone(),
+            config_projection_digest: projection.projection_digest.clone(),
+            // The forensic note reaches the receipt only as rendered evidence
+            // text carrying its own non-authoritative ceiling. There is no
+            // constructor that turns it into a lease, grant, or current-state
+            // assertion, and none is added here.
+            audit_fence_note: request.audit_fence_note.as_ref().map(describe_audit_fence),
             authority_nonce: request.authority_nonce.clone(),
             state_fence_digest: request.state_fence_digest.clone(),
         };
+        // The inner preparation owns its phase records; this notes only the
+        // propagation of its failure to the delegation boundary.
         prepare_isolated_destination(&mut self.journal, &admission)
+            .map_err(|error| note_prepare_error(OP_DELEGATE, "prepare", error, 0))
     }
 
     /// Reconciles one operation without duplicating effects.
@@ -1124,7 +1546,25 @@ impl OwnerEvidence {
     /// fence↔manifest agreement. Any step fails closed with a static
     /// [`PreparationError`]; owner error internals are never echoed.
     /// Absence of proof is never treated as proof of absence.
+    ///
+    /// The outcome is observed once: the static field in each refusal already
+    /// names the failed inspection step, and no path or owner text is logged.
     pub fn inspect(host_state_root: &Path) -> Result<Self, PreparationError> {
+        match Self::inspect_inner(host_state_root) {
+            Ok(evidence) => {
+                observe_prepare_progress(OP_OWNER_EVIDENCE, "inspect", "inspected", 0, 0);
+                Ok(evidence)
+            }
+            Err(error) => Err(note_prepare_error(OP_OWNER_EVIDENCE, "inspect", error, 0)),
+        }
+    }
+
+    /// Inspection body behind the outcome observation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered inspection chain stays in one boundary; the wrapper only observes the outcome"
+    )]
+    fn inspect_inner(host_state_root: &Path) -> Result<Self, PreparationError> {
         if !host_state_root.is_absolute() {
             return Err(PreparationError::InvalidRequest {
                 field: "host_state_root",
@@ -1274,6 +1714,50 @@ impl OwnerEvidence {
         bind_approved_build(&self.approved).map_err(projection_to_preparation)
     }
 
+    /// Projects the bounded owner-issued configuration evidence for one
+    /// presented preparation request (issue #958, cases 958/1-4, 958/16).
+    ///
+    /// This is the production construction of the owner-bound projection. The
+    /// owner supplies three of its inputs and the request supplies only
+    /// presented evidence:
+    ///
+    /// - the manifest digest is the owner-issued configuration digest from
+    ///   `binding`, so a caller can never present a competing manifest;
+    /// - the projection fence is the committed activation fence's authority
+    ///   state fence, so a caller cannot choose the fence its evidence is bound
+    ///   to;
+    /// - the generation handle is bound inside the projector from the same
+    ///   owner record.
+    ///
+    /// Installation identity, owner lease reference, numeric generation,
+    /// purge-ledger revision, presented build digests and the optional
+    /// forensic note are caller-presented and shape-checked here, then bound
+    /// into the returned [`BackupConfigProjection`]. The projector verifies
+    /// presented-vs-owner equality where the owner has evidence and never
+    /// invents currency where it does not: the installation registry, the
+    /// approved generation and the activation commit fence carry no
+    /// owner-issued lease reference and no purge-ledger revision, so those two
+    /// stay presented until #954 control contracts land. No secret-typed field
+    /// exists on this path, and a credential-shaped value fails digest or
+    /// identity shape rather than being projected.
+    pub fn project_backup_configuration(
+        &self,
+        request: &PresentedPreparationRequest,
+        binding: &ApprovedBuildBinding,
+    ) -> Result<BackupConfigProjection, PreparationError> {
+        let config = BackupConfigRequest {
+            installation_id: request.source_installation_id.clone(),
+            owner_lease_ref: request.owner_lease_ref.clone(),
+            generation: request.approved_generation,
+            manifest_digest: binding.config_digest.clone(),
+            build_digests: request.build_digests.clone(),
+            purge_ledger_revision: request.purge_ledger_revision,
+            audit: request.audit_fence_note.clone(),
+        };
+        project_backup_config_owner_bound(&config, binding, &self.fence.authority_state_fence)
+            .map_err(projection_to_preparation)
+    }
+
     /// Returns the registry CAS revision observed at inspection time.
     ///
     /// Binds "current": HostComposition compares revisions to detect
@@ -1295,18 +1779,21 @@ impl OwnerEvidence {
 /// static reasons; lease error internals are echoed only inside
 /// [`PreparationError::FilesystemEffect`], matching file precedent.
 pub fn verify_staging_parent_lease(parent: &Path) -> Result<PathBuf, PreparationError> {
-    let lease = ProtectedRootLease::open_existing(parent).map_err(|error| {
-        PreparationError::FilesystemEffect {
+    let lease = ProtectedRootLease::open_existing(parent)
+        .map_err(|error| PreparationError::FilesystemEffect {
             path: parent.to_string_lossy().into_owned(),
             reason: format!("staging parent is not a protected root: {error}"),
-        }
-    })?;
-    lease
+        })
+        .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
+    let verified = lease
         .canonical_path()
         .map_err(|error| PreparationError::FilesystemEffect {
             path: parent.to_string_lossy().into_owned(),
             reason: format!("staging parent identity changed during admission: {error}"),
         })
+        .map_err(|error| note_prepare_error(OP_STAGING_LEASE, "verify", error, 0))?;
+    observe_prepare_progress(OP_STAGING_LEASE, "verify", "verified", 0, 0);
+    Ok(verified)
 }
 
 /// Authenticated caller control for one delegated preparation (issue #958).
@@ -1362,19 +1849,31 @@ impl BackupCallerAuth {
         installation: &PlatformHandle,
         source_installation_id: &str,
     ) -> Result<(), PreparationError> {
-        self.check_shapes()?;
+        self.check_shapes()
+            .map_err(|error| note_prepare_error(OP_CALLER_AUTH, "authenticate", error, 0))?;
         if !lease.is_for_installation(installation) {
-            return Err(PreparationError::InvalidRequest {
-                field: "caller_auth",
-                reason: "held owner lease does not cover the launch installation".to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "held owner lease does not cover the launch installation".to_owned(),
+                },
+                0,
+            ));
         }
         if source_installation_id != installation.as_str() {
-            return Err(PreparationError::InvalidRequest {
-                field: "caller_auth",
-                reason: "presented source differs from the lease-bound installation".to_owned(),
-            });
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "presented source differs from the lease-bound installation".to_owned(),
+                },
+                0,
+            ));
         }
+        observe_prepare_progress(OP_CALLER_AUTH, "authenticate", "authenticated", 0, 0);
         Ok(())
     }
 }

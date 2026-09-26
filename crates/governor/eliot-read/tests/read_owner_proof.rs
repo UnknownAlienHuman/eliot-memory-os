@@ -34,8 +34,8 @@ use eliot_contracts::{
 };
 use eliot_read::{
     BranchEnvironmentScope, EliotResourceUri, FreshnessPolicy, NamedParameters, QueryIntent,
-    QueryMode, QueryRequest, ReadApi, ReadError, ReadService, RequiredAssurance, ResourceRequest,
-    StateRequest, StoreReadFailure, TimeScope,
+    QueryMode, QueryRequest, ReadApi, ReadError, ReadOrderingBinding, ReadService,
+    RequiredAssurance, ResourceRequest, StateRequest, StoreReadFailure, TimeScope,
 };
 use eliot_store_api::{
     CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
@@ -120,6 +120,7 @@ fn state_request(consistency: ReadConsistency, minimum: u64) -> Result<StateRequ
         scope_id: Some(scope_id()?),
         consistency,
         dependency_revisions: dependencies,
+        ordering: ReadOrderingBinding::without_order_dependency(),
         parameters: NamedParameters::new(),
         provenance_handles: Vec::new(),
     })
@@ -136,6 +137,7 @@ fn query_request(consistency: ReadConsistency, minimum: u64) -> Result<QueryRequ
         scope_id: Some(scope_id()?),
         consistency,
         dependency_revisions: dependencies,
+        ordering: ReadOrderingBinding::without_order_dependency(),
         parameters: NamedParameters::new(),
         provenance_handles: Vec::new(),
     })
@@ -696,6 +698,7 @@ fn intent_gate_admits_closed_modes_rejects_foreign_operation()
             scope_id: scope.map(ScopeId::new).transpose()?,
             consistency: ReadConsistency::ExactFence,
             dependency_revisions: BTreeMap::new(),
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters,
             provenance_handles: Vec::new(),
         };
@@ -708,6 +711,7 @@ fn intent_gate_admits_closed_modes_rejects_foreign_operation()
             scope_id: Some(scope_id()?),
             consistency: ReadConsistency::ExactFence,
             dependency_revisions: BTreeMap::new(),
+            ordering: ReadOrderingBinding::without_order_dependency(),
             parameters: NamedParameters::new(),
             provenance_handles: Vec::new(),
         };
@@ -734,6 +738,7 @@ fn resource_expansion_binds_exact_uri() -> Result<(), Box<dyn std::error::Error>
         scope_id: Some(scope_id()?),
         consistency: ReadConsistency::Eventual,
         dependency_revisions: BTreeMap::new(),
+        ordering: ReadOrderingBinding::without_order_dependency(),
         parameters: NamedParameters::new(),
         provenance_handles: Vec::new(),
     };
@@ -749,6 +754,7 @@ fn resource_expansion_binds_exact_uri() -> Result<(), Box<dyn std::error::Error>
         scope_id: Some(scope_id()?),
         consistency: ReadConsistency::Eventual,
         dependency_revisions: BTreeMap::new(),
+        ordering: ReadOrderingBinding::without_order_dependency(),
         parameters: NamedParameters::from_map(BTreeMap::from([(
             "resource_uri".to_owned(),
             Value::String("eliot://resource/foreign".to_owned()),

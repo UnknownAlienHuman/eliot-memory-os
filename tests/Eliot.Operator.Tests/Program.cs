@@ -413,12 +413,12 @@ sealed class FakeGovernorClient : IGovernorClient
     }
 
     public Task<JsonElement> UserAutomationAsync(
-        UserAutomationOperation operation,
+        UserAutomationOperatorRequest request,
         CancellationToken cancellationToken = default)
     {
-        operation.Validate();
+        request.Validate();
         UserAutomationCount++;
-        LastUserAutomation = operation;
+        LastUserAutomation = request.Operation;
         return Task.FromResult(JsonSerializer.SerializeToElement(new
         {
             accepted = true,

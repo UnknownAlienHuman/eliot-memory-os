@@ -1,16 +1,22 @@
 //! Host Windows Event Log sink seam (F-LOG-HOST-0, issue #889).
 //!
-//! Thin bounded wrapper naming #984's accepted safe platform port. On the
-//! current base #984 is absent (no `event_log.rs` in
-//! `crates/kernel/eliot-platform-windows`, no `Win32_System_EventLog`
-//! feature, zero `eventlog` matches), so this wrapper ships the same
-//! typed-unavailable seam as the kernel precedent
-//! (`kernel_diagnostics.rs:54-94`): it names the consumer contract (fixed
-//! source, event ids, severity, redacted insertion strings; admitted
-//! start/stop/failure only) but performs no delivery, acquires no Event Log
-//! FFI, registers no source, edits no registry, and never fakes delivery
-//! through another sink. Production delivery smoke on isolated Windows stays
-//! an honest residual until #984 lands.
+//! Thin bounded wrapper over #984's accepted safe platform port
+//! (`eliot_platform_windows`, landed `bf37d3e1` / #1706): admitted
+//! start/stop/failure events map to the fixed source, event ids, severity,
+//! and one redacted insertion string, and delivery goes through
+//! `report_local_event`. The wrapper registers no source, edits no registry,
+//! and performs no elevation; it acquires no Event Log FFI and never fakes
+//! delivery through another sink. Production delivery smoke on isolated
+//! Windows stays an honest residual for the test phase.
+//!
+//! Delivery outcomes stay five-way distinct: OS acceptance under the fixed
+//! registered-source profile, the explicitly admitted degraded Application
+//! profile (never substituted silently; unreachable without installation
+//! policy admission), source/access unavailability, OS acceptance versus
+//! registered-source proof (acceptance never proves registration or
+//! formatted-message availability), and downstream delivery uncertainty
+//! (success proves OS acceptance only, never downstream delivery). Handle
+//! acquisition is never equated with installed message resources.
 //!
 //! The wrapper owns the finite nonblocking producer admission, queue and
 //! in-flight limits, drop reporting, and shutdown policy for the potentially
@@ -22,13 +28,17 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use eliot_platform_windows::{
+    AdmittedEventLogEvent, EventLogError, is_event_log_supported, report_local_event,
+};
+
 use crate::host_diagnostics::BoundedDetail;
 
 /// Fixed Event Log source named by the #984 consumer contract.
 ///
 /// No runtime source registration happens here: this string is the admitted
-/// name #984's safe port must use once landed. There is no fallback source
-/// and no silent substitution.
+/// name #984's safe port uses. There is no fallback source and no silent
+/// substitution.
 pub const EVENT_LOG_SOURCE: &str = "EliotHost";
 
 /// Bound for one redacted insertion string. Mirrors
@@ -167,15 +177,72 @@ impl EventLogRecord {
     }
 }
 
+/// Honest delivery disposition for one admitted record reported through #984.
+///
+/// Success proves OS acceptance only: not a registered source, not
+/// formatted-message availability, not downstream delivery, and not a Host
+/// semantic result. The two arms keep the registered-source profile and the
+/// explicitly admitted degraded Application profile distinct; this wrapper
+/// uses only the registered-source profile and never substitutes the
+/// degraded one silently, so the degraded arm is unreachable without
+/// installation-policy admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventLogDelivery {
+    /// The OS accepted the record under the fixed registered-source profile
+    /// (`EliotHost`, fixed event id and severity). Source registration and
+    /// downstream delivery stay unproven.
+    RegisteredSourceAccepted {
+        /// The admitted event that was accepted, for correlation.
+        event: AdmittedEvent,
+    },
+    /// The OS accepted the record under the explicitly admitted degraded
+    /// Application profile. Never produced without installation-policy
+    /// admission; no silent fallback exists.
+    DegradedApplicationAccepted {
+        /// The admitted event that was accepted, for correlation.
+        event: AdmittedEvent,
+    },
+}
+
+impl EventLogDelivery {
+    /// The admitted event that was accepted, for correlation with the
+    /// submitted record.
+    #[must_use]
+    pub const fn event(&self) -> AdmittedEvent {
+        match self {
+            Self::RegisteredSourceAccepted { event }
+            | Self::DegradedApplicationAccepted { event } => *event,
+        }
+    }
+}
+
 /// Typed Event Log wrapper failures.
 ///
 /// All outcomes are diagnostics only: they never change the Host
 /// operation, result, error, order, retry, state, or receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsEventLogError {
-    /// Delivery was requested but #984's safe port is still absent. Never a
+    /// The OS port cannot carry the record: this build has no live port
+    /// (non-Windows) or the reachable port is currently unavailable. Never a
     /// silent fallback and never FFI acquired inside Host.
     EventLogUnavailable,
+    /// The record was rejected before any OS call (over-bound, `NUL`, or a
+    /// protected marker). Nothing was submitted.
+    InvalidRecord,
+    /// No source handle could be acquired: the source is missing or access
+    /// was denied. Nothing was submitted. Carries only the bounded `Win32`
+    /// error code, never message text or insertion contents.
+    SourceUnavailable {
+        /// Bounded `Win32` error code; no message text.
+        code: u32,
+    },
+    /// The OS refused the validated record; OS acceptance is unknown.
+    /// Carries only the bounded `Win32` error code, never message text or
+    /// insertion contents.
+    ReportRefused {
+        /// Bounded `Win32` error code; no message text.
+        code: u32,
+    },
     /// Bounded admission rejected the record; `dropped_total` on the queue
     /// advanced by one. Nonblocking by construction.
     QueueFull,
@@ -190,6 +257,21 @@ impl fmt::Display for WindowsEventLogError {
             Self::EventLogUnavailable => {
                 write!(f, "windows event log sink unavailable (see issue #984)")
             }
+            Self::InvalidRecord => {
+                write!(
+                    f,
+                    "windows event log record failed validation; nothing was submitted"
+                )
+            }
+            Self::SourceUnavailable { code } => {
+                write!(f, "windows event log source/access unavailable ({code})")
+            }
+            Self::ReportRefused { code } => {
+                write!(
+                    f,
+                    "windows event log report refused ({code}); OS acceptance unknown"
+                )
+            }
             Self::QueueFull => write!(f, "windows event log queue full; record dropped"),
             Self::Closed => write!(f, "windows event log queue is shut down"),
         }
@@ -200,24 +282,75 @@ impl std::error::Error for WindowsEventLogError {}
 
 /// Reports whether the Event Log sink can carry Host diagnostics.
 ///
-/// Always answers [`WindowsEventLogError::EventLogUnavailable`] until #984
-/// lands. Absence stays missing, never a faked delivery and never handle
-/// acquisition equated with installed message resources.
+/// Answers `Ok` where #984's safe port is live (Windows): delivery is
+/// attempted through `report_local_event`. Off Windows the port stays
+/// [`WindowsEventLogError::EventLogUnavailable`]: absence stays missing,
+/// never a faked delivery and never handle acquisition equated with
+/// installed message resources.
 pub fn event_log_sink_status() -> Result<(), WindowsEventLogError> {
-    Err(WindowsEventLogError::EventLogUnavailable)
+    if is_event_log_supported() {
+        Ok(())
+    } else {
+        Err(WindowsEventLogError::EventLogUnavailable)
+    }
 }
 
-/// Attempts Event Log delivery for one admitted record.
+/// Attempts Event Log delivery for one admitted record through #984.
 ///
-/// Currently always returns [`WindowsEventLogError::EventLogUnavailable`]:
-/// #984's safe port is absent, so there is no handle, no OS acceptance, and
-/// no downstream delivery to report. The record's mapping (source, event id,
-/// severity) is still validated by construction, so this function proves
-/// mapping and failure handling only. It never blocks, never spawns a
-/// worker, never logs through the sink (no recursion), and never changes the
-/// caller's Host result.
-pub fn report_event(_record: &EventLogRecord) -> Result<(), WindowsEventLogError> {
-    Err(WindowsEventLogError::EventLogUnavailable)
+/// Maps the admitted event to the fixed source, event id, and severity and
+/// submits the bounded redacted insertion string via the safe port. Success
+/// proves OS acceptance only, under the registered-source profile; source
+/// registration, formatted-message availability, and downstream delivery
+/// stay unproven. The degraded Application profile is never substituted
+/// silently. This call is synchronous and may block inside the OS port; it
+/// never spawns a worker, never logs through the sink (no recursion), and
+/// never changes the caller's Host result.
+pub fn report_event(record: &EventLogRecord) -> Result<EventLogDelivery, WindowsEventLogError> {
+    let event = record.event();
+    match report_local_event(to_platform_event(event), record.insertion()) {
+        Ok(receipt) => {
+            debug_assert_eq!(
+                receipt.event_id(),
+                event.event_id(),
+                "platform receipt must carry the submitted admitted mapping"
+            );
+            debug_assert_eq!(
+                receipt.source(),
+                EVENT_LOG_SOURCE,
+                "platform receipt must carry the fixed source"
+            );
+            Ok(EventLogDelivery::RegisteredSourceAccepted { event })
+        }
+        Err(error) => Err(map_event_log_error(error)),
+    }
+}
+
+/// Maps one admitted wrapper event to #984's platform event.
+fn to_platform_event(event: AdmittedEvent) -> AdmittedEventLogEvent {
+    match event {
+        AdmittedEvent::ServiceStart => AdmittedEventLogEvent::ServiceStart,
+        AdmittedEvent::ServiceStop => AdmittedEventLogEvent::ServiceStop,
+        AdmittedEvent::ServiceFailure => AdmittedEventLogEvent::ServiceFailure,
+    }
+}
+
+/// Maps #984's typed port failure to the wrapper's typed outcome.
+///
+/// Unavailable and unsupported ports stay
+/// [`WindowsEventLogError::EventLogUnavailable`]; refused source acquisition
+/// and refused reports keep their bounded codes; pre-OS rejections stay
+/// invalid without echoing insertion contents.
+fn map_event_log_error(error: EventLogError) -> WindowsEventLogError {
+    match error {
+        EventLogError::InvalidInput => WindowsEventLogError::InvalidRecord,
+        EventLogError::Unavailable | EventLogError::UnsupportedPlatform => {
+            WindowsEventLogError::EventLogUnavailable
+        }
+        EventLogError::RegistrationFailed { code } => {
+            WindowsEventLogError::SourceUnavailable { code }
+        }
+        EventLogError::ReportFailed { code } => WindowsEventLogError::ReportRefused { code },
+    }
 }
 
 /// Finite nonblocking producer admission queue in front of the OS port.

@@ -16,7 +16,10 @@
 //!   that transition through [`BoundedBacklog::archive`] itself when the
 //!   surface bound is already full, and returns the [`ArchivedCandidate`]
 //!   receipts, so the bound-failure path is wired and auditable instead of
-//!   an unwired obligation on every caller.
+//!   an unwired obligation on every caller. All three
+//!   [`ArchiveCause`] values have a live producer on that path: ownerless
+//!   and low value from live entry state, stale from the derived rule in
+//!   `archive_cause_for`.
 //! - Retrieval refuses expired local overlays and unclosed reusable
 //!   candidates. Before closure, only the exact non-expired `LOCAL_ADMITTED`
 //!   overlay of the active campaign may influence a compatible attempt.
@@ -27,27 +30,32 @@
 //!   [`CrossTaskAdmission`] revalidating scope, authority, retention,
 //!   evaluator, and rollback.
 //!
-//! Overlay and reusable-candidate material is MEANT to be **owner-retained**,
-//! not caller-presented: [`BoundedBacklog::bind_local_overlay`] and
-//! [`BoundedBacklog::bind_reusable_candidate`] bind it once under an
-//! owner-verified permit, and [`BoundedBacklog::live_local_overlay`] /
-//! [`BoundedBacklog::active_reusable`] read the bound record back.
+//! Overlay and reusable-candidate material is **owner-retained**, not
+//! caller-presented: [`BoundedBacklog::bind_local_overlay`] and
+//! [`BoundedBacklog::bind_reusable_candidate`] write it into the backlog's
+//! own registries under an owner-verified permit, and
+//! [`BoundedBacklog::live_local_overlay`] /
+//! [`BoundedBacklog::active_reusable`] read the bound record back under that
+//! same permit.
 //!
-//! That retention is NOT yet the retrieval path, and this module does not
-//! pretend it is. [`BoundedBacklog::bind_local_overlay`],
-//! [`BoundedBacklog::bind_reusable_candidate`] and
-//! [`BoundedBacklog::active_reusable`] have no caller anywhere in the
-//! workspace, and [`BoundedBacklog::live_local_overlay`] has exactly one, this
-//! crate's own `intake_from_evidence_governed`, which itself has no caller.
-//! So nothing ever writes `bound_overlays` or `bound_reusables`: the two
-//! registries are provably always empty, a permit that binds an overlay
-//! subject can never resolve one, and [`retrieve_governed`] still takes a
-//! caller-presented [`GovernedOverlay`] and
-//! `Option<&ReusableCandidateRef>` in its [`GovernedRetrieval`]. There is no
-//! wired retrieval path. The methods are kept deliberately, pending the
-//! owner-boundary fix that wires them into that gate, and each is documented
-//! below with exactly what a verified permit authenticates and what an owner
-//! merely declares.
+//! Both halves of that retention are now driven by one owner-side path in
+//! this crate: `intake::intake_from_evidence_governed` writes the campaign
+//! owner's retained material into the registries
+//! ([`BoundedBacklog::bind_local_overlay`],
+//! [`BoundedBacklog::bind_reusable_candidate`]) and then resolves every
+//! influence subject back out of them
+//! ([`BoundedBacklog::live_local_overlay`], [`BoundedBacklog::active_reusable`]).
+//! The two registries are therefore written and read on the same path, and a
+//! permit that binds an influence subject with no live retained record is
+//! refused rather than served from the request.
+//!
+//! What is still NOT retained here, and is not pretended to be:
+//! [`retrieve_governed`] still takes a caller-presented [`GovernedOverlay`]
+//! and `Option<&ReusableCandidateRef>` in its [`GovernedRetrieval`]. That is
+//! the Context-Compiler retrieval/delivery half of #1869 W4, it lives in
+//! `eliot-context-compiler-wasm`, and it is not this module's gate. The
+//! methods below are each documented with exactly what a verified permit
+//! authenticates and what an owner merely declares.
 //!
 //! All records here are advisory/candidate evidence. Nothing in this module
 //! performs promotion, activation, publication, mutation, or task Finish;
@@ -73,8 +81,12 @@ use crate::{CandidateState, ImprovementCandidate, ImprovementSurface};
 /// Per-surface active-backlog bound, owned by the Governor decision authority.
 ///
 /// `governor_authority_ref` names the existing Governor policy/admission that
-/// owns this bound (e.g. a maintenance-admission policy revision). This crate
-/// never mints Governor authority; it only binds to it.
+/// owns this bound (e.g. a maintenance-admission policy revision). It is also
+/// the admission epoch of every entry on this surface: a governed admission
+/// stores the permit's authority on the entry, and
+/// `archive_cause_for` claims [`ArchiveCause::Stale`] for an entry whose
+/// retained epoch is no longer this one. This crate never mints Governor
+/// authority; it only binds to it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CandidateBoundPolicy {
     pub target_surface: ImprovementSurface,
@@ -147,7 +159,10 @@ pub fn evidence_lineage_digest(canonical_lineage: &[String]) -> String {
 /// admitted under via [`BoundedBacklog::admit_governed`] (`None` for
 /// registry-only [`BoundedBacklog::admit`); the producer requires it to
 /// match the verified permit, so production binds retained owner identity
-/// rather than caller labels.
+/// rather than caller labels. It is also the entry's retained ADMISSION EPOCH:
+/// `archive_cause_for` compares it against the owning authority the surface
+/// bound currently names and claims [`ArchiveCause::Stale`] when they differ,
+/// so this field is load-bearing state and not only provenance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackedCandidate {
     pub candidate: ImprovementCandidate,
@@ -199,9 +214,13 @@ pub enum ArchiveCause {
 /// record instead of a caller-presented [`GovernedOverlay`], and a rotated or
 /// re-issued permit no longer matches it, so the binding is refused rather
 /// than silently reused (I12.24:218 "An overlay is not canonical doctrine and
-/// is not visible to unrelated tasks"). The record is not on any live path
-/// yet: nothing calls `bind_local_overlay`, so this registry stays empty (see
-/// the module doc).
+/// is not visible to unrelated tasks"). The record is written from the owner
+/// side by [`BoundedBacklog::bind_local_overlay`], whose single caller is
+/// `intake::intake_from_evidence_governed`: that path binds the campaign
+/// owner's retained overlay under the admitting permit and then reads it back
+/// out of this registry. A backlog restored without its bindings refuses
+/// retrieval until the owner binds them again, which is the fail-closed
+/// direction.
 ///
 /// What the verified permit AUTHENTICATES, and how:
 ///
@@ -334,6 +353,17 @@ struct ArchiveTarget {
     /// an ownerless record has no decision owner to act on it and is already
     /// ineligible for retrieval, delivery and cross-task use (I12.24:295), so
     /// archiving it destroys no reachable influence.
+    ///
+    /// DELIBERATELY UNCHANGED by the derived staleness cause. I12.24:297
+    /// bounds the backlog "by target surface and value", so the release order
+    /// stays ownerlessness-then-value; a stale-but-owned entry is a third
+    /// legitimate CAUSE for leaving the active set, and giving it its own
+    /// rank ahead of the value comparison would let a high-value stale entry
+    /// displace a lower-value live one, which is the contract's bound turned
+    /// inside out. The effect that matters is the one the cause has on
+    /// eligibility, not on ordering: a surface whose only archivable entries
+    /// are stale ones is relieved instead of permanently refusing
+    /// `BoundExceeded` behind silently-active records.
     retention_rank: u8,
     /// The assessed value, compared ONLY through [`f64::total_cmp`].
     ///
@@ -479,16 +509,22 @@ impl BoundedBacklog {
     ///
     /// What is and is not claimed:
     ///
-    /// - Only causes justified by live state are used. An entry with no
-    ///   owner is archived as [`ArchiveCause::Ownerless`]; an owned entry
-    ///   below the surface floor is archived as [`ArchiveCause::LowValue`].
-    ///   [`ArchiveCause::Stale`] is deliberately NOT claimed: no live
-    ///   producer sets `ImprovementLifecycle::Stale` anywhere in this crate,
-    ///   and this registry observes no time-based evidence that could
-    ///   support the claim. Asserting staleness here would be inventing a
-    ///   defect signature (issue #10). When no entry's state justifies a
-    ///   cause, nothing is force-archived and the original bound refusal
+    /// - All three causes are justified by live state. An entry with no owner
+    ///   is archived as [`ArchiveCause::Ownerless`]; an owned entry below the
+    ///   surface floor is archived as [`ArchiveCause::LowValue`]; an owned
+    ///   entry at or above the floor whose retained admission epoch is no
+    ///   longer the one this surface's bound names is archived as
+    ///   [`ArchiveCause::Stale`]. The staleness rule and the two signatures it
+    ///   deliberately does not use are stated in full in
+    ///   `archive_cause_for`; nothing here asserts a damage signature the
+    ///   record does not carry (issue #10). When no entry's state justifies
+    ///   a cause, nothing is force-archived and the original bound refusal
     ///   surfaces.
+    /// - Cause precedence is unchanged for the two causes that already had a
+    ///   producer: ownerless is still claimed before low value, and low value
+    ///   before stale, so an entry that is both low-value and stale is still
+    ///   archived as [`ArchiveCause::LowValue`] with the same summary and the
+    ///   same selection rank it had before staleness existed.
     /// - A candidate refused by the value floor is not a bound-pressure
     ///   event. The incoming candidate is what is being refused, so no
     ///   existing entry is archived to make room for it and
@@ -723,7 +759,7 @@ impl BoundedBacklog {
         let surface = policy.target_surface;
         let mut archived: Vec<ArchivedCandidate> = Vec::new();
         for _ in 0..deficit {
-            let Some(target) = self.next_archivable(surface, policy.min_value) else {
+            let Some(target) = self.next_archivable(policy) else {
                 return Err(PressureAdmissionError::ReliefFailed {
                     source: BoundsError::BoundExceeded {
                         surface,
@@ -744,7 +780,8 @@ impl BoundedBacklog {
     }
 
     /// The single best-justified archive target among the active entries on
-    /// `surface`, or `None` when no entry's live state justifies a cause.
+    /// `policy`'s surface, or `None` when no entry's live state justifies a
+    /// cause.
     ///
     /// Selection order, applied in stable `entries` index order so the result
     /// is reproducible for the same backlog:
@@ -760,14 +797,20 @@ impl BoundedBacklog {
     ///    admission path accepts: a bit-pattern order would rank every
     ///    negative above every positive and retire the more valuable entry;
     /// 3. then the lowest `entries` index as the final total tiebreak.
-    fn next_archivable(&self, surface: ImprovementSurface, floor: f64) -> Option<ArchiveTarget> {
+    ///
+    /// The cause a target is eligible for comes from
+    /// `archive_cause_for`; this method decides only WHICH of the eligible
+    /// entries to release first, and staleness does not enter that order (see
+    /// [`ArchiveTarget::retention_rank`]).
+    fn next_archivable(&self, policy: &CandidateBoundPolicy) -> Option<ArchiveTarget> {
+        let surface = policy.target_surface;
         let mut best: Option<ArchiveTarget> = None;
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.candidate.target_surface != surface || !entry.candidate.state.is_experimental()
             {
                 continue;
             }
-            let Some(cause) = archive_cause_for(entry, floor) else {
+            let Some(cause) = archive_cause_for(entry, policy) else {
                 continue;
             };
             let candidate = ArchiveTarget {
@@ -776,7 +819,7 @@ impl BoundedBacklog {
                 index,
                 cause,
                 candidate_id: entry.candidate.candidate_id.clone(),
-                summary: pressure_archive_summary(entry, cause, floor),
+                summary: pressure_archive_summary(entry, cause, policy),
             };
             let outranks = best
                 .as_ref()
@@ -948,8 +991,9 @@ impl BoundedBacklog {
     /// re-issued permit supersedes the older binding instead of leaving two
     /// conflicting records behind.
     ///
-    /// No caller exists for this method yet (see the module doc), so nothing
-    /// registers a bound overlay in a running process.
+    /// Its single caller is `intake::intake_from_evidence_governed`, which
+    /// writes the campaign owner's retained overlay into this registry under
+    /// the admitting permit before the same path resolves it back out.
     pub fn bind_local_overlay(
         &mut self,
         overlay: GovernedOverlay,
@@ -1030,11 +1074,18 @@ impl BoundedBacklog {
     /// behaviour (I12.24:295). It is the ONLY clock in this path — the
     /// binding carries no authenticated expiry of its own.
     ///
-    /// Its single in-crate caller is `intake_from_evidence_governed`, and
-    /// nothing calls that in turn, so this gate never runs against a bound
-    /// overlay today: no caller of `bind_local_overlay` exists, so a permit
-    /// that binds an overlay subject is always refused here with
-    /// [`BoundsError::OverlayBackingMismatch`]. See the module doc.
+    /// Its single in-crate caller is
+    /// `intake::intake_from_evidence_governed`, which binds the campaign
+    /// owner's retained overlay through [`BoundedBacklog::bind_local_overlay`]
+    /// on the same path and then reads it back here. So a permit that binds
+    /// an overlay subject and has no live retained overlay — because the
+    /// campaign retains none, or because the retained one expired, drifted
+    /// or was admitted under a rotated permit — is refused here with
+    /// [`BoundsError::OverlayBackingMismatch`], [`BoundsError::ExpiredOverlay`],
+    /// [`BoundsError::StaleStateFence`] or
+    /// [`BoundsError::OverlayNotAdmitted`] rather than served from the
+    /// request. That refusal is what stops a candidate being admitted into a
+    /// campaign that could never use it (I12.24:295).
     pub fn live_local_overlay(
         &self,
         verified: &VerifiedLearningAdmission<'_>,
@@ -1097,8 +1148,10 @@ impl BoundedBacklog {
     /// `origin_campaign_id` must equal the permit's bound source campaign and
     /// `candidate_id` its bound subject, so those two cannot be re-spelled.
     ///
-    /// No caller exists for this method yet (see the module doc), so nothing
-    /// registers a bound reusable candidate in a running process.
+    /// Its single caller is `intake::intake_from_evidence_governed`, which
+    /// writes the campaign owner's retained closure material into this
+    /// registry under the admitting permit before the same path resolves it
+    /// back out.
     pub fn bind_reusable_candidate(
         &mut self,
         candidate_id: &str,
@@ -1160,8 +1213,12 @@ impl BoundedBacklog {
     /// backlog entry. The closure ref it hands back is owner-declared and not
     /// permit-authenticated; see [`Self::bind_reusable_candidate`].
     ///
-    /// No caller exists for this method yet (see the module doc), so this gate
-    /// is not on any live retrieval path.
+    /// Its single caller is `intake::intake_from_evidence_governed`, which
+    /// binds the campaign owner's retained closure material through
+    /// [`BoundedBacklog::bind_reusable_candidate`] on the same path and then
+    /// reads it back here, so a permit that binds a reusable candidate with
+    /// no live retained record is refused rather than served from the
+    /// request.
     pub fn active_reusable(
         &self,
         candidate_id: &str,
@@ -1195,18 +1252,88 @@ impl BoundedBacklog {
 ///
 /// Mirrors exactly the validation [`BoundedBacklog::archive`] performs, so
 /// the bound-pressure path can never force a cause the archive transition
-/// would reject. An owned entry at or above the floor is never claimed, and
-/// [`ArchiveCause::Stale`] is never returned: this crate has no live
-/// producer of `ImprovementLifecycle::Stale` and the registry holds no
-/// time-based evidence that could support the claim.
-fn archive_cause_for(entry: &TrackedCandidate, floor: f64) -> Option<ArchiveCause> {
+/// would reject. Precedence is ownerless, then low value, then stale: the two
+/// causes that already had a producer keep it, and the third is claimed only
+/// for an entry neither of them reaches.
+///
+/// The stale claim is the derived rule below. It reads two fields that
+/// already exist on the records and invents neither a threshold nor a
+/// signature:
+///
+/// - [`TrackedCandidate::admitted_under_authority`] — the Governor authority
+///   the entry was admitted under, written from the owner-verified permit by
+///   [`BoundedBacklog::admit_governed`] and
+///   [`BoundedBacklog::admit_reporting_pressure`], and `None` for a
+///   registry-only [`BoundedBacklog::admit`];
+/// - [`CandidateBoundPolicy::governor_authority_ref`] — the Governor decision
+///   that owns this surface's bound right now.
+///
+/// `Some(retained) != policy.governor_authority_ref` means the bound has moved
+/// to a different Governor decision, so the entry's own admission is no
+/// longer current and the record is stale until it is re-admitted under the
+/// bound's present epoch. I12.24:18 makes exactly that move load-bearing for
+/// a frozen baseline ("An authorized change to objective, Architecture,
+/// boundaries or ceilings supersedes that baseline, creates a new State Fence
+/// and forces revalidation"), and I12.24:143 states the mirror rule for owner
+/// revisions: a new owner revision rebuilds the derived view rather than
+/// mutating it. The bound's owning Governor decision is the admission epoch
+/// of this record.
+///
+/// `None` is NOT stale. "No admission epoch was recorded" is a different fact
+/// from "the recorded epoch was superseded", and conflating them would archive
+/// the registry-only `admit` path, which is how `eliotd`'s Self-Quality
+/// intake enters the backlog and which records no Governor epoch by design.
+/// An epoch that IS recorded but blank is the opposite case and is claimed as
+/// stale: a record that names no usable admission cannot be current under any
+/// epoch. Both sides are compared through
+/// `retained_admission_epoch`, which normalises exactly as
+/// [`CandidateBoundPolicy::validate_governed`] does on admission.
+///
+/// The two other stale signatures I12.24 could support are NOT derived here,
+/// and the boundary is recorded rather than bridged:
+///
+/// - a local-overlay expiry compared against owner/host-sourced `now`: the
+///   archive decision is per surface, and [`TrackedCandidate`] records no
+///   campaign, so no field on the entry links it to the overlay whose expiry
+///   would make it stale. Inferring one would invent the link, and guessing a
+///   campaign would let another campaign's expiry archive this one.
+/// - a closure status: the retained closure handle lives on
+///   [`BoundReusableCandidate`], not on the backlog entry, so an entry's own
+///   state says nothing about whether it is closed.
+fn archive_cause_for(
+    entry: &TrackedCandidate,
+    policy: &CandidateBoundPolicy,
+) -> Option<ArchiveCause> {
     if entry.owner.is_none() {
         return Some(ArchiveCause::Ownerless);
     }
-    if entry.value < floor {
+    if entry.value < policy.min_value {
         return Some(ArchiveCause::LowValue);
     }
+    if entry.admitted_under_authority.is_some()
+        && retained_admission_epoch(entry) != Some(policy.governor_authority_ref.trim())
+    {
+        return Some(ArchiveCause::Stale);
+    }
     None
+}
+
+/// The entry's retained admission epoch, normalised the same way
+/// [`CandidateBoundPolicy::validate_governed`] compares it, or `None` when the
+/// entry carries no usable authority at all.
+///
+/// Single normalisation point for both consumers of the field: the staleness
+/// rule in `archive_cause_for` and the durable summary token in
+/// `pressure_archive_summary`. Keeping them on one function is what stops the
+/// value a receipt prints and the value the rule compared from drifting.
+/// `Some("none")` and `None` stay distinct here, so a record that literally
+/// stores the token as its authority is not silently read as "no epoch".
+fn retained_admission_epoch(entry: &TrackedCandidate) -> Option<&str> {
+    entry
+        .admitted_under_authority
+        .as_deref()
+        .map(str::trim)
+        .filter(|authority| !authority.is_empty())
 }
 
 /// Deterministic, evidence-derived archive summary for the bound-pressure
@@ -1215,7 +1342,7 @@ fn archive_cause_for(entry: &TrackedCandidate, floor: f64) -> Option<ArchiveCaus
 /// Fixed `key=value` tokens joined by `;`, so the token separator stays
 /// unambiguous even when a canonical record handle contains whitespace.
 /// Every token is read from live state — the retained entry, the surface
-/// policy floor and the derived cause — so the same backlog and policy always
+/// bound policy and the derived cause — so the same backlog and policy always
 /// produce the same string and the summary is never empty or constant.
 ///
 /// That is a DETERMINISM claim, not an authenticity claim, and the summary
@@ -1226,11 +1353,21 @@ fn archive_cause_for(entry: &TrackedCandidate, floor: f64) -> Option<ArchiveCaus
 /// registry-only admission path. Only `authority=` carries owner authority,
 /// and only when the entry was admitted through a governed path at all.
 ///
+/// `bound_authority=` and `bound_policy_revision=` are the other half of the
+/// stale claim: the Governor decision and revision that own this surface's
+/// bound right now. They are the comparison the staleness rule is derived
+/// from, so a `cause=stale` receipt states both sides of the comparison that
+/// produced it and can be re-derived from the stored records alone.
+///
 /// `decision_revision` is the candidate revision at which the archive
 /// decision was taken. It is deliberately NOT the receipt's
 /// `archived_revision`, which is the post-transition revision produced by
 /// the `retire_candidate` chain.
-fn pressure_archive_summary(entry: &TrackedCandidate, cause: ArchiveCause, floor: f64) -> String {
+fn pressure_archive_summary(
+    entry: &TrackedCandidate,
+    cause: ArchiveCause,
+    policy: &CandidateBoundPolicy,
+) -> String {
     let lineage = canonical_evidence_lineage(&entry.candidate.evidence_refs);
     let fingerprint = evidence_lineage_digest(&lineage)
         .chars()
@@ -1238,23 +1375,33 @@ fn pressure_archive_summary(entry: &TrackedCandidate, cause: ArchiveCause, floor
         .collect::<String>();
     format!(
         "cause={};surface={};candidate={};decision_revision={};value={};floor={};\
-         evidence={};lineage_fp16={};merged_from={};authority={}",
+         evidence={};lineage_fp16={};merged_from={};authority={};\
+         bound_authority={};bound_policy_revision={}",
         archive_cause_token(cause),
         surface_token(entry.candidate.target_surface),
         entry.candidate.candidate_id.trim(),
         entry.candidate.revision,
         entry.value,
-        floor,
+        policy.min_value,
         lineage.len(),
         fingerprint,
         entry.merged_from.len(),
-        entry
-            .admitted_under_authority
-            .as_deref()
-            .map(str::trim)
-            .filter(|authority| !authority.is_empty())
-            .unwrap_or("none"),
+        retained_authority_token(entry),
+        policy.governor_authority_ref.trim(),
+        policy.policy_revision,
     )
+}
+
+/// The entry's retained admission authority as a durable summary token, or
+/// the stable token `none`.
+///
+/// Shares its normalisation with the staleness rule through
+/// `retained_admission_epoch`, so the value a receipt prints and the value the
+/// rule compared cannot drift apart. This is the rendering; the rule reads the
+/// normalised `Option`, not this token, so a record that literally stores
+/// `none` as its authority is not confused with an absent one here.
+fn retained_authority_token(entry: &TrackedCandidate) -> &str {
+    retained_admission_epoch(entry).unwrap_or("none")
 }
 
 /// Stable summary token for an archive cause. Mirrors the enum's own

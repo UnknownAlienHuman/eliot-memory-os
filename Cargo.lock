@@ -1064,6 +1064,10 @@ dependencies = [
 name = "eliot-context"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-admission",
+ "eliot-context-assembly",
+ "eliot-context-candidates",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-cue-contracts",
  "eliot-evidence",
@@ -1114,6 +1118,7 @@ dependencies = [
  "eliot-cue-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-memory-projection-contracts",
  "eliot-protocol",
  "eliot-receipts",
  "schemars",
@@ -2441,6 +2446,8 @@ dependencies = [
  "eliot-contracts",
  "eliot-epistemic",
  "eliot-evidence",
+ "eliot-memory-curation-contracts",
+ "eliot-memory-curation-screen",
  "schemars",
  "serde",
  "thiserror",

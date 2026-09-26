@@ -53,8 +53,8 @@ mod reactive_context_delivery;
 mod scm_launch;
 mod store_kernel_launch_sequence;
 /// Host Windows Event Log sink seam (F-LOG-HOST-0, #889): thin bounded
-/// wrapper over #984's accepted safe port; explicitly unavailable until #984
-/// lands, never FFI inside Host.
+/// wrapper over #984's accepted safe port; typed delivery outcomes, fixed
+/// source/event/severity mapping only, never FFI inside Host.
 pub mod windows_event_log;
 
 // F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
@@ -3607,6 +3607,47 @@ fn operation(label: &str) -> Result<IdempotencyIdentity, HostError> {
     })
 }
 
+/// Deterministic journal mutation identity for one pre-commit drain re-arm.
+///
+/// The journal keys `applied_operations` on this identity, so a re-arm retried
+/// after a crash or an `OutcomeUnknown` append must reuse it and append
+/// byte-identical record bytes to replay instead of forking a second attempt.
+/// [`operation`] mints two fresh identities per call and therefore can never
+/// reach the replay result; the cutover and Store-rebind seams already use one
+/// deterministic identity per logical mutation.
+///
+/// Every input is a durable fact of the attempt — the activation fence, the
+/// drain generation, the exact cancelled predecessor record checksum, the
+/// authoritative census code and the appended stage — so the identity is a
+/// function of the attempt itself and not of process-local time or call order.
+/// One identity per appended stage follows the cutover and Store-rebind
+/// convention: sharing one identity across two appended records would be a
+/// checksum conflict, not a second mutation.
+#[cfg(windows)]
+fn drain_rearm_operation(
+    fence: &RecordFence,
+    drain_generation: &EpochTransition,
+    predecessor_checksum: &str,
+    census_code: &str,
+    stage: &str,
+) -> Result<IdempotencyIdentity, HostError> {
+    let attempt = sha256_json(&(
+        "eliot-host::drain-rearm:v1",
+        stage,
+        &fence.activation_id,
+        &fence.activation_generation,
+        drain_generation,
+        predecessor_checksum,
+        census_code,
+    ))?;
+    Ok(IdempotencyIdentity {
+        operation_id: PlatformHandle::new(format!("host-drain-rearm:{stage}:{attempt}"))
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        idempotency_key: PlatformHandle::new(attempt)
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+    })
+}
+
 fn record_fence(
     host: &HostInstallationEpoch,
     activation_id: &PlatformHandle,
@@ -4345,8 +4386,8 @@ impl HostComposition {
         crate::backup_cutover::CutoverError,
     > {
         use crate::backup_cutover::{
-            CutoverDisposition, CutoverError, execute_cutover, reconcile_cutover_outcome,
-            validate_cutover_request,
+            CutoverDisposition, CutoverError, execute_cutover, plan_cutover_attempt,
+            reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
         };
         // Real dispatch decision: only the separately admitted cutover
         // operation resolves `Cutover`. Rehearsal completion and preparation
@@ -4365,7 +4406,23 @@ impl HostComposition {
             .open_registry_store()?
             .load()
             .map_err(|error| CutoverError::Registry(error.to_string()))?;
-        let validated = validate_cutover_request(request, evidence, &registry)?;
+        // Authenticated identity FIRST, then the retained-operation
+        // classification, then admission. The classification reports a typed
+        // difference between "no such operation", "terminally refused" and
+        // "same key, different content", so running it against an
+        // unauthenticated presented operation id would be a pre-authentication
+        // oracle. Authentication first, classification second, admission third.
+        validate_cutover_identity(request)?;
+        // The retained operation is classified and the registry's
+        // operation-bound outcome resolved BEFORE the admission gate set's
+        // expected-predecessor check, so an exact committed retry and an
+        // interrupted post-CAS operation are no longer refused by a gate that is
+        // false by construction once their own activation committed (#2737).
+        // The gate this yields is derived from the durable classification,
+        // never asserted here.
+        let plan = plan_cutover_attempt(self, request, &registry)?;
+        let validated =
+            validate_cutover_request(request, evidence, &registry, plan.predecessor_gate())?;
         drop(registry);
         // The activation bound to the cutover is the Host journal owner's
         // committed generation, never a caller-supplied copy.
@@ -4392,6 +4449,13 @@ impl HostComposition {
         // genuinely absent here: retirement is a separate explicitly
         // authorized step, so the registry flip alone is the observed proof
         // and the honest disposition is `RetirementPending`.
+        //
+        // The projection runs only for a PROVEN commit. An unresolved outcome
+        // is returned exactly as its owner observation produced it, so this
+        // read model can never restate a retained unknown as progress (#2737).
+        if committed.disposition != CutoverDisposition::Committed {
+            return Ok((committed, barrier));
+        }
         let readback = self
             .open_registry_store()?
             .load()
@@ -4406,6 +4470,7 @@ impl HostComposition {
                 })?
                 .pending_cutover
                 .as_ref(),
+            readback.committed_cutover_activation(),
             readback.active_generation(),
             &validated.request.target_generation,
             None,
@@ -8487,6 +8552,7 @@ impl HostComposition {
                                 PlatformHandle::new("scm-stop-request")
                                     .map_err(|error| HostError::Platform(error.to_string()))?,
                             ],
+                            expected_predecessor: None,
                         }))?;
                         // F-LOG-HOST-1: drain Requested is distinct from
                         // Draining; shares one drain_generation correlation.
@@ -8508,6 +8574,7 @@ impl HostComposition {
                                 PlatformHandle::new("host-admission-closed")
                                     .map_err(|error| HostError::Platform(error.to_string()))?,
                             ],
+                            expected_predecessor: None,
                         }))?;
                         // F-LOG-HOST-1: Draining is distinct from Requested and
                         // from drained/StoppedClean; one correlation.
@@ -8543,6 +8610,32 @@ impl HostComposition {
                     }
                 }
                 ActivationState::Draining if state.drain_commit.is_some() => {}
+                ActivationState::Draining => {
+                    // I14.23/I1.5: this is the linearization point the ordered
+                    // sequence still owes. The idle-drain prologue already
+                    // appended `Draining`, so arriving here with
+                    // `drain_commit == None` is the normal unlinearized
+                    // pre-commit window, not an unusable activation: it is
+                    // routed through the same `DrainCommit` append the
+                    // `Active` arm uses, so there stays exactly one commit
+                    // writer, one commit shape and one lease/receipt snapshot
+                    // rule, and the reducer's own `Draining -> StoppedClean`
+                    // edge further below is reused unchanged. The durable
+                    // drain record supplies the exact `drain_generation` this
+                    // commit correlates with; a `Draining` activation without
+                    // one is a durable inconsistency and never a clean stop.
+                    let drain = state.drain.as_ref().ok_or_else(|| {
+                        HostError::OwnerLeaseRecovery(
+                            "Host activation is Draining without a durable drain record".to_owned(),
+                        )
+                    })?;
+                    let commit =
+                        drain_commit_record_for_stop(&state, &activation, &drain.drain_generation)?;
+                    // F-LOG-HOST-1: drain commit is distinct from
+                    // Requested/Draining; one drain_generation correlation.
+                    host_lifecycle_observe_drain("host.drain commit");
+                    self.append_record(HostStateRecord::DrainCommit(commit))?;
+                }
                 ActivationState::DegradedRecovery => {
                     // A degraded supervision record is a durable fence, not an
                     // excuse to fabricate a clean stop. Move through the

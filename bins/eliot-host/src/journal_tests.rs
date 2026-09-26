@@ -2301,6 +2301,7 @@ fn activation_reopen_starts_a_fresh_child_after_historical_active() -> TestResul
             drain_generation: drain_generation.clone(),
             state: DrainState::Requested,
             evidence_refs: vec![PlatformHandle::new("scm-stop-request-test")?],
+            expected_predecessor: None,
         }),
     )?;
     append_reconciled(
@@ -2311,6 +2312,7 @@ fn activation_reopen_starts_a_fresh_child_after_historical_active() -> TestResul
             drain_generation: drain_generation.clone(),
             state: DrainState::Draining,
             evidence_refs: vec![PlatformHandle::new("host-admission-closed-test")?],
+            expected_predecessor: None,
         }),
     )?;
     let draining = transition_activation_record(

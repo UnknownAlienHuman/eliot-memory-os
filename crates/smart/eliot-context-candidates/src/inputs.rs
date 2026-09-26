@@ -10,11 +10,12 @@
 //!
 //! Issue #43 designs the eighth provider slot (applicable memory) at this
 //! input boundary without changing the mapped denominator yet: [`MemoryInput`]
-//! carries the evaluated `ApplicableMemorySet` shape structurally (binding,
-//! slot state, applicable/excluded handles, advisory cue hits,
-//! denominator/truncation flags) because the typed
-//! `eliot-memory-projection-contracts` dependency can only land with
-//! workspace admission (registry flip deferred). The mapper still enforces
+//! is the slot shape (binding, slot state, applicable/excluded handles,
+//! advisory cue hits, denominator/truncation flags) and
+//! [`MemoryInput::from_applicable_set`] builds it from the typed
+//! `ApplicableMemorySet` evaluator output, depending only on the
+//! `eliot-memory-projection-contracts` contract cell — never on the
+//! evaluator or provider implementations. The mapper still enforces
 //! the seven-slot denominator; [`eight_slots`] and
 //! [`check_denominator_is_seven_or_eight`] name the migration target the
 //! mapper adopts after #41 merges. No eighth provider, unknown field, or
@@ -22,15 +23,23 @@
 //!
 //! Every record uses `deny_unknown_fields`: an unknown current field or an
 //! unknown variant is rejected at the boundary, never absorbed.
+//!
+//! CC-004 (issue #41) adds the typed alternative for the three Governor
+//! slots: [`CanonicalProjectionInput`] carries one validated
+//! [`CanonicalProjectionSet`](eliot_context_contracts::CanonicalProjectionSet)
+//! plus supplied measurements, collected mechanically by the mapper. The
+//! opaque path stays for owners that supply opaque snapshots.
 
 use eliot_context_contracts::{
-    AtomAvailability, AuthorityClass, ContextBinding, ContextError, ContextRecipe, MeasurementRef,
-    PrivacyClass, ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
+    AtomAvailability, AuthorityClass, CanonicalProjectionSet, ContextBinding, ContextError,
+    ContextRecipe, MeasurementRef, PrivacyClass, ProofBinding, ProviderId, ProviderRole,
+    SemanticRole, SourceSnapshot,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId};
 use eliot_cue_contracts::{ActivationResult, Completeness};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
+use eliot_memory_projection_contracts::{ApplicableMemorySet, DenominatorState, ExclusionReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -411,6 +420,54 @@ impl OpaqueProjection {
     }
 }
 
+/// Hard ceiling on supplied measurements carried by one canonical input.
+///
+/// The typed set holds at most 1 goal plus 64 commitments plus 2 continuity
+/// texts plus 1 safety note plus 64 triggers plus 64 affordances (196
+/// members); the ceiling keeps a malformed input bounded before measurement
+/// alignment.
+pub const MAX_CANONICAL_MEASUREMENTS: usize = 256;
+
+/// Typed CC-004 canonical projections plus supplied measurements.
+///
+/// This is the mechanical alternative to the three opaque Governor slots
+/// (task frame, negative memory, affordance): one validated
+/// [`CanonicalProjectionSet`] whose every text maps to exactly one whole
+/// member verbatim, with measurements aligned by
+/// [`CanonicalMember`](crate::CanonicalMember) identity. No canonical state
+/// is retrieved and no role prose is invented: a missing projection is a
+/// missing input (the caller keeps the opaque path for that slot), never
+/// filler.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalProjectionInput {
+    /// Validated task/continuity/safety/affordance projections under one
+    /// shared binding; must equal the request binding at collection.
+    pub set: CanonicalProjectionSet,
+    /// Supplied measurements keyed by derived member identity.
+    pub measurements: Vec<MemberMeasurement>,
+}
+
+impl CanonicalProjectionInput {
+    /// Validate the set shape and every supplied measurement shape.
+    ///
+    /// Binding equality with the request and measurement alignment are
+    /// checked at collection and derivation, which see the request and the
+    /// set.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.set.validate()?;
+        if self.measurements.len() > MAX_CANONICAL_MEASUREMENTS {
+            return Err(ContextError::Bounds {
+                field: "canonical.measurements",
+            });
+        }
+        for entry in &self.measurements {
+            entry.measurement.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Supplied measurement aligned to one derived member identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -541,16 +598,42 @@ pub const MEMORY_PROVIDER: &str = "eliot.memory-applicability.v1";
 
 /// Hard ceiling on advisory cue-hit handles carried by one memory input.
 ///
-/// This mirrors the evaluator advisory bound structurally; the typed import
-/// lands with workspace admission.
+/// This mirrors the evaluator advisory bound; the typed evaluator output is
+/// consumed through [`MemoryInput::from_applicable_set`].
 pub const MAX_MEMORY_CUE_HITS: usize = 512;
+
+/// Stable reason class for one typed evaluator exclusion.
+///
+/// Bare classes name the failed rule; precondition variants suffix the exact
+/// gate identity (`PRECONDITION_FAILED:<id>`) so the failed gate is never
+/// lost in the slot view. The match is exhaustive on purpose: a new
+/// evaluator rule must receive a conscious class here, never a silent
+/// default. There is deliberately no cue-hit class: a cue hit is advisory
+/// evidence recorded on [`MemoryExclusion::cue_hit`], never a reason.
+#[must_use]
+pub fn exclusion_reason_class(reason: &ExclusionReason) -> String {
+    match reason {
+        ExclusionReason::Stale => "STALE".to_owned(),
+        ExclusionReason::Conflicted => "CONFLICTED".to_owned(),
+        ExclusionReason::Rejected => "REJECTED".to_owned(),
+        ExclusionReason::EpistemicallyUnknown => "EPISTEMICALLY_UNKNOWN".to_owned(),
+        ExclusionReason::Protected => "PROTECTED".to_owned(),
+        ExclusionReason::NegativeMemory => "NEGATIVE_MEMORY".to_owned(),
+        ExclusionReason::PreconditionFailed { id } => format!("PRECONDITION_FAILED:{id}"),
+        ExclusionReason::PreconditionUnassessed { id } => {
+            format!("PRECONDITION_UNASSESSED:{id}")
+        }
+        ExclusionReason::LifecycleInactive => "LIFECYCLE_INACTIVE".to_owned(),
+        ExclusionReason::FenceMismatch => "FENCE_MISMATCH".to_owned(),
+        ExclusionReason::ScopeMismatch => "SCOPE_MISMATCH".to_owned(),
+    }
+}
 
 /// One excluded applicable-memory handle with its substantive reason.
 ///
-/// The reason travels as a bounded reason class (never a cue-hit flag):
-/// the typed `ExclusionReason` enum lives in
-/// `eliot-memory-projection-contracts` and is imported directly once that
-/// crate is workspace-admitted. A cue hit on an excluded handle is recorded
+/// The reason travels as a bounded reason class (never a cue-hit flag);
+/// [`exclusion_reason_class`] maps the typed evaluator `ExclusionReason`.
+/// A cue hit on an excluded handle is recorded
 /// on `cue_hit` and never promotes the handle into `applicable`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -641,6 +724,68 @@ impl MemoryInput {
             }
         }
         Ok(())
+    }
+
+    /// Build the memory slot from the typed evaluator output contract.
+    ///
+    /// The caller supplies the compilation binding and the slot projection
+    /// state; the set supplies the verdict. Task and scope must equal the
+    /// set binding exactly and the fences must be compatible, otherwise the
+    /// set belongs to another read and is rejected. Applicable handles,
+    /// exclusions with exact reason classes, advisory cue-hit flags, the
+    /// known-denominator bit, and the truncation flag all transfer
+    /// field-for-field; cue-hit handles are re-sorted for a deterministic
+    /// slot order. Roles, session binding, and the revalidation flag stay on
+    /// the typed set, which the caller keeps: the slot references handles,
+    /// it never restates evaluator standing, and a `truncated` slot always
+    /// implies revalidation downstream. Cue-hit handles that named no
+    /// evaluated record are unrepresentable here and correctly absent.
+    pub fn from_applicable_set(
+        set: &ApplicableMemorySet,
+        binding: ContextBinding,
+        state: ProjectionState,
+    ) -> Result<Self, ContextError> {
+        if set.binding.task_id != binding.task_id || set.binding.scope_id != binding.scope_id {
+            return Err(ContextError::InvalidField("memory.binding"));
+        }
+        if !set
+            .binding
+            .state_fence
+            .is_compatible_with(&binding.state_fence)
+        {
+            return Err(ContextError::InvalidField("memory.binding"));
+        }
+        let mut applicable = Vec::with_capacity(set.applicable.len());
+        let mut excluded = Vec::with_capacity(set.excluded.len());
+        let mut cue_hits = Vec::new();
+        for record in &set.applicable {
+            if record.cue_hit {
+                cue_hits.push(record.handle.clone());
+            }
+            applicable.push(record.handle.clone());
+        }
+        for record in &set.excluded {
+            if record.cue_hit {
+                cue_hits.push(record.handle.clone());
+            }
+            excluded.push(MemoryExclusion {
+                handle: record.handle.clone(),
+                reason: exclusion_reason_class(&record.reason),
+                cue_hit: record.cue_hit,
+            });
+        }
+        cue_hits.sort();
+        let input = Self {
+            binding,
+            state,
+            applicable,
+            excluded,
+            cue_hits,
+            denominator_known: matches!(set.denominator, DenominatorState::Known { .. }),
+            truncated: set.truncated,
+        };
+        input.validate()?;
+        Ok(input)
     }
 }
 

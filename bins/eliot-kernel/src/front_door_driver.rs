@@ -15,6 +15,8 @@ use eliot_ipc::{
     DeliveryOutcome, NamedPipeServer, TransportError, TransportLimits,
     decode_client_hello_frame_unbound, handshake_rejection_frame, server_hello_frame,
 };
+#[cfg(windows)]
+use eliot_kernel::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 use eliot_kernel::{KernelComposition, KernelFrameAction};
 use eliot_kernel_service::{
     KernelControlCommand, control_response_frame, decode_control_request_frame,
@@ -68,10 +70,33 @@ pub async fn run_front_door_loop(kernel: Arc<KernelComposition>, binding: &Kerne
     loop {
         tokio::select! {
             joined = sessions.join_next(), if !sessions.is_empty() => {
+                // F-LOG-KERNEL-0 (#895 W2/T15): JoinSet evidence projection
+                // (I14.20): Ok(Ok)/Ok(Err)/Err/None map to
+                // success/failure/join-failure/drained. Observation only,
+                // no peer/session payload (I15.4).
                 match joined {
-                    Some(Ok(Ok(()))) | None => {}
-                    Some(Ok(Err(error))) => write_error("SESSION_FAILURE", &error.to_string()),
-                    Some(Err(error)) => write_error("SESSION_TASK_FAILURE", &error.to_string()),
+                    Some(Ok(Ok(()))) => observe_entrypoint_with_detail(
+                        EntrypointStage::SessionTaskOutcome,
+                        "kernel.session.outcome:success",
+                    ),
+                    Some(Ok(Err(error))) => {
+                        observe_entrypoint_with_detail(
+                            EntrypointStage::SessionTaskOutcome,
+                            "kernel.session.outcome:failure",
+                        );
+                        write_error("SESSION_FAILURE", &error.to_string());
+                    }
+                    Some(Err(error)) => {
+                        observe_entrypoint_with_detail(
+                            EntrypointStage::SessionTaskOutcome,
+                            "kernel.session.outcome:join_failure",
+                        );
+                        write_error("SESSION_TASK_FAILURE", &error.to_string());
+                    }
+                    None => observe_entrypoint_with_detail(
+                        EntrypointStage::SessionTaskOutcome,
+                        "kernel.session.outcome:drained",
+                    ),
                 }
             }
             signal = tokio::signal::ctrl_c() => {
@@ -146,6 +171,14 @@ pub async fn run_front_door_loop(kernel: Arc<KernelComposition>, binding: &Kerne
                 peer_set = replacement_peers;
                 peer_set_revision = replacement_revision;
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
+                    // F-LOG-KERNEL-0 (#895 W2/T14): permit exhaustion is
+                    // visible here without a false success/failure claim:
+                    // neither a terminal record nor a success event, only
+                    // the admission observation. No peer/session payload.
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::SessionPermitAdmission,
+                        "kernel.session.admission:deferred_capacity",
+                    );
                     drop(accepted_server);
                     continue;
                 };
@@ -167,8 +200,21 @@ pub async fn run_front_door_loop(kernel: Arc<KernelComposition>, binding: &Kerne
     }
     let _ = shutdown_tx.send(true);
     while let Some(joined) = sessions.join_next().await {
+        // F-LOG-KERNEL-0 (#895 W2/T15): same JoinSet projection as the
+        // in-loop arms; drain outcomes are recorded, never discarded.
         match joined {
-            Ok(Ok(()) | Err(_)) | Err(_) => {}
+            Ok(Ok(())) => observe_entrypoint_with_detail(
+                EntrypointStage::SessionTaskOutcome,
+                "kernel.session.outcome:success",
+            ),
+            Ok(Err(_)) => observe_entrypoint_with_detail(
+                EntrypointStage::SessionTaskOutcome,
+                "kernel.session.outcome:failure",
+            ),
+            Err(_) => observe_entrypoint_with_detail(
+                EntrypointStage::SessionTaskOutcome,
+                "kernel.session.outcome:join_failure",
+            ),
         }
     }
 }

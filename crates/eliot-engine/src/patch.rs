@@ -2,6 +2,8 @@ use crate::{
     EngineError, WriteAdmissionService, WriterHandle, codecortex_report_ref,
     context::CompletionGate, guard_work_lease_for_files, work::WorkLeaseGuardError,
 };
+use eliot_instrument_api::InstrumentKind;
+use eliot_instrument_runner::profile::{InstrumentRegistry, ProfileCompiler};
 use eliot_store::BlobStore;
 use eliot_types::{
     ActionLease, ActionScope, CodeCortexReport, CommandContext, CompletionGateDecision,
@@ -428,8 +430,24 @@ impl<'a> VerifierHarness<'a> {
         agent_id: eliot_types::AgentId,
         plan: &VerifierPlan,
     ) -> Result<Vec<VerifierRun>, EngineError> {
+        // Route every requirement through the single profile compiler (#1813):
+        // a requirement that claims a governed instrument name must execute
+        // an invocation of an admitted class. Quarantined legacy names keep
+        // their current behavior with no governed claim.
+        let instrument_registry =
+            InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
+                EngineError::ServiceNotReady {
+                    service: "instrument-profile".to_owned(),
+                    reason: format!("builtin profile registry is unavailable: {error}"),
+                }
+            })?;
         let mut runs = Vec::new();
         for requirement in plan.required.iter().chain(plan.optional.iter()) {
+            gate_requirement_profile(
+                &instrument_registry,
+                &requirement.name,
+                requirement.command_kind,
+            )?;
             runs.push(
                 self.run_requirement(project_id, task_id, agent_id, requirement)
                     .await?,
@@ -590,6 +608,22 @@ impl CompletionGate {
         }) {
             reasons.push("required_verifier_missing_canonical_scope_or_receipt".to_owned());
         }
+        // The finish binding only trusts required runs whose claimed profile
+        // name survives the single profile compiler (#1813): a governed name
+        // with a foreign or unmappable command class can never satisfy
+        // DONE_VERIFIED.
+        match InstrumentRegistry::with_builtin_profiles(1) {
+            Ok(instrument_registry) => {
+                for run in verifier_runs.iter().filter(|run| run.required_for_done) {
+                    if gate_requirement_profile(&instrument_registry, &run.name, run.command_kind)
+                        .is_err()
+                    {
+                        reasons.push(format!("required_verifier_profile_mismatch:{}", run.name));
+                    }
+                }
+            }
+            Err(_) => reasons.push("instrument_profile_registry_unavailable".to_owned()),
+        }
         if !proof
             .evidence
             .iter()
@@ -637,6 +671,58 @@ impl From<&BoundedCommandOutput> for CommandBlobs {
 struct FixedCommand {
     program: &'static str,
     args: Vec<&'static str>,
+}
+
+/// Maps a harness command class to its instrument class, if it has one.
+///
+/// Audit, deny, domain-verifier, and manual-review requirements execute no
+/// governed instrument, so they can never claim a governed profile name.
+fn instrument_kind_for_command(kind: VerifierCommandKind) -> Option<InstrumentKind> {
+    match kind {
+        VerifierCommandKind::CargoCheck | VerifierCommandKind::CargoClippy => {
+            Some(InstrumentKind::Build)
+        }
+        VerifierCommandKind::CargoTest | VerifierCommandKind::CargoNextest => {
+            Some(InstrumentKind::Test)
+        }
+        VerifierCommandKind::CargoFmtCheck => Some(InstrumentKind::Format),
+        VerifierCommandKind::CargoAudit
+        | VerifierCommandKind::CargoDeny
+        | VerifierCommandKind::DomainVerifier
+        | VerifierCommandKind::ManualReview => None,
+    }
+}
+
+/// Gates one claimed profile name through the single profile compiler.
+///
+/// Quarantined legacy names pass through with no governed claim. Governed
+/// names require a mappable command class admitted by the profile; anything
+/// else fails closed so a forged governed claim can never execute or satisfy
+/// a finish gate.
+fn gate_requirement_profile(
+    registry: &InstrumentRegistry,
+    name: &str,
+    command_kind: VerifierCommandKind,
+) -> Result<(), EngineError> {
+    let compiled = ProfileCompiler::new(registry).compile(name);
+    if !compiled.is_governed() {
+        return Ok(());
+    }
+    let Some(kind) = instrument_kind_for_command(command_kind) else {
+        return Err(EngineError::ServiceNotReady {
+            service: "instrument-profile".to_owned(),
+            reason: format!(
+                "governed profile '{name}' cannot be claimed by a requirement with no governed instrument class"
+            ),
+        });
+    };
+    let _admitted = compiled
+        .require_kind(kind)
+        .map_err(|error| EngineError::ServiceNotReady {
+            service: "instrument-profile".to_owned(),
+            reason: format!("profile compiler rejected the verifier claim: {error}"),
+        })?;
+    Ok(())
 }
 
 fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {

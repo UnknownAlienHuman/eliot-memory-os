@@ -34,6 +34,11 @@
 //! ([`MemoryInput`], [`eight_slots`]): the slot shape, availability mapping,
 //! and denominator check land here, while mapper adoption of the eight-slot
 //! denominator waits for #41 to merge. The mapped denominator stays seven.
+//!
+//! Issue #41 lands the typed CC-004 alternative for the three Governor
+//! slots: [`CanonicalProjectionInput`] plus
+//! [`construct_context_candidates_with_canonical`]. The opaque path stays
+//! for owners that have not adopted the typed set.
 
 #![forbid(unsafe_code)]
 
@@ -43,20 +48,22 @@ pub mod mapper;
 pub mod vocabulary;
 
 pub use derive::{
-    assurance_member_id, attention_member_id, conflict_member_id, derived_member_id,
-    direct_member_id, envelope_member_id, epistemic_member_id,
+    CanonicalDerivedMembers, CanonicalMember, assurance_member_id, attention_member_id,
+    conflict_member_id, derive_canonical_projections, derived_member_id, direct_member_id,
+    envelope_member_id, epistemic_member_id,
 };
 pub use eliot_context_contracts::ContextError;
 pub use inputs::{
-    AttentionInput, CandidateBounds, CandidatePolicy, CandidateRequest, CueActivationResult,
-    CueInput, EpistemicInput, EvidenceInput, MAX_MEMORY_CUE_HITS, MEMORY_PROVIDER,
-    MemberMeasurement, MemoryExclusion, MemoryInput, OpaqueMember, OpaqueProjection,
-    ProjectionSchema, ProjectionState, check_denominator_is_seven_or_eight, eight_slots,
-    memory_availability,
+    AttentionInput, CandidateBounds, CandidatePolicy, CandidateRequest, CanonicalProjectionInput,
+    CueActivationResult, CueInput, EpistemicInput, EvidenceInput, MAX_CANONICAL_MEASUREMENTS,
+    MAX_MEMORY_CUE_HITS, MEMORY_PROVIDER, MemberMeasurement, MemoryExclusion, MemoryInput,
+    OpaqueMember, OpaqueProjection, ProjectionSchema, ProjectionState,
+    check_denominator_is_seven_or_eight, eight_slots, exclusion_reason_class, memory_availability,
 };
 pub use mapper::{
     ContextCandidateSetResult, FrontierRecord, MAX_FRONTIER_TEXT_BYTES, MemberDisposition,
     MemberOutcome, RoleDisposition, construct_context_candidates,
+    construct_context_candidates_with_canonical,
 };
 pub use vocabulary::{
     CANDIDATE_SCHEMA_VERSION, KIND_MAP_VERSION, PROVIDER_AFFORDANCE, PROVIDER_ATTENTION,

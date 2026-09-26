@@ -12,6 +12,13 @@
 //! All journal mutations use one short Redb write transaction. The unique
 //! phase-slot index, sequence row and (when present) result row are committed
 //! together. A receipt is owner-issued only after current-owner readback.
+//!
+//! An append-triggered retention pass is composed into that same transaction
+//! and runs only after the append has been admitted against the addressed
+//! stream binding, the exact operation/envelope identity, the retired-slot and
+//! budget preconditions and the current predecessor. A refused append therefore
+//! cannot commit a reclamation, and an exact replay cannot reclaim the very row
+//! whose persisted receipt it returns.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -596,6 +603,45 @@ fn plan_resolved_prefix(
     Ok(removals)
 }
 
+/// True when the presented predecessor is exactly the current journal head.
+///
+/// A stream with no retained row has no head, and a request that omits the
+/// predecessor matches it. Every other relationship is a conflict: a caller
+/// whose request was built against a reclaimed or superseded head must learn
+/// that rather than append onto a head it never observed.
+fn expected_predecessor_matches(
+    operation: &RestoreJournalOperation,
+    head: Option<&JournalPredecessor>,
+) -> bool {
+    match (&operation.expected_predecessor, head) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.sequence == current.sequence && expected.digest == current.digest
+        }
+        _ => false,
+    }
+}
+
+/// Reports whether already-validated stream state has reached the accepted
+/// reclaim point of the retention policy.
+///
+/// This is deliberately a PURE function over the in-transaction
+/// [`JournalStreamState`] the writer transaction has already validated, not a
+/// preflight read. A separate read transaction would answer the pressure
+/// question from a snapshot that a later prune could invalidate before the pass
+/// runs, which is exactly the unlocked check-then-act race this must not have.
+/// A stream that does not exist yet never reaches this function: the caller has
+/// already refused an unbound stream. Both the retained members and the retired
+/// phase-slot tombstones count, so a stream that has already reclaimed heavily
+/// reaches the point again and is reclaimed again.
+fn restore_journal_under_retention_pressure(
+    stream_state: &JournalStreamState,
+    policy: &RestoreJournalRetentionPolicy,
+) -> bool {
+    stream_state.intents.len() >= policy.reclaim_from_members
+        || stream_state.used_slots.len() >= policy.reclaim_from_members
+}
+
 /// Reclaims the oldest contiguous resolved prefix under the accepted window.
 ///
 /// The whole pass runs inside the caller's single write transaction, so the
@@ -733,6 +779,30 @@ impl RedbRecoveryStore {
             .and_then(|stream_state| stream_state.binding.clone()))
     }
 
+    /// Reads the durable head record of one bound stream, after validating the
+    /// complete journal schema, index closure and sequence chain.
+    ///
+    /// The head is written in the same transaction as every append and prune and
+    /// is proved equal to the head the retained rows derive, so it is the one
+    /// durable witness a requester can chain to and derive its member
+    /// denominator from
+    /// ([`RestoreJournalMemberDenominator::for_head`]). It is deliberately NOT
+    /// a readback of any entry: a requester that took its expected member count
+    /// from the very rows it is asking about would be comparing an answer with
+    /// itself, and the retire counter, the phase-slot tombstones and the
+    /// sequence chain could then disagree without anything noticing.
+    ///
+    /// A stream with no persisted binding is refused, so an absent head can
+    /// never be read as a complete empty journal.
+    pub fn restore_journal_durable_head(
+        &self,
+        stream: &str,
+    ) -> Result<Option<JournalPredecessor>, OrsError> {
+        validate_journal_text(stream, "journal.stream")?;
+        let state = self.read_restore_journal_state()?;
+        Ok(state.stream(stream)?.head.clone())
+    }
+
     /// Ensures the explicit versioned journal layout. This method is
     /// idempotent for a valid v2 layout and refuses to recreate a missing or
     /// legacy table.
@@ -745,6 +815,15 @@ impl RedbRecoveryStore {
 
     /// Appends one intent with exact binding, predecessor and unique-index
     /// compare, or replays the exact owner row.
+    ///
+    /// Every admission decision is taken inside the one write transaction that
+    /// commits the append, and in this order: addressed stream binding, exact
+    /// operation/envelope replay classification, retired phase slot, retained
+    /// plus retired budget, current predecessor. Only then, and only for a
+    /// genuinely new admitted append, is the bounded retention pass composed
+    /// into the same transaction. A refusal at any step drops that transaction,
+    /// so no bound, identity, retired-slot or predecessor refusal can leave a
+    /// committed journal mutation behind.
     #[allow(
         clippy::too_many_lines,
         reason = "the atomic append boundary keeps validation, compare, indexes and readback together"
@@ -766,93 +845,135 @@ impl RedbRecoveryStore {
         let phase_identity = operation.phase_identity(stream)?;
         let slot_sha256 = sha256_hex(phase_identity.as_bytes());
         let operation_sha256 = operation.identity_sha256(stream)?;
-        // Retention under pressure, on the append path a restoring caller
-        // actually executes. Once a stream reaches the accepted reclaim point
-        // the oldest contiguous RESOLVED prefix is reclaimed before the new
-        // intent is admitted, so resolved history is reclaimed rather than a
-        // recovery-needed intent being evicted to make room. The probe reads
-        // only validated owner state and a stream that has not reached the
-        // reclaim point is admitted exactly as before, with no write at all.
-        //
-        // The pass is idempotent and separate from this append's own atomic
-        // boundary, so it can neither roll back nor weaken the append: a stream
-        // whose unresolved frontier blocks reclamation simply proceeds and is
-        // refused by the existing ceiling further down, which is the correct
-        // failure — the alternative would be evicting an unresolved intent.
-        if self.restore_journal_under_retention_pressure(stream)? {
-            self.apply_restore_journal_retention(stream)?;
-        }
+        // The accepted retention window an append-triggered reclamation runs
+        // under. It is the same policy the independent maintenance operation
+        // applies, so the append path can never reclaim under a laxer window
+        // than maintenance.
+        let retention_policy = RestoreJournalRetentionPolicy::accepted();
+        retention_policy.validate()?;
         let write = self.database.begin_write().map_err(storage)?;
         initialize_restore_journal_schema(&write)?;
         let mut intents = write.open_table(RESTORE_JOURNAL_INTENTS).map_err(storage)?;
-        let results = write.open_table(RESTORE_JOURNAL_RESULTS).map_err(storage)?;
+        let mut results = write.open_table(RESTORE_JOURNAL_RESULTS).map_err(storage)?;
         let mut meta = write.open_table(RESTORE_JOURNAL_META).map_err(storage)?;
-        let state = validate_journal_tables(&intents, &results, &meta)?;
-        let stream_state = state.stream(stream)?;
-        if stream_state
-            .binding
-            .as_ref()
-            .is_none_or(|binding| !operation.matches_binding(binding))
+        let mut state = validate_journal_tables(&intents, &results, &meta)?;
+        // Admission is decided against the SAME write transaction that later
+        // commits this append, and nothing is written until the addressed stream
+        // binding, the exact operation/envelope identity, the retired-slot and
+        // budget preconditions and the current predecessor have all been proven.
+        // A refused append therefore cannot leave a committed retention effect
+        // behind: a retained row, phase-slot tombstone, prune fence, head or
+        // retention decision is only ever reclaimed as part of an append that is
+        // itself admitted and committed together with it.
         {
-            return Err(integrity(
-                "restore_journal_binding",
-                "operation does not match the persisted stream binding",
-            ));
-        }
-        let phase_slot = slot_sha256.clone();
-        if let Some(index) = stream_state.indexes.get(&phase_slot) {
-            let entry = stream_state
-                .intents
-                .get(&index.intent_sequence)
-                .ok_or_else(|| {
-                    integrity("restore_journal_index", "operation index has no intent row")
-                })?;
-            if index.operation_sha256 != operation_sha256
-                || index.payload_sha256 != payload_sha256
-                || entry.operation != *operation
-                || entry.payload != payload
+            let stream_state = state.stream(stream)?;
+            if stream_state
+                .binding
+                .as_ref()
+                .is_none_or(|binding| !operation.matches_binding(binding))
             {
-                return Err(identity_conflict());
+                return Err(integrity(
+                    "restore_journal_binding",
+                    "operation does not match the persisted stream binding",
+                ));
             }
-            drop(intents);
-            drop(results);
-            drop(meta);
-            write.commit().map_err(storage)?;
-            return self.owner_receipt(
-                stream,
-                &phase_slot,
-                RestoreJournalReceiptKind::Intent,
-                true,
-            );
-        }
-        if stream_state.used_slots.contains(&phase_slot) {
-            // The operation that owned this phase slot was pruned. Its row and
-            // index are gone, so accepting a new operation here would make the
-            // slot reusable and break phase-slot uniqueness across the journal
-            // history. The caller must reconcile against the history fence
-            // instead of appending into a retired slot.
-            return Err(integrity(
-                "restore_journal_operation",
-                "phase slot was already consumed by a pruned operation",
-            ));
+            // Exact replay is classified BEFORE any retention effect. A replayed
+            // operation is by definition still retained, so reclaiming here would
+            // delete the very row whose persisted receipt the caller asked for
+            // and turn an exact replay into a pruned-slot refusal. A changed
+            // identity or payload in the same phase slot is an identity conflict
+            // and performs no transition at all.
+            if let Some(index) = stream_state.indexes.get(&slot_sha256) {
+                let entry = stream_state
+                    .intents
+                    .get(&index.intent_sequence)
+                    .ok_or_else(|| {
+                        integrity("restore_journal_index", "operation index has no intent row")
+                    })?;
+                if index.operation_sha256 != operation_sha256
+                    || index.payload_sha256 != payload_sha256
+                    || entry.operation != *operation
+                    || entry.payload != payload
+                {
+                    return Err(identity_conflict());
+                }
+                drop(intents);
+                drop(results);
+                drop(meta);
+                write.commit().map_err(storage)?;
+                return self.owner_receipt(
+                    stream,
+                    &slot_sha256,
+                    RestoreJournalReceiptKind::Intent,
+                    true,
+                );
+            }
+            if stream_state.used_slots.contains(&slot_sha256) {
+                // The operation that owned this phase slot was pruned. Its row and
+                // index are gone, so accepting a new operation here would make the
+                // slot reusable and break phase-slot uniqueness across the journal
+                // history. The caller must reconcile against the history fence
+                // instead of appending into a retired slot. The refusal stays
+                // honest: the lost receipt is never reconstructed from the
+                // presented request, and the slot never becomes reusable.
+                return Err(integrity(
+                    "restore_journal_operation",
+                    "phase slot was already consumed by a pruned operation",
+                ));
+            }
+
+            // Refuse BEFORE writing anything when the combined retained-plus-retired
+            // slot budget is already full. Validation enforces the same bound, so
+            // admitting one more slot here would let a normal append commit a state
+            // that the very next read rejects, bricking an otherwise valid store.
+            if stream_state.intents.len() >= MAX_JOURNAL_HISTORY_ENTRIES
+                || stream_state.used_slots.len() >= MAX_JOURNAL_HISTORY_ENTRIES
+            {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            if !expected_predecessor_matches(operation, stream_state.head.as_ref()) {
+                return Err(predecessor_conflict());
+            }
         }
 
-        // Refuse BEFORE writing anything when the combined retained-plus-retired
-        // slot budget is already full. Validation enforces the same bound, so
-        // admitting one more slot here would let a normal append commit a state
-        // that the very next read rejects, bricking an otherwise valid store.
-        if stream_state.intents.len() >= MAX_JOURNAL_HISTORY_ENTRIES
-            || stream_state.used_slots.len() >= MAX_JOURNAL_HISTORY_ENTRIES
-        {
-            return Err(OrsError::ProjectionLimitExceeded);
+        // Only a genuinely new, admitted append reaches retention. The bounded
+        // pass runs through the existing locked helper over the already-open
+        // table handles inside this same transaction, so reclamation and the
+        // append share one owner-controlled atomic boundary: no second
+        // transaction, and no unlocked preflight that could race a later prune
+        // between the pressure decision and the pass. A stream whose unresolved
+        // frontier blocks reclamation simply proceeds to the ceiling refusal
+        // above — it is never made room by evicting an unresolved intent.
+        let under_retention_pressure =
+            restore_journal_under_retention_pressure(state.stream(stream)?, &retention_policy);
+        if under_retention_pressure {
+            let stream_state = state.stream(stream)?;
+            retain_restore_journal_locked(
+                &mut intents,
+                &mut results,
+                &mut meta,
+                &state,
+                stream_state,
+                stream,
+                retention_policy.keep_resolved,
+            )?;
+            // The pass removed rows, added tombstones and can move the head, so
+            // the whole closure is re-derived from the mutated tables. The
+            // append's own sequence and byte/work accounting then describe the
+            // state this transaction will actually commit. Any refusal below
+            // drops the write transaction, so a committed reclamation can never
+            // exist beside a rejected append or a half-updated metadata row.
+            state = validate_journal_tables(&intents, &results, &meta)?;
+        }
+        let stream_state = state.stream(stream)?;
+        // The predecessor is proven again against the head this append actually
+        // uses. Reclamation only drops the oldest resolved prefix, so the head
+        // normally does not move, but appending onto a moved head without this
+        // check would commit a predecessor linkage the very next read rejects.
+        if !expected_predecessor_matches(operation, stream_state.head.as_ref()) {
+            return Err(predecessor_conflict());
         }
         let head = stream_state.head.clone();
-        match (&operation.expected_predecessor, &head) {
-            (None, None) => {}
-            (Some(expected), Some(current))
-                if expected.sequence == current.sequence && expected.digest == current.digest => {}
-            _ => return Err(predecessor_conflict()),
-        }
         let sequence = match head {
             Some(current) => current
                 .sequence
@@ -872,7 +993,7 @@ impl RedbRecoveryStore {
         let index = RestoreJournalOperationIndex {
             stream: stream.to_owned(),
             slot_identity: phase_identity,
-            slot_sha256: phase_slot.clone(),
+            slot_sha256: slot_sha256.clone(),
             operation_identity: operation.identity(stream)?,
             operation_sha256,
             transaction_id: operation.transaction_id.clone(),
@@ -903,7 +1024,7 @@ impl RedbRecoveryStore {
         let added_bytes = (encoded_entry.len()
             + encoded_index.len()
             + intent_row_key.len()
-            + operation_key(&phase_slot).len()
+            + operation_key(&slot_sha256).len()
             + encoded_head.len()
             + head_key.len())
         .saturating_sub(replaced_head_bytes);
@@ -915,7 +1036,7 @@ impl RedbRecoveryStore {
         intents
             .insert(intent_row_key.as_str(), encoded_entry.as_str())
             .map_err(storage)?;
-        meta.insert(operation_key(&phase_slot).as_str(), encoded_index.as_str())
+        meta.insert(operation_key(&slot_sha256).as_str(), encoded_index.as_str())
             .map_err(storage)?;
         meta.insert(head_key.as_str(), encoded_head.as_str())
             .map_err(storage)?;
@@ -939,7 +1060,7 @@ impl RedbRecoveryStore {
         }
         self.owner_receipt(
             stream,
-            &phase_slot,
+            &slot_sha256,
             RestoreJournalReceiptKind::Intent,
             false,
         )
@@ -1174,7 +1295,15 @@ impl RedbRecoveryStore {
     ///
     /// The denominator counts the WHOLE journal, retired members included, so
     /// a retained suffix is proved rather than assumed to be the entire
-    /// history. Missing, corrupt, unsupported, stale or partially reclaimed
+    /// history. Because a denominator is always the member count its own head
+    /// covers, the equality below is a real requirement and not a round trip:
+    /// the requester counts from the durable head record read by
+    /// [`Self::restore_journal_durable_head`], while the store counts from the
+    /// retained intent rows plus the fence's recorded retire counter. Those are
+    /// different durable facts, and they disagree exactly when a fence, its
+    /// tombstones and the sequence chain no longer describe one history —
+    /// which this refusal reports instead of certifying a corrupt journal
+    /// complete. Missing, corrupt, unsupported, stale or partially reclaimed
     /// storage returns a typed refusal instead of a proof. Zero entries is
     /// [`RestoreJournalCompleteness::ExactNew`] only for a validated exact new
     /// journal — bound, no retained member, no retired phase slot and no prune
@@ -1414,13 +1543,17 @@ impl RedbRecoveryStore {
     /// reclaimed together with the recovery-needed members it refused to
     /// evict.
     ///
-    /// This is the product entry point the append path runs once a stream
-    /// reaches the accepted reclaim point. It never evicts an unresolved intent
-    /// to make room: reclamation stops at the first unresolved intent, and a
-    /// reclamation the retired-slot bound would refuse removes nothing and is
-    /// reported as a refusal. The surviving frontier is recomputed from current
-    /// owner state after the pass, so the report cannot claim a reclamation the
-    /// journal does not show.
+    /// This is an INDEPENDENTLY AUTHORIZED maintenance operation: it runs in its
+    /// own write transaction and returns its own
+    /// [`RestoreJournalRetentionReport`], which is never folded into an
+    /// append receipt. The append path reaches the same bounded pass under the
+    /// accepted reclaim point, but only for an append it has already admitted,
+    /// and only inside that append's own atomic boundary. Neither surface ever
+    /// evicts an unresolved intent to make room: reclamation stops at the first
+    /// unresolved intent, and a reclamation the retired-slot bound would refuse
+    /// removes nothing and is reported as a refusal. The surviving frontier is
+    /// recomputed from current owner state after the pass, so the report cannot
+    /// claim a reclamation the journal does not show.
     pub fn apply_restore_journal_retention(
         &self,
         stream: &str,
@@ -1437,24 +1570,6 @@ impl RedbRecoveryStore {
             surviving_unresolved_members: frontier.unresolved_members,
             oldest_surviving_unresolved: frontier.oldest_unresolved_sequence,
         })
-    }
-
-    /// Reports whether this stream has reached the accepted reclaim point of
-    /// the retention policy.
-    ///
-    /// Only validated owner state answers the question, and a stream that does
-    /// not exist yet is not under pressure. Both the retained members and the
-    /// retired phase-slot tombstones count: tombstones accumulate as history is
-    /// reclaimed, so a stream that has already reclaimed heavily reaches the
-    /// point again and is reclaimed again.
-    fn restore_journal_under_retention_pressure(&self, stream: &str) -> Result<bool, OrsError> {
-        let policy = RestoreJournalRetentionPolicy::accepted();
-        policy.validate()?;
-        let state = self.read_restore_journal_state()?;
-        Ok(state.streams.get(stream).is_some_and(|stream_state| {
-            stream_state.intents.len() >= policy.reclaim_from_members
-                || stream_state.used_slots.len() >= policy.reclaim_from_members
-        }))
     }
 
     /// Runs exactly one retention pass in its own write transaction and returns

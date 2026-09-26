@@ -1,7 +1,11 @@
 use crate::{CompilePacketL3Request, CueBinding, MaterialPacketFrame, MemoryExposureMode};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::{
+    Deserialize, Serialize,
+    de::{Error as _, MapAccess, Visitor},
+};
+use serde_json::{Map, Value, json};
+use std::fmt;
 
 /// Wire/schema revision for the capture-first `eliot.observe` surface.
 ///
@@ -11,7 +15,7 @@ use serde_json::{Value, json};
 /// hash material for old `Some(note)` cue bindings.
 pub const OBSERVE_INPUT_SCHEMA_VERSION: &str = "eliot.observe-v1";
 
-#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize)]
 pub struct CompilePacketToolInput {
     #[serde(flatten)]
     pub request: CompilePacketL3Request,
@@ -19,6 +23,127 @@ pub struct CompilePacketToolInput {
     pub material_frame: Option<MaterialPacketFrame>,
     #[serde(default)]
     pub memory_mode: Option<MemoryExposureMode>,
+}
+
+// Explicit decoder for the one permitted flat wire shape: the wrapper keys
+// plus the flattened `CompilePacketL3Request` keys, with no nested `request`
+// object and no new discriminator. A derived `flatten` decoder buffers the
+// remaining keys into a map and would silently keep the last duplicate, so
+// this decoder rejects duplicate keys while reading the raw map, before any
+// insertion, and rejects unknown keys before typed output. Request keys
+// mirror `CompilePacketL3Request` (`memory.rs`, #937-owned); a shape change
+// there invalidates this decoder. Serialization and the published schema
+// still derive from the declaration above.
+//
+// The prose here is deliberately a plain comment: this type derives
+// `JsonSchema`, and a doc comment would become the published schema
+// `description`, which the wire compatibility boundary must not change.
+impl<'de> Deserialize<'de> for CompilePacketToolInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(CompilePacketToolInputVisitor)
+    }
+}
+
+struct CompilePacketToolInputVisitor;
+
+const COMPILE_PACKET_TOOL_FIELDS: &[&str] = &[
+    "project_id",
+    "task_id",
+    "goal",
+    "candidate_handles",
+    "max_tokens",
+    "material_frame",
+    "memory_mode",
+];
+
+impl<'de> Visitor<'de> for CompilePacketToolInputVisitor {
+    type Value = CompilePacketToolInput;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a flat compile-packet tool object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut request_keys = Map::new();
+        let mut material_frame: Option<MaterialPacketFrame> = None;
+        let mut memory_mode: Option<MemoryExposureMode> = None;
+        let mut material_frame_seen = false;
+        let mut memory_mode_seen = false;
+        let mut project_id_seen = false;
+        let mut task_id_seen = false;
+        let mut goal_seen = false;
+        let mut candidate_handles_seen = false;
+        let mut max_tokens_seen = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "material_frame" => {
+                    if material_frame_seen {
+                        return Err(A::Error::duplicate_field("material_frame"));
+                    }
+                    material_frame_seen = true;
+                    material_frame = map.next_value()?;
+                }
+                "memory_mode" => {
+                    if memory_mode_seen {
+                        return Err(A::Error::duplicate_field("memory_mode"));
+                    }
+                    memory_mode_seen = true;
+                    memory_mode = map.next_value()?;
+                }
+                "project_id" => {
+                    if project_id_seen {
+                        return Err(A::Error::duplicate_field("project_id"));
+                    }
+                    project_id_seen = true;
+                    request_keys.insert(key, map.next_value()?);
+                }
+                "task_id" => {
+                    if task_id_seen {
+                        return Err(A::Error::duplicate_field("task_id"));
+                    }
+                    task_id_seen = true;
+                    request_keys.insert(key, map.next_value()?);
+                }
+                "goal" => {
+                    if goal_seen {
+                        return Err(A::Error::duplicate_field("goal"));
+                    }
+                    goal_seen = true;
+                    request_keys.insert(key, map.next_value()?);
+                }
+                "candidate_handles" => {
+                    if candidate_handles_seen {
+                        return Err(A::Error::duplicate_field("candidate_handles"));
+                    }
+                    candidate_handles_seen = true;
+                    request_keys.insert(key, map.next_value()?);
+                }
+                "max_tokens" => {
+                    if max_tokens_seen {
+                        return Err(A::Error::duplicate_field("max_tokens"));
+                    }
+                    max_tokens_seen = true;
+                    request_keys.insert(key, map.next_value()?);
+                }
+                _ => {
+                    return Err(A::Error::unknown_field(&key, COMPILE_PACKET_TOOL_FIELDS));
+                }
+            }
+        }
+        let request = CompilePacketL3Request::deserialize(Value::Object(request_keys))
+            .map_err(A::Error::custom)?;
+        Ok(CompilePacketToolInput {
+            request,
+            material_frame,
+            memory_mode,
+        })
+    }
 }
 
 #[allow(clippy::expect_used)]

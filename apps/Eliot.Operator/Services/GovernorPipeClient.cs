@@ -68,10 +68,13 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     }
 
     public Task<JsonElement> UserAutomationAsync(
-        UserAutomationOperation operation,
+        UserAutomationOperatorRequest request,
         CancellationToken cancellationToken = default)
     {
-        var request = UserAutomationOperatorRequest.Create(operation);
+        // The caller supplies the one prepared request, so the transmitted
+        // identity is the retained identity. Only its shape is checked here:
+        // re-deriving the key would rewrite a pending request's identity to
+        // match today's serializer instead of honouring the retained one.
         request.Validate();
         // Kernel/Host authenticates this route and supplies RequestMetadata,
         // principal, State Fence and OperationIdentity. Reusing the generic

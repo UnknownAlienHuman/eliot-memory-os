@@ -137,6 +137,10 @@ pub(super) async fn dispatch_host_governor_method(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one auditable JSON-RPC routing table plus its #7 correlation observation; splitting would hide the exactly-once emit"
+)]
 pub(super) async fn handle_message(
     state: &McpState,
     context: AuthenticatedRequestContext,
@@ -144,6 +148,8 @@ pub(super) async fn handle_message(
 ) -> Option<Value> {
     let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str)?;
+    let mut correlation = correlation::McpInvocationCorrelation::receive(&request, method);
+    correlation.observe_session(&context.session_id.to_string());
     let result = if state.profile == McpAccessProfile::HostGovernor {
         let Some(result) = dispatch_host_governor_method(
             state,
@@ -152,6 +158,8 @@ pub(super) async fn handle_message(
         )
         .await
         else {
+            correlation.observe_error_code(-32601);
+            correlation.emit();
             return Some(error_response(
                 &id,
                 -32601,
@@ -194,6 +202,8 @@ pub(super) async fn handle_message(
             }
             "ping" => Ok(json!({})),
             _ => {
+                correlation.observe_error_code(-32601);
+                correlation.emit();
                 return Some(error_response(
                     &id,
                     -32601,
@@ -226,6 +236,8 @@ pub(super) async fn handle_message(
                 .await
             }
             _ => {
+                correlation.observe_error_code(-32601);
+                correlation.emit();
                 return Some(error_response(
                     &id,
                     -32601,
@@ -234,6 +246,8 @@ pub(super) async fn handle_message(
             }
         }
     };
+    correlation.observe_handler_result(&result);
+    correlation.emit();
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err(error) => dispatch_error_response(&id, &error),

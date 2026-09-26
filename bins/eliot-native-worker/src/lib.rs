@@ -388,6 +388,82 @@ pub fn require_artifact_manifest_match(
     Ok(())
 }
 
+/// Requires the presenting generation's admitted Module Catalog revision to
+/// equal the owner-produced executable join's catalog revision.
+///
+/// Catalog-revision negative (Implements #22 W1): the generation's catalog
+/// binding (`NativeWorkerRegistration::module_catalog_revision`, mirroring
+/// the `catalog_revision` admitted by `eliot-module-registry`) travels
+/// outside the owner-digest comparison, so a generation admitted under one
+/// catalog revision would otherwise drive work bound to another. Any
+/// disagreement — or an unbound (zero) revision on either side — is a
+/// refused presentation (typed exit 78 in the binary, never the
+/// missing-material deferral). The owner advances the revision through a new
+/// admission; the worker never repairs it locally.
+///
+/// # Errors
+///
+/// Returns [`NativeWorkerError::KernelAdmissionRequired`] when the claim
+/// carries no v2 executable join, either side carries an unbound catalog
+/// revision, or the two revisions disagree.
+pub fn require_module_catalog_revision_match(
+    registration: &NativeWorkerRegistration,
+    claim: &NativeWorkerClaim,
+) -> Result<(), NativeWorkerError> {
+    let join = claim.executable_binding.as_ref().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "admitted claim carries no executable join; old wire cannot prove a catalog revision"
+                .to_owned(),
+        )
+    })?;
+    if registration.module_catalog_revision == 0 || join.module_catalog_revision == 0 {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted generation carries no bound Module Catalog revision".to_owned(),
+        ));
+    }
+    if registration.module_catalog_revision != join.module_catalog_revision {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted generation catalog revision does not match the owner-produced executable revision"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Requires the presenting generation's admitted capability cell to equal
+/// the owner-produced executable join's cell.
+///
+/// Cell-identity negative (Implements #22 W7): the generation's cell binding
+/// (`NativeWorkerRegistration::capability_cell`, in the issue #13
+/// `CapabilityCellId` family) travels outside the owner-digest comparison,
+/// so a generation admitted as one cell would otherwise drive work bound to
+/// another. Any disagreement is a
+/// refused presentation (typed exit 78 in the binary, never the
+/// missing-material deferral). The namespace binding is structural: only the
+/// exact admitted cell of the #13 family satisfies the join.
+///
+/// # Errors
+///
+/// Returns [`NativeWorkerError::KernelAdmissionRequired`] when the claim
+/// carries no v2 executable join or the two cell identities disagree.
+pub fn require_worker_cell_match(
+    registration: &NativeWorkerRegistration,
+    claim: &NativeWorkerClaim,
+) -> Result<(), NativeWorkerError> {
+    let join = claim.executable_binding.as_ref().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "admitted claim carries no executable join; old wire cannot prove a capability cell"
+                .to_owned(),
+        )
+    })?;
+    if registration.capability_cell != join.capability_cell {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted generation cell does not match the owner-bound executable cell".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Drives one admitted native-worker generation to `Ready`.
 ///
 /// Sequence: register, claim the exact authenticated unit, reconcile any
@@ -396,7 +472,8 @@ pub fn require_artifact_manifest_match(
 /// `start_claimed` through the exact `WorkerCore::demand_start_claimed` gate,
 /// then submit readiness. Invalid admission fails before any factory or
 /// process start is invoked: the artifact/manifest pin refuses first, then
-/// the lifecycle transport refuses, and the claimed core gate refuses before
+/// the catalog-revision (W1) and cell-identity (W7) pins, then the lifecycle
+/// transport refuses, and the claimed core gate refuses before
 /// P-03 starts anything. No coordinator
 /// verification is consumed here (T9-05 is not part of this contour); no user
 /// authentication is performed (owner decision #1376); no worker-local replay
@@ -420,8 +497,12 @@ where
 {
     // Artifact/manifest negative (#22): a worker starting from a
     // non-matching artifact/manifest identity is refused before any
-    // registration submit, factory effect, or process start.
+    // registration submit, factory effect, or process start. The generation's
+    // Module Catalog revision (W1) and capability cell (W7, #13 family) pins
+    // refuse next: a rewired registration or join never reaches the transport.
     require_artifact_manifest_match(admission.claim(), &hello)?;
+    require_module_catalog_revision_match(registration, admission.claim())?;
+    require_worker_cell_match(registration, admission.claim())?;
     lifecycle.submit_registration(registration)?;
     lifecycle.submit_claim(admission)?;
     lifecycle.submit_reconcile(reconcile)?;
@@ -2306,7 +2387,9 @@ mod tests {
             adapter_revision: 3,
             config_digest: "c".repeat(64),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
+            capability_cell: load(eliot_contracts::CapabilityCellId::new("cell-test-1")),
             grant_graph_revision: 5,
+            module_catalog_revision: 7,
             replay_stream_id: "claim-1/gen-1".to_owned(),
             launch_nonce: nonce.to_owned(),
             process_invocation_digest: "d".repeat(64),

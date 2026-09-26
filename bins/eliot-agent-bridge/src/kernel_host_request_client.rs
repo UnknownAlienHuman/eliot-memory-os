@@ -75,8 +75,66 @@ const AGENT_HOST_REQUEST_RECONCILE_OPERATION: &str = "agent_host_request_reconci
 /// admission-receipt) pair the kernel admitted; the typed answer is the
 /// durable record only, with no new receipt and no state advance.
 const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydrate";
+/// Closed kernel entry that resolves one logical host request or one exact
+/// operation handle without staging or dispatch (issue #2571).
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs` (resolve dispatch
+/// arm); the literal is repeated here because that constant will be
+/// `pub(crate)` to that binary and this crate takes no new dependencies. The
+/// entry is lookup-only: it never stages a row, issues a receipt, advances
+/// state, or runs provider work. It answers the two query forms built by
+/// [`host_request_resolve_frame`] with either the durable record in the
+/// existing rehydrated shape (no new receipt) or an explicit
+/// `accepted:false` resolve value (`absent` or `conflict`). Any transport or
+/// store failure surfaces as a transport failure, never as absence.
+const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_request_resolve";
 /// Canonical prefix of the kernel-derived opaque operation handle.
 const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
+/// Authenticated owner namespace for every logical host-request key
+/// (issue #2571: the admitted correlation namespace).
+///
+/// Mirrors `HOST_REQUEST_LOGICAL_NAMESPACE` in
+/// `crates/kernel/eliot-ors/src/store.rs`; the two literals are the shared
+/// recovery contract and must change together. The namespace names the
+/// Kernel-admitted application-continuity domain: keys derive only from the
+/// Kernel-issued session, the stable client occurrence, and the exact
+/// commitment — never from bare text, a principal alone, or a
+/// connection/deadline.
+const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
+/// Explicit admitted-unbound marker for parent/task/scope key components.
+///
+/// Mirrors `HOST_REQUEST_UNBOUND_MARKER` in
+/// `crates/kernel/eliot-ors/src/store.rs`. Recovery preserves an old
+/// task/scope binding but never silently rebinds it: a changed binding
+/// under a known key is a conflict, not an adoption.
+const HOST_REQUEST_UNBOUND_MARKER: &str = "-";
+/// Logical-key kind marker for invocation replay (issue #2571).
+///
+/// Mirrors the `host_request_kind_marker` mapping in
+/// `crates/kernel/eliot-ors/src/store.rs`; the literals must change
+/// together.
+const LOGICAL_KIND_INVOCATION: &str = "invocation";
+/// Logical-key kind marker for cancellation intent (issue #2571).
+///
+/// Mirrors the `host_request_kind_marker` mapping in
+/// `crates/kernel/eliot-ors/src/store.rs`; the literals must change
+/// together.
+const LOGICAL_KIND_CANCELLATION: &str = "cancellation";
+/// Filler capability carried only on handle-form resolve envelopes
+/// (issue #2571).
+///
+/// The owner ignores it: handle-form lookup loads by exact handle and
+/// checks ownership and rights, never binding these echoes. It exists only
+/// because the envelope shape requires a non-empty capability; it is never
+/// staged, never receipted, and the resolve entry must never bind it.
+const RESOLVE_HANDLE_CAPABILITY_FILLER: &str = "eliot.resolve.lookup";
+/// Filler payload digest carried only on handle-form resolve envelopes
+/// (issue #2571).
+///
+/// Sixty-four zeros, which is never a real payload digest. Same
+/// never-bind contract as [`RESOLVE_HANDLE_CAPABILITY_FILLER`].
+const RESOLVE_HANDLE_PAYLOAD_FILLER: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 /// Exact payload-schema identity for the canonical `ToolRequest` bytes.
 const HOST_REQUEST_PAYLOAD_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 /// Bridge-proposed relative deadline when the host states no preference.
@@ -101,7 +159,10 @@ pub struct KernelHostRequestClient {
 /// Process memory only; it dies with this bridge process, which spans exactly
 /// one admitted connection. An exact replay resends byte-identical envelopes
 /// so the kernel deduplicates by digest; a changed payload under a known
-/// correlation never reaches the wire.
+/// correlation never reaches the wire. The cache is an optimization only:
+/// on a miss the owner is asked to resolve the logical key (issue #2571)
+/// before any fresh envelope is built, so a restarted Bridge still
+/// converges on the original operation instead of dispatching twice.
 #[derive(Clone, Debug)]
 pub(super) struct ReplayCacheEntry {
     pub(super) payload_digest: String,
@@ -134,8 +195,155 @@ impl ParentLink {
             request_base: envelope.identity.request_id.as_str().to_owned(),
         }
     }
+
+    /// Rebuilds the exact parent reference from an owner-resolved durable
+    /// record (issue #2571: cancellation/status across Bridge restart).
+    ///
+    /// Called only with a record the resolve entry returned for the exact
+    /// queried handle under the current session: the capability and payload
+    /// come from durable owner state, never from host text and never from a
+    /// guessed default, so the cancellation envelope binds the original
+    /// commitment instead of inventing one.
+    fn from_owner_record(
+        handle: &str,
+        capability: &str,
+        payload_digest: &str,
+        request_base: &str,
+    ) -> Result<Self, PortFailure> {
+        if handle.is_empty()
+            || capability.trim().is_empty()
+            || capability.chars().any(char::is_control)
+            || request_base.trim().is_empty()
+            || request_base.chars().any(char::is_control)
+        {
+            return Err(unknown_handle());
+        }
+        if payload_digest.len() != 64
+            || !payload_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(unknown_handle());
+        }
+        Ok(Self {
+            handle: handle.to_owned(),
+            capability: capability.to_owned(),
+            payload_digest: payload_digest.to_owned(),
+            request_base: request_base.to_owned(),
+        })
+    }
 }
 
+/// Derives the canonical logical key for one host request (issue #2571:
+/// the logical key and replay contract).
+///
+/// Byte-identical contract to `host_request_logical_key` in
+/// `crates/kernel/eliot-ors/src/store.rs`: the owner namespace, kind
+/// marker, Kernel-issued session continuity, stable client occurrence,
+/// parent (or the explicit unbound marker), task/scope binding (or the
+/// explicit admitted-unbound marker), capability, and payload commitment are
+/// joined with a control separator text can never contain, then digested.
+/// Connection, deadline, fence, epoch, and generation are never key
+/// material. The occurrence rule is strict: one correlation value names at
+/// most one logical occurrence, so a retry reuses its correlation while an
+/// intentional second action mints a new one — identical payload bytes
+/// alone never distinguish the two, the occurrence does.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the logical key binds every commitment component explicitly so no binding is implicit at the call site"
+)]
+fn logical_host_request_key(
+    kind_marker: &str,
+    session: &str,
+    occurrence: &str,
+    parent: Option<&str>,
+    task: Option<&str>,
+    scope: Option<&str>,
+    capability: &str,
+    payload_digest: &str,
+) -> Result<String, PortFailure> {
+    for component in [kind_marker, session, occurrence, capability] {
+        if component.trim().is_empty() || component.chars().any(char::is_control) {
+            return Err(request_failure());
+        }
+    }
+    for component in [parent, task, scope].into_iter().flatten() {
+        if component.trim().is_empty() || component.chars().any(char::is_control) {
+            return Err(request_failure());
+        }
+    }
+    if payload_digest.len() != 64
+        || !payload_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(request_failure());
+    }
+    for component in [kind_marker, session, occurrence, capability]
+        .into_iter()
+        .chain([parent, task, scope].into_iter().flatten())
+    {
+        if component == HOST_REQUEST_UNBOUND_MARKER {
+            return Err(request_failure());
+        }
+    }
+    let text = format!(
+        "{namespace}\x1fkind={kind_marker}\x1fsession={session}\x1foccurrence={occurrence}\x1fparent={parent}\x1ftask={task}\x1fscope={scope}\x1fcapability={capability}\x1fpayload={payload_digest}",
+        namespace = HOST_REQUEST_LOGICAL_NAMESPACE,
+        parent = parent.unwrap_or(HOST_REQUEST_UNBOUND_MARKER),
+        task = task.unwrap_or(HOST_REQUEST_UNBOUND_MARKER),
+        scope = scope.unwrap_or(HOST_REQUEST_UNBOUND_MARKER),
+    );
+    Ok(sha256_hex(text.as_bytes()))
+}
+
+/// Derives the logical key for one invocation replay lookup.
+///
+/// The occurrence is the request correlation; the bridge carries no
+/// task/scope authority of its own, so invocations are explicitly
+/// admitted-unbound and a future task-bound caller resolves under a
+/// different key rather than silently adopting this one.
+fn logical_invocation_key(
+    request: &HostInvocationRequest,
+    session: &str,
+    payload_digest: &str,
+) -> Result<String, PortFailure> {
+    logical_host_request_key(
+        LOGICAL_KIND_INVOCATION,
+        session,
+        request.correlation_id.as_str(),
+        None,
+        None,
+        None,
+        request.tool.canonical_name(),
+        payload_digest,
+    )
+}
+
+/// Derives the logical key for one cancellation intent.
+///
+/// The cancellation binds its own stable identity — the cancel correlation
+/// occurrence — to the original parent handle plus the parent commitment
+/// the owner returned, so a repeated cancellation after restart or a lost
+/// acknowledgement resolves its retained intent instead of generating
+/// another effectful cancellation from a fresh timestamp.
+fn logical_cancellation_key(
+    cancel_correlation: &str,
+    parent: &ParentLink,
+    session: &str,
+) -> Result<String, PortFailure> {
+    logical_host_request_key(
+        LOGICAL_KIND_CANCELLATION,
+        session,
+        cancel_correlation,
+        Some(parent.handle.as_str()),
+        None,
+        None,
+        parent.capability.as_str(),
+        parent.payload_digest.as_str(),
+    )
+}
+///
 /// Minimal tolerant view of the kernel-returned durable record.
 ///
 /// Only the operation join, the state, and the optional result pair matter
@@ -148,6 +356,12 @@ impl ParentLink {
 /// `pub(crate)` so the composition caller driving `rehydrate_operation` can
 /// read the exact durable state the Kernel owner returned; the bridge still
 /// interprets nothing beyond this join.
+///
+/// The commitment tail (`request_digest` and below) is `None` on legacy
+/// submit-family replies and `Some` wherever the Kernel serves the full
+/// durable row (notably the resolve entry, issue #2571): the bridge
+/// verifies a resolved record against the requested logical key from these
+/// exact fields before adopting its handle, state, or result.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct AdmittedReplyView {
     pub(crate) operation_id: String,
@@ -156,6 +370,33 @@ pub(crate) struct AdmittedReplyView {
     pub(crate) result_digest: Option<String>,
     #[serde(default)]
     pub(crate) result_response: Option<serde_json::Value>,
+    /// Digest of the exact admitted envelope (`Some` on full-row replies).
+    #[serde(default)]
+    pub(crate) request_digest: Option<String>,
+    /// Closed durable kind (`INVOCATION`, `CANCELLATION`, ...) on full rows.
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+    /// Stable client occurrence on full rows.
+    #[serde(default)]
+    pub(crate) request_id: Option<String>,
+    /// Exact targeted parent handle on full child rows.
+    #[serde(default)]
+    pub(crate) parent_operation_id: Option<String>,
+    /// Kernel-issued session continuity on full rows.
+    #[serde(default)]
+    pub(crate) session_ref: Option<String>,
+    /// Governor task binding (or absent for admitted-unbound) on full rows.
+    #[serde(default)]
+    pub(crate) task_ref: Option<String>,
+    /// Governor scope binding (or absent for admitted-unbound) on full rows.
+    #[serde(default)]
+    pub(crate) scope_ref: Option<String>,
+    /// Exact capability on full rows.
+    #[serde(default)]
+    pub(crate) capability_ref: Option<String>,
+    /// Exact payload commitment on full rows.
+    #[serde(default)]
+    pub(crate) payload_digest: Option<String>,
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
@@ -242,6 +483,23 @@ fn unknown_handle() -> PortFailure {
     }
 }
 
+/// Builds the typed recovery limitation for a resolve with no durable
+/// answer (issue #2571).
+///
+/// Returned when the owner lookup itself is unavailable — a failed
+/// exchange, an undecodable reply, or a record that cannot be verified
+/// against the requested commitment. It names the logical key so the
+/// operator can reconcile that exact request, and it never authorizes a
+/// fresh operation: store/readback failure cannot become absence or a safe
+/// retry.
+fn unknown_resolve_outcome(logical_key: &str) -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: format!(
+            "host-request resolve left an unknown outcome for logical key {logical_key}; re-attach and reconcile it before retrying as a new occurrence"
+        ),
+    }
+}
+
 fn unix_ms() -> Result<u64, PortFailure> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -302,6 +560,18 @@ impl KernelTransportOwner {
     }
 }
 
+/// What one invocation preparation decided (issue #2571).
+enum InvocationPreparation {
+    /// Submit this envelope on the current transport: a cache-hit exact
+    /// replay or a fresh build the owner proved stageable. Boxed: the
+    /// envelope is the large variant beside the small recovered pair.
+    Submit(Box<HostRequestEnvelope>),
+    /// Return the owner-resolved original without dispatch: the logical
+    /// key plus the verified record commitment. Boxed beside the small
+    /// submit envelope so neither variant dominates the size.
+    Recovered(Box<AdmittedReplyView>, String),
+}
+
 impl KernelHostRequestClient {
     fn exchange(&mut self, frame: &Frame) -> Result<Frame, PortFailure> {
         self.shared
@@ -310,6 +580,18 @@ impl KernelHostRequestClient {
             .exchange_host_request_frame(frame)
     }
 
+    /// Replays, resolves, or builds one invocation (issue #2571).
+    ///
+    /// The local map is an optimization only. A cache hit with the same
+    /// payload resends the byte-identical envelope; a changed payload
+    /// under a known correlation stays a local conflict with no wire
+    /// traffic. On a cache miss the logical key is resolved against the
+    /// owner BEFORE any fresh invocation is constructed — including when
+    /// no earlier admission acknowledgement reached the Bridge — so a
+    /// restarted Bridge with an empty cache returns the original
+    /// operation/result instead of dispatching twice. A fresh envelope is
+    /// built only for an authoritatively absent key; conflict and
+    /// unavailable owner answers never build one.
     fn replay_or_build_invocation(
         &mut self,
         correlation: &str,
@@ -318,14 +600,14 @@ impl KernelHostRequestClient {
         session_id: &str,
         payload_digest: &str,
         now_ms: u64,
-    ) -> Result<HostRequestEnvelope, PortFailure> {
-        let mut owner = self
-            .shared
-            .try_borrow_mut()
-            .map_err(|_| request_failure())?;
-        if let Some(cached) = owner.replay_cache.get(correlation) {
+    ) -> Result<InvocationPreparation, PortFailure> {
+        let cached = {
+            let owner = self.shared.try_borrow().map_err(|_| request_failure())?;
+            owner.replay_cache.get(correlation).cloned()
+        };
+        if let Some(cached) = cached {
             if cached.payload_digest == payload_digest {
-                return Ok(cached.envelope.clone());
+                return Ok(InvocationPreparation::Submit(Box::new(cached.envelope)));
             }
             // Changed payload under a known correlation: the durable Kernel
             // owner (ORS) is the cross-restart source of truth for which bytes
@@ -334,16 +616,58 @@ impl KernelHostRequestClient {
             // durable record; never resubmit under a new identity here.
             return Err(PortFailure::IdempotencyConflict);
         }
-        let envelope =
-            build_invocation_envelope(request, facts, session_id, payload_digest, now_ms)?;
-        owner.replay_cache.insert(
-            correlation.to_owned(),
-            ReplayCacheEntry {
-                payload_digest: payload_digest.to_owned(),
-                envelope: envelope.clone(),
-            },
+        let logical_key = logical_invocation_key(request, session_id, payload_digest)?;
+        let resolve_label = resolve_request_label(correlation);
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_label,
+            None,
+            facts,
+            session_id,
+            request.tool.canonical_name(),
+            payload_digest,
+            now_ms,
+        )?;
+        let query = resolve_key_query(
+            &logical_key,
+            correlation,
+            request.tool.canonical_name(),
+            payload_digest,
         );
-        Ok(envelope)
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, facts)?;
+        let outcome = match self.exchange(&frame) {
+            Ok(reply) => decode_resolve_reply(
+                &reply,
+                &resolve_envelope,
+                &ResolveQuery::LogicalKey {
+                    key: logical_key.clone(),
+                },
+            ),
+            Err(_) => LogicalOwnerOutcome::Unavailable,
+        };
+        match outcome {
+            LogicalOwnerOutcome::Resolved(record) => {
+                verify_resolved_key_commitment(&record, &logical_key)?;
+                Ok(InvocationPreparation::Recovered(record, logical_key))
+            }
+            LogicalOwnerOutcome::Absent => {
+                let envelope =
+                    build_invocation_envelope(request, facts, session_id, payload_digest, now_ms)?;
+                self.shared
+                    .try_borrow_mut()
+                    .map_err(|_| request_failure())?
+                    .replay_cache
+                    .insert(
+                        correlation.to_owned(),
+                        ReplayCacheEntry {
+                            payload_digest: payload_digest.to_owned(),
+                            envelope: envelope.clone(),
+                        },
+                    );
+                Ok(InvocationPreparation::Submit(Box::new(envelope)))
+            }
+            LogicalOwnerOutcome::Conflict => Err(PortFailure::IdempotencyConflict),
+            LogicalOwnerOutcome::Unavailable => Err(unknown_resolve_outcome(&logical_key)),
+        }
     }
 
     fn parent_link_for_handle(&self, digest: &str) -> Result<ParentLink, PortFailure> {
@@ -357,6 +681,145 @@ impl KernelHostRequestClient {
             })
             .map(|entry| ParentLink::of(&entry.envelope))
             .ok_or_else(plan_gap_unknown_handle)
+    }
+
+    /// Resolves the exact parent reference for one operation handle,
+    /// consulting the owner when the local cache no longer holds it
+    /// (issue #2571: cancellation/status across Bridge restart).
+    ///
+    /// A cache hit keeps today's exact behavior. On a miss the resolve
+    /// entry is asked for the durable parent record under the current
+    /// session: the returned capability and payload rebuild the parent
+    /// link from owner state, so a fresh connection performs authorized
+    /// cancellation on the old handle while a foreign principal, scope, or
+    /// unapproved continuity cannot — denial answers exactly like absence,
+    /// disclosing neither task nor payload. An unavailable owner is the
+    /// explicit recovery limitation, never a guessed parent.
+    fn resolve_parent_link(
+        &mut self,
+        digest: &str,
+        facts: &TransportFacts,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<ParentLink, PortFailure> {
+        if let Ok(cached) = self.parent_link_for_handle(digest) {
+            return Ok(cached);
+        }
+        let handle = format!("{HOST_REQUEST_OPERATION_ID_PREFIX}{digest}");
+        let resolve_label = resolve_request_label(digest);
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_label,
+            Some(handle.as_str()),
+            facts,
+            session_id,
+            RESOLVE_HANDLE_CAPABILITY_FILLER,
+            RESOLVE_HANDLE_PAYLOAD_FILLER,
+            now_ms,
+        )?;
+        let query = resolve_handle_query(&handle);
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, facts)?;
+        let outcome = match self.exchange(&frame) {
+            Ok(reply) => decode_resolve_reply(
+                &reply,
+                &resolve_envelope,
+                &ResolveQuery::OperationHandle {
+                    handle: handle.clone(),
+                },
+            ),
+            Err(_) => LogicalOwnerOutcome::Unavailable,
+        };
+        match outcome {
+            LogicalOwnerOutcome::Resolved(record) => {
+                if record.operation_id != handle
+                    || record.session_ref.as_deref() != Some(session_id)
+                {
+                    return Err(unknown_cancel_outcome(&handle));
+                }
+                let (capability, payload_digest, request_base) = match (
+                    &record.capability_ref,
+                    &record.payload_digest,
+                    &record.request_id,
+                ) {
+                    (Some(capability), Some(payload_digest), Some(request_base)) => (
+                        capability.clone(),
+                        payload_digest.clone(),
+                        request_base.clone(),
+                    ),
+                    _ => return Err(unknown_cancel_outcome(&handle)),
+                };
+                ParentLink::from_owner_record(&handle, &capability, &payload_digest, &request_base)
+                    .map_err(|_| unknown_cancel_outcome(&handle))
+            }
+            LogicalOwnerOutcome::Absent | LogicalOwnerOutcome::Conflict => {
+                Err(plan_gap_unknown_handle())
+            }
+            LogicalOwnerOutcome::Unavailable => Err(unknown_cancel_outcome(&handle)),
+        }
+    }
+
+    /// Resolves one cancellation's retained intent after an unknown
+    /// delivery (issue #2571).
+    ///
+    /// The cancellation's own logical identity — its correlation bound to
+    /// the original parent — is looked up before any probe: a staged
+    /// intent whose acknowledgement was lost returns its retained outcome
+    /// instead of generating another effectful cancellation from a fresh
+    /// timestamp. An authoritatively absent intent falls back to the
+    /// observation-only parent probe; a conflicting intent is an
+    /// idempotency conflict for the caller to re-issue under a new
+    /// correlation; an unavailable owner stays the explicit limitation.
+    fn resolve_retained_cancellation(
+        &mut self,
+        parent: &ParentLink,
+        cancel_correlation: &str,
+        cancel_envelope: &HostRequestEnvelope,
+        facts: &TransportFacts,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<HostCancellationPortOutcome, PortFailure> {
+        let logical_key = logical_cancellation_key(cancel_correlation, parent, session_id)
+            .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
+        let resolve_label = resolve_request_label(cancel_correlation);
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_label,
+            None,
+            facts,
+            session_id,
+            parent.capability.as_str(),
+            parent.payload_digest.as_str(),
+            now_ms,
+        )
+        .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
+        let query = resolve_key_query(
+            &logical_key,
+            cancel_correlation,
+            parent.capability.as_str(),
+            parent.payload_digest.as_str(),
+        );
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, facts)
+            .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
+        let outcome = match self.exchange(&frame) {
+            Ok(reply) => decode_resolve_reply(
+                &reply,
+                &resolve_envelope,
+                &ResolveQuery::LogicalKey {
+                    key: logical_key.clone(),
+                },
+            ),
+            Err(_) => LogicalOwnerOutcome::Unavailable,
+        };
+        match outcome {
+            LogicalOwnerOutcome::Resolved(record) => {
+                verify_resolved_key_commitment(&record, &logical_key)
+                    .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
+                map_cancel_record_state(record.state)
+            }
+            LogicalOwnerOutcome::Absent => {
+                self.probe_confirms_parent(facts, session_id, parent, cancel_envelope, now_ms)
+            }
+            LogicalOwnerOutcome::Conflict => Err(PortFailure::IdempotencyConflict),
+            LogicalOwnerOutcome::Unavailable => Err(unknown_cancel_outcome(&parent.handle)),
+        }
     }
 }
 
@@ -472,6 +935,68 @@ fn build_reconciliation_envelope(
         payload_sha256: parent.payload_digest.clone(),
     };
     finish_envelope(facts, HostRequestKind::Reconciliation, identity)
+}
+
+/// Maximum resolve request-label length: leaves room for the
+/// `:idempotent`/`:cancel` derivations under the 512-byte envelope text
+/// ceiling, so even the longest submittable correlation keeps a valid
+/// resolve envelope.
+const MAX_RESOLVE_LABEL_BYTES: usize = 480;
+
+/// Derives the resolve request label for one occurrence or handle
+/// (issue #2571).
+///
+/// Readable `{base}:resolve` while it fits the envelope text ceiling; a
+/// digest fallback beyond that, so a long-but-submittable correlation
+/// never loses its resolve path. Deterministic in both cases and unique
+/// per query base, which is all the transport correlation needs.
+fn resolve_request_label(base: &str) -> String {
+    let direct = format!("{base}:resolve");
+    if direct.len() <= MAX_RESOLVE_LABEL_BYTES {
+        direct
+    } else {
+        format!("resolve:{}", sha256_hex(base.as_bytes()))
+    }
+}
+
+/// Builds one lookup-only resolve envelope over the current transport
+/// binding (issue #2571).
+///
+/// The envelope carries the CURRENT connection, session, fence, and
+/// descriptor — never the recovered operation's original transport
+/// material, never expired credentials. The recovery request therefore has
+/// its own current transport identity while the recovered operation keeps
+/// its original identity. The kind is `Status` (observation-only); the
+/// handle form names its exact parent (which also satisfies the per-kind
+/// presence rule), while the logical-key form carries the selectors the
+/// owner recomputes the key from and is accepted only on the resolve entry.
+fn build_resolve_envelope(
+    request_label: &str,
+    parent_operation_id: Option<&str>,
+    facts: &TransportFacts,
+    session_id: &str,
+    capability: &str,
+    payload_digest: &str,
+    now_ms: u64,
+) -> Result<HostRequestEnvelope, PortFailure> {
+    let deadline = now_ms.saturating_add(DEFAULT_DEADLINE_PREFERENCE_MS);
+    if deadline == 0 {
+        return Err(request_failure());
+    }
+    let identity = HostRequestIdentity {
+        request_id: RequestId::new(request_label).map_err(|_| request_failure())?,
+        idempotency_key: format!("{request_label}:idempotent"),
+        cancellation_id: format!("{request_label}:cancel"),
+        parent_operation_id: parent_operation_id.map(str::to_owned),
+        deadline_unix_ms: deadline,
+        capability: capability.to_owned(),
+        session_id: Some(session_id.to_owned()),
+        task_id: None,
+        work_scope_id: None,
+        payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
+        payload_sha256: payload_digest.to_owned(),
+    };
+    finish_envelope(facts, HostRequestKind::Status, identity)
 }
 
 fn finish_envelope(
@@ -753,6 +1278,68 @@ fn host_request_rehydrate_frame(
     Ok(frame)
 }
 
+/// Builds the logical-key resolve query carried beside the resolve
+/// envelope (issue #2571).
+///
+/// The owner recomputes the canonical key from the envelope session plus
+/// these selectors and requires equality with the presented key before any
+/// lookup, so a confused selector can never address another request's
+/// history. Called on every invocation cache miss, including when no
+/// earlier admission acknowledgement reached the Bridge.
+fn resolve_key_query(
+    logical_key: &str,
+    occurrence: &str,
+    capability: &str,
+    payload_digest: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "form": "logical-key",
+        "logical_key": logical_key,
+        "occurrence": occurrence,
+        "capability": capability,
+        "payload_digest": payload_digest,
+    })
+}
+
+/// Builds the exact-handle resolve query carried beside the resolve
+/// envelope (issue #2571).
+///
+/// Called on every cancellation cache miss so a fresh connection can
+/// cancel or observe the old handle: the owner checks exact parent
+/// ownership and current rights before returning the parent commitment,
+/// and answers denial exactly like absence so no foreign task or payload
+/// is disclosed.
+fn resolve_handle_query(operation_handle: &str) -> serde_json::Value {
+    serde_json::json!({
+        "form": "operation-handle",
+        "operation_handle": operation_handle,
+    })
+}
+
+/// Builds one resolve frame carrying the exact resolve envelope plus its
+/// typed query.
+///
+/// Reuses the neutral frame identity of
+/// [`host_request_frame_for_envelope`]; only the payload gains the `query`
+/// value the owner validates before any lookup. The old envelope is never
+/// resent as current authority: the resolve envelope is built fresh over
+/// the current transport facts, so no receipt is rewritten, no fence is
+/// copied, and no connection-echo check is weakened.
+fn host_request_resolve_frame(
+    query: &serde_json::Value,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_RESOLVE_OPERATION, envelope, facts)?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["query"] = query.clone();
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
 /// Strictly decodes one admitted reply: response/result shape, connection and
 /// request joins, closed `known`/`accepted` status, receipt digest validation
 /// against the exact sent envelope, and the operation join. Any mismatch is
@@ -789,7 +1376,11 @@ fn decode_admitted_reply(
         serde_json::from_value(value.get("receipt")?.clone()).ok()?;
     receipt.validate().ok()?;
     receipt.validate_envelope(envelope).ok()?;
-    let record = decode_record_view(value, envelope, receipt.operation_id.as_str())?;
+    let record = decode_record_view(
+        value,
+        receipt.operation_id.as_str(),
+        &envelope.envelope_sha256,
+    )?;
     Some((receipt, record))
 }
 
@@ -830,20 +1421,205 @@ fn decode_rehydrated_reply(
     if value.get("operation_id")?.as_str()? != expected {
         return None;
     }
-    decode_record_view(value, envelope, &expected)
+    decode_record_view(value, &expected, &envelope.envelope_sha256)
+}
+
+/// What the bridge asked the resolve entry to prove (issue #2571).
+enum ResolveQuery {
+    /// Replay lookup: return the durable winner for this logical key, or
+    /// prove it absent, conflicting, or unavailable.
+    LogicalKey { key: String },
+    /// Parent lookup: return the durable record for this exact handle, or
+    /// prove it absent (denial included, without disclosure) or unavailable.
+    OperationHandle { handle: String },
+}
+
+/// The explicit owner response to one resolve (issue #2571).
+///
+/// Every variant is produced from the owner's typed reply, never guessed:
+/// `Resolved` carries the original handle, state, and result with their
+/// historical binding; `Absent` authoritatively permits staging a new
+/// occurrence under admitted continuity; `Conflict` reports a changed
+/// commitment under a known key; `Unavailable` is the explicit recovery
+/// limitation for transport, store, or verification failure.
+enum LogicalOwnerOutcome {
+    /// The original handle, state, and result with their historical
+    /// binding. Boxed: the record is the large variant beside the small
+    /// dispositional answers.
+    Resolved(Box<AdmittedReplyView>),
+    Absent,
+    Conflict,
+    Unavailable,
+}
+
+/// Strictly decodes one resolve reply against the exact resolve envelope.
+///
+/// Transport joins mirror the submit family (response/result shape,
+/// current connection and resolve-request joins, no request identity);
+/// the resolve envelope is current transport, never authority, so no
+/// receipt is expected and none is accepted. A resolved record must carry
+/// its original digest for body coherence; anything else — a wrong echo,
+/// a malformed handle, a missing digest — is `Unavailable`, never a
+/// guessed outcome and never absence.
+fn decode_resolve_reply(
+    reply: &Frame,
+    envelope: &HostRequestEnvelope,
+    query: &ResolveQuery,
+) -> LogicalOwnerOutcome {
+    let payload = (|| {
+        reply.validate().ok()?;
+        if reply.kind != FrameKind::Response || reply.message_type != MessageType::Result {
+            return None;
+        }
+        if reply.connection_id != envelope.connection_id {
+            return None;
+        }
+        if reply.request_id.as_ref() != Some(&envelope.identity.request_id) {
+            return None;
+        }
+        if reply.request_identity.is_some() {
+            return None;
+        }
+        let payload = match &reply.payload {
+            ProtocolPayload::Json(value) => value.clone(),
+            _ => return None,
+        };
+        if payload.get("status")?.as_str()? != "known" {
+            return None;
+        }
+        Some(payload)
+    })();
+    let Some(payload) = payload else {
+        return LogicalOwnerOutcome::Unavailable;
+    };
+    let Some(value) = payload.get("value") else {
+        return LogicalOwnerOutcome::Unavailable;
+    };
+    if value.get("accepted").and_then(serde_json::Value::as_bool) == Some(true) {
+        let Some(operation_id) = value
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return LogicalOwnerOutcome::Unavailable;
+        };
+        match query {
+            ResolveQuery::LogicalKey { key } => {
+                let echo = value.get("logical_key").and_then(serde_json::Value::as_str);
+                if echo != Some(key.as_str()) {
+                    return LogicalOwnerOutcome::Unavailable;
+                }
+                if parse_operation_handle(operation_id).is_err() {
+                    return LogicalOwnerOutcome::Unavailable;
+                }
+            }
+            ResolveQuery::OperationHandle { handle } => {
+                if operation_id != handle.as_str() {
+                    return LogicalOwnerOutcome::Unavailable;
+                }
+            }
+        }
+        let Some(coherence) = value
+            .get("record")
+            .and_then(|record| record.get("request_digest"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return LogicalOwnerOutcome::Unavailable;
+        };
+        let coherence = coherence.to_owned();
+        return match decode_record_view(value, operation_id, &coherence) {
+            Some(record) => LogicalOwnerOutcome::Resolved(Box::new(record)),
+            None => LogicalOwnerOutcome::Unavailable,
+        };
+    }
+    let Some(disposition) = value.get("resolve").and_then(serde_json::Value::as_str) else {
+        return LogicalOwnerOutcome::Unavailable;
+    };
+    match (query, disposition) {
+        (ResolveQuery::LogicalKey { key }, "absent") => {
+            let echo = value.get("logical_key").and_then(serde_json::Value::as_str);
+            if echo != Some(key.as_str()) {
+                return LogicalOwnerOutcome::Unavailable;
+            }
+            LogicalOwnerOutcome::Absent
+        }
+        (_, "absent") => LogicalOwnerOutcome::Absent,
+        (ResolveQuery::LogicalKey { .. }, "conflict") => LogicalOwnerOutcome::Conflict,
+        _ => LogicalOwnerOutcome::Unavailable,
+    }
+}
+
+/// Verifies that a resolved record carries the requested logical key
+/// (issue #2571).
+///
+/// Recomputes the canonical key from the record's exact commitment fields
+/// and requires equality with the requested key: the returned original
+/// commitment must match the requested semantic input before its handle,
+/// state, or result is adopted. A missing commitment field, an
+/// unrecognized kind, or a mismatch fails closed as the explicit recovery
+/// limitation — never as a conflict and never as absence.
+fn verify_resolved_key_commitment(
+    record: &AdmittedReplyView,
+    expected_key: &str,
+) -> Result<(), PortFailure> {
+    let limitation = || unknown_resolve_outcome(expected_key);
+    let Some(kind) = &record.kind else {
+        return Err(limitation());
+    };
+    let Some(occurrence) = &record.request_id else {
+        return Err(limitation());
+    };
+    let Some(session) = &record.session_ref else {
+        return Err(limitation());
+    };
+    let Some(capability) = &record.capability_ref else {
+        return Err(limitation());
+    };
+    let Some(payload) = &record.payload_digest else {
+        return Err(limitation());
+    };
+    if record.request_digest.is_none() {
+        return Err(limitation());
+    }
+    let marker = match kind.as_str() {
+        "INVOCATION" => LOGICAL_KIND_INVOCATION,
+        "CANCELLATION" => LOGICAL_KIND_CANCELLATION,
+        _ => return Err(limitation()),
+    };
+    let recomputed = logical_host_request_key(
+        marker,
+        session,
+        occurrence,
+        record.parent_operation_id.as_deref(),
+        record.task_ref.as_deref(),
+        record.scope_ref.as_deref(),
+        capability,
+        payload,
+    )
+    .map_err(|_| limitation())?;
+    if recomputed != expected_key {
+        return Err(limitation());
+    }
+    Ok(())
 }
 
 /// Decodes the durable record under one reply value after the caller proved
 /// the operation join: exact operation identity plus the result-pair coherence
-/// rules shared by the submit-family and rehydrate answers. A result pair
+/// rules shared by the submit-family, rehydrate, and resolve answers. A result pair
 /// where none belongs (or a half-present pair) fails decoding into the
 /// unknown-outcome path: the bridge never guesses which half to trust.
 /// `RESULT_RECEIVED` must carry both; a `TERMINAL` may carry both forward;
 /// every other state must carry neither.
+///
+/// `coherence_request_digest` is the exact admitted envelope digest the
+/// result body must bind: the presenting envelope's digest for the
+/// submit-family and rehydrate answers (the presented envelope IS the
+/// admitted one there), the original record's digest for resolve answers
+/// (the resolve envelope is current transport, never the original
+/// authority).
 fn decode_record_view(
     value: &serde_json::Value,
-    envelope: &HostRequestEnvelope,
     expected_operation_id: &str,
+    coherence_request_digest: &str,
 ) -> Option<AdmittedReplyView> {
     let record: AdmittedReplyView = serde_json::from_value(value.get("record")?.clone()).ok()?;
     if record.operation_id != expected_operation_id {
@@ -860,7 +1636,7 @@ fn decode_record_view(
             wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
             wire_version: HostRequestResultBody::CONTRACT_VERSION,
             operation_id: record.operation_id.clone(),
-            request_sha256: envelope.envelope_sha256.clone(),
+            request_sha256: coherence_request_digest.to_owned(),
             result_digest: digest.clone(),
             response: body.clone(),
             // Readback coherence only: stored rows predate attempt ownership,
@@ -971,6 +1747,59 @@ fn decode_stored_response(
     Ok(response)
 }
 
+/// Decodes one owner-resolved stored result against the original admission
+/// (issue #2571).
+///
+/// Mirrors [`decode_stored_response`] with a different trust root: the
+/// presenting resolve envelope is current transport, so the request
+/// triple is rebuilt from the original record digest plus the
+/// occurrence-derived request and idempotency identities (recomputed from
+/// the stable correlation, never trusted from the reply). The recovered
+/// result is therefore verified against the original admission with
+/// current response correlation, and the original handle stays the typed
+/// reconcile path.
+fn decode_resolved_response(
+    record: &AdmittedReplyView,
+    occurrence: &str,
+    tool_name: &str,
+    request_digest: &str,
+) -> Result<McpResponse, PortFailure> {
+    let idempotency_key = format!("{occurrence}:invoke");
+    let body = record
+        .result_response
+        .clone()
+        .ok_or_else(|| invalid_result("a received result must carry its bounded body"))?;
+    let encoded = serde_json::to_vec(&body).map_err(|_| invalid_result("unserializable body"))?;
+    if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+        return Err(invalid_result("body exceeds the bounded ceiling"));
+    }
+    let response: McpResponse = serde_json::from_value(body)
+        .map_err(|_| invalid_result("body is not a bounded response"))?;
+    if response.request_id != occurrence {
+        return Err(invalid_result("request identity mismatch"));
+    }
+    if response.idempotency_key != idempotency_key {
+        return Err(invalid_result("idempotency binding mismatch"));
+    }
+    if response.canonical_tool_name != tool_name {
+        return Err(invalid_result("tool binding mismatch"));
+    }
+    let expected_request =
+        expected_canonical_request_digest_by_parts(request_digest, occurrence, &idempotency_key)?;
+    if response.canonical_request_sha256 != expected_request {
+        return Err(invalid_result("response digest mismatch"));
+    }
+    let digest = record
+        .result_digest
+        .clone()
+        .ok_or_else(|| invalid_result("a received result must carry its digest"))?;
+    let bytes = canonical_json_bytes(&response).map_err(|_| invalid_result("uncanonicalizable"))?;
+    if sha256_hex(&bytes) != digest {
+        return Err(invalid_result("digest does not bind the exact body"));
+    }
+    Ok(response)
+}
+
 /// Derives the exact canonical request digest one admitted stored result
 /// must echo (#2564 item 5).
 ///
@@ -986,10 +1815,29 @@ fn decode_stored_response(
 fn expected_canonical_request_digest(
     envelope: &HostRequestEnvelope,
 ) -> Result<String, PortFailure> {
+    expected_canonical_request_digest_by_parts(
+        envelope.envelope_sha256.as_str(),
+        envelope.identity.request_id.as_str(),
+        envelope.identity.idempotency_key.as_str(),
+    )
+}
+
+/// Derives the expected canonical request digest from explicit parts.
+///
+/// The resolve path (issue #2571) holds the original digest from the
+/// owner-returned record instead of the presenting envelope, so the same
+/// formula is applied to caller-supplied parts. The occurrence-derived
+/// request and idempotency identities are recomputed from the stable
+/// correlation, never trusted from the reply.
+fn expected_canonical_request_digest_by_parts(
+    request_digest: &str,
+    request_id: &str,
+    idempotency_key: &str,
+) -> Result<String, PortFailure> {
     let bytes = canonical_json_bytes(&(
-        envelope.envelope_sha256.clone(),
-        envelope.identity.request_id.as_str().to_owned(),
-        envelope.identity.idempotency_key.clone(),
+        request_digest.to_owned(),
+        request_id.to_owned(),
+        idempotency_key.to_owned(),
     ))
     .map_err(|_| invalid_result("uncanonicalizable"))?;
     Ok(sha256_hex(&bytes))
@@ -1043,6 +1891,98 @@ fn submit_outcome(
     }
 }
 
+/// Maps one owner-resolved original record to the invocation outcome
+/// (issue #2571).
+///
+/// Mirrors [`submit_outcome`] with the original handle, state, and result:
+/// the original operation/result is returned with current response
+/// correlation and no second dispatch occurs. Unresolved durable states
+/// settle as admission with the original handle — the resolve read proved
+/// the kernel staged the operation, so existence is certain even though
+/// the bridge holds neither the original envelope nor its receipt for a
+/// rehydrate. A result body is served only after it verifies against the
+/// original admission triple; original expiry and cancellation survive any
+/// new deadline proposal.
+fn submit_outcome_for_resolved(
+    record: &AdmittedReplyView,
+    occurrence: &str,
+    tool_name: &str,
+    logical_key: &str,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    let limitation = || unknown_resolve_outcome(logical_key);
+    parse_operation_handle(record.operation_id.as_str()).map_err(|_| limitation())?;
+    let handle = HostOperationHandle::new(record.operation_id.clone()).map_err(|_| limitation())?;
+    let request_digest = record.request_digest.as_deref().ok_or_else(limitation)?;
+    match record.state {
+        HostRequestRecordState::Requested
+        | HostRequestRecordState::Admitted
+        | HostRequestRecordState::Routed
+        | HostRequestRecordState::Submitted
+        | HostRequestRecordState::PossiblyEffected
+        | HostRequestRecordState::Unknown
+        | HostRequestRecordState::Reconciling => Ok(HostInvocationPortOutcome::Accepted {
+            operation_handle: handle,
+        }),
+        HostRequestRecordState::ResultReceived => {
+            let response = decode_resolved_response(record, occurrence, tool_name, request_digest)?;
+            Ok(HostInvocationPortOutcome::Responded {
+                operation_handle: handle,
+                response: Box::new(response),
+            })
+        }
+        HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
+        HostRequestRecordState::Cancelled => Err(PortFailure::Cancelled),
+        HostRequestRecordState::Terminal => {
+            if record.result_digest.is_some() {
+                let response =
+                    decode_resolved_response(record, occurrence, tool_name, request_digest)?;
+                return Ok(HostInvocationPortOutcome::Responded {
+                    operation_handle: handle,
+                    response: Box::new(response),
+                });
+            }
+            Err(PortFailure::TransportBindingRejected {
+                reason: "operation is already terminal; reconcile the exact operation".to_owned(),
+            })
+        }
+        HostRequestRecordState::Conflicted => Err(PortFailure::TransportBindingRejected {
+            reason: "operation is already terminal; reconcile the exact operation".to_owned(),
+        }),
+    }
+}
+
+/// Maps one cancellation record state to the cancellation outcome
+/// (issue #2571).
+///
+/// Shared by the fresh-cancel decode and the retained-intent resolve:
+/// requested/observed states (including a received result on the parent)
+/// settle as acceptance of the cancellation intent, expiry stays a
+/// timeout, and terminal states stay terminal. Cancellation requested,
+/// cancellation observed, and unresolved prior effects therefore stay
+/// separate outcomes instead of collapsing into a fresh effect.
+fn map_cancel_record_state(
+    state: HostRequestRecordState,
+) -> Result<HostCancellationPortOutcome, PortFailure> {
+    match state {
+        HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
+        HostRequestRecordState::Requested
+        | HostRequestRecordState::Admitted
+        | HostRequestRecordState::Routed
+        | HostRequestRecordState::Submitted
+        | HostRequestRecordState::PossiblyEffected
+        | HostRequestRecordState::Unknown
+        | HostRequestRecordState::Reconciling
+        | HostRequestRecordState::ResultReceived
+        | HostRequestRecordState::Cancelled => Ok(HostCancellationPortOutcome::Accepted),
+        HostRequestRecordState::Conflicted | HostRequestRecordState::Terminal => {
+            Err(PortFailure::TransportBindingRejected {
+                reason: "cancellation record is already terminal; reconcile the exact operation"
+                    .to_owned(),
+            })
+        }
+    }
+}
+
 impl KernelHostRequestPort for KernelHostRequestClient {
     fn invoke(
         &mut self,
@@ -1060,14 +2000,28 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
         let correlation = request.correlation_id.as_str().to_owned();
         let payload_digest = canonical_payload_digest(&request.tool)?;
-        let envelope = self.replay_or_build_invocation(
+        let envelope = match self.replay_or_build_invocation(
             &correlation,
             request,
             &facts,
             &session,
             &payload_digest,
             now_ms,
-        )?;
+        )? {
+            // The owner resolved the logical key to its durable winner:
+            // return the original handle/state/result with current
+            // response correlation. No second dispatch occurs, including
+            // when the first admission acknowledgement was lost.
+            InvocationPreparation::Recovered(record, logical_key) => {
+                return submit_outcome_for_resolved(
+                    &record,
+                    correlation.as_str(),
+                    request.tool.canonical_name(),
+                    logical_key.as_str(),
+                );
+            }
+            InvocationPreparation::Submit(envelope) => envelope,
+        };
         if now_ms >= envelope.identity.deadline_unix_ms {
             // Only a cached replay can be stale here: fresh builds set
             // deadline to now plus a positive preference. The original attempt
@@ -1140,7 +2094,10 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             .session
             .clone()
             .ok_or_else(plan_gap_cancel_no_session)?;
-        let parent = self.parent_link_for_handle(&digest)?;
+        // Cache first, owner on a miss: a fresh connection performs
+        // authorized cancellation on the old handle through the resolve
+        // entry, while denial stays indistinguishable from absence.
+        let parent = self.resolve_parent_link(&digest, &facts, &session, now_ms)?;
         let envelope = build_cancellation_envelope(request, &facts, &session, &parent, now_ms)?;
         if now_ms >= envelope.identity.deadline_unix_ms {
             return Err(PortFailure::DeadlineExceeded);
@@ -1150,30 +2107,31 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             &envelope,
             &facts,
         )?;
+        let cancel_correlation = request.correlation_id.as_str().to_owned();
         let Ok(reply) = self.exchange(&frame) else {
-            return self.probe_confirms_parent(&facts, &session, &parent, &envelope, now_ms);
+            // Unknown delivery: the retained cancellation intent is
+            // resolved by its own stable identity before any probe, so a
+            // lost acknowledgement recovers the staged intent instead of
+            // generating another effectful cancellation.
+            return self.resolve_retained_cancellation(
+                &parent,
+                cancel_correlation.as_str(),
+                &envelope,
+                &facts,
+                &session,
+                now_ms,
+            );
         };
         match decode_admitted_reply(&reply, &envelope) {
-            Some((_, record)) => match record.state {
-                HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
-                HostRequestRecordState::Requested
-                | HostRequestRecordState::Admitted
-                | HostRequestRecordState::Routed
-                | HostRequestRecordState::Submitted
-                | HostRequestRecordState::PossiblyEffected
-                | HostRequestRecordState::Unknown
-                | HostRequestRecordState::Reconciling
-                | HostRequestRecordState::ResultReceived
-                | HostRequestRecordState::Cancelled => Ok(HostCancellationPortOutcome::Accepted),
-                HostRequestRecordState::Conflicted | HostRequestRecordState::Terminal => {
-                    Err(PortFailure::TransportBindingRejected {
-                        reason:
-                            "cancellation record is already terminal; reconcile the exact operation"
-                                .to_owned(),
-                    })
-                }
-            },
-            None => self.probe_confirms_parent(&facts, &session, &parent, &envelope, now_ms),
+            Some((_, record)) => map_cancel_record_state(record.state),
+            None => self.resolve_retained_cancellation(
+                &parent,
+                cancel_correlation.as_str(),
+                &envelope,
+                &facts,
+                &session,
+                now_ms,
+            ),
         }
     }
 
@@ -1765,6 +2723,15 @@ mod tests {
             state,
             result_digest: None,
             result_response: None,
+            request_digest: None,
+            kind: None,
+            request_id: None,
+            parent_operation_id: None,
+            session_ref: None,
+            task_ref: None,
+            scope_ref: None,
+            capability_ref: None,
+            payload_digest: None,
         };
         let (request_for_outcome, _, envelope_for_outcome) = test_envelope();
         let outcome_for = |state| {
@@ -1815,6 +2782,15 @@ mod tests {
             state: HostRequestRecordState::ResultReceived,
             result_digest: Some(digest.clone()),
             result_response: Some(body.clone()),
+            request_digest: None,
+            kind: None,
+            request_id: None,
+            parent_operation_id: None,
+            session_ref: None,
+            task_ref: None,
+            scope_ref: None,
+            capability_ref: None,
+            payload_digest: None,
         };
         match submit_outcome(&receipt, &received, &request, &envelope) {
             Ok(HostInvocationPortOutcome::Responded {

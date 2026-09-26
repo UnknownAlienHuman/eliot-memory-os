@@ -278,12 +278,35 @@ impl WatchdogSpool {
     /// supervision authority, epoch, restart, deletion, or cutover state is
     /// touched.
     ///
+    /// Two owner-level refusals run before the capture, because this owner
+    /// holds nothing that could satisfy them honestly:
+    ///
+    /// - A capture naming a `canonical_ref` or `ors_ref` is refused. Coherence
+    ///   with another owner's capture is established by the cross-owner
+    ///   coordinator's exact fence protocol, which this owner does not
+    ///   participate in; it can neither verify a caller-asserted reference nor
+    ///   carry one as evidence. The honest outcome is refusal, not a recorded
+    ///   reference.
+    /// - A capture whose bounded work would exceed `limits.max_work_units` is
+    ///   refused, so the admitted work ceiling is consulted against the real
+    ///   retained member count instead of only being shape-validated. For the
+    ///   admitted default window that ceiling equals the retention ceiling this
+    ///   owner already enforces, so it is a safety net against an over-limit or
+    ///   corrupt spool rather than a bound that binds an ordinary capture.
+    ///
+    /// The owner-held installation identity, generation, and admitted
+    /// requester are bound by the composition's owner-bound
+    /// [`WatchdogBackupPort`](crate::WatchdogBackupPort); the spool itself
+    /// holds no installation identity, so it never compares a caller value
+    /// against itself.
+    ///
     /// # Errors
     ///
     /// Returns [`SpoolError`] when the limits window is unbounded or
-    /// over-ceiling, the spool header or high-water is missing or invalid, or
-    /// any retained entry is expired, missing, duplicated, conflicting, or
-    /// malformed.
+    /// over-ceiling, the capture names a cross-owner reference, the retained
+    /// work exceeds the bounded work ceiling, the spool header or high-water
+    /// is missing or invalid, or any retained entry is expired, missing,
+    /// duplicated, conflicting, or malformed.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "955 owner-method contract takes the capture bindings by value; the fence builder borrows them"
@@ -294,6 +317,12 @@ impl WatchdogSpool {
         limits: WatchdogSpoolBackupLimits,
     ) -> Result<WatchdogSpoolFence, SpoolError> {
         limits.validate()?;
+        if params.canonical_ref.is_some() || params.ors_ref.is_some() {
+            return Err(SpoolError::Corrupt(
+                "watchdog spool backup capture refuses an unverifiable canonical/ORS reference; coherence belongs to the cross-owner fence protocol"
+                    .to_owned(),
+            ));
+        }
         let read = self
             .database
             .begin_read()
@@ -321,27 +350,58 @@ impl WatchdogSpool {
         let high_water = read_high_water(&high_water)?
             .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))?;
         validate_high_water(&header, &entries, high_water)?;
+        // The work ceiling is consulted against the real retained member count
+        // rather than only shape-validated, so a capture over an over-limit or
+        // corrupt spool fails closed here instead of reading an unbounded set.
+        // It is a safety net, not a binding production bound: the owner port
+        // admits `max_work_units == BACKUP_MAX_WORK_UNITS`, which equals the
+        // `SPOOL_MAX_RECORDS` retention ceiling this same spool enforces, so for
+        // an admitted capture the comparison can only trip when the retained
+        // set is itself over the ceiling.
+        let capture_work = u64::try_from(entries.len()).map_err(|_| {
+            SpoolError::Corrupt(
+                "watchdog spool backup capture work exceeds the bounded counter".to_owned(),
+            )
+        })?;
+        if capture_work > limits.max_work_units {
+            return Err(SpoolError::Corrupt(
+                "watchdog spool backup capture exceeds the bounded work ceiling".to_owned(),
+            ));
+        }
         backup::capture_fence(&header, &entries, high_water, &params)
     }
 
     /// Imports an isolated-restore step chain as quarantined historical evidence.
     ///
-    /// Gates the destination through [`backup::validate_isolated_destination`]
-    /// (destination must differ from both the source and the active
-    /// installation) and the chain through [`backup::validate_restore_chain`],
-    /// rooted at the admitted preparation digest carried as the first step's
-    /// predecessor. Each accepted step is appended through the existing
-    /// [`append`](Self::append) path as a `Recovery` record naming the exact
-    /// source installation with the step digest as evidence; such records
-    /// grant no lease, heartbeat, supervision authority, or epoch, and keep
-    /// the coverage denominator incomplete until reconciled. Idempotency
-    /// follows [`backup::SpoolImportReplayLedger`] semantics plus the durable
-    /// quarantine framing: a byte-identical repeat observes `Duplicate` and
-    /// appends nothing, while changed content under an observed operation
-    /// identity fails closed as [`SpoolError::Corrupt`]. At most one bounded
-    /// step per [`backup::BACKUP_MAX_WORK_UNITS`] work unit is admitted, each
-    /// appended in its own bounded write transaction; no restart, deletion,
-    /// overwrite, or cutover is performed.
+    /// Gates the destination triple through
+    /// [`backup::validate_isolated_destination`] (the destination must differ
+    /// from both the source and the active installation) and the chain through
+    /// [`backup::validate_restore_chain`], rooted at the admitted preparation
+    /// digest carried as the first step's predecessor. Each accepted step is
+    /// appended through the existing [`append`](Self::append) path as a
+    /// `Recovery` record naming the exact source installation with the step
+    /// digest as evidence; such records grant no lease, heartbeat, supervision
+    /// authority, or epoch, and keep the coverage denominator incomplete until
+    /// reconciled. Idempotency follows [`backup::SpoolImportReplayLedger`]
+    /// semantics plus the durable quarantine framing: a byte-identical repeat
+    /// observes `Duplicate` and appends nothing, while changed content under an
+    /// observed operation identity fails closed as [`SpoolError::Corrupt`]. At
+    /// most one bounded step per [`backup::BACKUP_MAX_WORK_UNITS`] work unit is
+    /// admitted, each appended in its own bounded write transaction; no
+    /// restart, deletion, overwrite, or cutover is performed.
+    ///
+    /// Known limitation (unresolved, not claimed as admission): the accepted
+    /// step is appended to **this** owner spool, which is the currently active
+    /// installation's spool. The destination triple is validated and then
+    /// discarded; no admitted isolated destination spool is opened or written.
+    /// This owner has no constructor that accepts an externally admitted
+    /// destination installation binding, so writing into one would require
+    /// inventing an admission that does not exist here. The consequence is
+    /// bounded and non-authoritative — the rows are quarantined historical
+    /// `Recovery` markers carrying no active lease, heartbeat, supervision, or
+    /// epoch authority — but they are **not** in the isolated destination, and
+    /// this method therefore does not yet perform an isolated-destination
+    /// import. See the #945 final composition for the admitted destination.
     ///
     /// # Errors
     ///

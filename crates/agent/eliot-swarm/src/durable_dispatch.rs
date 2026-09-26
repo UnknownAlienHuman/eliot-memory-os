@@ -434,12 +434,27 @@ pub const MAX_PLAN_DRAIN_CANCELS: usize = 16;
 ///   all empty, so a terminal aggregate may publish only after every child is
 ///   accounted for.
 ///
+/// Drain order (issue #2652; I14.13, I9.9): a nonempty `cancel` set is
+/// independently authorized cleanup and the caller services it even when
+/// `unknown` is nonempty — unknown children block only `terminal_ready`,
+/// never cancellation of known live siblings. `cancel` names requested, not
+/// observed-terminated, cancellations: only `terminal` with its exact
+/// [`TerminalKind`] proves settlement, and a requested cancel with a lost
+/// response stays possibly applied until the caller polls or reconciles that
+/// same cancellation identity through the owner
+/// ([`super::durable_work::DurableWorkMachine::observe_child`] /
+/// [`super::durable_work::DurableWorkMachine::reconcile`]) rather than
+/// reminting it. Unknown children are never cleared, never terminal, and
+/// retain their writer/resource claims.
+///
 /// Fail-closed: an empty denominator is [`SwarmError::Empty`], and a repeated
 /// child slot is [`SwarmError::Duplicate`].
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanDrain {
     /// Exact active children to cancel through the owner-side path this pass.
+    /// Requested, not observed-terminated: the caller services this set even
+    /// when `unknown` is nonempty (issue #2652).
     pub cancel: Vec<WorkItemId>,
     /// Active children beyond this pass's bound; cancel them on later passes.
     pub pending: Vec<WorkItemId>,
@@ -456,6 +471,15 @@ pub struct PlanDrain {
 ///
 /// See [`PlanDrain`] for the accounting rules; see
 /// [`MAX_PLAN_DRAIN_CANCELS`] for the structural bound.
+///
+/// Caller obligations (issue #2652): execute a nonempty `cancel` set before
+/// treating an unknown-blocked aggregate as final within the pass; rotate the
+/// denominator frontier across passes — this pass names the first `bound`
+/// running children in denominator order, so a caller that re-presents the
+/// same order starves later eligible children behind a slow first group;
+/// a zero allowance parks every running child in `pending` with
+/// `terminal_ready` unset, which is the explicit bounded partial outcome, not
+/// a signal to spin.
 pub fn plan_cancellation_drain(
     children: &[(WorkItemId, ChildDisposition)],
     max_cancels: usize,

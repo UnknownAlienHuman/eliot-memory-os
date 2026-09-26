@@ -93,48 +93,67 @@ const FORBIDDEN_PUBLIC_ERROR_MARKERS: &[&str] = &[
 /// publishable after sanitization.
 const REDACTED_PUBLIC_ERROR: &str = "redacted-provider-error";
 
-/// Replaces one case-insensitive occurrence scan of `marker` inside `text`
-/// with `[redacted]`, preserving all other bytes verbatim.
-fn redact_marker(text: &str, marker: &str) -> String {
-    let text_lower = text.to_lowercase();
-    let mut redacted = String::with_capacity(text.len());
-    let mut rest = text;
-    let mut rest_lower = text_lower.as_str();
-    while let Some(index) = rest_lower.find(marker) {
-        // `marker` is ASCII, so the byte index is a char boundary in both
-        // the original and the lowercased view.
-        redacted.push_str(&rest[..index]);
-        redacted.push_str("[redacted]");
-        rest = &rest[index + marker.len()..];
-        rest_lower = &rest_lower[index + marker.len()..];
-    }
-    redacted.push_str(rest);
-    redacted
+/// Byte-preserving ASCII case-insensitive credential-marker screen (issue
+/// #2641). Markers are ASCII, so stepping over the original string's char
+/// boundaries keeps every compared slice boundary valid in both views. The
+/// previous helper sliced the original with offsets derived from Unicode
+/// `to_lowercase()` (where `\u{212A}` is three bytes but lowercases to one),
+/// which can panic; this scan never indexes with a transformed offset.
+fn contains_forbidden_marker(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    FORBIDDEN_PUBLIC_ERROR_MARKERS.iter().any(|marker| {
+        let marker = marker.as_bytes();
+        if marker.is_empty() || bytes.len() < marker.len() {
+            return false;
+        }
+        text.char_indices().any(|(index, _)| {
+            index + marker.len() <= bytes.len()
+                && bytes[index..index + marker.len()].eq_ignore_ascii_case(marker)
+        })
+    })
 }
 
 /// Sanitizes one adapter-supplied public error message at the adapter
-/// boundary (issue #369 W20/A21). Credential/secret markers are redacted,
-/// control characters are removed, and the result is truncated to
-/// [`MAX_SAFE_ERROR_CHARS`] on a char boundary. Infallible by construction:
-/// an empty or fully-redacted input yields [`REDACTED_PUBLIC_ERROR`], never
-/// an empty string, so the output always satisfies
-/// [`validate_safe_public_error`].
+/// boundary (issue #369 W20/A21, hardened by issue #2641). The whole
+/// untrusted message is discarded to the existing `redacted-provider-error`
+/// fallback whenever it is credential-bearing, oversized, control-bearing,
+/// or otherwise not an establishable permitted public diagnostic: label-only
+/// redaction would retain values such as `password=DEMO_VALUE_123` while
+/// defeating the validator's keyword check, and parsing a credential grammar
+/// to keep surrounding prose is rejected in favor of discarding. Control
+/// filtering happens by rejection before any marker scan, so tokens are never
+/// joined across removed controls into a forbidden sequence after the last
+/// scan (e.g. `bea\nrer DEMO_VALUE_123`). The input bound is checked before
+/// any cloning or case work, so intermediate work stays bounded and only a
+/// finite prefix is ever truncated to [`MAX_SAFE_ERROR_CHARS`] on a char
+/// boundary. Infallible by construction: every permitted transformation lands
+/// through [`validate_safe_public_error`], and any failure yields the
+/// fallback, so the output always satisfies [`validate_safe_public_error`]
+/// and the fallback is stable under repeated sanitization.
 #[must_use]
 pub fn sanitize_adapter_error(raw: &str) -> String {
-    let mut sanitized = raw.to_owned();
-    for marker in FORBIDDEN_PUBLIC_ERROR_MARKERS {
-        sanitized = redact_marker(&sanitized, marker);
+    // Bound before allocating: the byte pre-check is exact (four bytes per
+    // scalar value worst case) and allocation-free, and the scalar count
+    // enforces the exact bound. An oversized input returns the fixed fallback
+    // rather than a possibly misleading prefix.
+    if raw.len() > MAX_SAFE_ERROR_CHARS * 4 || raw.chars().count() > MAX_SAFE_ERROR_CHARS {
+        return REDACTED_PUBLIC_ERROR.to_owned();
     }
-    let sanitized: String = sanitized
-        .chars()
-        .filter(|char| !char.is_control())
-        .collect();
-    let mut truncated = String::new();
-    for char in sanitized.chars().take(MAX_SAFE_ERROR_CHARS) {
-        truncated.push(char);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return REDACTED_PUBLIC_ERROR.to_owned();
     }
+    if trimmed.chars().any(char::is_control) {
+        return REDACTED_PUBLIC_ERROR.to_owned();
+    }
+    if contains_forbidden_marker(trimmed) {
+        return REDACTED_PUBLIC_ERROR.to_owned();
+    }
+    // Truncation only removes a suffix, so it cannot introduce markers or
+    // controls; the final validator gate stays as defense-in-depth.
+    let truncated: String = trimmed.chars().take(MAX_SAFE_ERROR_CHARS).collect();
     let truncated = truncated.trim().to_owned();
-    if truncated.is_empty() {
+    if truncated.is_empty() || validate_safe_public_error(&truncated).is_err() {
         return REDACTED_PUBLIC_ERROR.to_owned();
     }
     truncated
@@ -376,6 +395,25 @@ pub fn candidate_digest_for(
     candidate: &RouteSelectionCandidate,
 ) -> Result<LowercaseSha256, serde_json::Error> {
     let bytes = canonical_json_bytes(candidate)?;
+    typed_digest(sha256_hex(&bytes))
+}
+
+/// Computes the exact route-fingerprint identity: the canonical digest of
+/// the fingerprint bytes (issue #2645).
+///
+/// This is the owner-qualified digest for the requested/selected/observed
+/// route columns retained at durable host-event staging: the requested column
+/// binds [`AdmittedRouteReceipt::requested_route`], and the actual column
+/// binds [`PhysicalRouteObservationReceipt::observed_route`]. It reuses the
+/// same `sha256_hex(canonical_json_bytes(..))` recipe as
+/// [`candidate_digest_for`]; it never substitutes an admission self-digest
+/// (logical-decision identity) for a fingerprint digest (route identity), and
+/// a copied unchecked string never validates because every staging validator
+/// recomputes it from the owner material.
+pub fn route_fingerprint_digest_for(
+    fingerprint: &RouteFingerprint,
+) -> Result<LowercaseSha256, serde_json::Error> {
+    let bytes = canonical_json_bytes(fingerprint)?;
     typed_digest(sha256_hex(&bytes))
 }
 

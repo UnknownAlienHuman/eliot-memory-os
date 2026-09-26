@@ -1,4 +1,5 @@
 use crate::EngineError;
+use eliot_instrument_runner::profile::{CompiledProfile, InstrumentRegistry, ProfileCompiler};
 use eliot_types::verification::VerificationRun;
 use eliot_types::{
     FlakeReport, ProjectId, StatefulDbIsolationReport, TestCostClass, TestCostReport, TestIntent,
@@ -74,6 +75,19 @@ impl VerificationPlannerService {
         profile_id: &str,
         changed_refs: Vec<String>,
     ) -> Result<VerificationPlan, EngineError> {
+        // Route the requested profile through the single profile compiler
+        // (#1813): governed instrument names belong to the instrument lanes,
+        // never to the suite-profile path. Quarantined legacy text keeps its
+        // current behavior with no governed claim.
+        let compiled = compile_instrument_profile(profile_id)?;
+        if compiled.is_governed() {
+            return Err(rejected(
+                "verification-profile",
+                &format!(
+                    "governed instrument profile '{profile_id}' is not a suite profile; run it through the instrument lane"
+                ),
+            ));
+        }
         let profile = VerificationProfileService.profile(profile_id)?;
         let max_cost = profile.max_cost_class.unwrap_or(TestCostClass::VeryLarge);
         let selected_tests = inventory
@@ -147,6 +161,19 @@ impl VerificationRunnerService {
             return Err(rejected(
                 "verification-runner",
                 "verification plan contains unknown commands",
+            ));
+        }
+        // Governed instrument names can never ride the legacy record path
+        // (#1813): quarantine covers unknown profile strings, not unrouted
+        // entries into governed lanes.
+        let compiled = compile_instrument_profile(&plan.profile_id)?;
+        if compiled.is_governed() {
+            return Err(rejected(
+                "verification-runner",
+                &format!(
+                    "governed instrument profile '{}' has no legacy record; run the admitted invocation through the registered provider and evaluate it with run_current",
+                    plan.profile_id
+                ),
             ));
         }
         // Legacy promotion removed (T7-S2): a `Passed` run fabricated without
@@ -668,4 +695,19 @@ fn rejected(service: &str, reason: &str) -> EngineError {
         service: service.to_owned(),
         reason: reason.to_owned(),
     }
+}
+
+/// Compiles one profile name through the single profile compiler (#1813).
+///
+/// This is the same admission the governed build and current lanes use, so
+/// the same admitted name always resolves to the same revision and stage
+/// graph no matter which entry point asked.
+fn compile_instrument_profile(name: &str) -> Result<CompiledProfile, EngineError> {
+    let registry = InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
+        rejected(
+            "verification-profile",
+            &format!("builtin profile registry is unavailable: {error}"),
+        )
+    })?;
+    Ok(ProfileCompiler::new(&registry).compile(name))
 }
