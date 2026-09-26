@@ -58,7 +58,7 @@ pub use inputs::{
     CueActivationResult, CueInput, EpistemicInput, EvidenceInput, MAX_CANONICAL_MEASUREMENTS,
     MAX_MEMORY_CUE_HITS, MEMORY_PROVIDER, MemberMeasurement, MemoryExclusion, MemoryInput,
     OpaqueMember, OpaqueProjection, ProjectionSchema, ProjectionState,
-    check_denominator_is_seven_or_eight, eight_slots, memory_availability,
+    check_denominator_is_seven_or_eight, eight_slots, exclusion_reason_class, memory_availability,
 };
 pub use mapper::{
     ContextCandidateSetResult, FrontierRecord, MAX_FRONTIER_TEXT_BYTES, MemberDisposition,
