@@ -746,6 +746,28 @@ impl SourceRecord {
         self.authority_domains.iter().any(|d| d == domain)
     }
 
+    /// Whether this record is competent outside `domain`.
+    ///
+    /// The negation [`Self::covers_domain`] leaves unnamed, because a caller that
+    /// needs the negative test should not have to negate the positive one itself
+    /// and risk inverting it at a call site.
+    pub fn outside_domain(&self, domain: &str) -> bool {
+        !self.covers_domain(domain)
+    }
+
+    /// Whether this record carries `span` among its own admitted evidence spans.
+    ///
+    /// Exact on all three span fields, so a relation cannot quote an excerpt
+    /// digest the record does not hold and call it admitted. A record with no
+    /// spans admits none, which is the fail-closed answer.
+    pub fn binds_span(&self, span: &EvidenceSpan) -> bool {
+        self.evidence_spans.iter().any(|held| {
+            held.span_id == span.span_id
+                && held.anchor == span.anchor
+                && held.excerpt_digest == span.excerpt_digest
+        })
+    }
+
     /// Deterministic canonical bytes of the whole vetted record.
     ///
     /// This is the one encoder for the declared
@@ -2294,6 +2316,96 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
     }
 }
 
+/// Whether a claim is material to the inquiry decision.
+///
+/// Typed rather than a bare `bool` so a frozen claim identity cannot carry an
+/// unlabelled truth value into an audit: materiality changes which public audit
+/// class a verdict may take, and an unlabelled `false` reads as "not material"
+/// whether the author meant that or forgot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum ClaimMateriality {
+    /// The claim is material to the inquiry decision and must be audited.
+    Material,
+    /// The claim is supporting colour and is not audited as material.
+    NonMaterial,
+}
+
+impl ClaimMateriality {
+    /// Stable wire spelling of this materiality.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Material => "MATERIAL",
+            Self::NonMaterial => "NON_MATERIAL",
+        }
+    }
+
+    /// Whether a claim of this materiality may be audited as material.
+    pub const fn is_material(self) -> bool {
+        matches!(self, Self::Material)
+    }
+}
+
+/// What a statement asserts, as distinct from how strongly it asserts it.
+///
+/// Modality is part of the frozen claim identity because two claims can share a
+/// subject, a population and a source while differing only in modality, and a
+/// counterevidence relation that refutes a descriptive claim says nothing about
+/// a normative one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum ClaimModality {
+    /// Describes what is the case.
+    Descriptive,
+    /// Asserts what will be the case.
+    Predictive,
+    /// Asserts what ought to be the case.
+    Normative,
+    /// Asserts that one thing causes another.
+    Causal,
+}
+
+impl ClaimModality {
+    /// Stable wire spelling of this modality.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Descriptive => "DESCRIPTIVE",
+            Self::Predictive => "PREDICTIVE",
+            Self::Normative => "NORMATIVE",
+            Self::Causal => "CAUSAL",
+        }
+    }
+}
+
+/// The scope under which one claim or one counterevidence relation is asserted.
+///
+/// I21.8 requires a claim to be judged under the population, time, definition and
+/// denominator it was actually made under. A source about another population is
+/// not a weaker contradiction of a claim about this one; it is a statement about
+/// something else, and this record is what keeps the two apart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClaimConditions {
+    /// Population or scope the statement is about.
+    pub population_scope: String,
+    /// Time window and version the statement is about.
+    pub time_version: String,
+    /// Definition, unit and denominator the statement is measured in.
+    pub definition_unit_denominator: String,
+    /// Modality the statement asserts in.
+    pub modality: ClaimModality,
+}
+
+impl ClaimConditions {
+    /// Stable wire spelling of this condition set.
+    pub fn wire_name(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.population_scope,
+            self.time_version,
+            self.definition_unit_denominator,
+            self.modality.wire_name()
+        )
+    }
+}
+
 /// One already-structured material-claim record for audit. Claims arrive
 /// structured; prose is never parsed into claims and entailment is never
 /// inferred.
@@ -2312,9 +2424,616 @@ pub struct AuditedClaim {
     /// Structured precision assertions for this claim.
     pub precision: Vec<PrecisionAssertion>,
     /// Counterclaim identities preserved against this claim.
+    ///
+    /// These are **alleged** counterclaims and nothing more. A handle listed here
+    /// is eligible to be examined; it is never a contradiction, and a caller
+    /// cannot promote one by listing it. `Contradicts` is reachable only from a
+    /// [`ClaimOppositionRelation`] that the accepted semantic-evaluation owner
+    /// established, so this list is preserved rather than believed.
     pub counterclaim_ids: Vec<String>,
     /// Unknown evidence references that must stay explicit.
     pub unknown_refs: Vec<String>,
+    /// Frozen claim identities this claim was frozen under.
+    ///
+    /// Empty means the claim carries no frozen identity, and the audit then
+    /// reports every attached counterclaim as unverifiable rather than assuming
+    /// opposition. A claim that cannot state what it is cannot have anything
+    /// contradict it.
+    pub frozen_identities: Vec<FrozenClaimIdentity>,
+    /// Owner-issued claim↔counterevidence relations.
+    ///
+    /// Each is examined on its own evidence. A relation whose evaluator, span or
+    /// source commitment does not verify is reported as unverifiable; it does not
+    /// fall back to the weaker same-domain test that produced the original
+    /// defect.
+    pub opposition_relations: Vec<ClaimOppositionRelation>,
+}
+
+impl AuditedClaim {
+    /// Named constructor for a claim audited without a frozen identity.
+    ///
+    /// A claim that carries no [`FrozenClaimIdentity`] cannot be released as
+    /// supported, because there is nothing to check its wording and revision
+    /// against. This derives the identity a caller would otherwise have to
+    /// assemble by hand, so the shape a claim must have before it can be audited
+    /// is stated once here rather than left to each caller to remember.
+    ///
+    /// The derived identity is scoped from the claim's own domain and statement, so
+    /// it is the identity this claim currently has — not a claim about anything
+    /// broader. A caller holding a real artifact digest or an explicit revision
+    /// should freeze its own identity instead of using this.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every refusal [`FrozenClaimIdentity::freeze`] raises.
+    pub fn freeze_identity(&self) -> Result<FrozenClaimIdentity, PortfolioError> {
+        FrozenClaimIdentity::freeze(FrozenClaimIdentity {
+            claim_id: self.claim_id.clone(),
+            statement: self.statement.clone(),
+            materiality: if self.material {
+                ClaimMateriality::Material
+            } else {
+                ClaimMateriality::NonMaterial
+            },
+            subject: self.domain.clone(),
+            conditions: ClaimConditions {
+                population_scope: self.domain.clone(),
+                time_version: String::new(),
+                definition_unit_denominator: String::new(),
+                modality: ClaimModality::Descriptive,
+            },
+            artifact_digest: self.statement_artifact_digest(),
+            claim_revision: 1,
+            digest: String::new(),
+        })
+    }
+
+    /// The digest of the statement text this claim carries, as its artifact
+    /// identity when no artifact revision was supplied.
+    ///
+    /// The statement is the released wording, so its digest is the honest artifact
+    /// commitment available here. A caller holding a real artifact digest should
+    /// freeze the identity explicitly instead of relying on this.
+    fn statement_artifact_digest(&self) -> String {
+        freeze(&format!("claim-statement/v1;{}", self.statement))
+    }
+}
+
+/// The five public release audit classes that `#1765` requires.
+///
+/// I21.8 names exactly five: `SUPPORTED`, `PARTIALLY_SUPPORTED`, `UNSUPPORTED`,
+/// `CONTRADICTED`, `NOT_VERIFIABLE_IN_SCOPE`. The internal [`ClaimOutcome`] keeps
+/// further values because outside-manifest, stale and incomplete-accounting are
+/// real and distinct findings, and collapsing them into one of the five would
+/// lose the reason. This enum is the lossless public projection, and
+/// [`ClaimVerdict::public_class`] is its only producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicAuditClass {
+    /// Every material dimension the release gate requires is established.
+    Supported,
+    /// Some required dimensions hold and the remainder is preserved as residue.
+    PartiallySupported,
+    /// The claim is not established as supported, and nothing contradicts it.
+    ///
+    /// Covers both "no sufficient in-manifest support" and "support that went
+    /// stale": I21.8 has no separate public class for staleness, and a stale-limited
+    /// claim is not releasable as supported. The distinction is in
+    /// [`ClaimVerdict::outcome`] and [`ClaimVerdict::failed_dimensions`].
+    Unsupported,
+    /// Exact frozen counterevidence refutes the claim under compatible conditions.
+    Contradicted,
+    /// At least one required dimension is unknown, unevaluable or out of scope.
+    ///
+    /// This is the fail-closed class: it is never inferred from the absence of a
+    /// finding. A dimension nobody could evaluate is unknown, and unknown is not
+    /// support.
+    NotVerifiableInScope,
+}
+
+impl PublicAuditClass {
+    /// Every public class, weakest-first, as a frozen ordered list.
+    ///
+    /// Declared so a release consumer can enumerate the whole public vocabulary
+    /// from one owner instead of reconstructing it from the five spellings it
+    /// happens to have seen.
+    pub const ALL: [Self; 5] = [
+        Self::NotVerifiableInScope,
+        Self::Unsupported,
+        Self::PartiallySupported,
+        Self::Supported,
+        Self::Contradicted,
+    ];
+
+    /// Stable wire spelling of this public class.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Supported => "SUPPORTED",
+            Self::PartiallySupported => "PARTIALLY_SUPPORTED",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::Contradicted => "CONTRADICTED",
+            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
+        }
+    }
+}
+
+/// The dimension of a claim a counterevidence relation contests.
+///
+/// A relation names the dimension it opposes so that agreement on every other
+/// dimension is explicit rather than assumed. A source that shares a subject and
+/// a population but asserts the opposite time window has not refuted the claim;
+/// it has made a different claim, and `OppositionDimension` is how the difference
+/// is named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum OppositionDimension {
+    /// The asserted proposition itself.
+    Proposition,
+    /// The polarity of the assertion.
+    Polarity,
+    /// The subject the assertion is about.
+    Subject,
+    /// The population or scope the assertion covers.
+    Population,
+    /// The time window or version the assertion covers.
+    TimeVersion,
+    /// The modality the assertion is made in.
+    ///
+    /// Distinct from [`Self::Proposition`]: a descriptive claim and a normative
+    /// one can assert the same proposition and still not stand or fall together,
+    /// so a modality mismatch is reported as its own dimension rather than folded
+    /// into the proposition.
+    Modality,
+    /// The definition, unit or denominator the assertion is measured in.
+    DefinitionUnit,
+    /// The intervention the assertion attributes the outcome to.
+    Intervention,
+    /// The specific excerpt the assertion rests on.
+    Excerpt,
+}
+
+impl OppositionDimension {
+    /// Stable wire spelling of this dimension.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Proposition => "PROPOSITION",
+            Self::Polarity => "POLARITY",
+            Self::Subject => "SUBJECT",
+            Self::Population => "POPULATION",
+            Self::TimeVersion => "TIME_VERSION",
+            Self::Modality => "MODALITY",
+            Self::DefinitionUnit => "DEFINITION_UNIT",
+            Self::Intervention => "INTERVENTION",
+            Self::Excerpt => "EXCERPT",
+        }
+    }
+}
+
+/// Whether a relation asserts opposition to the claim or agreement with it.
+///
+/// `Agrees` exists so that "this source supports the claim" is a first-class,
+/// refusable statement rather than the absence of a contradiction. A source that
+/// agrees cannot become counterevidence through any attachment order, and a
+/// relation that claims opposition while evaluating as agreement is a relation
+/// that does not verify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum OppositionPolarity {
+    /// The source contests the claim on the named dimension.
+    Denies,
+    /// The source supports the claim on the named dimension.
+    Agrees,
+}
+
+impl OppositionPolarity {
+    /// Stable wire spelling of this polarity.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Denies => "DENIES",
+            Self::Agrees => "AGREES",
+        }
+    }
+}
+
+/// What the accepted semantic-evaluation owner concluded about one excerpt.
+///
+/// #2874 forbids inferring entailment here. There is no substring match, no
+/// regex test and no trust in a source's own prose label: the only admissible
+/// answer is a receipt from the evaluation owner, and its absence is `Unknown`
+/// rather than a negative result computed locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum SemanticEvaluationOutcome {
+    /// The evaluator established that the excerpt refutes the claim.
+    Refutes,
+    /// The evaluator established that the excerpt does not speak to the claim.
+    Insufficient,
+}
+
+impl SemanticEvaluationOutcome {
+    /// Stable wire spelling of this outcome.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Refutes => "REFUTES",
+            Self::Insufficient => "INSUFFICIENT",
+        }
+    }
+}
+
+/// One owner-issued claim↔counterevidence relation.
+///
+/// This is the only thing that can make a claim `CONTRADICTED`. It binds the exact
+/// claim identity and revision, the exact source record commitment and the exact
+/// span the opposition rests on, the dimension and polarity of the opposition, the
+/// conditions under which the opposition holds, and an evaluator receipt. A
+/// caller that supplies none of this gets `NOT_VERIFIABLE_IN_SCOPE`, which is the
+/// correct answer for "we asserted an opposition and cannot show it".
+///
+/// # What the digest proves, and what it does not
+///
+/// `digest` and `verify_integrity` prove **tamper-after-issue**: the bytes present
+/// are the bytes that were issued. They do **not** prove *authenticity of issue*.
+/// Every field here is `pub` on a plain struct with no `#[non_exhaustive]`, and
+/// `canonical_digest` is public, so a caller can build a struct literal and
+/// compute the matching digest itself. The digest is a checksum, not a signature.
+///
+/// What stops that from being a caller-writable "proof" is that the relation is
+/// only ever *believed* where it agrees with data the caller does not control:
+/// the source record commitment is recomputed from the portfolio's own record
+/// (`#2873`'s complete field set), the span must be one the record actually
+/// admits, and the claim identity must match the claim under audit. Those are the
+/// checks that bind an opposition to real evidence. Genuine *authority* over who
+/// may issue a relation — an issuer capability, a signature, or a registry lookup —
+/// has no owner in this repository, and adding one would mean inventing an
+/// authority this crate does not have. See the acceptance note on A4.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClaimOppositionRelation {
+    /// Stable relation identity.
+    pub relation_id: String,
+    /// Frozen identity of the claim this relation contests.
+    ///
+    /// Bound whole, including its own `#[serde(skip)]` digest, so a relation cannot
+    /// be re-pointed at a different claim revision without changing its bytes.
+    pub claim: FrozenClaimIdentity,
+    /// Handle of the source alleged to contest the claim.
+    pub source_handle: String,
+    /// Exact commitment of the source record as frozen.
+    ///
+    /// This is [`SourceRecord::digest`] under
+    /// [`SOURCE_RECORD_DIGEST_DOMAIN`], so a source whose interpretation-relevant
+    /// field changed after the relation was issued no longer matches and the
+    /// relation does not verify.
+    pub source_record_digest: String,
+    /// The exact span the opposition rests on.
+    pub span: EvidenceSpan,
+    /// The dimension of the claim this relation contests.
+    pub dimension: OppositionDimension,
+    /// Whether the source contests or agrees with the claim.
+    pub polarity: OppositionPolarity,
+    /// Conditions under which the opposition holds.
+    pub compatible_conditions: ClaimConditions,
+    /// Identity of the evaluator that reached the outcome.
+    pub evaluator_id: String,
+    /// Exact evaluator revision the outcome was produced under.
+    pub evaluator_revision: String,
+    /// What the evaluator concluded.
+    pub evaluation: SemanticEvaluationOutcome,
+    /// Fraction of the claim the evaluation covered, in millionths.
+    ///
+    /// A relation that covers only part of the claim cannot silently close all of
+    /// it; coverage below one millionth leaves the remainder unaccounted.
+    pub coverage_ppm: u32,
+    /// Frozen digest over the whole relation shape.
+    #[serde(skip)]
+    pub digest: String,
+}
+
+/// Declared identity domain of [`FrozenClaimIdentity`].
+///
+/// `v1` is the first declared form. An edited claim's wording, materiality,
+/// subject, conditions, artifact digest or revision all move it, which is what
+/// makes "the wording changed after the opposition was frozen" detectable rather
+/// than a matter of trusting the caller.
+pub const FROZEN_CLAIM_IDENTITY_DOMAIN: &str = "frozen-claim-identity/v1";
+
+/// Declared identity domain of [`ClaimOppositionRelation`].
+///
+/// `v1` is the first declared form. It binds the claim identity, the source record
+/// commitment, the span, the dimension, the polarity, the compatible conditions,
+/// the evaluator identity and revision, the evaluation outcome and the coverage,
+/// so a relation altered in any of those respects stops verifying against itself.
+pub const CLAIM_OPPOSITION_RELATION_DOMAIN: &str = "claim-opposition-relation/v1";
+
+/// One frozen claim identity: exactly what was claimed, under what conditions,
+/// at which artifact revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FrozenClaimIdentity {
+    /// Claim identity.
+    pub claim_id: String,
+    /// Exact final statement wording.
+    pub statement: String,
+    /// Whether the claim is material.
+    pub materiality: ClaimMateriality,
+    /// The subject the claim is about.
+    pub subject: String,
+    /// The exact conditions the claim was made under.
+    pub conditions: ClaimConditions,
+    /// Digest of the artifact the claim was released in.
+    pub artifact_digest: String,
+    /// Revision of the claim within its artifact.
+    pub claim_revision: u64,
+    /// Frozen digest over the whole identity shape.
+    #[serde(skip)]
+    pub digest: String,
+}
+
+/// The single canonical encoder input for [`FrozenClaimIdentity`].
+#[derive(Serialize)]
+struct FrozenClaimIdentityDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen identity, minus its own digest.
+    identity: &'a FrozenClaimIdentity,
+}
+
+/// The single canonical encoder input for [`ClaimOppositionRelation`].
+#[derive(Serialize)]
+struct ClaimOppositionRelationDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole relation, minus its own digest.
+    relation: &'a ClaimOppositionRelation,
+}
+
+impl FrozenClaimIdentity {
+    /// Validates and freezes one claim identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank identity, statement, subject or
+    /// condition, a bad artifact digest, or a value that cannot be encoded.
+    pub fn freeze(mut identity: Self) -> Result<Self, PortfolioError> {
+        text(&identity.claim_id, "claim_identity.claim_id")?;
+        text(&identity.statement, "claim_identity.statement")?;
+        text(&identity.subject, "claim_identity.subject")?;
+        text(
+            &identity.conditions.population_scope,
+            "claim_identity.population_scope",
+        )?;
+        text(
+            &identity.conditions.time_version,
+            "claim_identity.time_version",
+        )?;
+        text(
+            &identity.conditions.definition_unit_denominator,
+            "claim_identity.definition_unit_denominator",
+        )?;
+        digest(&identity.artifact_digest, "claim_identity.artifact_digest")?;
+        if identity.claim_revision == 0 {
+            return Err(PortfolioError::Blank {
+                field: "claim_identity.claim_revision",
+            });
+        }
+        identity.digest = String::new();
+        identity.digest = identity.canonical_digest()?;
+        Ok(identity)
+    }
+
+    /// Deterministic canonical bytes of the frozen identity, digest excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the identity cannot be encoded.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&FrozenClaimIdentityDigestInput {
+            domain: FROZEN_CLAIM_IDENTITY_DOMAIN,
+            identity: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "claim_identity.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the identity cannot be encoded.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::InvalidDigest`] when they disagree.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "claim_identity.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ClaimOppositionRelation {
+    /// Validates and freezes one opposition relation.
+    ///
+    /// # Errors
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank relation, source, span, condition or
+    /// evaluator identity, a bad source commitment or excerpt digest, or a
+    /// coverage value above one millionth. Also propagates the claim identity's own
+    /// refusal, so a relation cannot be issued against an identity that does not
+    /// verify.
+    pub fn freeze(mut relation: Self) -> Result<Self, PortfolioError> {
+        text(&relation.relation_id, "opposition.relation_id")?;
+        text(&relation.source_handle, "opposition.source_handle")?;
+        digest(
+            &relation.source_record_digest,
+            "opposition.source_record_digest",
+        )?;
+        text(&relation.span.span_id, "opposition.span_id")?;
+        text(&relation.span.anchor, "opposition.anchor")?;
+        digest(&relation.span.excerpt_digest, "opposition.excerpt_digest")?;
+        text(
+            &relation.compatible_conditions.population_scope,
+            "opposition.population_scope",
+        )?;
+        text(
+            &relation.compatible_conditions.time_version,
+            "opposition.time_version",
+        )?;
+        text(
+            &relation.compatible_conditions.definition_unit_denominator,
+            "opposition.definition_unit_denominator",
+        )?;
+        text(&relation.evaluator_id, "opposition.evaluator_id")?;
+        text(
+            &relation.evaluator_revision,
+            "opposition.evaluator_revision",
+        )?;
+        if relation.coverage_ppm > 1_000_000 {
+            return Err(PortfolioError::Conflict {
+                field: "opposition.coverage_ppm",
+            });
+        }
+        // The relation is only meaningful against a claim identity that verifies,
+        // so the claim's own commitment is proved here rather than at each use.
+        relation.claim.verify_integrity()?;
+        relation.digest = String::new();
+        relation.digest = relation.canonical_digest()?;
+        Ok(relation)
+    }
+
+    /// Deterministic canonical bytes of the relation, digest excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the relation cannot be encoded.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&ClaimOppositionRelationDigestInput {
+            domain: CLAIM_OPPOSITION_RELATION_DOMAIN,
+            relation: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "opposition.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the relation cannot be encoded.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::InvalidDigest`] when they disagree.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "opposition.digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Named constructor for a relation whose claim identity is already frozen.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every refusal [`Self::freeze`] raises, including the frozen
+    /// claim identity's own. Building a relation and dropping it establishes
+    /// nothing; the audit only ever reads relations attached to
+    /// [`AuditedClaim::opposition_relations`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::freeze`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        relation_id: impl Into<String>,
+        claim: FrozenClaimIdentity,
+        source_handle: impl Into<String>,
+        source_record: &SourceRecord,
+        span: EvidenceSpan,
+        dimension: OppositionDimension,
+        polarity: OppositionPolarity,
+        compatible_conditions: ClaimConditions,
+        evaluator_id: impl Into<String>,
+        evaluator_revision: impl Into<String>,
+        evaluation: SemanticEvaluationOutcome,
+        coverage_ppm: u32,
+    ) -> Result<Self, PortfolioError> {
+        let source_record_digest = source_record.digest()?;
+        Self::freeze(Self {
+            relation_id: relation_id.into(),
+            claim,
+            source_handle: source_handle.into(),
+            source_record_digest,
+            span,
+            dimension,
+            polarity,
+            compatible_conditions,
+            evaluator_id: evaluator_id.into(),
+            evaluator_revision: evaluator_revision.into(),
+            evaluation,
+            coverage_ppm,
+            digest: String::new(),
+        })
+    }
+
+    /// Whether this relation's own conditions are compatible with the claim's.
+    ///
+    /// Compatibility is decided field by field and the mismatching fields are
+    /// returned, never inferred from the broad authority domain. A partial overlap
+    /// is reported as partial: it is not rounded up to agreement, because the
+    /// whole defect this replaces was a broad-domain test standing in for an
+    /// exact one.
+    pub fn condition_compatibility(
+        &self,
+        claim_conditions: &ClaimConditions,
+    ) -> ConditionCompatibility {
+        let mut mismatched: Vec<OppositionDimension> = Vec::new();
+        if self.compatible_conditions.population_scope != claim_conditions.population_scope {
+            mismatched.push(OppositionDimension::Population);
+        }
+        if self.compatible_conditions.time_version != claim_conditions.time_version {
+            mismatched.push(OppositionDimension::TimeVersion);
+        }
+        if self.compatible_conditions.definition_unit_denominator
+            != claim_conditions.definition_unit_denominator
+        {
+            mismatched.push(OppositionDimension::DefinitionUnit);
+        }
+        if self.compatible_conditions.modality != claim_conditions.modality {
+            mismatched.push(OppositionDimension::Modality);
+        }
+        if mismatched.is_empty() {
+            ConditionCompatibility::Compatible
+        } else if mismatched.len() == 4 {
+            ConditionCompatibility::Incompatible(mismatched)
+        } else {
+            ConditionCompatibility::PartiallyOverlapping(mismatched)
+        }
+    }
+}
+
+/// How one relation's conditions relate to the claim's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConditionCompatibility {
+    /// Every condition matches; the opposition is under the same conditions.
+    Compatible,
+    /// Some conditions match and some do not; both facts are preserved.
+    PartiallyOverlapping(Vec<OppositionDimension>),
+    /// No condition matches; this is a statement about something else.
+    Incompatible(Vec<OppositionDimension>),
 }
 
 /// Claim audit outcome for one structured claim.
@@ -2349,7 +3068,48 @@ pub enum ClaimOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CounterclaimDisposition {
     /// Resolved to relevant counterevidence under compatible conditions.
+    ///
+    /// Reachable only from a verified [`ClaimOppositionRelation`]. Every other
+    /// variant below means the opposition was *not* established, and none of them
+    /// is ever read as support.
     Contradicts,
+    /// The handle is eligible on every axis the manifest, lineage, domain,
+    /// freshness and weight checks cover, but nothing establishes that it actually
+    /// contests this claim. This is the variant the original defect turned into
+    /// `Contradicts`, and it is the honest default for a bare attachment.
+    NotVerifiableInScope,
+    /// The relation is frozen against a different claim or a different claim
+    /// revision, so it says nothing about this claim.
+    RelationClaimMismatch,
+    /// The claim's wording no longer matches the wording the relation was frozen
+    /// against. An edited claim invalidates every verdict reached through it.
+    RelationStatementChanged,
+    /// The claim carries no frozen identity, so no opposition can be established
+    /// against it.
+    NoFrozenClaimIdentity,
+    /// The relation's bytes no longer hash to the digest frozen beside them.
+    RelationDigestMismatch,
+    /// The relation rests on a span the admitted source record does not contain.
+    SpanNotAdmitted,
+    /// The relation is frozen against a source revision that no longer exists.
+    RelationSourceRevisionChanged,
+    /// The evaluator found the excerpt insufficient to speak to the claim.
+    EvaluationInsufficient,
+    /// The relation carries no evaluator identity or revision.
+    NoEvaluationRoute,
+    /// The evaluator established that the source **agrees** with the claim. A
+    /// source that supports a claim cannot become counterevidence through any
+    /// attachment order.
+    AgreesWithClaim,
+    /// The opposition is stated under conditions that do not match the claim's on
+    /// any dimension, so it is a statement about something else.
+    IncompatibleConditions,
+    /// The opposition matches the claim's conditions on some dimensions and not
+    /// others. Preserved as partial; never rounded up to agreement.
+    PartiallyOverlappingConditions,
+    /// The opposition covers only part of the claim, leaving the remainder
+    /// unaccounted.
+    PartialCoverage,
     /// The handle is allowlisted but explicitly revoked, so it cannot be
     /// verified as counterevidence and is not merely absent.
     Revoked,
@@ -2375,6 +3135,7 @@ impl CounterclaimDisposition {
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::Contradicts => "CONTRADICTS",
+            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
             Self::Revoked => "REVOKED",
             Self::OutsideManifest => "OUTSIDE_MANIFEST",
             Self::UnresolvedLineage => "UNRESOLVED_LINEAGE",
@@ -2382,7 +3143,29 @@ impl CounterclaimDisposition {
             Self::Stale => "STALE",
             Self::CarriesNoWeight => "CARRIES_NO_WEIGHT",
             Self::AlsoACitation => "ALSO_A_CITATION",
+            Self::RelationClaimMismatch => "RELATION_CLAIM_MISMATCH",
+            Self::RelationStatementChanged => "RELATION_STATEMENT_CHANGED",
+            Self::NoFrozenClaimIdentity => "NO_FROZEN_CLAIM_IDENTITY",
+            Self::RelationDigestMismatch => "RELATION_DIGEST_MISMATCH",
+            Self::SpanNotAdmitted => "SPAN_NOT_ADMITTED",
+            Self::RelationSourceRevisionChanged => "RELATION_SOURCE_REVISION_CHANGED",
+            Self::EvaluationInsufficient => "EVALUATION_INSUFFICIENT",
+            Self::NoEvaluationRoute => "NO_EVALUATION_ROUTE",
+            Self::AgreesWithClaim => "AGREES_WITH_CLAIM",
+            Self::IncompatibleConditions => "INCOMPATIBLE_CONDITIONS",
+            Self::PartiallyOverlappingConditions => "PARTIALLY_OVERLAPPING_CONDITIONS",
+            Self::PartialCoverage => "PARTIAL_COVERAGE",
         }
+    }
+
+    /// Whether this disposition means the opposition was established.
+    ///
+    /// The only `true` in this table is [`Self::Contradicts`], and it is the only
+    /// one reachable from a verified relation. Everything else — including
+    /// [`Self::AgreesWithClaim`] and every eligibility failure — leaves the
+    /// opposition unestablished, and none of them is ever read as support.
+    pub const fn establishes_opposition(self) -> bool {
+        matches!(self, Self::Contradicts)
     }
 }
 
@@ -2441,6 +3224,80 @@ pub struct ClaimVerdict {
     pub grade_ceiling: Option<u8>,
     /// Evidence handles behind the verdict, sorted.
     pub evidence_map: Vec<String>,
+    /// Every dimension the audit examined, whether or not it found a failure.
+    ///
+    /// This is the record that makes the public projection lossless in the other
+    /// direction. A verdict that kept only its terminal outcome would force a
+    /// consumer to recover "was this also outside the manifest, and also stale?"
+    /// by matching residue prose — the exact mistake the `#1765` repair already
+    /// had to undo once. The dimensions are named, not rendered.
+    pub dimensions: Vec<AuditDimension>,
+    /// Digests of the relations the audit relied on, sorted.
+    ///
+    /// A verdict is bound to the exact relations that produced it, so a later
+    /// reader can tell whether the opposition still verifies rather than trusting
+    /// a `CONTRADICTED` label whose evidence has since changed.
+    pub relation_digests: Vec<String>,
+    /// Digest of the frozen claim identity this verdict was decided under.
+    ///
+    /// Empty when the claim carried no frozen identity, which is itself a reason
+    /// the verdict cannot be `Supported`.
+    pub claim_identity_digest: String,
+    /// Citations that did not resolve inside the frozen manifest, sorted.
+    ///
+    /// Recorded as data rather than inferred from the terminal class, so
+    /// `ReferenceVerification` can be judged on the citation set itself and a
+    /// consumer can see exactly which references failed.
+    pub outside_citations: Vec<String>,
+    /// Citations whose record resolved but carried no evidentiary weight, sorted.
+    ///
+    /// The value half of the audit: a citation can be inside the manifest and
+    /// still contribute no weight, and that is a different finding from being
+    /// outside it.
+    pub unweighted_citations: Vec<String>,
+}
+
+/// One named dimension the claim audit examined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditDimension {
+    /// Every material citation resolved inside the frozen manifest.
+    ReferenceVerification,
+    /// Every material citation carries evidentiary weight.
+    ValueVerification,
+    /// The claim is inside the requested specification and scope.
+    SpecificationCompliance,
+    /// The method and artifact the claim rests on are the ones audited.
+    MethodArtifactAlignment,
+    /// The claim's wording and revision still match what was frozen.
+    ClaimIdentityCurrent,
+    /// Every alleged counterclaim was examined.
+    CounterevidenceExamined,
+    /// Material-claim accounting is complete.
+    AccountingComplete,
+    /// Every attached counterclaim resolved to exactly one disposition.
+    ///
+    /// The premise of this dimension is that the partitions agree: a handle cannot
+    /// be simultaneously "outside the manifest" on the citation side and "also a
+    /// citation" on the counterclaim side. `audit_claim` classifies each handle
+    /// once and both partitions read that one answer, so this dimension is the
+    /// record that the two did not diverge.
+    PartitionCoherence,
+}
+
+impl AuditDimension {
+    /// Stable wire spelling of this dimension.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReferenceVerification => "REFERENCE_VERIFICATION",
+            Self::ValueVerification => "VALUE_VERIFICATION",
+            Self::SpecificationCompliance => "SPECIFICATION_COMPLIANCE",
+            Self::MethodArtifactAlignment => "METHOD_ARTIFACT_ALIGNMENT",
+            Self::ClaimIdentityCurrent => "CLAIM_IDENTITY_CURRENT",
+            Self::CounterevidenceExamined => "COUNTEREVIDENCE_EXAMINED",
+            Self::AccountingComplete => "ACCOUNTING_COMPLETE",
+            Self::PartitionCoherence => "PARTITION_COHERENCE",
+        }
+    }
 }
 
 impl ClaimVerdict {
@@ -2458,6 +3315,177 @@ impl ClaimVerdict {
                 )
             })
             .collect()
+    }
+
+    /// The public release class for this verdict.
+    ///
+    /// I21.8 names five public classes and the internal [`ClaimOutcome`] has eight,
+    /// so this projection is **many-to-one and therefore not lossless on its own**:
+    /// `OutsideManifest`, `NotVerifiableInScope` and `IncompleteAccounting` all
+    /// reach [`PublicAuditClass::NotVerifiableInScope`], and `Unsupported` and
+    /// `StaleLimited` both reach [`PublicAuditClass::Unsupported`]. The mapping is
+    /// total and each arm is individually defensible — the five classes describe
+    /// what a release consumer may *do*, and a stale-limited claim is not
+    /// `Supported` — but the specific reason lives in
+    /// [`Self::outcome`](ClaimVerdict::outcome), [`Self::failed_dimensions`] and the
+    /// residue.
+    ///
+    /// The loss the issue asks for is preserved by keeping those alongside the
+    /// class rather than by pretending five classes can express eight findings. A
+    /// consumer that needs the distinction reads them; a consumer that only needs
+    /// "may this be released as supported" reads this.
+    #[must_use]
+    pub fn public_class(&self) -> PublicAuditClass {
+        match self.outcome {
+            ClaimOutcome::Contradicted => PublicAuditClass::Contradicted,
+            ClaimOutcome::Supported => PublicAuditClass::Supported,
+            ClaimOutcome::PartiallySupported => PublicAuditClass::PartiallySupported,
+            ClaimOutcome::Unsupported | ClaimOutcome::StaleLimited => PublicAuditClass::Unsupported,
+            ClaimOutcome::OutsideManifest
+            | ClaimOutcome::NotVerifiableInScope
+            | ClaimOutcome::IncompleteAccounting => PublicAuditClass::NotVerifiableInScope,
+        }
+    }
+
+    /// Whether every dimension the release gate requires was established.
+    ///
+    /// This is the "no `SUPPORTED` promotion while a required dimension fails or
+    /// is unknown" rule expressed as a question a consumer can ask, rather than
+    /// as a precedence chain that decides it silently.
+    #[must_use]
+    pub fn dimensions_complete(&self) -> bool {
+        !self.dimensions.is_empty()
+            && self
+                .dimensions
+                .iter()
+                .all(|dimension| self.dimension_passed(*dimension))
+    }
+
+    /// Whether one named dimension was examined and found sound.
+    ///
+    /// Public, and deliberately so. `dimensions_complete` answers "may this be
+    /// released", but a release consumer that has to act on a failure needs to
+    /// know *which* dimension failed, and the alternative is recovering it from
+    /// rendered residue — the exact mistake the `#1765` repair already had to undo
+    /// once. An absent dimension did not pass.
+    #[must_use]
+    pub fn dimension_passed(&self, dimension: AuditDimension) -> bool {
+        self.dimensions.contains(&dimension) && !self.dimension_failed(dimension)
+    }
+
+    /// The wire spellings of the examined audit dimensions, in sorted order.
+    ///
+    /// A binding that covers this verdict names the dimensions it examined without
+    /// depending on the enum's declaration order or on rendered prose.
+    #[must_use]
+    pub fn dimension_names(&self) -> Vec<String> {
+        self.dimensions
+            .iter()
+            .map(|dimension| dimension.wire_name().to_owned())
+            .collect()
+    }
+
+    /// The named dimensions this verdict examined and found unsound.
+    ///
+    /// The direct answer to "which findings does this verdict carry", so a
+    /// consumer never has to infer it from a single boolean or from prose.
+    #[must_use]
+    pub fn failed_dimensions(&self) -> Vec<AuditDimension> {
+        self.dimensions
+            .iter()
+            .copied()
+            .filter(|dimension| self.dimension_failed(*dimension))
+            .collect()
+    }
+
+    /// Whether one examined dimension failed.
+    fn dimension_failed(&self, dimension: AuditDimension) -> bool {
+        let failed = match dimension {
+            // Reference verification asks whether every citation resolved inside
+            // the frozen manifest. It is a question about the citation set, so it
+            // is answered from the set and not from the terminal class: reading
+            // `outcome` here would make this dimension a restatement of the
+            // precedence chain rather than an independent observation, which is
+            // what I21.8 asks for.
+            AuditDimension::ReferenceVerification => self.outside_citations.is_empty(),
+            // Value verification asks whether the resolved citations carried
+            // weight. Answered from the recorded set, not from the terminal class.
+            AuditDimension::ValueVerification => !self.unweighted_citations.is_empty(),
+            AuditDimension::SpecificationCompliance => {
+                self.counterclaim_resolutions.iter().any(|entry| {
+                    matches!(
+                        entry.disposition,
+                        CounterclaimDisposition::IncompatibleConditions
+                            | CounterclaimDisposition::PartiallyOverlappingConditions
+                            | CounterclaimDisposition::OutsideDomain
+                    )
+                })
+            }
+            // The claim is aligned with the artifact it was released in when it
+            // carries a frozen identity that verifies. An unfrozen claim, or one
+            // whose identity was substituted, has no such alignment.
+            AuditDimension::MethodArtifactAlignment => self.claim_identity_digest.is_empty(),
+            AuditDimension::ClaimIdentityCurrent => {
+                // Every disposition that means the claim's own identity no longer
+                // describes the claim being audited. The set is deliberately
+                // identical to the `identity_current` test in `audit_claim`: a
+                // disposition present in one and absent from the other would let a
+                // verdict exist *because* a relation was stale while reporting the
+                // identity as current.
+                self.counterclaim_resolutions.iter().any(|entry| {
+                    matches!(
+                        entry.disposition,
+                        CounterclaimDisposition::RelationStatementChanged
+                            | CounterclaimDisposition::RelationClaimMismatch
+                            | CounterclaimDisposition::NoFrozenClaimIdentity
+                            | CounterclaimDisposition::RelationDigestMismatch
+                            | CounterclaimDisposition::RelationSourceRevisionChanged
+                    )
+                })
+            }
+            // Every alleged counterclaim resolved to a settled disposition:
+            // either a verified contradiction, or a refusal that names why. The
+            // dimension is only recorded when there WAS an alleged counterclaim to
+            // examine, so its absence already means the question was not asked.
+            AuditDimension::CounterevidenceExamined => {
+                self.counterclaim_resolutions.iter().any(|entry| {
+                    !matches!(
+                        entry.disposition,
+                        CounterclaimDisposition::Contradicts
+                            | CounterclaimDisposition::AlsoACitation
+                            | CounterclaimDisposition::NotVerifiableInScope
+                    )
+                })
+            }
+            AuditDimension::AccountingComplete => {
+                self.outcome == ClaimOutcome::IncompleteAccounting || !self.unknowns.is_empty()
+            }
+            // Coherence is a property of how this verdict was built rather than of
+            // what it found: every handle in `counterclaim_resolutions` carries
+            // exactly one disposition, and a handle cannot appear twice with
+            // different answers. It fails only if the resolution list contradicts
+            // itself, which no current path can produce — which is the point of
+            // recording it.
+            // Coherence fails when a handle received two different standings: the
+            // same handle appearing twice in the resolution list, or appearing as
+            // both an outside citation and a settled counterclaim. The second case
+            // is the one the issue names, and it is reachable from a caller that
+            // lists a handle on both sides.
+            AuditDimension::PartitionCoherence => {
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                let duplicated = self
+                    .counterclaim_resolutions
+                    .iter()
+                    .any(|entry| !seen.insert(entry.counterclaim_id.as_str()));
+                let cross_partition = self.outside_citations.iter().any(|handle| {
+                    self.counterclaim_resolutions
+                        .iter()
+                        .any(|entry| &entry.counterclaim_id == handle)
+                });
+                duplicated || cross_partition
+            }
+        };
+        !failed
     }
 }
 
@@ -2884,7 +3912,268 @@ fn resolve_counterclaim(
         ));
         return CounterclaimDisposition::CarriesNoWeight;
     }
-    CounterclaimDisposition::Contradicts
+    // The standing is resolved once, above, and re-read here rather than
+    // re-derived: the counterclaim partition and the citation partition must be
+    // able to disagree about nothing except the semantic question, never about
+    // whether the handle exists, was withdrawn, or was substituted.
+    // Everything above is *eligibility*: the handle is authorized, resolves,
+    // covers the domain, is fresh and carries weight. None of that is opposition.
+    // A source that satisfies all five and agrees with the claim is not a
+    // contradiction of it, and the only thing that can establish opposition is a
+    // [`ClaimOppositionRelation`] whose claim identity, source commitment, span,
+    // conditions and evaluator receipt all verify. An eligible handle with no such
+    // relation is reported as not verifiable, never as `Contradicts`.
+    //
+    // The staleness check above is the eligibility half; `verified_opposition`
+    // re-checks it because an opposition is only meaningful for a source that is
+    // still fresh at the audit instant, and that is a property of the record
+    // rather than of the relation.
+    if let Some(disposition) = verified_opposition(counterclaim_id, claim, record, now_ms, residue)
+    {
+        return disposition;
+    }
+    residue.push(format!(
+        "claim: counterclaim {counterclaim_id} is eligible but no verified opposition relation establishes that it contests this claim"
+    ));
+    CounterclaimDisposition::NotVerifiableInScope
+}
+
+/// The single standing one handle has under one manifest, resolved once.
+///
+/// Both the citation partition and the counterclaim partition read this, so a
+/// handle cannot receive inconsistent typed semantics across the two. The order
+/// is fixed and total: revocation is decided before membership, because a revoked
+/// handle was authorized and then withdrawn, and reporting it as merely absent
+/// would lose that. `OutsideManifest` and `Admitted` are distinct because a
+/// handle the manifest never froze and a handle it froze are different facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleStanding {
+    /// The handle was authorized and then explicitly withdrawn.
+    Revoked,
+    /// The handle is not part of the frozen manifest.
+    OutsideManifest,
+    /// The manifest admits the handle but no authoritative record stands behind it.
+    UnresolvedLineage,
+    /// The record was substituted after the manifest froze its commitment.
+    SubstitutedAfterFreeze,
+    /// The record resolves but is past its frozen freshness boundary.
+    Stale,
+    /// The record resolves and carries no evidentiary weight.
+    NoWeight,
+    /// The handle is admitted, resolves, matches its frozen commitment and carries
+    /// weight. Domain competence is judged per claim and is not part of standing.
+    Admitted,
+}
+
+impl HandleStanding {
+    /// Stable wire spelling of this standing.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Revoked => "REVOKED",
+            Self::OutsideManifest => "OUTSIDE_MANIFEST",
+            Self::UnresolvedLineage => "UNRESOLVED_LINEAGE",
+            Self::SubstitutedAfterFreeze => "SUBSTITUTED_AFTER_FREEZE",
+            Self::Stale => "STALE",
+            Self::NoWeight => "NO_WEIGHT",
+            Self::Admitted => "ADMITTED",
+        }
+    }
+
+    /// Whether a handle in this standing may be cited as support or as
+    /// counterevidence. Everything except [`Self::Admitted`] fails closed.
+    pub const fn may_support(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+}
+
+/// Resolves the one standing `handle` has under `manifest` and `portfolio`.
+///
+/// This is the only place either partition decides what a handle is. Both call
+/// it, so revocation cannot be hidden behind a later check and a substituted
+/// record cannot be admitted on one side and refused on the other.
+fn handle_standing(
+    handle: &str,
+    portfolio: &EvidencePortfolio,
+    manifest: &AuthorizedManifest,
+) -> HandleStanding {
+    if manifest.revoked.iter().any(|revoked| revoked == handle) {
+        return HandleStanding::Revoked;
+    }
+    if !manifest.allows(handle) {
+        return HandleStanding::OutsideManifest;
+    }
+    let Some(record) = portfolio.records.get(handle) else {
+        return HandleStanding::UnresolvedLineage;
+    };
+    if !manifest.binds_source_record(record) {
+        return HandleStanding::SubstitutedAfterFreeze;
+    }
+    if !record.acquisition.may_support() {
+        return HandleStanding::NoWeight;
+    }
+    if record.acquisition == SourceDisposition::Stale {
+        return HandleStanding::Stale;
+    }
+    HandleStanding::Admitted
+}
+
+/// Renders one wire name per mismatched condition, in the order the conditions
+/// were compared.
+///
+/// Shared by both mismatch arms so the two cannot drift, and so a consumer
+/// reading the residue sees the same vocabulary the typed disposition carries.
+fn wire_names(dimensions: &[OppositionDimension]) -> String {
+    let names: Vec<&str> = dimensions
+        .iter()
+        .map(|dimension| dimension.wire_name())
+        .collect();
+    names.join(",")
+}
+
+/// Decides whether one eligible handle is verified counterevidence for this claim.
+///
+/// Returns `None` when no relation establishes opposition, which the caller
+/// reports as `NotVerifiableInScope`. Every failure below is a refusal to believe
+/// a relation, and each preserves why: a relation that cannot be proved is not
+/// evidence in either direction.
+///
+/// The checks run most-specific first, and each records its own typed residue
+/// line, so the reason an eligible handle did not contradict is never lost:
+///
+/// * a relation whose own bytes no longer hash to its digest was altered after it
+///   was issued;
+/// * a relation bound to a different claim identity or a different claim revision
+///   says nothing about this claim, and a claim whose wording moved invalidates
+///   every verdict reached through it;
+/// * a relation whose source commitment no longer matches the record contests a
+///   source revision that does not exist any more;
+/// * a relation whose span is not one of the record's own evidence spans rests on
+///   an excerpt the admitted record does not contain;
+/// * a relation that evaluates as agreement is a source that supports the claim,
+///   which can never become counterevidence through any attachment order;
+/// * a condition mismatch leaves the opposition about a different population,
+///   time, unit or modality, and a partial overlap is preserved as partial;
+/// * an `Insufficient` evaluation, a missing evaluator identity, or coverage
+///   below the whole claim is an unknown, not a negative result.
+#[allow(clippy::too_many_lines)]
+fn verified_opposition(
+    counterclaim_id: &str,
+    claim: &AuditedClaim,
+    record: &SourceRecord,
+    now_ms: i64,
+    residue: &mut Vec<String>,
+) -> Option<CounterclaimDisposition> {
+    let relation = claim
+        .opposition_relations
+        .iter()
+        .find(|relation| relation.source_handle == counterclaim_id)?;
+    if relation.claim.claim_id != claim.claim_id {
+        residue.push(format!(
+            "claim: opposition relation {} contests claim {} not {}",
+            relation.relation_id, relation.claim.claim_id, claim.claim_id
+        ));
+        return Some(CounterclaimDisposition::RelationClaimMismatch);
+    }
+    if relation.claim.statement != claim.statement {
+        residue.push(format!(
+            "claim: opposition relation {} is frozen against different statement wording",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::RelationStatementChanged);
+    }
+    let Some(identity) = claim
+        .frozen_identities
+        .iter()
+        .find(|identity| identity.claim_id == claim.claim_id)
+    else {
+        residue.push(
+            "claim: no frozen claim identity, so no opposition can be established".to_owned(),
+        );
+        return Some(CounterclaimDisposition::NoFrozenClaimIdentity);
+    };
+    if identity.claim_revision != relation.claim.claim_revision {
+        residue.push(format!(
+            "claim: opposition relation {} is frozen against revision {} not {}",
+            relation.relation_id, relation.claim.claim_revision, identity.claim_revision
+        ));
+        return Some(CounterclaimDisposition::RelationClaimMismatch);
+    }
+    if identity.verify_integrity().is_err() || relation.verify_integrity().is_err() {
+        residue.push(format!(
+            "claim: opposition relation {} does not match its own frozen digest",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::RelationDigestMismatch);
+    }
+    if !record.binds_span(&relation.span) {
+        residue.push(format!(
+            "claim: opposition relation {} rests on a span the admitted record does not contain",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::SpanNotAdmitted);
+    }
+    if !record
+        .digest()
+        .is_ok_and(|current| current == relation.source_record_digest)
+    {
+        residue.push(format!(
+            "claim: opposition relation {} is frozen against a different source revision",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::RelationSourceRevisionChanged);
+    }
+    if relation.evaluation == SemanticEvaluationOutcome::Insufficient {
+        residue.push(format!(
+            "claim: evaluator {} found the excerpt {} insufficient",
+            relation.evaluator_id, relation.span.span_id
+        ));
+        return Some(CounterclaimDisposition::EvaluationInsufficient);
+    }
+    if relation.evaluator_id.trim().is_empty() || relation.evaluator_revision.trim().is_empty() {
+        residue.push(format!(
+            "claim: opposition relation {} carries no evaluator identity",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::NoEvaluationRoute);
+    }
+    if relation.polarity == OppositionPolarity::Agrees {
+        residue.push(format!(
+            "claim: source {counterclaim_id} is evaluated as agreeing with the claim on {}",
+            relation.dimension.wire_name()
+        ));
+        return Some(CounterclaimDisposition::AgreesWithClaim);
+    }
+    match relation.condition_compatibility(&identity.conditions) {
+        ConditionCompatibility::Incompatible(mismatched) => {
+            residue.push(format!(
+                "claim: opposition is stated under different conditions ({})",
+                wire_names(&mismatched)
+            ));
+            return Some(CounterclaimDisposition::IncompatibleConditions);
+        }
+        ConditionCompatibility::PartiallyOverlapping(mismatched) => {
+            residue.push(format!(
+                "claim: opposition overlaps only partially; mismatched {}",
+                wire_names(&mismatched)
+            ));
+            return Some(CounterclaimDisposition::PartiallyOverlappingConditions);
+        }
+        ConditionCompatibility::Compatible => {}
+    }
+    if relation.coverage_ppm < 1_000_000 {
+        residue.push(format!(
+            "claim: opposition covers {}ppm of the claim; the remainder is unaccounted",
+            relation.coverage_ppm
+        ));
+        return Some(CounterclaimDisposition::PartialCoverage);
+    }
+    if record.is_stale_at(now_ms) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is stale and cannot contradict"
+        ));
+        return Some(CounterclaimDisposition::Stale);
+    }
+    Some(CounterclaimDisposition::Contradicts)
 }
 
 /// Audits one already-structured claim against the frozen portfolio and
@@ -2920,6 +4209,11 @@ pub fn audit_claim(
     // diagnostic text, and matching a substring of it let an unrelated line
     // (a counterclaim outside the manifest, say) flip a citation verdict.
     let mut outside_citation = false;
+    // The two citation findings are recorded as data, not as a single boolean, so
+    // each audit dimension can be judged on the citation set itself and a consumer
+    // can see which references failed rather than inferring it from a class.
+    let mut outside_citations: Vec<String> = Vec::new();
+    let mut unweighted_citations: Vec<String> = Vec::new();
     // A manifest that fails its own integrity check is the authorization this
     // claim was judged under, so the gap is seeded here rather than per handle:
     // with the manifest unproven, no handle it admits is proven either, and the
@@ -2930,11 +4224,12 @@ pub fn audit_claim(
         residue.push("claim: material claim records no citations".to_owned());
     }
     for handle in &claim.citations {
-        if !manifest.allows(handle) {
-            outside_citation = true;
-            residue.push(format!("claim: citation {handle} outside frozen manifest"));
-            continue;
-        }
+        // One classification per handle, resolved once and read by both
+        // partitions. This is the coherence property the issue asks for: a handle
+        // cannot be "outside the manifest" on the citation side and something else
+        // on the counterclaim side, because neither side re-derives standing from
+        // its own rules.
+        let standing = handle_standing(handle, portfolio, manifest);
         let Some(record) = portfolio.records.get(handle) else {
             lineage_gap = true;
             residue.push(format!(
@@ -2942,18 +4237,39 @@ pub fn audit_claim(
             ));
             continue;
         };
-        // A record that no longer hashes to the commitment this manifest froze
-        // is not the source the manifest admitted. Treating it as a lineage gap
-        // keeps the verdict non-supporting without introducing a second
-        // terminal class for what is, exactly, an unproven lineage.
-        if !manifest.binds_source_record(record) {
-            lineage_gap = true;
-            residue.push(format!(
-                "claim: citation {handle} does not match the frozen source commitment"
-            ));
+        if !standing.may_support() {
+            match standing {
+                HandleStanding::OutsideManifest => {
+                    outside_citation = true;
+                    outside_citations.push(handle.clone());
+                    residue.push(format!("claim: citation {handle} outside frozen manifest"));
+                }
+                // A record that no longer hashes to the commitment this manifest
+                // froze is not the source the manifest admitted. Treating it as a
+                // lineage gap keeps the verdict non-supporting without introducing
+                // a second terminal class for what is, exactly, an unproven lineage.
+                HandleStanding::SubstitutedAfterFreeze => {
+                    lineage_gap = true;
+                    residue.push(format!(
+                        "claim: citation {handle} does not match the frozen source commitment"
+                    ));
+                }
+                HandleStanding::Stale => {
+                    stale_hit = true;
+                    residue.push(format!("claim: citation {handle} stale limits claim"));
+                }
+                _ => {
+                    support_gap = true;
+                    unweighted_citations.push(handle.clone());
+                    residue.push(format!(
+                        "claim: citation {handle} stands {} and carries no weight",
+                        standing.wire_name()
+                    ));
+                }
+            }
             continue;
         }
-        if !record.covers_domain(&claim.domain) {
+        if record.outside_domain(&claim.domain) {
             lineage_gap = true;
             residue.push(format!(
                 "claim: source {handle} outside claim domain {}",
@@ -2961,6 +4277,10 @@ pub fn audit_claim(
             ));
             continue;
         }
+        // An admitted handle whose record has passed its own freshness boundary
+        // still limits the claim, and that is a staleness finding rather than a
+        // weight finding: a time-stale record may support, it just cannot carry a
+        // contradiction.
         if record.is_stale_at(now_ms) {
             stale_hit = true;
             residue.push(format!("claim: source {handle} stale limits claim"));
@@ -3027,40 +4347,176 @@ pub fn audit_claim(
     }
     let contradicting: Vec<&CounterclaimResolution> = resolutions
         .iter()
-        .filter(|entry| entry.disposition == CounterclaimDisposition::Contradicts)
+        .filter(|entry| entry.disposition.establishes_opposition())
         .collect();
     let unverifiable: Vec<&CounterclaimResolution> = resolutions
         .iter()
-        .filter(|entry| entry.disposition != CounterclaimDisposition::Contradicts)
+        .filter(|entry| !entry.disposition.establishes_opposition())
         .collect();
     let counterevidence: Vec<String> = claim.counterclaim_ids.clone();
     let unknowns: Vec<String> = claim.unknown_refs.clone();
     let precision_gap = !unsupported_precision.is_empty();
-    let outcome = if outside_citation {
-        ClaimOutcome::OutsideManifest
-    } else if !contradicting.is_empty() {
+    // The terminal outcome is derived from the named dimensions, and every
+    // dimension is recorded whether or not it failed. I21.8 requires the four
+    // audit dimensions to be observed separately, and `#1765` requires the
+    // precise reasons to survive into the release decision; a single `if/else`
+    // chain that returns on the first hit discards exactly the findings a release
+    // consumer needs. `dimensions` below is the record, and the chain only names
+    // the terminal class.
+    let identity_current = !resolutions.iter().any(|entry| {
+        matches!(
+            entry.disposition,
+            CounterclaimDisposition::RelationStatementChanged
+                | CounterclaimDisposition::RelationClaimMismatch
+                | CounterclaimDisposition::NoFrozenClaimIdentity
+                | CounterclaimDisposition::RelationDigestMismatch
+                | CounterclaimDisposition::RelationSourceRevisionChanged
+        )
+    });
+    // A material claim needs an identity that verifies, not merely one that is
+    // present. `AuditedClaim.frozen_identities` is a caller-writable `Vec` of
+    // plain structs, so a caller can push an identity whose `digest` is empty or
+    // stale, or one frozen against different wording; checking only for presence
+    // would let that self-declared value stand in for a proof. The recorded digest
+    // is the recomputed one and is empty unless the identity proves out, so
+    // `MethodArtifactAlignment` fails on exactly the same condition.
+    //
+    // A claim that cannot prove its identity is accounted for as an open material
+    // claim rather than a supported one. Routing it through
+    // `IncompleteAccounting` rather than a new terminal class keeps the public
+    // five-class projection the only thing a release consumer has to read, while
+    // the dimension records the real reason.
+    // An identity that does not prove out leaves an empty recorded digest, so a
+    // caller cannot substitute a self-declared one.
+    let claim_identity = claim
+        .frozen_identities
+        .iter()
+        .find(|identity| identity.claim_id == claim.claim_id);
+    let claim_identity_verified = claim_identity.is_some_and(|identity| {
+        identity.verify_integrity().is_ok() && identity.statement == claim.statement
+    });
+    let claim_identity_digest = if claim_identity_verified {
+        claim_identity.map_or(String::new(), |identity| identity.digest.clone())
+    } else {
+        String::new()
+    };
+    let unfrozen_material_claim = claim.material && !claim_identity_verified && !outside_citation;
+    // The dimensions the audit actually EXAMINED, recorded per verdict.
+    //
+    // A constant list of all eight would carry no information: it could not
+    // distinguish "examined and passed" from "never examined", which is the whole
+    // point of naming them. Each entry below is pushed at the point where the
+    // audit genuinely looked at that property, so a consumer can tell a dimension
+    // that was checked and found sound from one that was skipped. A dimension the
+    // audit could not examine is simply absent, and `dimensions_complete` treats
+    // absence as failure.
+    let mut dimensions: Vec<AuditDimension> = vec![
+        AuditDimension::ClaimIdentityCurrent,
+        AuditDimension::MethodArtifactAlignment,
+    ];
+    // The citation partition examined reference verification for every citation,
+    // and value verification for every citation that resolved.
+    let mut examined_reference = !claim.citations.is_empty();
+    let mut examined_value = false;
+    for handle in &claim.citations {
+        if manifest_intact && manifest.allows(handle) {
+            examined_reference = true;
+            if let Some(record) = portfolio.records.get(handle) {
+                examined_value = true;
+                let _ = record;
+            }
+        }
+    }
+    if examined_reference {
+        dimensions.push(AuditDimension::ReferenceVerification);
+    }
+    if examined_value {
+        dimensions.push(AuditDimension::ValueVerification);
+    }
+    // Specification compliance is examined only when there is a claim identity to
+    // compare its scope against; without one, the audit has no specification.
+    if claim_identity_verified {
+        dimensions.push(AuditDimension::SpecificationCompliance);
+    }
+    // Counterevidence was examined exactly when at least one alleged counterclaim
+    // was classified. A claim with none has not had the question asked, and saying
+    // otherwise would be the vacuous truth the dimension name warns about.
+    if !claim.counterclaim_ids.is_empty() {
+        dimensions.push(AuditDimension::CounterevidenceExamined);
+    }
+    // Partition coherence is examined when both partitions could have seen a
+    // handle, which is the only situation where they can disagree.
+    if !claim.citations.is_empty() && !claim.counterclaim_ids.is_empty() {
+        dimensions.push(AuditDimension::PartitionCoherence);
+    }
+    // Accounting completeness is examined once the claim's own bookkeeping has
+    // been walked: its unknowns and its material/empty-citation state.
+    dimensions.push(AuditDimension::AccountingComplete);
+    dimensions.sort();
+    dimensions.dedup();
+    // The terminal outcome is DERIVED from the examined dimensions rather than
+    // chosen by a precedence chain, so two independent failures both stay visible:
+    // a verified contradiction alongside an outside-manifest citation reports the
+    // contradiction, and the outside-manifest finding remains in `dimensions` and
+    // in the residue. Reading the first matching arm of an `if/else` chain, by
+    // contrast, silently discards whichever finding it did not reach.
+    let reference_failed = examined_reference && outside_citation;
+    let value_failed = examined_value && support_gap;
+    let contradicted = !contradicting.is_empty();
+    // One place decides how much support the claim actually has, so the weight,
+    // precision and lineage gaps cannot each re-derive a different terminal class
+    // and drift apart.
+    let support_class = if stale_hit && supporting.is_empty() {
+        ClaimOutcome::StaleLimited
+    } else if supporting.is_empty() {
+        ClaimOutcome::Unsupported
+    } else {
+        ClaimOutcome::PartiallySupported
+    };
+    let outcome = if contradicted {
+        // A verified contradiction is the strongest finding and is never masked by
+        // a weaker one; every other failure stays recorded alongside it.
         ClaimOutcome::Contradicted
+    } else if reference_failed {
+        ClaimOutcome::OutsideManifest
     } else if !unverifiable.is_empty() {
         ClaimOutcome::NotVerifiableInScope
-    } else if !unknowns.is_empty()
-        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
-    {
-        ClaimOutcome::IncompleteAccounting
-    } else if lineage_gap || precision_gap || support_gap {
-        if stale_hit && supporting.is_empty() {
-            ClaimOutcome::StaleLimited
-        } else if supporting.is_empty() {
-            ClaimOutcome::Unsupported
-        } else {
-            ClaimOutcome::PartiallySupported
-        }
+    } else if value_failed || precision_gap || lineage_gap {
+        support_class
     } else if stale_hit {
         ClaimOutcome::StaleLimited
+    } else if !unknowns.is_empty()
+        || unfrozen_material_claim
+        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
+    {
+        // An open material claim, an unfrozen one, or one with preserved unknowns
+        // is not supported. This arm sits after the support gaps so a claim that
+        // is both unsupported and unfrozen reports the support gap, which is the
+        // more specific finding.
+        ClaimOutcome::IncompleteAccounting
+    } else if !identity_current {
+        // A claim whose wording moved after the opposition was frozen cannot be
+        // released as supported, and a verdict reached through a stale claim
+        // identity is not a verdict about this claim at all. Checked last, because
+        // it is the most specific reason and the other findings stay recorded
+        // either way.
+        ClaimOutcome::NotVerifiableInScope
     } else {
         ClaimOutcome::Supported
     };
+    let mut relation_digests: Vec<String> = claim
+        .opposition_relations
+        .iter()
+        .map(|relation| relation.digest.clone())
+        .collect();
+    relation_digests.sort();
+    relation_digests.dedup();
     let grade_ceiling = decide_grade(&supporting, &claim.domain, now_ms).ceiling;
     evidence_map.sort();
+    outside_citations.sort();
+    outside_citations.dedup();
+    unweighted_citations.sort();
+    unweighted_citations.dedup();
     residue.sort();
     let mut counter_sorted = counterevidence;
     counter_sorted.sort();
@@ -3086,6 +4542,11 @@ pub fn audit_claim(
         unknowns: unknowns_sorted,
         grade_ceiling,
         evidence_map,
+        dimensions,
+        relation_digests,
+        claim_identity_digest,
+        outside_citations,
+        unweighted_citations,
     }
 }
 

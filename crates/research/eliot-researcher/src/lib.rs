@@ -23,8 +23,15 @@ use eliot_research_exchange_api::{
 // The coverage-account vocabulary `R6` publishes on its records: the observed
 // population the account learns, the owner-bound absence preconditions and the
 // verdict they produce. Referenced, never redefined here.
+// The claim-audit vocabulary a `#1765` release consumer reads off an exported
+// record. `ClaimVerdict` is a `pub` field of the exported `ClaimAuditRecord`, so
+// every type a consumer must name to interpret a verdict is nameable here rather
+// than only through a module path.
 pub use evidence_portfolio::{
-    AbsencePreconditions, AbsenceVerdict, ManifestSource, NoMatchEvaluation, ObservedOutsideScope,
+    AbsencePreconditions, AbsenceVerdict, AuditDimension, ClaimMateriality, ClaimModality,
+    ClaimOppositionRelation, ClaimVerdict, ConditionCompatibility, CounterclaimDisposition,
+    FrozenClaimIdentity, HandleStanding, ManifestSource, NoMatchEvaluation, ObservedOutsideScope,
+    OppositionDimension, OppositionPolarity, PublicAuditClass, SemanticEvaluationOutcome,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without

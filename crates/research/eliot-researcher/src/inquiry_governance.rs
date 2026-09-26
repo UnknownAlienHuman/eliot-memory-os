@@ -2800,6 +2800,10 @@ impl ResearchDebt {
 /// reference firewall holds: no citation, source identity, URL, line range or
 /// support relation is minted here through prose.
 #[derive(Clone, Debug, PartialEq, Eq)]
+// The I21-8 binding record commits to nothing of the verdict's evidence, so a
+// `CONTRADICTED` label can outlive the relation that produced it. Every field
+// below is bound into `claim-audit-record/v2` for that reason; see the type's own
+// doc comment.
 pub struct ClaimAuditRecord {
     /// Audited claim identity.
     pub claim_id: String,
@@ -2856,8 +2860,14 @@ impl ClaimAuditRecord {
         Ok(record)
     }
 
+    /// The canonical digest over the whole binding shape.
+    ///
+    /// The domain is `v2`: the `v1` preimage committed to the verdict's terminal
+    /// label, its rendered residue and its evidence handles, and to none of the
+    /// evidence that establishes a contradiction. The same record shape therefore
+    /// hashes differently under `v2`, and the name says so instead of covering both.
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("claim-audit-record/v1;");
+        let mut preimage = String::from("claim-audit-record/v2;");
         push_field(&mut preimage, "claim_id", &self.claim_id);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
@@ -2895,6 +2905,57 @@ impl ClaimAuditRecord {
             "unsupported_precision",
             self.verdict.unsupported_precision.len(),
         );
+        // I21.8 requires the contradiction itself to be bound to the evidence that
+        // established it, not only its label. Without these the record's digest
+        // commits to the word CONTRADICTED and to nothing about which relation,
+        // which claim identity, which audit dimensions or which citations produced
+        // it — so a relation, an evaluator result, a source revision or the frozen
+        // claim identity could all change while this binding stayed bit-identical.
+        push_field(
+            &mut preimage,
+            "claim_identity_digest",
+            &self.verdict.claim_identity_digest,
+        );
+        push_count(
+            &mut preimage,
+            "relation_digests",
+            self.verdict.relation_digests.len(),
+        );
+        for digest in &self.verdict.relation_digests {
+            push_field(&mut preimage, "relation_digest", digest);
+        }
+        push_count(
+            &mut preimage,
+            "counterclaim_resolutions",
+            self.verdict.counterclaim_resolutions.len(),
+        );
+        for entry in &self.verdict.counterclaim_resolutions {
+            push_field(&mut preimage, "counterclaim_id", &entry.counterclaim_id);
+            push_field(
+                &mut preimage,
+                "counterclaim_disposition",
+                entry.disposition.wire_name(),
+            );
+        }
+        for (tag, values) in [
+            ("dimension", &self.verdict.dimension_names()),
+            ("outside_citation", &self.verdict.outside_citations),
+            ("unweighted_citation", &self.verdict.unweighted_citations),
+        ] {
+            push_count(&mut preimage, tag, values.len());
+            for value in values {
+                push_field(&mut preimage, tag, value);
+            }
+        }
+        push_field(
+            &mut preimage,
+            "public_class",
+            self.verdict.public_class().wire_name(),
+        );
+        match self.verdict.grade_ceiling {
+            Some(ceiling) => push_field(&mut preimage, "grade_ceiling", &ceiling.to_string()),
+            None => push_field(&mut preimage, "grade_ceiling", "none"),
+        }
         freeze(&preimage)
     }
 }

@@ -304,6 +304,8 @@ fn source_outside_claim_authority_domain() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::Unsupported);
@@ -362,13 +364,31 @@ fn stale_partial_and_contested_sources_limit_grade() {
         statement: "the alloy survives".to_owned(),
         material: true,
         domain: "propulsion".to_owned(),
+        // `rival-src` is deliberately BOTH a citation and an alleged counterclaim.
+        // That is the scenario acceptance bullet 6 names, and the fixture keeps
+        // it: a handle used on both sides must receive one coherent
+        // classification, and revocation must not be hidden by check order.
         citations: vec!["base-src".to_owned(), "rival-src".to_owned()],
         precision: Vec::new(),
         counterclaim_ids: vec!["rival-src".to_owned()],
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
-    assert_eq!(verdict.outcome, ClaimOutcome::Contradicted);
+    // The old fixture expected CONTRADICTED from this input. That is the defect
+    // #2874 closes: listing a handle contests nothing, and a handle that is also
+    // a citation is reported as exactly that. No opposition relation is supplied,
+    // so nothing here can establish a contradiction.
+    assert_eq!(
+        verdict.counterclaim_resolutions[0].disposition,
+        CounterclaimDisposition::AlsoACitation
+    );
+    assert_ne!(verdict.outcome, ClaimOutcome::Contradicted);
+    assert_eq!(
+        verdict.public_class(),
+        PublicAuditClass::NotVerifiableInScope
+    );
     assert_eq!(verdict.counterevidence, vec!["rival-src".to_owned()]);
 }
 
@@ -691,6 +711,8 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: vec!["unread-dossier-9".to_owned()],
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&hidden_unknown, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -705,6 +727,8 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&bare, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -717,10 +741,34 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
-    let verdict = audit_claim(&clean, &portfolio, &manifest, 1_700_000_300_000);
-    assert_eq!(verdict.outcome, ClaimOutcome::Supported);
-    assert_eq!(verdict.grade_ceiling, Some(2));
+    // An unfrozen material claim is NOT supported: there is nothing to check its
+    // wording and revision against, so `MethodArtifactAlignment` fails by
+    // construction. The internal outcome stays INCOMPLETE_ACCOUNTING rather than
+    // acquiring a new terminal class, and the public projection is
+    // NOT_VERIFIABLE_IN_SCOPE. The grade ceiling is still computed from the
+    // resolved record, so the evidence quality is reported even though the
+    // claim's own identity is not fixed.
+    let unfrozen = audit_claim(&clean, &portfolio, &manifest, 1_700_000_300_000);
+    assert_eq!(unfrozen.outcome, ClaimOutcome::IncompleteAccounting);
+    assert_eq!(
+        unfrozen.public_class(),
+        PublicAuditClass::NotVerifiableInScope
+    );
+    assert!(!unfrozen.dimensions_complete());
+    assert_eq!(unfrozen.grade_ceiling, Some(2));
+    // Freezing the identity is what a release consumer must do before the same
+    // claim can be supported, and then it is — the positive case stays reachable.
+    let mut frozen = clean.clone();
+    frozen.frozen_identities = vec![clean.freeze_identity().expect("claim identity")];
+    let supported = audit_claim(&frozen, &portfolio, &manifest, 1_700_000_300_000);
+    assert_eq!(supported.outcome, ClaimOutcome::Supported);
+    assert_eq!(supported.public_class(), PublicAuditClass::Supported);
+    assert!(!supported.claim_identity_digest.is_empty());
+    assert!(supported.claim_identity_digest.len() == 64);
+    assert_eq!(supported.grade_ceiling, Some(2));
     assert!(GOLDEN.contains("INCOMPLETE_ACCOUNTING"));
     assert!(GOLDEN.contains("SUPPORTED"));
     assert!(GOLDEN.contains("weakest_link"));
