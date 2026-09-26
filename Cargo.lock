@@ -2904,6 +2904,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-research-exchange",
  "eliot-research-exchange-api",
+ "serde",
 ]
 
 [[package]]

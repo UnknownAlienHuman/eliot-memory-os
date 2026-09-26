@@ -23,8 +23,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_research_exchange_api::{CompletionDisposition, DisclosureClass, SourceClass};
+use serde::{Serialize, Serializer};
 
 /// Stable identity of this discipline surface.
 pub const PORTFOLIO_CONTRACT: &str = "eliot.research.evidence-portfolio";
@@ -128,6 +129,27 @@ pub enum PortfolioError {
         /// Failing field path.
         field: &'static str,
     },
+    /// A canonical value could not be encoded into its declared identity domain.
+    ///
+    /// Identity preimages in this module go through the repository's accepted
+    /// canonical serializer ([`eliot_contracts::canonical_json_bytes`]), so an
+    /// unencodable value is a real refusal rather than a silent omission: a
+    /// digest that skipped a field it could not spell would be exactly the
+    /// identity seam this module exists to close.
+    Unencodable {
+        /// Failing field path.
+        field: &'static str,
+    },
+    /// A recomputed canonical digest disagrees with the frozen one.
+    ///
+    /// This is the readback/provenance check: a record, inquiry or manifest
+    /// whose bytes no longer hash to the digest bound to it has been substituted
+    /// or corrupted after the freeze, and constructor-time validation alone
+    /// cannot detect that.
+    InvalidDigest {
+        /// Failing field path.
+        field: &'static str,
+    },
 }
 
 impl std::fmt::Display for PortfolioError {
@@ -163,6 +185,12 @@ impl std::fmt::Display for PortfolioError {
             }
             Self::InvalidTerminal { field } => {
                 write!(f, "{field} cannot decode as complete")
+            }
+            Self::Unencodable { field } => {
+                write!(f, "{field} cannot be encoded into its canonical domain")
+            }
+            Self::InvalidDigest { field } => {
+                write!(f, "{field} does not match its recomputed canonical digest")
             }
         }
     }
@@ -344,6 +372,19 @@ impl SourceDisposition {
     }
 }
 
+impl Serialize for SourceDisposition {
+    /// Serializes as the same stable wire spelling [`Self::wire_name`] returns.
+    ///
+    /// The identity preimages must not depend on a Rust variant name, and this
+    /// enum must not grow a second spelling: `wire_name` is the single owner and
+    /// this impl only projects it. A derived `Serialize` would have emitted the
+    /// variant identifier (`Observed`) instead, which is the same defect as
+    /// encoding `{:?}` into a digest.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
 /// Ranked deception/exfiltration/persistence risk for one source (I15.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RiskState {
@@ -369,8 +410,16 @@ impl RiskState {
     }
 }
 
+impl Serialize for RiskState {
+    /// Serializes as the same stable wire spelling [`Self::wire_name`] returns.
+    /// See the [`SourceDisposition`] impl for the single-owner rationale.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
 /// One exact structured evidence span inside a source payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EvidenceSpan {
     /// Stable span identity within the source.
     pub span_id: String,
@@ -380,12 +429,36 @@ pub struct EvidenceSpan {
     pub excerpt_digest: String,
 }
 
+impl EvidenceSpan {
+    /// Total order used to freeze spans deterministically.
+    ///
+    /// `evidence_spans` arrives as a `Vec`, so a caller's ordering would
+    /// otherwise leak into the record's identity and two records holding the
+    /// same spans in a different order would disagree on their digest while
+    /// meaning exactly the same thing. Ordering is by the whole span, so a
+    /// duplicated `span_id` with different content still sorts deterministically
+    /// and both copies stay bound.
+    fn canonical_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.span_id
+            .cmp(&other.span_id)
+            .then_with(|| self.anchor.cmp(&other.anchor))
+            .then_with(|| self.excerpt_digest.cmp(&other.excerpt_digest))
+    }
+}
+
 /// A vetted source record. Every I15.5 assurance dimension is an explicit
 /// typed field: identity/provenance, integrity, freshness, domain competence,
 /// incentives/track record, independence/common lineage, privacy class,
 /// instruction-injection risk, deception/exfiltration/persistence risk,
 /// allowed epistemic use, allowed effects, and required verifier/quarantine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Every field on this struct participates in [`Self::digest`]. The record is
+/// serialized whole through the repository's canonical serializer, so a field
+/// cannot be added here and left out of the identity: the omission that made a
+/// changed freshness boundary, transform verification, allowed effect, verifier,
+/// quarantine, counterevidence target, citation edge, excerpt span or data role
+/// hash identically is no longer expressible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SourceRecord {
     /// Canonical source handle; the frozen identity of this record.
     pub handle: String,
@@ -518,7 +591,7 @@ impl SourceRecord {
     /// artifacts: a derived record without verified raw lineage keeps its
     /// transform cap downstream instead of failing here.
     #[allow(clippy::too_many_lines)]
-    pub fn new(params: SourceRecordParams) -> Result<Self, PortfolioError> {
+    pub fn new(mut params: SourceRecordParams) -> Result<Self, PortfolioError> {
         text(&params.handle, "source.handle")?;
         text(&params.title, "source.title")?;
         text(&params.locator, "source.locator")?;
@@ -609,6 +682,22 @@ impl SourceRecord {
             digest(&span.excerpt_digest, "source.excerpt_digest")?;
         }
         text(&params.data_role, "source.data_role")?;
+        // The two caller-ordered collections are frozen into canonical order
+        // here rather than only inside the encoder, so a constructor-built record
+        // and its digest agree about what "the same record" means: two records
+        // listing the same citation edges or the same evidence spans in a
+        // different order are now equal *and* hash equally, instead of comparing
+        // unequal while sharing one identity.
+        //
+        // This is an invariant of the constructor, not of the type: every field is
+        // `pub` and the struct is not `#[non_exhaustive]`, so a direct struct
+        // literal can still carry an arbitrary order. Such a record is not
+        // rejected — it simply hashes to its own distinct identity, and
+        // `AuthorizedManifest::binds_source_record` still catches it against the
+        // commitment a manifest froze. The claim being made here is the narrow
+        // one: `new` normalises, and only `new` is claimed to.
+        params.cites.sort();
+        params.evidence_spans.sort_by(EvidenceSpan::canonical_order);
         Ok(Self {
             handle: params.handle,
             class: params.class,
@@ -657,38 +746,80 @@ impl SourceRecord {
         self.authority_domains.iter().any(|d| d == domain)
     }
 
-    /// Canonical digest of this vetted record.
-    pub fn digest(&self) -> String {
-        let mut preimage = String::from("source-record/v1;");
-        self.canonical_into(&mut preimage);
-        freeze(&preimage)
+    /// Deterministic canonical bytes of the whole vetted record.
+    ///
+    /// This is the one encoder for the declared
+    /// [`SOURCE_RECORD_DIGEST_DOMAIN`], and [`Self::digest`] is its only
+    /// caller. Object keys are sorted recursively and the domain string is
+    /// bound into the bytes, so the same record always produces the same bytes
+    /// with no clock, address or map-ordering input.
+    ///
+    /// The previous encoder was a hand-written field list that named ten of the
+    /// record's twenty-nine fields. Anything it did not name was invisible to
+    /// the identity, which is the defect this method replaces: the field set is
+    /// now the struct's field set, so a field cannot be added to the record and
+    /// forgotten here.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&SourceRecordDigestInput {
+            domain: SOURCE_RECORD_DIGEST_DOMAIN,
+            record: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "source.canonical_body",
+        })
     }
 
-    fn canonical_into(&self, preimage: &mut String) {
-        push_field(preimage, "handle", &self.handle);
-        push_field(preimage, "class", &format!("{:?}", self.class));
-        push_field(preimage, "locator", &self.locator);
-        push_field(preimage, "content_digest", &self.content_digest);
-        push_field(preimage, "operation_id", &self.operation_id);
-        push_field(preimage, "receipt_handle", &self.receipt_handle);
-        push_field(preimage, "acquisition", self.acquisition.wire_name());
-        if let Some(grade) = self.grade {
-            push_field(preimage, "grade", &grade.to_string());
+    /// Canonical digest of this vetted record.
+    ///
+    /// Refused rather than defaulted when the record cannot be encoded: a digest
+    /// computed over a silently shortened field set would be worse than no
+    /// digest, because it would look like provenance.
+    pub fn digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with a frozen one.
+    ///
+    /// This is the readback check the constructor cannot perform. A record
+    /// substituted after the freeze still validates as itself — every field it
+    /// carries is well-formed — and only a recomputation over the bytes actually
+    /// present can say that it is no longer the record that was frozen.
+    pub fn verify_identity(&self, frozen_digest: &str) -> Result<(), PortfolioError> {
+        if self.digest()? != frozen_digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "source.record_digest",
+            });
         }
-        push_count(preimage, "domains", self.authority_domains.len());
-        for domain in &self.authority_domains {
-            push_field(preimage, "domain", domain);
-        }
-        if let Some(root) = &self.lineage_root {
-            push_field(preimage, "lineage_root", root);
-        }
-        push_field(preimage, "disclosure", &format!("{:?}", self.disclosure));
-        push_field(preimage, "deception_risk", self.deception_risk.wire_name());
+        Ok(())
     }
 }
 
+/// Declared identity domain of [`SourceRecord`].
+///
+/// Bumped `v1` -> `v2` with the complete field set. The `v1` preimage was a
+/// length-prefixed string over ten named fields, so a record that changed its
+/// freshness boundary, transform verification, allowed use or effects, verifier,
+/// quarantine, counterevidence relation, citation edges, excerpt spans or data
+/// role hashed identically to its predecessor. The bytes and the field set both
+/// changed, so the domain says so instead of letting one name cover two
+/// incompatible field sets.
+pub const SOURCE_RECORD_DIGEST_DOMAIN: &str = "source-record/v2";
+
+/// The single canonical encoder input for [`SourceRecord`].
+///
+/// The record is borrowed whole rather than field-by-field: the omission this
+/// replaces happened because a hand-written list and a struct can drift apart,
+/// and nothing in the compiler objects when they do.
+#[derive(Serialize)]
+struct SourceRecordDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole vetted record.
+    record: &'a SourceRecord,
+}
+
 /// One expected source-role slot of the frozen denominator.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RoleSlot {
     /// Role name admitted by the denominator.
     pub role: String,
@@ -701,7 +832,7 @@ pub struct RoleSlot {
 }
 
 /// Finite budget caps bound into the immutable inquiry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BudgetCaps {
     /// Maximum acquisition attempts.
     pub attempts: u64,
@@ -727,7 +858,10 @@ pub struct BudgetCaps {
 /// independence, freshness and grade requirements, admitted route capability
 /// references, independent budgets, stop and partial policy, and the
 /// operation/replay identity with its frozen digest.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Every field participates in [`Self::digest`], and the digest is the only one
+/// excluded from its own preimage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FrozenInquiry {
     /// Schema identity the inquiry is bound to.
     pub schema: String,
@@ -770,8 +904,35 @@ pub struct FrozenInquiry {
     /// Replay identity of this inquiry.
     pub replay_id: String,
     /// Frozen digest over the whole inquiry shape.
+    ///
+    /// Excluded from its own preimage by `#[serde(skip)]`, so the digest is the
+    /// only field on this struct that is not part of the identity it certifies.
+    #[serde(skip)]
     pub digest: String,
 }
+
+/// Declared identity domain of [`FrozenInquiry`].
+///
+/// Bumped `v1` -> `v2` when the State Fence was added to the preimage, and
+/// `v2` -> `v3` here for a different reason: the `v2` preimage spelled all five
+/// fence components with `{:?}`. Rust `Debug` is a diagnostic rendering, not a
+/// versioned wire form — it is not covered by any compatibility promise, it can
+/// change with a type wrapper or a derive, and `task_revision`, `policy_revision`
+/// and `integration_revision` are three distinct types that were each rendered
+/// independently. The fence is now serialized as the typed value it is, through
+/// the same canonical serializer as the rest of the inquiry.
+///
+/// # What this does and does not buy
+///
+/// It removes the `Debug` dependency, which was unversioned and undocumented. It
+/// does **not** make these bytes independent of the fence's field set: the
+/// encoder is now bound to `StateFence`'s serde shape in `eliot-contracts`, so a
+/// field added there changes `frozen-inquiry/v3` bytes with no bump on this side
+/// and nothing here would detect it. That residual is real and is why the field
+/// set is a declared contract rather than an implementation detail — but it is a
+/// weaker guarantee than a versioned wire form, and this constant's name should
+/// not be read as claiming otherwise.
+pub const FROZEN_INQUIRY_DIGEST_DOMAIN: &str = "frozen-inquiry/v3";
 
 /// Named constructor arguments for [`FrozenInquiry::freeze`].
 #[derive(Clone, Debug)]
@@ -900,91 +1061,7 @@ impl FrozenInquiry {
         text(&params.replay_id, "inquiry.replay_id")?;
         params.roles.sort_by(|a, b| a.role.cmp(&b.role));
         params.routes.sort();
-        // Domain bumped v1 -> v2 with the State Fence added to the preimage.
-        // The fence was validated and stored but never hashed, so two inquiries
-        // differing only in fence shared a v1 digest; a silent field addition
-        // under an unchanged domain would have changed historical identities
-        // without saying so. Nothing consumes this digest outside this crate and
-        // its test, so the bump is a declaration, not a migration.
-        let mut preimage = String::from("frozen-inquiry/v2;");
-        push_field(&mut preimage, "schema", &params.schema);
-        push_field(&mut preimage, "protocol", &params.protocol);
-        push_field(&mut preimage, "policy", &params.policy);
-        push_field(&mut preimage, "question", &params.question);
-        push_field(&mut preimage, "objective", &params.objective);
-        push_field(&mut preimage, "output_contract", &params.output_contract);
-        push_field(&mut preimage, "requester", &params.requester);
-        push_field(&mut preimage, "task", &params.task);
-        push_field(&mut preimage, "attempt", &params.attempt);
-        push_field(&mut preimage, "scope", &params.scope);
-        push_field(&mut preimage, "privacy", &params.privacy);
-        push_field(
-            &mut preimage,
-            "disclosure",
-            &format!("{:?}", params.disclosure),
-        );
-        push_count(&mut preimage, "roles", params.roles.len());
-        for slot in &params.roles {
-            push_field(&mut preimage, "role", &slot.role);
-            push_field(&mut preimage, "class", &format!("{:?}", slot.class));
-            push_field(&mut preimage, "required", &slot.required.to_string());
-            push_field(&mut preimage, "authority_domain", &slot.authority_domain);
-        }
-        push_count(&mut preimage, "routes", params.routes.len());
-        for route in &params.routes {
-            push_field(&mut preimage, "route", route);
-        }
-        for (tag, value) in [
-            ("attempts", params.budgets.attempts),
-            ("sources", params.budgets.sources),
-            ("bytes", params.budgets.bytes),
-            ("stu", params.budgets.stu),
-            ("output", params.budgets.output),
-            ("cost", params.budgets.cost),
-            ("work", params.budgets.work),
-        ] {
-            push_field(&mut preimage, tag, &value.to_string());
-        }
-        push_field(
-            &mut preimage,
-            "deadline_ms",
-            &params.budgets.deadline_ms.to_string(),
-        );
-        push_field(&mut preimage, "stop_rule", &params.stop_rule);
-        push_field(&mut preimage, "partial_policy", &params.partial_policy);
-        push_field(&mut preimage, "operation_id", &params.operation_id);
-        push_field(&mut preimage, "replay_id", &params.replay_id);
-        // The fence is validated and stored on the frozen inquiry, so it is part
-        // of the inquiry's identity: two inquiries differing only in their fence
-        // must not share a digest. Each revision is formatted in its own type —
-        // `task_revision`, `policy_revision` and `integration_revision` are three
-        // distinct types, not one iterable.
-        push_field(
-            &mut preimage,
-            "fence_authority_epoch",
-            &format!("{:?}", params.fence.authority_epoch),
-        );
-        push_field(
-            &mut preimage,
-            "fence_resource_generation",
-            &format!("{:?}", params.fence.resource_generation),
-        );
-        push_field(
-            &mut preimage,
-            "fence_task_revision",
-            &format!("{:?}", params.fence.task_revision),
-        );
-        push_field(
-            &mut preimage,
-            "fence_policy_revision",
-            &format!("{:?}", params.fence.policy_revision),
-        );
-        push_field(
-            &mut preimage,
-            "fence_integration_revision",
-            &format!("{:?}", params.fence.integration_revision),
-        );
-        Ok(Self {
+        let mut inquiry = Self {
             schema: params.schema,
             protocol: params.protocol,
             policy: params.policy,
@@ -1005,8 +1082,49 @@ impl FrozenInquiry {
             partial_policy: params.partial_policy,
             operation_id: params.operation_id,
             replay_id: params.replay_id,
-            digest: freeze(&preimage),
+            digest: String::new(),
+        };
+        inquiry.digest = inquiry.canonical_digest()?;
+        Ok(inquiry)
+    }
+
+    /// Deterministic canonical bytes of the whole frozen inquiry, with the
+    /// stored digest excluded.
+    ///
+    /// The State Fence is serialized as the typed value it is, through the same
+    /// canonical serializer as every other field, so its five components are
+    /// bound by their own contract spellings rather than by whatever `Debug`
+    /// happened to print. The digest and the bytes come from this one encoder, so
+    /// a stored inquiry can be re-read and re-hashed without reconstructing a
+    /// preimage by hand.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&FrozenInquiryDigestInput {
+            domain: FROZEN_INQUIRY_DIGEST_DOMAIN,
+            inquiry: self,
         })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "inquiry.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// A reloaded inquiry is only the same inquiry if its bytes still hash to
+    /// the digest recorded beside them. The fence is inside those bytes, so a
+    /// fence rewritten after the freeze is detected here rather than being
+    /// accepted as the fence the inquiry was frozen under.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "inquiry.digest",
+            });
+        }
+        Ok(())
     }
 
     /// Exact denominator members: one `role#index` position per required
@@ -1037,6 +1155,19 @@ impl FrozenInquiry {
         }
         freeze(&preimage)
     }
+}
+
+/// The single canonical encoder input for [`FrozenInquiry`].
+///
+/// The inquiry is borrowed whole; its `digest` field is excluded by
+/// `#[serde(skip)]` on the field itself, so the exclusion is declared next to
+/// the field it excludes rather than reconstructed at each call site.
+#[derive(Serialize)]
+struct FrozenInquiryDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen inquiry, minus its own digest.
+    inquiry: &'a FrozenInquiry,
 }
 
 /// One provider-neutral acquisition request prepared through the existing
@@ -2397,20 +2528,43 @@ impl EvidencePortfolio {
     }
 }
 
+/// The exact identity one manifest admits for one source.
+///
+/// A manifest used to bind `handle -> (content_digest, transformed_from)`, which
+/// commits the acquired bytes and the raw lineage and nothing else. A source
+/// could keep both of those while its freshness boundary, transform
+/// verification, allowed use or effects, verifier, quarantine, counterevidence
+/// relation, citation edges, excerpt spans or data role all changed, and the
+/// manifest rehashed identically while the record an audit reads had become a
+/// different object. The record commitment below is what closes that; the other
+/// two are kept as explicit subfields because they remain independently
+/// meaningful commitments and a consumer should not have to re-derive them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ManifestSource {
+    /// The complete canonical commitment of the vetted [`SourceRecord`], over
+    /// every identity-relevant field it carries.
+    pub record_digest: String,
+    /// Digest of the acquired content bytes.
+    pub content_digest: String,
+    /// Raw source the admitted record was transformed from, when derived.
+    pub transformed_from: Option<String>,
+}
+
 /// One immutable authorized manifest over the exact inquiry, denominator,
 /// source and evidence identities, raw and transform digests, dependence
 /// graph, coverage, grade limits, counterevidence, conflicts, unknowns, the
-/// reference allowlist, and privacy/expiry bounds. Canonical sets are frozen
-/// sorted, so the manifest bytes are stable under arrival order while
-/// meaningful sequence stays identity-visible.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// reference allowlist, and privacy/expiry bounds. Every collection here is a
+/// set in meaning and is frozen sorted by [`Self::freeze`], so the manifest bytes
+/// are stable under arrival order while meaningful sequence stays
+/// identity-visible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AuthorizedManifest {
     /// Digest of the frozen inquiry.
     pub inquiry_digest: String,
     /// Digest of the exact denominator.
     pub denominator_digest: String,
-    /// Source identities to `(content digest, transform lineage)` pairs.
-    pub sources: BTreeMap<String, (String, Option<String>)>,
+    /// Exact source identity commitments by canonical handle.
+    pub sources: BTreeMap<String, ManifestSource>,
     /// Dependence edges `(from, to)` in frozen order.
     pub dependence_edges: BTreeSet<(String, String)>,
     /// Digest of the frozen coverage accounting.
@@ -2434,8 +2588,18 @@ pub struct AuthorizedManifest {
     /// Manifest revision; a revision invalidates older audits.
     pub revision: u64,
     /// Frozen digest over the whole manifest shape.
+    ///
+    /// Excluded from its own preimage by `#[serde(skip)]`.
+    #[serde(skip)]
     pub digest: String,
 }
+
+/// Declared identity domain of [`AuthorizedManifest`].
+///
+/// Bumped `v1` -> `v2` with the per-source record commitment. The `v1`
+/// preimage named two subfields per source where a manifest now names three, so
+/// the same name would have covered two different field sets.
+pub const AUTHORIZED_MANIFEST_DIGEST_DOMAIN: &str = "authorized-manifest/v2";
 
 /// Named constructor arguments for [`AuthorizedManifest::freeze`].
 #[derive(Clone, Debug)]
@@ -2445,7 +2609,7 @@ pub struct AuthorizedManifestParams {
     /// Denominator digest.
     pub denominator_digest: String,
     /// Source identities.
-    pub sources: BTreeMap<String, (String, Option<String>)>,
+    pub sources: BTreeMap<String, ManifestSource>,
     /// Dependence edges.
     pub dependence_edges: BTreeSet<(String, String)>,
     /// Coverage digest.
@@ -2484,10 +2648,11 @@ impl AuthorizedManifest {
                 field: "manifest.sources",
             });
         }
-        for (handle, (content, raw)) in &params.sources {
+        for (handle, source) in &params.sources {
             text(handle, "manifest.source")?;
-            digest(content, "manifest.content_digest")?;
-            if let Some(raw) = raw {
+            digest(&source.record_digest, "manifest.source.record_digest")?;
+            digest(&source.content_digest, "manifest.content_digest")?;
+            if let Some(raw) = &source.transformed_from {
                 text(raw, "manifest.raw_lineage")?;
             }
         }
@@ -2548,6 +2713,12 @@ impl AuthorizedManifest {
         params.conflicts.sort();
         params.unknowns.sort();
         params.allowlist.sort();
+        // `revoked` is a set in meaning — it answers membership, never order — so
+        // it is sorted with the rest. It was the one canonical collection the
+        // freeze left in arrival order, which meant two manifests revoking the
+        // same handles in a different order hashed differently under one declared
+        // domain: an identity that moved without any authorization moving.
+        params.revoked.sort();
         let mut manifest = Self {
             inquiry_digest: params.inquiry_digest,
             denominator_digest: params.denominator_digest,
@@ -2565,7 +2736,7 @@ impl AuthorizedManifest {
             revision: params.revision,
             digest: String::new(),
         };
-        manifest.digest = freeze(&authorized_manifest_preimage(&manifest));
+        manifest.digest = manifest.canonical_digest()?;
         Ok(manifest)
     }
 
@@ -2575,77 +2746,65 @@ impl AuthorizedManifest {
         self.allowlist.iter().any(|h| h == handle) && !self.revoked.iter().any(|h| h == handle)
     }
 
-    /// Canonical bytes of the frozen manifest shape (without the digest
-    /// field), stable under arrival order.
+    /// The exact identity this manifest froze for `handle`, when it froze one.
+    pub fn source_commitment(&self, handle: &str) -> Option<&ManifestSource> {
+        self.sources.get(handle)
+    }
+
+    /// Whether this manifest still commits `record` exactly as it was frozen.
     ///
-    /// This is the same encoder [`Self::freeze`] digests, over the same declared
-    /// domain, so the two cannot describe different field sets again. It was
-    /// previously a second, shorter encoder that reused the
-    /// `authorized-manifest/v1` domain prefix while omitting grade limits,
-    /// counterevidence, conflicts, unknowns, the allowlist, revoked handles,
-    /// disclosure, expiry and revision — two records could then share a declared
-    /// domain without sharing an identity.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        authorized_manifest_preimage(self).into_bytes()
+    /// A substituted record that keeps its handle and its content digest still
+    /// changes one of the interpretation-relevant fields, so it changes the
+    /// record commitment and fails here. The answer is false for a handle the
+    /// manifest never froze, which is the same refusal as a record outside it.
+    pub fn binds_source_record(&self, record: &SourceRecord) -> bool {
+        self.source_commitment(&record.handle)
+            .is_some_and(|source| record.verify_identity(&source.record_digest).is_ok())
+    }
+
+    /// Deterministic canonical bytes of the frozen manifest shape, with the
+    /// stored digest excluded.
+    ///
+    /// This is the same encoder [`Self::canonical_digest`] hashes, over the same
+    /// declared domain, so a persisted manifest can be re-read and re-hashed
+    /// without a second field list that could drift from the first.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&AuthorizedManifestDigestInput {
+            domain: AUTHORIZED_MANIFEST_DIGEST_DOMAIN,
+            manifest: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "manifest.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "manifest.digest",
+            });
+        }
+        Ok(())
     }
 }
 
-/// The single canonical encoder for the declared `authorized-manifest/v1`
-/// domain. Both the frozen digest and [`AuthorizedManifest::canonical_bytes`] go
-/// through here, so every field that can change what the manifest authorizes is
-/// covered by exactly one field set.
-fn authorized_manifest_preimage(manifest: &AuthorizedManifest) -> String {
-    let mut preimage = String::from("authorized-manifest/v1;");
-    push_field(&mut preimage, "inquiry_digest", &manifest.inquiry_digest);
-    push_field(
-        &mut preimage,
-        "denominator_digest",
-        &manifest.denominator_digest,
-    );
-    push_count(&mut preimage, "sources", manifest.sources.len());
-    for (handle, (content, raw)) in &manifest.sources {
-        push_field(&mut preimage, "source", handle);
-        push_field(&mut preimage, "content", content);
-        if let Some(raw) = raw {
-            push_field(&mut preimage, "raw", raw);
-        }
-    }
-    push_count(&mut preimage, "edges", manifest.dependence_edges.len());
-    for (from, to) in &manifest.dependence_edges {
-        push_field(&mut preimage, "from", from);
-        push_field(&mut preimage, "to", to);
-    }
-    push_field(&mut preimage, "coverage_digest", &manifest.coverage_digest);
-    for limit in &manifest.grade_limits {
-        push_field(&mut preimage, "grade_limit", limit);
-    }
-    for item in &manifest.counterevidence {
-        push_field(&mut preimage, "counterevidence", item);
-    }
-    for item in &manifest.conflicts {
-        push_field(&mut preimage, "conflict", item);
-    }
-    for item in &manifest.unknowns {
-        push_field(&mut preimage, "unknown", item);
-    }
-    for handle in &manifest.allowlist {
-        push_field(&mut preimage, "allowed", handle);
-    }
-    for handle in &manifest.revoked {
-        push_field(&mut preimage, "revoked", handle);
-    }
-    push_field(
-        &mut preimage,
-        "disclosure",
-        &format!("{:?}", manifest.disclosure),
-    );
-    push_field(
-        &mut preimage,
-        "expires_ms",
-        &manifest.expires_ms.to_string(),
-    );
-    push_field(&mut preimage, "revision", &manifest.revision.to_string());
-    preimage
+/// The single canonical encoder input for [`AuthorizedManifest`].
+///
+/// The manifest is borrowed whole; its `digest` field is excluded by
+/// `#[serde(skip)]` on the field itself, so the exclusion is declared next to
+/// the field it excludes.
+#[derive(Serialize)]
+struct AuthorizedManifestDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen manifest, minus its own digest.
+    manifest: &'a AuthorizedManifest,
 }
 
 /// Classifies one attached counterclaim identity against this claim.
@@ -2695,6 +2854,16 @@ fn resolve_counterclaim(
         ));
         return CounterclaimDisposition::UnresolvedLineage;
     };
+    // The manifest froze this handle's complete record commitment, so a record
+    // that no longer hashes to it was substituted after the freeze. It is
+    // reported as unresolved lineage rather than silently audited as the source
+    // the manifest admitted.
+    if !manifest.binds_source_record(record) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} does not match the frozen source commitment"
+        ));
+        return CounterclaimDisposition::UnresolvedLineage;
+    }
     if !record.covers_domain(&claim.domain) {
         residue.push(format!(
             "claim: counterclaim {counterclaim_id} outside claim domain {}",
@@ -2736,12 +2905,26 @@ pub fn audit_claim(
     let mut evidence_map: Vec<String> = Vec::new();
     let mut unsupported_precision: Vec<UnsupportedPrecisionItem> = Vec::new();
     let mut stale_hit = false;
+    // A manifest whose bytes no longer hash to the digest frozen beside them is
+    // not the manifest that was authorized: an expiry widened, a revocation
+    // cleared or a handle re-admitted after the freeze all leave every field
+    // individually well-formed. The audit refuses to derive anything from it,
+    // which is a different failure from a citation being individually
+    // unverifiable, so it is decided once here rather than per handle.
+    let manifest_intact = manifest.verify_integrity().is_ok();
+    if !manifest_intact {
+        residue.push("claim: manifest does not match its own frozen digest".to_owned());
+    }
     // These three are recorded where the condition is actually known rather
     // than recovered later from the rendered residue prose. A residue line is
     // diagnostic text, and matching a substring of it let an unrelated line
     // (a counterclaim outside the manifest, say) flip a citation verdict.
     let mut outside_citation = false;
-    let mut lineage_gap = false;
+    // A manifest that fails its own integrity check is the authorization this
+    // claim was judged under, so the gap is seeded here rather than per handle:
+    // with the manifest unproven, no handle it admits is proven either, and the
+    // claim cannot come out `Supported`.
+    let mut lineage_gap = !manifest_intact;
     let mut support_gap = false;
     if claim.material && claim.citations.is_empty() {
         residue.push("claim: material claim records no citations".to_owned());
@@ -2759,6 +2942,17 @@ pub fn audit_claim(
             ));
             continue;
         };
+        // A record that no longer hashes to the commitment this manifest froze
+        // is not the source the manifest admitted. Treating it as a lineage gap
+        // keeps the verdict non-supporting without introducing a second
+        // terminal class for what is, exactly, an unproven lineage.
+        if !manifest.binds_source_record(record) {
+            lineage_gap = true;
+            residue.push(format!(
+                "claim: citation {handle} does not match the frozen source commitment"
+            ));
+            continue;
+        }
         if !record.covers_domain(&claim.domain) {
             lineage_gap = true;
             residue.push(format!(

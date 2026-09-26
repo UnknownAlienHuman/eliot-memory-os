@@ -3623,7 +3623,7 @@ impl InquiryGovernance {
             source_admission_requests: admissibility
                 .iter()
                 .map(SourceAdmissibilityRecord::transition_request)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             unadmitted_references,
             profile,
             admissibility,
