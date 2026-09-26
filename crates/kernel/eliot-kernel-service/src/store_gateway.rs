@@ -1692,17 +1692,10 @@ impl KernelStoreGateway {
                 }
             },
             request_id: request_id.clone(),
-            correlation_projection: Some(HostCorrelationProjection::Opaque {
-                domain: match obligation.kind {
-                    UserAutomationRuntimeObligationKind::WakeHorizonPublication => {
-                        HostCorrelationDomain::Request
-                    }
-                    UserAutomationRuntimeObligationKind::WakeCancellation => {
-                        HostCorrelationDomain::Cancellation
-                    }
-                },
-                occurrence: request_label.clone(),
-            }),
+            correlation_projection: Some(user_automation_obligation_correlation_projection(
+                obligation,
+                request_label.clone(),
+            )),
             idempotency_key: obligation_label(obligation, sealed.identity.idempotency_key.clone())?,
             cancellation_id: obligation_label(
                 obligation,
@@ -3739,6 +3732,24 @@ fn retained_horizon_phase(
                 &reason,
             ))
         }
+    }
+}
+
+/// Selects the disjoint durable identity family for a Kernel-owned obligation.
+fn user_automation_obligation_correlation_projection(
+    obligation: &UserAutomationRuntimeObligation,
+    occurrence: String,
+) -> HostCorrelationProjection {
+    HostCorrelationProjection::KernelOperational {
+        domain: match obligation.kind {
+            UserAutomationRuntimeObligationKind::WakeHorizonPublication => {
+                HostCorrelationDomain::Request
+            }
+            UserAutomationRuntimeObligationKind::WakeCancellation => {
+                HostCorrelationDomain::Cancellation
+            }
+        },
+        occurrence,
     }
 }
 

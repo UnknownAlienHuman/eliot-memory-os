@@ -4462,9 +4462,9 @@ impl RedbRecoveryStore {
             crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none()
             || (record.session_ref.is_none()
-                && matches!(
+                && !matches!(
                     record.correlation_projection.as_ref(),
-                    Some(HostCorrelationProjection::McpJsonRpc { .. })
+                    Some(HostCorrelationProjection::KernelOperational { .. })
                 )))
         {
             return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
@@ -5154,6 +5154,7 @@ impl RedbRecoveryStore {
                 domain: eliot_contracts::HostCorrelationDomain::Cancellation,
                 occurrence,
             } => vec![occurrence.clone(), format!("cancel:{occurrence}")],
+            HostCorrelationProjection::KernelOperational { .. } => Vec::new(),
             HostCorrelationProjection::McpJsonRpc {
                 domain: eliot_contracts::HostCorrelationDomain::Request,
                 id: HostJsonRpcCorrelationId::String(value),
