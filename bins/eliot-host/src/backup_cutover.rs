@@ -639,12 +639,15 @@ pub enum OwnerObservationCoherence {
 /// retained epoch evidence the retirement binder scans.
 ///
 /// Not covered: the cross-store registry load has no shared transaction with
-/// the journal, and `read_cutover_disposition` samples the journal on BOTH sides
-/// of it and on BOTH sides of the `query_epoch_retirement` lookup, so the pair
-/// it hands the mapper is one moment with respect to this cutover or is reported
-/// as `Moving`. `HostComposition::backup_dispatch_cutover` performs the same
-/// bracketing for the execute path, but resolves the retirement outside its
-/// compared interval; the key here bounds what this function proves.
+/// the journal. Both read paths therefore sample the journal on BOTH sides of
+/// it AND on both sides of the `query_epoch_retirement` lookup:
+/// `read_cutover_disposition` brackets `first / second / third` around the
+/// resolution, and `HostComposition::backup_dispatch_cutover` brackets
+/// `before / durable / resampled` the same way. In each case the retirement is
+/// resolved FROM the middle sample, so every journal-derived input the mapper
+/// receives comes from one read, and the pair is either one moment with respect
+/// to this cutover or is reported as `Moving`. What this function bounds is
+/// WHICH fields are compared, not who samples them.
 pub(crate) fn cutover_observation_unchanged(before: &HostState, after: &HostState) -> bool {
     before.pending_cutover == after.pending_cutover
         && before.epoch_retirements == after.epoch_retirements
