@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
-    ActiveGenerationRegistryQuery,
+    ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
 };
 
 /// Governor's existing authenticated publish operation. The semantic
@@ -424,6 +424,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "origin_challenge_issue" => "origin_challenge_issue",
         "origin_control_decide" => "origin_control_decide",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
+        GENERATION_CUTOVER_OPERATION => GENERATION_CUTOVER_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -1632,6 +1633,9 @@ impl KernelComposition {
             }
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
                 self.generation_registry_active_query_operation(session, payload.clone())
+            }
+            GENERATION_CUTOVER_OPERATION => {
+                self.generation_cutover_operation(session, payload.clone())
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
@@ -4915,6 +4919,39 @@ impl KernelComposition {
             "value": projection.response(),
             "recovery": null,
         })
+    }
+
+    /// Drives one authenticated generation cutover through the Kernel's sole
+    /// semantic gateway and projects the gateway's own terminal code back on
+    /// the authenticated reply.
+    ///
+    /// The operation selector only picks this entry. The closed request carries
+    /// a cutover identity and the admitted session State Fence and nothing
+    /// else, so the generation, epoch, route scope, and cutover state all come
+    /// from the owner's committed ORS cutover-ownership record inside
+    /// [`super::generation_control::KernelComposition::apply_authenticated_generation_cutover`].
+    /// A malformed request, a fence that is not the exact admitted session
+    /// fence, an absent record, a non-committed record, or a stale/foreign epoch
+    /// fences the session with the exact typed transport error; none of them
+    /// fabricates a cutover or a success answer.
+    fn generation_cutover_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: GenerationCutoverRequest =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        let outcome = self
+            .apply_authenticated_generation_cutover(
+                &request,
+                &session.module_generation.state_fence,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": outcome,
+            "recovery": null,
+        }))
     }
 
     /// Consumes the authenticated Governor startup receipt without importing

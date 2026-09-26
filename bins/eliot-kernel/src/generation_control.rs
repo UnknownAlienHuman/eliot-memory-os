@@ -14,6 +14,7 @@ use super::KernelComposition;
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::KernelServiceError;
+use eliot_runtime_contracts::GenerationCutoverState;
 use serde::{Deserialize, Serialize};
 
 /// Authenticated daemon operation used by Governor to obtain the mechanical
@@ -22,6 +23,78 @@ use serde::{Deserialize, Serialize};
 /// The operation is served by the existing authenticated daemon dispatch
 /// channel. This is a selector, not a second transport or an authority.
 pub const ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION: &str = "daemon_generation_projection";
+
+/// Authenticated daemon operation that drives one generation cutover through
+/// the sole Kernel semantic gateway.
+///
+/// The operation is served by the same existing authenticated daemon dispatch
+/// channel as [`ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION`]; the projection
+/// read and the cutover write are the two halves of one generation control
+/// plane, and neither mints a second transport or a second authority. The
+/// selector only picks this entry: the durable cutover-ownership record and the
+/// authenticated session fence below remain the sole evidence.
+pub const GENERATION_CUTOVER_OPERATION: &str = "daemon_generation_cutover";
+
+/// Exact request payload for [`GENERATION_CUTOVER_OPERATION`].
+///
+/// The caller names ONE cutover identity and presents the State Fence it is
+/// operating under. It never supplies a generation, an epoch, a route scope, a
+/// migration decision, or a cutover state: every one of those is read from the
+/// owner's durable cutover-ownership record, so a request cannot assert an
+/// authority field the ORS linearization point never recorded.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationCutoverRequest {
+    /// Version of the authenticated cutover request.
+    pub version: u8,
+    /// Exact cutover identity of one owner-recorded cutover-ownership row.
+    pub cutover_id: String,
+    /// Exact State Fence carried by the admitted daemon session.
+    pub state_fence: StateFence,
+}
+
+impl GenerationCutoverRequest {
+    /// Validates the closed request shape before it reaches the ORS owner.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.version != 1 {
+            return Err(KernelServiceError::InvalidField {
+                field: "generation_cutover.request.version",
+                reason: "unsupported cutover request version",
+            });
+        }
+        if self.cutover_id.trim().is_empty() || self.cutover_id.chars().any(char::is_control) {
+            return Err(KernelServiceError::InvalidField {
+                field: "generation_cutover.request.cutover_id",
+                reason: "cutover identity is invalid",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "generation_cutover.request.state_fence",
+                reason: "state fence is invalid",
+            })
+    }
+}
+
+/// Closed outcome of one authenticated generation cutover request.
+///
+/// `terminal_code` is the ONE stable diagnostic code for the failed cutover,
+/// read from the same mapper the cutover gateway uses. It is `None` only when
+/// the owner's durable receipt actually committed the cutover, so "requested",
+/// "refused", and "committed" never collapse into one answer: an unknown or
+/// refused outcome is never projected as a committed cutover.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GenerationCutoverOutcome {
+    /// Version of the authenticated cutover outcome.
+    pub version: u8,
+    /// Exact cutover identity this outcome answers.
+    pub cutover_id: String,
+    /// Terminal diagnostic code of the refused cutover, `None` when committed.
+    pub terminal_code: Option<&'static str>,
+    /// State Fence the cutover was admitted and attempted under.
+    pub state_fence: StateFence,
+}
 
 /// Exact request payload for [`ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION`].
 ///
@@ -470,6 +543,121 @@ impl KernelComposition {
             )));
         }
         Ok(())
+    }
+
+    /// Applies one authenticated generation cutover from the owner's durable
+    /// cutover-ownership record through the sole Kernel semantic gateway.
+    ///
+    /// This is the production control-plane entry that drives
+    /// [`KernelComposition::apply_generation_cutover`]. It is a selector and a
+    /// binding, never a second authority:
+    ///
+    /// - the request carries only a cutover identity and the admitted session
+    ///   `StateFence`; every generation, epoch, route scope, and cutover state
+    ///   below is READ from the owner's committed ORS record, so a request can
+    ///   never assert an authority field the linearization point never recorded;
+    /// - the request fence must be the exact admitted session fence, and the
+    ///   record's `old_epoch` must be the same authority tuple that fence
+    ///   carries, so a stale, foreign, or replayed epoch stays typed instead of
+    ///   advancing the live fence;
+    /// - only a `Committed` record reaches the gateway. A staged (`Armed`)
+    ///   candidate or a `FailedRequiresForwardCutover` row is evidence, never
+    ///   authority, and is refused before any ORS staging happens.
+    ///
+    /// The gateway owns the one terminal for the underlying cutover operation.
+    /// This boundary reports that same terminal code back on the authenticated
+    /// reply through [`GenerationCutoverOutcome::terminal_code`] so a refused or
+    /// unknown cutover is observable on the real control-plane path and is never
+    /// projected as a committed cutover. No route, epoch, generation, digest, or
+    /// owner error string crosses the reply (I15.4, I07.20).
+    pub fn apply_authenticated_generation_cutover(
+        &self,
+        request: &GenerationCutoverRequest,
+        authenticated_session_fence: &StateFence,
+    ) -> Result<GenerationCutoverOutcome, KernelServiceError> {
+        request.validate()?;
+        if &request.state_fence != authenticated_session_fence {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_cutover.request.session_fence",
+            });
+        }
+        let record = self
+            .generation_gateway
+            .ors
+            .load_cutover_ownership(request.cutover_id.as_str())
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?
+            .ok_or(KernelServiceError::InvalidField {
+                field: "generation_cutover.request.cutover_id",
+                reason: "no cutover ownership record is recorded for this cutover",
+            })?;
+        // I14.14: the ORS commit is the durable linearization point. A staged or
+        // fenced row is evidence of an interrupted attempt, never authority, so
+        // only a `Committed` record can reach the semantic gateway. The refusal
+        // is a typed handshake mismatch on the record's state — the presented
+        // record does not match the required committed state — and never
+        // fabricates a service-lifecycle transition.
+        if record.state != GenerationCutoverState::Committed {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_cutover.request.record_state",
+            });
+        }
+        // The durable record projects only scalar epoch sequences (issue #64),
+        // so the lineage-bearing epoch is the admitted session's own. The
+        // record's `old_epoch` must be that same authority's current sequence,
+        // which refuses a stale, foreign, or already-superseded epoch before
+        // the router is ever asked to cut over.
+        let old_epoch = authenticated_session_fence.authority_epoch.clone();
+        if old_epoch.sequence.get() != record.old_epoch.value() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_cutover.request.old_epoch",
+            });
+        }
+        let new_epoch = EpochId::new(
+            old_epoch.lineage_id.clone(),
+            std::num::NonZeroU64::new(record.new_epoch.value()).ok_or(
+                KernelServiceError::Platform(
+                    "recorded cutover epoch is not representable".to_owned(),
+                ),
+            )?,
+        )
+        .map_err(|_| {
+            KernelServiceError::Platform("recorded cutover epoch is not representable".to_owned())
+        })?;
+        let decision = CutoverDecision::new(
+            record.cutover_id.as_str(),
+            RouteScope::new(record.scope.module_id.as_str().to_owned()).map_err(|_| {
+                KernelServiceError::Platform("recorded cutover route scope is invalid".to_owned())
+            })?,
+            record.old_generation,
+            record.new_generation,
+            old_epoch,
+            new_epoch,
+            GenerationCutoverState::Committed,
+        )
+        .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let state_fence = request.state_fence.clone();
+        let cutover_id = record.cutover_id;
+        match self.apply_generation_cutover(&decision) {
+            Ok(()) => Ok(GenerationCutoverOutcome {
+                version: 1,
+                cutover_id,
+                terminal_code: None,
+                state_fence,
+            }),
+            Err(error) => {
+                // The gateway already emitted the one terminal diagnostic for
+                // this failed cutover. The stable code is projected back on the
+                // authenticated reply so the refusal is observable on the real
+                // control-plane path; it is the SAME code and never a second
+                // failure claim, and no error payload crosses the reply.
+                Ok(GenerationCutoverOutcome {
+                    version: 1,
+                    cutover_id,
+                    terminal_code: Some(generation_cutover_terminal_code(&error)),
+                    state_fence,
+                })
+            }
+        }
     }
 }
 
