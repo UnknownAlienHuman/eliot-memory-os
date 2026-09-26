@@ -928,6 +928,7 @@ fn requested_host_request_record(
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,
         },
         request_id: label(envelope.identity.request_id.as_str())?,
+        correlation_projection: envelope.identity.correlation_projection.clone(),
         idempotency_key: label(&envelope.identity.idempotency_key)?,
         cancellation_id: label(&envelope.identity.cancellation_id)?,
         parent_operation_id: optional_label(envelope.identity.parent_operation_id.as_ref())?,
@@ -1439,6 +1440,7 @@ mod local_read_result_tests {
             connection_id: "conn-test-1".to_owned(),
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: RequestId::new("host-request-1").expect("valid test request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,
@@ -1561,6 +1563,7 @@ mod local_read_result_tests {
             operation_id: ors_operation_id_for_test(),
             kind: OrsHostRequestKind::Invocation,
             request_id: label("req-1"),
+            correlation_projection: None,
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,
@@ -1671,6 +1674,7 @@ mod local_read_build_tests {
             connection_id: "conn-test-1".to_owned(),
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: RequestId::new("host-request-1").expect("valid test request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,
