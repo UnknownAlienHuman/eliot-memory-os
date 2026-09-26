@@ -89,14 +89,20 @@ impl StreamRecoveryActivation {
         matches!(self, Self::Active)
     }
 
-    /// Whether `next` is a legal successor. `Retired` is absorbing and
-    /// `Suspended` can never return to `Active`, so a restore cannot revive
-    /// process, session or authority state through this projection.
+    /// Whether `next` is a legal successor.
+    ///
+    /// Re-presenting `Active` or `Suspended` is permitted so the ORS owner can
+    /// advance availability or reconciliation observations without inventing a
+    /// lifecycle transition. `Retired` remains absorbing and can only be
+    /// replayed as an otherwise identical durable row.
     pub const fn permits_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
             (
-                Self::Active | Self::Suspended,
+                Self::Active,
+                Self::Active | Self::Suspended | Self::Retired
+            ) | (
+                Self::Suspended,
                 Self::Suspended | Self::Retired
             )
         )
@@ -315,7 +321,7 @@ pub struct ProcessStreamRecoveryBinding {
 /// Stdout and stderr are independent records with independent identities: the
 /// durable key is `(operation_id, stream)`, so one stream can never satisfy,
 /// overwrite or be read back as the other.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessStreamRecoveryProjection {
     /// ORS wire/storage contract version of this projection.
@@ -381,6 +387,89 @@ pub struct ProcessStreamRecoveryProjection {
     /// Observation time in Unix milliseconds.
     pub observed_at_ms: i64,
 }
+
+/// Durable-state view used for process-stream replay equality.
+///
+/// `observed_at_ms` is deliberately absent. It records when a caller happened
+/// to observe the physical result, while replay identity is the exact retained
+/// operation/stream evidence plus the mutable ORS availability,
+/// reconciliation, and activation state. A lost response may cause the same
+/// physical result to be observed later; that must return `Unchanged`, retain
+/// the first accepted timestamp, and leave the family revision stable.
+#[derive(PartialEq)]
+struct ProcessStreamRecoveryDurableState<'a> {
+    contract_version: u16,
+    stream_contract_revision: &'a str,
+    scope: StreamRecoveryEvidenceScope,
+    operation_id: &'a OperationIdentity,
+    request_digest: &'a str,
+    process_tree_id: &'a OpaqueLabel,
+    job_id: &'a OpaqueLabel,
+    image_id: &'a OpaqueLabel,
+    session_id: &'a OpaqueLabel,
+    stream: ProcessStreamKind,
+    authority_epoch: &'a EpochId,
+    generation: u64,
+    writer_epoch: &'a EpochLineage,
+    state_fence_digest: &'a str,
+    policy_revision: &'a str,
+    transport: StreamTransportStatus,
+    observed_sha256: &'a str,
+    observed_bytes: u64,
+    persistence: StreamPersistenceStatus,
+    source: &'a Option<DurableProcessStreamSource>,
+    durable_coverage: &'a Option<StreamRecoveryCoverage>,
+    transport_prefix_identity: &'a Option<ProcessStreamTransportPrefixIdentity>,
+    preview: &'a StreamRecoveryPreview,
+    policy: &'a ProcessStreamPolicyBinding,
+    gaps: &'a [StreamEvidenceGap],
+    availability: StreamRecoveryAvailability,
+    reconciliation: &'a StreamRecoveryReconciliation,
+    activation: StreamRecoveryActivation,
+}
+
+impl ProcessStreamRecoveryProjection {
+    fn durable_state(&self) -> ProcessStreamRecoveryDurableState<'_> {
+        ProcessStreamRecoveryDurableState {
+            contract_version: self.contract_version,
+            stream_contract_revision: &self.stream_contract_revision,
+            scope: self.scope,
+            operation_id: &self.operation_id,
+            request_digest: &self.request_digest,
+            process_tree_id: &self.process_tree_id,
+            job_id: &self.job_id,
+            image_id: &self.image_id,
+            session_id: &self.session_id,
+            stream: self.stream,
+            authority_epoch: &self.authority_epoch,
+            generation: self.generation,
+            writer_epoch: &self.writer_epoch,
+            state_fence_digest: &self.state_fence_digest,
+            policy_revision: &self.policy_revision,
+            transport: self.transport,
+            observed_sha256: &self.observed_sha256,
+            observed_bytes: self.observed_bytes,
+            persistence: self.persistence,
+            source: &self.source,
+            durable_coverage: &self.durable_coverage,
+            transport_prefix_identity: &self.transport_prefix_identity,
+            preview: &self.preview,
+            policy: &self.policy,
+            gaps: &self.gaps,
+            availability: self.availability,
+            reconciliation: &self.reconciliation,
+            activation: self.activation,
+        }
+    }
+}
+
+impl PartialEq for ProcessStreamRecoveryProjection {
+    fn eq(&self, other: &Self) -> bool {
+        self.durable_state() == other.durable_state()
+    }
+}
+
+impl Eq for ProcessStreamRecoveryProjection {}
 
 impl ProcessStreamRecoveryProjection {
     /// Derives the recovery projection from one accepted stream observation.
