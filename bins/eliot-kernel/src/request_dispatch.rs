@@ -42,10 +42,15 @@
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
 //!   admissibility, provisioning shape, store-level isolation inequality),
-//!   then returns `blocked` naming the Governor-built transitions
-//!   (`governor-restore-transitions`: `CoordinationCommit` plus restore-class
-//!   imports; owning lane Governor/eliotd). Owner-backed gates are marked
-//!   `-deferred` in `gates_passed` and never claimed as proven.
+//!   then returns `blocked` naming the three real owners rather than a
+//!   Governor transition type: the Kernel restore coordinator and the
+//!   production call to it (#960), the owner-issued restore evidence - a
+//!   `RestoreJournalAdmission` plus a `DestinationManifestEvidence` - (#962),
+//!   and the front-door connection (#2569), all open. Measured on this tree,
+//!   none of those three exists yet: there is no `restore_transitions` symbol
+//!   and no `CoordinationCommit` type anywhere, and the composition's
+//!   isolated-restore entry has no production caller. Owner-backed gates are
+//!   marked `-deferred` in `gates_passed` and never claimed as proven.
 //!
 //! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
 //! operation gate; this file holds only the route. The arm fences the frame
@@ -842,11 +847,14 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
 /// waits for the owner edge; each entry must already be a JSON object so
 /// malformed rows refuse before any owner readback.
 ///
-/// Execution itself refuses with `plan_gap` naming the Governor-built
-/// coordination commit plus restore-class imports (owning lane
-/// Governor/eliotd, open): committing or importing without them would
-/// fabricate Governor authority, and rehearsal never activates, retires, or
-/// cuts over.
+/// Execution itself refuses with `plan_gap` naming the real owners rather
+/// than a Governor transition type: the Kernel restore coordinator and the
+/// production call to it (#960), the owner-issued `RestoreJournalAdmission`
+/// and `DestinationManifestEvidence` (#962), and the front-door connection
+/// (#2569), all open. Provisioning the isolated destination, admitting the
+/// durable ORS restore journal and importing restore-class bytes without that
+/// owner evidence would fabricate owner authority, and rehearsal never
+/// activates, retires, or cuts over.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear shape-validation sequence per rehearsal gate; splitting it would hide the exact admission order the blocked reply reports"
@@ -1033,14 +1041,14 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
             (
                 "missing_owner",
                 Value::String(
-                    "governor-restore-transitions (CoordinationCommit plus restore-class imports; owning lane Governor/eliotd)"
+                    "backup-restore-owners (#960 Kernel restore coordinator and its production call; #962 owner-issued RestoreJournalAdmission and DestinationManifestEvidence; #2569 front-door connection)"
                         .to_owned(),
                 ),
             ),
             (
                 "reason",
                 Value::String(
-                    "gates proven through the rehearsal shape path; execution needs the Governor-built coordination commit plus restore-class imports, which no owner supplies yet"
+                    "the six rehearsal shape gates ran for real; the isolated destination, the durable ORS journal admission and the restore-class import are owner evidence no production owner supplies, and the composition's isolated-restore entry has no production caller"
                         .to_owned(),
                 ),
             ),
