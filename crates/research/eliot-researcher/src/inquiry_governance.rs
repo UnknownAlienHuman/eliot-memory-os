@@ -2181,7 +2181,7 @@ impl CoverageReceipt {
         eligible_handles.sort();
         eligible_handles.dedup();
         let observed_outside_scope = account.observed_outside_scope();
-        let enumeration_state = enumeration_state(&account, &observed_outside_scope);
+        let enumeration_state = enumeration_state(account, &observed_outside_scope);
         // This plane records per-source acquisition dispositions, not per-member
         // query predicate results, and it holds no authoritative enumeration
         // attestation for the route. It therefore binds no bounded predicate
