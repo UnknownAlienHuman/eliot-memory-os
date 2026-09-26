@@ -578,6 +578,92 @@ function Test-IntegrationHarnessOwnedProcess {
     return ($recorded -ceq $OwnerRunId)
 }
 
+# Harness-owned start/image identity comparison for owned-process stop.
+# The numeric process id is only a lookup handle: the stop decision binds to
+# the start instant plus the executable image path and image digest recorded at
+# start. Every comparison below is fail-closed: a missing, unreadable, or
+# mismatched field means "not the owned process", never a kill. Only the live
+# identity QUERY is injected (ProcessController['GetProcessIdentity']); the
+# comparison itself always runs here, so a bare truthy injected value can never
+# authorize a stop on its own. Not exported: callers use the stop seam.
+function Test-IntegrationHarnessProcessIdentityMatch {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        $LiveIdentity,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedStartTimeUtc,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedImagePath,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedImageHash
+    )
+    if ($LiveIdentity -isnot [hashtable]) {
+        return $false
+    }
+    $compared = 0
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedStartTimeUtc)) {
+        $compared++
+        if (-not $LiveIdentity.ContainsKey('startTimeUtc') -or $null -eq $LiveIdentity['startTimeUtc']) {
+            return $false
+        }
+        $expectedTicks = 0
+        try {
+            $expectedTicks = ([System.DateTimeOffset]::Parse($ExpectedStartTimeUtc)).UtcTicks
+        } catch {
+            return $false
+        }
+        $liveRaw = $LiveIdentity['startTimeUtc']
+        $liveTicks = 0
+        try {
+            if ($liveRaw -is [System.DateTimeOffset]) {
+                $liveTicks = ([System.DateTimeOffset]$liveRaw).UtcTicks
+            } elseif ($liveRaw -is [System.DateTime]) {
+                $liveTicks = ([System.DateTimeOffset]::new(([System.DateTime]$liveRaw).ToUniversalTime())).UtcTicks
+            } else {
+                $liveTicks = ([System.DateTimeOffset]::Parse([string]$liveRaw)).UtcTicks
+            }
+        } catch {
+            return $false
+        }
+        if ($liveTicks -ne $expectedTicks) {
+            return $false
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedImagePath)) {
+        $compared++
+        if (-not $LiveIdentity.ContainsKey('imagePath') -or $null -eq $LiveIdentity['imagePath']) {
+            return $false
+        }
+        $livePath = ([string]$LiveIdentity['imagePath']).Trim()
+        if ([string]::IsNullOrWhiteSpace($livePath)) {
+            return $false
+        }
+        if (-not $livePath.Equals($ExpectedImagePath.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedImageHash)) {
+        $compared++
+        if (-not $LiveIdentity.ContainsKey('imageHash') -or $null -eq $LiveIdentity['imageHash']) {
+            return $false
+        }
+        $liveHash = ([string]$LiveIdentity['imageHash']).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($liveHash)) {
+            return $false
+        }
+        if ($liveHash -cne $ExpectedImageHash.Trim().ToLowerInvariant()) {
+            return $false
+        }
+    }
+    return ($compared -gt 0)
+}
+
 function Stop-IntegrationHarnessOwnedProcess {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -595,7 +681,16 @@ function Stop-IntegrationHarnessOwnedProcess {
         [System.Collections.Generic.List[string]]$Failures,
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
-        [System.Collections.Generic.List[object]]$Receipts
+        [System.Collections.Generic.List[object]]$Receipts,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedStartTimeUtc,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedImagePath,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ExpectedImageHash
     )
     if ($ProcessId -le 0) {
         throw [System.ArgumentException]::new('HARNESS-INVALID-PID: process id must be positive.')
@@ -608,6 +703,19 @@ function Stop-IntegrationHarnessOwnedProcess {
             throw [System.ArgumentException]::new("HARNESS-INVALID-CONTROLLER: controller is missing '$field'.")
         }
     }
+    # Identity-bound stop: when the caller supplies any start/image expectation
+    # recorded at start, the stop additionally requires a live identity match.
+    # Without expectations the injected ownership predicate alone decides, for
+    # compatibility with callers that predate identity recording.
+    $identityBound = (-not [string]::IsNullOrWhiteSpace($ExpectedStartTimeUtc)) -or `
+        (-not [string]::IsNullOrWhiteSpace($ExpectedImagePath)) -or `
+        (-not [string]::IsNullOrWhiteSpace($ExpectedImageHash))
+    if ($identityBound) {
+        if (-not $ProcessController.ContainsKey('GetProcessIdentity') -or
+            $ProcessController['GetProcessIdentity'] -isnot [scriptblock]) {
+            throw [System.ArgumentException]::new("HARNESS-INVALID-CONTROLLER: identity-bound stop requires 'GetProcessIdentity'.")
+        }
+    }
     $receipt = [ordered]@{
         role               = $Role
         pid                = $ProcessId
@@ -616,6 +724,7 @@ function Stop-IntegrationHarnessOwnedProcess {
         stopped            = $false
         skippedForeign     = $false
         cleanupUnknown     = $false
+        identityMismatch   = $false
     }
     try {
         $owned = (& $ProcessController['TestOwnership'] $ProcessId $OwnerRunId)
@@ -630,6 +739,27 @@ function Stop-IntegrationHarnessOwnedProcess {
                 cleanupUnknown = $true
                 pid            = $ProcessId
                 role           = $Role
+            }
+        }
+        if ($identityBound) {
+            $liveIdentity = (& $ProcessController['GetProcessIdentity'] $ProcessId)
+            $identityOk = Test-IntegrationHarnessProcessIdentityMatch -LiveIdentity $liveIdentity `
+                -ExpectedStartTimeUtc $ExpectedStartTimeUtc `
+                -ExpectedImagePath $ExpectedImagePath `
+                -ExpectedImageHash $ExpectedImageHash
+            if (-not $identityOk) {
+                $Failures.Add("foreign-process-never-touched:$Role")
+                $receipt.skippedForeign = $true
+                $receipt.cleanupUnknown = $true
+                $receipt.identityMismatch = $true
+                $Receipts.Add([pscustomobject]$receipt)
+                return @{
+                    stopped        = $false
+                    skippedForeign = $true
+                    cleanupUnknown = $true
+                    pid            = $ProcessId
+                    role           = $Role
+                }
             }
         }
         $receipt.graceful_requested = [bool](& $ProcessController['RequestGraceful'] $ProcessId)
@@ -1177,7 +1307,22 @@ function Invoke-IntegrationHarnessCleanup {
         throw [System.ArgumentException]::new('HARNESS-INVALID-RUN: run has no binding.')
     }
     $binding = $Run['binding']
-    $ordered = @($Resources | Sort-Object -Property { [string]$_['resourceKey'] } -Descending)
+    # Cleanup is the true reverse of prepare order: prepare sorts ascending by the
+    # (dependencyCount, resourceKey) pair, so cleanup sorts the identical pair
+    # in reverse order (descending). Dependents stop before their dependencies.
+    $ordered = @($Resources | Sort-Object -Property {
+        $depends = 0
+        if ($_ -is [hashtable] -and $_['dependsOn']) { $depends = @($_['dependsOn']).Count }
+        $sortKey = ''
+        if ($_ -is [hashtable] -and $_.ContainsKey('resourceKey')) {
+            $sortKey = [string]$_['resourceKey']
+        } elseif ($_ -is [hashtable] -and $_.ContainsKey('allocation')) {
+            $sortKey = [string]$_['allocation']
+        } else {
+            $sortKey = [string]$_
+        }
+        ('{0:D6}:{1}' -f $depends, $sortKey)
+    } -Descending)
     $records = [System.Collections.Generic.List[hashtable]]::new()
     $failures = [System.Collections.Generic.List[string]]::new()
     $unknown = $false
@@ -1251,14 +1396,21 @@ function Invoke-IntegrationHarnessCleanup {
             })
         }
     }
+    # The first cleanup failure is the primary failure: it is retained verbatim
+    # and never overwritten by later failures in the reverse-order walk.
+    $primaryFailure = $null
+    if ($failures.Count -gt 0) {
+        $primaryFailure = [string]$failures[0]
+    }
     $overall = 'CleanupVerified'
     if ($unknown) {
         $overall = 'ReconciliationRequired'
     }
     return @{
-        overallState = $overall
-        records      = @($records)
-        failures     = @($failures)
+        overallState   = $overall
+        records        = @($records)
+        failures       = @($failures)
+        primaryFailure = $primaryFailure
     }
 }
 
@@ -1688,6 +1840,53 @@ function Invoke-HarnessValidateConfiguration {
     }
 }
 
+# Pure WhatIf plan derivation: the fixed closed command sequence, per-identity
+# resources in plan order, and per-resource cleanup steps in reverse order.
+# No allocation and no side effects; identical input yields identical output.
+# Not exported: the WhatIf seam attaches the derivation to every plan shape.
+function Get-HarnessWhatIfDerivation {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$SortedIdentities
+    )
+    $commands = @($Script:ClosedOperations)
+    if (Test-IntegrationHarnessModelLoaded) {
+        $opsCommand = Get-Command -Name 'Get-IntegrationHarnessProviderOperations' -ErrorAction SilentlyContinue
+        if ($null -ne $opsCommand) {
+            $commands = @(Get-IntegrationHarnessProviderOperations)
+        }
+    }
+    $resources = [System.Collections.Generic.List[hashtable]]::new()
+    $order = 0
+    foreach ($identity in $SortedIdentities) {
+        [void]$resources.Add(@{
+            testIdentity = [string]$identity
+            resourceKey  = ('test:{0}' -f $identity)
+            planOrder    = $order
+        })
+        $order++
+    }
+    $cleanup = [System.Collections.Generic.List[hashtable]]::new()
+    $cleanupOrder = 0
+    for ($i = $resources.Count - 1; $i -ge 0; $i--) {
+        [void]$cleanup.Add(@{
+            resourceKey  = [string]$resources[$i]['resourceKey']
+            testIdentity = [string]$resources[$i]['testIdentity']
+            cleanupOrder = $cleanupOrder
+            idempotent   = $true
+        })
+        $cleanupOrder++
+    }
+    return @{
+        commands  = @($commands)
+        resources = @($resources)
+        cleanup   = @($cleanup)
+    }
+}
+
 function Invoke-HarnessWhatIf {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -1739,10 +1938,17 @@ function Invoke-HarnessWhatIf {
         $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
         $rows = @($parsed.rows)
         $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
+        $planIdentities = @(@($parsed.rows) | ForEach-Object {
+            ('{0}::{1}::{2}::{3}' -f $_.packageId, $_.targetKind, $_.targetName, $_.testName)
+        } | Sort-Object -Culture '' -CaseSensitive)
+        $derivation = Get-HarnessWhatIfDerivation -SortedIdentities $planIdentities
         return @{
             status         = 'Planned'
             inventory      = $resolved
             selectionCount = $rows.Count
+            commands       = @($derivation['commands'])
+            resources      = @($derivation['resources'])
+            cleanup        = @($derivation['cleanup'])
             timeoutSeconds = $TimeoutSeconds
             coreVersion    = (Get-IntegrationHarnessCoreVersion)
             proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
@@ -1777,22 +1983,30 @@ function Invoke-HarnessWhatIf {
             }
         }
         $sorted = @($explicit | Sort-Object -Culture '' -CaseSensitive)
+        $derivation = Get-HarnessWhatIfDerivation -SortedIdentities $sorted
         return @{
             status         = 'Planned'
             inventory      = $resolved
             selection      = @($sorted)
             selectionCount = $sorted.Count
+            commands       = @($derivation['commands'])
+            resources      = @($derivation['resources'])
+            cleanup        = @($derivation['cleanup'])
             timeoutSeconds = $TimeoutSeconds
             coreVersion    = (Get-IntegrationHarnessCoreVersion)
             proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
         }
     }
     $sorted = @($explicit | Sort-Object -Culture '' -CaseSensitive)
+    $derivation = Get-HarnessWhatIfDerivation -SortedIdentities $sorted
     return @{
         status         = 'Planned'
         inventory      = 'default'
         selection      = @($sorted)
         selectionCount = $sorted.Count
+        commands       = @($derivation['commands'])
+        resources      = @($derivation['resources'])
+        cleanup        = @($derivation['cleanup'])
         timeoutSeconds = $TimeoutSeconds
         coreVersion    = (Get-IntegrationHarnessCoreVersion)
         proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
@@ -1801,7 +2015,7 @@ function Invoke-HarnessWhatIf {
 
 function Invoke-HarnessRun {
     [CmdletBinding()]
-    [OutputType([hashtable])]
+    [OutputType([pscustomobject])]
     param(
         [Parameter()]
         [AllowEmptyCollection()]
@@ -1826,7 +2040,10 @@ function Invoke-HarnessRun {
         [Parameter()]
         [string]$EvidenceLogPath,
         [Parameter()]
-        [string]$ResultArtifactPath
+        [string]$ResultArtifactPath,
+        [Parameter()]
+        [AllowNull()]
+        [hashtable]$Provider
     )
     $explicit = @()
     if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $null -ne $SelectedTestId) {
@@ -1861,12 +2078,24 @@ function Invoke-HarnessRun {
     }
     if ($hasInventory) {
         $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
+        $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
         $byIdentity = @{}
+        $rowTables = [System.Collections.Generic.List[hashtable]]::new()
         foreach ($row in @($parsed.rows)) {
             $h = @{}
             foreach ($prop in $row.PSObject.Properties) {
                 $h[[string]$prop.Name] = $prop.Value
             }
+            try {
+                $rowCommand = Get-Command -Name 'Test-IntegrationHarnessInventoryRow' -ErrorAction SilentlyContinue
+                if ($null -ne $rowCommand) {
+                    [void](Test-IntegrationHarnessInventoryRow -Row $h)
+                }
+            }
+            catch {
+                throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory row is not accepted: $($_.Exception.Message)")
+            }
+            [void]$rowTables.Add($h)
             $identity = ('{0}::{1}::{2}::{3}' -f $h['packageId'], $h['targetKind'], $h['targetName'], $h['testName'])
             if (-not $byIdentity.ContainsKey($identity)) {
                 $byIdentity[$identity] = $h
@@ -1877,7 +2106,563 @@ function Invoke-HarnessRun {
                 throw [System.ArgumentException]::new("HARNESS-UNKNOWN-TEST: selected identity is not in inventory: '$id'.")
             }
         }
-        throw [System.InvalidOperationException]::new('HARNESS-PROOF-CEILING: Run execution requires concrete providers outside INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY.')
+        $sorted = @()
+        if ($wantAll) {
+            $sorted = @(@($byIdentity.Keys) | Sort-Object -Culture '' -CaseSensitive)
+        } else {
+            $sorted = @($explicit | Sort-Object -Culture '' -CaseSensitive)
+        }
+
+        # --- Dispatch: the selection above is frozen and inventory-bound. ---
+        # Disposition precedence: an explicit HarnessProbe is fault injection
+        # and wins; otherwise a missing provider blocks every selected test
+        # with InfrastructureBlocked; otherwise the provider dispatches the
+        # closed operations in state-machine order. States mark reached
+        # pipeline stages; load-bearing truth lives in the dispositions and
+        # the evidence collected below.
+        $providerMissing = ($null -eq $Provider -or $Provider.Count -eq 0)
+        $probeMode = [string]$HarnessProbe
+        $runId = $RunId
+        if ([string]::IsNullOrWhiteSpace($runId)) {
+            $runId = [guid]::NewGuid().ToString('N')
+        }
+        if ($runId -cnotmatch '^[0-9a-f]{32}$') {
+            throw [System.ArgumentException]::new('HARNESS-INVALID-BINDING: RunId must be 32 lowercase hex.')
+        }
+        $selectedRows = @($sorted | ForEach-Object { $byIdentity[[string]$_] })
+        $providerName = 'unbound-provider'
+        $rowProviderClasses = @($selectedRows | ForEach-Object { [string]$_['providerClass'] } |
+            Sort-Object -Culture '' -CaseSensitive -Unique)
+        if ($rowProviderClasses.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($rowProviderClasses[0])) {
+            $providerName = $rowProviderClasses[0]
+        }
+        $providerRevision = (Get-IntegrationHarnessCoreVersion)
+        if (Test-IntegrationHarnessModelLoaded) {
+            $revCommand = Get-Command -Name 'Get-IntegrationHarnessProviderInterfaceVersion' -ErrorAction SilentlyContinue
+            if ($null -ne $revCommand) {
+                $providerRevision = Get-IntegrationHarnessProviderInterfaceVersion
+            }
+        }
+        $deadline = [System.DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+
+        # Selection-subset digest, computed exactly as New-IntegrationHarnessRun
+        # verifies it: ordered selected rows, canonical JSON, SHA-256 hex.
+        $orderedDigestRows = @($selectedRows | Sort-Object -Property {
+            ('{0}::{1}::{2}::{3}' -f $_['packageId'], $_['targetKind'], $_['targetName'], $_['testName'])
+        })
+        $subsetInput = @{ rows = @($orderedDigestRows) }
+        $subsetCanonical = $null
+        if (Test-IntegrationHarnessModelLoaded) {
+            $canonCommand = Get-Command -Name 'Get-IntegrationHarnessCanonicalJson' -ErrorAction SilentlyContinue
+            if ($null -ne $canonCommand) {
+                $subsetCanonical = Get-IntegrationHarnessCanonicalJson -Value $subsetInput
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($subsetCanonical)) {
+            $subsetCanonical = ($subsetInput | ConvertTo-Json -Compress -Depth 16)
+        }
+        $subsetDigest = $null
+        if (Test-IntegrationHarnessModelLoaded) {
+            $shaCommand = Get-Command -Name 'Get-IntegrationHarnessSha256Hex' -ErrorAction SilentlyContinue
+            if ($null -ne $shaCommand) {
+                $subsetDigest = Get-IntegrationHarnessSha256Hex -Text $subsetCanonical
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($subsetDigest)) {
+            $subsetBytes = [System.Text.Encoding]::UTF8.GetBytes($subsetCanonical)
+            $subsetHasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $subsetHash = $subsetHasher.ComputeHash($subsetBytes)
+            } finally {
+                $subsetHasher.Dispose()
+            }
+            $subsetDigest = (($subsetHash | ForEach-Object { $_.ToString('x2') }) -join '')
+        }
+
+        $binding = $null
+        if (Test-IntegrationHarnessModelLoaded) {
+            $bindCommand = Get-Command -Name 'New-IntegrationHarnessRunBinding' -ErrorAction SilentlyContinue
+            if ($null -ne $bindCommand) {
+                $binding = New-IntegrationHarnessRunBinding -RunId $runId -TestClass 'integration' `
+                    -ProviderName $providerName -ProviderRevision $providerRevision `
+                    -Owner 'integration-harness' -Generation 1 `
+                    -DeadlineUtc $deadline -InventoryDigest $subsetDigest
+            }
+        }
+        if ($null -eq $binding) {
+            $binding = @{
+                runId            = $runId
+                testClass        = 'integration'
+                providerName     = $providerName
+                providerRevision = $providerRevision
+                owner            = 'integration-harness'
+                generation       = 1
+                deadlineUtc      = $deadline.ToString('o')
+                inventoryDigest  = $subsetDigest
+            }
+        }
+        $bounds = @{ maxResources = 64; maxArtifactBytes = 1048576 }
+        if (Test-IntegrationHarnessModelLoaded) {
+            $boundsCommand = Get-Command -Name 'Get-IntegrationHarnessDefaultBounds' -ErrorAction SilentlyContinue
+            if ($null -ne $boundsCommand) {
+                $bounds = Get-IntegrationHarnessDefaultBounds
+            }
+        }
+
+        $run = New-IntegrationHarnessRun -Inventory @{ rows = @($rowTables) } `
+            -SelectedIdentities $sorted -Binding $binding
+        if (Test-IntegrationHarnessModelLoaded) {
+            $setCommand = Get-Command -Name 'Test-IntegrationHarnessSelectedSet' -ErrorAction SilentlyContinue
+            if ($null -ne $setCommand) {
+                [void](Test-IntegrationHarnessSelectedSet -SelectedRows $selectedRows)
+            }
+        }
+        # Grouping is a pure derivation used for planning; the rank-7 hop
+        # below marks the initialization stage on the state ladder.
+        $groups = @(Group-IntegrationHarnessSelection -SelectedRows $selectedRows)
+        if ($groups.Count -gt [int]$bounds['maxResources']) {
+            throw [System.ArgumentException]::new('HARNESS-BOUNDS-EXCEEDED: selection exceeds the resource bound.')
+        }
+
+        $rootBase = $CandidateRoot
+        if ([string]::IsNullOrWhiteSpace($rootBase)) {
+            $rootBase = [System.IO.Path]::GetTempPath()
+        }
+        # The owned-root seam compares parent identity without a trailing
+        # separator, so normalize the base the same way (drive roots keep
+        # theirs).
+        $normalizedBase = [System.IO.Path]::GetFullPath($rootBase)
+        $driveRoot = [System.IO.Path]::GetPathRoot($normalizedBase)
+        if ($normalizedBase.Length -gt $driveRoot.Length) {
+            $normalizedBase = $normalizedBase.TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        }
+        $rootBase = $normalizedBase
+        $ownedRoot = New-IntegrationHarnessOwnedRunRoot -BaseTemp $rootBase -RunId $runId `
+            -Owner 'integration-harness' -Generation 1
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'OwnedRunRoot'
+        $run['ownedRoot'] = [string]$ownedRoot['ownedRoot']
+        if ($InjectFailureAfterSecretSetup) {
+            [void](Remove-IntegrationHarnessOwnedRoot -OwnedRoot $run['ownedRoot'] `
+                -ExpectedParent ([System.IO.Path]::GetFullPath($rootBase)) -ExpectedRunId $runId)
+            throw [System.InvalidOperationException]::new('HARNESS-INJECTED-FAILURE: injected failure after setup.')
+        }
+
+        $primaryFailure = $null
+        $cleanedState = @{}
+        $blockedGroup = @{}
+        $providerPlans = [System.Collections.Generic.List[hashtable]]::new()
+        $groupResourceKey = @{}
+        if (-not $providerMissing -and $probeMode -ceq 'none') {
+            $planIndex = 0
+            foreach ($group in $groups) {
+                $resourceKey = ('group-{0:D4}' -f $planIndex)
+                $groupResourceKey[$resourceKey] = $planIndex
+                try {
+                    [void](Invoke-IntegrationHarnessProviderOperation -Operation 'ValidateRequirement' `
+                        -Provider $Provider -Binding $binding `
+                        -Arguments @{ groupKey = [string]$group['groupKey']; testCount = [int]$group['count'] })
+                    $fragment = Invoke-IntegrationHarnessProviderOperation -Operation 'Plan' `
+                        -Provider $Provider -Binding $binding `
+                        -Arguments @{ groupKey = [string]$group['groupKey']; testCount = [int]$group['count'] }
+                } catch {
+                    $blockedGroup[$planIndex] = 'InfrastructureBlocked'
+                    if ($null -eq $primaryFailure) {
+                        $primaryFailure = $_.Exception.Message
+                    }
+                    $planIndex++
+                    continue
+                }
+                $plan = @{
+                    resourceKey      = $resourceKey
+                    runId            = [string]$binding['runId']
+                    testClass        = [string]$binding['testClass']
+                    providerRevision = [string]$binding['providerRevision']
+                    owner            = [string]$binding['owner']
+                    generation       = [int]$binding['generation']
+                    dependsOn        = @()
+                }
+                if ($fragment.ContainsKey('dependsOn') -and $null -ne $fragment['dependsOn']) {
+                    $plan['dependsOn'] = @($fragment['dependsOn'])
+                }
+                [void]$providerPlans.Add($plan)
+                $planIndex++
+            }
+        }
+        $rootPlan = @{
+            resourceKey      = 'owned-run-root'
+            runId            = [string]$binding['runId']
+            testClass        = [string]$binding['testClass']
+            providerRevision = [string]$binding['providerRevision']
+            owner            = [string]$binding['owner']
+            generation       = [int]$binding['generation']
+            dependsOn        = @()
+        }
+        $run = Approve-IntegrationHarnessProviderPlan -Run $run `
+            -Plans @(@($providerPlans) + @($rootPlan))
+
+        $allocations = @()
+        if ($providerPlans.Count -gt 0) {
+            $prepareResult = Invoke-IntegrationHarnessPrepare -Run $run -Plans @($providerPlans) `
+                -Provider $Provider -Bounds $bounds
+            if ([bool]$prepareResult['success']) {
+                $allocations = @($prepareResult['allocations'])
+            } else {
+                $primaryFailure = [string]$prepareResult['primaryFailure']
+                # Prepare already cleaned its started plans on failure: seed
+                # the shared cleaned set so the final pass skips exactly the
+                # verified ones (idempotent) and re-attempts the rest.
+                foreach ($earlyRecord in @($prepareResult['cleanupRecords'])) {
+                    if ($earlyRecord -is [hashtable] -and
+                        [string]$earlyRecord['state'] -ceq 'CleanupVerified' -and
+                        $earlyRecord.ContainsKey('resourceKey')) {
+                        $cleanedState[[string]$earlyRecord['resourceKey']] = $true
+                    }
+                }
+                # Nothing remains allocated after a failed prepare, so every
+                # group is infrastructure-blocked; the primary failure above
+                # is retained verbatim.
+                for ($blockedIndex = 0; $blockedIndex -lt $groups.Count; $blockedIndex++) {
+                    $blockedGroup[$blockedIndex] = 'InfrastructureBlocked'
+                }
+            }
+        }
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'Allocation'
+
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'StartRequested'
+        $startedKeys = @{}
+        foreach ($allocation in $allocations) {
+            $allocationKey = [string]$allocation['resourceKey']
+            $allocationGroup = [int]$groupResourceKey[$allocationKey]
+            if ($blockedGroup.ContainsKey($allocationGroup)) {
+                continue
+            }
+            try {
+                [void](Invoke-IntegrationHarnessProviderOperation -Operation 'Start' `
+                    -Provider $Provider -Binding $binding `
+                    -Arguments @{ resourceKey = $allocationKey; allocation = $allocation['allocation'] })
+                $startedKeys[$allocationKey] = $true
+            } catch {
+                $blockedGroup[$allocationGroup] = 'InfrastructureBlocked'
+                if ($null -eq $primaryFailure) {
+                    $primaryFailure = $_.Exception.Message
+                }
+            }
+        }
+
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'ObservedProcessReadinessUnknown'
+        $readinessRecords = [System.Collections.Generic.List[hashtable]]::new()
+        foreach ($allocation in $allocations) {
+            $observedKey = [string]$allocation['resourceKey']
+            $observedGroup = [int]$groupResourceKey[$observedKey]
+            if ($blockedGroup.ContainsKey($observedGroup)) {
+                continue
+            }
+            if (-not $startedKeys.ContainsKey($observedKey)) {
+                continue
+            }
+            try {
+                $observation = Invoke-IntegrationHarnessProviderOperation -Operation 'ObserveReadiness' `
+                    -Provider $Provider -Binding $binding -Arguments @{ resourceKey = $observedKey }
+            } catch {
+                $blockedGroup[$observedGroup] = 'InfrastructureBlocked'
+                if ($null -eq $primaryFailure) {
+                    $primaryFailure = $_.Exception.Message
+                }
+                continue
+            }
+            [void]$readinessRecords.Add(@{ resourceKey = $observedKey; observation = $observation })
+            try {
+                $ready = Test-IntegrationHarnessReadiness -Observation $observation -Binding $binding
+            } catch {
+                $blockedGroup[$observedGroup] = 'HarnessError'
+                if ($null -eq $primaryFailure) {
+                    $primaryFailure = $_.Exception.Message
+                }
+                continue
+            }
+            if (-not $ready) {
+                $blockedGroup[$observedGroup] = 'InfrastructureBlocked'
+                if ($null -eq $primaryFailure) {
+                    $primaryFailure = "readiness-not-accepted:$observedKey"
+                }
+            }
+        }
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'AcceptedSemanticReadiness'
+
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'GroupInitialization'
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'ExactTestExecution'
+        $executionReceipts = [System.Collections.Generic.List[hashtable]]::new()
+        $groupIndex = 0
+        foreach ($group in $groups) {
+            $members = @($group['rows'])
+            if ($probeMode -cne 'none') {
+                foreach ($member in $members) {
+                    $memberIdentity = ('{0}::{1}::{2}::{3}' -f $member['packageId'], $member['targetKind'], $member['targetName'], $member['testName'])
+                    if ($probeMode -ceq 'failure') {
+                        [void]$executionReceipts.Add(@{
+                            testIdentity = $memberIdentity
+                            disposition  = 'AssertionFailed'
+                        })
+                    } else {
+                        $probeHasher = [System.Security.Cryptography.SHA256]::Create()
+                        try {
+                            $binaryHash = $probeHasher.ComputeHash(
+                                [System.Text.Encoding]::UTF8.GetBytes("probe-binary:$memberIdentity"))
+                            $discoveryHash = $probeHasher.ComputeHash(
+                                [System.Text.Encoding]::UTF8.GetBytes("probe-discovery:$memberIdentity"))
+                        } finally {
+                            $probeHasher.Dispose()
+                        }
+                        [void]$executionReceipts.Add(@{
+                            testIdentity    = $memberIdentity
+                            disposition     = 'Passed'
+                            executedReceipt = @{
+                                testIdentity    = $memberIdentity
+                                binaryDigest    = (($binaryHash | ForEach-Object { $_.ToString('x2') }) -join '')
+                                discoveryDigest = (($discoveryHash | ForEach-Object { $_.ToString('x2') }) -join '')
+                            }
+                        })
+                    }
+                }
+            } elseif ($providerMissing -or $blockedGroup.ContainsKey($groupIndex)) {
+                $groupDisposition = 'InfrastructureBlocked'
+                if ($blockedGroup.ContainsKey($groupIndex)) {
+                    $groupDisposition = [string]$blockedGroup[$groupIndex]
+                }
+                foreach ($member in $members) {
+                    $memberIdentity = ('{0}::{1}::{2}::{3}' -f $member['packageId'], $member['targetKind'], $member['targetName'], $member['testName'])
+                    [void]$executionReceipts.Add(@{
+                        testIdentity = $memberIdentity
+                        disposition  = $groupDisposition
+                    })
+                }
+            } else {
+                $contaminated = $false
+                foreach ($member in $members) {
+                    $memberIdentity = ('{0}::{1}::{2}::{3}' -f $member['packageId'], $member['targetKind'], $member['targetName'], $member['testName'])
+                    if ($contaminated) {
+                        [void]$executionReceipts.Add(@{
+                            testIdentity = $memberIdentity
+                            disposition  = 'NotExecutedDueToPriorContamination'
+                        })
+                        continue
+                    }
+                    $resetOk = $true
+                    try {
+                        [void](Invoke-IntegrationHarnessProviderOperation -Operation 'ResetForTest' `
+                            -Provider $Provider -Binding $binding `
+                            -Arguments @{ testIdentity = $memberIdentity; groupKey = [string]$group['groupKey'] })
+                    } catch {
+                        $resetOk = $false
+                        if ($null -eq $primaryFailure) {
+                            $primaryFailure = $_.Exception.Message
+                        }
+                    }
+                    if (-not $resetOk) {
+                        $contaminated = $true
+                        [void]$executionReceipts.Add(@{
+                            testIdentity = $memberIdentity
+                            disposition  = 'InfrastructureBlocked'
+                        })
+                        continue
+                    }
+                    try {
+                        $collected = Invoke-IntegrationHarnessProviderOperation -Operation 'CollectEvidence' `
+                            -Provider $Provider -Binding $binding `
+                            -Arguments @{ testIdentity = $memberIdentity; groupKey = [string]$group['groupKey'] }
+                    } catch {
+                        if ($null -eq $primaryFailure) {
+                            $primaryFailure = $_.Exception.Message
+                        }
+                        [void]$executionReceipts.Add(@{
+                            testIdentity = $memberIdentity
+                            disposition  = 'InfrastructureBlocked'
+                        })
+                        continue
+                    }
+                    # A pass requires an exact executed-test receipt bound to
+                    # this identity; provider success alone never passes.
+                    $testDisposition = 'HarnessError'
+                    $testReceipt = $null
+                    if ($collected.ContainsKey('executedReceipt') -and $collected['executedReceipt'] -is [hashtable]) {
+                        $candidate = $collected['executedReceipt']
+                        if ([string]$candidate['testIdentity'] -ceq $memberIdentity -and
+                            -not [string]::IsNullOrWhiteSpace([string]$candidate['binaryDigest']) -and
+                            -not [string]::IsNullOrWhiteSpace([string]$candidate['discoveryDigest'])) {
+                            $digestsOk = $true
+                            if (Test-IntegrationHarnessModelLoaded) {
+                                $fmtCommand = Get-Command -Name 'Test-IntegrationHarnessDigestFormat' -ErrorAction SilentlyContinue
+                                if ($null -ne $fmtCommand) {
+                                    try {
+                                        [void](Test-IntegrationHarnessDigestFormat -Digest ([string]$candidate['binaryDigest']))
+                                        [void](Test-IntegrationHarnessDigestFormat -Digest ([string]$candidate['discoveryDigest']))
+                                    } catch {
+                                        $digestsOk = $false
+                                    }
+                                }
+                            }
+                            if ($digestsOk) {
+                                $testDisposition = 'Passed'
+                                $testReceipt = $candidate
+                            }
+                        }
+                    }
+                    $testRecord = @{
+                        testIdentity = $memberIdentity
+                        disposition  = $testDisposition
+                    }
+                    if ($null -ne $testReceipt) {
+                        $testRecord['executedReceipt'] = $testReceipt
+                    }
+                    [void]$executionReceipts.Add($testRecord)
+                }
+            }
+            $groupIndex++
+        }
+
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'TerminalTestEvidence'
+        $terminalRecords = @(New-IntegrationHarnessTerminalEvidence -ExecutionReceipts @($executionReceipts) `
+            -SelectedIdentities $sorted)
+
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'EvidenceCollection'
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'CleanupRequested'
+        $finalCleanupRecords = [System.Collections.Generic.List[hashtable]]::new()
+        if ($providerPlans.Count -gt 0) {
+            $cleanupResult = Invoke-IntegrationHarnessCleanup -Run $run -Resources @($providerPlans) `
+                -Provider $Provider -CleanedState $cleanedState
+            foreach ($cleanupRecord in @($cleanupResult['records'])) {
+                [void]$finalCleanupRecords.Add($cleanupRecord)
+            }
+            if ($null -ne $cleanupResult['primaryFailure'] -and $null -eq $primaryFailure) {
+                $primaryFailure = [string]$cleanupResult['primaryFailure']
+            }
+        }
+        if ($probeMode -ceq 'retained_handle') {
+            [void]$finalCleanupRecords.Add(@{
+                resourceKey  = 'probe-retained-handle'
+                state        = 'ReconciliationRequired'
+                alreadyClean = $false
+                failures     = @('cleanup-unknown')
+            })
+        }
+        try {
+            $rootRemoval = Remove-IntegrationHarnessOwnedRoot -OwnedRoot $run['ownedRoot'] `
+                -ExpectedParent ([System.IO.Path]::GetFullPath($rootBase)) -ExpectedRunId $runId
+        } catch {
+            if ($null -eq $primaryFailure) {
+                $primaryFailure = $_.Exception.Message
+            }
+            $rootRemoval = @{
+                state        = 'ReconciliationRequired'
+                alreadyClean = $false
+                failures     = @('root-removal-failed')
+            }
+        }
+        [void]$finalCleanupRecords.Add(@{
+            resourceKey  = 'owned-run-root'
+            state        = [string]$rootRemoval['state']
+            alreadyClean = [bool]$rootRemoval['alreadyClean']
+            failures     = @($rootRemoval['failures'])
+        })
+
+        $run = Move-IntegrationHarnessState -Run $run -ToState 'OwnedResourcesStopped'
+        $needsReconciliation = $false
+        foreach ($finalRecord in $finalCleanupRecords) {
+            if ([string]$finalRecord['state'] -ceq 'ReconciliationRequired') {
+                $needsReconciliation = $true
+            }
+        }
+        if ($needsReconciliation) {
+            $run = Move-IntegrationHarnessState -Run $run -ToState 'ReconciliationRequired'
+        } else {
+            $run = Move-IntegrationHarnessState -Run $run -ToState 'CleanupVerified'
+        }
+
+        $sourceIdentity = @{
+            inventoryPath = $resolved
+            selectionKind = 'ExplicitSelection'
+            harnessProbe  = $probeMode
+            providerBound = (-not $providerMissing)
+        }
+        if ($wantAll) {
+            $sourceIdentity['selectionKind'] = 'SelectAllRows'
+        }
+        $candidateIdentity = 'default-temp'
+        if (-not [string]::IsNullOrWhiteSpace($CandidateRoot)) {
+            $candidateIdentity = [System.IO.Path]::GetFullPath($CandidateRoot)
+        }
+        $worktreeIdentity = @{
+            ownedRoot     = [string]$run['ownedRoot']
+            runId         = $runId
+            candidateRoot = $candidateIdentity
+        }
+        $toolIdentities = @{
+            powershellVersion = ([string]$PSVersionTable.PSVersion)
+            coreVersion       = (Get-IntegrationHarnessCoreVersion)
+            modelLoaded       = [bool](Test-IntegrationHarnessModelLoaded)
+        }
+        $evidence = New-IntegrationHarnessRunEvidence -Run $run -Groups $groups `
+            -TerminalRecords $terminalRecords -CleanupRecords @($finalCleanupRecords) `
+            -ArtifactHandles @() -SourceIdentity $sourceIdentity `
+            -WorktreeIdentity $worktreeIdentity -ToolIdentities $toolIdentities -Bounds $bounds
+        # Readiness observations are bound here: the evidence constructor
+        # carries no readiness channel, so the collected records attach
+        # post-hoc before the completeness gate below.
+        $evidence['readinessRecords'] = @($readinessRecords)
+        [void](Test-IntegrationHarnessEvidenceComplete -Evidence $evidence)
+        $completed = Complete-IntegrationHarnessRun -Run $run -Evidence $evidence `
+            -CleanupRecords @($finalCleanupRecords)
+
+        $outcome = [string]$completed['outcome']
+        $exitCode = 1
+        if ($outcome -ceq 'Complete') {
+            $exitCode = 0
+        }
+        $result = [pscustomobject][ordered]@{
+            status                   = 'Completed'
+            outcome                  = $outcome
+            state                    = [string]$completed['state']
+            runId                    = $runId
+            inventory                = $resolved
+            selectionCount           = $sorted.Count
+            executed_test_count      = [int]$evidence['arithmetic']['executedCount']
+            exit_code                = $exitCode
+            workspace_test_exit_code = $exitCode
+            primaryFailure           = $primaryFailure
+            reconciliationRequired   = [bool]$completed['reconciliationRequired']
+            coreVersion              = (Get-IntegrationHarnessCoreVersion)
+            proofCeiling             = $Script:ProofCeiling
+            evidence                 = $evidence
+        }
+        if ($PSBoundParameters.ContainsKey('EvidenceLogPath') -and -not [string]::IsNullOrWhiteSpace($EvidenceLogPath)) {
+            try {
+                $logEntry = ([ordered]@{
+                    runId       = $runId
+                    outcome     = $outcome
+                    state       = [string]$completed['state']
+                    inventory   = $resolved
+                    selection   = @($sorted)
+                    arithmetic  = $evidence['arithmetic']
+                    fingerprint = [string]$evidence['failureFingerprint']
+                } | ConvertTo-Json -Compress -Depth 16)
+                [System.IO.File]::AppendAllText($EvidenceLogPath, $logEntry + [System.Environment]::NewLine,
+                    [System.Text.UTF8Encoding]::new($false))
+            } catch {
+                throw [System.IO.IOException]::new(
+                    "HARNESS-EVIDENCE-WRITE-FAILED: evidence log is not persisted: $($_.Exception.Message)")
+            }
+        }
+        if ($PSBoundParameters.ContainsKey('ResultArtifactPath') -and -not [string]::IsNullOrWhiteSpace($ResultArtifactPath)) {
+            try {
+                $artifactText = ($result | ConvertTo-Json -Depth 16)
+                [System.IO.File]::WriteAllText($ResultArtifactPath, $artifactText,
+                    [System.Text.UTF8Encoding]::new($false))
+            } catch {
+                throw [System.IO.IOException]::new(
+                    "HARNESS-EVIDENCE-WRITE-FAILED: result artifact is not persisted: $($_.Exception.Message)")
+            }
+        }
+        return $result
     }
     if ($explicit.Count -gt 0) {
         throw [System.ArgumentException]::new("HARNESS-UNKNOWN-TEST: selected identity is not in inventory: '$($explicit[0])'.")

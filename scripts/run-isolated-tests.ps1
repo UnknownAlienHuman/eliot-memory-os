@@ -275,6 +275,122 @@ function Invoke-HarnessValidateConfigurationProfile {
     exit 0
 }
 
+# #907 OBJ provider dispatch: the Run profile binds the closed 9-operation
+# provider table from the real Store/Runtime mechanics. Binding is by EXACT
+# native-identity triple match only (testClass/providerName/providerRevision
+# against each loaded provider module's self-declared identity): never
+# translated, never guessed. Anything else throws a typed no-bound-provider
+# error that the Run seam turns into per-test InfrastructureBlocked -- a
+# producing branch, never skip/pass. Operations whose inputs have no explicit
+# source (runtime target, launch binary, execution client/outcome) throw typed
+# missing-input errors for the same treatment; the #909/#911 provider inputs
+# fill those seams without reshaping this table.
+function Resolve-HarnessBoundProviderClass {
+    param([Parameter(Mandatory)][hashtable]$Binding)
+
+    $testClass = [string]$Binding['testClass']
+    $providerName = [string]$Binding['providerName']
+    $providerRevision = [string]$Binding['providerRevision']
+    $storeIdentity = Get-StoreProviderIdentity
+    if ($testClass -ceq [string]$storeIdentity['testClass'] -and
+        $providerName -ceq [string]$storeIdentity['providerName'] -and
+        $providerRevision -ceq [string]$storeIdentity['providerRevision']) {
+        return 'STORE'
+    }
+    $runtimeIdentity = Get-RuntimeProviderIdentity
+    if ($testClass -ceq [string]$runtimeIdentity['testClass'] -and
+        $providerName -ceq [string]$runtimeIdentity['providerName'] -and
+        $providerRevision -ceq [string]$runtimeIdentity['providerRevision']) {
+        return 'RUNTIME'
+    }
+    throw ("HARNESS-NO-BOUND-PROVIDER: no loaded real provider matches binding '{0}' / '{1}' / '{2}'; refusing to translate or guess a provider." -f $testClass, $providerName, $providerRevision)
+}
+
+function New-HarnessRunProviderTable {
+    param(
+        [Parameter(Mandatory)][string]$BaseTemp,
+        [Parameter(Mandatory)][hashtable]$RunState,
+        [Parameter(Mandatory)][scriptblock]$Entropy,
+        [Parameter(Mandatory)][scriptblock]$PortReservation
+    )
+
+    $table = @{
+        ValidateRequirement = {
+            param($context)
+            $binding = $context.binding
+            $class = Resolve-HarnessBoundProviderClass -Binding $binding
+            if ($class -ceq 'RUNTIME') {
+                throw 'HARNESS-NO-EXPLICIT-RUNTIME-TARGET: runtime validation needs a topology target and Run arguments carry none; the row targetClass is not threaded through.'
+            }
+            $requirement = @{ testClass = [string]$binding['testClass']; providerRevision = [string]$binding['providerRevision'] }
+            return Invoke-StoreValidateRequirement -Binding $binding -Requirement $requirement -Lock (Get-StoreLockIdentity)
+        }.GetNewClosure()
+        Plan = {
+            param($context)
+            $binding = $context.binding
+            $class = Resolve-HarnessBoundProviderClass -Binding $binding
+            if ($class -ceq 'RUNTIME') {
+                throw 'HARNESS-NO-EXPLICIT-RUNTIME-TARGET: runtime planning needs a topology target and Run arguments carry none; the row targetClass is not threaded through.'
+            }
+            $requirement = @{ testClass = [string]$binding['testClass']; providerRevision = [string]$binding['providerRevision'] }
+            return Invoke-StorePlan -Binding $binding -Requirement $requirement
+        }.GetNewClosure()
+        Allocate = {
+            param($context)
+            $binding = $context.binding
+            $class = Resolve-HarnessBoundProviderClass -Binding $binding
+            $key = [string]$context.arguments['resourceKey']
+            if ($class -ceq 'RUNTIME') {
+                $result = Invoke-RuntimeAllocate -Binding $binding -Plan $context.arguments['plan'] -BaseTemp $BaseTemp -Entropy $Entropy
+            } else {
+                $result = Invoke-StoreAllocate -Binding $binding -Plan $context.arguments['plan'] -BaseTemp $BaseTemp -Entropy $Entropy -PortReservation $PortReservation
+            }
+            $RunState['allocations'][$key] = $result
+            return $result
+        }.GetNewClosure()
+        Start = {
+            param($context)
+            [void](Resolve-HarnessBoundProviderClass -Binding $context.binding)
+            throw 'HARNESS-NO-EXPLICIT-LAUNCH-TARGET: no tool input selects a launch binary, so nothing is launched; the acquisition/launcher seam stays empty for the #909/#911 provider inputs.'
+        }.GetNewClosure()
+        ObserveReadiness = {
+            param($context)
+            [void](Resolve-HarnessBoundProviderClass -Binding $context.binding)
+            throw 'HARNESS-NO-START-RECEIPT: Start never proceeds without an explicit launch target, so there is nothing to observe.'
+        }.GetNewClosure()
+        ResetForTest = {
+            param($context)
+            [void](Resolve-HarnessBoundProviderClass -Binding $context.binding)
+            throw 'HARNESS-NO-EXECUTION-CLIENT: fixture reset needs a store/topology client and fixture inputs that no explicit input binds.'
+        }.GetNewClosure()
+        CollectEvidence = {
+            param($context)
+            [void](Resolve-HarnessBoundProviderClass -Binding $context.binding)
+            throw 'HARNESS-NO-EXECUTION-INPUT: evidence collection needs a test-binary locator and outcome inputs that no explicit input binds; provider success alone never passes.'
+        }.GetNewClosure()
+        Stop = {
+            param($context)
+            [void](Resolve-HarnessBoundProviderClass -Binding $context.binding)
+            $key = [string]$context.arguments['resourceKey']
+            if (-not $RunState['startReceipts'].ContainsKey($key)) {
+                return @{ stopped = $true; reason = 'never-started' }
+            }
+            throw 'HARNESS-NO-PROCESS-CONTROLLER: a start receipt exists but no identity-bound process controller is constructed yet.'
+        }.GetNewClosure()
+        VerifyCleanup = {
+            param($context)
+            [void](Resolve-HarnessBoundProviderClass -Binding $context.binding)
+            $key = [string]$context.arguments['resourceKey']
+            if (-not $RunState['allocations'].ContainsKey($key)) {
+                throw ("HARNESS-NO-ALLOCATION: no allocation is recorded for '{0}'; nothing to verify." -f $key)
+            }
+            throw 'HARNESS-NO-START-RECEIPT: verification needs a start receipt and Start never proceeds without an explicit launch target.'
+        }.GetNewClosure()
+    }
+    return $table
+}
+
+ 
 # -Run profile dispatch (#907 OBJ edge): invoke the Run seam for exactly the
 # frozen selection, probe the result shape defensively, and emit the terminal
 # receipt. Zero executed tests is NOT success (fail-closed throw).
@@ -322,6 +438,8 @@ function Invoke-HarnessRunProfile {
         entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
         core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
         model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+        store_module_sha256 = (Get-FileSha256Hex $storeModulePath)
+        runtime_module_sha256 = (Get-FileSha256Hex $runtimeModulePath)
         workspace_test_exit_code = $runExit
     }
     $receipt | ConvertTo-Json -Compress
@@ -403,7 +521,7 @@ if ($PSBoundParameters.ContainsKey('PlanOutputPath') -and $activeProfile -ne 'Wh
 }
 
 # ---------------------------------------------------------------------------
-# 5. Admitted run-root derivation (no creation). The candidate root is unique
+# 5. Admitted run-root derivation (plus the empty root itself for -Run). The candidate root is unique
 #    per invocation, must descend from TEMP, and must not cross a forbidden
 #    host boundary. The seam admits (creates + writes the owner receipt for)
 #    the final run root; the coordinator never creates worktree/data state.
@@ -418,6 +536,19 @@ if (-not $ownedPrefix.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCas
 $lowerRoot = $candidateRoot.ToLowerInvariant()
 if ($lowerRoot.Contains('onedrive') -or $lowerRoot.Contains('programdata')) {
     Write-HarnessUsageError 'admitted run root crossed a forbidden host boundary; nothing launches.'
+}
+# The Run coordinator admits (creates) exactly this empty root: the owned-run-root
+# seam requires an existing, reparse-walked base and creates everything under
+# it. All run-owned state (processes, ports, pipes, worktrees, data, secrets)
+# stays module-owned; the coordinator creates nothing else. Other profiles
+# create nothing (WhatIf self-creates its plan parents).
+if ($activeProfile -eq 'Run') {
+    try {
+        [IO.Directory]::CreateDirectory($candidateRoot) | Out-Null
+    }
+    catch {
+        Write-HarnessInternalError ('admitted run-root creation failed: ' + (Get-BoundedErrorDetail $_.Exception.Message))
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -500,6 +631,25 @@ catch {
     exit $script:DelegationFailureExitCode
 }
 
+# #907 OBJ: the Run profile additionally binds the real provider mechanics.
+# Other profiles stay dependency-light and never touch these modules.
+$storeModulePath = $null
+$runtimeModulePath = $null
+if ($activeProfile -eq 'Run') {
+    $storeModulePath = Join-Path $PSScriptRoot 'integration\IntegrationHarness.Store.psm1'
+    $runtimeModulePath = Join-Path $PSScriptRoot 'integration\IntegrationHarness.Runtime.psm1'
+    try {
+        Import-Module -Name $storeModulePath -ErrorAction Stop
+        Import-Module -Name $runtimeModulePath -ErrorAction Stop
+    }
+    catch {
+        [Console]::Error.WriteLine(
+            ("run-isolated-tests harness error: IntegrationHarness.Store/Runtime provider modules unavailable; cannot delegate -Run. Missing file or import failure: {0}" -f
+                (Get-BoundedErrorDetail $_.Exception.Message)))
+        exit $script:DelegationFailureExitCode
+    }
+}
+
 $seamName = $null
 if ($activeProfile -eq 'WhatIf') { $seamName = 'Invoke-HarnessWhatIf' }
 elseif ($activeProfile -eq 'ValidateConfiguration') { $seamName = 'Invoke-HarnessValidateConfiguration' }
@@ -521,6 +671,35 @@ if ($null -ne $resolvedInventoryPath) { $seamArgs['InventoryPath'] = $resolvedIn
 if ($activeProfile -eq 'Run') {
     $seamArgs['RunId'] = $runId
     $seamArgs['CandidateRoot'] = $candidateRoot
+    # #907 OBJ: bind the closed provider table. Cross-op state (allocations,
+    # start receipts) lives in this coordinator-closed hashtable, keyed by
+    # resource key; adapters snapshot it via .GetNewClosure().
+    $providerRunState = @{ allocations = @{}; startReceipts = @{} }
+    $providerEntropy = {
+        $bytes = New-Object byte[] 8
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    }.GetNewClosure()
+    $providerPortReservation = {
+        param($request)
+        # Ephemeral loopback port pick: bind :0, read the port, release.
+        # Documented pick-vs-bind race window (test-harness scope only);
+        # never a privileged or non-loopback endpoint.
+        $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+        try {
+            $listener.Start()
+            $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+        } finally {
+            $listener.Stop()
+        }
+        if ($port -lt 1024 -or $port -gt 65535) {
+            throw ("HARNESS-PORT-RESERVATION: picked port '{0}' is outside the ephemeral bound." -f $port)
+        }
+        return @{ host = '127.0.0.1'; port = $port }
+    }.GetNewClosure()
+    $seamArgs['Provider'] = New-HarnessRunProviderTable -BaseTemp $candidateRoot `
+        -RunState $providerRunState -Entropy $providerEntropy -PortReservation $providerPortReservation
     if ($HarnessProbe -ne 'none') { $seamArgs['HarnessProbe'] = $HarnessProbe }
     if ($InjectFailureAfterSecretSetup) { $seamArgs['InjectFailureAfterSecretSetup'] = $true }
     if ($null -ne $resolvedEvidenceLogPath) { $seamArgs['EvidenceLogPath'] = $resolvedEvidenceLogPath }
