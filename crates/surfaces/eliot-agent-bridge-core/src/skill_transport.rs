@@ -15,8 +15,8 @@
 //! profile) so the operation binding can land without changing a single
 //! payload byte. A new Tool Definition or payload shape gets a NEW contract
 //! revision — v1 is frozen and rejected; v2 adds the accepted candidate to
-//! the intake payload, so the daemon binds every install to the exact
-//! accepted procedure projection instead of a bare package claim.
+//! the intake payload, while v3 carries typed `WorkScope` guard-withholding
+//! evidence in result outcomes.
 
 #![forbid(unsafe_code)]
 
@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Versioned Skill transport contract identity.
-pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v2";
+pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v3";
 /// Payload contract revision. Decode rejects any other revision.
-pub const SKILL_TRANSPORT_VERSION: u32 = 2;
+pub const SKILL_TRANSPORT_VERSION: u32 = 3;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
@@ -222,8 +222,8 @@ impl SkillIntakePayload {
 /// Typed Skill wire failure.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum SkillTransportError {
-    /// Payload contract revision is not the frozen v2.
-    #[error("skill transport version mismatch: expected v2")]
+    /// Payload contract revision is unsupported.
+    #[error("skill transport version mismatch: expected v3")]
     BadVersion,
     /// Encoded payload exceeds its I7.2 bound.
     #[error("skill transport payload exceeds its bound")]
@@ -371,8 +371,8 @@ impl SkillDisplayPayload {
 /// of these outcomes; the bridge polls it like any other result body. Every
 /// claimed pair settles through this envelope — including refusals — so no
 /// skill pair can poison the poller into a crash loop. Success carries the
-/// digest-bound receipt or display verbatim; refusal carries a stable code
-/// plus bounded detail and never fabricates delivery.
+/// digest-bound receipt or display verbatim; refusal carries a stable code and
+/// bounded detail, while `WorkScope` withholding preserves its typed evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillResultEnvelope {
@@ -418,6 +418,9 @@ pub enum SkillResultOutcome {
         /// Bounded human detail naming the refusal.
         detail: String,
     },
+    /// A canonical write was withheld by the `WorkScope` guard. The complete
+    /// identity classification and receipt remain typed across the bridge.
+    ScopeGuardWithheld(Box<eliot_skill::SkillScopeGuardFailure>),
 }
 
 impl SkillResultEnvelope {
@@ -472,49 +475,56 @@ impl SkillResultEnvelope {
     /// pair was understood and declined with a reason.
     pub fn refused(error: &eliot_skill::SkillError) -> Self {
         use eliot_skill::SkillError;
-        let (code, detail) = match error {
-            SkillError::FenceMismatch => (
-                "FENCE_MISMATCH".to_owned(),
-                "scope fence does not match the admitted fence".to_owned(),
-            ),
-            SkillError::InvalidField { field, reason } => {
-                (format!("INVALID_FIELD:{field}"), (*reason).to_owned())
+        let outcome = match error {
+            SkillError::ScopeGuardWithheld(failure) => {
+                SkillResultOutcome::ScopeGuardWithheld(failure.clone())
             }
-            SkillError::RevisionConflict => (
-                "REVISION_CONFLICT".to_owned(),
-                "base revision changed under the act".to_owned(),
-            ),
-            SkillError::NotFound => (
-                "NOT_FOUND".to_owned(),
-                "named Skill has no catalogue entry".to_owned(),
-            ),
-            SkillError::IdentityMismatch => (
-                "IDENTITY_MISMATCH".to_owned(),
-                "receipt, ack, or digest binding does not match".to_owned(),
-            ),
-            SkillError::IndependentEvidenceRequired => (
-                "EVIDENCE_REQUIRED".to_owned(),
-                "promotion needs independent evidence".to_owned(),
-            ),
-            SkillError::NonReversiblePromotion => (
-                "NON_REVERSIBLE".to_owned(),
-                "promotion is not reversible".to_owned(),
-            ),
+            SkillError::FenceMismatch => SkillResultOutcome::Refused {
+                code: "FENCE_MISMATCH".to_owned(),
+                detail: "scope fence does not match the admitted fence".to_owned(),
+            },
+            SkillError::InvalidField { field, reason } => SkillResultOutcome::Refused {
+                code: format!("INVALID_FIELD:{field}"),
+                detail: (*reason).to_owned(),
+            },
+            SkillError::RevisionConflict => SkillResultOutcome::Refused {
+                code: "REVISION_CONFLICT".to_owned(),
+                detail: "base revision changed under the act".to_owned(),
+            },
+            SkillError::NotFound => SkillResultOutcome::Refused {
+                code: "NOT_FOUND".to_owned(),
+                detail: "named Skill has no catalogue entry".to_owned(),
+            },
+            SkillError::IdentityMismatch => SkillResultOutcome::Refused {
+                code: "IDENTITY_MISMATCH".to_owned(),
+                detail: "receipt, ack, or digest binding does not match".to_owned(),
+            },
+            SkillError::IndependentEvidenceRequired => SkillResultOutcome::Refused {
+                code: "EVIDENCE_REQUIRED".to_owned(),
+                detail: "promotion needs independent evidence".to_owned(),
+            },
+            SkillError::NonReversiblePromotion => SkillResultOutcome::Refused {
+                code: "NON_REVERSIBLE".to_owned(),
+                detail: "promotion is not reversible".to_owned(),
+            },
             SkillError::Serialization(error) | SkillError::Surface(error) => {
-                ("SURFACE".to_owned(), error.clone())
+                SkillResultOutcome::Refused {
+                    code: "SURFACE".to_owned(),
+                    detail: error.clone(),
+                }
             }
-            SkillError::Store(_) => (
-                "STORE".to_owned(),
-                "canonical store failure; see store receipt".to_owned(),
-            ),
-            SkillError::Duplicate { field } => (
-                format!("INVALID_FIELD:{field}"),
-                "duplicate field".to_owned(),
-            ),
+            SkillError::Store(_) => SkillResultOutcome::Refused {
+                code: "STORE".to_owned(),
+                detail: "canonical store failure; see store receipt".to_owned(),
+            },
+            SkillError::Duplicate { field } => SkillResultOutcome::Refused {
+                code: format!("INVALID_FIELD:{field}"),
+                detail: "duplicate field".to_owned(),
+            },
         };
         Self {
             contract_version: SKILL_TRANSPORT_VERSION,
-            outcome: SkillResultOutcome::Refused { code, detail },
+            outcome,
         }
     }
 }

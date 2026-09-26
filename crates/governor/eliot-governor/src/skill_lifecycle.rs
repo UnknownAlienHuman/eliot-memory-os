@@ -212,99 +212,107 @@ fn map_kernel_error(error: KernelPortError, ctx: &StoreFailureIdentityContext) -
     }
 }
 
+fn map_composition_store_failure(
+    disposition: StoreFailureDisposition,
+    reason_token: &str,
+    retry: StoreRetryDirective,
+    recovery: StoreRecoveryAction,
+    ctx: &StoreFailureIdentityContext,
+) -> SkillError {
+    store_failure(
+        disposition,
+        reason_token,
+        StoreMutationDisposition::NotAttempted,
+        retry,
+        recovery,
+        ctx,
+    )
+    .map_or(SkillError::IdentityMismatch, SkillError::Store)
+}
+
 fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityContext) -> SkillError {
     match error {
         CompositionError::Kernel(inner) => map_kernel_error(inner, ctx),
-        CompositionError::Canonical(_) => store_failure(
+        CompositionError::Canonical(_) => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "CANONICAL_REJECTED",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
-        CompositionError::Provider(_) => store_failure(
+        ),
+        CompositionError::Provider(_) => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "PROVIDER_MISMATCH",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
-        CompositionError::Recovery(_) => store_failure(
+        ),
+        CompositionError::Recovery(_) => map_composition_store_failure(
             StoreFailureDisposition::Conflict,
             "RECOVERY_MISMATCH",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::NewIdentityAfterCondition,
             StoreRecoveryAction::RefreshStateFence,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
-        CompositionError::NotReady => store_failure(
+        ),
+        CompositionError::NotReady => map_composition_store_failure(
             StoreFailureDisposition::Unavailable,
             "GOVERNOR_NOT_READY",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::RetrySameIdentityAfterBackoff,
             StoreRecoveryAction::RestoreStoreConnectivity,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
-        CompositionError::Owner(_) => store_failure(
+        ),
+        CompositionError::Owner(_) => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "OWNER_REJECTED",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
-        CompositionError::Authority(_) => store_failure(
+        ),
+        CompositionError::Authority(_) => map_composition_store_failure(
             StoreFailureDisposition::Denied,
             "AUTHORITY_REJECTED",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
-        CompositionError::StartupOrder { .. } => store_failure(
+        ),
+        CompositionError::StartupOrder { .. } => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "STARTUP_ORDER",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,
-        )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
+        ),
         CompositionError::ActivationTaskSelectionRequired
         | CompositionError::ActivationScopeAmbiguous { .. }
-        | CompositionError::ActivationScopeSelectionRequired => store_failure(
+        | CompositionError::ActivationScopeSelectionRequired => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "ACTIVATION_SELECTION_REQUIRED",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,
-        )
-        .map_or(SkillError::IdentityMismatch, SkillError::Store),
-        CompositionError::ActivationStaleFence => store_failure(
+        ),
+        CompositionError::ActivationStaleFence => map_composition_store_failure(
             StoreFailureDisposition::Conflict,
             "ACTIVATION_FENCE_STALE",
-            StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::NewIdentityAfterCondition,
             StoreRecoveryAction::RefreshStateFence,
             ctx,
-        )
-        .map_or(SkillError::IdentityMismatch, SkillError::Store),
+        ),
+        CompositionError::ScopeGuardWithheld {
+            claimed_scope,
+            observed_scope,
+            trigger,
+            identity,
+            verdict,
+            report,
+        } => SkillError::ScopeGuardWithheld(Box::new(eliot_skill::SkillScopeGuardFailure {
+            claimed_scope,
+            observed_scope,
+            trigger,
+            identity,
+            verdict,
+            report,
+        })),
     }
 }
 
