@@ -753,15 +753,18 @@ pub struct EffectiveCapabilityPath {
 }
 
 /// Derived holder view. Authorization checks exact paths to avoid unsafe
-/// cross-products between independent alternate paths.
+/// cross-products between independent alternate paths. The graph constructs
+/// snapshots and callers evaluate them through authorization query methods,
+/// so a quarantined cross-root relation without an exact admitted transition
+/// receipt cannot appear in a snapshot (#2875 items 3, 5; acceptance A2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveCapabilitySnapshot {
-    pub snapshot_id: SnapshotId,
-    pub holder: PrincipalRef,
-    pub work_scope: WorkScopeBinding,
-    pub session: SessionBinding,
-    pub grant_graph_revision: u64,
-    pub paths: Vec<EffectiveCapabilityPath>,
+    snapshot_id: SnapshotId,
+    holder: PrincipalRef,
+    work_scope: WorkScopeBinding,
+    session: SessionBinding,
+    grant_graph_revision: u64,
+    paths: Vec<EffectiveCapabilityPath>,
 }
 
 impl EffectiveCapabilitySnapshot {
