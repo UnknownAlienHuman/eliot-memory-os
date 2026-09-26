@@ -14,7 +14,7 @@ use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -86,6 +86,8 @@ const MAX_JOB_PROCESS_IDS: usize = 4_096;
 const JOB_COMPLETION_KEY: usize = 0x454c_494f;
 const JOB_OBSERVER_SHUTDOWN_KEY: usize = 0x454e_4421;
 const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+// Match the existing 10 ms bounded polling cadence used by process/job waits below.
+const JOB_OBSERVER_POLL_TIMEOUT_MS: u32 = 10;
 static LEGACY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
@@ -1506,6 +1508,7 @@ struct ObservedProcess {
 struct JobProcessObserver {
     completion_port: OwnedHandle,
     observed: Arc<Mutex<Vec<ObservedProcess>>>,
+    shutdown_requested: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1540,13 +1543,18 @@ impl JobProcessObserver {
         }
         let observed = Arc::new(Mutex::new(Vec::new()));
         let thread_observed = Arc::clone(&observed);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let thread_shutdown_requested = Arc::clone(&shutdown_requested);
         let raw_port = completion_port.0 as usize;
         let thread = std::thread::Builder::new()
             .name("eliot-job-process-observer".to_owned())
-            .spawn(move || job_process_observer_loop(raw_port, &thread_observed))?;
+            .spawn(move || {
+                job_process_observer_loop(raw_port, &thread_observed, &thread_shutdown_requested);
+            })?;
         Ok(Self {
             completion_port,
             observed,
+            shutdown_requested,
             thread: Some(thread),
         })
     }
@@ -1588,11 +1596,12 @@ impl JobProcessObserver {
         if self.thread.is_none() {
             return;
         }
-        // The shutdown directive is idempotent (the observer breaks on the
-        // first shutdown key and the port is dropped after the join), so a
-        // failed Post — submission unknown — permits a bounded re-post. Any
-        // further unknown outcome stops the loop; the join below still
-        // bounds observer teardown.
+        // Publish shutdown before posting so the finite dequeue poll can exit
+        // even if every idempotent sentinel re-post fails. The port stays live
+        // until after join, preserving its ownership across any blocked call.
+        self.shutdown_requested.store(true, Ordering::Release);
+        // A failed Post has unknown submission outcome, so the bounded retries
+        // remain safe because each shutdown directive is idempotent.
         let mut directive = AsyncIoOutcome::Prepared;
         for _ in 0..3 {
             directive = directive.submit_issued();
@@ -1622,9 +1631,16 @@ impl Drop for JobProcessObserver {
     }
 }
 
-fn job_process_observer_loop(raw_port: usize, observed: &Arc<Mutex<Vec<ObservedProcess>>>) {
+fn job_process_observer_loop(
+    raw_port: usize,
+    observed: &Arc<Mutex<Vec<ObservedProcess>>>,
+    shutdown_requested: &AtomicBool,
+) {
     let completion_port = raw_port as HANDLE;
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
         let mut message = 0_u32;
         let mut completion_key = 0_usize;
         let mut overlapped = ptr::null_mut();
@@ -1635,16 +1651,31 @@ fn job_process_observer_loop(raw_port: usize, observed: &Arc<Mutex<Vec<ObservedP
                 &raw mut message,
                 &raw mut completion_key,
                 &raw mut overlapped,
-                u32::MAX,
+                JOB_OBSERVER_POLL_TIMEOUT_MS,
             )
         };
+        // Capture GQCS error state before any further operation can replace it.
+        // SAFETY: GetLastError has no pointer preconditions.
+        let dequeue_error = if dequeued == 0 {
+            unsafe { GetLastError() }
+        } else {
+            0
+        };
+        if shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
+        if dequeued == 0 {
+            // WAIT_TIMEOUT is the expected poll result; any other failure
+            // ends observation rather than spinning on a broken completion port.
+            if dequeue_error == WAIT_TIMEOUT {
+                continue;
+            }
+            break;
+        }
         if completion_key == JOB_OBSERVER_SHUTDOWN_KEY {
             break;
         }
-        if dequeued == 0
-            || completion_key != JOB_COMPLETION_KEY
-            || message != JOB_OBJECT_MSG_NEW_PROCESS
-        {
+        if completion_key != JOB_COMPLETION_KEY || message != JOB_OBJECT_MSG_NEW_PROCESS {
             continue;
         }
         let Ok(pid) = u32::try_from(overlapped as usize) else {
