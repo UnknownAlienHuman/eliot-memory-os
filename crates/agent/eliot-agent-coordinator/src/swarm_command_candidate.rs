@@ -2,8 +2,9 @@
 //!
 //! [`compile_refresh_catalogue_candidate`],
 //! [`compile_replace_policy_candidate`], [`compile_launch_swarm_candidate`],
-//! and [`compile_cancel_attempt_candidate`] compile the four operator command
-//! kinds against exact current A-02 catalogue/policy identities and the exact
+//! [`compile_cancel_attempt_candidate`], and
+//! [`compile_bounded_monitor_candidate`] compile the operator command kinds
+//! against exact current A-02 catalogue/policy identities and the exact
 //! visible [`SwarmAttemptProjection`] rows. Compilation follows the
 //! `swarm_staffing.rs` digest/validate pattern: every candidate carries an
 //! immutable canonical [`SwarmCommandCandidate::command_digest`], exact replay
@@ -45,6 +46,7 @@ use crate::model_control::{
     ZeroModelExecutionCounters, canonical_digest, catalogue_digest, compile_model_selection,
     preference_policy_digest, validate_canonical_digest,
 };
+use crate::provider_account_catalogue::ProviderAccountCommand;
 use crate::swarm_controlboard::SwarmAttemptProjection;
 use crate::swarm_staffing::MAX_STAFFING_SLOTS;
 
@@ -198,6 +200,17 @@ pub struct CancelAttemptRequest {
     pub reason: String,
 }
 
+/// Bounded-monitor request carrying the existing provider-account command
+/// contract unchanged. The view time comes only from the authenticated caller
+/// binding and is recorded in the candidate so validation can prove that the
+/// requested bound was still in the future when this candidate was compiled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedMonitorRequest {
+    pub binding: SwarmCommandCallerBinding,
+    pub command: ProviderAccountCommand,
+}
+
 /// Per-role launch binding: proof that a dispatchable eligible route exists
 /// for one demanded role. The `selection_digest` is the read-only probe
 /// receipt digest bound to the command identity plus the exact
@@ -223,7 +236,7 @@ impl LaunchRoleBinding {
     }
 }
 
-/// The four command payloads. Every variant binds the exact source-view and
+/// The command payloads. Every variant binds the exact source-view and
 /// catalogue/policy/attempt identities the candidate was compiled against.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
@@ -256,6 +269,10 @@ pub enum SwarmCommandKind {
         selection_digest: String,
         role: ModelRole,
         reason: String,
+    },
+    BoundedMonitor {
+        command: ProviderAccountCommand,
+        observed_at_unix_ms: u64,
     },
 }
 
@@ -352,8 +369,39 @@ fn validate_cancel_payload(
     validate_text(reason, "command.reason")
 }
 
+fn validate_bounded_monitor_payload(
+    command: &ProviderAccountCommand,
+    account_scope: &str,
+    observed_at_unix_ms: u64,
+) -> Result<(), SwarmCommandCandidateError> {
+    command
+        .validate()
+        .map_err(|_| SwarmCommandCandidateError::InvalidField("command.bounded_monitor"))?;
+    let ProviderAccountCommand::BoundedMonitor {
+        account_scope: command_scope,
+        bound_unix_ms,
+        ..
+    } = command
+    else {
+        return Err(SwarmCommandCandidateError::InvalidField(
+            "command.bounded_monitor",
+        ));
+    };
+    if command_scope != account_scope {
+        return Err(SwarmCommandCandidateError::InvalidField(
+            "command.account_scope",
+        ));
+    }
+    if observed_at_unix_ms == 0 || *bound_unix_ms <= observed_at_unix_ms {
+        return Err(SwarmCommandCandidateError::InvalidField(
+            "command.bound_unix_ms",
+        ));
+    }
+    Ok(())
+}
+
 impl SwarmCommandKind {
-    fn validate(&self) -> Result<(), SwarmCommandCandidateError> {
+    fn validate(&self, account_scope: &str) -> Result<(), SwarmCommandCandidateError> {
         match self {
             Self::RefreshCatalogue {
                 catalogue_snapshot_id,
@@ -399,6 +447,10 @@ impl SwarmCommandKind {
                 reason,
                 ..
             } => validate_cancel_payload(selection_id, selection_digest, reason),
+            Self::BoundedMonitor {
+                command,
+                observed_at_unix_ms,
+            } => validate_bounded_monitor_payload(command, account_scope, *observed_at_unix_ms),
         }
     }
 }
@@ -499,7 +551,7 @@ impl SwarmCommandCandidate {
                 "command.view_fence",
             ));
         }
-        self.kind.validate()?;
+        self.kind.validate(&self.account_scope)?;
         if !self.candidate_only || self.dispatch_authority {
             return Err(SwarmCommandCandidateError::InvalidField(
                 "command.authority",
@@ -800,4 +852,26 @@ pub fn compile_cancel_attempt_candidate(
         reason: request.reason.clone(),
     };
     finalize_candidate(&request.binding, &request.account_scope, kind)
+}
+
+/// Compiles a bounded-monitor candidate from the existing provider-account
+/// command contract. The account scope must match the authenticated capability
+/// scope and the requested finite timestamp must be strictly later than the
+/// observed view time. This records intent only: it starts no polling, provider
+/// call, service, lease, or execution.
+pub fn compile_bounded_monitor_candidate(
+    request: &BoundedMonitorRequest,
+) -> Result<SwarmCommandCandidate, SwarmCommandCandidateError> {
+    let ProviderAccountCommand::BoundedMonitor { account_scope, .. } = &request.command else {
+        return Err(SwarmCommandCandidateError::InvalidField(
+            "command.bounded_monitor",
+        ));
+    };
+    request.binding.validate_for(account_scope)?;
+    validate_bounded_monitor_payload(&request.command, account_scope, request.binding.now_unix_ms)?;
+    let kind = SwarmCommandKind::BoundedMonitor {
+        command: request.command.clone(),
+        observed_at_unix_ms: request.binding.now_unix_ms,
+    };
+    finalize_candidate(&request.binding, account_scope, kind)
 }
