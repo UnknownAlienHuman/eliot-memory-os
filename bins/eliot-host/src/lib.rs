@@ -5014,6 +5014,14 @@ use journal_append::{
     initial_activation_record, pending_activation_binding, terminated_prior_kernel,
     transition_activation_record, transition_activation_record_with_evidence,
 };
+// I1.5 capability gate: `start_manifest_contour` reads the durable
+// `requested_capabilities` of the generation it is starting and starts only the
+// branches that set requires. The spellings come from the frozen
+// `ActivationTriggerClass` vocabulary, never from literals at the call site.
+use activation_lifecycle::{
+    CAPABILITY_CANONICAL_STORE, CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
+    requires_capability,
+};
 
 mod store_recovery_fence;
 use store_recovery_fence::{
@@ -8261,7 +8269,24 @@ impl HostComposition {
         next.trigger_evidence
             .push(phase_b_activation_binding(&phase_b)?);
         self.append_record(HostStateRecord::Activation(next))?;
-        if let Some(watchdog_approval) = watchdog_approval.as_ref()
+        // I1.5 "start only the remaining capabilities required by the admitted
+        // request". The set that may gate this contour is the one the
+        // activation generation itself durably carries, read back from the
+        // journal after the `Starting` append rather than recomputed from the
+        // caller's intent, so no branch is started for a capability no admitted
+        // request of this generation required.
+        let required = self.required_generation_capabilities()?;
+        if required.is_empty() {
+            return self.cleanup_launched_contour(HostError::RecoveryRequired(
+                "activation generation requires no capability; refusing to start a contour"
+                    .to_owned(),
+            ));
+        }
+        let requires_runtime = requires_capability(&required, CAPABILITY_RUNTIME_SUPERVISION);
+        let requires_store = requires_capability(&required, CAPABILITY_CANONICAL_STORE);
+        let requires_supervision =
+            requires_capability(&required, CAPABILITY_INDEPENDENT_SUPERVISION);
+        if let Some(watchdog_approval) = watchdog_approval.as_ref().filter(|_| requires_supervision)
             && let Err(error) = self.start_watchdog(
                 &phase_b,
                 &manifest.runtime_launch,
@@ -8287,6 +8312,16 @@ impl HostComposition {
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
+        if !(requires_runtime && requires_store) {
+            // A generation that does not require the full control contour must
+            // not run one. The Host readiness fence refuses `ControlReady`
+            // without a proven Store branch, so admitting a partial contour here
+            // would produce a generation that can never become ready; refusing
+            // the start keeps the unmet requirement visible instead.
+            return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
+                "activation generation requires runtime={requires_runtime} store={requires_store}; the approved contour needs both"
+            )));
+        }
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = match self
             .next_kernel_activation_context(
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),
