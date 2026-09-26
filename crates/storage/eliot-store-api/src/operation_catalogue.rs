@@ -748,7 +748,9 @@ pub fn validate_read_against_catalogue(
 /// `ApplyReactiveInjectionState`, and `ApplyResourceSnapshot` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
-/// and consumer triple. An `Erasure`-class plan additionally admits only the
+/// consumer triple, and semantic owner-authority gate. `ApplySwarmOwnerRevisions`
+/// remains known but unactivated until Governor's owner-specific authorization
+/// evidence is carried and verified at this boundary. An `Erasure`-class plan additionally admits only the
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
 /// below): no generic reversible-effect executor admits the erasure class
 /// through this gate.
@@ -821,7 +823,8 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
-            | NamedMutationOperation::ApplyErasure => {
+            | NamedMutationOperation::ApplyErasure
+            | NamedMutationOperation::ApplySwarmOwnerRevisions => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::ApplyNotificationState => {
