@@ -625,8 +625,16 @@ impl KernelComposition {
     }
 
     /// Returns the Kernel-owned cross-owner backup capture coordinator
-    /// (issue #959). Invocation arrives with the #962 owner-channel turn;
-    /// until then the coordinator is held without effects.
+    /// (issue #959).
+    ///
+    /// The coordinator is not merely held: `dispatch_backup_frame`'s verify
+    /// arm calls [`KernelBackupCapture::verify_only`] through this accessor
+    /// (`request_dispatch.rs`, `handle_backup_verify`), so the object is
+    /// reached on the production front door today. What is still absent is the
+    /// *capture* side of it — `capture` and `request_from_ports` have no
+    /// production caller and no production [`PublicationPort`] provider, which
+    /// is the owner-blocked half this issue's `backup.create` leg refuses with
+    /// `plan_gap` naming #959.
     #[must_use]
     pub fn backup_capture(&self) -> &KernelBackupCapture {
         &self.backup_capture
