@@ -62,6 +62,23 @@ pub struct AntigravityExecutableFingerprint {
     pub fingerprinted_at: OffsetDateTime,
 }
 
+impl AntigravityExecutableFingerprint {
+    /// Decode one canonical fingerprint JSON document (#934 W2).
+    ///
+    /// Wire text -> `serde_json::from_str` into the denied `Self` (unknown
+    /// fields and duplicate keys rejected by the derive before any map
+    /// insertion). No policy validator exists for this type and none is
+    /// invented here. Diagnostics name the error class without echoing input.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        serde_json::from_str(raw).map_err(|e| format!("malformed executable fingerprint: {e}"))
+    }
+
+    /// Byte-oriented form of [`Self::from_json_str`].
+    pub fn from_json_slice(raw: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(raw).map_err(|e| format!("malformed executable fingerprint: {e}"))
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +260,27 @@ impl AntigravityPersistentLaunchContract {
         }
         Ok(())
     }
+
+    /// Decode one canonical launch-contract JSON document (#934 W2).
+    ///
+    /// Wire text -> `serde_json::from_str` into the denied `Self` (unknown
+    /// fields and duplicate keys rejected by the derive before any map
+    /// insertion) -> `validate` (existing launch policy, reused unchanged).
+    /// Diagnostics name the error class without echoing input.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        let contract: Self =
+            serde_json::from_str(raw).map_err(|e| format!("malformed launch contract: {e}"))?;
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    /// Byte-oriented form of [`Self::from_json_str`].
+    pub fn from_json_slice(raw: &[u8]) -> Result<Self, String> {
+        let contract: Self =
+            serde_json::from_slice(raw).map_err(|e| format!("malformed launch contract: {e}"))?;
+        contract.validate()?;
+        Ok(contract)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -344,6 +382,23 @@ pub struct AntigravityPersistentLaunchReceipt {
     pub env_allowlisted: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+impl AntigravityPersistentLaunchReceipt {
+    /// Decode one canonical launch-receipt JSON document (#934 W2).
+    ///
+    /// Wire text -> `serde_json::from_str` into the denied `Self` (unknown
+    /// fields and duplicate keys rejected by the derive before any map
+    /// insertion). No policy validator exists for this type and none is
+    /// invented here. Diagnostics name the error class without echoing input.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        serde_json::from_str(raw).map_err(|e| format!("malformed launch receipt: {e}"))
+    }
+
+    /// Byte-oriented form of [`Self::from_json_str`].
+    pub fn from_json_slice(raw: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(raw).map_err(|e| format!("malformed launch receipt: {e}"))
+    }
 }
 
 pub fn is_allowed_env_name(name: &str) -> bool {
