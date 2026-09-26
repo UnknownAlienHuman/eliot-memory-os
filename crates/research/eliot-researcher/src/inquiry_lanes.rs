@@ -34,12 +34,29 @@
 //!   blocks a confirmatory claim instead of implying no exposure.
 //!
 //! The `IndependenceBlindingPolicy::registered_before_outcome_exposure` flag
-//! therefore remains what it always was — a declaration recorded by the profile
-//! — and this module's [`authorise_confirmatory_exposure`] is the only thing
-//! that authorises a confirmatory claim. A reviewer should check exactly that:
-//! the field is read nowhere in this module, and
-//! [`LaneRegistration::committed_registration_digest`] is the value a profile
-//! revision must carry.
+//! therefore remains a declaration recorded by the profile, and it is not the
+//! ordering proof. What changed for #1763 is that the flag can no longer be
+//! reached by a string: a profile revision is given a
+//! [`CommittedLaneRegistration`], never a digest, and the only way to obtain
+//! one is this crate's own profile-resolution path
+//! (`crate::inquiry_governance::commit_lane_registration`). A bare 64-hex
+//! string is therefore unrepresentable rather than merely insufficient.
+//!
+//! # What the profile binds, and why not its integrity digest
+//!
+//! [`CommittedLaneRegistration::commit`] and
+//! [`authorise_confirmatory_exposure`] both require the registration to name
+//! the exact profile revision it governs. That binding cannot be the profile's
+//! `integrity_digest`: that digest covers the independence and blinding policy,
+//! the policy's digest covers the committed registration identity, and the
+//! registration's own content digest covers the profile digest it binds — so
+//! "the registration binds the profile integrity digest" is a SHA-256 fixed
+//! point and no value satisfies it. [`InquiryProtocolProfile`] therefore also
+//! publishes `registration_binding_digest`, which covers every field of the
+//! revision except the one naming the registration, and
+//! [`verify_lane_and_profile_binding`] compares against that. The
+//! committed-identity equality it also performs is unchanged and is still the
+//! anti-replay check.
 //!
 //! # What this module does not own
 //!
@@ -304,6 +321,43 @@ impl std::fmt::Display for LaneRegistrationError {
 
 impl std::error::Error for LaneRegistrationError {}
 
+impl LaneRegistrationError {
+    /// The failing field path this error names, or `None` for the two variants
+    /// that carry another domain's typed error.
+    ///
+    /// The sibling `inquiry_governance` domain converts a refusal into its own
+    /// closed vocabulary through this accessor, so it needs the field path
+    /// without the whole typed error. The two nested variants answer `None`
+    /// because their own domain error is the lossless conversion, and the
+    /// synthetic paths below are therefore never reachable from that conversion.
+    pub(crate) fn field(&self) -> Option<&'static str> {
+        match self {
+            Self::Portfolio(_) | Self::Profile(_) => None,
+            Self::Blank { field }
+            | Self::BadDigest { field }
+            | Self::UnknownVocabulary { field }
+            | Self::LaneRegistrationRequired { field }
+            | Self::RegistrationNotCommitted { field }
+            | Self::ExposurePrecedesCommit { field }
+            | Self::OrderingReceiptForeign { field }
+            | Self::OrderingReceiptReplayed { field }
+            | Self::ExposureCoverageIncomplete { field }
+            | Self::CrossLaneEvidence { field }
+            | Self::PartitionNotFrozen { field }
+            | Self::PartitionMemberUnknown { field }
+            | Self::UnregisteredDeviation { field }
+            | Self::AttemptNotDisclosed { field }
+            | Self::BlindingNotApplied { field }
+            | Self::BlindingRemovesEssentialInformation { field }
+            | Self::SealedBlindingMappingRequired { field }
+            | Self::StaleFence { field }
+            | Self::GradeChangeNotAsDeclared { field }
+            | Self::SupersessionOwnerRequired { field }
+            | Self::IntegrityMismatch { field } => Some(field),
+        }
+    }
+}
+
 impl From<PortfolioError> for LaneRegistrationError {
     fn from(error: PortfolioError) -> Self {
         Self::Portfolio(error)
@@ -338,6 +392,15 @@ pub enum OrderedSubjectKind {
     /// The registration record itself was committed through the governed
     /// record/artifact path.
     LaneRegistrationCommit,
+    /// The independence/disclosure owner sealed the blinding mapping a
+    /// registration cites.
+    ///
+    /// This is a distinct owner act from `Disclosure`: sealing a mapping hides
+    /// it, disclosing material releases it, and one receipt must not be able to
+    /// stand for both. A registration that cites a sealed mapping is refused
+    /// unless the seal precedes its own commit, which is what
+    /// [`CommittedLaneRegistration::commit`] proves.
+    SealedBlindingMapping,
     /// Evidence was acquired.
     Acquisition,
     /// Material was disclosed to a consumer.
@@ -355,6 +418,7 @@ impl OrderedSubjectKind {
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::LaneRegistrationCommit => "lane_registration_commit",
+            Self::SealedBlindingMapping => "sealed_blinding_mapping",
             Self::Acquisition => "acquisition",
             Self::Disclosure => "disclosure",
             Self::Execution => "execution",
@@ -1482,6 +1546,61 @@ impl LaneRegistration {
         supersedes: Option<String>,
         change_reason: &str,
     ) -> Result<Self, LaneRegistrationError> {
+        let registration = Self::freeze_content(params, revision, supersedes, change_reason)?;
+        let receipt = &registration.owner_receipt;
+        receipt.validate_integrity()?;
+        if receipt.subject != OrderedSubjectKind::LaneRegistrationCommit {
+            return Err(LaneRegistrationError::RegistrationNotCommitted {
+                field: "registration.owner_receipt",
+            });
+        }
+        if receipt.state_fence != registration.state_fence {
+            return Err(LaneRegistrationError::StaleFence {
+                field: "registration.owner_receipt",
+            });
+        }
+        if receipt.subject_digest != registration.content_digest {
+            return Err(LaneRegistrationError::RegistrationNotCommitted {
+                field: "registration.owner_receipt",
+            });
+        }
+        Ok(registration)
+    }
+
+    /// The content digest an owner commit receipt for these parameters has to
+    /// attest.
+    ///
+    /// `register` requires a commit receipt whose `subject_digest` is this
+    /// value, and the commit receipt is not part of the content — it is issued
+    /// *over* the frozen content. Without this function the owner that commits a
+    /// registration could not compute the digest its own receipt must carry, so
+    /// a `LaneRegistration` would be unconstructible by the only party allowed to
+    /// commit one. The commit receipt in `params` is not read here and may hold
+    /// any well-formed value; [`LaneRegistration::register`] is what refuses one
+    /// that does not attest this digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns the field, vocabulary and stale-fence errors the content itself
+    /// raises, through the same validation [`LaneRegistration::register`]
+    /// applies.
+    pub fn content_digest_of(
+        params: &LaneRegistrationParams,
+    ) -> Result<String, LaneRegistrationError> {
+        Ok(
+            Self::freeze_content(params.clone(), 1, None, "initial lane registration")?
+                .content_digest,
+        )
+    }
+
+    /// Freezes the registration content and its digest, without the commit
+    /// receipt checks [`LaneRegistration::build`] applies afterwards.
+    fn freeze_content(
+        params: LaneRegistrationParams,
+        revision: u64,
+        supersedes: Option<String>,
+        change_reason: &str,
+    ) -> Result<Self, LaneRegistrationError> {
         require_text(&params.registration_id, "registration.registration_id")?;
         require_text(&params.inquiry_id, "registration.inquiry_id")?;
         require_text(&params.profile_id, "registration.profile_id")?;
@@ -1522,17 +1641,6 @@ impl LaneRegistration {
             .map_err(|_| LaneRegistrationError::StaleFence {
                 field: "registration.state_fence",
             })?;
-        params.owner_receipt.validate_integrity()?;
-        if params.owner_receipt.subject != OrderedSubjectKind::LaneRegistrationCommit {
-            return Err(LaneRegistrationError::RegistrationNotCommitted {
-                field: "registration.owner_receipt",
-            });
-        }
-        if params.owner_receipt.state_fence != params.state_fence {
-            return Err(LaneRegistrationError::StaleFence {
-                field: "registration.owner_receipt",
-            });
-        }
         if let Some(partition) = &params.evidence_partition {
             partition.validate_integrity()?;
         }
@@ -1557,11 +1665,6 @@ impl LaneRegistration {
             content_digest: String::new(),
         };
         registration.content_digest = registration.compute_content_digest();
-        if registration.owner_receipt.subject_digest != registration.content_digest {
-            return Err(LaneRegistrationError::RegistrationNotCommitted {
-                field: "registration.owner_receipt",
-            });
-        }
         Ok(registration)
     }
 
@@ -1646,6 +1749,134 @@ impl LaneRegistration {
         );
         freeze(&preimage)
     }
+}
+
+/// A committed lane registration admitted into a profile revision (I21.4).
+///
+/// This is the only value a profile revision can be given as its lane
+/// registration, and it is deliberately not a digest string. It carries the
+/// registration the identity was derived from, so every read re-proves that
+/// registration, its owner commit receipt and the hash-chain ancestry of that
+/// commit. A bare 64-hex string is therefore not merely insufficient — it is
+/// unrepresentable, and no crate outside this one can construct this type at
+/// all, because the only constructor is crate-private and lives on the
+/// Researcher contract owner's own profile-resolution path.
+///
+/// The constructor is deliberately not `pub`: I21.2 resolves the grade and lane
+/// here and I21.4 freezes the registration under this same contract owner, so a
+/// caller that could hand-build a committed registration could also satisfy the
+/// profile with a registration nobody committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedLaneRegistration {
+    /// The committed registration this identity was derived from.
+    registration: LaneRegistration,
+    /// Its committed identity, as [`LaneRegistration::committed_registration_digest`].
+    committed_digest: String,
+}
+
+impl CommittedLaneRegistration {
+    /// Admits one committed registration, proving the owner-issued ancestry of
+    /// its commit receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registration's own integrity failure, and
+    /// [`LaneRegistrationError::OrderingReceiptForeign`] when the commit and
+    /// the mapping seal were issued into different owner journals,
+    /// [`LaneRegistrationError::RegistrationNotCommitted`] when either receipt
+    /// does not attest its own subject, and
+    /// [`LaneRegistrationError::ExposurePrecedesCommit`] when the commit is not a
+    /// chained descendant of the mapping seal in the same journal.
+    pub(crate) fn commit(registration: LaneRegistration) -> Result<Self, LaneRegistrationError> {
+        verify_commit_ancestry(&registration)?;
+        let committed = Self {
+            committed_digest: registration.committed_registration_digest(),
+            registration,
+        };
+        committed.validate_integrity()?;
+        Ok(committed)
+    }
+
+    /// The committed identity a profile revision carries as its lane
+    /// registration digest.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.committed_digest
+    }
+
+    /// The registration this committed identity was derived from.
+    #[must_use]
+    pub fn registration(&self) -> &LaneRegistration {
+        &self.registration
+    }
+
+    /// Re-proves the registration, the committed identity over it and the
+    /// owner-issued ancestry of its commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaneRegistrationError::IntegrityMismatch`] when the committed
+    /// identity no longer matches the registration it was derived from, and the
+    /// ancestry errors of [`CommittedLaneRegistration::commit`] otherwise.
+    pub fn validate_integrity(&self) -> Result<(), LaneRegistrationError> {
+        self.registration.validate_integrity()?;
+        if self.registration.committed_registration_digest() != self.committed_digest {
+            return Err(LaneRegistrationError::IntegrityMismatch {
+                field: "committed_registration.digest",
+            });
+        }
+        verify_commit_ancestry(&self.registration)
+    }
+}
+
+/// Proves the registration's commit receipt is a chained act of the owner
+/// journal rather than a floating receipt that merely claims a position.
+///
+/// Two owner acts have a real order inside one journal: the independence/
+/// disclosure owner seals the blinding mapping the registration cites, and only
+/// then can the registration that cites that mapping be committed. The commit
+/// must therefore descend from the seal inside the same
+/// `(owner_principal, journal_identity)` pair. A receipt that jumps the chain,
+/// that claims a high position with no predecessor, or that arrives from another
+/// owner's journal, orders nothing and is refused here — which is the same
+/// ancestry property [`LaneRegistration::require_commit_precedes`] then extends
+/// from the commit to every exposure event.
+fn verify_commit_ancestry(registration: &LaneRegistration) -> Result<(), LaneRegistrationError> {
+    let commit = &registration.owner_receipt;
+    let seal = &registration.sealed_blinding_mapping.receipt;
+    if !commit.shares_journal_with(seal) {
+        return Err(LaneRegistrationError::OrderingReceiptForeign {
+            field: "registration.owner_receipt",
+        });
+    }
+    if commit.subject != OrderedSubjectKind::LaneRegistrationCommit
+        || seal.subject != OrderedSubjectKind::SealedBlindingMapping
+    {
+        return Err(LaneRegistrationError::RegistrationNotCommitted {
+            field: "registration.owner_receipt",
+        });
+    }
+    if seal.subject_digest != registration.sealed_blinding_mapping.mapping_digest {
+        return Err(LaneRegistrationError::SealedBlindingMappingRequired {
+            field: "registration.sealed_blinding_mapping",
+        });
+    }
+    let index: BTreeMap<&str, &OwnerOrderingReceipt> = BTreeMap::from([
+        (commit.receipt_digest.as_str(), commit),
+        (seal.receipt_digest.as_str(), seal),
+    ]);
+    let descends_from_seal = seal.is_strictly_before(commit)
+        && chain_reaches(
+            &index,
+            commit.receipt_digest.as_str(),
+            seal.receipt_digest.as_str(),
+        );
+    if !descends_from_seal {
+        return Err(LaneRegistrationError::ExposurePrecedesCommit {
+            field: "registration.owner_receipt",
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2806,7 +3037,7 @@ pub fn revise_grade_requirement(
     declared_change: GradeRequirementChange,
     reason: &str,
     supersession_owner: &str,
-    committed_registration_digest: Option<&str>,
+    committed_registration: Option<&LaneRegistration>,
 ) -> Result<GradeRevisionOutcome, LaneRegistrationError> {
     profile.validate_integrity()?;
     require_text(reason, "grade_revision.reason")?;
@@ -2822,17 +3053,22 @@ pub fn revise_grade_requirement(
             });
         }
     }
-    // A confirmatory revision must carry the committed registration digest; an
+    // A confirmatory revision must carry the committed registration; an
     // exploratory revision must carry none, so a confirmatory registration can
-    // never be invented for work that never needed one.
-    let expected = committed_registration_digest.map(str::to_owned);
-    if confirmatory != expected.is_some() {
+    // never be invented for work that never needed one. The value is admitted
+    // as a registration and re-proved, not as a digest string, so this path
+    // cannot launder a caller-supplied string into the profile either.
+    let committed = committed_registration
+        .cloned()
+        .map(CommittedLaneRegistration::commit)
+        .transpose()?;
+    if confirmatory != committed.is_some() {
         return Err(LaneRegistrationError::RegistrationNotCommitted {
             field: "grade_revision.lane_registration_digest",
         });
     }
     let mut params = params;
-    params.lane_registration_digest = expected;
+    params.committed_lane_registration = committed;
     let revised = profile.revise(params, reason)?;
     revised.validate_integrity()?;
     let previous_grade = profile.evidence_grade;
@@ -3084,6 +3320,19 @@ pub fn authorise_confirmatory_exposure(
 
 /// Verifies that the lane is confirmatory content and that the registration and
 /// the profile it binds are the same exact revision.
+///
+/// The registration binds [`InquiryProtocolProfile::registration_binding_digest`],
+/// not [`InquiryProtocolProfile::integrity_digest`], and the difference is not
+/// a relaxation. I21.4 makes the registration name the exact profile revision
+/// while I21.3 makes the profile carry the registration's committed identity;
+/// binding the full integrity digest would make those two requirements
+/// unsatisfiable together, because the integrity digest covers the independence
+/// and blinding policy, that policy's digest covers the committed registration
+/// identity, and the registration's own content digest covers the profile digest
+/// it binds. The binding digest covers every field of the revision *except* the
+/// one naming the registration, so "the same exact revision" still holds and the
+/// fixed point does not have to exist. The committed-identity equality below
+/// remains the anti-replay check, and it is unchanged.
 fn verify_lane_and_profile_binding(
     request: &ConfirmatoryReleaseRequest<'_>,
 ) -> Result<String, LaneRegistrationError> {
@@ -3095,8 +3344,10 @@ fn verify_lane_and_profile_binding(
             field: "profile.lane",
         });
     }
-    if request.registration.profile_digest != request.profile.integrity_digest
+    if request.registration.profile_digest != request.profile.registration_binding_digest
         || request.registration.inquiry_id != request.profile.inquiry_id
+        || request.registration.profile_id != request.profile.profile_id
+        || request.registration.profile_revision != request.profile.revision
     {
         return Err(LaneRegistrationError::OrderingReceiptReplayed {
             field: "registration.profile_digest",
@@ -3812,7 +4063,7 @@ impl InquiryLaneDiscipline {
         &mut self,
         params: LaneRegistrationParams,
     ) -> Result<&LaneRegistration, LaneRegistrationError> {
-        if params.profile_digest != self.profile.integrity_digest
+        if params.profile_digest != self.profile.registration_binding_digest
             || params.inquiry_id != self.profile.inquiry_id
         {
             return Err(LaneRegistrationError::OrderingReceiptReplayed {
@@ -4007,8 +4258,14 @@ impl InquiryLaneDiscipline {
             });
         }
         self.ledger.validate_integrity()?;
+        // The registration names the revision through
+        // `registration_binding_digest`, for the reason
+        // `verify_lane_and_profile_binding` states: naming the full
+        // `integrity_digest` would be a SHA-256 fixed point, because that digest
+        // already covers the committed registration identity.
         let registration_binds_profile = self.active_registration().is_none_or(|registration| {
-            registration.profile_digest == self.profile.integrity_digest
+            registration.profile_digest == self.profile.registration_binding_digest
+                && registration.inquiry_id == self.profile.inquiry_id
         });
         if !registration_binds_profile {
             return Err(LaneRegistrationError::OrderingReceiptReplayed {
@@ -4037,16 +4294,14 @@ impl InquiryLaneDiscipline {
         reason: &str,
         supersession_owner: &str,
     ) -> Result<GradeRevisionOutcome, LaneRegistrationError> {
-        let committed = self
-            .active_registration()
-            .map(LaneRegistration::committed_registration_digest);
+        let committed = self.active_registration().cloned();
         let outcome = revise_grade_requirement(
             &self.profile,
             params,
             declared_change,
             reason,
             supersession_owner,
-            committed.as_deref(),
+            committed.as_ref(),
         )?;
         self.adopt_revision(&outcome);
         self.preserved_claim_bindings
