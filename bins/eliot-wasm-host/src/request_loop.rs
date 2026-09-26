@@ -2265,13 +2265,10 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             served_marker.as_ref(),
         ) {
             crate::dispatch_material::StagedDeliveryState::Replay { identity } => {
-                // Same delivery this process already served to its published
-                // terminal frame — or the same grant under spent one-shot
-                // authority, or a durable-marker terminal-unacknowledged set
-                // after a crash between publish and reclaim. Serving it again
-                // would revive spent authority for a new effect, so the chain
-                // ends here with the retained result and the exact replayed
-                // identity preserved.
+                // The classifier also treats a differing identity under the
+                // same spent grant as Replay. Preserve the staged identity;
+                // the final projection may reuse an outcome only when this
+                // identity exactly matches the one served in this process.
                 if outcome.is_none() {
                     // Cross-restart replay with nothing retained in this
                     // process: drain the exact-identity staged set plus its
@@ -2356,15 +2353,15 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
             }
         }
     }
-    // A replay with a retained frame returns that result; a replay with
-    // nothing retained (cross-restart terminal-unacknowledged, or a
-    // same-grant re-stage under spent authority) is explicit in-progress
-    // — the marker carries identity, not a result payload, so no result
-    // is fabricated. Only a drive that observed nothing staged reports
-    // absence.
+    // Only an exact in-process replay may return the retained terminal
+    // frame. A same-grant replay for another identity cannot borrow that
+    // result. Cross-restart terminal-unacknowledged state remains explicitly
+    // in-progress because its marker carries identity, not a result payload.
+    // Only a drive that observed nothing staged reports absence.
     match (outcome, replayed) {
-        (Some(frame), _) => Ok(frame),
-        (None, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
+        (Some(frame), None) => Ok(frame),
+        (Some(frame), Some(identity)) if served.as_ref() == Some(&identity) => Ok(frame),
+        (_, Some(identity)) => Err(OrdinaryDriveError::DeliveryInProgress {
             operation_id: identity.operation_id,
             generation: identity.generation,
             claim_id: identity.claim_id,
