@@ -53,6 +53,10 @@ use redb::{Database, TableDefinition};
 #[cfg(test)]
 use crate::InstallationTransactionStore;
 use crate::approved_generation_registry::PendingActivationTerminalDisposition;
+#[cfg(any(test, feature = "test-support"))]
+use crate::approved_generation_registry::{
+    TestSupportRegistryFixtureContour, test_support_activation_fixture,
+};
 #[cfg(feature = "test-support")]
 use crate::validate_approval_against_manifest;
 use crate::{
@@ -399,6 +403,12 @@ impl RedbInstallationRegistry {
     /// same typed approval/fence projection that the installer transaction
     /// path commits; every subsequent Phase-B mutation goes through the real
     /// Host-owner CAS methods.
+    ///
+    /// The staged Pending record and every terminal/readback relation derived
+    /// from it retain one coherent transaction/plan/manifest/approval/intent
+    /// identity: the approval and the activation-intent digest are minted
+    /// together by the one installation-owned test-support activation fixture,
+    /// so the immediate commit below cannot drop the Pending identity.
     #[cfg(feature = "test-support")]
     pub fn seed_active_generation_for_test_support(
         &self,
@@ -426,32 +436,29 @@ impl RedbInstallationRegistry {
             field: "test_support.approval_ref".to_owned(),
             reason: error.to_string(),
         })?;
-        let runtime = &manifest.runtime_launch;
-        let approval = InstallationActivationApproval::from_verified_parts(
-            approval_ref,
-            transaction_id.clone(),
-            plan_digest.clone(),
-            manifest.generation.clone(),
-            manifest_digest,
-            runtime.descriptor_digest.clone(),
-            PlatformHandle::new("owner:test-support").map_err(|error| {
-                InstallationError::InvalidField {
-                    field: "test_support.required_owner".to_owned(),
-                    reason: error.to_string(),
-                }
-            })?,
-            manifest.signature_ref.clone(),
-            runtime.authority_descriptor_path.clone(),
-            runtime.authority_descriptor_digest.clone(),
-            runtime.authority_generation,
-            runtime.authority_state_fence.clone(),
-        );
-        approval.validate()?;
-        validate_approval_against_manifest(&approval, manifest, "test_support")?;
+        let required_owner = PlatformHandle::new("owner:test-support").map_err(|error| {
+            InstallationError::InvalidField {
+                field: "test_support.required_owner".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let activation_fixture = test_support_activation_fixture(
+            transaction_id,
+            plan_digest,
+            manifest,
+            &approval_ref,
+            &required_owner,
+            TestSupportRegistryFixtureContour::Durable,
+        )?;
+        validate_approval_against_manifest(&activation_fixture.approval, manifest, "test_support")?;
         commit_fence.validate_against_manifest(manifest)?;
         let expected_revision = self.load()?.revision();
         self.mutate_atomic(expected_revision, |registry| {
-            registry.stage_pending_activation_unchecked(manifest.clone(), approval, &[])?;
+            registry.stage_pending_activation_unchecked(
+                manifest.clone(),
+                &activation_fixture,
+                &[],
+            )?;
             registry.commit_pending_activation_unchecked(
                 transaction_id,
                 plan_digest,
@@ -487,6 +494,13 @@ impl RedbInstallationRegistry {
     /// `expected_revision` is checked against the registry snapshot inside the
     /// same redb write transaction that commits the projection.  An exact retry
     /// is a no-op and does not advance the revision.
+    ///
+    /// The staged Pending record always carries a real activation-intent
+    /// identity: a transaction that still retains its production
+    /// `InstallationActivationProjectionIntent` uses that intent through the
+    /// existing digest owner, and a fixture transaction without one uses the
+    /// single installation-owned activation fixture binding.  Neither path
+    /// substitutes the manifest, plan or approval digest.
     #[cfg(test)]
     pub fn stage_pending_activation_from_transaction_store<S: InstallationTransactionStore>(
         &self,
@@ -508,7 +522,11 @@ impl RedbInstallationRegistry {
         }
         approval.validate_against(&transaction)?;
         self.mutate_atomic(expected_revision, |registry| {
-            registry.stage_pending_activation_from_transaction_with_approval(&transaction, approval)
+            registry.stage_pending_activation_from_transaction_for_test_support(
+                &transaction,
+                approval,
+                TestSupportRegistryFixtureContour::Durable,
+            )
         })
     }
 
@@ -517,6 +535,12 @@ impl RedbInstallationRegistry {
     /// installation transaction's own bootstrap approval; it contains no
     /// caller-supplied signature or dynamic authority bytes.  The Host remains
     /// fenced until its authenticated epoch and Phase-B handoff complete.
+    ///
+    /// The bootstrap approval and its activation-intent identity come from one
+    /// versioned, domain-separated installation-owned preimage bound to the
+    /// exact transaction, plan, candidate manifest and durable registry
+    /// fixture contour, so the staged Pending record and the terminal/readback
+    /// relations derived from it keep one coherent identity.
     #[cfg(test)]
     pub fn stage_pending_activation_from_transaction_store_bootstrap<
         S: InstallationTransactionStore,
@@ -549,24 +573,20 @@ impl RedbInstallationRegistry {
             field: "bootstrap_approval.approval_ref".to_owned(),
             reason: error.to_string(),
         })?;
-        let runtime = &transaction.candidate_manifest.runtime_launch;
-        let approval = InstallationActivationApproval::from_verified_parts(
-            approval_ref,
-            transaction.transaction_id.clone(),
-            transaction.installer_plan_digest.clone(),
-            transaction.candidate_manifest.generation.clone(),
-            manifest_digest,
-            runtime.descriptor_digest.clone(),
-            transaction.request.required_owner.clone(),
-            transaction.candidate_manifest.signature_ref.clone(),
-            runtime.authority_descriptor_path.clone(),
-            runtime.authority_descriptor_digest.clone(),
-            runtime.authority_generation,
-            runtime.authority_state_fence.clone(),
-        );
-        approval.validate_against(&transaction)?;
+        let activation_fixture = test_support_activation_fixture(
+            &transaction.transaction_id,
+            &transaction.installer_plan_digest,
+            &transaction.candidate_manifest,
+            &approval_ref,
+            &transaction.request.required_owner,
+            TestSupportRegistryFixtureContour::Durable,
+        )?;
         self.mutate_atomic(expected_revision, |registry| {
-            registry.stage_pending_activation_from_transaction_with_approval(&transaction, approval)
+            registry.stage_pending_activation_from_transaction_for_test_support(
+                &transaction,
+                activation_fixture.approval,
+                TestSupportRegistryFixtureContour::Durable,
+            )
         })
     }
 
