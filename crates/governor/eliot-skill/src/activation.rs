@@ -100,10 +100,12 @@ pub struct AdherenceCheckpoints {
 impl AdherenceCheckpoints {
     /// Combines the three checkpoints without inferring compliance:
     /// any violation dominates, then partial, then unanimous followed;
-    /// unanimous silence stays `NotAssessed`, mixed silence stays `Unknown`.
+    /// any silence stays `Unknown`, never compliance (I7.25: silence about
+    /// adherence is unknown, not compliance; installation, retrieval,
+    /// repetition and model agreement never appear here).
     #[must_use]
     pub fn combined(self) -> SkillAdherenceStatus {
-        use SkillAdherenceStatus::{Followed, NotAssessed, Partial, Unknown, Violated};
+        use SkillAdherenceStatus::{Followed, Partial, Unknown, Violated};
         let checkpoints = [self.early, self.mid, self.final_checkpoint];
         if checkpoints.contains(&Violated) {
             Violated
@@ -111,8 +113,6 @@ impl AdherenceCheckpoints {
             Partial
         } else if checkpoints.iter().all(|status| *status == Followed) {
             Followed
-        } else if checkpoints.iter().all(|status| *status == NotAssessed) {
-            NotAssessed
         } else {
             Unknown
         }
@@ -565,8 +565,10 @@ pub struct LifecycleEvidence<'a> {
 /// delivery/expansion evidence; `executed`/`failed`/`uncertain` count the
 /// execution evidence by outcome and `verified` counts observed executions
 /// with verifier refs; `useful` counts attempts whose exact receipt summary is
-/// useful. Installed, delivered, executed and useful stay distinct; aggregate
-/// counts never substitute for the per-attempt receipts the caller keeps.
+/// useful. Installed, delivered, executed and useful stay distinct. The view
+/// retains the exact bound attempt receipts alongside the counters, so
+/// lifecycle fields resolve to their underlying activation records instead of
+/// leaving aggregate counts to substitute for them.
 /// Status is `Stale` with the detection reason exactly when the pinned
 /// dependencies disagree with the live set, else `Current`: quarantine only
 /// arrives through governed review, never through derivation. Interaction refs
@@ -618,6 +620,10 @@ pub fn derive_lifecycle_view(
             useful: attempts.useful,
         },
         execution_evidence: evidence.executions.to_vec(),
+        // The fold above validated every receipt and bound it to this exact
+        // skill revision and package digest, so retaining the presented slice
+        // keeps exactly the records the counters count — no more, no fewer.
+        attempt_receipts: evidence.attempts.to_vec(),
         observed_decision_or_verifier_delta: evidence.observed_decision_or_verifier_delta,
         false_activation_refs: attempts.false_activation_refs,
         interactions,
@@ -749,7 +755,8 @@ impl UnknownEffectsVerdict {
 ///
 /// Validates every presented [`SkillExecutionEvidence`] and folds the exact
 /// outcome counts through [`fold_execution_evidence`]: observed executions
-/// require exact step refs, causal credit stays denied, and missing
+/// require exact step refs, non-default causal credit requires exact step
+/// refs and never claims sole cause, and missing
 /// instrumentation never becomes an observed claim — unreported executions
 /// simply do not fold. The returned verdict names the still-uncertain
 /// execution refs; the caller refuses retry while [`UnknownEffectsVerdict::retry_permitted`]
@@ -795,8 +802,9 @@ pub fn reconcile_unknown_effects(
 }
 
 /// Counts execution evidence by outcome; observed executions with verifier
-/// refs count as verified. Causal credit is never assigned: evidence
-/// validation already forces `NoCausalCredit`. This is the single production
+/// refs count as verified. Causal credit is never a sole-cause claim:
+/// evidence validation accepts only the distributed, uncertain or associated
+/// representations, each bound to exact step refs. This is the single production
 /// outcome fold — [`reconcile_unknown_effects`] and
 /// [`derive_lifecycle_view`] both count through it, so the daemon execution
 /// ingest and the lifecycle derivation can never publish divergent counters
@@ -946,6 +954,7 @@ mod tests {
             dependencies,
             counters: LifecycleCounters::default(),
             execution_evidence: Vec::new(),
+            attempt_receipts: Vec::new(),
             observed_decision_or_verifier_delta: None,
             false_activation_refs: Vec::new(),
             interactions: SkillInteractionView::default(),
@@ -975,8 +984,8 @@ mod tests {
         );
         assert_eq!(
             summary.adhered,
-            SkillAdherenceStatus::NotAssessed,
-            "absent adherence evidence stays unassessed, never compliance"
+            SkillAdherenceStatus::Unknown,
+            "absent adherence evidence stays unknown, never compliance"
         );
         Ok(())
     }

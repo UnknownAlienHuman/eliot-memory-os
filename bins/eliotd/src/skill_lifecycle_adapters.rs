@@ -3043,6 +3043,7 @@ mod tests {
             dependencies: Vec::new(),
             counters: LifecycleCounters::default(),
             execution_evidence: Vec::new(),
+            attempt_receipts: Vec::new(),
             observed_decision_or_verifier_delta: None,
             false_activation_refs: Vec::new(),
             interactions: SkillInteractionView::default(),
