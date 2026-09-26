@@ -5239,9 +5239,9 @@ impl HostComposition {
         crate::backup_cutover::CutoverError,
     > {
         use crate::backup_cutover::{
-            CutoverDisposition, CutoverError, admitted_cutover_operation, execute_cutover,
-            plan_cutover_attempt, reconcile_cutover_outcome, validate_cutover_identity,
-            validate_cutover_request,
+            CutoverDisposition, CutoverError, OwnerObservationCoherence,
+            admitted_cutover_operation, execute_cutover, plan_cutover_attempt,
+            reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
         };
         // Real dispatch decision, resolved from the admitted cutover payload
         // itself rather than from the routing table: the presented body must
@@ -5317,6 +5317,14 @@ impl HostComposition {
         if committed.disposition != CutoverDisposition::Committed {
             return Ok((committed, barrier));
         }
+        // The registry and the journal are separate owners with no shared
+        // transaction, so the pair is only one moment if the journal is sampled
+        // on BOTH sides of the registry read. The pre-registry sample is what
+        // brackets the load; a sample taken only after it would leave the load
+        // outside the compared interval and certify a torn pair as settled.
+        let before = self.journal.snapshot().map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?;
         let readback = self
             .open_registry_store()?
             .load()
@@ -5324,19 +5332,40 @@ impl HostComposition {
         let durable = self.journal.snapshot().map_err(|error| {
             CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
         })?;
+        // A failed READ is a failure, never a concurrency fact: it is propagated
+        // with the same error the surrounding reads use, so it can never be
+        // reported as owner movement.
+        let coherence = match self.journal.snapshot() {
+            Ok(resampled)
+                if crate::backup_cutover::cutover_observation_unchanged(&before, &resampled) =>
+            {
+                OwnerObservationCoherence::Coherent
+            }
+            Ok(_) => OwnerObservationCoherence::Moving,
+            Err(error) => {
+                return Err(CutoverError::HostTransition(HostError::OwnerLeaseRecovery(
+                    error.to_string(),
+                )));
+            }
+        };
         let retirement =
             crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         let reconciled = reconcile_cutover_outcome(
             request,
-            true,
             durable.pending_cutover.as_ref(),
             readback.committed_cutover_activation(),
             readback.active_generation(),
             &retirement,
+            coherence,
         );
         if reconciled.disposition != CutoverDisposition::RetirementPending {
             return Ok((reconciled, barrier));
         }
+        // Reached only when the projection above DID return `RetirementPending`,
+        // which requires both a coherent pair and the registry's own
+        // operation-bound receipt. A torn pair returned `Unknown` +
+        // `ConcurrentOwnerMovement` at the branch above, so the proven
+        // `Committed` never reaches here unreported.
         Ok((committed, barrier))
     }
 
@@ -5351,11 +5380,13 @@ impl HostComposition {
     /// owner actually applied for this exact cutover operation, then projects
     /// them through
     /// [`crate::backup_cutover::reconcile_cutover_outcome`], so the returned
-    /// disposition is the exact requested/validated/prepared/committed/
-    /// reconciled/retirement-pending/failed/unknown state of the operation
-    /// rather than a local assumption, and
+    /// disposition is the exact state of the operation rather than a local
+    /// assumption, and
     /// [`crate::backup_cutover::CutoverOutcome::residual`] names whatever
-    /// uncertainty the owners left behind. The optional `retirement_receipt`
+    /// uncertainty the owners left behind. No caller assertion is accepted: this
+    /// port takes no `validated` flag, so the pure mapper cannot certify
+    /// qualification from a caller's word, and an unqualified read answers
+    /// `Requested`. The optional `retirement_receipt`
     /// is a lookup HINT, never the proof: it is believed only when it names the
     /// transaction identity the journal owner computed for the record it
     /// resolved, so an unrelated genuine `AppendReceipt` cannot produce
@@ -5372,15 +5403,9 @@ impl HostComposition {
     pub fn backup_dispatch_cutover_disposition(
         &self,
         request: &crate::backup_cutover::CutoverRequest,
-        validated: bool,
         retirement_receipt: Option<&eliot_host_state::AppendReceipt>,
     ) -> Result<crate::backup_cutover::CutoverOutcome, HostError> {
-        crate::backup_cutover::read_cutover_disposition(
-            self,
-            request,
-            validated,
-            retirement_receipt,
-        )
+        crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)
     }
 
     /// Executes the separately authorized prior-generation retirement that
