@@ -162,18 +162,20 @@ pub enum CommitRecoveryError {
         /// What is missing or failed.
         detail: String,
     },
-    /// A mutating operation proved no Ordering Scope, so the pause gate
-    /// cannot be shown satisfied for it. This is the precise missing-scope
-    /// limitation, never a bypass: an absent scope vector is not evidence
-    /// that a mutation is unpaused, so durable admission stays closed while
-    /// any open record could be covering the unnamed scope.
+    /// A mutating operation proved the Ordering Scope of the ledger record it
+    /// writes but not the enclosing level an open record may be indexed at, so
+    /// its coverage by the open unknown-commit set cannot be shown. This is
+    /// the precise missing-link limitation, never a bypass: an unproven link
+    /// is not evidence that a mutation is unpaused, so durable admission stays
+    /// closed while any other open record could be covering it.
     #[error(
-        "mutating operation {operation} addresses no Ordering Scope, so its unknown-commit pause coverage cannot be proven: {detail}"
+        "mutating operation {operation} proves no Ordering Scope above the ledger record it \
+         writes, so its unknown-commit pause coverage cannot be proven: {detail}"
     )]
     OrderingScopeUnresolved {
-        /// Closed operation kind whose Ordering Scope is not derivable.
+        /// Closed operation kind whose enclosing Ordering Scope is not derivable.
         operation: String,
-        /// Why no scope is available for this operation.
+        /// Why no enclosing scope is available for this operation.
         detail: String,
     },
     /// A retained record exists under the presented idempotency key but does
