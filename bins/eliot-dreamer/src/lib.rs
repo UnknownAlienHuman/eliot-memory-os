@@ -24,6 +24,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
+mod pulse;
 mod result_stage;
 mod validation_stage;
 

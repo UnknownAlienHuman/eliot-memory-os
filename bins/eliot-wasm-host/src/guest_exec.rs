@@ -226,9 +226,10 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
             return fail(code, status);
         }
     };
-    let engine = match WasmtimeComponentEngine::new_for_admitted_bytes(
+    let engine = match WasmtimeComponentEngine::new_for_admitted_limits(
         &request.artifact,
         GUEST_EXEC_COMPONENT_CONFIGURATION,
+        &request.limits,
     ) {
         Ok(engine) => engine,
         Err(error) => {
@@ -253,6 +254,14 @@ pub fn run_guest_exec(args: &GuestExecArgs) -> i32 {
             ),
             EXIT_NOT_COMPLETED,
         );
+    }
+    // Guest-side no-effect enforcement (issue #21, A4): the completed
+    // report must carry no effect content and stay inside the admitted
+    // envelope before anything is emitted. A violation fails closed with
+    // empty stdout, exactly like any other unreportable run. Canary and
+    // cutover stay Kernel/ORS-owned per I14.14; no host cutover exists here.
+    if eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&request.limits, &report).is_err() {
+        return fail("GUEST_EXEC_EMISSION_DENIED", EXIT_NOT_COMPLETED);
     }
     // Measurements first: a completed run without fully observed metering
     // is unreportable — exit without stdout rather than emit output the

@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 /// `delegation_calibration` and `ul` stay `#[serde(default)]`: approved
 /// operational sections (the in-repo `config/eliot-governor.toml` omits two of
 /// them), still enforced afterwards by `GovernorConfig::validate`.
+/// Upstream ingress: decoded directly from TOML bytes by
+/// `crates/eliot-app/src/config.rs::load_config` (`toml::from_str`, which
+/// rejects duplicate keys itself) and then `validate`d; there is no `Value`
+/// hop in this causal chain.
+/// Invalidate-on-change: if `load_config` gains a pre-parse/`Value` step,
+/// re-verify duplicate-key refusal.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernorConfig {

@@ -1,3 +1,12 @@
+//! T03/#932 slice of the shipped serde-boundary inventory (42 rows): this
+//! file holds 28 of them — 27 `derive` declarations plus the single
+//! `<inferred>` decoder-callsite, which resolves to the `#[cfg(test)]`
+//! `HostEventEnvelope` round-trip below (exact-internal, no production
+//! decoder). `config.rs` holds 13 rows and `secret_boundary.rs` holds 1;
+//! two further `config.rs` `<inferred>` rows are unassigned
+//! `exact-internal` test callsites. All 17 `Deserialize` structs here deny
+//! unknown fields; protected state/generation/epoch fields are wire-required.
+
 use crate::{
     AgentRole, AgentSessionId, OperationPhase, ProjectId, TaintClass, TaskId, WorkItemId,
     WorkLeaseId, WorktreeLeaseId, WriteReceiptRef,
@@ -169,6 +178,10 @@ pub enum AgentSessionState {
 /// nested `AgentHostIdentity`/`AgentCapabilityEnvelope` are closed too.
 /// `state` and `generation` are required on the wire: a missing value must not
 /// decode as an `Active` current-generation binding (Appendix P).
+/// Wire-nested in `delegation.rs::DelegationState` (T07/#936, denied) with
+/// the other T03 lease/job/result members.
+/// Invalidate-on-change: if that outer loses its deny or gains
+/// `flatten`/`Value` routing, re-verify nested rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionHostBinding {
@@ -194,6 +207,10 @@ pub struct AgentSessionHostBinding {
 /// and duplicate member keys are already refused by the derived `MapAccess`.
 /// `role_lease_epoch` and `operation_generation` are required on the wire: a
 /// missing value must not decode as a current-generation authority binding.
+/// Wire-nested in `external_agent.rs::ExternalAgentExecutionRequest`
+/// (T04/#933, denied) alongside `AgentInvocationRequest`.
+/// Invalidate-on-change: if that outer loses its deny or gains
+/// `flatten`/`Value` routing, re-verify nested rejection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostLaunchContract {
@@ -279,6 +296,18 @@ pub struct HostLaunchScope {
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
 /// and duplicate member keys are already refused by the derived `MapAccess`.
 /// `event_kind` stays an opaque summary string by owner contract (#371 `R4`).
+/// Upstream ingress (not edited here): production envelopes are constructed
+/// by `crates/eliot-engine/src/host.rs::HostEventService::normalize`, whose
+/// `serde_json::from_slice(raw)` bytes-to-`Value` hop already collapses
+/// duplicate keys before the manual key picks with fallbacks
+/// (`tool`/`tool_name`/`command`, `changed_path`/`file_path`/`path`,
+/// `host_session_id`/`session_id`). Byte entry is
+/// `crates/eliot-app/src/host_runtime/event_and_authority.rs::record_event`
+/// (`HostCommand::Event`, stdin). Owner: #371 (`R4` typed normalized
+/// host-event boundary — normalizer identity and loss/omission manifest).
+/// Invalidate-on-change: if `normalize` stops routing through `Value`,
+/// changes its fallbacks, or #371 redefines the tainted/normalized split,
+/// re-verify the opacity, taint, and deny claims above.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostEventEnvelope {
@@ -443,8 +472,10 @@ pub enum AgentResultStatus {
 /// and duplicate member keys are already refused by the derived `MapAccess`.
 /// `role_lease_epoch` and `operation_generation` are required on the wire: a
 /// missing value must not decode as a current-generation authority binding.
-/// Nested `canonical_receipt: WriteReceiptRef` is owned by T08/#937 and stays
-/// open here; unknown keys inside it are that owner's gap, not this decoder's.
+/// Nested `canonical_receipt: WriteReceiptRef` is closed upstream by T08/#937
+/// (`deny_unknown_fields` on `memory.rs::WriteReceiptRef`).
+/// Invalidate-on-change: if that deny is ever removed, unknown keys inside
+/// `canonical_receipt` reopen outside this decoder.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResultEnvelope {
@@ -481,8 +512,10 @@ pub enum AgentResultDispositionKind {
 
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
 /// and duplicate member keys are already refused by the derived `MapAccess`.
-/// Nested `canonical_receipt: WriteReceiptRef` is owned by T08/#937 and stays
-/// open here; unknown keys inside it are that owner's gap, not this decoder's.
+/// Nested `canonical_receipt: WriteReceiptRef` is closed upstream by T08/#937
+/// (`deny_unknown_fields` on `memory.rs::WriteReceiptRef`).
+/// Invalidate-on-change: if that deny is ever removed, unknown keys inside
+/// `canonical_receipt` reopen outside this decoder.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResultDisposition {

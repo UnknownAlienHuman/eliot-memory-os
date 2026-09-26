@@ -187,7 +187,7 @@ pub use eval::{
     ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
     HarnessExperimentRecord, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
     MetaIsolationRejectionRecord, MetaPolicyAuthorization, MetaPolicyExecutionAction,
-    MetaPolicyExecutionReceipt, ReplayThresholdPolicyV1,
+    MetaPolicyExecutionReceipt, ReplayEvaluationIntegrityReceipt, ReplayThresholdPolicyV1,
 };
 pub use external_agent::{
     ExternalAgentExecutionRequest, ExternalAgentPurpose, OPERATION_AUTHORITY_SCHEMA_VERSION,

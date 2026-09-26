@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 #[cfg(test)]
@@ -14,10 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_agent_bridge_core::{
     AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
     ConnectionId, CoverageGap, CursorPolicy, DeliveryClass, DemandId, EventDisposition,
-    EventForwardAck, EventForwardStatus, EventPortOutcome, HostActivationPort, HostEventEnvelope,
-    McpForwardingPort, OutstandingDeliveryView, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
-    ReconnectRequest, RecoveryDirective, TerminalReductionInputs, TransportEdge,
+    EventForwardAck, EventForwardStatus, EventPortOutcome, Generation, HostActivationPort,
+    HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
+    ProviderReadiness, ReconciliationPortOutcome, ReconciliationPortResult,
+    ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact, RecoveredGapFact,
+    RecoveredPendingView, RecoveredStreamFacts, RecoveryDirective, RecoveryReadRequest,
+    RecoveryView, TerminalReductionInputs, TransportEdge,
 };
 /// I7.17 recall response projection: bounded handles-first agent output with
 /// a server-derived disposition, binding receipt, and rank-trace handle.
@@ -141,12 +143,22 @@ struct KernelTransportOwner {
     limits: eliot_ipc::TransportLimits,
     activated_session: Option<String>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
-    /// Bridge-owned delivered frontier per stream: the highest sequence the
-    /// owner answered with a durable phase on this connection. Carried as the
-    /// reconcile consumed frontier so the Kernel can advance its acked
-    /// cursors; process memory only, bounded at `MAX_DELIVERED_STREAMS`,
-    /// never a reconciliation log.
-    delivered_cursors: BTreeMap<String, u64>,
+    /// Bridge-held digest-verified durable sequences per stream: the exact
+    /// contiguous set justified by the receiving owner's receipts.
+    /// Out-of-order receipts stay retained above their holes; only the
+    /// contiguous run above the owner-confirmed base is ever offered as
+    /// the consumed frontier, so pagination or reordering can never
+    /// acknowledge a hole or an unseen page. Carried as the reconcile
+    /// consumed frontier so the Kernel can advance its acked cursors;
+    /// process memory only, bounded below, never a reconciliation log.
+    delivered_sequences: BTreeMap<String, BTreeSet<u64>>,
+    /// Last contiguous frontier per stream already offered as consumed.
+    /// Monotonic: resends are idempotent no-ops the owner applies safely.
+    consumed_sent: BTreeMap<String, u64>,
+    /// Owner-confirmed acked base per stream learned from verified
+    /// reconcile replies. Held sequences at or below the base are pruned
+    /// as owner-confirmed; the contiguous run always starts above it.
+    owner_acked: BTreeMap<String, u64>,
 }
 
 type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
@@ -197,8 +209,32 @@ const BRIDGE_EVENT_DEADLINE_PREFERENCE_MS: u64 = 60_000;
 /// Maximum bridge-owned delivered streams retained for the reconcile
 /// consumed frontier. Eviction only defers ack advancement; nothing is lost.
 const MAX_DELIVERED_STREAMS: usize = 1024;
+/// Maximum held durable sequences per stream. Overflow defers acknowledgement
+/// of the newest receipts — the safe direction — without losing them
+/// owner-side; the producer's at-least-once retry redelivers.
+const MAX_DELIVERED_SEQUENCES_PER_STREAM: usize = 4096;
 /// Bound on consumed-frontier entries carried by one reconcile frame.
 const MAX_RECONCILE_CONSUMED_ENTRIES: usize = 1024;
+/// Bound on streams decoded from one owner reconcile answer. The
+/// enumeration itself stays bounded: stream-list coverage needs its own
+/// bounded continuation, not an unbounded outer collection. Hitting the
+/// bound keeps the walk partial, never silently complete.
+const MAX_RECOVERY_STREAMS: usize = 1024;
+/// Bound on events decoded from one owner stream page, mirroring the
+/// owner's own truncation cap: a 129-event stream arrives as 128 plus a
+/// continuation, and the second page stays explicitly partial until the
+/// retained-source page route serves it.
+const MAX_RECOVERY_PAGE_ITEMS: usize = 128;
+/// Bound on total events materialized from one owner answer across all
+/// streams, enforced from array lengths before any fact is built.
+const MAX_RECOVERY_TOTAL_EVENTS: usize = 4096;
+/// Bound on gaps decoded from one owner stream page, mirroring the
+/// owner's per-stream gap cap.
+const MAX_RECOVERY_GAPS_PER_STREAM: usize = 256;
+/// Bound on total gaps materialized from one owner answer.
+const MAX_RECOVERY_TOTAL_GAPS: usize = 4096;
+/// Bound on owner text legs, mirroring the retained-source text cap.
+const MAX_RECOVERY_TEXT_BYTES: usize = 1024;
 
 /// Frozen four-operation dispatch map (Implements #2561 item 1).
 ///
@@ -543,20 +579,381 @@ fn decode_best_effort_outcome(
     })
 }
 
-/// Decodes one event-route reconcile reply into the port outcome (Implements
-/// #2561 item 2, reconciliation leg).
+/// Extracts bounded owner text: non-blank, no control characters, within
+/// the retained-source text cap. Mirrors the owner's text rule without
+/// adding a store edge.
+fn recovery_text(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, ProviderFailure> {
+    let text = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && !text.chars().any(char::is_control)
+                && text.len() <= MAX_RECOVERY_TEXT_BYTES
+        })
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner text leg is not bounded text")
+        })?;
+    Ok(text.to_owned())
+}
+
+/// Extracts a bounded owner identity: text that additionally carries no key
+/// separator, mirroring the owner's identity rule.
+fn recovery_identity(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, ProviderFailure> {
+    let text = recovery_text(value, field)?;
+    if text.contains("::") {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner identity carries the key separator",
+        ));
+    }
+    Ok(text)
+}
+
+/// Extracts a lowercase SHA-256 digest leg, mirroring the owner's digest
+/// rule. A nonblank hash is never proof of anything by itself; it only
+/// names the exact retained bytes the owner holds.
+fn recovery_digest(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, ProviderFailure> {
+    let text = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner digest leg is not SHA-256 hex")
+        })?;
+    Ok(text.to_owned())
+}
+
+/// Extracts an owner cursor leg, which may be zero for a fresh stream.
+fn recovery_cursor(value: &serde_json::Value, field: &'static str) -> Result<u64, ProviderFailure> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner cursor leg is not an integer")
+        })
+}
+
+/// Extracts an owner sequence leg, which must be nonzero.
+fn recovery_sequence(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<u64, ProviderFailure> {
+    let sequence = recovery_cursor(value, field)?;
+    if sequence == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: owner sequence leg must be nonzero",
+        ));
+    }
+    Ok(sequence)
+}
+
+/// Verifies the versioned reconciliation-key preimage explicitly.
 ///
-/// Reads event ownership and cursors from the owner's answer — never from
-/// the host-request ledger. The presenting connection echo and the
-/// reconciliation key bind the answer to this exchange; the key travels as
-/// the receipt reference while the core seals the authority match against
-/// the live attach binding. An empty fact set reconciles as an empty fact
-/// set (still keyed), not as a denial: foreign bindings are refused by the
-/// face continuity check and the core seal, not by inventing ownership.
+/// The owner hashes the reconciliation object BEFORE attaching
+/// `reconcile_key` and BEFORE reconciling Governor-intake handoffs under
+/// that key, so the preimage is the answer minus exactly those two legs:
+/// observation facts in, its own key and later mutation receipts out. A
+/// mismatch is an unknown outcome — the consumed frontier may already have
+/// applied owner-side, and the monotonic server application makes a retry
+/// safe — never an attack claim and never completion proof.
+fn verify_reconcile_key(reconciliation: &serde_json::Value) -> Result<String, ProviderFailure> {
+    let key = recovery_digest(reconciliation, "reconcile_key")?;
+    let mut preimage = reconciliation.clone();
+    let object = preimage.as_object_mut().ok_or_else(|| {
+        event_shape_failure("reconciliation refused: owner answer is not an object")
+    })?;
+    object.remove("reconcile_key");
+    object.remove("handoffs_reconciled");
+    let bytes = canonical_json_bytes(&preimage).map_err(|_| event_transport_failure())?;
+    if sha256_hex(&bytes) != key {
+        return Err(event_shape_failure(
+            "reconciliation refused: key does not bind the observed facts; \
+             unknown outcome, nothing applied, safe to retry",
+        ));
+    }
+    Ok(key)
+}
+
+/// Decodes one owner gap fact: scoped under its stream, or unscoped at top
+/// level. Shape only — interval coherence against the walk window is
+/// enforced by the core on import. Gap identities are bare keys (never
+/// key-encoded with a separator), mirroring the owner's gap rule.
+fn decode_recovery_gap(
+    gap: &serde_json::Value,
+    stream_id: &str,
+) -> Result<RecoveredGapFact, ProviderFailure> {
+    let gap_id = recovery_text(gap, "gap_id")?;
+    let start_sequence = recovery_sequence(gap, "start_sequence")?;
+    let end_sequence = recovery_sequence(gap, "end_sequence")?;
+    let reason_ref = recovery_text(gap, "reason_ref")?;
+    RecoveredGapFact::checked(
+        gap_id,
+        stream_id.to_owned(),
+        start_sequence,
+        end_sequence,
+        reason_ref,
+    )
+    .map_err(|_| event_shape_failure("reconciliation refused: malformed owner gap interval"))
+}
+
+/// Running decode budget: array lengths are enforced before any fact is
+/// built, so a hostile or corrupt answer cannot force unbounded
+/// materialization.
+struct RecoveryDecodeBudget {
+    events: usize,
+    gaps: usize,
+}
+
+/// Decodes one owner stream page whole: identities, records, cursors, and
+/// gaps. The page cursors must echo the stream cursors — one snapshot, not
+/// a stitched view — every item must advance past the acknowledged base in
+/// strict order without duplicate identities, and the continuation must
+/// name the page tail within the durable cursor. A page carrying a future
+/// producer generation refuses; an older generation is retained as
+/// fenced history, never relabeled and never silently dropped.
+fn decode_recovery_stream(
+    stream: &serde_json::Value,
+    live_generation: u64,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<(RecoveredStreamFacts, u64), ProviderFailure> {
+    let (stream_id, durable_cursor, acked_cursor, page) =
+        decode_stream_snapshot(stream, live_generation)?;
+    let events = decode_page_events(&stream_id, page, live_generation, budget)?;
+    let gaps = decode_stream_gaps(stream, &stream_id, budget)?;
+    let page_continuation = decode_page_continuation(page, durable_cursor)?;
+    let page_complete = page_continuation.is_none();
+    let facts = RecoveredStreamFacts::checked(
+        stream_id,
+        durable_cursor,
+        acked_cursor,
+        events,
+        gaps,
+        page_continuation,
+        page_complete,
+    )
+    .map_err(|_| {
+        event_shape_failure(
+            "reconciliation refused: page identities, ordering, or continuation are incoherent",
+        )
+    })?;
+    Ok((facts, acked_cursor))
+}
+
+/// Decodes the stream fact header and binds the pending page to the same
+/// snapshot: identities, cursors, provenance generation, and staging
+/// provenance must all agree before any item is materialized.
+fn decode_stream_snapshot(
+    stream: &serde_json::Value,
+    live_generation: u64,
+) -> Result<(String, u64, u64, &serde_json::Value), ProviderFailure> {
+    let stream_id = recovery_identity(stream, "stream_id")?;
+    let durable_cursor = recovery_cursor(stream, "durable_cursor")?;
+    let acked_cursor = recovery_cursor(stream, "acked_cursor")?;
+    if acked_cursor > durable_cursor {
+        return Err(event_shape_failure(
+            "reconciliation refused: acknowledged cursor exceeds the durable cursor",
+        ));
+    }
+    let provenance_generation = stream
+        .get("last_producer_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: stream fact without provenance")
+        })?;
+    if provenance_generation > live_generation {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream provenance names a future generation",
+        ));
+    }
+    if stream.get("last_staging_connection").is_none() {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream fact without staging provenance",
+        ));
+    }
+    let page = stream
+        .get("pending_first_page")
+        .ok_or_else(event_transport_failure)?;
+    if page.get("stream_id").and_then(serde_json::Value::as_str) != Some(stream_id.as_str()) {
+        return Err(event_shape_failure(
+            "reconciliation refused: page stream does not match its stream fact",
+        ));
+    }
+    if page
+        .get("durable_cursor")
+        .and_then(serde_json::Value::as_u64)
+        != Some(durable_cursor)
+        || page.get("acked_cursor").and_then(serde_json::Value::as_u64) != Some(acked_cursor)
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: page cursors disagree with the stream fact snapshot",
+        ));
+    }
+    Ok((stream_id, durable_cursor, acked_cursor, page))
+}
+
+/// Decodes the page item array into checked event facts within the
+/// negotiated per-page and total budgets. No envelope is fabricated here:
+/// digest-only legs travel as named digests for the owner-redelivery path.
+fn decode_page_events(
+    stream_id: &str,
+    page: &serde_json::Value,
+    live_generation: u64,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<Vec<RecoveredEventFact>, ProviderFailure> {
+    let items = page
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    if items.len() > MAX_RECOVERY_PAGE_ITEMS {
+        return Err(event_shape_failure(
+            "reconciliation refused: page exceeds the negotiated event budget",
+        ));
+    }
+    budget.events = budget.events.saturating_add(items.len());
+    if budget.events > MAX_RECOVERY_TOTAL_EVENTS {
+        return Err(event_shape_failure(
+            "reconciliation refused: answer exceeds the negotiated total event budget",
+        ));
+    }
+    let mut events = Vec::with_capacity(items.len());
+    for item in items {
+        let event_id = recovery_identity(item, "event_id")?;
+        let sequence = recovery_sequence(item, "sequence")?;
+        let phase = item
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_owner_phase)
+            .ok_or_else(|| {
+                event_shape_failure(
+                    "reconciliation refused: page event carries an unsupported phase",
+                )
+            })?;
+        let disposition_supported = item
+            .get("disposition")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_owner_disposition)
+            == Some(EventDisposition::Accepted);
+        if !disposition_supported {
+            return Err(event_shape_failure(
+                "reconciliation refused: page event carries an unsupported disposition",
+            ));
+        }
+        let envelope_digest = recovery_digest(item, "envelope_sha256")?;
+        let producer_id = recovery_text(item, "producer_id")?;
+        let producer_generation = recovery_sequence(item, "producer_generation")?;
+        if producer_generation > live_generation {
+            return Err(event_shape_failure(
+                "reconciliation refused: page event names a future producer generation",
+            ));
+        }
+        let staging_connection = recovery_text(item, "staging_connection")?;
+        events.push(
+            RecoveredEventFact::checked(
+                stream_id.to_owned(),
+                event_id,
+                sequence,
+                phase,
+                envelope_digest,
+                producer_id,
+                producer_generation,
+                staging_connection,
+            )
+            .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?,
+        );
+    }
+    Ok(events)
+}
+
+/// Decodes the stream-scoped gap array within the negotiated gap budget.
+fn decode_stream_gaps(
+    stream: &serde_json::Value,
+    stream_id: &str,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<Vec<RecoveredGapFact>, ProviderFailure> {
+    let gaps_value = stream.get("gaps").ok_or_else(event_transport_failure)?;
+    let gaps_array = gaps_value.as_array().ok_or_else(event_transport_failure)?;
+    if gaps_array.len() > MAX_RECOVERY_GAPS_PER_STREAM {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream exceeds the negotiated gap budget",
+        ));
+    }
+    budget.gaps = budget.gaps.saturating_add(gaps_array.len());
+    if budget.gaps > MAX_RECOVERY_TOTAL_GAPS {
+        return Err(event_shape_failure(
+            "reconciliation refused: answer exceeds the negotiated total gap budget",
+        ));
+    }
+    let mut gaps = Vec::with_capacity(gaps_array.len());
+    for gap in gaps_array {
+        gaps.push(decode_recovery_gap(gap, stream_id)?);
+    }
+    Ok(gaps)
+}
+
+/// Decodes the page continuation leg: absent or null means complete, a
+/// number must stay within the durable cursor, anything else refuses.
+fn decode_page_continuation(
+    page: &serde_json::Value,
+    durable_cursor: u64,
+) -> Result<Option<u64>, ProviderFailure> {
+    match page.get("continuation") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(_)) => {
+            let continuation = recovery_sequence(page, "continuation")?;
+            if continuation > durable_cursor {
+                return Err(event_shape_failure(
+                    "reconciliation refused: page continuation exceeds the durable cursor",
+                ));
+            }
+            Ok(Some(continuation))
+        }
+        Some(_) => Err(event_shape_failure(
+            "reconciliation refused: page continuation is not a sequence",
+        )),
+    }
+}
+
+/// Decodes one event-route reconcile reply into the port outcome (Implements
+/// #2561 item 2, reconciliation leg; issue #2732 bounded continuation).
+///
+/// Reads event ownership, cursors, pages, and gaps from the owner's answer —
+/// never from the host-request ledger — and validates the actual response,
+/// not field presence: the presenting connection echo, the live generation
+/// against the presenting attach, exact stream/event/content identities,
+/// the declared window, ordering, duplicate conflicts, predecessor/next
+/// continuation coherence, and cumulative budgets. The reconciliation key
+/// is verified against its versioned preimage (observation facts minus its
+/// own key and the later handoff mutation receipts) via
+/// [`verify_reconcile_key`]. Anything malformed, foreign, or future
+/// refuses the whole answer without applying half a page; the checked
+/// facts travel into the core's recovery window through
+/// [`ReconciliationPortResult::reconciled_with_pages`], which restores the
+/// replay/pending view instead of discarding the pages. An empty fact set
+/// still reconciles as an empty fact set (still keyed), not as a denial.
+/// When `expected` carries the continuation that produced this answer, the
+/// required stream scope must still be present and its continuation must
+/// still advance past the requested predecessor; otherwise the page is a
+/// foreign or stale continuation and refuses.
 fn decode_reconciliation_outcome(
     binding: &AttachBinding,
     facts: &BridgeEventTransportFacts,
     value: &serde_json::Value,
+    port: &mut KernelMcpForwardingPort,
+    expected: Option<&RecoveryReadRequest>,
 ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
     if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true) {
         return Err(event_transport_failure());
@@ -564,68 +961,165 @@ fn decode_reconciliation_outcome(
     let reconciliation = value
         .get("reconciliation")
         .ok_or_else(event_transport_failure)?;
-    if reconciliation
+    let connection_echo = reconciliation
         .get("connection_id")
         .and_then(serde_json::Value::as_str)
-        != Some(facts.connection_id.as_str())
-    {
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner answer without connection echo")
+        })?;
+    if connection_echo != facts.connection_id.as_str() {
         return Err(event_shape_failure(
             "reconciliation refused: owner answer does not echo the presenting connection",
         ));
     }
-    let streams = reconciliation
-        .get("streams")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(event_transport_failure)?;
-    for stream in streams {
-        if stream
-            .get("stream_id")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|text| text.trim().is_empty())
-        {
-            return Err(event_shape_failure(
-                "reconciliation refused: owner stream fact without identity",
-            ));
-        }
-        for cursor in ["durable_cursor", "acked_cursor"] {
-            if stream
-                .get(cursor)
-                .and_then(serde_json::Value::as_u64)
-                .is_none()
-            {
-                return Err(event_shape_failure(
-                    "reconciliation refused: owner stream fact without cursors",
-                ));
-            }
-        }
-        if stream.get("pending_first_page").is_none() || stream.get("gaps").is_none() {
-            return Err(event_shape_failure(
-                "reconciliation refused: owner stream fact without pending page or gaps",
-            ));
-        }
-    }
-    if reconciliation.get("unscoped_gaps").is_none() {
+    let live_generation = recovery_cursor(reconciliation, "live_generation")?;
+    if live_generation == 0 {
         return Err(event_shape_failure(
-            "reconciliation refused: owner answer without unscoped gaps",
+            "reconciliation refused: live generation must be nonzero",
         ));
     }
-    let key = reconciliation
-        .get("reconcile_key")
-        .and_then(serde_json::Value::as_str)
-        .filter(|key| !key.trim().is_empty() && !key.chars().any(char::is_control))
-        .ok_or_else(event_transport_failure)?;
+    if live_generation != binding.activation_generation().get() {
+        return Err(event_shape_failure(
+            "reconciliation refused: live generation does not match the presenting attach",
+        ));
+    }
+    let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
+    let (stream_facts, stream_list_complete) =
+        decode_reconciliation_streams(reconciliation, live_generation, &mut budget, port)?;
+    let unscoped_gaps = decode_unscoped_gaps(reconciliation, &mut budget)?;
+    let unproven_scope_present = reconciliation
+        .get("unproven_scope_present")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner answer without scope provenance")
+        })?;
+    let key = verify_reconcile_key(reconciliation)?;
+    let handoffs_reconciled = reconciliation
+        .get("handoffs_reconciled")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            event_shape_failure("reconciliation refused: owner answer without handoff receipt")
+        })?;
+    check_expected_continuation(&stream_facts, expected)?;
     let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
         .map_err(|_| {
             event_shape_failure(
                 "reconciliation refused: owner key does not form a receipt reference",
             )
         })?;
-    let result = ReconciliationPortResult::reconciled(binding, receipt_ref).map_err(|_| {
+    let presenting_connection = ConnectionId::new(connection_echo).map_err(|_| {
+        event_shape_failure("reconciliation refused: connection echo is not a valid identity")
+    })?;
+    let live = Generation::new(live_generation).map_err(|_| {
+        event_shape_failure("reconciliation refused: live generation is not a valid generation")
+    })?;
+    let result = ReconciliationPortResult::reconciled_with_pages(
+        binding,
+        receipt_ref,
+        key,
+        live,
+        presenting_connection,
+        unproven_scope_present,
+        handoffs_reconciled,
+        stream_facts,
+        unscoped_gaps,
+        stream_list_complete,
+    )
+    .map_err(|_| {
         event_shape_failure(
             "reconciliation refused: live attach binding does not seal the owner answer",
         )
     })?;
     Ok(ReconciliationPortOutcome::Reconciled(result))
+}
+
+/// Decodes the stream enumeration of one owner answer within the
+/// negotiated stream budget, recording each page's owner-confirmed acked
+/// base on the port as it is decoded. The enumeration itself needs its
+/// own bound: without it the outer collection would be unbounded no
+/// matter how small each page is.
+fn decode_reconciliation_streams(
+    reconciliation: &serde_json::Value,
+    live_generation: u64,
+    budget: &mut RecoveryDecodeBudget,
+    port: &mut KernelMcpForwardingPort,
+) -> Result<(Vec<RecoveredStreamFacts>, bool), ProviderFailure> {
+    let streams = reconciliation
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(event_transport_failure)?;
+    if streams.len() > MAX_RECOVERY_STREAMS {
+        return Err(event_shape_failure(
+            "reconciliation refused: stream enumeration exceeds the negotiated budget",
+        ));
+    }
+    let stream_list_complete = streams.len() < MAX_RECOVERY_STREAMS;
+    let mut stream_facts = Vec::with_capacity(streams.len().min(64));
+    for stream in streams {
+        let (page, acked) = decode_recovery_stream(stream, live_generation, budget)?;
+        port.note_owner_acked(page.stream_id(), acked);
+        stream_facts.push(page);
+    }
+    Ok((stream_facts, stream_list_complete))
+}
+
+/// Decodes the top-level unscoped gaps within the negotiated gap budget.
+/// Unscoped coverage is accounted against the same cumulative total as
+/// stream-scoped gaps, so gap-heavy answers stay within budget.
+fn decode_unscoped_gaps(
+    reconciliation: &serde_json::Value,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<Vec<RecoveredGapFact>, ProviderFailure> {
+    let unscoped_value = reconciliation
+        .get("unscoped_gaps")
+        .ok_or_else(event_transport_failure)?;
+    let unscoped_array = unscoped_value
+        .as_array()
+        .ok_or_else(event_transport_failure)?;
+    if unscoped_array.len() > MAX_RECOVERY_GAPS_PER_STREAM {
+        return Err(event_shape_failure(
+            "reconciliation refused: unscoped gaps exceed the negotiated gap budget",
+        ));
+    }
+    budget.gaps = budget.gaps.saturating_add(unscoped_array.len());
+    if budget.gaps > MAX_RECOVERY_TOTAL_GAPS {
+        return Err(event_shape_failure(
+            "reconciliation refused: answer exceeds the negotiated total gap budget",
+        ));
+    }
+    let mut unscoped_gaps = Vec::with_capacity(unscoped_array.len());
+    for gap in unscoped_array {
+        unscoped_gaps.push(decode_recovery_gap(gap, "")?);
+    }
+    Ok(unscoped_gaps)
+}
+
+/// Requires the requested continuation scope to still be present in the
+/// answer with a continuation that still advances past the requested
+/// predecessor; otherwise the page is foreign or stale and refuses.
+fn check_expected_continuation(
+    stream_facts: &[RecoveredStreamFacts],
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<(), ProviderFailure> {
+    if let Some(request) = expected {
+        let page = stream_facts
+            .iter()
+            .find(|page| page.stream_id() == request.stream_id())
+            .ok_or_else(|| {
+                event_shape_failure(
+                    "recovery continuation refused: required stream scope absent from the answer",
+                )
+            })?;
+        if let Some(continuation) = page.page_continuation()
+            && continuation <= request.after_sequence()
+        {
+            return Err(event_shape_failure(
+                "recovery continuation refused: answer continuation does not advance past \
+                 the requested predecessor",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Admitted event-route face: durable event delivery and acknowledgement
@@ -667,6 +1161,17 @@ fn decode_reconciliation_outcome(
 /// | `forward_event` | `normalize_acp_event` for raw producer bytes (ACP owner); forwarded `EventEnvelope` linkage re-validated Kernel-side | coordinator `observe_committed_intake` over `CommittedHostEventIntake` (ACP/commit path) | owner phase/disposition/cursors from the ORS row |
 /// | `forward_gap` | gap identity/interval validation (no normalization) | none (coverage accounting) | gap acceptance bound to the gap identity |
 /// | `reconcile_external` | none (read path) | none (read path) | ownership/cursor/page facts plus the bound reconciliation key |
+///
+/// `reconcile_continue` shares the `reconcile_external` row: same closed
+/// Kernel request, same authority check, same contiguous consumed
+/// frontier — plus the pure `recovery_scope` continuation selectors
+/// (declared window key, one stream scope, predecessor sequence, explicit
+/// event/gap budgets). A continuation read changes no cursor; the token is
+/// rebound to the live authority before exchange, and the reply decodes
+/// through the same validating path with the requested scope required
+/// present. Recovery-only reads stay reachable while normal forwarding is
+/// gated, so the gate cannot block the walk that satisfies it — and the
+/// walk performs no ordinary effect, so it cannot bypass the gate either.
 ///
 /// Actual phase/disposition information returns through `McpForwardingPort`
 /// and its bridge-core callers: durable classes answer with the owner's
@@ -781,33 +1286,127 @@ impl KernelMcpForwardingPort {
         })
     }
 
-    /// Records the bridge-owned delivered frontier for one stream after the
-    /// owner answers a durable phase.
+    /// Records one digest-verified durable receipt for the exact contiguous
+    /// acknowledgement set.
     ///
+    /// The receipt joins the stream's held durable sequences; out-of-order
+    /// receipts stay retained above their holes without advancing anything.
     /// Process-local routing aid for the reconcile consumed frontier (like
     /// the byte-identity replay cache): it dies with this connection, is
     /// bounded, and is never a reconciliation log — reconciliation reads the
-    /// ORS-owned cursors. Eviction under the bound only defers ack
-    /// advancement (safe direction); nothing is lost and no cursor resets.
+    /// ORS-owned cursors. Owner-confirmed prefixes are pruned on every
+    /// verified reply; overflow and eviction only defer ack advancement
+    /// (safe direction); nothing is lost and no cursor resets.
     fn note_delivered(&mut self, stream_id: &str, sequence: u64) {
+        if sequence == 0 {
+            return;
+        }
         let Ok(mut owner) = self.shared.try_borrow_mut() else {
             return;
         };
-        let evict: Option<String> = if owner.delivered_cursors.len() >= MAX_DELIVERED_STREAMS
-            && !owner.delivered_cursors.contains_key(stream_id)
+        if !owner.delivered_sequences.contains_key(stream_id)
+            && owner.delivered_sequences.len() >= MAX_DELIVERED_STREAMS
+            && let Some(oldest) = owner.delivered_sequences.keys().next().cloned()
         {
-            owner.delivered_cursors.keys().next().cloned()
-        } else {
-            None
-        };
-        if let Some(oldest) = evict {
-            owner.delivered_cursors.remove(&oldest);
+            owner.delivered_sequences.remove(&oldest);
+            owner.consumed_sent.remove(&oldest);
+            owner.owner_acked.remove(&oldest);
         }
-        owner
-            .delivered_cursors
+        let base = owner
+            .consumed_sent
+            .get(stream_id)
+            .copied()
+            .unwrap_or(0)
+            .max(owner.owner_acked.get(stream_id).copied().unwrap_or(0));
+        let held = owner
+            .delivered_sequences
             .entry(stream_id.to_owned())
-            .and_modify(|frontier| *frontier = (*frontier).max(sequence))
-            .or_insert(sequence);
+            .or_default();
+        loop {
+            let confirmed = match held.first() {
+                Some(first) if *first <= base => *first,
+                _ => break,
+            };
+            held.remove(&confirmed);
+        }
+        if held.len() >= MAX_DELIVERED_SEQUENCES_PER_STREAM {
+            return;
+        }
+        held.insert(sequence);
+    }
+
+    /// Records the owner-confirmed acked base from a verified reconcile
+    /// reply and prunes the held sequences it confirms.
+    ///
+    /// Owner confirmation is a receipt, not local inference: only sequences
+    /// at or below the confirmed base leave the held set, and the
+    /// contiguous frontier always resumes above it.
+    fn note_owner_acked(&mut self, stream_id: &str, acked: u64) {
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        let known = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
+        if acked > known {
+            owner.owner_acked.insert(stream_id.to_owned(), acked);
+        }
+        let base = owner
+            .consumed_sent
+            .get(stream_id)
+            .copied()
+            .unwrap_or(0)
+            .max(owner.owner_acked.get(stream_id).copied().unwrap_or(0));
+        let empty = if let Some(held) = owner.delivered_sequences.get_mut(stream_id) {
+            let confirmed: Vec<u64> = held.range(..=base).copied().collect();
+            for sequence in confirmed {
+                held.remove(&sequence);
+            }
+            held.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            owner.delivered_sequences.remove(stream_id);
+        }
+    }
+
+    /// Builds the exact contiguous consumed frontier justified by the
+    /// receiving owner's receipts.
+    ///
+    /// Per stream, the frontier is the contiguous digest-verified durable
+    /// run above the owner-confirmed base: holes and unseen pages are
+    /// never acknowledged, and only newly advanced frontiers are offered.
+    /// Recording the offered frontier is idempotent — the owner applies it
+    /// monotonically, so a lost answer replays safely.
+    fn contiguous_consumed_payload(&mut self) -> Vec<serde_json::Value> {
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return Vec::new();
+        };
+        let mut frontiers: Vec<(String, u64)> = Vec::new();
+        for (stream_id, held) in &owner.delivered_sequences {
+            let sent = owner.consumed_sent.get(stream_id).copied().unwrap_or(0);
+            let acked = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
+            let mut frontier = sent.max(acked);
+            while held.contains(&frontier.saturating_add(1)) {
+                frontier = frontier.saturating_add(1);
+                if frontier == u64::MAX {
+                    break;
+                }
+            }
+            if frontier > sent {
+                frontiers.push((stream_id.clone(), frontier));
+            }
+        }
+        frontiers.sort_by(|left, right| left.0.cmp(&right.0));
+        frontiers.truncate(MAX_RECONCILE_CONSUMED_ENTRIES);
+        for (stream_id, frontier) in &frontiers {
+            owner.consumed_sent.insert(stream_id.clone(), *frontier);
+        }
+        frontiers
+            .into_iter()
+            .map(|(stream_id, sequence)| {
+                serde_json::json!({ "stream_id": stream_id, "sequence": sequence })
+            })
+            .collect()
     }
 }
 
@@ -953,17 +1552,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             ));
         }
         let now_ms = bridge_event_unix_ms()?;
-        let consumed: Vec<serde_json::Value> = self
-            .shared
-            .try_borrow()
-            .map_err(|_| event_transport_failure())?
-            .delivered_cursors
-            .iter()
-            .take(MAX_RECONCILE_CONSUMED_ENTRIES)
-            .map(|(stream_id, sequence)| {
-                serde_json::json!({ "stream_id": stream_id, "sequence": sequence })
-            })
-            .collect();
+        let consumed = self.contiguous_consumed_payload();
         let correlation = format!("bridge-reconcile:{}", facts.connection_id);
         let frame = bridge_event_frame_for_operation(
             &correlation,
@@ -977,7 +1566,80 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let reply = self.exchange(&frame)?;
         let value =
             decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
-        decode_reconciliation_outcome(binding, &facts, &value)
+        decode_reconciliation_outcome(binding, &facts, &value, self, None)
+    }
+    /// Reads one bounded recovery page inside the declared window through
+    /// the real reconcile route (issue #2732).
+    ///
+    /// The frame carries the exact contiguous consumed frontier (never a
+    /// maximum-sequence inference) plus the `recovery_scope` continuation
+    /// selectors: declared window key, one stream scope, the predecessor
+    /// sequence, and explicit event/gap budgets. The selectors are pure —
+    /// a continuation read changes no producer/consumer cursor — and the
+    /// token is rebound here to the exact live authority before anything
+    /// is exchanged: the expected generation and presenting connection
+    /// must still match the live attach, so each call rechecks the scoped
+    /// rights, including after a reconnect, and possession of the token
+    /// alone authorizes nothing. The reply decodes through the same
+    /// validating path as the full read, additionally requiring the
+    /// requested stream scope to still be present with a continuation that
+    /// advances past the requested predecessor.
+    fn reconcile_continue(
+        &mut self,
+        binding: &AttachBinding,
+        request: &RecoveryReadRequest,
+    ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+        self.check_continuity(binding)?;
+        if request.expected_generation() != binding.activation_generation().get() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "recovery continuation refused: token generation is not the live attach \
+                 generation (stale or replaced attach); nothing exchanged, nothing applied",
+            ));
+        }
+        let facts = self.transport_facts()?;
+        if facts.session.is_none() {
+            return Err(event_shape_failure(
+                "event-route recovery refused: no admitted Kernel session; attach and activate \
+                 before event recovery",
+            ));
+        }
+        if request.expected_connection() != facts.connection_id.as_str() {
+            return Err(ProviderFailure::new(
+                "eliot-kernel-front-door",
+                "recovery continuation refused: token connection is not the presenting \
+                 connection (reconnect or replacement attach); nothing exchanged, nothing applied",
+            ));
+        }
+        let now_ms = bridge_event_unix_ms()?;
+        let consumed = self.contiguous_consumed_payload();
+        let correlation = format!(
+            "bridge-recover:{}:{}:{}",
+            facts.connection_id,
+            request.stream_id(),
+            request.after_sequence()
+        );
+        let frame = bridge_event_frame_for_operation(
+            &correlation,
+            &facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Reconcile.kernel_operation(),
+                "consumed": consumed,
+                "recovery_scope": {
+                    "window_key": request.window_key(),
+                    "stream_id": request.stream_id(),
+                    "after_sequence": request.after_sequence(),
+                    "event_limit": request.event_limit(),
+                    "gap_offset": request.gap_offset(),
+                    "gap_limit": request.gap_limit(),
+                },
+            }),
+            now_ms,
+        )?;
+        let reply = self.exchange(&frame)?;
+        let value =
+            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        decode_reconciliation_outcome(binding, &facts, &value, self, Some(request))
     }
 }
 
@@ -1120,6 +1782,26 @@ pub fn kernel_ports_with_declaration(
             "receipt connection mismatch".to_owned(),
         ));
     }
+    Ok(kernel_faces_from_admission(
+        transport, runtime, loaded, limits, receipt,
+    ))
+}
+
+/// Wraps one admitted front-door connection in the single retained
+/// transport owner and splits it into the three kernel faces.
+///
+/// The owner (transport, runtime, lease, activation guard, replay cache and
+/// the phase-aware delivery/ack maps) is built here so the admission
+/// exchange in [`kernel_ports_with_declaration`] stays a straight-line
+/// handshake; the three faces share the one owner, never a second
+/// transport, runtime, or lease.
+fn kernel_faces_from_admission(
+    transport: eliot_ipc::NamedPipeTransport,
+    runtime: tokio::runtime::Runtime,
+    loaded: LoadedAgentBridgeDeclaration,
+    limits: eliot_ipc::TransportLimits,
+    receipt: AgentBridgePeerAdmissionReceipt,
+) -> KernelPorts {
     let owner: SharedTransport = Rc::new(RefCell::new(KernelTransportOwner {
         admitted: AdmittedConnection { transport, receipt },
         runtime,
@@ -1128,7 +1810,9 @@ pub fn kernel_ports_with_declaration(
         limits,
         activated_session: None,
         replay_cache: HashMap::new(),
-        delivered_cursors: BTreeMap::new(),
+        delivered_sequences: BTreeMap::new(),
+        consumed_sent: BTreeMap::new(),
+        owner_acked: BTreeMap::new(),
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
         shared: owner.clone(),
@@ -1139,7 +1823,7 @@ pub fn kernel_ports_with_declaration(
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort {
         shared: owner.clone(),
     });
-    Ok((host, host_request, fwd))
+    (host, host_request, fwd)
 }
 
 /// Projects a reactive delivery-record failure onto the closed bridge error
@@ -1336,6 +2020,25 @@ impl BridgeRunner {
     }
     pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
         self.core.reconcile_external()
+    }
+    /// Reads one bounded recovery page inside the declared window.
+    ///
+    /// Reachable while normal forwarding is gated: the walk restores
+    /// checked receipt/accounting facts without performing ordinary
+    /// effects, so recovery can satisfy the gate without bypassing it.
+    #[allow(clippy::result_large_err)]
+    pub fn recover_next_page(&mut self) -> Result<RecoveryView, BridgeError> {
+        self.core.recover_next_page()
+    }
+    /// Returns the read-only progress of the declared recovery window, if any.
+    #[must_use]
+    pub fn recovery_view(&self) -> Option<RecoveryView> {
+        self.core.recovery_view()
+    }
+    /// Lists recovered owner receipts without local acknowledgement cover.
+    #[must_use]
+    pub fn recovered_pending(&self) -> Vec<RecoveredPendingView> {
+        self.core.recovered_pending()
     }
     pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
         self.core.forward_hook(event)

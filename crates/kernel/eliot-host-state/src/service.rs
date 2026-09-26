@@ -3,13 +3,14 @@ use std::path::Path;
 use eliot_platform::PlatformHandle;
 
 use crate::{
-    AppendReceipt, HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord,
-    JournalBackend, JournalError, PreparedAppend, ReactiveContextEnqueueReceipt,
-    ReactiveContextOperationQuery, ReactiveContextPrepareRequest, ReactiveContextPrepareResult,
-    ReactiveContextPreparedEnqueue, ReactiveContextQueueError, ReactiveContextQueuePort,
-    ReactiveContextQueueQuery, ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome,
-    ReactiveContextReconcileRequest, ReactiveContextTransition, ReactiveContextTransitionReceipt,
-    ReconcileOutcome, RedbJournalBackend,
+    AppendReceipt, EpochRetirementObservation, EpochRetirementQuery, EpochRetirementQueryError,
+    HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord, JournalBackend,
+    JournalError, PreparedAppend, ReactiveContextEnqueueReceipt, ReactiveContextOperationQuery,
+    ReactiveContextPrepareRequest, ReactiveContextPrepareResult, ReactiveContextPreparedEnqueue,
+    ReactiveContextQueueError, ReactiveContextQueuePort, ReactiveContextQueueQuery,
+    ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome, ReactiveContextReconcileRequest,
+    ReactiveContextTransition, ReactiveContextTransitionReceipt, ReconcileOutcome,
+    RedbJournalBackend,
 };
 
 /// Production-facing service boundary for the Host operational journal.
@@ -89,6 +90,15 @@ impl<B: JournalBackend> HostStateJournalService<B> {
         query: ReactiveContextOperationQuery,
     ) -> Result<crate::ReactiveContextQueueEntry, ReactiveContextQueueError> {
         self.journal.query_reactive_context_operation(query)
+    }
+
+    /// Exact `EpochRetirement` record this journal applied for one canonical
+    /// operation identity, or a typed absence.
+    pub fn query_epoch_retirement(
+        &self,
+        query: &EpochRetirementQuery,
+    ) -> Result<EpochRetirementObservation, EpochRetirementQueryError> {
+        self.journal.query_epoch_retirement(query)
     }
 
     pub fn reconcile_reactive_context(

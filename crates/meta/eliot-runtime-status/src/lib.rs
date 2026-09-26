@@ -3697,6 +3697,7 @@ mod store_currentness_production_tests {
             retained_epochs: Vec::new(),
             retired_epochs: Vec::new(),
             applied_operations: applied,
+            epoch_retirements: Vec::new(),
         }
     }
     fn manifest_roots(portable: &str, host_root: &str) -> eliot_installation::RuntimeStateRoots {
@@ -4239,6 +4240,7 @@ mod live_production_observer_tests {
             retained_epochs: Vec::new(),
             retired_epochs: Vec::new(),
             applied_operations: vec![applied],
+            epoch_retirements: Vec::new(),
         };
         let manifest = {
             let portable = if cfg!(windows) {
@@ -4605,6 +4607,7 @@ mod live_production_observer_tests {
             retained_epochs: Vec::new(),
             retired_epochs: Vec::new(),
             applied_operations: Vec::new(),
+            epoch_retirements: Vec::new(),
         };
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
@@ -4667,6 +4670,7 @@ mod live_production_observer_tests {
             retained_epochs: Vec::new(),
             retired_epochs: Vec::new(),
             applied_operations: Vec::new(),
+            epoch_retirements: Vec::new(),
         };
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {

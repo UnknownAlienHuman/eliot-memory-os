@@ -165,6 +165,11 @@ pub struct NormalizedSchedule {
 
 impl NormalizedSchedule {
     /// Validates schedule shape without interpreting calendar semantics.
+    ///
+    /// Shape validation deliberately does not read the calendar: the
+    /// owner-normalized occurrence set is the trigger contract, and
+    /// [`Self::validate_normalized_occurrences`] performs the deterministic
+    /// calendar/timezone/DST interpretation over exactly that set.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         text(&self.expression, "schedule.expression")?;
         text(&self.calendar, "schedule.calendar")?;
@@ -196,6 +201,145 @@ impl NormalizedSchedule {
         }
         Ok(())
     }
+
+    /// Validates the declared timezone identifier without guessing one.
+    ///
+    /// Only the closed canonical forms are admitted: `UTC`, an `Etc/GMT`
+    /// fixed-offset zone, or a canonical `Area/Location` IANA identifier. A
+    /// blank, offset-suffixed, or otherwise shaped zone is refused instead of
+    /// being resolved to a nearest match, because an ambiguous calendar
+    /// phrase is never silently guessed.
+    pub fn validate_timezone(&self) -> Result<(), UserAutomationError> {
+        let zone = self.timezone.trim();
+        if zone != self.timezone || zone.is_empty() {
+            return Err(UserAutomationError::Invalid("schedule.timezone"));
+        }
+        let canonical = zone == "UTC"
+            || zone
+                .strip_prefix("Etc/GMT")
+                .is_some_and(offset_is_canonical)
+            || (zone.split('/').count() == 2
+                && zone.split('/').all(|segment| {
+                    !segment.is_empty()
+                        && segment
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                }));
+        if !canonical {
+            return Err(UserAutomationError::Invalid("schedule.timezone.canonical"));
+        }
+        Ok(())
+    }
+
+    /// Interprets the owner-normalized occurrence set deterministically.
+    ///
+    /// Each occurrence key is a canonical local wall clock
+    /// (`YYYY-MM-DDTHH:MM:SS`) followed by the exact UTC offset selected by the
+    /// declared timezone, so no time-zone database is required and no offset
+    /// is inferred. The check enforces the property the declared
+    /// [`DstFoldPolicy`]/[`DstGapPolicy`] must leave behind: the normalized set
+    /// is unambiguous, that is, at most one member per local wall clock. A set
+    /// that still carries an unresolved fold (or gap) member fails closed
+    /// instead of being admitted.
+    pub fn validate_normalized_occurrences(&self) -> Result<(), UserAutomationError> {
+        self.validate()?;
+        self.validate_timezone()?;
+        let mut wall_clocks = BTreeSet::new();
+        for occurrence_key in &self.next_occurrences {
+            let wall_clock = occurrence_wall_clock(occurrence_key)?;
+            if !wall_clocks.insert(wall_clock) {
+                return Err(UserAutomationError::Invalid(
+                    "schedule.next_occurrences.dst_ambiguity",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether one calendar occurrence belongs to this revision's
+    /// owner-normalized occurrence set.
+    ///
+    /// An occurrence outside the set is not resolved, shifted, or folded into a
+    /// neighbour: the caller fails closed.
+    pub fn contains_occurrence(&self, occurrence_key: &str) -> Result<bool, UserAutomationError> {
+        occurrence_wall_clock(occurrence_key)?;
+        Ok(self
+            .next_occurrences
+            .iter()
+            .any(|key| key == occurrence_key))
+    }
+
+    /// Returns the deterministic successor of one normalized occurrence.
+    ///
+    /// `None` means the occurrence is the last retained member of this
+    /// revision's projection; a caller never invents a later occurrence.
+    pub fn next_occurrence_after(
+        &self,
+        occurrence_key: &str,
+    ) -> Result<Option<String>, UserAutomationError> {
+        occurrence_wall_clock(occurrence_key)?;
+        Ok(self
+            .next_occurrences
+            .iter()
+            .skip_while(|key| key.as_str() != occurrence_key)
+            .nth(1)
+            .cloned())
+    }
+}
+
+/// Length of the canonical local wall clock prefix `YYYY-MM-DDTHH:MM:SS`.
+const OCCURRENCE_WALL_CLOCK_BYTES: usize = 19;
+
+/// Splits one canonical occurrence key into its local wall clock and exact
+/// UTC offset, refusing any spelling that is not canonical.
+fn occurrence_wall_clock(occurrence_key: &str) -> Result<&str, UserAutomationError> {
+    let bytes = occurrence_key.as_bytes();
+    if bytes.len() != OCCURRENCE_WALL_CLOCK_BYTES + 1
+        && bytes.len() != OCCURRENCE_WALL_CLOCK_BYTES + 6
+    {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.shape",
+        ));
+    }
+    if !bytes[..OCCURRENCE_WALL_CLOCK_BYTES]
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        })
+    {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.wall_clock",
+        ));
+    }
+    let offset = &occurrence_key[OCCURRENCE_WALL_CLOCK_BYTES..];
+    if offset != "Z"
+        && !(bytes.len() == OCCURRENCE_WALL_CLOCK_BYTES + 6
+            && (offset.starts_with('+') || offset.starts_with('-'))
+            && offset.as_bytes()[3] == b':'
+            && offset[1..3].bytes().all(|byte| byte.is_ascii_digit())
+            && offset[4..].bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.offset",
+        ));
+    }
+    Ok(&occurrence_key[..OCCURRENCE_WALL_CLOCK_BYTES])
+}
+
+/// Returns whether a canonical `Etc/GMT` offset suffix is well formed.
+fn offset_is_canonical(offset: &str) -> bool {
+    offset.is_empty()
+        || offset
+            .strip_prefix('+')
+            .or_else(|| offset.strip_prefix('-'))
+            .is_some_and(|hours| {
+                hours.len() == 1
+                    || (hours.len() == 2 && hours.bytes().all(|byte| byte.is_ascii_digit()))
+            })
 }
 
 /// The exact UserAutomation WorkScope projection.
@@ -530,7 +674,7 @@ impl UserAutomationRevision {
         text(&self.owner_principal, "owner_principal")?;
         self.work_scope.validate()?;
         text(&self.natural_language_intent, "natural_language_intent")?;
-        self.schedule.validate()?;
+        self.schedule.validate_normalized_occurrences()?;
         self.task.validate()?;
         list_text(
             &self.portable_skill_package_revision_refs,
@@ -639,6 +783,128 @@ impl UserAutomationRevision {
     #[must_use]
     pub const fn durable_job_operation(&self) -> JobOperationKind {
         JobOperationKind::Submit
+    }
+
+    /// Compiles one owner-normalized calendar occurrence into the immutable
+    /// scheduled trigger of this revision.
+    ///
+    /// The occurrence must be a member of this revision's normalized set. A
+    /// calendar phrase the owner did not normalize is refused here rather than
+    /// resolved, shifted, or folded into a neighbouring occurrence, so a
+    /// duplicate wake or a restart of a different schedule revision can never
+    /// invent a second identity for the same instant.
+    pub fn scheduled_trigger(
+        &self,
+        occurrence_key: &str,
+    ) -> Result<UserAutomationTrigger, UserAutomationError> {
+        self.validate()?;
+        if !self.schedule.contains_occurrence(occurrence_key)? {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.unnormalized",
+            ));
+        }
+        let trigger = UserAutomationTrigger::Scheduled {
+            occurrence_key: occurrence_key.to_owned(),
+        };
+        trigger.validate()?;
+        Ok(trigger)
+    }
+
+    /// Builds the revision-bound invocation for one calendar occurrence.
+    ///
+    /// `ScheduledWake` is the origin for the existing scheduler wake and
+    /// `AutomationChild` for an already admitted child. Neither path mints a
+    /// principal: the caller supplies the authenticated principal reference and
+    /// the owner route revalidates it before any effect.
+    pub fn scheduled_invocation(
+        &self,
+        occurrence_key: &str,
+        authenticated_principal: &str,
+        trigger_origin: UserAutomationTriggerOrigin,
+        child_depth: u16,
+    ) -> Result<UserAutomationInvocation, UserAutomationError> {
+        text(authenticated_principal, "principal_ref")?;
+        let trigger = self.scheduled_trigger(occurrence_key)?;
+        let invocation = UserAutomationInvocation {
+            automation_id: self.automation_id.clone(),
+            automation_revision: self.revision.clone(),
+            trigger,
+            mode: self.mode,
+            principal_ref: authenticated_principal.to_owned(),
+            work_scope_ref: self.work_scope.scope_id.clone(),
+            workdir_ref: self.workdir_ref.clone(),
+            trigger_origin,
+            child_depth,
+            provenance: None,
+        };
+        invocation.occurrence_identity_projection()?;
+        Ok(invocation)
+    }
+
+    /// Builds the explicit manual run-now trigger for one Human-issued nonce.
+    ///
+    /// A manual nonce never mutates the normalized schedule: the manual
+    /// occurrence is a distinct trigger kind, so it receives a distinct stable
+    /// identity from any calendar occurrence of the same revision.
+    pub fn manual_trigger(
+        &self,
+        nonce: &str,
+    ) -> Result<UserAutomationTrigger, UserAutomationError> {
+        self.validate()?;
+        text(nonce, "operation.nonce")?;
+        let trigger = UserAutomationTrigger::Manual {
+            nonce: nonce.to_owned(),
+        };
+        trigger.validate()?;
+        Ok(trigger)
+    }
+
+    /// Returns the stable revision-bound occurrence identity for one trigger.
+    pub fn occurrence_identity_for(
+        &self,
+        trigger: &UserAutomationTrigger,
+    ) -> Result<String, UserAutomationError> {
+        self.validate()?;
+        UserAutomationInvocation::occurrence_identity_for(
+            &self.automation_id,
+            &self.revision,
+            trigger,
+        )
+    }
+
+    /// Compiles the bounded next-occurrence projection of this revision into
+    /// immutable revision-bound occurrence identities.
+    ///
+    /// This is the deterministic schedule compiler surface shown to the Human
+    /// before activation and reused by every later admission: the same revision
+    /// always produces the same ordered identities, and a duplicate wake or
+    /// restart resolves to the identity already present in this list.
+    pub fn compile_occurrence_identities(
+        &self,
+    ) -> Result<Vec<AutomationOccurrenceIdentity>, UserAutomationError> {
+        self.validate()?;
+        self.schedule.validate_normalized_occurrences()?;
+        let mut identities = Vec::with_capacity(self.schedule.next_occurrences.len());
+        for occurrence_key in &self.schedule.next_occurrences {
+            let trigger = self.scheduled_trigger(occurrence_key)?;
+            let occurrence_id = self.occurrence_identity_for(&trigger)?;
+            identities.push(AutomationOccurrenceIdentity {
+                automation_id: self.automation_id.clone(),
+                revision: self.revision.clone(),
+                trigger,
+                occurrence_id,
+            });
+        }
+        Ok(identities)
+    }
+
+    /// Returns the deterministic successor occurrence of this revision.
+    pub fn next_occurrence_after(
+        &self,
+        occurrence_key: &str,
+    ) -> Result<Option<String>, UserAutomationError> {
+        self.validate()?;
+        self.schedule.next_occurrence_after(occurrence_key)
     }
 }
 
@@ -889,21 +1155,81 @@ impl AutomationExecutionReference {
     }
 }
 
+/// Why one automation occurrence still carries an unresolved effect
+/// obligation (I14.21, I5.16).
+///
+/// The disposition of a stored occurrence is never inferred from the absence
+/// of a closure or coverage record: an occurrence whose owner-issued evidence
+/// cannot be read, or one whose denominator could not be proven complete,
+/// keeps an explicit typed obligation instead of silently reading as "no
+/// effect".
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AutomationReconciliationCause {
+    /// The admitting canonical operation has no committed receipt, or its
+    /// committed receipt still requires a reconciliation envelope.
+    UnresolvedOperation,
+    /// The stored invocation row carries no usable owner-issued invocation
+    /// document (absent, legacy, or malformed). I5.16: absence of a coverage
+    /// record is `unknown`, not unrestricted/complete.
+    MissingInvocationEvidence,
+    /// The stored invocation document carries no owner-issued provenance, so
+    /// the admitting canonical operation cannot be resolved for this row.
+    MissingInvocationProvenance,
+    /// The canonical receipt lookup for the admitting operation could not be
+    /// read; the effect disposition is unknown, not absent.
+    ReceiptEvidenceUnavailable,
+    /// The declared occurrence denominator was not owner-proven complete at
+    /// the read revision, so later occurrences may still carry unresolved
+    /// effects that are not represented inline.
+    IncompleteDenominator,
+}
+
 /// Existing reconciliation obligation for an uncertain effect.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomationReconciliationReference {
-    /// Occurrence whose effect remains uncertain.
+    /// Occurrence whose effect remains uncertain, or the exact automation
+    /// denominator identity when the obligation is denominator coverage
+    /// rather than one occurrence.
     pub occurrence_id: String,
-    /// Existing ORS/reconciliation operation reference.
+    /// Existing ORS/reconciliation operation reference, or the actionable
+    /// migration reference for a row whose owner evidence is unusable. It
+    /// never claims a committed or failed outcome that was not observed.
     pub operation_ref: String,
+    /// Typed reason this obligation exists.
+    pub cause: AutomationReconciliationCause,
+    /// Owner-issued read revision the occurrence denominator was read at.
+    /// Every obligation in one projection carries the same value, so Status,
+    /// History, preflight and Remove answer from one denominator revision.
+    pub read_revision: String,
+    /// Durable owner query handle that enumerates the rest of the declared
+    /// denominator. Present exactly when coverage is not owner-proven.
+    pub denominator_query_ref: Option<String>,
 }
 
 impl AutomationReconciliationReference {
     /// Validates one reconciliation reference.
+    ///
+    /// The durable denominator handle is required exactly for
+    /// [`AutomationReconciliationCause::IncompleteDenominator`]: an
+    /// unrepresented remainder of the denominator must remain addressable
+    /// after retirement, and a per-occurrence obligation must not carry a
+    /// collection handle that implies more rows.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         text(&self.occurrence_id, "reconciliation.occurrence_id")?;
-        text(&self.operation_ref, "reconciliation.operation_ref")
+        text(&self.operation_ref, "reconciliation.operation_ref")?;
+        text(&self.read_revision, "reconciliation.read_revision")?;
+        let handle_is_expected = self.cause == AutomationReconciliationCause::IncompleteDenominator;
+        if handle_is_expected != self.denominator_query_ref.is_some() {
+            return Err(UserAutomationError::Invalid(
+                "reconciliation.denominator_query_ref",
+            ));
+        }
+        if let Some(handle) = &self.denominator_query_ref {
+            text(handle, "reconciliation.denominator_query_ref")?;
+        }
+        Ok(())
     }
 }
 
@@ -921,6 +1247,12 @@ pub struct UserAutomationExecutionProjection {
 
 impl UserAutomationExecutionProjection {
     /// Validates projection shape and retains unknown outcomes as obligations.
+    ///
+    /// Every retained obligation must also agree on one owner-issued
+    /// denominator read revision. Two revisions in one projection mean the
+    /// read raced a successor commit or retirement, so the set was assembled
+    /// from two snapshots and fails closed instead of answering as one
+    /// complete denominator.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         list_len(
             self.current_execution_refs.len(),
@@ -933,8 +1265,18 @@ impl UserAutomationExecutionProjection {
             self.unresolved_reconciliation_refs.len(),
             "execution.unresolved_reconciliation_refs",
         )?;
+        let mut read_revision: Option<&str> = None;
         for reconciliation in &self.unresolved_reconciliation_refs {
             reconciliation.validate()?;
+            match read_revision {
+                None => read_revision = Some(reconciliation.read_revision.as_str()),
+                Some(observed) if observed == reconciliation.read_revision => {}
+                Some(_) => {
+                    return Err(UserAutomationError::Invalid(
+                        "execution.unresolved_reconciliation_refs",
+                    ));
+                }
+            }
         }
         text(&self.history_query_ref, "execution.history_query_ref")
     }
@@ -948,6 +1290,10 @@ impl UserAutomationExecutionProjection {
     }
 
     /// Returns whether an effect must be reconciled before a new admission.
+    ///
+    /// An unproven occurrence denominator is itself an obligation, so an
+    /// incomplete or unreadable denominator reads as blocking rather than as
+    /// "no reconciliation obligation" (I5.16).
     #[must_use]
     pub fn requires_reconciliation(&self) -> bool {
         !self.unresolved_reconciliation_refs.is_empty()

@@ -37,7 +37,7 @@ use thiserror::Error;
 
 use crate::{
     CapabilityId, ComponentEnginePort, EffectProposal, EngineInvocation, EngineReport,
-    EngineTermination, PortError, Sha256Digest, canonical_digest,
+    EngineTermination, InvocationLimits, PortError, Sha256Digest, canonical_digest,
 };
 
 /// Lifecycle labels from I14.19. These are a projection of the canonical
@@ -575,6 +575,113 @@ pub fn reconcile_shadow(
             divergences,
         },
     }
+}
+
+/// Guest-side no-effect violation: the executed guest produced effect
+/// content or out-of-envelope demand. The host-child boundary carries only
+/// the child emission code; the typed reason stays at this call boundary.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum GuestNoEffectError {
+    /// Executed guest produced canonical/external effect content.
+    #[error("guest produced effect content")]
+    EffectContent {
+        /// Failing content class (never payloads).
+        field: &'static str,
+    },
+    /// Executed guest demands memory or artifact influence beyond its envelope.
+    #[error("guest exceeded its memory envelope")]
+    MemoryEnvelope {
+        /// Failing envelope leg (never measurements).
+        field: &'static str,
+    },
+    /// Executed guest reports an epoch policy other than the admitted one.
+    #[error("guest epoch policy disagrees with the admitted policy")]
+    EpochPolicy,
+}
+
+/// Enforces guest-side no-effect for one executed report against its
+/// admitted limits: the guest half of A13.3/A4 (issue #21).
+///
+/// The executing child calls this on its completed report before emitting
+/// anything: a guest that produced effect content (proposed effects, state
+/// deltas, host calls) or out-of-envelope memory/artifact demand fails
+/// closed instead of emitting. Contour-agnostic by construction — the child
+/// carries no contour, so the check verifies the execution invariant every
+/// contour requires; the contour-conditional host gate stays parent-side.
+/// Wall time and epoch ticks are load/driver-race sensitive and stay with
+/// the epoch driver plus the host scheduling gate; they are not re-verified
+/// here. Canary effects and cutover stay Kernel/ORS-owned per I14.14.
+pub fn enforce_guest_no_effect(
+    limits: &InvocationLimits,
+    report: &EngineReport,
+) -> Result<(), GuestNoEffectError> {
+    if !report.proposed_effects.is_empty() {
+        return Err(GuestNoEffectError::EffectContent {
+            field: "proposed-effects",
+        });
+    }
+    if !report.observed_state_delta.is_empty() {
+        return Err(GuestNoEffectError::EffectContent {
+            field: "state-delta",
+        });
+    }
+    if !report.host_calls.is_empty() || report.usage.host_calls != 0 {
+        return Err(GuestNoEffectError::EffectContent {
+            field: "host-calls",
+        });
+    }
+    if report.usage.effective_epoch_policy != limits.epoch {
+        return Err(GuestNoEffectError::EpochPolicy);
+    }
+    if report
+        .usage
+        .peak_memory_bytes
+        .is_none_or(|bytes| bytes > limits.max_memory_bytes)
+    {
+        return Err(GuestNoEffectError::MemoryEnvelope {
+            field: "peak-memory",
+        });
+    }
+    if report
+        .usage
+        .table_elements
+        .is_none_or(|elements| elements > limits.max_table_elements)
+    {
+        return Err(GuestNoEffectError::MemoryEnvelope {
+            field: "table-elements",
+        });
+    }
+    if report.usage.instances > limits.max_instances {
+        return Err(GuestNoEffectError::MemoryEnvelope { field: "instances" });
+    }
+    if report
+        .usage
+        .stack_bytes
+        .is_some_and(|bytes| bytes > limits.max_stack_bytes)
+        || report.usage.enforced_stack_limit_bytes != Some(limits.max_stack_bytes)
+    {
+        return Err(GuestNoEffectError::MemoryEnvelope {
+            field: "stack-limit",
+        });
+    }
+    if report.usage.artifact_reads > limits.artifact_access.max_reads
+        || report.usage.artifact_bytes > limits.artifact_access.max_bytes
+    {
+        return Err(GuestNoEffectError::MemoryEnvelope {
+            field: "artifact-bounds",
+        });
+    }
+    if !report
+        .usage
+        .accessed_artifact_digests
+        .iter()
+        .all(|digest| limits.artifact_access.allowed_digests.contains(digest))
+    {
+        return Err(GuestNoEffectError::MemoryEnvelope {
+            field: "artifact-allowlist",
+        });
+    }
+    Ok(())
 }
 
 /// Versioned state snapshot owned by the host.

@@ -54,6 +54,7 @@ mod experience_runtime;
 mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
+mod governor_observe_serve;
 pub mod improvement_candidate_route;
 pub mod improvement_intake;
 mod kernel_authority_client;
@@ -63,6 +64,7 @@ mod kernel_transition_client;
 pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
 pub mod notification_board_attach;
+pub mod notification_state_emit;
 mod observation_adapters;
 mod owner_feed;
 mod process_origin;
@@ -121,9 +123,16 @@ pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
 };
+pub use controlboard_adapters::{
+    CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
+    controlboard_result_body, is_controlboard_read_tool, serve_controlboard_view,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
-pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
+pub use daemon_kernel_client::{
+    DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome, ObserveSubmitOutcome,
+    OwnerSessionFacts,
+};
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
 #[cfg(all(test, windows))]
@@ -131,6 +140,9 @@ pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
 pub use daemon_kernel_client::{parse_local_read_claimed_pair, parse_local_read_submit_outcome};
+pub use daemon_kernel_client::{
+    parse_observe_claimed_pair, parse_observe_defer_outcome, parse_observe_submit_outcome,
+};
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
     DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
@@ -170,14 +182,23 @@ pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
     serve_admitted_local_read,
 };
+pub use governor_observe_serve::{
+    ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
+    observe_suboperation_owner, serve_admitted_observe,
+};
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, check_improvement_repeat, improvement_operation_owners,
+    ImprovementRouteRequest, assess_improvement_repeat, improvement_operation_owners,
     improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+};
+pub use notification_state_emit::{
+    AutomationFailureKey, NotificationStateEmit, automation_failure_key,
+    emit_blocked_automation_notification, notification_already_recorded,
+    read_notification_ordering_head,
 };
 pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
 pub use process_origin::{
@@ -438,9 +459,14 @@ pub struct DaemonComposition {
     ///
     /// Volatile fast path only, never durability: a newly created board
     /// replays an already-admitted operation without a second effecting-port
-    /// call while the process lives. Durable operator identity lives in
-    /// Kernel ORS through the async Governor operator borrow; post-commit
-    /// refreshes retain this handle without ever clearing it.
+    /// call while the process lives. Cross-restart durability is NOT owned by
+    /// Kernel ORS through an async Governor operator borrow: the borrow reaches
+    /// only `KernelTransitionPort::receipt`, whose `eliot_store_api::WriteReceipt`
+    /// carries neither the `session_id` nor the `access_digest` a reconciled
+    /// board receipt must carry, so the contract this would need is a
+    /// command-receipt projection read for the exact `OperationId` that no
+    /// reachable port returns. Post-commit refreshes retain this handle without
+    /// ever clearing it.
     operator_replay: SharedOperatorReplay,
     /// Set when a post-commit refresh fails after the write receipt was
     /// already durable. The dependent view is stale/pending until the caller
@@ -503,6 +529,16 @@ pub struct DaemonComposition {
     /// execute. Semantics stay in the Governor registry; this is the
     /// composition root's handle on that view.
     capability_admission: GovernorCapabilityAdmission,
+    /// Governor-owned durable learning-closure owner (issue #1863, I12.24).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`] and owned by the
+    /// single [`eliot_governor::LearningClosureService`]. The live finish
+    /// ceremony commits one durable `AttemptLearningDelta` edge per
+    /// consequential attempt through it (see
+    /// [`DaemonComposition::close_attempt_learning`]). It holds no authority,
+    /// performs no transport, and is never read on the readiness path: closure
+    /// must not block or fail the finish ceremony.
+    learning_closure: eliot_governor::LearningClosureService,
 }
 
 impl DaemonComposition {
@@ -566,6 +602,7 @@ impl DaemonComposition {
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
             capability_admission: GovernorCapabilityAdmission::new(),
+            learning_closure: eliot_governor::LearningClosureService::new(),
         })
     }
 
@@ -867,6 +904,50 @@ impl DaemonComposition {
         self.governor.kernel_snapshot()
     }
 
+    /// Commits the durable learning-closure edge for one consequential attempt.
+    ///
+    /// This is the production caller of
+    /// [`eliot_governor::GovernorComposition::close_attempt_learning`] on the
+    /// live `TestD` terminal finish ceremony
+    /// (`testd_terminal_completion::commit_testd_terminal_owner_fact`, phase 6).
+    ///
+    /// `activity_name` is the activity/tool identity the durable terminal job
+    /// row recorded for the observed step, and it is the value the ordinary-read
+    /// exclusion is applied to: a recorded `read_file`/`read`/`grep` derives no
+    /// boundary and commits no record.
+    ///
+    /// `receipt` is the admission receipt presented for the stored record. No
+    /// admission-receipt owner issues one at this seam, so the live caller
+    /// presents `None` and the durable receipt records the gate refusal: an
+    /// unadmitted proposed behavioral change is not delivered to the subsequent
+    /// attempt.
+    ///
+    /// The edge is non-blocking by construction: it reads retained owner
+    /// images, performs no transport, and its result is returned to the caller
+    /// instead of being propagated into the finish decision (I12.24 line 293).
+    pub fn close_attempt_learning(
+        &self,
+        evidence: &eliot_testd_core::TestdTerminalCompletionEvidence,
+        decision: &eliot_governor::FinishDecisionReceipt,
+        activity_name: &str,
+        receipt: Option<&eliot_governor::AdmissionReceipt>,
+    ) -> Result<eliot_governor::LearningClosureOutcome, eliot_governor::LearningClosureError> {
+        self.governor.close_attempt_learning(
+            &self.learning_closure,
+            evidence,
+            decision,
+            activity_name,
+            None,
+            receipt,
+        )
+    }
+
+    /// Borrows the single Governor-owned durable learning-closure owner.
+    #[must_use]
+    pub const fn learning_closure(&self) -> &eliot_governor::LearningClosureService {
+        &self.learning_closure
+    }
+
     /// Returns the retained protected config path, for diagnostics only.
     #[must_use]
     pub fn config_path(&self) -> &Path {
@@ -1119,17 +1200,54 @@ impl DaemonComposition {
         self.notification_snapshot = records;
     }
 
+    /// Joins the owner-side canonical notification-state admission to this
+    /// composition's live retained fact: material readiness plus the exact
+    /// admitted State Fence the transition must be built and submitted under
+    /// (issue #1780, I1.8).
+    ///
+    /// The fence is read from the retained Governor snapshot, never from a
+    /// caller claim, so a transported or cached fence cannot substitute it.
+    ///
+    /// This is deliberately **not** a write intake and carries no commit. It
+    /// performs no canonical write, never calls
+    /// [`Self::commit_canonical_and_refresh`], and never calls
+    /// `GovernorComposition::check_canonical_write_work_scope`: that gate
+    /// withholds any write whose `scope_id` is not the bound `WorkScope`, and
+    /// the fixed canonical notification scope
+    /// (`eliot_store_api::NOTIFICATION_STATE_SCOPE`) is by contract never that
+    /// `WorkScope` — a notification write routed through the gate would be
+    /// silently withheld rather than refused. Submission therefore goes to the
+    /// admitted Kernel `ApplyNotificationState` route over the retained daemon
+    /// transport through [`crate::notification_state_emit`], which rechecks the
+    /// fixed scope, ordering scope, transition class, and closed leg parameters
+    /// itself and additionally requires a same-fence record read-back.
+    pub fn notification_state_admission_fence(&self) -> Result<StateFence, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(self.governor.kernel_snapshot().state_fence().clone())
+    }
+
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
+    /// This is the one production composition owner of the `ControlBoard` ports
+    /// (Implements #1187 W1/A1). Its production caller is
+    /// [`serve_controlboard_view`](crate::serve_controlboard_view), which the
+    /// daemon runtime's local-read poller serves for one Kernel-admitted
+    /// claimed pair; no other site builds a board.
+    ///
     /// The board reads one immutable snapshot taken here; every port call in
-    /// the returned value observes the same revision and fence. Callers take
-    /// a fresh board per operation so a Governor refresh surfaces as an
-    /// exact-view mismatch instead of silent divergence. The board shares the
-    /// retained volatile replay handle, so a newly created board replays an
-    /// already-admitted operation instead of admitting it twice; durable
-    /// operator identity stays in Kernel ORS through the async Governor
-    /// operator borrow. Access resolution admits exactly the one live
+    /// the returned value observes the same revision and fence, so one served
+    /// read cannot mix two of either. Callers take a fresh board per operation,
+    /// which means a Governor refresh is not observed by the board in flight:
+    /// it appears at the next read as a newer, still internally consistent view,
+    /// not as a mismatch. The board shares the retained volatile replay handle,
+    /// so a newly created board replays an already-admitted operation instead
+    /// of admitting it twice; cross-restart durability is not owned here — it
+    /// needs the command-receipt projection read for the exact `OperationId`
+    /// that the `operator_replay` field contract names and that no reachable
+    /// port provides. Access resolution admits exactly the one live
     /// Kernel-issued owner session when the runtime threaded validated facts
     /// (AUD-C02-B), else the typed provider gap; the Swarm projection remains
     /// a typed provider gap until its owning slice lands. Reads serve a

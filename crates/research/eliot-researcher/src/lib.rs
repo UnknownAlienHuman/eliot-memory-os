@@ -1,16 +1,58 @@
 //! Researcher composition root.
 //!
-//! Researcher owns acquisition requests and bridge composition only. It does
-//! not interpret claims, promote memory, or bypass the exchange fence.
+//! Researcher owns acquisition requests, the frozen evidence portfolio, the
+//! typed `R6` inquiry-governance domain and the confirmatory/exploratory lane
+//! registration that gates a confirmatory claim. It does not interpret claims,
+//! promote memory, own a work graph, or bypass the exchange fence.
 
 #![forbid(unsafe_code)]
 
 pub mod evidence_portfolio;
+pub mod inquiry_governance;
+pub mod inquiry_lanes;
+pub mod inquiry_obligations;
+pub mod source_admissibility;
 
 use eliot_contracts::StateFence;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
 use eliot_research_exchange_api::{
     AllowedReferenceManifest, AnchorPrecision, DisclosureClass, ResearchQueryRequest, SourceClass,
+};
+
+// The `R6` typed inquiry-governance surface. Every field type a consumer reads
+// off an exported record is nameable here, so the domain can be consumed without
+// reaching into a module path for a vocabulary it must match on.
+pub use inquiry_governance::{
+    AcquisitionOutcome, BlindedField, CandidateEvidence, CounterSearchStatus, CoverageGoal,
+    CoverageReceipt, DenominatorKind, EvidenceFreeze, EvidenceGrade, EvidenceSetPrecision,
+    GovernorInquiryAdmissionRequest, HypothesisPolicy, IndependenceBlindingPolicy,
+    IndependenceDimension, IndependenceProfile, InquiryError, InquiryGovernance, InquiryHorizon,
+    InquiryLane, InquiryObservation, InquiryOutputContract, InquiryProtocol,
+    InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures, InquiryStopRule,
+    InquiryTerminalRecord, InquiryUncertainty, MissingSourceClass, PreservedNextProbe,
+    PreservedUnknown, ReopenCondition, ResearchDebt, ResearchDebtKind, SourcePortfolio,
+    SpecialistDiscoverability, StopRuleKind, StreamEvidence, VerifierStrength,
+};
+pub use inquiry_lanes::{
+    AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
+    BlindingApplication, ConfirmatoryClaimKind, ConfirmatoryExposureAuthorization,
+    ConfirmatoryLaneClaim, ConfirmatoryReleaseRequest, DeterministicAssignmentRule,
+    DeviationAllowance, DeviationDisposition, DeviationRecord, DeviationRecordParams,
+    DeviationScope, ExclusionAndQualityControl, ExploratoryFinding, ExploratoryRelease,
+    ExposureChannel, ExposureEvent, ExposureEventKind, ExposureEventParams, ExposureLedger,
+    GradeChangeKind, GradeRequirementChange, GradeRevisionOutcome, InquiryLaneDiscipline,
+    LaneEvidenceClass, LanePartition, LanePartitionParams, LaneRegistration, LaneRegistrationError,
+    LaneRegistrationParams, LaneReleaseAuthorization, OrderedSubjectKind, OwnerOrderingReceipt,
+    OwnerOrderingReceiptParams, PartitionAssignment, PartitionSide, PrimaryOutcomeRule,
+    RegistrationDigests, SealedBlindingMapping, SealedBlindingMappingParams,
+};
+pub use inquiry_obligations::{
+    AcceptanceCertificateKind, InquiryObligation, InquiryObligationStatus,
+    TaskGraphCompilationInputs,
+};
+pub use source_admissibility::{
+    GovernorSourceTransitionRequest, SourceAdmissibilityReason, SourceAdmissibilityRecord,
+    SourceEligibility, SourceIndependence, SourceLimits, SourceTaint,
 };
 
 pub struct Researcher<B> {

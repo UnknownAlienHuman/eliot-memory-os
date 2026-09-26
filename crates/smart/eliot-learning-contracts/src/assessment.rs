@@ -42,6 +42,10 @@ pub enum AssessmentDimension {
     CausalCeiling,
     /// Privacy, authority and proof constraints.
     PrivacyAuthorityProof,
+    /// Cost evidence, retained independently from benefit.
+    Cost,
+    /// Regret evidence against the foregone control outcome.
+    Regret,
 }
 
 impl AssessmentDimension {
@@ -61,6 +65,8 @@ impl AssessmentDimension {
             Self::TransferApplicability => "TRANSFER_APPLICABILITY",
             Self::CausalCeiling => "CAUSAL_CEILING",
             Self::PrivacyAuthorityProof => "PRIVACY_AUTHORITY_PROOF",
+            Self::Cost => "COST",
+            Self::Regret => "REGRET",
         }
     }
 }

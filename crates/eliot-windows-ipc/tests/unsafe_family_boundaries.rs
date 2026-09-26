@@ -245,3 +245,41 @@ fn credential_boundary_fixture_binds_sites_and_deferred_families() {
         );
     }
 }
+
+// WORK_UNIT_CASE inventory 789/13..42 (wave 2, issue #789 implementation
+// lane): declaration-only. Each marker below names its wired bounding
+// implementation plus production caller; EXECUTION stays TEST-PHASE (no
+// #[test] here per the owner NO TESTS order). The fixture `cases` array
+// carries the matching DATA rows. Discovery rule: a marker line counts as
+// DECLARED; only a marker immediately above #[test] counts as EXECUTED
+// (cases 1..12 above).
+// WORK_UNIT_CASE: 789/13 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::OwnedHandle::drop caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::drop
+// WORK_UNIT_CASE: 789/14 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::SuspendedProcessGuard::drop caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named
+// WORK_UNIT_CASE: 789/15 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::acquire caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/16 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::mutation_attempted caller crates/eliot-app/src/cognitive_runner.rs::mutation_attempted
+// WORK_UNIT_CASE: 789/17 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::drop caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/18 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::acquire caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/19 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::drop caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/20 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::drop caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/21 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::drop caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/22 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::drop caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/23 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::current_job_processes caller crates/eliot-app/src/host_runtime/supervised_process.rs::capture_descendants_at_root_exit
+// WORK_UNIT_CASE: 789/24 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named caller crates/eliot-app/src/host_runtime/supervised_process.rs::run_worker
+// WORK_UNIT_CASE: 789/25 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::credential_read_current_user caller crates/kernel/eliot-platform-windows/src/secret_store.rs::credential_read
+// WORK_UNIT_CASE: 789/26 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::try_wait caller crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs::run
+// WORK_UNIT_CASE: 789/27 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::credential_target_name caller crates/eliot-windows-ipc/src/lib.rs::credential_ids_current_user_with_prefix
+// WORK_UNIT_CASE: 789/28 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::shutdown caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::drop
+// WORK_UNIT_CASE: 789/29 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::OwnedHandle caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named
+// WORK_UNIT_CASE: 789/30 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::OwnedHandle caller crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::acquire
+// WORK_UNIT_CASE: 789/31 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::named_pipe_client_process caller crates/eliot-app/src/named_pipe_ipc.rs::serve_connection
+// WORK_UNIT_CASE: 789/32 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::verify_file_owner_and_dacl caller bins/eliot-host/src/host_startup_evidence.rs::read_blob_manifest_digest
+// WORK_UNIT_CASE: 789/33 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::SuspendedProcessGuard::drop caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named
+// WORK_UNIT_CASE: 789/34 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::JobProcessObserver::shutdown caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::drop
+// WORK_UNIT_CASE: 789/35 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::job_process_ids caller crates/eliot-app/src/host_runtime/supervised_process.rs::run_worker
+// WORK_UNIT_CASE: 789/36 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::drop caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/37 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::OwnedHandle::drop caller crates/eliot-windows-ipc/src/lib.rs::SuspendedJobChild::spawn_named
+// WORK_UNIT_CASE: 789/38 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::truncate_image_buffer caller crates/eliot-store/src/surreal_server.rs::verify_owned_process_identity
+// WORK_UNIT_CASE: 789/39 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::DirectoryOplockGuard::acquire caller crates/eliot-app/src/cognitive_runner.rs::pin_bundle_directory
+// WORK_UNIT_CASE: 789/40 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::create_current_user_server caller crates/eliot-app/src/named_pipe_ipc.rs::bind
+// WORK_UNIT_CASE: 789/41 status TEST-PHASE impl crates/eliot-windows-ipc/src/bin/eliot-process-guardian.rs::main caller crates/eliot-windows-ipc/src/lib.rs::test_support::isolated_operator_cursor_credentials
+// WORK_UNIT_CASE: 789/42 status TEST-PHASE impl crates/eliot-windows-ipc/src/lib.rs::OwnedHandle caller crates/eliot-windows-ipc/src/lib.rs::create_kill_on_close_job

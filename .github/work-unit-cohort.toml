@@ -50,10 +50,24 @@ disposition = "blocked"
 prerequisites = []
 
 [[row]]
+issue = 843
+unit = "D-WORK-UNIT-GATE"
+body_sha256 = "3b9814aa4762a77c91671412e433217466e4153716fdfdc3e9c4e7f1f112493b"
+disposition = "superseded"
+prerequisites = []
+
+[[row]]
 issue = 846
 unit = "D-TEST-WINDOWS-STAGING"
 body_sha256 = "966da099e32a0a47cf91bd8b64718b8686a63144728e792f0f166972296b99b7"
 disposition = "blocked"
+prerequisites = []
+
+[[row]]
+issue = 859
+unit = "D-WU-ACCEPTANCE-DATA"
+body_sha256 = "ed5122df452109d66e9edf3028fc7597f22041c08ae2ba4c86055a162a90abc3"
+disposition = "superseded"
 prerequisites = []
 
 [[row]]
@@ -71,19 +85,21 @@ disposition = "nonexecutable"
 prerequisites = []
 
 [aggregate]
-issues = [728, 748, 750, 818, 838, 839, 846, 974, 994]
+issues = [728, 748, 750, 818, 838, 839, 843, 846, 859, 974, 994]
 numeric_descriptors = []
 matrix_cases = 0
 assigned = 0
 blocked = 5
 planned = 0
 nonexecutable = 2
-superseded = 0
+superseded = 2
 accepted_historical = 2
-sha256 = "034089026c858af9a81a68883e30255e9283d8c9122f70e137bd6dc44d23254c"
+sha256 = "1177af1d0dff9e7ea72975877b88c204c70610c3c76e88efcc0cc65c59a13667"
 
 [provenance]
-base_commit = "f8e48263f5bceadc43cd02f7664d17eda84ad660"
+base_commit = "46d645f2c6ece125842e8deefdb661797c0fa0e9"
 acquired_at = "2026-09-25T20:30:18Z"
 acquisition = "gh api repos/UnknownAlienHuman/eliot-memory-os/issues/{number}+timeline+pulls (read-only, 2026-09-25)"
-note = "Provenance is observed context only; it is not part of the hashed aggregate payload."
+acquired_at_historical = "2026-09-26T04:18:45Z"
+acquisition_historical = "gh api repos/UnknownAlienHuman/eliot-memory-os/issues/{843,859}+pulls/{843,859}/files (read-only, 2026-09-26)"
+note = "Provenance is observed context only; it is not part of the hashed aggregate payload. Rows 728/748/750/818/838/839/846/974/994 re-verify the 2026-09-25 snapshot at f8e48263f5bceadc43cd02f7664d17eda84ad660; rows 843/859 acquired 2026-09-26."

@@ -1139,6 +1139,32 @@ fn host_request_user_automation_frame(
     Ok(frame)
 }
 
+/// Builds the Observe submit frame carrying the exact canonical tool bytes
+/// (issue #2565).
+///
+/// Rides the same `agent_host_request_submit` entry as the digest-only
+/// submits; only the payload gains the exact `ToolRequest` JSON the Kernel
+/// linkage gate binds to the admitted envelope digest before admission. The
+/// Kernel retains the linked bytes for the daemon observe flight instead of
+/// dropping to a digest-only stage, so a successful admission stays
+/// recoverable input. A submit without these bytes keeps the legacy
+/// digest-only shape and never enqueues an observe pair.
+fn host_request_observe_submit_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?;
+    let tool = serde_json::to_value(&request.tool).map_err(|_| request_failure())?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["tool"] = tool;
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
 /// One finite dispatch row for every canonical tool (Implements #1739 item 1).
 ///
 /// This is the single recorded dispatch map [`KernelHostRequestClient::invoke`]
@@ -1153,7 +1179,7 @@ fn host_request_user_automation_frame(
 /// |---|---|---|---|
 /// | `eliot.state` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; projection-owner readback join missing |
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
-/// | `eliot.observe` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; observation-owner execution join missing |
+/// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
 /// | `eliot.act` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; action-model/authority gate + effect dispatch missing (#1742) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
@@ -1176,6 +1202,13 @@ enum CanonicalDispatchEntry {
     /// `completion_join` names the exact missing owner execution that must
     /// complete the row before a completed response is legitimate.
     SubmitAdmitOnly { completion_join: &'static str },
+    /// Observe submit carrying the exact canonical tool bytes (issue #2565).
+    /// Rides the same `agent_host_request_submit` entry as the digest-only
+    /// submits; the Kernel linkage gate binds the bytes to the admitted
+    /// envelope before admission, retains them for the daemon observe flight,
+    /// and enqueues the admitted pair. The Accepted reply stays an operation
+    /// handle until the flight submits the retained result.
+    SubmitObservePair,
     /// Non-hot operator carrier on the submit leg with tool bytes. Only
     /// [`ToolRequest::UserAutomation`] rides here.
     SubmitCarryingBytes,
@@ -1199,9 +1232,7 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         | ToolRequest::Query(_)
         | ToolRequest::SkillInject(_)
         | ToolRequest::SkillDisplay(_) => CanonicalDispatchEntry::InvokeRead,
-        ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
-            completion_join: "observation-owner execution: submit-record pair (enqueue, fenced claim, submit result) + daemon flight + retained observation readback",
-        },
+        ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitObservePair,
         ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "action-model/authority gate + effect dispatch (#1742 material-context gate)",
         },
@@ -2044,6 +2075,9 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             )?,
             CanonicalDispatchEntry::SubmitCarryingBytes => {
                 host_request_user_automation_frame(request, &envelope, &facts)?
+            }
+            CanonicalDispatchEntry::SubmitObservePair => {
+                host_request_observe_submit_frame(request, &envelope, &facts)?
             }
             CanonicalDispatchEntry::RefusedUntilRoute { .. } => {
                 return Err(unsupported_finish());

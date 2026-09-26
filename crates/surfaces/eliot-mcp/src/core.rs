@@ -15,9 +15,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ApplicationRequest, ContractViolation, LEGACY_FINISH_INPUT_REJECTED, McpProtocolVersion,
-    QueryInput, QueryMode, ToolRequest, TypedRejection, decode_protected_request_bytes,
-    validate_proof_ceiling,
+    ADMITTED_TOOL_NAMES, ApplicationRequest, ClientCapabilities, ContractViolation,
+    HostCancellationRequest, HostCorrelationId, HostCorrelationReceipt, HostGatewayError,
+    HostInvocationRequest, HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED,
+    McpProtocolVersion, QueryInput, QueryMode, ToolRequest, TypedRejection, canonical_tool_schemas,
+    decode_protected_request_bytes, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -1769,6 +1771,805 @@ fn hex_digest(bytes: &[u8]) -> String {
         value.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     value
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC wire adapter for the flagged Claude MCP front door (issue #2562).
+//
+// Pure translation between MCP JSON-RPC frames on stdio and the existing
+// inert host-request contracts (`HostInvocationRequest`,
+// `HostCancellationRequest`) served through `HostRequestGateway` plus an
+// authenticated `KernelHostRequestPort`. This adapter owns no transport,
+// process, session, task, authority, or durable state: every function takes
+// plain values and returns plain values. Version-specific behavior stays in
+// this crate (I7.7); raw MCP messages never reach the private `op` enum or
+// the I7.2 frame decoder.
+//
+// Negotiation covers exactly two wire versions: the primary `2026-07-28`
+// profile (internal `McpProtocolVersion::Final2026_07_28`) and the
+// `2025-11-25` compatibility adapter, which maps to the same ELIOT Session
+// and the same tool semantics. Tool listing uses the generated schemas from
+// `canonical_tool_schemas` (same `serde`/`schemars` contract types as EBP
+// clients; hand-written MCP schemas are forbidden by I7.6).
+// ---------------------------------------------------------------------------
+
+/// Exact JSON-RPC envelope version required on this transport.
+pub const MCP_JSONRPC_VERSION: &str = "2.0";
+
+/// Negotiated primary MCP wire version (I7.7 final profile).
+pub const MCP_WIRE_VERSION_PRIMARY: &str = "2026-07-28";
+
+/// Negotiated compatibility MCP wire version (I7.7 compatibility adapter).
+pub const MCP_WIRE_VERSION_COMPAT: &str = "2025-11-25";
+
+/// Server name advertised in the `initialize` result.
+pub const MCP_BRIDGE_SERVER_NAME: &str = "eliot-agent-bridge";
+
+/// JSON-RPC parse error: the frame is not well-formed JSON.
+pub const WIRE_PARSE_ERROR: i64 = -32700;
+/// JSON-RPC invalid request: the envelope or negotiation is malformed.
+pub const WIRE_INVALID_REQUEST: i64 = -32600;
+/// JSON-RPC method not found: unadvertised method or tool.
+pub const WIRE_METHOD_NOT_FOUND: i64 = -32601;
+/// JSON-RPC invalid params: the method is known but its params are not.
+pub const WIRE_INVALID_PARAMS: i64 = -32602;
+/// JSON-RPC internal error: the owner refused after admission-shaped input.
+pub const WIRE_INTERNAL_ERROR: i64 = -32603;
+/// Cancelled before dispatch: no kernel effect was ever issued.
+pub const WIRE_REQUEST_CANCELLED: i64 = -32800;
+
+/// Maximum decoded method-name characters echoed in diagnostics.
+pub const MAX_WIRE_METHOD_CHARS: usize = 128;
+
+/// Maximum cancellation-reason bytes accepted from a wire notification.
+///
+/// Mirrors the host contract bound; the gateway re-validates the
+/// authoritative limit before anything reaches the trusted port.
+pub const MAX_WIRE_CANCEL_REASON_BYTES: usize = 1_024;
+
+/// Negotiated MCP wire version for one stdio connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NegotiatedWireVersion {
+    /// Primary final profile; maps to `McpProtocolVersion::Final2026_07_28`.
+    Primary,
+    /// Compatibility adapter; same session, same tool semantics (I7.7).
+    Compat,
+}
+
+impl NegotiatedWireVersion {
+    /// Returns the exact wire string echoed in the `initialize` result.
+    #[must_use]
+    pub const fn wire_string(self) -> &'static str {
+        match self {
+            Self::Primary => MCP_WIRE_VERSION_PRIMARY,
+            Self::Compat => MCP_WIRE_VERSION_COMPAT,
+        }
+    }
+
+    /// Returns the internal protocol profile used for every host request.
+    ///
+    /// Both wire versions map to the single final profile: the compatibility
+    /// adapter changes correlation only, never session or tool authority.
+    #[must_use]
+    pub const fn internal_profile(self) -> McpProtocolVersion {
+        McpProtocolVersion::Final2026_07_28
+    }
+}
+
+/// Negotiates one exact wire version from the client's `initialize` params.
+///
+/// Only the two supported versions are admitted; anything else fails closed
+/// with the explicit supported set so the caller can report it without a
+/// legacy fallback.
+pub fn negotiate_wire_version(requested: &str) -> Result<NegotiatedWireVersion, WireRejection> {
+    match requested {
+        MCP_WIRE_VERSION_PRIMARY => Ok(NegotiatedWireVersion::Primary),
+        MCP_WIRE_VERSION_COMPAT => Ok(NegotiatedWireVersion::Compat),
+        _ => Err(WireRejection {
+            code: WIRE_INVALID_PARAMS,
+            message: "unsupported MCP protocol version; this surface negotiates exactly 2026-07-28 or 2025-11-25",
+            data: json!({
+                "requested": bound_wire_text(requested),
+                "supported": [MCP_WIRE_VERSION_PRIMARY, MCP_WIRE_VERSION_COMPAT],
+            }),
+        }),
+    }
+}
+
+/// One preserved JSON-RPC correlation identity.
+///
+/// The exact wire form is retained so responses echo the request identity
+/// bit-for-bit: strings cross verbatim, integers cross as integers. The
+/// derived `correlation_text` enters ELIOT correlation (as the opaque host
+/// correlation) under an explicitly type-qualified, injective encoding, so
+/// numeric `7` and string `"7"` never select the same retained operation or
+/// cancellation mark; it never becomes session, task, or authority identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JsonRpcId {
+    /// String identity, echoed verbatim.
+    Str(String),
+    /// Integer identity, echoed as an integer.
+    Int(i64),
+}
+
+/// Type tag qualifying a string wire identity inside opaque correlation text.
+///
+/// Client text is always wrapped under this tag, so a client string
+/// resembling a tag (for example `"int:7"` or `"cancel:int:7"`) encodes as
+/// `"str:int:7"` and can never alias an integer identity or a generated
+/// cancellation identity.
+const CORRELATION_STR_TAG: &str = "str:";
+/// Type tag qualifying an integer wire identity inside opaque correlation text.
+const CORRELATION_INT_TAG: &str = "int:";
+/// Domain tag qualifying a cancellation request inside opaque correlation text.
+///
+/// Cancellation correlations always start with this tag while request
+/// correlations always start with `str:` or `int:`, so the two correlation
+/// domains stay disjoint no matter what client text arrives.
+const CORRELATION_CANCEL_TAG: &str = "cancel:";
+
+impl JsonRpcId {
+    /// Parses one wire identity; rejects null, boolean, float, and
+    /// out-of-range integers explicitly instead of coercing them.
+    pub fn parse(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(text) => Some(Self::Str(text.clone())),
+            Value::Number(number) => number
+                .as_i64()
+                .or_else(|| {
+                    number
+                        .as_u64()
+                        .and_then(|unsigned| i64::try_from(unsigned).ok())
+                })
+                .map(Self::Int),
+            _ => None,
+        }
+    }
+
+    /// Returns the opaque correlation text carried into host requests.
+    ///
+    /// The encoding is deterministic and injective: integers cross as
+    /// `int:<decimal>` (including the `-` sign for negatives) and strings
+    /// cross as `str:<verbatim>`. Response envelopes still echo the original
+    /// wire form via `to_json`; only correlation crosses in this qualified
+    /// form, and the same mapping applies on both negotiated wire profiles.
+    ///
+    /// Compatibility: transport generations using the previous lossy
+    /// projection (bare `"7"` for both wire forms) never match a qualified
+    /// key, so an old retained entry is never silently reinterpreted as the
+    /// new encoding. A lookup against such an entry misses and follows the
+    /// existing unknown-target path (no new execution; durable recovery stays
+    /// kernel-side), and no active operation is evicted to avoid a collision
+    /// because distinct wire identities now key distinct entries. The result
+    /// is validated again by `HostCorrelationId::new` at construction;
+    /// over-long wire strings fail closed there, while blank wire strings are
+    /// rejected by the builders before encoding so the previous admission
+    /// boundary is preserved.
+    #[must_use]
+    pub fn correlation_text(&self) -> String {
+        match self {
+            Self::Str(text) => format!("{CORRELATION_STR_TAG}{text}"),
+            Self::Int(number) => format!("{CORRELATION_INT_TAG}{number}"),
+        }
+    }
+
+    /// Renders the exact wire identity for a response envelope.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Str(text) => Value::String(text.clone()),
+            Self::Int(number) => json!(*number),
+        }
+    }
+}
+
+/// One decoded MCP JSON-RPC frame: envelope only, no dispatch.
+///
+/// Duplicate object keys collapse last-wins at the `serde_json` layer. That
+/// is contained here because this envelope carries no identity, session,
+/// task, fence, or authority fields: the only decoded values are the opaque
+/// correlation, the closed method name, and inert params validated per
+/// method below. A confused envelope can only confuse its own correlation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireRequest {
+    /// Correlation identity; `None` marks a notification.
+    pub id: Option<JsonRpcId>,
+    /// Exact closed method name.
+    pub method: String,
+    /// Inert params object (empty when the frame carries none).
+    pub params: Value,
+}
+
+/// Typed wire rejection that always renders as a negotiated JSON-RPC error.
+///
+/// Diagnostics carry only static messages plus bounded control names; raw
+/// request bodies, secrets, and protected bytes never cross into responses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireRejection {
+    /// JSON-RPC error code.
+    pub code: i64,
+    /// Static public message.
+    pub message: &'static str,
+    /// Bounded structured data (control names only, never bodies).
+    pub data: Value,
+}
+
+impl WireRejection {
+    fn new(code: i64, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            data: Value::Null,
+        }
+    }
+
+    fn with_data(code: i64, message: &'static str, data: Value) -> Self {
+        Self {
+            code,
+            message,
+            data,
+        }
+    }
+}
+
+/// Decodes one newline-delimited MCP JSON-RPC frame.
+///
+/// Batches (top-level arrays) are refused explicitly: MCP over stdio serves
+/// exactly one frame per line, and a batch has no single correlation to
+/// preserve.
+pub fn decode_wire_request(text: &str) -> Result<WireRequest, WireEnvelopeError> {
+    let value: Value = serde_json::from_str(text).map_err(|_| WireEnvelopeError::parse())?;
+    if value.is_array() {
+        return Err(WireEnvelopeError::invalid_request(
+            None,
+            "batches are not served on this transport; send exactly one frame per line",
+        ));
+    }
+    let envelope = value.as_object().ok_or_else(|| {
+        WireEnvelopeError::invalid_request(None, "frame must be one JSON-RPC object")
+    })?;
+    if envelope.get("jsonrpc").and_then(Value::as_str) != Some(MCP_JSONRPC_VERSION) {
+        return Err(WireEnvelopeError::invalid_request(
+            None,
+            "frame must carry exactly \"jsonrpc\":\"2.0\"",
+        ));
+    }
+    let method = envelope
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|method| !method.trim().is_empty())
+        .ok_or_else(|| {
+            WireEnvelopeError::invalid_request(None, "frame must carry a non-blank method name")
+        })?;
+    if method.len() > MAX_WIRE_METHOD_CHARS || method.chars().any(char::is_control) {
+        return Err(WireEnvelopeError::invalid_request(
+            None,
+            "method name exceeds the bounded method-name limit",
+        ));
+    }
+    let id = match envelope.get("id") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(JsonRpcId::parse(raw).ok_or_else(|| {
+            WireEnvelopeError::invalid_request(
+                None,
+                "request id must be a string or an integer; null, boolean, float, and composite ids are refused",
+            )
+        })?),
+    };
+    let params = match envelope.get("params") {
+        None | Some(Value::Null) => Value::Object(Map::new()),
+        Some(Value::Object(_)) => envelope
+            .get("params")
+            .cloned()
+            .unwrap_or(Value::Object(Map::new())),
+        Some(_) => {
+            return Err(WireEnvelopeError::invalid_request(
+                id.clone(),
+                "params must be an object when present",
+            ));
+        }
+    };
+    Ok(WireRequest {
+        id,
+        method: method.to_owned(),
+        params,
+    })
+}
+
+/// Envelope-level decode failure that still knows its correlation when the
+/// frame carried a usable identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireEnvelopeError {
+    /// Correlation identity when one decoded before the failure.
+    pub id: Option<JsonRpcId>,
+    /// JSON-RPC error code.
+    pub code: i64,
+    /// Static public message.
+    pub message: &'static str,
+}
+
+impl WireEnvelopeError {
+    fn parse() -> Self {
+        Self {
+            id: None,
+            code: WIRE_PARSE_ERROR,
+            message: "frame is not well-formed JSON",
+        }
+    }
+
+    fn invalid_request(id: Option<JsonRpcId>, message: &'static str) -> Self {
+        Self {
+            id,
+            code: WIRE_INVALID_REQUEST,
+            message,
+        }
+    }
+
+    /// Renders the negotiated JSON-RPC error envelope for this failure.
+    #[must_use]
+    pub fn render(&self) -> Value {
+        render_error(self.id.as_ref(), self.code, self.message, Value::Null)
+    }
+}
+
+/// Renders one negotiated JSON-RPC result envelope with the exact identity.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "result moves into the JSON envelope; clippy cannot see through json!"
+)]
+pub fn render_result(id: &JsonRpcId, result: Value) -> Value {
+    json!({
+        "jsonrpc": MCP_JSONRPC_VERSION,
+        "id": id.to_json(),
+        "result": result,
+    })
+}
+
+/// Renders one negotiated JSON-RPC error envelope.
+///
+/// A `None` identity renders `null`, which is the only envelope available
+/// when the frame carried no usable correlation.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "data moves into the JSON envelope; clippy cannot see through json!"
+)]
+pub fn render_error(id: Option<&JsonRpcId>, code: i64, message: &str, data: Value) -> Value {
+    let wire_id = id.map_or(Value::Null, JsonRpcId::to_json);
+    json!({
+        "jsonrpc": MCP_JSONRPC_VERSION,
+        "id": wire_id,
+        "error": {
+            "code": code,
+            "message": message,
+            "data": data,
+        },
+    })
+}
+
+/// Renders one wire rejection against its correlation identity.
+#[must_use]
+pub fn render_rejection(id: Option<&JsonRpcId>, rejection: &WireRejection) -> Value {
+    render_error(
+        id,
+        rejection.code,
+        rejection.message,
+        rejection.data.clone(),
+    )
+}
+
+/// Builds the `initialize` result for the negotiated version.
+///
+/// Initialization negotiates the wire version and advertises exactly the
+/// implemented surface (tools plus resources); it creates no application
+/// identity.
+#[must_use]
+pub fn initialize_result(version: NegotiatedWireVersion, server_version: &str) -> Value {
+    json!({
+        "protocolVersion": version.wire_string(),
+        "capabilities": {
+            "tools": {},
+            "resources": {},
+        },
+        "serverInfo": {
+            "name": MCP_BRIDGE_SERVER_NAME,
+            "version": server_version,
+        },
+    })
+}
+
+/// Builds the `tools/list` result from the generated canonical schemas.
+///
+/// Every entry comes from `canonical_tool_schemas`, generated from the same
+/// `serde`/`schemars` contract types EBP clients use. A method with no
+/// registered semantic owner is absent here, so the listing follows the
+/// owner and never advertises an unimplemented tool.
+pub fn tools_list_result() -> Result<Value, WireRejection> {
+    canonical_tool_schemas_for_list()
+}
+
+/// Rejects a blank string wire identity before qualified encoding.
+///
+/// `HostCorrelationId::new` rejects blank and control-character text, but the
+/// `str:` qualifier would mask a blank wire string (`""` would encode as
+/// `"str:"` and pass). Integers are never blank. Control characters and
+/// over-long text keep failing closed at `HostCorrelationId::new` because the
+/// qualifier preserves them in the encoded form.
+fn reject_blank_wire_id(correlation: &JsonRpcId) -> Result<(), WireRejection> {
+    if let JsonRpcId::Str(text) = correlation
+        && (text.trim().is_empty() || text.chars().any(char::is_control))
+    {
+        return Err(WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "request correlation must be non-blank opaque text without control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the `tools/call` host invocation from a wire name plus arguments.
+///
+/// Only the eight advertised canonical tools are admitted; anything else is
+/// an explicit unadvertised-capability failure, never an empty success. The
+/// correlation crosses under the type-qualified injective encoding
+/// (`int:`/`str:` via [`JsonRpcId::correlation_text`]) as the opaque host
+/// correlation, so numeric and string wire identities stay distinct through
+/// invocation, handle retention, replay, and cancellation.
+pub fn build_host_invocation(
+    version: NegotiatedWireVersion,
+    correlation: &JsonRpcId,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<HostInvocationRequest, WireRejection> {
+    if !ADMITTED_TOOL_NAMES.contains(&tool_name) {
+        return Err(WireRejection::with_data(
+            WIRE_METHOD_NOT_FOUND,
+            "tool is not advertised on this MCP surface",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        ));
+    }
+    if !arguments.is_object() {
+        return Err(WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "tool arguments must be an object",
+        ));
+    }
+    let tool: ToolRequest = serde_json::from_value(json!({
+        "name": tool_name,
+        "arguments": arguments,
+    }))
+    .map_err(|_| {
+        WireRejection::with_data(
+            WIRE_INVALID_PARAMS,
+            "tool arguments do not satisfy the canonical input contract",
+            json!({ "tool": bound_wire_text(tool_name) }),
+        )
+    })?;
+    reject_blank_wire_id(correlation)?;
+    let correlation_id = HostCorrelationId::new(correlation.correlation_text()).map_err(|_| {
+        WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "request correlation exceeds the bounded opaque-correlation contract",
+        )
+    })?;
+    let request = HostInvocationRequest {
+        protocol_version: version.internal_profile(),
+        correlation_id,
+        client_capabilities: ClientCapabilities::default(),
+        tool,
+        deadline_preference_ms: None,
+        observed_context: HostObservedContext::default(),
+    };
+    request.validate().map_err(|_| {
+        WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "tool arguments failed host-boundary validation",
+        )
+    })?;
+    Ok(request)
+}
+
+/// Builds one host cancellation from a wire `requestId` plus its exact
+/// admitted operation handle.
+///
+/// The handle must be the exact Kernel-issued handle retained for the
+/// cancelled correlation; the gateway echoes it back so a redirected result
+/// is detected instead of trusted. The cancellation correlation applies the
+/// `cancel:` domain tag to the same type-qualified encoding used at
+/// invocation, so cancelling an unsubmitted string `"7"` (key
+/// `cancel:str:7`) can never target numeric `7`'s retained operation (key
+/// `int:7`), and a client string resembling the tag still resolves under its
+/// own `str:`-qualified key.
+pub fn build_host_cancellation(
+    version: NegotiatedWireVersion,
+    correlation: &JsonRpcId,
+    operation_handle: &HostOperationHandle,
+    reason: Option<&str>,
+) -> Result<HostCancellationRequest, WireRejection> {
+    if let Some(reason) = reason
+        && (reason.len() > MAX_WIRE_CANCEL_REASON_BYTES
+            || reason.trim().is_empty()
+            || reason.chars().any(char::is_control))
+    {
+        return Err(WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "cancellation reason exceeds the bounded public-reason contract",
+        ));
+    }
+    reject_blank_wire_id(correlation)?;
+    let cancel_correlation = HostCorrelationId::new(format!(
+        "{CORRELATION_CANCEL_TAG}{}",
+        correlation.correlation_text()
+    ))
+    .map_err(|_| {
+        WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "request correlation exceeds the bounded opaque-correlation contract",
+        )
+    })?;
+    let request = HostCancellationRequest {
+        protocol_version: version.internal_profile(),
+        correlation_id: cancel_correlation,
+        operation_handle: operation_handle.clone(),
+        reason: reason.map(str::to_owned),
+        deadline_preference_ms: None,
+        observed_context: HostObservedContext::default(),
+    };
+    request.validate().map_err(|_| {
+        WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "cancellation request failed host-boundary validation",
+        )
+    })?;
+    Ok(request)
+}
+
+/// Decodes `initialize` params to the exact requested version string.
+pub fn decode_initialize_version(params: &Value) -> Result<&str, WireRejection> {
+    params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|version| !version.trim().is_empty())
+        .ok_or_else(|| {
+            WireRejection::new(
+                WIRE_INVALID_PARAMS,
+                "initialize params must carry a non-blank protocolVersion string",
+            )
+        })
+}
+
+/// Decodes `tools/call` params to the exact tool name plus arguments.
+pub fn decode_tools_call(params: &Value) -> Result<(&str, &Value), WireRejection> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            WireRejection::new(
+                WIRE_INVALID_PARAMS,
+                "tools/call params must carry a non-blank name string",
+            )
+        })?;
+    if name.len() > MAX_WIRE_METHOD_CHARS || name.chars().any(char::is_control) {
+        return Err(WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "tool name exceeds the bounded tool-name limit",
+        ));
+    }
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    if !arguments.is_object() && !arguments.is_null() {
+        return Err(WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "tool arguments must be an object when present",
+        ));
+    }
+    Ok((name, arguments))
+}
+
+/// Decodes `resources/read` params to the exact resource URI.
+pub fn decode_resource_uri(params: &Value) -> Result<&str, WireRejection> {
+    params
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())
+        .ok_or_else(|| {
+            WireRejection::new(
+                WIRE_INVALID_PARAMS,
+                "resources/read params must carry a non-blank uri string",
+            )
+        })
+}
+
+/// Decodes `notifications/cancelled` params to the cancelled identity plus an
+/// optional bounded reason.
+pub fn decode_cancel_notification(
+    params: &Value,
+) -> Result<(JsonRpcId, Option<&str>), WireRejection> {
+    let raw = params.get("requestId").ok_or_else(|| {
+        WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "notifications/cancelled params must carry requestId",
+        )
+    })?;
+    let id = JsonRpcId::parse(raw).ok_or_else(|| {
+        WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "cancelled requestId must be a string or an integer",
+        )
+    })?;
+    let reason = params.get("reason").and_then(Value::as_str);
+    Ok((id, reason))
+}
+
+/// Rejects a non-empty list cursor explicitly: the eight-tool surface fits
+/// one page, so pagination is not offered and a cursor cannot name anything.
+pub fn reject_list_cursor(params: &Value, method: &'static str) -> Result<(), WireRejection> {
+    if params
+        .get("cursor")
+        .is_some_and(|cursor| !cursor.is_null() && cursor != &Value::String(String::new()))
+    {
+        return Err(WireRejection::with_data(
+            WIRE_INVALID_PARAMS,
+            "list pagination is not offered on this surface; the catalogue fits one page",
+            json!({ "method": method }),
+        ));
+    }
+    Ok(())
+}
+
+/// Renders one admitted inline tool result.
+///
+/// `structuredContent` carries the exact owner response plus the exact
+/// admitted operation handle; gap kinds render `isError` with their typed
+/// failure instead of an empty success. `evidence` carries the optional
+/// hot-resource projection recorded for this delivery (handle URI plus
+/// digest naming the immutable bytes); full bytes expand through
+/// `resources/read`, never inline.
+pub fn render_responded_result(
+    operation_handle: &HostOperationHandle,
+    response: &McpResponse,
+    evidence: Option<&Value>,
+) -> Result<Value, WireRejection> {
+    let mut structured = json!({
+        "response": response,
+        "operation_handle": operation_handle.as_str(),
+    });
+    if let Some(evidence) = evidence
+        && let Some(object) = structured.as_object_mut()
+    {
+        object.insert("evidence".to_owned(), evidence.clone());
+    }
+    let text = serde_json::to_string(&structured).map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted response could not be rendered on the wire",
+        )
+    })?;
+    let is_error = matches!(
+        response.kind,
+        ResponseKind::PlanGap | ResponseKind::Unsupported
+    );
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
+        "isError": is_error,
+    }))
+}
+
+/// Renders one admitted-but-pending tool result.
+///
+/// The operation stays kernel-owned under its exact handle; the recovery
+/// directive names the durable reconciliation route instead of executing
+/// anything new.
+pub fn render_accepted_result(
+    operation_handle: &HostOperationHandle,
+    receipt: &HostCorrelationReceipt,
+) -> Result<Value, WireRejection> {
+    let structured = json!({
+        "status": "ACCEPTED",
+        "operation_handle": operation_handle.as_str(),
+        "correlation_id": receipt.correlation_id().as_str(),
+        "recovery": receipt.recovery(),
+    });
+    let text = serde_json::to_string(&structured).map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "admitted acceptance could not be rendered on the wire",
+        )
+    })?;
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
+        "isError": false,
+    }))
+}
+
+/// Renders one owner-typed rejection as an explicit tool failure.
+///
+/// The typed provider failure crosses unchanged; the call never becomes an
+/// empty success.
+pub fn render_rejected_result(
+    correlation: &str,
+    failure: &PortFailure,
+) -> Result<Value, WireRejection> {
+    let structured = json!({
+        "status": "REJECTED",
+        "correlation_id": correlation,
+        "failure": failure,
+    });
+    let text = serde_json::to_string(&structured).map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "owner rejection could not be rendered on the wire",
+        )
+    })?;
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured,
+        "isError": true,
+    }))
+}
+
+/// Maps one gateway failure to its negotiated JSON-RPC error.
+///
+/// Malformed host input is invalid params; a malformed trusted-port result
+/// is an internal error. Both stay inside the negotiated envelope: the
+/// legacy custom ERROR object never mixes into MCP.
+#[must_use]
+pub fn gateway_error_to_wire(error: &HostGatewayError) -> (i64, &'static str) {
+    match error {
+        HostGatewayError::HostContract(_) => (
+            WIRE_INVALID_PARAMS,
+            "host request failed boundary validation",
+        ),
+        HostGatewayError::InvalidPortResult { .. }
+        | HostGatewayError::ResponseSerialization(_)
+        | HostGatewayError::ResponseTooLarge { .. } => (
+            WIRE_INTERNAL_ERROR,
+            "trusted owner returned an unusable result",
+        ),
+    }
+}
+
+/// Bounds one control name echoed in diagnostics; longer names truncate so
+/// diagnostics never echo protected bodies.
+///
+/// The budget covers at most `MAX_WIRE_METHOD_CHARS` retained input bytes,
+/// floored to the last UTF-8 character boundary so the prefix stays valid
+/// UTF-8; the `…` truncation marker rides outside the budget. Only the bounded
+/// prefix is allocated, never the full unbounded input.
+fn bound_wire_text(value: &str) -> String {
+    if value.len() <= MAX_WIRE_METHOD_CHARS {
+        value.to_owned()
+    } else {
+        let mut end = MAX_WIRE_METHOD_CHARS;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &value[..end])
+    }
+}
+
+fn canonical_tool_schemas_for_list() -> Result<Value, WireRejection> {
+    let schemas = canonical_tool_schemas().map_err(|_| {
+        WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "generated tool schemas are unavailable",
+        )
+    })?;
+    let tools: Vec<Value> = schemas
+        .iter()
+        .map(|schema| {
+            json!({
+                "name": schema.name,
+                "description": schema.description,
+                "inputSchema": schema.input_schema,
+                "outputSchema": schema.output_schema,
+            })
+        })
+        .collect();
+    Ok(json!({ "tools": tools }))
 }
 
 #[cfg(test)]

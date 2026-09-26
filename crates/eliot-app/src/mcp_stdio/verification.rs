@@ -2030,6 +2030,9 @@ pub(super) fn dispatch_verify_inventory(state: &McpState) -> Result<Value> {
 pub(super) fn dispatch_verify_plan(state: &McpState, arguments: Value) -> Result<Value> {
     let input: VerifyPlanToolInput = serde_json::from_value(arguments)?;
     let profile = input.profile.as_deref().unwrap_or("change-gate");
+    if GovernedProfileService.compile_governed(profile)?.is_some() {
+        return dispatch_governed_verify_plan(state, profile);
+    }
     let inventory = mcp_verification_inventory();
     let plan = VerificationPlannerService.plan(
         &inventory,
@@ -2045,6 +2048,24 @@ pub(super) fn dispatch_verify_plan(state: &McpState, arguments: Value) -> Result
     });
     write_verification_report_json_md(state, "verification-plans", "Verification Plans", &report)?;
     Ok(report)
+}
+
+fn dispatch_governed_verify_plan(state: &McpState, profile: &str) -> Result<Value> {
+    let blob_store = BlobStore::open(&state.blob_store)?;
+    let report = GovernedProfileService.describe_execution(profile, Some(&blob_store))?;
+    write_verification_report_json_md(
+        state,
+        "governed-profile",
+        "Governed Profile Execution",
+        &report,
+    )?;
+    Ok(json!({
+        "component": "governed_profile_execution",
+        "bounded": true,
+        "report": report,
+        "success": report.success,
+        "report_ref": state.root.join("reports").join("governed-profile").join("latest.json")
+    }))
 }
 
 pub(super) fn dispatch_verify_report(state: &McpState) -> Result<Value> {

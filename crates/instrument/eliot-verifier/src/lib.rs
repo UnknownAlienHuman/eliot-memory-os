@@ -21,6 +21,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+pub mod self_change;
+
+pub use self_change::{
+    AdversarialCase, AdversarialProof, AdversarialSuiteRecord, AxisVerdicts, BootstrapPhase,
+    CanaryRecord, ComparisonAxis, ConflictArbiter, EvidenceDigest, FrontDoorVerdict,
+    GenerationReceipt, OracleConflict, OracleResolution, OuterGuardianRecord, ParserOutput,
+    ParserReplayRecord, SelectionOutcome, SelectionSentinelRecord, SelfChangeBootstrap,
+    SelfChangeError, SelfChangeSurface, SentinelCase, ShadowComparisonRecord, SpecialCase,
+    SpecialCaseEvidence, verdict_with_bootstrap, verify_finish_adversarial,
+    verify_outer_guardian_record, verify_parser_replay, verify_selection_sentinel,
+};
+
 pub const CONTRACT_NAME: &str = "eliot.instrument.verifier";
 pub const CONTRACT_VERSION: (u16, u16, u16) = (1, 0, 0);
 

@@ -16,6 +16,11 @@ const SAFE_SECRET_PLACEHOLDERS: &[&[u8]] = &[
 ];
 
 /// Non-sensitive classification emitted when content is rejected.
+/// There is no upstream `Value`/byte-decoder ingress for this boundary:
+/// `SecretBoundaryViolation` has no `Deserialize` impl (category-only) and
+/// `inspect_secret_bytes` scans raw bytes directly with unchanged bounds.
+/// Invalidate-on-change: a future `Deserialize` on the violation must deny
+/// unknown fields and keep canary bytes out of `Display`/`Debug`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretBoundaryRule {

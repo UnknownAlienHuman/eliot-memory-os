@@ -30,7 +30,7 @@ use eliot_mod_research::execution::ProviderBridge;
 use eliot_mod_research::kernel_client::ResearchKernelClient;
 use eliot_mod_research::{
     BridgeIdentity, RESEARCH_SOURCE_UNAVAILABLE, RawProviderEvidence, ResearchDispatchAuthority,
-    SubmissionRecord, compose_admitted,
+    SubmissionRecord, compose_admitted, project_admitted_inquiry,
 };
 use eliot_process::{Generation, OperationId};
 use eliot_process_executor::WindowsProcessExecutor;
@@ -165,6 +165,7 @@ fn run() -> Result<String, Failure> {
             eliot_kernel_service::REASON_RUNTIME_FAILED,
             records,
         );
+        report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
         return Ok(receipt.to_string());
     }
     // The bridge retains the typed terminal classification, the raw evidence
@@ -189,7 +190,54 @@ fn run() -> Result<String, Failure> {
         }),
         records,
     );
+    report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
     Err(Failure::Degraded(Box::new(receipt)))
+}
+
+/// Reports the `R6` inquiry-governance view of the operation this run performed.
+///
+/// The provider receipt on stdout stays this process's product and is not
+/// rewritten. The `R6` view is the second half of the same evidence stream: it
+/// states the versioned inquiry profile with its selected grade and lane, the
+/// source-admissibility disposition of the retained material, the coverage
+/// receipt with its declared denominator kind, and the terminal typed inquiry
+/// disposition bound to the profile, portfolio, manifest and State Fence. A
+/// submission acknowledgement and a provider exit code are not inquiry outcomes,
+/// so this view is what distinguishes an answered inquiry from a completed
+/// process, and every non-answering outcome keeps its explicit unknown, narrower
+/// claim and next probe.
+///
+/// A projection that cannot be built is reported as a typed gap on the same
+/// stream. It never becomes a closed inquiry, never rewrites the receipt, and
+/// never changes this process's exit code: the operation's own truth is the
+/// provider receipt, and the governance view is a projection of it.
+///
+/// `failure` is the bridge's retained typed terminal classification. It carries
+/// the acquisition coverage gap this run suffered, so the dependent inquiry
+/// records the named `I21.11` outcome (`RESEARCH_SOURCE_UNAVAILABLE` or
+/// `INCOMPLETE_COVERAGE`) and keeps its preserved explicit unknown and next
+/// probe instead of reporting a generic acquisition code.
+fn report_admitted_inquiry(
+    request: &eliot_research_exchange_api::ResearchQueryRequest,
+    receipt: &ProviderExecutionReceipt,
+    failure: Option<&eliot_mod_research::TerminalFailure>,
+) {
+    match project_admitted_inquiry(request, receipt, failure) {
+        Ok(inquiry) => {
+            let _ = writeln!(
+                io::stderr(),
+                "{}: {inquiry}",
+                eliot_mod_research::INQUIRY_GOVERNANCE_VIEW
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "{}: reason={error}",
+                eliot_mod_research::INQUIRY_GOVERNANCE_REFUSED
+            );
+        }
+    }
 }
 
 /// Seals one verified Kernel dispatch receipt into a local admission.

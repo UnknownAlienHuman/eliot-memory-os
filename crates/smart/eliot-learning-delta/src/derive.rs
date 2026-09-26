@@ -17,7 +17,7 @@ use crate::{
     DerivationContext, DerivationPolicy, EvidenceKind, EvidenceReceipt, LearningDeltaError,
     NoChangeProof, RefinerDraft, SemanticOutcome,
     input::{operation_from_values, validate_unique_ids},
-    retry::{RetryAssessment, assess_retry},
+    retry::{RetryAssessment, assess_retry, prior_retry_lineage, retry_reason_name},
 };
 
 /// Derive exactly one successful A32 outcome from immutable supplied records.
@@ -89,7 +89,7 @@ pub fn derive_attempt_learning_outcome(
             field: "retry.result",
         });
     }
-    phase_build_delta(state_view, input, &operations, &inverses, policy)
+    phase_build_delta(state_view, input, &operations, &inverses, retry, policy)
 }
 
 fn phase_preflight(
@@ -1254,6 +1254,7 @@ fn phase_build_delta(
     input: &AttemptEvidence,
     operations: &[eliot_learning_contracts::ChangeOperation],
     inverses: &[eliot_learning_contracts::InverseChange],
+    retry: RetryAssessment,
     policy: &DerivationPolicy,
 ) -> Result<AttemptLearningOutcome, LearningDeltaError> {
     let evaluator = input
@@ -1311,6 +1312,29 @@ fn phase_build_delta(
         .collect();
     let mut dependencies = dependencies;
     dependencies.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    // The retry relation is read from the owner-supplied prior lineage, never
+    // hardcoded away. A materially equivalent repeat is refused above (a
+    // controlled repeat may justify no change, but never a new candidate), so
+    // this arm can only observe a distinct prior attempt. The candidate
+    // contract has no field for a distinct-retry relation, and inventing an
+    // `equivalent_retry.reason` for a distinct retry would be fabricated
+    // justification, so the explicit distinct-retry relation (prior
+    // fingerprint, prior observable refs, prior evidence) is carried by the
+    // durable `StoredRetryRelation` that the same attempt commits.
+    let equivalent_retry = match retry {
+        RetryAssessment::EquivalentAllowed(reason) => {
+            let lineage = prior_retry_lineage(input)?.ok_or(LearningDeltaError::InvalidInput {
+                field: "retry.prior",
+            })?;
+            Some(eliot_learning_contracts::delta::EquivalentRetry {
+                prior_attempt: lineage.prior_attempt,
+                strategy_fingerprint: lineage.prior_fingerprint,
+                reason: retry_reason_name(reason).to_owned(),
+                evidence: lineage.prior_evidence,
+            })
+        }
+        RetryAssessment::Distinct => None,
+    };
     let mut candidate = AttemptLearningDeltaCandidate {
         binding: input.binding.clone(),
         attempt_id: input.attempt_id.clone(),
@@ -1328,7 +1352,7 @@ fn phase_build_delta(
         control: sorted_ids(&input.control),
         confounders: sorted_ids(&input.confounders),
         dependencies,
-        equivalent_retry: None,
+        equivalent_retry,
         proof_ceiling: eliot_learning_contracts::ProofCeiling::CandidateArtifact,
         canonical_digest: String::new(),
     };

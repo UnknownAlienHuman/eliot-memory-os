@@ -20,7 +20,7 @@ use eliot_store_api::{
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    generated_operation_manifests, named_mutation_operation_name,
+    audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
 };
 
 use super::{
@@ -274,7 +274,7 @@ pub(crate) async fn execute_named(
     let state_fence = resolve_state_fence(fence.as_ref(), &query.state_fence)?;
 
     let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
-    let payload = named_read_payload(adapter, db, &query, &state_fence).await?;
+    let payload = named_read_payload(adapter, db, &query, &state_fence, &revision_heads).await?;
     let response = NamedReadResponse {
         operation: query.operation,
         state_fence,
@@ -301,11 +301,18 @@ fn resolve_state_fence(
     }
 }
 
+/// Builds one named-read payload.
+///
+/// `read_heads` is the exact revision-head set the caller will return with the
+/// response, threaded in so an owner-issued denominator revision inside a
+/// payload is derived from the same snapshot the response reports rather than
+/// from a second, racy read.
 async fn named_read_payload(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
     query: &NamedReadRequest,
     state_fence: &StateFence,
+    read_heads: &[RevisionHead],
 ) -> Result<Value, AdapterError> {
     match query.operation {
         NamedReadOperation::GetCurrentEpistemicPosition => {
@@ -370,7 +377,7 @@ async fn named_read_payload(
             resource_snapshot_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetUserAutomationState => {
-            automation_state_payload(db, &adapter.config, query, state_fence).await
+            automation_state_payload(db, &adapter.config, query, state_fence, read_heads).await
         }
         NamedReadOperation::GetExperienceBankRange => {
             experience_bank_range_payload(db, &adapter.config, query, state_fence).await
@@ -1745,9 +1752,11 @@ async fn resource_snapshot_payload(
 /// Row shapes mirror the writer. `list` projects all same-fence current
 /// pointers in automation-id order (retired rows excluded unless
 /// requested); `current` projects one pointer or explicit absence;
-/// `history` projects the bounded revision set; `invocations` projects
-/// the bounded invocation set; `failure` projects the last same-fence
-/// failure row or explicit absence.
+/// `history` and `invocations` project the bounded row set plus the
+/// owner-issued `completeness` metadata (read revision and `COMPLETE` /
+/// `TRUNCATED` coverage) that proves whether the page exhausts the declared
+/// denominator; `failure` projects the last same-fence failure row or
+/// explicit absence.
 /// Parameters are re-validated here (membership and shape via the
 /// catalogue gate upstream; value rules here) so a misrouted query fails
 /// closed without touching state.
@@ -1756,6 +1765,7 @@ async fn automation_state_payload(
     config: &SurrealAdapterConfig,
     query: &NamedReadRequest,
     state_fence: &StateFence,
+    read_heads: &[RevisionHead],
 ) -> Result<Value, AdapterError> {
     eliot_store_api::validate_typed_read_parameters(
         NamedReadOperation::GetUserAutomationState,
@@ -1776,10 +1786,10 @@ async fn automation_state_payload(
             automation_current_payload(db, config, state_fence, &decoded).await
         }
         eliot_store_api::AUTOMATION_QUERY_HISTORY => {
-            automation_history_payload(db, config, state_fence, &decoded).await
+            automation_history_payload(db, config, state_fence, &decoded, read_heads).await
         }
         eliot_store_api::AUTOMATION_QUERY_INVOCATIONS => {
-            automation_invocations_payload(db, config, state_fence, &decoded).await
+            automation_invocations_payload(db, config, state_fence, &decoded, read_heads).await
         }
         eliot_store_api::AUTOMATION_QUERY_FAILURE => {
             automation_failure_payload(db, config, state_fence, &decoded).await
@@ -1873,15 +1883,24 @@ async fn automation_current_payload(
 }
 
 /// Projects the bounded revision set for one automation.
+///
+/// The page bound plus one probe row decides owner-proven coverage: the owner
+/// reads one row past the bound and, only when that probe row is absent,
+/// reports `COMPLETE`. A page that merely happens to be shorter than the
+/// bound is never completeness.
 async fn automation_history_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
     state_fence: &StateFence,
     decoded: &eliot_store_api::DecodedAutomationRead,
+    read_heads: &[RevisionHead],
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let rows = if let Some(requested_revision) = decoded.requested_revision.as_deref() {
+    let exact_revision = decoded.requested_revision.as_deref();
+    let mut truncated;
+    let rows = if let Some(requested_revision) = exact_revision {
+        truncated = false;
         super::surreal_automation::read_revision_for_read(
             db,
             config,
@@ -1892,15 +1911,26 @@ async fn automation_history_payload(
         .into_iter()
         .collect()
     } else {
-        super::surreal_automation::read_revisions_for_read(db, config, &automation_id, limit)
-            .await?
+        // Fetch covers the page bound plus one probe row: the row scan is
+        // O(table) like every other range read on this contour, and the probe
+        // decides coverage without a second query.
+        let rows = super::surreal_automation::read_revisions_for_read(
+            db,
+            config,
+            &automation_id,
+            limit + 1,
+        )
+        .await?;
+        truncated = rows.len() > limit;
+        rows
     };
     let mut revisions = Vec::new();
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
         }
-        if revisions.len() >= limit {
+        if revisions.len() > limit {
+            truncated = true;
             break;
         }
         revisions.push(json!({
@@ -1909,24 +1939,36 @@ async fn automation_history_payload(
             "revision_json": row.revision_json,
         }));
     }
-    let revision = projection_len(revisions.len())?;
+    if truncated {
+        revisions.pop();
+    }
+    let returned = revisions.len();
+    let revision = projection_len(returned)?;
     Ok(json!({
         "revisions": revisions,
         "revision": revision,
         "state_fence": state_fence,
+        "completeness": automation_page_completeness(read_heads, returned, truncated)?,
     }))
 }
 
 /// Projects the bounded invocation set for one automation.
+///
+/// Same owner-proven coverage rule as the revision page: the bound plus one
+/// probe row is what turns an unknown remainder into a `COMPLETE` proof.
 async fn automation_invocations_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
     state_fence: &StateFence,
     decoded: &eliot_store_api::DecodedAutomationRead,
+    read_heads: &[RevisionHead],
 ) -> Result<Value, AdapterError> {
     let automation_id = require_automation_id(decoded)?;
     let limit = usize::from(decoded.max_records.max(1));
-    let rows = if let Some(occurrence_id) = decoded.requested_occurrence_id.as_deref() {
+    let exact_occurrence = decoded.requested_occurrence_id.as_deref();
+    let mut truncated;
+    let rows = if let Some(occurrence_id) = exact_occurrence {
+        truncated = false;
         super::surreal_automation::read_invocation_for_read(
             db,
             config,
@@ -1937,8 +1979,15 @@ async fn automation_invocations_payload(
         .into_iter()
         .collect()
     } else {
-        super::surreal_automation::read_invocations_for_read(db, config, &automation_id, limit)
-            .await?
+        let rows = super::surreal_automation::read_invocations_for_read(
+            db,
+            config,
+            &automation_id,
+            limit + 1,
+        )
+        .await?;
+        truncated = rows.len() > limit;
+        rows
     };
     let mut invocations = Vec::new();
     for row in rows {
@@ -1952,7 +2001,8 @@ async fn automation_invocations_payload(
         {
             continue;
         }
-        if invocations.len() >= limit {
+        if invocations.len() > limit {
+            truncated = true;
             break;
         }
         invocations.push(json!({
@@ -1961,11 +2011,47 @@ async fn automation_invocations_payload(
             "invocation_json": row.invocation_json,
         }));
     }
-    let revision = projection_len(invocations.len())?;
+    if truncated {
+        invocations.pop();
+    }
+    let returned = invocations.len();
+    let revision = projection_len(returned)?;
     Ok(json!({
         "invocations": invocations,
         "revision": revision,
         "state_fence": state_fence,
+        "completeness": automation_page_completeness(read_heads, returned, truncated)?,
+    }))
+}
+
+/// Builds the owner-issued denominator completeness metadata for one page.
+///
+/// `read_revision` digests the exact revision-head set this read observed
+/// through the store-api head digest, so it is owner-issued rather than a
+/// caller claim and changes whenever a commit advances any head. It is bound
+/// to the same head set the response reports, so a page never claims a
+/// denominator revision the response did not serve. `coverage` is the closed
+/// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts the owner read one
+/// probe row past the bound and matched nothing further.
+fn automation_page_completeness(
+    read_heads: &[RevisionHead],
+    returned: usize,
+    truncated: bool,
+) -> Result<Value, AdapterError> {
+    let heads: Vec<(String, u64)> = read_heads
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    let read_revision = audit_heads_digest(&heads).map_err(AdapterError::Store)?;
+    let returned = u64::try_from(returned).map_err(|_| {
+        AdapterError::Store(StoreError::Serialization(
+            "automation completeness count overflow".to_owned(),
+        ))
+    })?;
+    Ok(json!({
+        "read_revision": read_revision,
+        "returned": returned,
+        "coverage": if truncated { "TRUNCATED" } else { "COMPLETE" },
     }))
 }
 

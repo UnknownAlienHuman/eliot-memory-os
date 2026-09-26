@@ -1,0 +1,2123 @@
+schema_version = 6
+wave_id = "cognitive-micromodules-wave-10"
+status = "PROTOTYPE_ASSIGNMENT_GATED"
+base_commit = "cdf4a29430e6ea51010e00a9b9301abda0b67895"
+normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
+normative_pair_receipt = "docs/normative-pair.toml"
+pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+purpose = "Freeze field-complete specialized semantic payload contracts for the ten Issue #262 Dreamer families by binding every row to a measured current defining Rust symbol. Reconciles the issue crate labels against measured physical crates; invents no crate, no order and no type."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+integration_owner = "cognitive-wave-integrator"
+agent_rule = "One agent receives one module manifest, frozen one-hop contracts, exact write scope, proof ceiling and named Product Pulse or Edge proof."
+workspace_rule = "This catalogue is metadata only. It creates no crate, changes no Cargo membership, no Cargo.lock entry, no Rust source and no generated index. Every crate named here already exists as an admitted root workspace member or an explicitly named prototype."
+authority_rule = "No row here owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
+dependency_rule = "depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
+order_rule = "No order is created, renumbered or reused by this catalogue. Every [[assignment]] order and every [[assignment_ref]] order below is a value already measured in crates/smart/cognitive-crate-decisions.toml (orders 1-43), crates/smart/cognitive-wave-09.toml (orders 76-86), or a [package.metadata.eliot] agent_order read from the crate's own Cargo.toml."
+label_resolution_rule = "The Issue #262 body names ten crate labels. Six of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning, and by extension any function-only package) do not name a physical crate on base cdf4a29. Each such label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
+freeze_binding_rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is NOT edited by this catalogue. Its exact bytes are pinned by REQUIRED_FREEZE_DIGEST over FREEZE_BYTES in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, enforced by verify_freeze_binding() which propose() calls, and re-read by scripts/read_freeze_digest.py against the CC-W9-REV12-HANDOFF recorded digest and recorded byte length. Per that file's own [readback].rule a byte change is a new freeze candidate, not an edit. Promotion of this index into the freeze is the recorded CC-W2-FREEZE-REPIN handoff."
+disjointness_rule = "This catalogue does not modify bins/, 233 memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file."
+
+[[stage]]
+id = "W2_SEMANTIC_PAYLOAD_INDEX"
+orders = [5, 6, 14, 16, 17, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 39, 40, 41, 42, 43, 49, 79]
+gate = "Every specialized semantic payload is bound to one measured defining symbol with exactly one disposition; nothing is presented as frozen that does not exist in current source."
+
+[[stage]]
+id = "W2_LABEL_RECONCILIATION"
+orders = [5, 21, 25, 39, 41, 42, 43]
+gate = "Six issue-named labels resolve to measured physical owners or to an explicit missing contract decision; no function-only Cargo package is created."
+
+[[stage]]
+id = "W2_CANDIDATE_ONLY_BOUNDARIES"
+orders = [5, 6, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 40, 41, 42, 43, 49, 79]
+gate = "merge/split/reconsolidation/accessibility/influence/plan/cycle outputs stay forward reversible candidates; chronology stays separate from causal hypothesis; model output never self-certifies."
+
+[[product_pulse]]
+id = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+scenario = "One bounded Dreamer job yields a grounding receipt, an Orientation packet and a typed plan or DreamCycle candidate, each with its exact recheckable denominator, an explicit omission list and a fence, consumed as an immutable projection by a non-owner surface."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[product_pulse]]
+id = "W2_MEMORY_MODEL_FAMILY_PULSE_01"
+scenario = "One validated curation item routes to exactly one I9.6 wire-kind handler that emits its own measured result or candidate type with coverage, rollback and revalidation visible, and the family index resolves the owner without a shared envelope."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+# ---------------------------------------------------------------------------
+# Issue #262 label reconciliation. Measured, not assumed.
+# ---------------------------------------------------------------------------
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-validation"
+physical_crate_found = false
+resolution = "renamed_to_measured_owner"
+owner_crate = "eliot-dreamer-candidate-validation"
+owner_module_id = "smart.dreamer.candidate_validation"
+measured_order = 5
+rejection_rule = "The label is a FORBIDDEN_PRODUCER in scripts/tests/test_wave_admission_d1.py and scripts/tests/test_wave_admission_l1.py; creating a crate of that name is a topology violation."
+secondary_owner = "eliot-dreamer-claim-grounding"
+secondary_module_id = "smart.dreamer.claim_grounding"
+secondary_measured_order = 14
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-orientation"
+physical_crate_found = true
+resolution = "reused_exact"
+owner_crate = "eliot-dreamer-orientation"
+owner_module_id = "smart.dreamer.orientation"
+measured_order = 6
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-self-query"
+physical_crate_found = true
+resolution = "reused_exact_with_prototype_status_drift"
+owner_crate = "eliot-dreamer-self-query"
+owner_module_id = "smart.dreamer.self_query"
+measured_order = 49
+drift = "Cargo metadata reads prototype = true while the crate is already an admitted root workspace member and a Cargo.lock entry."
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-research-synthesis"
+physical_crate_found = true
+resolution = "reused_exact_with_order_collision"
+owner_crate = "eliot-dreamer-research-synthesis"
+owner_module_id = "smart.dreamer.research-synthesis"
+measured_order = 6
+drift = "Its [package.metadata.eliot] agent_order = 6 collides with eliot-dreamer-orientation agent_order = 6, and it has no cognitive-crate-decisions.toml order because that ledger stops at 43."
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-memory-models"
+physical_crate_found = false
+resolution = "family_label_resolved_to_ten_handler_owners"
+owner_crate = "eliot-dreamer-curation"
+owner_module_id = "smart.dreamer.curation"
+measured_order = 31
+family_owner_crates = ["eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
+note = "No shared family envelope type exists in any of the ten; eliot-dreamer-concept emits no result type at all."
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-procedural"
+physical_crate_found = false
+resolution = "renamed_to_measured_owner"
+owner_crate = "eliot-dreamer-procedure"
+owner_module_id = "smart.dreamer.procedure"
+measured_order = 25
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-memory-revision"
+physical_crate_found = true
+resolution = "reused_exact"
+owner_crate = "eliot-dreamer-memory-revision"
+owner_module_id = "smart.dreamer.memory_revision"
+measured_order = 79
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-diagnosis"
+physical_crate_found = false
+resolution = "family_label_resolved_to_two_owners"
+owner_crate = "eliot-dreamer-development-diagnosis"
+owner_module_id = "smart.dreamer.development_diagnosis"
+measured_order = 40
+family_owner_crates = ["eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis"]
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-planning"
+physical_crate_found = false
+resolution = "family_label_resolved_to_four_owners"
+owner_crate = "eliot-dreamer-orchestration-plan"
+owner_module_id = "smart.dreamer.orchestration_plan"
+measured_order = 43
+family_owner_crates = ["eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan", "eliot-dreamer-probe-plan"]
+note = "eliot-dreamer-probe-plan has no cognitive-crate-decisions.toml order; its agent_order 17 is read from its own Cargo.toml."
+
+[[label_resolution]]
+issue_label = "eliot-dreamer-cycle"
+physical_crate_found = true
+resolution = "reused_exact_with_unrecorded_order"
+owner_crate = "eliot-dreamer-cycle"
+owner_module_id = "smart.dreamer.cycle"
+measured_order = "none_declared"
+note = "Its Cargo metadata carries functional_cell smart.dreamer.cycle and no agent_order, and it has no cognitive-crate-decisions.toml or wave order. This catalogue records the gap and does not invent an order."
+
+# ---------------------------------------------------------------------------
+# Agent assignments. Existing measured orders only.
+# ---------------------------------------------------------------------------
+
+[[assignment]]
+order = 5
+crate = "eliot-dreamer-candidate-validation"
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+functional_cell = "smart.dreamer.candidate_validation"
+depends_on = []
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 6
+crate = "eliot-dreamer-orientation"
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+functional_cell = "smart.dreamer.orientation"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 49
+crate = "eliot-dreamer-self-query"
+manifest = "crates/smart/eliot-dreamer-self-query/module.toml"
+functional_cell = "smart.dreamer.self_query"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_prototype_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER_PROTOTYPE_FLAGGED"
+
+[[assignment]]
+order = 6
+crate = "eliot-dreamer-research-synthesis"
+manifest = "crates/smart/eliot-dreamer-research-synthesis/module.toml"
+functional_cell = "smart.dreamer.research-synthesis"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+order_note = "Order 6 is duplicated from this crate's own [package.metadata.eliot] agent_order and is reported as a collision in CC-W2-RESEARCH-SYNTHESIS-BRIEF; it is not a second wave order."
+
+[[assignment]]
+order = 25
+crate = "eliot-dreamer-procedure"
+manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+functional_cell = "smart.dreamer.procedure"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_MEMORY_MODEL_FAMILY_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 79
+crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+functional_cell = "smart.dreamer.memory_revision"
+depends_on = ["eliot-dreamer-self-query"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_prototype_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER_PROTOTYPE_FLAGGED"
+
+[[assignment]]
+order = 40
+crate = "eliot-dreamer-development-diagnosis"
+manifest = "crates/smart/eliot-dreamer-development-diagnosis/module.toml"
+functional_cell = "smart.dreamer.development_diagnosis"
+depends_on = ["eliot-dreamer-conflict-analysis", "eliot-dreamer-candidate-validation"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 41
+crate = "eliot-dreamer-maintenance-plan"
+manifest = "crates/smart/eliot-dreamer-maintenance-plan/module.toml"
+functional_cell = "smart.dreamer.maintenance_plan"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 42
+crate = "eliot-dreamer-configuration-plan"
+manifest = "crates/smart/eliot-dreamer-configuration-plan/module.toml"
+functional_cell = "smart.dreamer.configuration_plan"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 43
+crate = "eliot-dreamer-orchestration-plan"
+manifest = "crates/smart/eliot-dreamer-orchestration-plan/module.toml"
+functional_cell = "smart.dreamer.orchestration_plan"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+
+[[assignment]]
+order = 17
+crate = "eliot-dreamer-probe-plan"
+manifest = "crates/smart/eliot-dreamer-probe-plan/module.toml"
+functional_cell = "smart.dreamer.probe_plan"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+order_note = "Order 17 is read from this crate's own [package.metadata.eliot] agent_order; it has no cognitive-crate-decisions.toml row."
+
+[[assignment]]
+order = "none_declared"
+crate = "eliot-dreamer-cycle"
+manifest = "crates/smart/eliot-dreamer-cycle/module.toml"
+functional_cell = "smart.dreamer.cycle"
+depends_on = ["eliot-dreamer-contracts"]
+product_pulse = "W2_SEMANTIC_PAYLOAD_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+order_note = "No agent_order and no wave order exist for this crate on base cdf4a29; none is invented here. See CC-W2-CYCLE-CANDIDATES."
+
+[[assignment]]
+order = 31
+crate = "eliot-dreamer-curation"
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+functional_cell = "smart.dreamer.curation"
+depends_on = ["eliot-dreamer-candidate-validation"]
+product_pulse = "W2_MEMORY_MODEL_FAMILY_PULSE_01"
+package_action = "existing_physical_crate_contract_freeze_only"
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+role = "family_index_owner_for_the_ten_I9.6_memory_model_handlers"
+
+[assignment_output]
+required = ["field-complete contract bound to one measured defining symbol", "one disposition per row", "package/module proof", "affected Edge proof", "named Product Pulse when applicable", "donor trace", "ContractChallenges", "merge/remove recommendation"]
+
+[[agent_brief]]
+order = 5
+crate = "eliot-dreamer-candidate-validation"
+functional_cell = "smart.dreamer.candidate_validation"
+objective = "Emit the grounding receipt as either an accepted candidate or a retained rejection carrier. Retain the exact supplied grounding, ledger, manifest, policy, usage and preservation report on rejection; never rewrite, deduplicate or normalize them."
+write_scope = ["crates/smart/eliot-dreamer-candidate-validation/src/**"]
+inputs = ["frozen DreamJobAdmission, DreamInputBundle, ModelDraft, GroundedDreamDraft, ValidationPolicy, BudgetUsage, PreservationReport"]
+outputs = ["CandidateValidationOutcome", "StructuredCandidateValidationOutcome"]
+forbidden = ["duplicate validation algorithm", "normalizing or deduplicating retained grounding", "a second grounding receipt type parallel to the structured one", "a generic JSON escape field", "self-certifying grounding"]
+stop_condition = "Stop and return ContractChallenge when the job shape is outside this gate's supported contract, when a required bound is exceeded, or when a caller asks the gate to make an unsupported claim."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 6
+crate = "eliot-dreamer-orientation"
+functional_cell = "smart.dreamer.orientation"
+objective = "Project one candidate-only Orientation packet with exact source coverage, per-status anchored evidence, interpretation as hypothesis text, rival/dissent residue, hidden-relation residue, unknowns, inert probes, invalidation conditions and provenance that proves projection inputs only."
+write_scope = ["crates/smart/eliot-dreamer-orientation/src/**"]
+inputs = ["AdmittedOrientationJob", "bounded DreamInputBundle", "ValidatedOrientationCandidate", "CurrentEpistemicPositionHandle list", "OrientationPolicy"]
+outputs = ["OrientationPacketCandidate"]
+forbidden = ["promoting a model recommendation to a typed plan", "upgrading OrientationResidue to an algorithmic relation", "promoting InertProbe to an effect", "a second ContextCompiler invocation", "an I9.5 DreamPacket type that does not exist in source"]
+stop_condition = "Stop and return ContractChallenge when coverage lacks an exact denominator, when a fence or scope identity disagrees, or when a closed OrientationSectionKind would have to be widened."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 49
+crate = "eliot-dreamer-self-query"
+functional_cell = "smart.dreamer.self_query"
+objective = "Pose a self-query as an owner input digest plus its schema pin plus the source citations verified at pose time, and revalidate that receipt against the live input and accepted-source projection. The receipt authorizes nothing by itself."
+write_scope = ["crates/smart/eliot-dreamer-self-query/src/**"]
+inputs = ["SelfQueryInput (A-03 owner, frozen in the r6 freeze)", "AcceptedSourceProjection (CC-006)"]
+outputs = ["SelfQueryPoseReceipt", "CitedSource"]
+forbidden = ["declaring Architecture or Implementation conformance from a pose receipt", "a second self-query brief type in this crate", "reading repository prose directly", "treating a cited triple as source authority"]
+stop_condition = "Stop and return ContractChallenge when a cited triple is stale or uncited, or when a brief is requested from this crate that another owner must own."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 6
+crate = "eliot-dreamer-research-synthesis"
+functional_cell = "smart.dreamer.research-synthesis"
+objective = "Project one candidate research brief from a governed immutable ResearchPack plus a grounded structured draft, keeping claims, counterclaims, exact citations, rivals, unknowns, probes, an inert Concilium plan, seven I9.7 preservation verdicts, visible coverage and bounded omissions separate."
+write_scope = ["crates/smart/eliot-dreamer-research-synthesis/src/**"]
+inputs = ["ResearchPack (Researcher-plane owned; CC-005)", "GroundedDraft (A-03 owner)", "InputReceipt", "SynthesisPolicy"]
+outputs = ["ResearchBrief", "SynthesisOutcome"]
+forbidden = ["Researcher acquisition inside Smart", "a self-selected coverage denominator", "an aggregate URL list treated as grounded research", "merging the inert Concilium plan into the recommendation set", "raising the source authority ceiling"]
+stop_condition = "Stop and return ContractChallenge when the pack coverage denominator is not CompleteScope, when counter-search is not Complete for an absence claim, or when any of the seven preservation verdicts fails."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 25
+crate = "eliot-dreamer-procedure"
+functional_cell = "smart.dreamer.procedure"
+objective = "Propose one grounded procedure with per-step exactly-one disposition, closed effect class, bounded retries, transfer plan, verifier, inverse, forward-correction, reopen and unknown-handling notes. Propose only; execute nothing."
+write_scope = ["crates/smart/eliot-dreamer-procedure/src/**"]
+inputs = ["ValidatedCurationItem", "GroundedDreamDraft", "ProcedureEvidence", "CapabilityEnvSnapshot", "ExistingProcedureSnapshot", "ProcedurePolicy"]
+outputs = ["ProcedureCandidate"]
+forbidden = ["executing a proposed step", "retrying a step whose effect is EffectClass::Unknown", "treating a free-text effect_boundary as a bounded one", "a Skill or tool mutation"]
+stop_condition = "Stop and return ContractChallenge when a step has no bound verifier, when a step effect is Unknown and no external owner reconciles it, or when support is empirical but presented as mechanism."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 79
+crate = "eliot-dreamer-memory-revision"
+functional_cell = "smart.dreamer.memory_revision"
+objective = "Propose one advisory negative-memory extinction candidate that narrows activation, quarantine or archive only, echoes failure history verbatim, and carries the exact independently recheckable closure denominator."
+write_scope = ["crates/smart/eliot-dreamer-memory-revision/src/**"]
+inputs = ["FailureObservation (CC-FAILURE-OBSERVATION-SCHEMA)", "MemoryRevisionEvidence list", "admitted TaskProjection and SafetyProjection (CC-004)", "SelfQueryInput", "AcceptedSourceProjection"]
+outputs = ["NegativeMemoryExtinctionCandidate"]
+forbidden = ["a purge or any irreversible operator", "rewriting failure history", "suppressing negative memory only because it rarely changed an action", "claim-grade safety for a reversible candidate", "collapsing the exact trigger into a similarity score"]
+stop_condition = "Stop and return ContractChallenge when the closure denominator is incomplete, when a cited source triple is stale, when the same causal hypothesis recurs and Mechanism Review is required, or when irreversible extinction is requested."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 40
+crate = "eliot-dreamer-development-diagnosis"
+functional_cell = "smart.dreamer.development_diagnosis"
+objective = "Emit one falsifiable development diagnosis with a closed Product gap kind, current discriminator, repair history, frozen conflict analysis, live and falsified rival mechanisms, discriminating experiments, common-mode disclosure, one recommended experiment and an exact attempt denominator."
+write_scope = ["crates/smart/eliot-dreamer-development-diagnosis/src/**"]
+inputs = ["DreamJobAdmission", "ValidatedDreamDraft", "ProductGap", "DiscriminatorEvidence", "RepairHistory", "FrozenConflictAnalysis", "RivalMechanism list", "CommonModeDisclosure", "DiscriminatingExperiment list", "DiagnosisPolicy"]
+outputs = ["DevelopmentDiagnosisCandidate"]
+forbidden = ["supplying its own oracle", "an equivalent repair retry without new information", "treating ProxyOnly activity signals as a Product gap", "a global bottleneck or quality score", "a diagnosis that merges conflict analysis into itself"]
+stop_condition = "Stop and return ContractChallenge when every rival is falsified without a live mechanism, when no experiment discriminates, when the attempt denominator is incomplete, or when the gap kind would have to be widened."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 41
+crate = "eliot-dreamer-maintenance-plan"
+functional_cell = "smart.dreamer.maintenance_plan"
+objective = "Plan one finite owner-bound maintenance proposal over the ten inert admitted operation verbs, with expected deltas, a semantic verifier, explicit rollback steps, named required Human or owner decisions, resource ceilings and an exact attempt denominator. Plan only."
+write_scope = ["crates/smart/eliot-dreamer-maintenance-plan/src/**"]
+inputs = ["DreamJobAdmission", "ValidatedDreamDraft", "GroundedDreamDraft", "MaintenanceObjective", "TriggerEvidence", "PriorHistory", "PlannedOperation list", "ExpectedDelta list", "MaintenanceBoundary", "MaintenancePolicy"]
+outputs = ["MaintenancePlanCandidate"]
+forbidden = ["a scheduling, execution, Doctor, tool, provider or configuration verb", "crossing a named resource ceiling", "treating DecisionRequired as permission", "performing the planned operation"]
+stop_condition = "Stop and return ContractChallenge when a requested operation is outside the ten admitted verbs, when a ceiling would be exceeded, or when an owner decision is unnamed."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 42
+crate = "eliot-dreamer-configuration-plan"
+functional_cell = "smart.dreamer.configuration_plan"
+objective = "Emit one snapshot-bound configuration intent as a closed typed delta with a derived candidate digest, a bounded impact closure, an inert boundary, a rollback plan and an approval state. Propose only; never write configuration."
+write_scope = ["crates/smart/eliot-dreamer-configuration-plan/src/**"]
+inputs = ["DreamJobAdmission", "ValidatedDreamDraft", "TypedConfigurationRequest or StructuredRequest", "TypedConfigurationSnapshotSet or SnapshotAnchor", "ConfigurationFieldSchema list", "typed or structured change list", "impact closure", "prior history", "inert boundary", "policy"]
+outputs = ["ConfigurationChangeCandidate"]
+forbidden = ["writing configuration", "carrying a secret value instead of a SecretReference", "treating absence of approval as permission", "a generic or open shape where a typed delta is required", "scope widening"]
+stop_condition = "Stop and return ContractChallenge when a field is not bound to a declared schema, when a secret class is detected, when the base digest is stale, or when an equivalent failed change needs diagnosis first."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 43
+crate = "eliot-dreamer-orchestration-plan"
+functional_cell = "smart.dreamer.orchestration_plan"
+objective = "Decompose one objective into agent work units with explicit write claims, read refs, forbidden paths, budgets, readiness edges and a closed terminal outcome, preserving every omitted requirement instead of dropping it."
+write_scope = ["crates/smart/eliot-dreamer-orchestration-plan/src/**"]
+inputs = ["DreamJobAdmission", "ValidatedDreamDraft", "PlanObjective", "PlanRequirement list", "PlanSurface list", "AgentWorkUnitBrief list", "ReadinessEdge list", "DecompositionPolicy"]
+outputs = ["WorkUnitDecomposition"]
+forbidden = ["reserving a route, a launch or a schedule", "overlapping mutable write scopes", "a nominal-context dispatch as a context-envelope proof", "an arbitrary file split to satisfy a size rule", "dispatching parallel progress over one serialized mutable target"]
+stop_condition = "Stop and return ContractChallenge when write scopes overlap, when a readiness edge is not owner-resolved, when the requested claim is unsupported, or when a work unit has no context measurement status."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = "none_declared"
+crate = "eliot-dreamer-cycle"
+functional_cell = "smart.dreamer.cycle"
+objective = "Advance exactly one adjacent phase of one finite bounded DreamCycle against an immutable sample with an exact denominator, emitting an inert owner request and never scheduling itself."
+write_scope = ["crates/smart/eliot-dreamer-cycle/src/**"]
+inputs = ["DreamerCycleState", "ObservedOutcome list", "CyclePolicy", "SampleLimits", "injected observation time"]
+outputs = ["CycleStep", "CycleSample", "CyclePlan", "ExperimentCandidate"]
+forbidden = ["self-scheduling or any schedule or launch field", "a multi-cycle or recurring horizon", "skipping a phase", "a DurableJob or route reservation", "claiming a Complete sample without the exact SampleDenominator totals"]
+stop_condition = "Stop and return ContractChallenge when the injected observation is at or beyond the frozen deadline, when the frontier cannot be preserved, or when a plan horizon other than the single adjacent phase is requested."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+# ---------------------------------------------------------------------------
+# Field contracts. W9-shaped. Every field list is copied from measured source.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+id = "ValidationGroundingReceiptContract"
+owner_crate = "eliot-dreamer-candidate-validation"
+family = "grounding receipt and retained rejection carrier"
+source_handles = ["I6.4", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["candidate_validation_outcome_job_bundle_model_grounded_preservation_usage_policy_observation_time_ms_cancellation_requested_code_detail_input_digest", "rejection_code_IdentityMismatch_LineageMismatch_DuplicateItem_UnsupportedPrecision_BudgetExceeded_DeadlineExceeded_Cancelled_PreservationFailed_UnsupportedJobShape", "structured_rejection_input_code_detail_input_digest"]
+denominator = "the receipt-excluded validation input preimage identified by input_digest, over which the digest is recomputed on every validation"
+denominator_rule = "RECHECK: recompute the input preimage digest from the retained job, bundle, model, grounded, preservation, usage and policy fields and compare with the carried input_digest."
+complete_rule = "A rejection is a retained carrier, not a verdict: completeness of the retained material is what is complete; the model never certifies its own grounding."
+fence = "job, bundle, task, scope and fence identities inside DreamJobAdmission; any disagreement is RejectionCode::IdentityMismatch or LineageMismatch."
+omission_semantics = "A rejected draft is retained whole. Nothing is normalized, deduplicated, truncated or replaced by a summary."
+invariants = ["the model never self-certifies grounding", "no generic JSON escape field", "every RejectionCode is a closed machine-readable class", "one shared ValidationPolicy re-export, not a second policy owner"]
+
+[[field_contract]]
+id = "OrientationPacketContract"
+owner_crate = "eliot-dreamer-orientation"
+family = "Orientation packet and section coverage"
+source_handles = ["I6.4", "I9.6", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["packet_id_job_id_operation_id_task_id_scope_id_question", "frame_source_coverage_source_materials_omission_handles_coverage_denominator", "resolved_epistemic_position_handles_anchored_evidence_by_status", "synthesized_interpretations_rival_models_and_dissent_hidden_relation_candidates_unknowns_and_gaps", "recommended_probes_or_next_actions_architecture_implications_model_routes_and_cost", "budget_usage_invalidation_conditions_provenance_sections", "preservation_upstream_preservation_model_draft_grounded_draft_disposition_input_digest_output_digest", "section_kind_items_item_digests_digest_known_denominator", "orientation_section_kind_IdentityTaskFrame_Constraints_EvidenceCoverage_Positions_InterpretationsRivalsDissent_UnknownsGaps_RelationCandidates_InertProbes_SafeExternalHandoff_OmissionsExpansionFrontierInvalidation_Preservation"]
+denominator = "OrientationCoverage measured from the supplied bundle: material_count, omission_count, non_excluded_count, authoritative_denominator, denominator_digest, manifest_digest; the optional coverage_denominator on the packet"
+denominator_rule = "RECHECK: recount material, omission and non-excluded counts from the supplied bundle and the retained omission handles, and re-derive denominator_digest. A Complete coverage posture without the exact denominator is invalid; absence is never inferred from an empty list."
+complete_rule = "Every Complete state requires the exact independently recheckable coverage denominator above; a section with known = false is an explicit unknown, never filler."
+fence = "task_id, scope_id and the state_fence carried in OrientationProvenance; the operation_id and idempotency_key bind the request."
+omission_semantics = "Missing material appears as an omission_handle or a known = false section with a denominator, never as silent loss."
+invariants = ["a model recommendation stays inert and cannot become a typed plan", "unsupported residue is never upgraded to an algorithmic relation", "provenance proves projection inputs, not truth, delivery or effects", "chronology and causal hypothesis stay separate fields", "no closed section kind is widened", "the free-text OrientationResidue and InertProbe shapes are reported as open, not frozen as closed classes"]
+
+[[field_contract]]
+id = "SelfQueryBriefContract"
+owner_crate = "eliot-dreamer-self-query"
+family = "posed self-query and its citations"
+source_handles = ["I6.4", "I0.3"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["pose_receipt_input_digest_schema_version_cited", "cited_source_handle_revision_digest", "self_query_input_schema_version_validated_candidate_profile_attempt_question_source_bundle_handle_source_anchors_denominator_policy_usage_preservation_invalidation_conditions", "accepted_source_projection_schema_version_projection_id_pair_fence_sources_digest", "normative_pair_binding_architecture_digest_implementation_digest_pair_key_document_set_architecture_revision_implementation_revision_accepted_by_acceptance_receipt", "architecture_anchor_schema_version_anchor_id_source_handle_revision_source_digest_byte_start_byte_end_class_modality_text_applicability_dependency_refs", "architecture_dependency_denominator_schema_version_denominator_id_members_complete_digest"]
+denominator = "the owner's canonical input_digest over the complete validated input closure, which identifies exactly the closure the brief projectors consume"
+denominator_rule = "RECHECK: recompute the owner input_digest from the same SelfQueryInput and compare with the receipt; a mismatch is stale, never a similarity fallback."
+complete_rule = "A pose receipt is not durable proof until revalidate() passes against the live input and the accepted-source projection. Absence of a citation is not a license to read the source."
+fence = "the accepted-source projection fence plus the source_handle/revision/digest triples; exact-triple match only, stale on any drift."
+omission_semantics = "A source that cannot be cited stays absent from cited; it is never replaced by an uncited summary."
+invariants = ["a pose receipt authorizes nothing by itself", "Architecture and Implementation brief projections stay with eliot-dreamer-architecture-brief and eliot-dreamer-implementation-brief", "target contract and current support stay separate fields", "a citation is not source authority"]
+
+[[field_contract]]
+id = "ResearchSynthesisBriefContract"
+owner_crate = "eliot-dreamer-research-synthesis"
+family = "research brief, claim matrix, coverage and preservation"
+source_handles = ["I9.6", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["brief_id_pack_digest_question_claim_matrix_rivals_unknowns_probes_probe_residue_concilium_coverage_dependence_disposition_preservation_omitted_raw_digest_semantic_digest", "research_pack_pack_digest_question_task_id_scope_id_fence_epoch_fence_generation_bundle_digest_manifest_digest_sources_source_denominator_coverage_denominator_counter_search_missing_source_classes_omitted_sources", "grounded_draft_draft_digest_grounding_digest_task_id_scope_id_question_claims_rivals_unknowns_probes_concilium", "synthesis_request_schema_revision_binding_pack_draft_receipt_policy_bounds_cancellation", "preservation_dimension_Coverage_Preservation_Faithfulness_Lineage_Reversibility_SourceAuthority_DependencyClosure", "claim_disposition_Supported_Contested_Unsupported_OutsideManifest_PrecisionLimited_AbsentScopeComplete_AbsentScopeIncomplete_DuplicateCollapsed_Withheld", "synthesis_disposition_Complete_Partial_Exhausted_Abstained_Blocked_Unsupported_Conflicted_Unknown", "evidence_grade_E0_E1_E2_E3", "denominator_kind_CompleteScope_Sampled_Unknown", "counter_search_status_Complete_Partial_NotRun", "omission_kind_Claims_Rivals_References_Probes_Unknowns_Work_OutputBytes_Concilium", "probe_residue_reason_Nondiscriminative_UnknownTarget_Unauthorized_Budget"]
+denominator = "the ResearchPack coverage denominator: source_denominator handles over a DenominatorKind, backed by a CounterSearchStatus, with missing_source_classes and omitted_sources carrying reasons"
+denominator_rule = "RECHECK: re-resolve the pack manifest digest and the source_denominator handles; an absence claim is valid only when coverage_denominator is CompleteScope and counter_search is Complete, and invalid otherwise."
+complete_rule = "SynthesisDisposition::Complete requires all seven I9.7 preservation verdicts and no unnamed omission. Partial, Exhausted, Abstained, Blocked, Unsupported, Conflicted and Unknown are all non-complete and must say which role was cut."
+fence = "task_id, scope_id, fence_epoch and fence_generation on the pack, echoed by the grounded draft."
+omission_semantics = "Every cut records its OmissionKind and preserves the denominator that produced it. A reference that left the authorized set is OutsideManifest, never silently sourced."
+invariants = ["the model never certifies transformation faithfulness; the seven preservation verdicts are verdicts, not self-granted truths", "researcher acquires, Dreamer interprets, Governor governs", "the inert Concilium recommendation stays separate from the recommended probes", "no wire spelling is declared for a type that carries no serde boundary", "raw_digest is order-sensitive and semantic_digest is order-insensitive; neither substitutes for the other"]
+
+[[field_contract]]
+id = "MemoryModelCandidateContract"
+owner_crate = "eliot-dreamer-curation"
+family = "the eleven I9.6 semantic memory-model kinds across the ten A-21..A-30 handler crates"
+source_handles = ["I9.6", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT_WITH_ONE_MISSING_OWNER_DECISION"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["candidate_id_kind_source_handles_proposed_transformation_support_counterevidence", "scope_and_applicability_preservation_report_uncertainty_verifier_or_replay_expected_benefit_rollback", "kind_Classification_Relation_Episode_Concept_Procedure_Failure_Merge_Split_Reconsolidation_Accessibility_Repair", "handler_result_type_per_kind_ClassificationResult_RelationResult_EpisodeCandidate_ABSENT_FailureAssessment_and_FailureHandlerDecision_StructureRepairCandidate_ReconsolidationResult_AdjustmentProposal_MemoryRepairCandidate", "merge_split_equivalence_report_rollback_plan_invalidation_plan_dependent_dispositions", "reconsolidation_added_and_child_propositions_reactivation_binding_evidence_independence_dependent_outcome", "accessibility_axis_surface_standing_influence_change_protection_and_negative_memory_local_closure", "memory_repair_defect_kind_operation_kind_provenance_repair_spec_contamination_closure_representation_proposal", "chronology_chronology_link_boundary_gap_coverage_overlap_assessment_rollback"]
+denominator = "per-kind denominator over the retained source handles and the declared coverage member set, with explicit omissions, at the named fence"
+denominator_rule = "RECHECK: re-enumerate the affected members, dependent closure and revalidation plan from the retained source handles at the named fence. Similarity only warns; an exact trigger blocks or requires a probe."
+complete_rule = "A kind is Complete only when its own result type reports complete coverage with no unnamed omission. There is no family-level completeness: completeness is per kind."
+fence = "per-kind scope and fence; the family index carries no single fence of its own."
+omission_semantics = "Every kind carries its own omission class; an omitted member stays addressable and is never replaced by a family aggregate."
+invariants = ["merge, split, reconsolidation, accessibility and influence are forward reversible candidates only", "chronology stays separate from causal hypothesis", "no shared family envelope type is invented", "no aggregate intelligence, confidence or utility score across kinds", "the concept handler has no emitted result type on this base and is an explicit missing contract decision"]
+
+[[field_contract]]
+id = "ProceduralCandidateContract"
+owner_crate = "eliot-dreamer-procedure"
+family = "procedure candidate and per-step disposition"
+source_handles = ["I9.6", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["outcome_procedure_handle_objective_steps_step_dispositions_trigger_note_applicability_note_transfer_verifier_inverse_note_forward_correction_note_reopen_note_unknown_handling_note_candidate_digest_note", "step_step_id_owner_contract_ref_operation_inputs_precondition_dependencies_postcondition_verifier_effect_effect_boundary_budget_note_failure_note_cancel_note_reconcile_note_rollback_note_max_retries_timeout_ms_fanout", "step_disposition_kind_Grounded_Refinement_Conflict_Empirical_MissingVerifier_Unsafe_BlockedUnknownEffect_UnchangedWithEvidence", "effect_class_ReadOnly_OwnerDirected_Compensatable_Unknown", "procedure_outcome_Complete_Partial_Duplicate_Refinement_Conflict_Empirical_MissingVerifier_Unsafe_BlockedUnknownEffect_Stale_Rejected"]
+denominator = "the enumerated step set plus its dependency closure and evidence items over the bounded MAX_STEPS / MAX_STEP_DEPS / MAX_EVIDENCE_ITEMS bounds, with the candidate_digest recomputed over the candidate shape"
+denominator_rule = "RECHECK: recompute candidate_digest from the candidate fields; re-enumerate the step dependency closure and the evidence items; a step with EffectClass::Unknown is not retried."
+complete_rule = "ProcedureOutcome::Complete requires exactly one StepDisposition per step, a bound verifier on every step and a named transfer boundary. Empirical support blocks a mechanism claim."
+fence = "per-step owner and contract_ref plus the request scope; a moved request is ProcedureOutcome::Stale."
+omission_semantics = "A step with no bound verifier is MissingVerifier and blocks completeness; it is never dropped."
+invariants = ["a procedure candidate is proposed, never executed", "EffectClass::Unknown blocks every retry path until an external owner reconciles the exact operation", "the free-text effect_boundary is reported as unbounded in source, not frozen as a bound", "a Skill or tool mutation is out of scope"]
+
+[[field_contract]]
+id = "MemoryRevisionCandidateContract"
+owner_crate = "eliot-dreamer-memory-revision"
+family = "negative-memory extinction and closure denominator"
+source_handles = ["I12-19", "I12-21", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT_WITH_CORRECTED_STATIC_DESCRIPTION"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["contract_version_candidate_id_observation_ref_fingerprint_query_digest_narrowing_disposition_denominator_state_missing_digest", "narrowing_suppress_activation_quarantine_archive", "candidate_disposition_AdvisoryNarrow_MechanismReview", "candidate_state_Complete_Inconclusive_Unsupported", "closure_denominator_fence_enumerated_exclusions_recheck_digest_complete", "intake_observation_evidence_task_safety_query_sources_pose_digest_candidate_id"]
+denominator = "ClosureDenominator: the sorted union of the observation journal refs and the revision evidence refs at the named fence, with the closed-class exclusions carried verbatim and a recheck_digest recomputed over fence, members and exclusions"
+denominator_rule = "RECHECK: any third party holding the same refs at the same fence recomputes the identical recheck_digest. That is the recheck rule, not a second enumeration capability."
+complete_rule = "CandidateState::Complete requires a nonempty enumerated closure and an empty missing list. Without adequate adjudication only reversible suppress, quarantine or archive is allowed."
+fence = "StateFence on the ClosureDenominator, echoed by the observation and revision evidence."
+omission_semantics = "Every exclusion is a closed FailureOmission class; an unknown member keeps the state Inconclusive and is named in missing."
+invariants = ["there is no purge field by design", "failure history is echoed verbatim and only the advisory narrowing narrows", "the exact trigger stays distinct from semantic near-match; the Rust fingerprint is one opaque String, so this distinction is recorded as an open gap", "the wave-09 field family that the Rust candidate does not implement is recorded as corrected_static_description, not frozen", "recurring failure with the same causal hypothesis yields MechanismReview"]
+
+[[field_contract]]
+id = "DiagnosisCandidateContract"
+owner_crate = "eliot-dreamer-development-diagnosis"
+family = "conflict analysis and falsifiable development diagnosis"
+source_handles = ["I12-21", "I9.6", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["diagnosis_outcome_diagnosis_handle_product_id_source_revision_objective_id_gap_kind_product_gap", "current_discriminator_repair_history_conflict_analysis", "rival_mechanisms_experiment_alternatives_policy", "rivals_rivals_live_rivals_falsified_strongest_current_strongest_limits_note_common_mode", "recommended_experiment_recommendation_next_evidence_note", "preservation_input_receipt_digest_attempt_denominator_experiments_considered_candidate_digest_note", "product_gap_kind_ProductFailure_ProductPartial_Unknown_ProxyOnly", "rival_status_Live_Falsified", "experiment_outcome_kind_Success_NoChange_Regression_Unavailable_Unknown_InstrumentFailure", "diagnosis_outcome_Complete_Partial_Insufficient_MechanismReviewRequired_Stale_Rejected", "conflict_analysis_lineage_attribution_supplied_objections_supplied_probes_external_resolution_position_analysis_lineage_groups_common_mode_risk_recommended_probe_decision_owner_recommendation_dimension_verdicts_preservation"]
+denominator = "attempt_denominator over the retained attempt refs, with experiments_considered counted from the supplied DiscriminatingExperiment list, and rivals_live plus rivals_falsified equal to rivals.len()"
+denominator_rule = "RECHECK: re-enumerate the attempt denominator from the retained refs, re-count the rivals and re-map every experiment outcome kind. A rivals_live plus rivals_falsified total that differs from rivals.len() is invalid."
+complete_rule = "DiagnosisOutcome::Complete requires a live rival, a discriminating experiment, a bound current discriminator, and a closed Product gap kind. ProxyOnly and Unknown block completeness."
+fence = "product_id plus source_revision plus objective_id; a moved request is Stale."
+omission_semantics = "An unobserved gap kind stays Unknown; shared success may remain distributed or uncertain rather than attributed."
+invariants = ["a diagnosis supplies its own oracle never", "an equivalent repair without new information yields MechanismReviewRequired", "no global bottleneck, quality or intelligence score", "conflict analysis stays in eliot-dreamer-conflict-analysis; the two candidates are not merged", "neither candidate is a curation wire kind"]
+
+[[field_contract]]
+id = "PlanningCandidateContract"
+owner_crate = "eliot-dreamer-orchestration-plan"
+family = "maintenance, configuration, orchestration and probe plans"
+source_handles = ["I9.6", "I2.17", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["maintenance_outcome_plan_handle_objective_id_objective_revision_product_id_owner_decomposition_owners_trigger_id_operations_deltas_verifier_id_rollback_steps_required_decisions_stop_summary_preservation_input_receipt_digest_attempt_denominator_candidate_digest_note", "maintenance_op_kind_Inspect_Vacuum_Reindex_Compact_Snapshot_Verify_Reconcile_Prune_Refresh_Rotate", "configuration_outcome_intent_handle_primary_layer_primary_owner_base_digest_candidate_digest_base_revision_changes_impact_boundary_preservation_input_receipt_digest_attempt_denominator_note_details", "decomposition_plan_handle_objective_id_task_id_scope_id_units_edges", "agent_work_unit_requirement_surface_budget_write_claim_read_ref_forbidden_path_proof_status", "readiness_edge_dependency_kind_requirement_exclusion", "decomposition_outcome_Complete_Partial_Blocked_Rejected_Unsupported_Overlapped_Stale_Challenge_Provisional", "probe_plan_probe_proposal_dimensions_omission_target_relation_objective_disposition"]
+denominator = "per-plan attempt_denominator over the retained attempt refs, with the resource ceilings (CPU_MS, MEMORY_BYTES, STORAGE_BYTES, NETWORK_BYTES, CONTEXT_BYTES, COST_UNITS, HUMAN_MINUTES, WALL_MS, IDLE_MS, WORK_ITEMS, OUTPUT_BYTES) for maintenance, the typed impact closure for configuration, and the retained requirement set for decomposition"
+denominator_rule = "RECHECK: re-enumerate the attempt denominator from the retained refs; re-derive the typed impact closure from the declared schemas; re-count the retained and omitted requirements. A requirement dropped rather than preserved as omitted makes the plan Partial, never Complete."
+complete_rule = "Each plan is Complete only against its own denominator. DecisionRequired is not Complete and is not permission."
+fence = "objective_id plus objective_revision for maintenance; base_revision and base_digest for configuration; task_id and scope_id for decomposition; a moved base is Stale."
+omission_semantics = "A requirement that cannot be placed stays an explicit RequirementExclusion; a ceiling breach is named, not absorbed."
+invariants = ["planning owns no DurableJob, Ready Queue, route reservation, launch, schedule, config write, effect, authority or task finish", "only the ten inert admitted maintenance verbs exist; scheduling, execution, Doctor, tool, provider and configuration verbs have no spelling", "a secret is carried as a SecretReference, never as a value", "no generic or open shape where a typed delta is required", "none of the four plan types is a curation wire kind"]
+
+[[field_contract]]
+id = "DreamCycleCandidateContract"
+owner_crate = "eliot-dreamer-cycle"
+family = "one finite bounded DreamCycle, its sample and its durable projection"
+source_handles = ["I6.4", "I9.7"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["state_schema_version_cycle_id_job_bundle_digest_policy_id_policy_revision_policy_digest_phase_controller_revision_predecessor_digest_pending_proposed_requests_outcomes_frontier_budget_usage_cancellation_requested_canonical_digest", "step_predecessor_digest_next_state_requests_disposition_transition_digest", "plan_schema_version_cycle_id_from_phase_to_phase_horizon_job_digest_bundle_digest_policy_digest_state_digest_sample_digest_experiments_requests_frontier_plan_digest", "experiment_target_kind_horizon_reason", "sample_schema_version_cycle_id_phase_job_digest_bundle_digest_policy_digest_state_digest_denominator_sampled_pending_sampled_proposed_sampled_outcomes_omitted_pending_omitted_proposed_omitted_outcomes_frontier_complete_coverage_digest", "sample_denominator_pending_total_proposed_total_outcomes_total_frontier_total", "cycle_phase_Validated_BundleValidated_Screened_ModelObserved_GroundingValidated_CommonValidated_HandlerObserved_IntrinsicOutputChecked_ExternalAdmission_ClosureObserved", "outcome_disposition_Accepted_Rejected_NotAttempted_Completed_Partial_FailedBeforeEffect_Unknown_Cancelled_Expired_Superseded_Unavailable_Stale", "request_kind_BundleValidation_CurationScreen_ModelInvocation_Grounding_CommonValidation_SemanticHandler_IntrinsicOutput_ExternalAdmission_Closure_EffectReconciliation_Clarification", "step_disposition_Advanced_Replayed_ReconciliationRequired_Blocked_Terminal", "plan_horizon_OneCycle", "experiment_kind_ClarificationProbe_ReconciliationProbe"]
+denominator = "SampleDenominator{pending_total, proposed_total, outcomes_total, frontier_total} carried on CycleSample with sampled and omitted members listed by identity and a coverage_digest"
+denominator_rule = "RECHECK: recount the four totals from DreamerCycleState and reconcile them against the sampled and omitted member lists. CycleSample::complete is true only when the sampled members account for every total and the omitted lists are empty."
+complete_rule = "A complete sample requires the exact four totals plus empty omitted lists. A partial sample is an explicit partial read, never a Complete coverage claim."
+fence = "job, policy_id, policy_revision, policy_digest, bundle_digest and the predecessor_digest chain, plus the injected observation time for the deadline."
+omission_semantics = "A member not sampled appears in the matching omitted list with its identity, and the frontier names where sampling resumes."
+invariants = ["PlanHorizon has exactly one variant OneCycle, so the cycle is one finite bounded adjacent phase and cannot self-schedule", "ExperimentKind admits only a clarification probe and a reconciliation probe", "no DurableJob, route reservation, launch or schedule field exists", "MAX_NO_PROGRESS and MAX_DURABLE_COMMANDS bound the durable leg", "an inert owner request authorizes nothing"]
+
+# ---------------------------------------------------------------------------
+# Public-type ownership. One owner per public type; a re-export is not a
+# second owner.
+# ---------------------------------------------------------------------------
+
+[[ownership]]
+public_type = "CandidateValidationOutcome"
+rust_owner = "eliot-dreamer-candidate-validation"
+defining_symbol = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs::CandidateValidationOutcome"
+contract_index = "ValidationGroundingReceiptContract"
+functional_cells = ["smart.dreamer.candidate_validation"]
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+consumers = ["every typed curation handler behind the A-05 boundary"]
+
+[[ownership]]
+public_type = "StructuredCandidateValidationOutcome"
+rust_owner = "eliot-dreamer-candidate-validation"
+defining_symbol = "crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs::StructuredCandidateValidationOutcome"
+contract_index = "ValidationGroundingReceiptContract"
+functional_cells = ["smart.dreamer.candidate_validation"]
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+consumers = ["A-14b grounding carrier path"]
+reexport_rule = "Its Accepted payload is eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate; that type stays owned by eliot-dreamer-contracts and is not a second owner here."
+
+[[ownership]]
+public_type = "OrientationPacketCandidate"
+rust_owner = "eliot-dreamer-orientation"
+defining_symbol = "crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationPacketCandidate"
+contract_index = "OrientationPacketContract"
+functional_cells = ["smart.dreamer.orientation"]
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+consumers = ["DreamPacket review surface (candidate only)"]
+
+[[ownership]]
+public_type = "SelfQueryPoseReceipt"
+rust_owner = "eliot-dreamer-self-query"
+defining_symbol = "crates/smart/eliot-dreamer-self-query/src/lib.rs::SelfQueryPoseReceipt"
+contract_index = "SelfQueryBriefContract"
+functional_cells = ["smart.dreamer.self_query"]
+manifest = "crates/smart/eliot-dreamer-self-query/module.toml"
+consumers = ["eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-memory-revision"]
+
+[[ownership]]
+public_type = "ResearchBrief"
+rust_owner = "eliot-dreamer-research-synthesis"
+defining_symbol = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ResearchBrief"
+contract_index = "ResearchSynthesisBriefContract"
+functional_cells = ["smart.dreamer.research-synthesis"]
+manifest = "crates/smart/eliot-dreamer-research-synthesis/module.toml"
+consumers = ["research review surface (candidate only)"]
+
+[[ownership]]
+public_type = "ResearchPack"
+rust_owner = "Researcher plane (external to this catalogue)"
+defining_symbol = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ResearchPack"
+contract_index = "ResearchSynthesisBriefContract"
+functional_cells = ["smart.dreamer.research-synthesis"]
+manifest = "crates/smart/eliot-dreamer-research-synthesis/module.toml"
+consumers = ["eliot-dreamer-research-synthesis"]
+owner_rule = "Consumed by value and carried unchanged. Acquisition is the Researcher plane's (CC-005 DEFERRED_RESEARCH); this catalogue does not own it and does not extend it."
+
+[[ownership]]
+public_type = "MemoryModelCandidateContract family result types"
+rust_owner = "one owner per I9.6 kind; no shared family owner"
+defining_symbol = "crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationResult; crates/smart/eliot-dreamer-relation/src/result.rs::RelationResult; crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeCandidate; crates/smart/eliot-dreamer-failure/src/assessment.rs::FailureAssessment; crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairCandidate; crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationResult; crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentProposal; crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairCandidate"
+contract_index = "MemoryModelCandidateContract"
+functional_cells = ["smart.dreamer.classification", "smart.dreamer.relation", "smart.dreamer.episode", "smart.dreamer.failure", "smart.dreamer.structure_repair", "smart.dreamer.reconsolidation", "smart.dreamer.accessibility", "smart.dreamer.memory_repair"]
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+consumers = ["Governor transition path (candidate only)"]
+missing_owner = "eliot-dreamer-concept exposes EvidenceLedger, EvidenceAssessment and ConceptPolicy only; it emits no result type on this base."
+
+[[ownership]]
+public_type = "ProcedureCandidate"
+rust_owner = "eliot-dreamer-procedure"
+defining_symbol = "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureCandidate"
+contract_index = "ProceduralCandidateContract"
+functional_cells = ["smart.dreamer.procedure"]
+manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+consumers = ["curation dispatch and DreamPacket review surface (candidate only)"]
+
+[[ownership]]
+public_type = "NegativeMemoryExtinctionCandidate"
+rust_owner = "eliot-dreamer-memory-revision"
+defining_symbol = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::NegativeMemoryExtinctionCandidate"
+contract_index = "MemoryRevisionCandidateContract"
+functional_cells = ["smart.dreamer.memory_revision"]
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+consumers = ["Governor transition path (advisory only)"]
+cross_wave_note = "Already indexed by crates/smart/cognitive-wave-09.toml. That field family and the shipped Rust field set have diverged; see CC-W2-REVISION-CANDIDATE."
+
+[[ownership]]
+public_type = "DevelopmentDiagnosisCandidate"
+rust_owner = "eliot-dreamer-development-diagnosis"
+defining_symbol = "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DevelopmentDiagnosisCandidate"
+contract_index = "DiagnosisCandidateContract"
+functional_cells = ["smart.dreamer.development_diagnosis"]
+manifest = "crates/smart/eliot-dreamer-development-diagnosis/module.toml"
+consumers = ["advisory Dreamer review surface (candidate only)"]
+
+[[ownership]]
+public_type = "ConflictAnalysisCandidate"
+rust_owner = "eliot-dreamer-conflict-analysis"
+defining_symbol = "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisCandidate"
+contract_index = "DiagnosisCandidateContract"
+functional_cells = ["smart.dreamer.conflict_analysis"]
+manifest = "crates/smart/eliot-dreamer-conflict-analysis/module.toml"
+consumers = ["eliot-dreamer-development-diagnosis (FrozenConflictAnalysis input)", "advisory Dreamer review surface (candidate only)"]
+
+[[ownership]]
+public_type = "MaintenancePlanCandidate"
+rust_owner = "eliot-dreamer-maintenance-plan"
+defining_symbol = "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePlanCandidate"
+contract_index = "PlanningCandidateContract"
+functional_cells = ["smart.dreamer.maintenance_plan"]
+manifest = "crates/smart/eliot-dreamer-maintenance-plan/module.toml"
+consumers = ["owner decision surface (candidate only)"]
+
+[[ownership]]
+public_type = "ConfigurationChangeCandidate"
+rust_owner = "eliot-dreamer-configuration-plan"
+defining_symbol = "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationChangeCandidate"
+contract_index = "PlanningCandidateContract"
+functional_cells = ["smart.dreamer.configuration_plan"]
+manifest = "crates/smart/eliot-dreamer-configuration-plan/module.toml"
+consumers = ["owner decision surface (candidate only)"]
+
+[[ownership]]
+public_type = "WorkUnitDecomposition"
+rust_owner = "eliot-dreamer-orchestration-plan"
+defining_symbol = "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::WorkUnitDecomposition"
+contract_index = "PlanningCandidateContract"
+functional_cells = ["smart.dreamer.orchestration_plan"]
+manifest = "crates/smart/eliot-dreamer-orchestration-plan/module.toml"
+consumers = ["dispatch composition owner (candidate only)"]
+
+[[ownership]]
+public_type = "ProbePlan"
+rust_owner = "eliot-dreamer-probe-plan"
+defining_symbol = "crates/smart/eliot-dreamer-probe-plan/src/lib.rs::ProbePlan"
+contract_index = "PlanningCandidateContract"
+functional_cells = ["smart.dreamer.probe_plan"]
+manifest = "crates/smart/eliot-dreamer-probe-plan/module.toml"
+consumers = ["Dreamer probe selection surface (candidate only)"]
+
+[[ownership]]
+public_type = "DreamerCycleState"
+rust_owner = "eliot-dreamer-cycle"
+defining_symbol = "crates/smart/eliot-dreamer-cycle/src/contract.rs::DreamerCycleState"
+contract_index = "DreamCycleCandidateContract"
+functional_cells = ["smart.dreamer.cycle"]
+manifest = "crates/smart/eliot-dreamer-cycle/module.toml"
+consumers = ["Controller phase boundary (immutable projection)"]
+
+[[ownership]]
+public_type = "CycleStep"
+rust_owner = "eliot-dreamer-cycle"
+defining_symbol = "crates/smart/eliot-dreamer-cycle/src/contract.rs::CycleStep"
+contract_index = "DreamCycleCandidateContract"
+functional_cells = ["smart.dreamer.cycle"]
+manifest = "crates/smart/eliot-dreamer-cycle/module.toml"
+consumers = ["Controller phase boundary (immutable projection)"]
+
+[[ownership]]
+public_type = "GroundingValidationInput"
+rust_owner = "eliot-dreamer-claim-grounding"
+defining_symbol = "crates/smart/eliot-dreamer-claim-grounding/src/grounding.rs::GroundingRequest and the A-14b structured carrier consumed by StructuredCandidateRejectionReport.input"
+contract_index = "ValidationGroundingReceiptContract"
+functional_cells = ["smart.dreamer.claim_grounding"]
+manifest = "crates/smart/eliot-dreamer-claim-grounding/module.toml"
+consumers = ["eliot-dreamer-candidate-validation (structured leg)"]
+open_gap = "The exact A-14b carrier symbol name is not a top-level pub type in eliot-dreamer-claim-grounding; only GroundingRequest, GroundingControls and Cancellation are. Recorded as missing_contract_decision in CC-W2-VALIDATION-PAYLOAD rather than asserted as a located symbol."
+
+# ---------------------------------------------------------------------------
+# Field-complete per-type rows. One disposition per load-bearing row.
+# disposition is exactly one of: reused_exact, corrected_static_description,
+# missing_contract_decision, retired_with_successor.
+# ---------------------------------------------------------------------------
+
+[[type_contract]]
+id = "VAL-01"
+contract_index = "ValidationGroundingReceiptContract"
+crate = "eliot-dreamer-candidate-validation"
+rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs"
+symbol = "CandidateValidationOutcome"
+kind = "enum"
+fields = ["Accepted(Box<ValidatedCandidate>)", "Rejected(Box<CandidateRejectionReport>)"]
+wire_spelling = "Accepted / Rejected"
+wire_boundary = "serde deny_unknown_fields"
+required_optional_none = "No Option field; the outcome is exactly one of two variants."
+units_bounds = "no crate-level MAX_* const in this crate; bounds are carried by eliot-dreamer-contracts BudgetUsage and ValidationPolicy"
+identity_scope_fence = "carried inside the retained DreamJobAdmission and DreamInputBundle"
+provenance_privacy = "the retained report keeps the exact supplied material, so a rejection is auditable without a second copy"
+validation_error = "DreamDraftValidationError; the RejectionCode enum is the semantic reason and stays separate from it"
+compatibility = "adding a variant is a breaking wire change under deny_unknown_fields"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "VAL-02"
+contract_index = "ValidationGroundingReceiptContract"
+crate = "eliot-dreamer-candidate-validation"
+rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs"
+symbol = "CandidateRejectionReport"
+kind = "struct"
+fields = ["job", "bundle", "model", "grounded", "preservation", "usage", "policy", "observation_time_ms", "cancellation_requested", "code", "detail", "input_digest"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields"
+required_optional_none = "observation_time_ms is Option<u64>; its None means the gate had no explicit observation time, never that the deadline was met"
+units_bounds = "inherits the eliot-dreamer-contracts bounds carried in usage and policy"
+identity_scope_fence = "job, bundle, task, scope and fence live inside the retained job and bundle"
+provenance_privacy = "detail is bounded diagnostic text and never model authority"
+validation_error = "RejectionCode"
+compatibility = "detail is free text and bounded but not schema-validated; treat its wording as non-contractual"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "VAL-03"
+contract_index = "ValidationGroundingReceiptContract"
+crate = "eliot-dreamer-candidate-validation"
+rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs"
+symbol = "RejectionCode"
+kind = "enum"
+fields = ["IdentityMismatch", "LineageMismatch", "DuplicateItem", "UnsupportedPrecision", "BudgetExceeded", "DeadlineExceeded", "Cancelled", "PreservationFailed", "UnsupportedJobShape"]
+wire_spelling = "snake_case via serde rename_all"
+wire_boundary = "serde rename_all snake_case with deny_unknown_fields"
+required_optional_none = "closed set; no variant carries an open string class"
+units_bounds = "not applicable"
+identity_scope_fence = "not applicable"
+provenance_privacy = "not applicable"
+validation_error = "this enum IS the machine-readable rejection class"
+compatibility = "adding a variant breaks every pinned consumer under deny_unknown_fields"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "VAL-04"
+contract_index = "ValidationGroundingReceiptContract"
+crate = "eliot-dreamer-candidate-validation"
+rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs"
+symbol = "StructuredCandidateValidationOutcome and StructuredCandidateRejectionReport"
+kind = "enum plus struct"
+fields = ["StructuredCandidateValidationOutcome{Accepted(Box<ValidatedGroundingCandidate>), Rejected(Box<StructuredCandidateRejectionReport>)}", "StructuredCandidateRejectionReport{input, code, detail, input_digest}"]
+wire_spelling = "Accepted / Rejected; flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields; JsonSchema is not derived on the structured pair"
+required_optional_none = "no Option field"
+units_bounds = "the receipt-excluded structured input digest is recomputed over input, code and detail"
+identity_scope_fence = "carried inside the retained GroundingValidationInput"
+provenance_privacy = "the full supplied A-14b/A-05 carrier is retained without normalization"
+validation_error = "RejectionCode, shared with VAL-03"
+compatibility = "the accepted payload type is owned by eliot-dreamer-contracts, so this row is a consumer boundary, not a second owner"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "ORI-01"
+contract_index = "OrientationPacketContract"
+crate = "eliot-dreamer-orientation"
+rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
+symbol = "OrientationPacketCandidate"
+kind = "struct"
+fields = ["schema_version", "packet_id", "job_id", "operation_id", "task_id", "scope_id", "question", "frame", "source_coverage", "source_materials", "omission_handles", "coverage_denominator", "resolved_epistemic_position_handles", "anchored_evidence_by_status", "synthesized_interpretations", "rival_models_and_dissent", "hidden_relation_candidates", "unknowns_and_gaps", "recommended_probes_or_next_actions", "architecture_implications", "model_routes_and_cost", "budget_usage", "invalidation_conditions", "provenance", "sections", "preservation", "upstream_preservation", "model_draft", "grounded_draft", "disposition", "input_digest", "output_digest"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema; schema_version is deserialized through deserialize_orientation_packet_schema"
+required_optional_none = "coverage_denominator is Option and its None means no denominator was sealed, so no Complete coverage may be claimed; predecessor-style optionality is not used elsewhere on this type"
+units_bounds = "BudgetUsage is inherited from eliot-dreamer-contracts; no crate-level MAX_* const exists"
+identity_scope_fence = "job_id, operation_id, task_id, scope_id plus the state_fence inside provenance"
+provenance_privacy = "privacy_profile and requester_session are carried explicitly; source_materials are the disclosure-safe bounded set"
+validation_error = "OrientationError from OrientationResult; OrientationDisposition is the terminal class"
+compatibility = "the I9.5 name DreamPacket exists only as a doc comment; there is no typed DreamPacket symbol"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "ORI-02"
+contract_index = "OrientationPacketContract"
+crate = "eliot-dreamer-orientation"
+rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
+symbol = "OrientationSectionKind and OrientationSection"
+kind = "enum plus struct"
+fields = ["IdentityTaskFrame", "Constraints", "EvidenceCoverage", "Positions", "InterpretationsRivalsDissent", "UnknownsGaps", "RelationCandidates", "InertProbes", "SafeExternalHandoff", "OmissionsExpansionFrontierInvalidation", "Preservation", "OrientationSection{kind, items, item_digests, digest, known, denominator}"]
+wire_spelling = "snake_case section kinds via serde rename_all"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "denominator is Option; known = false with denominator None is an explicit unknown, not filler"
+units_bounds = "not applicable"
+identity_scope_fence = "bound to the packet, not to a fence of its own"
+provenance_privacy = "not applicable"
+validation_error = "not applicable; a section is validated by digest recomputation"
+compatibility = "adding a section kind is a breaking change for a pinned consumer"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "ORI-03"
+contract_index = "OrientationPacketContract"
+crate = "eliot-dreamer-orientation"
+rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
+symbol = "OrientationResidue and InertProbe"
+kind = "struct"
+fields = ["OrientationResidue{kind, text, source}", "InertProbe{text, status, result_space}"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "InertProbe.result_space is Option"
+units_bounds = "unbounded in source; no MAX_* const applies to these three String fields"
+identity_scope_fence = "not applicable"
+provenance_privacy = "not applicable"
+validation_error = "not applicable"
+compatibility = "the kind and status discriminants are free String, so an implementation agent can still invent values; this is an open gap, not a closed class"
+disposition = "missing_contract_decision"
+
+[[type_contract]]
+id = "ORI-04"
+contract_index = "OrientationPacketContract"
+crate = "eliot-dreamer-orientation"
+rust_path = "crates/smart/eliot-dreamer-orientation/src/result.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-orientation/src/input.rs", "crates/smart/eliot-dreamer-orientation/src/policy.rs"]
+symbol = "OrientationDisposition, OrientationResult, AdmittedOrientationJob, OrientationCoverageDenominator, OrientationPolicy, LocalOrientationFrame, CurrentEpistemicPositionHandle"
+kind = "enum, alias and structs"
+fields = ["OrientationDisposition", "OrientationResult", "LocalOrientationFrame", "AdmittedOrientationJob", "OrientationCoverageDenominator", "CoverageCepMember", "CoverageEvidenceMember", "CanonicalEvidenceHandle", "CurrentEpistemicPositionHandle", "OrientationError", "ValidatedOrientationCandidate"]
+wire_spelling = "as declared per item in the defining module"
+wire_boundary = "not applicable"
+required_optional_none = "ValidatedOrientationCandidate is a type alias over an already-validated input, so an Option would reintroduce an unvalidated path"
+units_bounds = "seal and validate_for are the binding gates"
+identity_scope_fence = "OrientationPolicy seals a policy digest; CurrentEpistemicPositionHandle validates for material use"
+provenance_privacy = "not applicable"
+validation_error = "OrientationError with validate_material and validate_for gates"
+compatibility = "ValidatedOrientationCandidate is a re-exported alias, so the validation owner is the alias source, not this row"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "SQ-01"
+contract_index = "SelfQueryBriefContract"
+crate = "eliot-dreamer-self-query"
+rust_path = "crates/smart/eliot-dreamer-self-query/src/lib.rs"
+symbol = "SelfQueryPoseReceipt"
+kind = "struct"
+fields = ["input_digest", "schema_version", "cited"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "no Option field; cited is empty when the owner input carries no source"
+units_bounds = "schema_version is always 1"
+identity_scope_fence = "the input_digest identifies the exact validated input closure; the fence travels inside the cited triples and the AcceptedSourceProjection"
+provenance_privacy = "cited preserves which sources were checked and authorizes nothing by itself"
+validation_error = "SelfQueryContractError from pose_self_query, pose_with_sources, revalidate and check_citations"
+compatibility = "the receipt is a projection over an owner type; the owner is eliot-dreamer-contracts, not this crate"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "SQ-02"
+contract_index = "SelfQueryBriefContract"
+crate = "eliot-dreamer-self-query"
+rust_path = "crates/smart/eliot-dreamer-self-query/src/lib.rs"
+symbol = "CitedSource"
+kind = "struct"
+fields = ["handle", "revision", "digest"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "no Option field"
+units_bounds = "handle is ArtifactId, inherited bound"
+identity_scope_fence = "the handle/revision/digest triple is the exact citation identity; drift on any element is stale"
+provenance_privacy = "not applicable"
+validation_error = "SelfQueryContractError from check_citations"
+compatibility = "exact-triple match only; there is no similarity fallback"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "SQ-03"
+contract_index = "SelfQueryBriefContract"
+crate = "eliot-dreamer-self-query"
+rust_path = "crates/smart/eliot-dreamer-self-query/src/lib.rs"
+symbol = "FREEZE_ID and OWNER_CONTRACT"
+kind = "const"
+fields = ["FREEZE_ID", "OWNER_CONTRACT"]
+wire_spelling = "string constants"
+wire_boundary = "not applicable"
+required_optional_none = "not applicable"
+units_bounds = "not applicable"
+identity_scope_fence = "FREEZE_ID names the r6 freeze revision this prototype was built against; OWNER_CONTRACT names eliot.smart.dreamer.contracts"
+provenance_privacy = "not applicable"
+validation_error = "no runtime check; verify_freeze_binding lives in eliot-dreamer-memory-revision, not here"
+compatibility = "a freeze revision bump makes this string stale; it is covered by CC-W2-CONSUMER-REPIN"
+disposition = "corrected_static_description"
+
+[[type_contract]]
+id = "RS-01"
+contract_index = "ResearchSynthesisBriefContract"
+crate = "eliot-dreamer-research-synthesis"
+rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs"
+symbol = "ResearchBrief"
+kind = "struct"
+fields = ["brief_id", "pack_digest", "question", "claim_matrix", "rivals", "unknowns", "probes", "probe_residue", "concilium", "coverage", "dependence", "disposition", "preservation", "omitted", "raw_digest", "semantic_digest"]
+wire_spelling = "none declared; the type does not derive Serialize or Deserialize"
+wire_boundary = "ABSENT: there is no serde boundary and no deny_unknown_fields on this shape"
+required_optional_none = "no Option field"
+units_bounds = "MAX_SYNTHESIS_OUTPUT_BYTES gates the rendered brief"
+identity_scope_fence = "pack_digest and question bind the brief to its exact pack"
+provenance_privacy = "dependence carries source dependence by canonical lineage; the pack's manifest_digest is the only authorized set"
+validation_error = "SynthesisError from synthesize"
+compatibility = "no wire compatibility rule can be stated for a shape with no wire form; the absence is the recorded fact"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "RS-02"
+contract_index = "ResearchSynthesisBriefContract"
+crate = "eliot-dreamer-research-synthesis"
+rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs"
+symbol = "SynthesisRequest, ResearchPack, GroundedDraft, InputReceipt, SynthesisPolicy, SynthesisBounds, CancellationView, JobBinding"
+kind = "struct"
+fields = ["SynthesisRequest{schema_revision, binding, pack, draft, receipt, policy, bounds, cancellation}", "ResearchPack{pack_digest, question, task_id, scope_id, fence_epoch, fence_generation, bundle_digest, manifest_digest, sources, source_denominator, coverage_denominator, counter_search, missing_source_classes, omitted_sources}", "GroundedDraft{draft_digest, grounding_digest, task_id, scope_id, question, claims, rivals, unknowns, probes, concilium}"]
+wire_spelling = "none declared; none of these types derives Serialize or Deserialize"
+wire_boundary = "ABSENT"
+required_optional_none = "schema_revision is the only version pin; SYNTHESIS_SCHEMA_REVISION is the only implemented value"
+units_bounds = "SYNTHESIS_SCHEMA_REVISION 1, MAX_SOURCES 64, MAX_CLAIMS 128, MAX_REFERENCES_PER_CLAIM 32, MAX_RIVALS 64, MAX_UNKNOWNS 64, MAX_PROBES 64, MAX_PROBE_OUTCOMES 16, MAX_HANDLE_BYTES 256, MAX_TEXT_BYTES 8192, MAX_SYNTHESIS_INPUT_BYTES 1048576, MAX_SYNTHESIS_OUTPUT_BYTES 1048576, DEFAULT_MAX_WORK 100000"
+identity_scope_fence = "task_id, scope_id, fence_epoch, fence_generation and bundle_digest; the pack question must equal the draft question"
+provenance_privacy = "manifest_digest is the allowed-reference manifest; a reference outside it is OutsideManifest"
+validation_error = "SynthesisError"
+compatibility = "researcher acquires, Dreamer interprets, Governor governs; this crate interprets only"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "RS-03"
+contract_index = "ResearchSynthesisBriefContract"
+crate = "eliot-dreamer-research-synthesis"
+rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs"
+symbol = "closed enums: EvidenceGrade, Freshness, Precision, PrecisionKind, ClaimKind, ClaimDisposition, SynthesisDisposition, PreservationDimension, DenominatorKind, CounterSearchStatus, SourceAuthority, RivalStance, ProbeResidueReason, OmissionKind, ProbeBasis, RequesterOrigin"
+kind = "enum"
+fields = ["EvidenceGrade{E0,E1,E2,E3}", "Freshness{Fresh,Stale,Unknown}", "Precision{Exact,Qualified,Unsupported}", "PrecisionKind{Documentary,Numeric,Time,Version,Causal,General}", "ClaimKind{Factual,Numeric,Time,Version,Causal,Absence}", "ClaimDisposition{Supported,Contested,Unsupported,OutsideManifest,PrecisionLimited,AbsentScopeComplete,AbsentScopeIncomplete,DuplicateCollapsed,Withheld}", "SynthesisDisposition{Complete,Partial,Exhausted,Abstained,Blocked,Unsupported,Conflicted,Unknown}", "PreservationDimension{Coverage,Preservation,Faithfulness,Lineage,Reversibility,SourceAuthority,DependencyClosure}", "DenominatorKind{CompleteScope,Sampled,Unknown}", "CounterSearchStatus{Complete,Partial,NotRun}", "SourceAuthority{Authoritative,Competent,Limited,Unknown}", "RivalStance{Supports,Opposes,Alternative}", "ProbeResidueReason{Nondiscriminative,UnknownTarget,Unauthorized,Budget}", "OmissionKind{Claims,Rivals,References,Probes,Unknowns,Work,OutputBytes,Concilium}", "ProbeBasis{SuppliedDiscriminative,CanonicalTransform(String)}", "RequesterOrigin{Human,AdmittedAgent,SchedulePolicy}"]
+wire_spelling = "Rust variant names; the crate declares no serde rename for these enums"
+wire_boundary = "ABSENT: the enums carry no serde attributes, so their wire spelling is undeclared"
+required_optional_none = "ProbeBasis::CanonicalTransform carries a String payload and is therefore the only open variant in this set"
+units_bounds = "EvidenceGrade and SourceAuthority are Ord, so E0 < E3 and Unknown < Authoritative are real orderings"
+identity_scope_fence = "not applicable"
+provenance_privacy = "RequesterOrigin is the closed I9.4 requester set"
+validation_error = "SynthesisError"
+compatibility = "variant additions are breaking in the absence of a wire boundary only at the Rust source level"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "RS-04"
+contract_index = "ResearchSynthesisBriefContract"
+crate = "eliot-dreamer-research-synthesis"
+rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-research-synthesis/src/digest.rs", "crates/smart/eliot-dreamer-research-synthesis/Cargo.toml"]
+symbol = "synthesize, request_digest, request_semantic_digest, brief_semantic_digest, brief_raw_digest, terminal_digest, pack_canonical_bytes, CanonicalWriter; and the crate [package.metadata.eliot] agent_order"
+kind = "function set plus manifest metadata"
+fields = ["synthesize(&SynthesisRequest) -> Result<SynthesisOutcome, SynthesisError>"]
+wire_spelling = "not applicable"
+wire_boundary = "not applicable"
+required_optional_none = "not applicable"
+units_bounds = "the CanonicalWriter is the deterministic byte writer that makes the order-sensitive and order-insensitive digests reproducible"
+identity_scope_fence = "not applicable"
+provenance_privacy = "redact_value and DIAGNOSTIC_VALUE_PREFIX keep diagnostic text bounded and redacted"
+validation_error = "SynthesisError"
+compatibility = "the agent_order = 6 recorded in this crate's own Cargo metadata collides with eliot-dreamer-orientation and has no cognitive-crate-decisions row; recorded, not repaired"
+disposition = "corrected_static_description"
+
+[[type_contract]]
+id = "MM-01"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-classification"
+rust_path = "crates/smart/eliot-dreamer-classification/src/result.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-classification/src/selection.rs", "crates/smart/eliot-dreamer-classification/src/evidence.rs", "crates/smart/eliot-dreamer-classification/src/policy.rs"]
+symbol = "ClassificationResult, ClassificationDisposition, CriterionResolution, SelectionReport, AlternativeTrace, ClassificationConflict, EvidenceTrace, EvidenceGradeBinding, ClassificationPolicy, BudgetReceipt, EvidenceQuality"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "the I9.6 CurationCandidate source_handles, proposed_transformation, support, counterevidence, scope_and_applicability, preservation_report, uncertainty, verifier_or_replay, expected_benefit and rollback are the family minimum this result must make visible"
+provenance_privacy = "EvidenceTrace and EvidenceGradeBinding carry the evidence lineage"
+validation_error = "owned by the defining module"
+compatibility = "adding an outcome variant is breaking for a pinned consumer"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-02"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-relation"
+rust_path = "crates/smart/eliot-dreamer-relation/src/result.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-relation/src/selection.rs", "crates/smart/eliot-dreamer-relation/src/policy.rs", "crates/smart/eliot-dreamer-relation/src/draft.rs"]
+symbol = "RelationResult, Selection, EvidenceBinding, EvidenceBindingKind, CausalMaterialBinding, CausalPredicateBinding, PathRef, RelationPolicy, EvidenceGradeBinding, GroundedRelationDraft"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "CausalMaterialBinding and CausalPredicateBinding are the causal-hypothesis fields; ChronologyLink in the episode crate is the separate chronology field, and the two must not be merged"
+provenance_privacy = "GroundedRelationDraft is re-exported from draft and is not a second owner"
+validation_error = "owned by the defining module"
+compatibility = "adding an outcome variant is breaking for a pinned consumer"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-03"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-episode"
+rust_path = "crates/smart/eliot-dreamer-episode/src/result.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-episode/src/input.rs"]
+symbol = "EpisodeCandidate, EpisodeOutcome, ChronologyLink, ChronologyRelation, EpisodeBoundary, EpisodeGap, EpisodeCoverage, OverlapAssessment, EpisodeRollback, EpisodeStatus, BoundaryRule, OverlapRule, OverlapDisposition, GroundedEventSet, GroundedEvent, EpisodeParticipant, MaterialPreimage, ValidatedCurationInput"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "ChronologyLink and ChronologyRelation are the chronology surface; chronology stays separate from causal hypothesis"
+provenance_privacy = "MaterialPreimage is the immutable pre-transformation material"
+validation_error = "owned by the defining module"
+compatibility = "adding an outcome variant is breaking for a pinned consumer"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-04"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-concept"
+rust_path = "crates/smart/eliot-dreamer-concept/src/evidence.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-concept/src/policy.rs"]
+symbol = "EvidenceLedger, EvidenceAssessment, ConceptPolicy"
+kind = "struct"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "not restated; owned by the defining module"
+provenance_privacy = "EvidenceLedger is the provenance surface for this kind"
+validation_error = "owned by the defining module"
+compatibility = "not determinable for a result type that does not exist"
+disposition = "missing_contract_decision"
+
+[[type_contract]]
+id = "MM-05"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-failure"
+rust_path = "crates/smart/eliot-dreamer-failure/src/assessment.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-failure/src/result.rs", "crates/smart/eliot-dreamer-failure/src/policy.rs"]
+symbol = "FailureAssessment, FailureHandlerDecision, FailurePolicy, FailureCountSummary, CausalLimits, TriggerAssessment, OutcomeAssessment, ApplicabilityAssessment"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "TriggerAssessment is the exact-trigger surface and stays distinct from any semantic near-match; ApplicabilityAssessment is a separate class"
+provenance_privacy = "FailureCountSummary carries the count with its denominator"
+validation_error = "owned by the defining module"
+compatibility = "adding an assessment variant is breaking for a pinned consumer"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-06"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-structure-repair"
+rust_path = "crates/smart/eliot-dreamer-structure-repair/src/lib.rs"
+symbol = "StructureRepairCandidate, RepairOutcome, RepairSubtype, EquivalenceReport, RollbackPlan, InvalidationPlan, MemberDisposition, DependentDisposition, MemberDispositionKind, DependentDispositionKind, MemberRecord, FrozenBundle, PriorTransition, StructureRepairPolicy, StructureRepairError"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "Merge and Split are two wire kinds over one RepairSubtype; EquivalenceReport, RollbackPlan and InvalidationPlan are the reversibility surface"
+provenance_privacy = "PriorTransition is the lineage surface"
+validation_error = "StructureRepairError"
+compatibility = "merge and split are forward reversible candidates only; no in-place rewrite is representable"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-07"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-reconsolidation"
+rust_path = "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs"
+symbol = "ReconsolidationResult, ReconsolidationOutcome, ReconsolidationRequest, ReconsolidationPolicy, ReconsolidationHandler, AddedProposition, ChildProposition, ParentRevision, ParentProposition, PropositionDelta, PropositionDisposition, ReactivationBinding, ReactivationEvidence, EvidenceIndependence, DependentOutcome, AxisOwnerRefs, PreservedSourceBinding, ChildAllocationRequest"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "AxisOwnerRefs binds the reconsolidation to its axis owner"
+provenance_privacy = "EvidenceIndependence and PreservedSourceBinding keep the source lineage visible"
+validation_error = "ReconsolidationError"
+compatibility = "ReconsolidationOutcome is snake_case on the wire; reconsolidation is a forward reversible candidate only"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-08"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-accessibility"
+rust_path = "crates/smart/eliot-dreamer-accessibility/src/lib.rs"
+symbol = "AdjustmentProposal, AdjustmentRequest, AdjustmentOutcome, AdjustmentPolicy, Axis, AxisStateSnapshot, CurrentAxisProjection, AccessibilitySurface, AccessibilityChange, InfluenceChange, ProtectionAndNegativeMemory, NegativeMemoryEntry, LocalInfluenceClosure, UsageAndOutcomeEvidence, AffectedPath, PathDisposition, AccessibilityStanding, InfluenceStanding, LocalClosureStanding, LocalRevocationClass, AccessibilityError"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "Axis and AxisOwnerRefs bind accessibility and influence to their owner; restoration of revoked influence after recovery is not representable"
+provenance_privacy = "UsageAndOutcomeEvidence is attributed, never self-asserted"
+validation_error = "AccessibilityError"
+compatibility = "accessibility and influence changes are forward reversible candidates only"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-09"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-memory-repair"
+rust_path = "crates/smart/eliot-dreamer-memory-repair/src/lib.rs"
+symbol = "MemoryRepairCandidate, MemoryRepairRequest, MemoryRepairHandler, RepairPolicy, RepairOutcome, RepairDefectKind, RepairOperationKind, RepairIdentity, TrajectoryEvidence, ThreatEvidence, CurrentMemoryProjection, AuthoritativeSourceLink, ProvenanceRepairSpec, ContaminationClosure, ContaminationAction, FalseRelationProposal, FalseRelationSpec, StaleViewSpec, RepresentationProposal, RepresentationSpec, AffectedMember, MemberDisposition, MemberDispositionKind, SourceAuthorityKind, SubjectKind, RepairError"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "SourceAuthorityKind and AuthoritativeSourceLink keep the source authority ceiling from being raised"
+provenance_privacy = "ProvenanceRepairSpec is the provenance surface; hidden rewriting of provenance is not representable"
+validation_error = "RepairError"
+compatibility = "lineage, influence and derived-view repair are forward reversible candidates only"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-10"
+contract_index = "MemoryModelCandidateContract"
+crate = "eliot-dreamer-curation"
+rust_path = "crates/smart/eliot-dreamer-curation/src/lib.rs"
+symbol = "NativeCurationHandler"
+kind = "re-export"
+fields = ["eliot_dreamer_contracts::NativeCurationHandler"]
+wire_spelling = "owned by eliot-dreamer-contracts"
+wire_boundary = "owned by eliot-dreamer-contracts"
+required_optional_none = "not applicable"
+units_bounds = "not applicable"
+identity_scope_fence = "the typed handler registry protocol is owned by eliot-dreamer-contracts (A-31)"
+provenance_privacy = "not applicable"
+validation_error = "owned by eliot-dreamer-contracts"
+compatibility = "this is a re-export and is recorded as the family index owner only because it is the dispatch facade; it is not a second type owner"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MM-11"
+contract_index = "MemoryModelCandidateContract"
+crate = "none"
+rust_path = "none"
+symbol = "a shared MemoryModelCandidate family envelope"
+kind = "absent"
+fields = ["none"]
+wire_spelling = "none"
+wire_boundary = "none"
+required_optional_none = "none"
+units_bounds = "none"
+identity_scope_fence = "none"
+provenance_privacy = "none"
+validation_error = "none"
+compatibility = "not determinable: the type does not exist on base cdf4a29 in any of the ten handler crates, and eliot-dreamer-concept emits no result type at all"
+disposition = "missing_contract_decision"
+
+[[type_contract]]
+id = "PR-01"
+contract_index = "ProceduralCandidateContract"
+crate = "eliot-dreamer-procedure"
+rust_path = "crates/smart/eliot-dreamer-procedure/src/lib.rs"
+symbol = "ProcedureCandidate"
+kind = "struct"
+fields = ["outcome", "procedure_handle", "objective", "steps", "step_dispositions", "trigger_note", "applicability_note", "transfer", "verifier", "inverse_note", "forward_correction_note", "reopen_note", "unknown_handling_note", "candidate_digest", "note"]
+wire_spelling = "none declared; the type does not derive Serialize or Deserialize"
+wire_boundary = "ABSENT: no serde boundary and no deny_unknown_fields on this shape"
+required_optional_none = "no Option field at this level; ProcedureStep.timeout_ms is Option<u64> and its None means no per-step timeout was bound"
+units_bounds = "MAX_STEPS, MAX_STEP_INPUTS, MAX_STEP_DEPS, MAX_EVIDENCE_ITEMS, MAX_CLOSURE_REFS, MAX_PROTECTIONS, MAX_PREDECESSORS, MAX_TEXT_BYTES, MAX_HANDLE_BYTES, MAX_ID_BYTES, MAX_SCOPE_BYTES, MAX_NOTE_BYTES, MAX_OBJECTIVE_BYTES, MAX_TOTAL_BYTES, MAX_REDACTED_CHARS, MAX_RETRIES, MAX_FANOUT"
+identity_scope_fence = "per-step owner and contract_ref; the candidate itself has no fence field"
+provenance_privacy = "SHELL_MARKERS, SDK_MARKERS, CREDENTIAL_MARKERS, UNBOUNDED_MARKERS, CONFIGURATION_MARKERS, ACQUIRED_AUTHORITY_MARKERS, FORBIDDEN_SURFACE_MARKERS, APPLICABILITY_OVERREACH_MARKERS and SIMILARITY_MARKERS are marker lists, not an authority boundary"
+validation_error = "ProcedureError plus ProcedureOutcome as the terminal class"
+compatibility = "no wire compatibility rule can be stated for a shape with no wire form"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "PR-02"
+contract_index = "ProceduralCandidateContract"
+crate = "eliot-dreamer-procedure"
+rust_path = "crates/smart/eliot-dreamer-procedure/src/lib.rs"
+symbol = "ProcedureStep, StepDisposition, EffectClass, StepDispositionKind, ProcedureOutcome, ProcedureEvidence, CapabilityEnvSnapshot, ExistingProcedureSnapshot, ProcedurePolicy, TransferPlan, compute_candidate_digest, propose_procedure"
+kind = "struct plus enums plus functions"
+fields = ["ProcedureStep{step_id, owner, contract_ref, operation, inputs, precondition, dependencies, postcondition, verifier, effect, effect_boundary, budget_note, failure_note, cancel_note, reconcile_note, rollback_note, max_retries, timeout_ms, fanout}"]
+wire_spelling = "none declared"
+wire_boundary = "ABSENT"
+required_optional_none = "timeout_ms is Option<u64>"
+units_bounds = "MAX_RETRIES and MAX_FANOUT are per-step u32 fields; the MAX_* consts above bound the collection sizes"
+identity_scope_fence = "owner and contract_ref name the external owner; effect_boundary is free text and unbounded in source"
+provenance_privacy = "existing procedures arrive as an ExistingProcedureSnapshot so a refinement or conflict is decidable"
+validation_error = "ProcedureError; outcome_rejection_hint maps an error to a bounded hint"
+compatibility = "EffectClass::Unknown blocks every retry path until an external owner reconciles the exact operation"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "PR-03"
+contract_index = "ProceduralCandidateContract"
+crate = "eliot-dreamer-procedure"
+rust_path = "crates/smart/eliot-dreamer-procedure/Cargo.toml"
+additional_rust_paths = ["Cargo.toml"]
+symbol = "crate admission and wave binding"
+kind = "manifest metadata"
+fields = ["prototype", "source_status", "workspace_admission", "functional_cell", "source_layer", "runtime_layer", "runtime_bundle", "agent_order"]
+wire_spelling = "not applicable"
+wire_boundary = "not applicable"
+required_optional_none = "not applicable"
+units_bounds = "not applicable"
+identity_scope_fence = "functional_cell smart.dreamer.procedure, agent_order 25"
+provenance_privacy = "not applicable"
+validation_error = "not applicable"
+compatibility = "admitted via #965 (T8-AS1); listed in root Cargo.toml and pinned in Cargo.lock"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MR-01"
+contract_index = "MemoryRevisionCandidateContract"
+crate = "eliot-dreamer-memory-revision"
+rust_path = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs"
+symbol = "NegativeMemoryExtinctionCandidate"
+kind = "struct"
+fields = ["contract_version", "candidate_id", "observation_ref", "fingerprint", "query_digest", "narrowing", "disposition", "denominator", "state", "missing", "digest"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "no Option field; missing is an explicit Vec that must be empty when the state is Complete"
+units_bounds = "CANDIDATE_CONTRACT_VERSION 1.0.0, MAX_REVISION_EVIDENCE 32, MAX_CLOSURE_MEMBERS 1024, MAX_MISSING_ENTRIES 256, MAX_ID_CHARS 1024"
+identity_scope_fence = "observation_ref plus the fence inside ClosureDenominator; query_digest echoes the posed self-query"
+provenance_privacy = "fingerprint is echoed verbatim from the observation"
+validation_error = "RevisionError; a digest mismatch is separate from FreezeVerificationError"
+compatibility = "fingerprint is one opaque String with no structured trigger field, so the exact-trigger versus semantic near-match distinction is not representable in the shipped shape"
+disposition = "corrected_static_description"
+
+[[type_contract]]
+id = "MR-02"
+contract_index = "MemoryRevisionCandidateContract"
+crate = "eliot-dreamer-memory-revision"
+rust_path = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs"
+symbol = "AdvisoryNarrowing, CandidateDisposition, CandidateState, ClosureDenominator, RevisionIntake, RevisionError, compute_digest, propose"
+kind = "struct plus enums plus functions"
+fields = ["AdvisoryNarrowing{suppress_activation, quarantine, archive}", "CandidateDisposition{AdvisoryNarrow, MechanismReview}", "CandidateState{Complete, Inconclusive, Unsupported}", "ClosureDenominator{fence, enumerated, exclusions, recheck_digest, complete}", "RevisionIntake{observation, evidence, task, safety, query, sources, pose_digest, candidate_id}"]
+wire_spelling = "SCREAMING_SNAKE_CASE on the two disposition/state enums; flat snake_case on the structs"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema on the structs; rename_all SCREAMING_SNAKE_CASE on the enums"
+required_optional_none = "no purge field exists by design: AdvisoryNarrowing carries only the three reversible operators"
+units_bounds = "MAX_REVISION_EVIDENCE and MAX_CLOSURE_MEMBERS bound the intake"
+identity_scope_fence = "ScopeMismatch, FenceMismatch, DigestMismatch and StaleCitation are named per field, so a divergence is diagnosable without opening the freeze"
+provenance_privacy = "task and safety arrive as admitted CC-004 projections; query and sources arrive as owner-validated inputs"
+validation_error = "RevisionError with ScopeMismatch, FenceMismatch, DigestMismatch, StaleCitation, Bounds, NotDigestible and the three owner-contract error wrappers"
+compatibility = "adding a narrowing operator is a breaking change and would cross the reversible-only boundary"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "MR-03"
+contract_index = "MemoryRevisionCandidateContract"
+crate = "eliot-dreamer-memory-revision"
+rust_path = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs"
+symbol = "FREEZE_ID, FREEZE_BYTES, REQUIRED_FREEZE_DIGEST, verify_freeze_binding, FreezeVerificationError"
+kind = "const, byte slice, function and error enum"
+fields = ["FREEZE_ID", "FREEZE_BYTES", "REQUIRED_FREEZE_DIGEST", "verify_freeze_binding", "FreezeVerificationError"]
+wire_spelling = "string constants over the embedded freeze bytes"
+wire_boundary = "not applicable"
+required_optional_none = "not applicable"
+units_bounds = "not applicable"
+identity_scope_fence = "the freeze_id line and the sha256 over the exact embedded bytes"
+provenance_privacy = "not applicable"
+validation_error = "FreezeVerificationError with FreezeIdDivergence, FreezeDigestDivergence, FreezeIdUnreadable and FreezeBytesNotUtf8"
+compatibility = "verify_freeze_binding is called from propose, so any freeze byte change fails closed at the candidate boundary. This row is the reason this catalogue does not edit the freeze."
+disposition = "corrected_static_description"
+
+[[type_contract]]
+id = "MR-04"
+contract_index = "MemoryRevisionCandidateContract"
+crate = "eliot-dreamer-memory-revision"
+rust_path = "crates/smart/cognitive-wave-09.toml"
+additional_rust_paths = []
+symbol = "the wave-09 NegativeMemoryExtinctionCandidate field family"
+kind = "prior static description"
+fields = ["revision_reactivation_trigger_and_task_scope", "revision_new_observation_outcome_or_prediction_error", "revision_old_and_new_epistemic_accessibility_and_influence_state", "revision_retained_narrowed_and_lost_distinctions", "revision_retrieval_downstream_use_interference_and_false_recall_checks", "revision_affected_procedures_views_and_dependency_closure", "revision_rollback_reopen_or_no_return_boundary", "revision_verifier_or_review_disposition", "extinction_evaluation_operation_equals_extinguish_with_evaluator_kind_and_subdimensions"]
+wire_spelling = "not applicable: these are semantic field names in a static description, not Rust fields"
+wire_boundary = "not applicable"
+required_optional_none = "not applicable"
+units_bounds = "not applicable"
+identity_scope_fence = "not applicable"
+provenance_privacy = "not applicable"
+validation_error = "not applicable"
+compatibility = "no shipped Rust field on NegativeMemoryExtinctionCandidate corresponds to reactivation trigger, task scope, affected procedures/views/dependency closure, rollback/reopen boundary, or verifier/review disposition. The prior static description and the implemented field set have diverged; the implemented set is authoritative and the divergence is recorded, not reconciled by invention."
+disposition = "corrected_static_description"
+
+[[type_contract]]
+id = "DX-01"
+contract_index = "DiagnosisCandidateContract"
+crate = "eliot-dreamer-development-diagnosis"
+rust_path = "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs"
+symbol = "DevelopmentDiagnosisCandidate, ProductGap, ProductGapKind, DiscriminatorEvidence, ControlledRepeat, RepairAttemptSummary, RepairHistory, FrozenConflictAnalysis, RivalMechanism, RivalStatus, CommonModeDisclosure, DiscriminatingExperiment, ExperimentOutcomeKind, DiagnosisPolicy, RivalAssessment, RepairRecommendation, DiagnosisOutcome, DiagnosisError, diagnose_development_gap"
+kind = "struct plus enums plus function"
+fields = ["outcome", "diagnosis_handle", "product_id", "source_revision", "objective_id", "gap_kind", "product_gap", "current_discriminator", "repair_history", "conflict_analysis", "rival_mechanisms", "experiment_alternatives", "policy", "rivals", "rivals_live", "rivals_falsified", "strongest_current", "strongest_limits_note", "common_mode", "recommended_experiment", "recommendation", "next_evidence_note", "preservation", "input_receipt_digest", "attempt_denominator", "experiments_considered", "candidate_digest", "note"]
+wire_spelling = "none declared; the type does not derive Serialize or Deserialize"
+wire_boundary = "ABSENT: no serde boundary and no deny_unknown_fields on this shape"
+required_optional_none = "strongest_current and recommended_experiment are Option; None means no live rival or no discriminating experiment, which blocks completeness rather than permitting an empty verdict"
+units_bounds = "MAX_RIVALS, MAX_EXPERIMENTS, MAX_ATTEMPTS, MAX_EVIDENCE_ITEMS, MAX_PREDICTIONS, MAX_ASSUMPTIONS, MAX_CONFOUNDERS, MAX_CONTROLLED_VARIABLES, MAX_TEXT_BYTES, MAX_HANDLE_BYTES, MAX_ID_BYTES, MAX_SCOPE_BYTES, MAX_NOTE_BYTES, MAX_TOTAL_BYTES, MAX_REDACTED_CHARS, EXPECTED_PRESERVATION_DIMENSIONS"
+identity_scope_fence = "product_id plus source_revision plus objective_id"
+provenance_privacy = "input_receipt_digest echoes the owner receipt; attempt_denominator is the exact recheckable denominator"
+validation_error = "DiagnosisError plus DiagnosisOutcome as the terminal class"
+compatibility = "no wire compatibility rule can be stated for a shape with no wire form"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "DX-02"
+contract_index = "DiagnosisCandidateContract"
+crate = "eliot-dreamer-conflict-analysis"
+rust_path = "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs"
+symbol = "ConflictAnalysisCandidate, ConflictAnalysisPolicy, LineageAttribution, SuppliedObjection, SuppliedProbe, ExternalResolution, ConflictSupplements, PositionAnalysis, LineageGroup, CommonModeRisk, RecommendedProbe, DecisionOwnerRecommendation, DimensionVerdict, PreservationReport, ConflictOutcome, PositionDispositionKind, DecisionOwnerKind, ConflictAnalysisError"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "none declared"
+wire_boundary = "ABSENT"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "LineageAttribution and LineageGroup carry the lineage; DecisionOwnerKind names the decision owner, not this crate"
+provenance_privacy = "SuppliedObjection and SuppliedProbe are supplied material, not conclusions"
+validation_error = "ConflictAnalysisError plus ConflictOutcome as the terminal class"
+compatibility = "this crate is an excluded_job_class with wire_kind = false and curation_kind = false; its result is not a curation wire kind"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "PL-01"
+contract_index = "PlanningCandidateContract"
+crate = "eliot-dreamer-maintenance-plan"
+rust_path = "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs"
+symbol = "MaintenancePlanCandidate, MaintenanceObjective, TriggerEvidence, BudgetSlice, PlannedOperation, ExpectedDelta, SemanticVerifier, MaintenanceBoundary, MaintenancePolicy, HistoryAttempt, PriorHistory, MaintenanceOpKind, DeltaDimension, DeltaDirection, TriggerKind, CancellationHandling, PriorAttemptDisposition, PriorEffectState, RepeatJustification, MaintenanceOutcome, MaintenancePlanError, propose_maintenance_plan"
+kind = "struct plus enums plus function"
+fields = ["outcome", "plan_handle", "objective_id", "objective_revision", "product_id", "owner", "decomposition_owners", "trigger_id", "operations", "deltas", "verifier_id", "rollback_steps", "required_decisions", "stop_summary", "preservation", "input_receipt_digest", "attempt_denominator", "candidate_digest", "note"]
+wire_spelling = "none declared; the type does not derive Serialize or Deserialize"
+wire_boundary = "ABSENT"
+required_optional_none = "no Option field at this level; the plan never invents an effect, so there is no optional effect slot"
+units_bounds = "MAX_OPERATIONS, MAX_DEPENDENCIES, MAX_DELTAS, MAX_OPERATION_INPUTS, MAX_PRECONDITIONS, MAX_NON_GOALS, MAX_EVIDENCE_ITEMS, MAX_ROLLBACK_STEPS, MAX_DECISIONS, MAX_ATTEMPTS and the eleven resource ceilings CPU_MS_CEILING, MEMORY_BYTES_CEILING, STORAGE_BYTES_CEILING, NETWORK_BYTES_CEILING, CONTEXT_BYTES_CEILING, COST_UNITS_CEILING, HUMAN_MINUTES_CEILING, WALL_MS_CEILING, IDLE_MS_CEILING, WORK_ITEMS_CEILING, OUTPUT_BYTES_CEILING"
+identity_scope_fence = "objective_id plus objective_revision; a moved objective is MaintenanceOutcome::Stale"
+provenance_privacy = "input_receipt_digest echoes the owner receipt; attempt_denominator is the exact recheckable denominator"
+validation_error = "MaintenancePlanError plus MaintenanceOutcome as the terminal class"
+compatibility = "MaintenanceOpKind admits exactly ten inert verbs; a scheduling, execution, Doctor, tool, provider or configuration verb has no spelling and is rejected as unsupported vocabulary"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "PL-02"
+contract_index = "PlanningCandidateContract"
+crate = "eliot-dreamer-configuration-plan"
+rust_path = "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs"
+symbol = "ConfigurationChangeCandidate, ConfigurationFieldSchema, TypedConfigurationValue, SecretReference, ConfigurationFieldType, ConfigurationFieldMutability, ConfigurationUnit, ConfigurationFieldConstraint, TypedConfigurationSnapshot, TypedConfigurationSnapshotSet, TypedConfigurationRequest, TypedRequestedField, TypedOperationIdentity, TypedConfigurationChange, TypedImpactClosure, TypedImpactMember, TypedImpactCompleteness, TypedRolloutPlan, TypedRollbackPlan, TypedApproval, TypedApprovalStatus, TypedConfigurationBoundary, TypedConfigurationPolicy, TypedCandidateDetails, ConfigurationCeiling, TypedHistoryDisposition, TypedVerifierReading, TypedReplayDisposition, propose_configuration_change, propose_typed_configuration_change"
+kind = "struct plus enums plus functions"
+fields = ["outcome", "intent_handle", "primary_layer", "primary_owner", "base_digest", "candidate_digest", "base_revision", "changes", "impact", "boundary", "preservation", "input_receipt_digest", "attempt_denominator", "note", "details"]
+wire_spelling = "none declared; the type does not derive Serialize or Deserialize"
+wire_boundary = "ABSENT"
+required_optional_none = "details is Option<TypedCandidateDetails> and is Some only on the typed leg; the structured leg leaves it None, which is a different contract surface, not a weaker one"
+units_bounds = "MAX_FIELDS, MAX_CHANGES, MAX_IMPACT, MAX_EVIDENCE_ITEMS, MAX_ROLLBACK_STEPS, MAX_ATTEMPTS, TYPED_CONFIGURATION_SCHEMA_VERSION, MAX_TYPED_SCHEMAS, MAX_TYPED_SNAPSHOT_FIELDS, MAX_TYPED_ALTERNATIVES, MAX_TYPED_SEQUENCE, MAX_TYPED_SEQUENCE, MAX_TYPED_OMISSIONS"
+identity_scope_fence = "base_revision plus base_digest; a stale base is ConfigurationOutcome::Stale"
+provenance_privacy = "SecretReference carries a reference class, never a secret value; SECRET_REF_CLASSES, SECRET_MARKERS and PRIVACY_MARKERS gate it"
+validation_error = "ConfigurationError plus ConfigurationOutcome as the terminal class"
+compatibility = "this crate proposes a configuration delta and never writes configuration; ConfigurationOutcome::DecisionRequired is not permission"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "PL-03"
+contract_index = "PlanningCandidateContract"
+crate = "eliot-dreamer-orchestration-plan"
+rust_path = "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs"
+symbol = "WorkUnitDecomposition, AgentWorkUnitBrief, PlanObjective, PlanRequirement, PlanSurface, WorkUnitBudget, ReadinessEdge, RequirementExclusion, DecompositionPolicy, ContextEnvelopeSelectionReceipt, SurfaceKind, DependencyKind, ProofStatus, ContextMeasurementStatus, DecompositionOutcome, OrchestrationPlanError, propose_work_unit_decomposition"
+kind = "struct plus enums plus function"
+fields = ["plan_handle", "objective_id", "task_id", "scope_id", "units", "edges"]
+wire_spelling = "none declared; the type does not derive Serialize or Deserialize"
+wire_boundary = "ABSENT"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "MAX_WORK_UNITS, MAX_REQUIREMENTS, MAX_SURFACES, MAX_EDGES, MAX_UNIT_REQUIREMENTS, MAX_WRITE_CLAIMS, MAX_READ_REFS, MAX_FORBIDDEN_PATHS, MAX_FAN_OUT, MAX_DEPTH, MAX_UNIT_CONTEXT_BYTES, MAX_UNIT_TOOL_CALLS, MAX_UNIT_OUTPUT_BYTES, MAX_UNIT_COST_UNITS, MAX_UNIT_TIME_MS, MAX_UNIT_WORK_UNITS, MAX_UNIT_PROOF_BYTES"
+identity_scope_fence = "task_id plus scope_id; an owner-resolved ReadinessEdge is the readiness surface"
+provenance_privacy = "ORACLE_MARKERS and HIDDEN_AUTHORITY_MARKERS gate the supplied text"
+validation_error = "OrchestrationPlanError plus DecompositionOutcome as the terminal class"
+compatibility = "DecompositionOutcome::Overlapped blocks separation, and ::Challenge routes to a bounded replan instead of an arbitrary file split; planning reserves no route, launch or schedule"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "PL-04"
+contract_index = "PlanningCandidateContract"
+crate = "eliot-dreamer-probe-plan"
+rust_path = "crates/smart/eliot-dreamer-probe-plan/src/model.rs"
+symbol = "ProbePlan, ProbeProposal, ProbeDimensions, ProbeOmission, ProbeTarget, ProbeRelationKind, ProbeObjectiveDispositionKind, ProbeObjectiveDisposition, OmissionKind, ProbePlanParams"
+kind = "struct plus enums"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "not restated; owned by the defining module"
+identity_scope_fence = "ProbeTarget is the exact-trigger surface; a semantic near-match does not select a probe"
+provenance_privacy = "ProbeOmission carries its OmissionKind so an omitted probe stays addressable"
+validation_error = "owned by the defining module"
+compatibility = "the crate declares no wave order in cognitive-crate-decisions.toml; its agent_order 17 is read from its own Cargo metadata"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "CY-01"
+contract_index = "DreamCycleCandidateContract"
+crate = "eliot-dreamer-cycle"
+rust_path = "crates/smart/eliot-dreamer-cycle/src/contract.rs"
+symbol = "DreamerCycleState, CycleStep, CyclePolicy, PendingRequest, ObservedOutcome, InertOwnerRequest, ExpectedArtifact, CandidateEvidence, PhasePolicyRule, CyclePhase, OutcomeDisposition, RequestKind, StepDisposition, CYCLE_SCHEMA_VERSION"
+kind = "struct plus enums"
+fields = ["DreamerCycleState{schema_version, cycle_id, job, bundle_digest, policy_id, policy_revision, policy_digest, phase, controller_revision, predecessor_digest, pending, proposed_requests, outcomes, frontier, budget_usage, cancellation_requested, canonical_digest}", "CycleStep{predecessor_digest, next_state, requests, disposition, transition_digest}"]
+wire_spelling = "flat snake_case field names; SCREAMING_SNAKE_CASE on the four enums"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "predecessor_digest is Option and its None marks the first state of a cycle, not a missing predecessor on a later one"
+units_bounds = "CYCLE_SCHEMA_VERSION 1, MAX_RECORDS 256, MAX_REQUESTS 64, MAX_CANONICAL_BYTES 1048576, MAX_TEXT_BYTES 16384"
+identity_scope_fence = "job, policy_id, policy_revision, policy_digest, bundle_digest, controller_revision and the predecessor_digest chain"
+provenance_privacy = "not applicable; the state is a bounded controller projection"
+validation_error = "CycleError plus StepDisposition as the terminal class"
+compatibility = "an adjacent phase only: a step advances exactly one phase or replays, and a jump is not representable"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "CY-02"
+contract_index = "DreamCycleCandidateContract"
+crate = "eliot-dreamer-cycle"
+rust_path = "crates/smart/eliot-dreamer-cycle/src/plan.rs"
+symbol = "CyclePlan, ExperimentCandidate, PlanHorizon, ExperimentKind, plan_cycle"
+kind = "struct plus enums plus function"
+fields = ["CyclePlan{schema_version, cycle_id, from_phase, to_phase, horizon, job_digest, bundle_digest, policy_digest, state_digest, sample_digest, experiments, requests, frontier, plan_digest}", "ExperimentCandidate{target, kind, horizon, reason}"]
+wire_spelling = "flat snake_case field names; SCREAMING_SNAKE_CASE on the two enums"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "no Option field; the horizon is always the single variant"
+units_bounds = "not applicable beyond the crate MAX_* consts"
+identity_scope_fence = "from_phase plus to_phase plus the four digests; the plan is bound to one sampled state"
+provenance_privacy = "not applicable"
+validation_error = "CycleError"
+compatibility = "PlanHorizon has exactly one variant OneCycle, so a multi-cycle or recurring horizon is not representable; ExperimentKind admits only a clarification probe and a reconciliation probe, so self-scheduling is not representable"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "CY-03"
+contract_index = "DreamCycleCandidateContract"
+crate = "eliot-dreamer-cycle"
+rust_path = "crates/smart/eliot-dreamer-cycle/src/sample.rs"
+symbol = "CycleSample, SampleDenominator, SampleLimits, sample_cycle"
+kind = "struct plus function"
+fields = ["CycleSample{schema_version, cycle_id, phase, job_digest, bundle_digest, policy_digest, state_digest, denominator, sampled_pending, sampled_proposed, sampled_outcomes, omitted_pending, omitted_proposed, omitted_outcomes, frontier, complete, coverage_digest}", "SampleDenominator{pending_total, proposed_total, outcomes_total, frontier_total}"]
+wire_spelling = "flat snake_case field names"
+wire_boundary = "serde deny_unknown_fields plus JsonSchema"
+required_optional_none = "no Option field; omission is expressed by the omitted_* lists, not by an absent member"
+units_bounds = "SampleLimits carries the per-sample bounds and is validated by its own validate()"
+identity_scope_fence = "cycle_id, phase and the four digests bind the sample to one state at one fence"
+provenance_privacy = "sampled and omitted members are named by identity, so an omitted member stays addressable"
+validation_error = "CycleError"
+compatibility = "complete is true only when the sampled members account for every total and the omitted lists are empty; a bare count never establishes completeness"
+disposition = "reused_exact"
+
+[[type_contract]]
+id = "CY-04"
+contract_index = "DreamCycleCandidateContract"
+crate = "eliot-dreamer-cycle"
+rust_path = "crates/smart/eliot-dreamer-cycle/src/durable.rs"
+additional_rust_paths = ["crates/smart/eliot-dreamer-cycle/src/step.rs", "crates/smart/eliot-dreamer-cycle/Cargo.toml"]
+symbol = "DurableJobState, DurableTransition, DurableCommand, DurableEvent, StageResolution, OperationOutcome, DurableDisposition, InFlightOperation, SettledOperation, StageRequest, StageEvidence, StageReconciled, RestartEvidence, FenceEvidence, DeadlineEvidence, DeliveryEvidence, AckEvidence, ProposedStageTransition, AdvanceStageCommand, ReconcileCommand, EscalateCommand, DURABLE_SCHEMA_VERSION, step_durable_job, step_dreamer_cycle, step_dreamer_cycle_at; and the crate [package.metadata.eliot] block"
+kind = "structs, enums, functions and manifest metadata"
+fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
+wire_spelling = "not restated; owned by the defining module"
+wire_boundary = "not restated; owned by the defining module"
+required_optional_none = "not restated; owned by the defining module"
+units_bounds = "DURABLE_SCHEMA_VERSION 1, MAX_SETTLED_OPERATIONS 64, MAX_NO_PROGRESS 8, MAX_DURABLE_COMMANDS 1"
+identity_scope_fence = "FenceEvidence, DeadlineEvidence and RestartEvidence are the per-transition binding surfaces"
+provenance_privacy = "DeliveryEvidence and AckEvidence keep acknowledgement distinct from use"
+validation_error = "CycleError"
+compatibility = "the crate declares no agent_order and no wave order on base cdf4a29; the durable leg projects an owner-owned DurableJobState and does not own a DurableJob"
+disposition = "corrected_static_description"
+
+# ---------------------------------------------------------------------------
+# The one semantic contract index.
+# ---------------------------------------------------------------------------
+
+[[field_contract_index]]
+contract_id = "ValidationGroundingReceiptContract"
+owner_crate = "eliot-dreamer-candidate-validation"
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+issue_label_resolved = "eliot-dreamer-validation"
+denominator_ref = "the receipt-excluded validation input preimage identified by input_digest"
+source_handles = ["I6.4", "I9.7"]
+measured_order = 5
+type_contract_rows = ["VAL-01", "VAL-02", "VAL-03", "VAL-04"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "OrientationPacketContract"
+owner_crate = "eliot-dreamer-orientation"
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+issue_label_resolved = "eliot-dreamer-orientation"
+denominator_ref = "OrientationCoverage material/omission/non-excluded counts plus the optional sealed coverage_denominator and its digest"
+source_handles = ["I6.4", "I9.6", "I9.7"]
+measured_order = 6
+type_contract_rows = ["ORI-01", "ORI-02", "ORI-03", "ORI-04"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "SelfQueryBriefContract"
+owner_crate = "eliot-dreamer-self-query"
+manifest = "crates/smart/eliot-dreamer-self-query/module.toml"
+issue_label_resolved = "eliot-dreamer-self-query"
+denominator_ref = "the owner canonical input_digest over the complete validated input closure"
+source_handles = ["I6.4", "I0.3"]
+measured_order = 49
+type_contract_rows = ["SQ-01", "SQ-02", "SQ-03"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "ResearchSynthesisBriefContract"
+owner_crate = "eliot-dreamer-research-synthesis"
+manifest = "crates/smart/eliot-dreamer-research-synthesis/module.toml"
+issue_label_resolved = "eliot-dreamer-research-synthesis"
+denominator_ref = "the ResearchPack source_denominator over a DenominatorKind backed by a CounterSearchStatus, with missing_source_classes and omitted_sources"
+source_handles = ["I9.6", "I9.7"]
+measured_order = 6
+order_collision = "agent_order 6 is duplicated with eliot-dreamer-orientation and has no cognitive-crate-decisions row"
+type_contract_rows = ["RS-01", "RS-02", "RS-03", "RS-04"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "MemoryModelCandidateContract"
+owner_crate = "eliot-dreamer-curation"
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+issue_label_resolved = "eliot-dreamer-memory-models"
+denominator_ref = "per-kind denominator over the retained source handles and declared coverage member set at the named fence; there is no family-level denominator"
+source_handles = ["I9.6", "I9.7"]
+measured_order = "21-30 plus 31"
+type_contract_rows = ["MM-01", "MM-02", "MM-03", "MM-04", "MM-05", "MM-06", "MM-07", "MM-08", "MM-09", "MM-10", "MM-11"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "ProceduralCandidateContract"
+owner_crate = "eliot-dreamer-procedure"
+manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+issue_label_resolved = "eliot-dreamer-procedural"
+denominator_ref = "the enumerated step set plus dependency closure and evidence items, with candidate_digest recomputed from the candidate shape"
+source_handles = ["I9.6", "I9.7"]
+measured_order = 25
+type_contract_rows = ["PR-01", "PR-02", "PR-03"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "MemoryRevisionCandidateContract"
+owner_crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+issue_label_resolved = "eliot-dreamer-memory-revision"
+denominator_ref = "ClosureDenominator: the sorted union of observation journal refs and revision evidence refs at the named fence, with closed-class exclusions and a recomputed recheck_digest"
+source_handles = ["I12-19", "I12-21", "I9.7"]
+measured_order = 79
+type_contract_rows = ["MR-01", "MR-02", "MR-03", "MR-04"]
+cross_wave_note = "Already indexed by crates/smart/cognitive-wave-09.toml; the two indexes must not be treated as two owners."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "DiagnosisCandidateContract"
+owner_crate = "eliot-dreamer-development-diagnosis"
+manifest = "crates/smart/eliot-dreamer-development-diagnosis/module.toml"
+issue_label_resolved = "eliot-dreamer-diagnosis"
+denominator_ref = "attempt_denominator over the retained attempt refs, with rivals_live plus rivals_falsified equal to rivals.len()"
+source_handles = ["I12-21", "I9.6", "I9.7"]
+measured_order = 40
+family_owner_crates = ["eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis"]
+type_contract_rows = ["DX-01", "DX-02"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "PlanningCandidateContract"
+owner_crate = "eliot-dreamer-orchestration-plan"
+manifest = "crates/smart/eliot-dreamer-orchestration-plan/module.toml"
+issue_label_resolved = "eliot-dreamer-planning"
+denominator_ref = "per-plan attempt_denominator, plus the resource ceilings for maintenance, the typed impact closure for configuration, and the retained requirement set for decomposition"
+source_handles = ["I9.6", "I2.17", "I9.7"]
+measured_order = 43
+family_owner_crates = ["eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan", "eliot-dreamer-probe-plan"]
+type_contract_rows = ["PL-01", "PL-02", "PL-03", "PL-04"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "DreamCycleCandidateContract"
+owner_crate = "eliot-dreamer-cycle"
+manifest = "crates/smart/eliot-dreamer-cycle/module.toml"
+issue_label_resolved = "eliot-dreamer-cycle"
+denominator_ref = "SampleDenominator{pending_total, proposed_total, outcomes_total, frontier_total} with sampled and omitted members named by identity and a coverage_digest"
+source_handles = ["I6.4", "I9.7"]
+measured_order = "none_declared"
+type_contract_rows = ["CY-01", "CY-02", "CY-03", "CY-04"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+# ---------------------------------------------------------------------------
+# Crate manifests. All are existing physical crates. None is created here.
+# ---------------------------------------------------------------------------
+
+[[crate_manifest]]
+crate = "eliot-dreamer-candidate-validation"
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.candidate_validation"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none; listed in root Cargo.toml and pinned in Cargo.lock before this change"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-claim-grounding"
+manifest = "crates/smart/eliot-dreamer-claim-grounding/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.claim_grounding"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-orientation"
+manifest = "crates/smart/eliot-dreamer-orientation/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.orientation"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-self-query"
+manifest = "crates/smart/eliot-dreamer-self-query/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.self_query"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER_PROTOTYPE_FLAGGED"
+workspace_admission_change = "none; the prototype flag and admitted membership are both pre-existing on base cdf4a29"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-research-synthesis"
+manifest = "crates/smart/eliot-dreamer-research-synthesis/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.research-synthesis"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-procedure"
+manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.procedure"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.memory_revision"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER_PROTOTYPE_FLAGGED"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-conflict-analysis"
+manifest = "crates/smart/eliot-dreamer-conflict-analysis/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.conflict_analysis"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-development-diagnosis"
+manifest = "crates/smart/eliot-dreamer-development-diagnosis/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.development_diagnosis"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-maintenance-plan"
+manifest = "crates/smart/eliot-dreamer-maintenance-plan/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.maintenance_plan"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-configuration-plan"
+manifest = "crates/smart/eliot-dreamer-configuration-plan/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.configuration_plan"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-orchestration-plan"
+manifest = "crates/smart/eliot-dreamer-orchestration-plan/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.orchestration_plan"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-probe-plan"
+manifest = "crates/smart/eliot-dreamer-probe-plan/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.probe_plan"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-cycle"
+manifest = "crates/smart/eliot-dreamer-cycle/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.cycle"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-curation"
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+status = "EXISTING_PHYSICAL_CRATE"
+functional_cells = ["smart.dreamer.curation"]
+crate_state = "ADMITTED_WORKSPACE_MEMBER"
+workspace_admission_change = "none; recorded as the memory-model family index owner only"
+
+# ---------------------------------------------------------------------------
+# Validation gates.
+# ---------------------------------------------------------------------------
+
+[[validation_gate]]
+id = "W2-TOML-PARSE"
+rule = "Every file edited by this work unit parses with python tomllib, and every field-shape denominator is recheckable by the stated denominator_rule."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-NO-INVENTED-SYMBOL"
+rule = "Every rust_path and symbol in every [[type_contract]] and [[ownership]] row resolves to a public item in the named source file on the current base, or the row carries disposition missing_contract_decision. A guessed schema is never presented as frozen."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-ONE-DISPOSITION-PER-ROW"
+rule = "Every load-bearing row carries exactly one disposition from reused_exact, corrected_static_description, missing_contract_decision, retired_with_successor. No row is both reused and missing."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-NO-FUNCTION-ONLY-PACKAGE"
+rule = "No crate is created. All twenty-four issue-named physical owners already exist as admitted root workspace members or as explicitly named prototypes; no Cargo.toml, Cargo.lock, .rs file, workflow or generated index is edited by this work unit."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-NO-FREEZE-BYTE-CHANGE"
+rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is byte-identical before and after this work unit, and python scripts/read_freeze_digest.py still passes. A byte change is a new freeze candidate under that file's own [readback].rule and requires the recorded CC-W2-FREEZE-REPIN handoff."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-COMPLETE-REQUIRES-DENOMINATOR"
+rule = "Every Complete coverage claim in every field_contract requires the exact independently recheckable denominator above; otherwise the state is Inconclusive, Partial, Unsupported or Unknown. A bare count never establishes completeness."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-PLANNING-OWNS-NO-EFFECT"
+rule = "No planning family output carries a DurableJob, a Ready Queue entry, a route reservation, a launch, a schedule, a configuration write, an effect, an authority or a task finish. The ten admitted maintenance verbs are inert; DecompositionOutcome::Overlapped and ::Challenge block the two obvious escapes."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-CYCLE-ONE-CYCLE-NO-SCHEDULE"
+rule = "PlanHorizon has exactly one variant and ExperimentKind admits only a clarification or reconciliation probe, so the cycle is one finite bounded adjacent phase and cannot self-schedule. Adding a recurring horizon or a schedule field is a contract break."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-NO-SELF-CERTIFICATION"
+rule = "No model output self-certifies grounding, transformation faithfulness, authority, coverage or product support. The seven I9.7 preservation dimensions, the coverage denominator and the fence gate are verdicts over owner material, never self-granted truths."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-EXACT-TRIGGER-NOT-SIMILARITY"
+rule = "An exact trigger blocks or requires a probe; a semantic near-match only warns. NegativeMemoryExtinctionCandidate.fingerprint is one opaque String on this base, so the structured exact-trigger boundary is recorded as an open gap rather than frozen as satisfied."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-FORWARD-REVERSIBLE-ONLY"
+rule = "merge, split, reconsolidation, accessibility, influence, revision, plan and cycle outputs are forward reversible candidates only. No in-place rewrite, purge or irreversible operator is representable in any frozen shape."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-CHRONOLOGY-SEPARATE-FROM-CAUSIS"
+rule = "ChronologyLink, ChronologyRelation, EpisodeBoundary and EpisodeGap stay separate from the causal-hypothesis fields. Merging them is a contract break."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-ROLE-SEPARATION"
+rule = "Researcher acquires, Dreamer interprets, Governor governs. A Dreamer crate may not acquire sources, and no crate in this catalogue may govern."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-NO-AGGREGATE-SCORE"
+rule = "No frozen type carries an aggregate intelligence, confidence, utility or learning score, and no generic JSON or vendor SDK type appears in a public contract field."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-PROOF-LADDER-CEILING"
+rule = "This catalogue is STATIC_FIELD_CONTRACT_ONLY / TARGET / NOT_EXECUTED. Rust implementation, package Module Proof, real provider-consumer Edge Proof and named Product Pulse execution all stay TEST-PHASE until they exist; package proof alone never reports product support."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+# ---------------------------------------------------------------------------
+# Handoff rules. Ordered; each names its consumer.
+# ---------------------------------------------------------------------------
+
+[[handoff]]
+id = "H-W2-FREEZE-PROMOTION"
+from = "crates/smart/cognitive-wave-10.toml"
+to = "crates/smart/cognitive-rev12-contract-schema-freeze.toml owner"
+trigger = "The owner decides to promote this semantic contract index into the freeze as revision 7."
+order = 1
+rule = "Publish r7 with a revision marker and supersedes_freeze_id plus supersedes_freeze_digest rows, then hand off to H-W2-DIGEST-REPIN. The r6 readback digest validates the r6 bytes only and never validates new bytes."
+blocking_consumer = "eliot-dreamer-memory-revision::verify_freeze_binding, called from propose"
+status = "BLOCKED_PENDING_OWNER_DECISION"
+
+[[handoff]]
+id = "H-W2-DIGEST-REPIN"
+from = "freeze owner"
+to = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs owner"
+trigger = "An r7 freeze is published."
+order = 2
+rule = "Update REQUIRED_FREEZE_DIGEST to the sha256 over the exact new freeze bytes. FREEZE_BYTES is an include_bytes! of the file itself, so no second copy or hand-copied digest is introduced. This is a .rs edit and is therefore out of scope for a TOML-only work unit."
+blocking_consumer = "eliot-dreamer-memory-revision::propose"
+status = "REQUIRED_BEFORE_R7_MERGE"
+
+[[handoff]]
+id = "H-W2-READBACK-ROW"
+from = "freeze owner"
+to = "crates/smart/cognitive-contract-challenges.toml owner"
+trigger = "An r7 freeze is published."
+order = 3
+rule = "Repoint the CC-W9-REV12-HANDOFF resolution_evidence recorded digest and recorded byte length to the r7 values, then re-run python scripts/read_freeze_digest.py green. The recorded value lives here because a digest of a file's own bytes cannot live inside those bytes."
+blocking_consumer = "scripts/read_freeze_digest.py"
+status = "REQUIRED_BEFORE_R7_MERGE"
+
+[[handoff]]
+id = "H-W2-IDENTITY-PINS"
+from = "freeze owner"
+to = "eliot-cognitive-quality, eliot-dreamer-memory-revision, eliot-dreamer-self-query, eliot-epistemic-context-provider, eliot-experience-projection, eliot-experience-provider, eliot-memory-quality, eliot-understanding-assessment"
+trigger = "An r7 freeze is published."
+order = 4
+rule = "Update all eight FREEZE_ID or CONSUMED_FREEZE_ID string pins in the same work unit as the digest re-pin, plus the six freeze_ref Cargo.toml rows and the four module.toml path rows. eliot-experience-provider is already stale on r5 and must move to the same revision rather than being left behind. Never mass find-and-replace the id: the self-comparison assertion in eliot-memory-quality must be updated together with its constant."
+blocking_consumer = "every crate declaring freeze_ref in its Cargo.toml"
+status = "REQUIRED_BEFORE_R7_MERGE"
+
+[[handoff]]
+id = "H-W2-CATALOGUE-PROMOTION"
+from = "crates/smart/cognitive-wave-10.toml"
+to = "crates/smart/cognitive-wave-01.toml, crates/smart/cognitive-wave-02.toml and crates/smart/cognitive-wave-09.toml owners"
+trigger = "This index is accepted."
+order = 5
+rule = "Each owning wave keeps its own rows; this catalogue adds a sibling index and does not renumber, rewrite or absorb any existing order. The one overlap is NegativeMemoryExtinctionCandidate, which wave-09 already indexes: the implemented Rust field set is authoritative and wave-09's longer semantic field family is recorded as corrected_static_description under MR-04, so wave-09's owner should either re-point its field list or cite MR-04. Both indexes must never be treated as two owners."
+blocking_consumer = "crates/smart/cognitive-wave-09.toml [[field_contract]] NegativeMemoryExtinctionCandidate"
+status = "ADVISORY"
+
+[[handoff]]
+id = "H-W2-NORMATIVE-PAIR-CORRECTION"
+from = "crates/smart/cognitive-wave-10.toml"
+to = "crates/smart/cognitive-wave-01.toml and crates/smart/cognitive-wave-09.toml owners"
+trigger = "Any pair identity in a wave catalogue is read."
+order = 6
+rule = "docs/normative-pair.toml is the only owner of the pair key, the revisions and the edition. The pair_key carried by wave-09 and the version string carried by wave-01 do not match it. This catalogue copies from docs/normative-pair.toml and records the discrepancy under CC-W2-NORMATIVE-PAIR-KEY rather than repairing the other wave files, because this work unit does not rewrite unrelated wave rows."
+blocking_consumer = "every catalogue that hand-maintains a pair_key or a document version string"
+status = "ADVISORY"
+
+[[handoff]]
+id = "H-W2-TOPOLOGY-DRIFT"
+from = "crates/smart/cognitive-wave-10.toml"
+to = "cognitive-crate-decisions.toml owner"
+trigger = "The next wave assignment is issued."
+order = 7
+rule = "Three measured gaps are recorded, not repaired: eliot-dreamer-cycle has no agent_order and no decisions row; eliot-dreamer-research-synthesis declares agent_order 6, which collides with eliot-dreamer-orientation and has no decisions row; eliot-dreamer-probe-plan declares agent_order 17 with no decisions row. Assigning any of them an order is an owner decision, and a duplicate order is rejected at wave review."
+blocking_consumer = "crates/smart/cognitive-crate-decisions.toml"
+status = "ADVISORY"
+
+# ---------------------------------------------------------------------------
+# Edges. All contract_only. No compile edge is asserted by this catalogue.
+# ---------------------------------------------------------------------------
+
+[[edge]]
+producer = "eliot-dreamer-bundle and eliot-dreamer-claim-grounding"
+contract = "DreamInputBundle, GroundedDreamDraft, GroundingValidationInput"
+consumer = "eliot-dreamer-candidate-validation"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-candidate-validation"
+contract = "CandidateValidationOutcome and StructuredCandidateValidationOutcome"
+consumer = "every typed curation handler in smart.dreamer.*"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "Governor/Memory OS canonical projection owners"
+contract = "admitted task/continuity/safety projections by handle (CC-004)"
+consumer = "eliot-dreamer-orientation, eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-self-query"
+contract = "SelfQueryPoseReceipt plus SelfQueryInput plus AcceptedSourceProjection"
+consumer = "eliot-dreamer-architecture-brief, eliot-dreamer-implementation-brief, eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "Researcher plane"
+contract = "ResearchPack (CC-005 DEFERRED_RESEARCH)"
+consumer = "eliot-dreamer-research-synthesis"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-candidate-validation"
+contract = "ValidatedCurationItem"
+consumer = "the ten smart.dreamer.* handler crates"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-conflict-analysis"
+contract = "ConflictAnalysisCandidate consumed as FrozenConflictAnalysis"
+consumer = "eliot-dreamer-development-diagnosis"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-cycle"
+contract = "CycleStep and CycleSample"
+consumer = "Controller phase boundary and the smart.dreamer.* handlers"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "every smart.dreamer.* producer in this catalogue"
+contract = "its [[field_contract]] candidate or result type"
+consumer = "Governor transition path and non-owner review surfaces"
+compile_link = "contract_only"
+
+[[forbidden_edge]]
+from = "any crate in this catalogue"
+to = "canonical state, storage adapter, kernel or daemon implementation, provider SDK, scheduler or effect executor"
+reason = "Every output is a candidate or an immutable projection with no operational authority."
+
+[[forbidden_edge]]
+from = "eliot-dreamer-research-synthesis"
+to = "source acquisition, retrieval or a self-selected coverage denominator"
+reason = "Researcher acquires, Dreamer interprets. CC-005 stays the Researcher's contract."
+
+[[forbidden_edge]]
+from = "eliot-dreamer-self-query, eliot-dreamer-architecture-brief, eliot-dreamer-implementation-brief"
+to = "declaring Architecture or Implementation conformance from a pose receipt or from repository prose"
+reason = "Target contract and current support stay separate; conformance evidence is a different owner's field."
+
+[[forbidden_edge]]
+from = "eliot-dreamer-memory-revision"
+to = "any irreversible extinction operator or a physical purge"
+reason = "AdvisoryNarrowing carries only suppress_activation, quarantine and archive by design."
+
+[[forbidden_edge]]
+from = "eliot-dreamer-maintenance-plan, eliot-dreamer-configuration-plan, eliot-dreamer-orchestration-plan, eliot-dreamer-probe-plan"
+to = "DurableJob, Ready Queue, route reservation, launch, schedule, configuration write, effect, authority or task finish"
+reason = "Planning owns none of these; the exclusion is structural in the outcome enums and vocabulary, and is recorded as W2-PLANNING-OWNS-NO-EFFECT."
+
+[[forbidden_edge]]
+from = "eliot-dreamer-cycle"
+to = "a schedule, a launch, a recurring horizon or any second cycle"
+reason = "PlanHorizon has exactly one variant and no cycle field schedules itself."
+
+[[forbidden_edge]]
+from = "any crate in this catalogue"
+to = "a second type owner duplicating an existing frozen type under a new name, or a generic JSON or vendor SDK escape field"
+reason = "A re-export is not a second owner, and an unbounded escape field defeats deny_unknown_fields."
+
+# ---------------------------------------------------------------------------
+# Donors.
+# ---------------------------------------------------------------------------
+
+[[donor]]
+path = "docs/architecture/I06-04-module-contract.md"
+disposition = "authoritative module contract shape: inputs/outputs, owned state, authority/effects, typed dependency ports, startup/drain and invalidation triggers, failure domain, health/freshness, rebuild boundary, proof entrypoints and removal boundary"
+targets = ["eliot-dreamer-cycle", "eliot-dreamer-validation family", "eliot-dreamer-orientation", "eliot-dreamer-self-query"]
+
+[[donor]]
+path = "docs/architecture/I09-06-curation-candidate.md"
+disposition = "authoritative CurationCandidate field set: candidate_id, kind, source_handles, proposed_transformation, support, counterevidence, scope_and_applicability, preservation_report, uncertainty, verifier_or_replay, expected_benefit, rollback; and the eleven closed kind values"
+targets = ["MemoryModelCandidateContract", "eliot-dreamer-curation", "the ten smart.dreamer.* handler crates"]
+
+[[donor]]
+path = "docs/architecture/I09-07-memory-transformation-validation.md"
+disposition = "authoritative seven transformation checks: coverage, preservation, faithfulness, lineage, reversibility, source authority, dependency closure; and the rule that failure leaves the original data intact and stores a rejected candidate only when useful for diagnosis"
+targets = ["ResearchSynthesisBriefContract", "MemoryModelCandidateContract", "ProceduralCandidateContract", "ValidationGroundingReceiptContract", "DreamCycleCandidateContract"]
+
+[[donor]]
+path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
+disposition = "upstream owner-neutral contracts reused verbatim: the self_query input, accepted-source, anchor and denominator vocabulary; the seven-class disposition vocabulary; the observation FailureObservation and MemoryRevisionEvidence shapes. Referenced by name only; no bytes copied and no type redefined here."
+targets = ["SelfQueryBriefContract", "MemoryRevisionCandidateContract", "ValidationGroundingReceiptContract"]
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-contracts"
+disposition = "the single owner of DreamJobAdmission, DreamInputBundle, ModelDraft, GroundedDreamDraft, ValidationPolicy, BudgetUsage, PreservationReport, BundleMaterial, OmissionHandle, RequesterOrigin, NativeCurationHandler and the self_query module. Every re-export of these types in this catalogue is a consumer boundary, not a second owner."
+targets = ["every contract in this catalogue"]
+
+[[donor]]
+path = "crates/smart/cognitive-wave-09.toml"
+disposition = "the W9 precedent for the [[field_contract]], [[ownership]], [[field_contract_index]], [[validation_gate]], [[edge]] and [[forbidden_edge]] shapes used here, and the prior static description of NegativeMemoryExtinctionCandidate reconciled under MR-04. Its orders 76-86 and its scope_rule are untouched."
+targets = ["this catalogue"]
+
+[[deferred]]
+capability = "Rust implementation of the frozen W2 semantic payload contracts"
+activation = "the owner promotes this index into the freeze as r7 under H-W2-FREEZE-PROMOTION, the digest and identity pins are re-pinned under H-W2-DIGEST-REPIN and H-W2-IDENTITY-PINS, then package Module Proof, real provider-consumer Edge Proof and named Product Pulse execution exist per contract"
+
+[[deferred]]
+capability = "The two recorded missing contract decisions: a shared memory-model family envelope and a structured exact-trigger field on the failure fingerprint"
+activation = "the owner decides whether each is a new frozen type in an existing crate or a correction to an existing one; neither may be realized as a new function-only Cargo package"
+
+[[deferred]]
+capability = "Closing the measured topology gaps: the missing wave order for eliot-dreamer-cycle, the duplicated agent_order 6 for eliot-dreamer-research-synthesis, the missing decisions row for eliot-dreamer-probe-plan, and the stale r5 pin in eliot-experience-provider"
+activation = "an owner decision in cognitive-crate-decisions.toml and a coordinated re-pin work unit; recorded, never invented, in this catalogue"

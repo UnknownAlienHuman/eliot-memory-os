@@ -361,6 +361,95 @@ impl Write for BoundedBuffer {
     }
 }
 
+/// Real prior-attempt lineage observed for one retry, before any equivalence
+/// verdict is applied.
+///
+/// These are the owner-supplied canonical handles the retry relation is built
+/// from: never prose, never a normalized plan, never a re-derived guess.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriorRetryLineage {
+    /// Prior attempt identity.
+    pub prior_attempt: AgentAttemptId,
+    /// Canonical strategy fingerprint the prior attempt recorded.
+    pub prior_fingerprint: String,
+    /// Evidence proving the prior relationship.
+    pub prior_evidence: Vec<ArtifactId>,
+}
+
+/// Extracts the prior-attempt lineage a retry actually carries.
+///
+/// `None` means the attempt is not a retry and the owner recorded no prior
+/// attempt material. A present prior attempt is accepted only with its exact
+/// canonical fingerprint and non-empty evidence, so a partially populated
+/// lineage fails closed instead of degrading into an unexplained relation.
+pub fn prior_retry_lineage(
+    input: &AttemptEvidence,
+) -> Result<Option<PriorRetryLineage>, LearningDeltaError> {
+    let retry = &input.retry;
+    let Some(prior_attempt) = retry.prior_attempt.clone() else {
+        if retry.prior_fingerprint.is_some()
+            || retry.prior_binding.is_some()
+            || retry.prior_target.is_some()
+            || retry.prior_outcome.is_some()
+            || !retry.prior_evidence.is_empty()
+            || !retry.prior_material_evidence.is_empty()
+            || retry.reason.is_some()
+        {
+            return Err(LearningDeltaError::InvalidInput {
+                field: "retry.prior",
+            });
+        }
+        return Ok(None);
+    };
+    if prior_attempt.as_str().trim().is_empty() || prior_attempt == input.attempt_id {
+        return Err(LearningDeltaError::InvalidInput {
+            field: "retry.prior_attempt",
+        });
+    }
+    let prior_fingerprint =
+        retry
+            .prior_fingerprint
+            .clone()
+            .ok_or(LearningDeltaError::InvalidInput {
+                field: "retry.fingerprint",
+            })?;
+    if prior_fingerprint.len() != 64
+        || !prior_fingerprint
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(LearningDeltaError::InvalidInput {
+            field: "retry.fingerprint",
+        });
+    }
+    if retry.prior_evidence.is_empty() {
+        return Err(LearningDeltaError::InvalidInput {
+            field: "retry.evidence",
+        });
+    }
+    Ok(Some(PriorRetryLineage {
+        prior_attempt,
+        prior_fingerprint,
+        prior_evidence: retry.prior_evidence.clone(),
+    }))
+}
+
+/// Closed reason name recorded for a materially equivalent controlled retry.
+///
+/// The name is taken from the closed [`RetryReason`] vocabulary rather than
+/// from provider prose, so the stored relation can never carry an invented
+/// justification.
+pub const fn retry_reason_name(reason: RetryReason) -> &'static str {
+    match reason {
+        RetryReason::Replication => "replication",
+        RetryReason::NoiseEstimation => "noise_estimation",
+        RetryReason::ControlledComparison => "controlled_comparison",
+        RetryReason::ExactReproduction => "exact_reproduction",
+        RetryReason::RecoveryProof => "recovery_proof",
+        RetryReason::VerifierCalibration => "verifier_calibration",
+    }
+}
+
 /// Compare the current canonical fingerprint with the prior one.
 pub fn assess_retry(
     input: &AttemptEvidence,

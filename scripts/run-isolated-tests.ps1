@@ -135,45 +135,217 @@ function Get-FileSha256Hex {
 
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
+# Profile arbitration (#907 W1): exactly one of -WhatIf, -ValidateConfiguration,
+# -Run. Default or conflicting invocation launches nothing (usage error, exit 2).
+# Called once from the main flow before any allocation, import, or data touch.
+function Resolve-HarnessActiveProfile {
+    param([switch]$WhatIf, [switch]$ValidateConfiguration, [switch]$Run)
+
+    $profileCount = 0
+    $activeProfile = $null
+    if ($WhatIf) { $profileCount++; $activeProfile = 'WhatIf' }
+    if ($ValidateConfiguration) { $profileCount++; $activeProfile = 'ValidateConfiguration' }
+    if ($Run) { $profileCount++; $activeProfile = 'Run' }
+    if ($profileCount -eq 0) {
+        Write-HarnessUsageError 'exactly one profile (-WhatIf, -ValidateConfiguration, or -Run) is required; default invocation launches nothing.'
+    }
+    if ($profileCount -gt 1) {
+        Write-HarnessUsageError 'profiles -WhatIf, -ValidateConfiguration, and -Run are mutually exclusive; conflicting invocation launches nothing.'
+    }
+    return $activeProfile
+}
+
+# Raw-launch guard (#907 W3): reject caller-controlled execution inputs before
+# anything launches. Takes the script's bound parameter names explicitly because
+# $PSBoundParameters inside a function would be the function's own.
+function Test-HarnessLaunchInput {
+    param(
+        [AllowEmptyCollection()][string[]]$BoundParameterNames = @(),
+        [switch]$McpOnly,
+        [switch]$RunIgnored
+    )
+
+    $removedLaunchParams = @(
+        'TestPackage', 'TestBinary', 'BinTarget', 'LibTarget',
+        'TestName', 'TestFilterExpression', 'SurrealExecutable'
+    )
+    foreach ($name in $removedLaunchParams) {
+        if ($BoundParameterNames -contains $name) {
+            Write-HarnessUsageError ("parameter -{0} no longer drives execution; fixed recipes derive from accepted inventory identities via -SelectedTestId/-SelectAllRows. Raw execution input is rejected and nothing launches." -f $name)
+        }
+    }
+    if ($McpOnly) {
+        Write-HarnessUsageError '-McpOnly encodes an implicit package/test selection; use explicit -SelectedTestId/-SelectAllRows. Nothing launches.'
+    }
+    if ($RunIgnored) {
+        Write-HarnessUsageError '-RunIgnored encodes an implicit selection/exclusion; use explicit -SelectedTestId/-SelectAllRows. Nothing launches.'
+    }
+    return $true
+}
+
+# -WhatIf profile dispatch (#907 W2/W10 seam edge): invoke the WhatIf seam for
+# the frozen selection, publish at most the explicitly requested plan file under
+# the admitted run root (reverse-order idempotent coordinator cleanup, original
+# failure retained), then emit the terminal receipt. Reads script-scope
+# admission/identity state; writes only the function-local plan flag.
+function Invoke-HarnessWhatIfProfile {
+    param([Parameter(Mandatory)][hashtable]$SeamArgs)
+
+    $planFileWritten = $false
+    $seamResult = Invoke-HarnessWhatIf @SeamArgs
+
+    if ($null -eq $seamResult) {
+        throw 'the WhatIf seam returned an empty plan; an empty plan is not success.'
+    }
+    $planJson = $seamResult | ConvertTo-Json -Depth 16 -Compress
+    $planDigest = [BitConverter]::ToString(
+        [Security.Cryptography.SHA256]::Create().ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($planJson))).Replace('-', '').ToLowerInvariant()
+    if ($null -ne $resolvedPlanPath) {
+        $planParent = Split-Path -Parent $resolvedPlanPath
+        $planParentFull = [IO.Path]::GetFullPath($planParent)
+        $planParentPrefix = $planParentFull.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        if (-not $planParentPrefix.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+            $planParentFull -ine $candidateRoot) {
+            throw 'the requested plan path escapes the admitted run root on re-admission.'
+        }
+        [IO.Directory]::CreateDirectory($planParentFull) | Out-Null
+        try {
+            [IO.File]::WriteAllText($resolvedPlanPath, $planJson, [Text.UTF8Encoding]::new($false))
+            $planFileWritten = $true
+        }
+        catch {
+            $writeError = $_.Exception.Message
+            $cleanupError = $null
+            try {
+                if (Test-Path -LiteralPath $resolvedPlanPath -PathType Leaf) {
+                    Remove-Item -LiteralPath $resolvedPlanPath -Force -ErrorAction Stop
+                }
+            }
+            catch {
+                $cleanupError = Get-BoundedErrorDetail $_.Exception.Message
+            }
+            if ($null -ne $cleanupError) {
+                throw ("plan publication failed ({0}); coordinator-owned partial cleanup also failed ({1}); original failure retained." -f $writeError, $cleanupError)
+            }
+            throw
+        }
+    }
+    $receipt = [ordered]@{
+        component = 'run-isolated-tests'
+        profile = $activeProfile
+        operation_status = 'OPERATION_COMPLETED'
+        run_id = $runId
+        admitted_root = $candidateRoot.Replace('\', '/')
+        selection_count = $explicitIds.Count
+        select_all_rows = [bool]$SelectAllRows
+        inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
+        plan_digest = $planDigest
+        plan_file = if ($null -eq $resolvedPlanPath) { $null } else { $resolvedPlanPath.Replace('\', '/') }
+        plan_file_written = $planFileWritten
+        seam = $seamName
+        entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
+        core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
+        model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+        workspace_test_exit_code = 0
+    }
+    $receipt | ConvertTo-Json -Compress
+    exit 0
+}
+
+# -ValidateConfiguration profile dispatch: invoke the read-only validation seam
+# and emit the terminal receipt. No plan file, no execution artifacts.
+function Invoke-HarnessValidateConfigurationProfile {
+    param([Parameter(Mandatory)][hashtable]$SeamArgs)
+
+    $seamResult = Invoke-HarnessValidateConfiguration @SeamArgs
+    $receipt = [ordered]@{
+        component = 'run-isolated-tests'
+        profile = $activeProfile
+        operation_status = 'OPERATION_COMPLETED'
+        run_id = $runId
+        inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
+        seam = $seamName
+        entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
+        core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
+        model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+        workspace_test_exit_code = 0
+    }
+    $receipt | ConvertTo-Json -Compress
+    exit 0
+}
+
+# -Run profile dispatch (#907 OBJ edge): invoke the Run seam for exactly the
+# frozen selection, probe the result shape defensively, and emit the terminal
+# receipt. Zero executed tests is NOT success (fail-closed throw).
+function Invoke-HarnessRunProfile {
+    param([Parameter(Mandatory)][hashtable]$SeamArgs)
+
+    # -Run: the seam result carries the outcome. Probe its shape defensively
+    # (documented precedence) without second-guessing a successful seam, except
+    # for the load-bearing invariant: zero executed tests is NOT success.
+    $seamResult = Invoke-HarnessRun @SeamArgs
+    $runExit = 0
+    $executedCount = $null
+    if ($null -eq $seamResult) {
+        throw 'the Run seam returned no result; an empty result is not success.'
+    }
+    foreach ($prop in @('workspace_test_exit_code', 'exit_code', 'exitCode')) {
+        if ($null -ne $seamResult.PSObject -and $null -ne $seamResult.PSObject.Properties[$prop]) {
+            $candidate = $seamResult.PSObject.Properties[$prop].Value
+            if ($candidate -is [int] -and $candidate -ge 0 -and $candidate -le 255) { $runExit = $candidate }
+            elseif ($candidate -is [int]) { $runExit = 1 }
+            break
+        }
+    }
+    foreach ($prop in @('executed_test_count', 'tests_executed', 'tests_run')) {
+        if ($null -ne $seamResult.PSObject -and $null -ne $seamResult.PSObject.Properties[$prop]) {
+            $candidate = $seamResult.PSObject.Properties[$prop].Value
+            if ($candidate -is [int]) { $executedCount = $candidate }
+            break
+        }
+    }
+    if ($null -ne $executedCount -and $executedCount -eq 0) {
+        throw 'the Run seam reported zero executed tests; zero discovered execution is not success.'
+    }
+    $receipt = [ordered]@{
+        component = 'run-isolated-tests'
+        profile = $activeProfile
+        operation_status = if ($runExit -eq 0) { 'OPERATION_COMPLETED' } else { 'FAILED' }
+        run_id = $runId
+        admitted_root = $candidateRoot.Replace('\', '/')
+        selection_count = $explicitIds.Count
+        select_all_rows = [bool]$SelectAllRows
+        inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
+        executed_test_count = $executedCount
+        seam = $seamName
+        entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
+        core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
+        model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+        workspace_test_exit_code = $runExit
+    }
+    $receipt | ConvertTo-Json -Compress
+    exit $runExit
+}
+
 
 # ---------------------------------------------------------------------------
 # 1. Profile arbitration. This runs before ANY allocation, import, process,
 #    port, pipe, worktree, or data touch. Nothing above this point has side
-#    effects (function definitions and pure assignments only).
+#    effects (function definitions and pure assignments only). The arbitration
+#    logic lives in Resolve-HarnessActiveProfile; the call below is the edge.
 # ---------------------------------------------------------------------------
-$profileCount = 0
-$activeProfile = $null
-if ($WhatIf) { $profileCount++; $activeProfile = 'WhatIf' }
-if ($ValidateConfiguration) { $profileCount++; $activeProfile = 'ValidateConfiguration' }
-if ($Run) { $profileCount++; $activeProfile = 'Run' }
-if ($profileCount -eq 0) {
-    Write-HarnessUsageError 'exactly one profile (-WhatIf, -ValidateConfiguration, or -Run) is required; default invocation launches nothing.'
-}
-if ($profileCount -gt 1) {
-    Write-HarnessUsageError 'profiles -WhatIf, -ValidateConfiguration, and -Run are mutually exclusive; conflicting invocation launches nothing.'
-}
+$activeProfile = Resolve-HarnessActiveProfile -WhatIf:$WhatIf -ValidateConfiguration:$ValidateConfiguration -Run:$Run
 
 # ---------------------------------------------------------------------------
 # 2. Raw-launch guard. The monolith let callers steer execution with package/
 #    binary/target/name/filter/executable inputs. That path is removed: the
 #    parameters stay in the signature for compatibility, but any explicit use
-#    fails closed here, before anything launches.
+#    fails closed here, before anything launches. The guard logic lives in
+#    Test-HarnessLaunchInput; the call below passes the script's own bound
+#    parameter names explicitly and is the production edge.
 # ---------------------------------------------------------------------------
-$removedLaunchParams = @(
-    'TestPackage', 'TestBinary', 'BinTarget', 'LibTarget',
-    'TestName', 'TestFilterExpression', 'SurrealExecutable'
-)
-foreach ($name in $removedLaunchParams) {
-    if ($PSBoundParameters.ContainsKey($name)) {
-        Write-HarnessUsageError ("parameter -{0} no longer drives execution; fixed recipes derive from accepted inventory identities via -SelectedTestId/-SelectAllRows. Raw execution input is rejected and nothing launches." -f $name)
-    }
-}
-if ($McpOnly) {
-    Write-HarnessUsageError '-McpOnly encodes an implicit package/test selection; use explicit -SelectedTestId/-SelectAllRows. Nothing launches.'
-}
-if ($RunIgnored) {
-    Write-HarnessUsageError '-RunIgnored encodes an implicit selection/exclusion; use explicit -SelectedTestId/-SelectAllRows. Nothing launches.'
-}
+[void](Test-HarnessLaunchInput -BoundParameterNames @($PSBoundParameters.Keys) -McpOnly:$McpOnly -RunIgnored:$RunIgnored)
 
 # ---------------------------------------------------------------------------
 # 3. Explicit finite selection. -Run and -WhatIf require exactly one selection
@@ -311,6 +483,9 @@ if ($PSBoundParameters.ContainsKey('ResultArtifactPath') -and -not [string]::IsN
 #    machine) and dispatch to the closed profile seam. Import happens only
 #    AFTER usage validation, so default/conflicting/contradictory invocations
 #    always report usage error (exit 2), never a delegation failure.
+#    Per-profile invocation plus terminal receipts live in the
+#    Invoke-HarnessWhatIfProfile / Invoke-HarnessValidateConfigurationProfile /
+#    Invoke-HarnessRunProfile functions; the dispatch below is the edge.
 # ---------------------------------------------------------------------------
 $coreModulePath = Join-Path $PSScriptRoot 'integration\IntegrationHarness.Core.psm1'
 $modelModulePath = Join-Path $PSScriptRoot 'integration\IntegrationHarness.Model.psm1'
@@ -355,136 +530,23 @@ if ($activeProfile -eq 'Run') {
 # Coordinator-owned state: at most the explicitly requested WhatIf plan file.
 # Everything run-owned (processes, ports, pipes, worktrees, data, secrets) is
 # module-owned and cleaned up by the seam in reverse order, idempotently.
-$planFileWritten = $false
 $terminalError = $null
-$seamResult = $null
 try {
-    $seamResult = & $seamName @seamArgs
-
     if ($activeProfile -eq 'WhatIf') {
-        if ($null -eq $seamResult) {
-            throw 'the WhatIf seam returned an empty plan; an empty plan is not success.'
-        }
-        $planJson = $seamResult | ConvertTo-Json -Depth 16 -Compress
-        $planDigest = [BitConverter]::ToString(
-            [Security.Cryptography.SHA256]::Create().ComputeHash(
-                [Text.Encoding]::UTF8.GetBytes($planJson))).Replace('-', '').ToLowerInvariant()
-        if ($null -ne $resolvedPlanPath) {
-            $planParent = Split-Path -Parent $resolvedPlanPath
-            $planParentFull = [IO.Path]::GetFullPath($planParent)
-            $planParentPrefix = $planParentFull.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-            if (-not $planParentPrefix.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase) -and
-                $planParentFull -ine $candidateRoot) {
-                throw 'the requested plan path escapes the admitted run root on re-admission.'
-            }
-            [IO.Directory]::CreateDirectory($planParentFull) | Out-Null
-            try {
-                [IO.File]::WriteAllText($resolvedPlanPath, $planJson, [Text.UTF8Encoding]::new($false))
-                $planFileWritten = $true
-            }
-            catch {
-                $writeError = $_.Exception.Message
-                $cleanupError = $null
-                try {
-                    if (Test-Path -LiteralPath $resolvedPlanPath -PathType Leaf) {
-                        Remove-Item -LiteralPath $resolvedPlanPath -Force -ErrorAction Stop
-                    }
-                }
-                catch {
-                    $cleanupError = Get-BoundedErrorDetail $_.Exception.Message
-                }
-                if ($null -ne $cleanupError) {
-                    throw ("plan publication failed ({0}); coordinator-owned partial cleanup also failed ({1}); original failure retained." -f $writeError, $cleanupError)
-                }
-                throw
-            }
-        }
-        $receipt = [ordered]@{
-            component = 'run-isolated-tests'
-            profile = $activeProfile
-            operation_status = 'OPERATION_COMPLETED'
-            run_id = $runId
-            admitted_root = $candidateRoot.Replace('\', '/')
-            selection_count = $explicitIds.Count
-            select_all_rows = [bool]$SelectAllRows
-            inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
-            plan_digest = $planDigest
-            plan_file = if ($null -eq $resolvedPlanPath) { $null } else { $resolvedPlanPath.Replace('\', '/') }
-            plan_file_written = $planFileWritten
-            seam = $seamName
-            entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
-            core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
-            model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
-            workspace_test_exit_code = 0
-        }
-        $receipt | ConvertTo-Json -Compress
-        exit 0
+        Invoke-HarnessWhatIfProfile -SeamArgs $seamArgs
     }
-
-    if ($activeProfile -eq 'ValidateConfiguration') {
-        $receipt = [ordered]@{
-            component = 'run-isolated-tests'
-            profile = $activeProfile
-            operation_status = 'OPERATION_COMPLETED'
-            run_id = $runId
-            inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
-            seam = $seamName
-            entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
-            core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
-            model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
-            workspace_test_exit_code = 0
-        }
-        $receipt | ConvertTo-Json -Compress
-        exit 0
+    elseif ($activeProfile -eq 'ValidateConfiguration') {
+        Invoke-HarnessValidateConfigurationProfile -SeamArgs $seamArgs
     }
-
-    # -Run: the seam result carries the outcome. Probe its shape defensively
-    # (documented precedence) without second-guessing a successful seam, except
-    # for the load-bearing invariant: zero executed tests is NOT success.
-    $runExit = 0
-    $executedCount = $null
-    if ($null -eq $seamResult) {
-        throw 'the Run seam returned no result; an empty result is not success.'
+    else {
+        Invoke-HarnessRunProfile -SeamArgs $seamArgs
     }
-    foreach ($prop in @('workspace_test_exit_code', 'exit_code', 'exitCode')) {
-        if ($null -ne $seamResult.PSObject -and $null -ne $seamResult.PSObject.Properties[$prop]) {
-            $candidate = $seamResult.PSObject.Properties[$prop].Value
-            if ($candidate -is [int] -and $candidate -ge 0 -and $candidate -le 255) { $runExit = $candidate }
-            elseif ($candidate -is [int]) { $runExit = 1 }
-            break
-        }
-    }
-    foreach ($prop in @('executed_test_count', 'tests_executed', 'tests_run')) {
-        if ($null -ne $seamResult.PSObject -and $null -ne $seamResult.PSObject.Properties[$prop]) {
-            $candidate = $seamResult.PSObject.Properties[$prop].Value
-            if ($candidate -is [int]) { $executedCount = $candidate }
-            break
-        }
-    }
-    if ($null -ne $executedCount -and $executedCount -eq 0) {
-        throw 'the Run seam reported zero executed tests; zero discovered execution is not success.'
-    }
-    $receipt = [ordered]@{
-        component = 'run-isolated-tests'
-        profile = $activeProfile
-        operation_status = if ($runExit -eq 0) { 'OPERATION_COMPLETED' } else { 'FAILED' }
-        run_id = $runId
-        admitted_root = $candidateRoot.Replace('\', '/')
-        selection_count = $explicitIds.Count
-        select_all_rows = [bool]$SelectAllRows
-        inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
-        executed_test_count = $executedCount
-        seam = $seamName
-        entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
-        core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
-        model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
-        workspace_test_exit_code = $runExit
-    }
-    $receipt | ConvertTo-Json -Compress
-    exit $runExit
 }
 catch {
     $terminalError = Get-BoundedErrorDetail $_.Exception.Message
-    [Console]::Error.WriteLine("run-isolated-tests harness error: -{0} delegation failed: {1}" -f $activeProfile, $terminalError)
+    # The -f expression must be parenthesized: WriteLine(...) parses commas as
+    # argument separators, so an unparenthesized -f formats with one argument
+    # and throws instead of reporting the delegation failure (exit 97).
+    [Console]::Error.WriteLine(("run-isolated-tests harness error: -{0} delegation failed: {1}" -f $activeProfile, $terminalError))
     exit $script:DelegationFailureExitCode
 }

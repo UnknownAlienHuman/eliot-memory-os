@@ -1,7 +1,7 @@
 use crate::{
-    DreamCandidateId, MemoryRevision, ProjectId, ReplayCaseId, ReplayRunId, ReplaySetId,
-    SemanticCommandKind, SkillId, SkillReplayRequirement, TaintClass, TaskId, WriteId,
-    WriteReceiptRef,
+    DreamCandidateId, MemoryRevision, ProjectId, ReplayCaseId, ReplayEvaluationIntegrityReceipt,
+    ReplayRunId, ReplaySetId, SemanticCommandKind, SkillId, SkillReplayRequirement, TaintClass,
+    TaskId, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -151,6 +151,12 @@ pub struct ReplayRun {
     pub sealed_input_hash: String,
     pub reproducibility_hash: String,
     pub uncertainty: String,
+    /// Sealed evaluation-integrity receipt (issue #1922 W6a). `Some` only for
+    /// canonical sealed replay; `None` for runs without canonical sealed
+    /// inputs and for records predating receipt retention: unknown, never a
+    /// validity claim. Consumers verify the seal and the run binding.
+    #[serde(default)]
+    pub evaluation_integrity_receipt: Option<ReplayEvaluationIntegrityReceipt>,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     #[serde(default, with = "time::serde::rfc3339::option")]

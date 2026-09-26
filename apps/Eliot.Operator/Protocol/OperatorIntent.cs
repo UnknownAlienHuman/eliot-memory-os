@@ -84,7 +84,11 @@ public enum OperatorMutationRoute
 /// request may have executed: the same identity must be reconciled, never
 /// resubmitted as a new mutation. `PossiblyExecuted` is a transport loss after
 /// the request was written; `StaleFence` is an owner-bound rejection proving
-/// the mutation was not admitted. All seven states stay distinct.
+/// the mutation was not admitted. `NotAttempted` is reserved for a request
+/// proven never to have left this process; it is not terminal and is never
+/// assigned to an older retained operation, because a failure before a new
+/// send says nothing about a previous execution. All eight states stay
+/// distinct.
 public enum OperatorOperationPhase
 {
     Created,
@@ -94,7 +98,8 @@ public enum OperatorOperationPhase
     Rejected,
     Cancelled,
     StaleFence,
-    UnknownReconciling
+    UnknownReconciling,
+    NotAttempted
 }
 
 /// One retained operation: identity, canonical envelope bytes, expected

@@ -11,16 +11,23 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    FencingToken, Generation, HostEventEnvelope, ReconnectRequest, SessionId,
+    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, SessionId,
 };
 use eliot_contracts::EpochId;
+use eliot_mcp::{
+    HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
+    HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
+    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
+    KernelHostRequestPort, NegotiatedWireVersion, ToolRequest, WIRE_INTERNAL_ERROR,
+    WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
+    build_host_cancellation, build_host_invocation, decode_cancel_notification,
+    decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
+    gateway_error_to_wire, initialize_result, negotiate_wire_version, render_accepted_result,
+    render_error, render_rejected_result, render_rejection, render_responded_result, render_result,
+    tools_list_result,
+};
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
-use eliot_mcp::{
-    HostCancellationRequest, HostCancellationResult, HostCorrelationReceipt, HostGatewayError,
-    HostInvocationRequest, HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
-    ToolRequest,
-};
 use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
@@ -28,12 +35,29 @@ use request_input::{
     read_bounded_record, scratch_budget,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
+
+/// Explicit checked MCP entrypoint token (issue #2562): a leading `mcp`
+/// argv token selects the MCP JSON-RPC front door on stdio. It is coherent
+/// with the approved invocation built by the Governor delegation
+/// (`eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL --transport
+/// stdio --client-declaration <absolute-path>`) and the release
+/// materialization of that argv; the tokenless argv keeps serving the
+/// existing private `op` clients byte-for-byte.
+const MCP_MODE_TOKEN: &str = "mcp";
+
+/// Media type of retained hot-resource snapshots: `record_tool_result_delivery`
+/// publishes the JSON-serialized response content (`serde_json::to_vec`), so
+/// expansion yields `application/json` bytes. This matches the surface's
+/// canonical bound-resource check, which only admits `application/json`
+/// bindings.
+const HOT_RESOURCE_MEDIA_TYPE: &str = "application/json";
 
 /// Stable identity of the binary-private stdio output profile.
 const STDIO_OUTPUT_PROFILE_ID: &str = "eliot.agent-bridge.stdio-output.v1";
@@ -510,7 +534,19 @@ impl KernelHostRequestPort for UnavailableKernelHostRequestPort {
 
 #[allow(clippy::too_many_lines)]
 fn main() {
-    let config = match parse_args(std::env::args().skip(1)) {
+    // Explicit checked MCP entrypoint contract (issue #2562): a leading
+    // `mcp` token selects the MCP JSON-RPC front door on stdio. It is
+    // stripped before the checked CLI parse, so the remaining argv keeps the
+    // documented `--profile/--transport/--client-declaration` contract and
+    // the tokenless argv keeps serving the existing private `op` clients
+    // byte-for-byte. No protocol sniffing: the mode is named by argv, never
+    // inferred from payload bytes.
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let mcp_mode = argv.first().is_some_and(|first| first == MCP_MODE_TOKEN);
+    if mcp_mode {
+        argv.remove(0);
+    }
+    let config = match parse_args(argv) {
         Ok(config) => config,
         Err(error) => {
             let (code, detail) = match error {
@@ -562,6 +598,14 @@ fn main() {
             format!("request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent");
         emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
         std::process::exit(PROVIDER_PORT_EXIT);
+    }
+    if mcp_mode {
+        // The MCP front door owns its stdio loop from here: it never falls
+        // through to the private `op` loop below, and the private loop never
+        // decodes an MCP frame. The exit code mirrors the provider discipline
+        // of the private path.
+        let code = run_mcp_front_door(&host_gateway, &mut host_request_client, &mut runner);
+        std::process::exit(code);
     }
     let mut stdin_lock = io::stdin().lock();
     // Total non-blank bounded records observed (dispatched or malformed) and
@@ -1982,6 +2026,17 @@ fn write_response(response: &Response) -> StdioWriteReceipt {
             };
         }
     };
+    emit_framed_bytes(framed)
+}
+
+/// Emits already-framed stdout bytes with the bounded write-plus-flush
+/// discipline shared by both stdio protocols.
+///
+/// The private `op` loop and the MCP front door frame differently but emit
+/// identically: at most one outstanding frame, a bounded wait on a slow
+/// consumer, and fail-closed break causes. Nothing here inspects payload
+/// bytes, so no secret can cross into a diagnostic.
+fn emit_framed_bytes(framed: Vec<u8>) -> StdioWriteReceipt {
     let bytes = framed.len();
     let awaited = await_with_timeout(STDOUT_WRITE_TIMEOUT, move || {
         let stdout = io::stdout();
@@ -2026,6 +2081,805 @@ fn write_response(response: &Response) -> StdioWriteReceipt {
                 cause: StdioBreakCause::WriteTimeout,
             }
         }
+    }
+}
+
+/// Flagged Claude MCP front door (issue #2562).
+///
+/// Selected by the explicit leading `mcp` argv token, this loop serves MCP
+/// JSON-RPC on stdio through the same authenticated Kernel faces as the
+/// private `op` loop: the same `kernel_ports_with_declaration` activation,
+/// the same `BridgeRunner` attach, and the same `HostRequestGateway` plus
+/// `KernelHostRequestClient` dispatch. The private `op` enum, its handlers,
+/// and the I7.2 frame decoder are untouched: every MCP frame decodes through
+/// the `eliot-mcp` wire adapter and every response renders as a negotiated
+/// JSON-RPC envelope echoing the exact request identity.
+///
+/// Single-threaded by construction: the trusted port borrows a process-local
+/// shared transport, so dispatch owns the port for the whole process.
+/// Cancellation therefore targets the exact admitted operation handle
+/// retained per correlation: a cancel that lands before its call refuses the
+/// dispatch, a cancel that lands after admission cancels that exact operation
+/// with the owner's real disposition, and an unknown target reconciles
+/// without executing anything new. Cancel dispositions travel on stderr
+/// (diagnostics stay off protocol stdout); `tools/call` results carry the
+/// admitted handle inline so later cancels and resource expansions name the
+/// exact operation.
+///
+/// Maximum retained admitted operation handles (correlation to exact Kernel
+/// operation). Oldest entries leave first; a cancel for a retired entry
+/// reports an unknown target instead of touching another operation.
+const MAX_RETAINED_OPERATION_HANDLES: usize = 256;
+/// Maximum retained hot-resource handles available to `resources/read`.
+/// Oldest entries leave first; an evicted URI reads as unknown, never stale.
+const MAX_RETAINED_RESOURCES: usize = 64;
+/// Maximum retained pre-dispatch cancellation marks. Oldest entries leave
+/// first; a retired mark simply stops refusing its correlation.
+const MAX_RETAINED_CANCELS: usize = 256;
+/// Demand identity minted for the MCP attach: transport correlation owned by
+/// this stdio process, never session or authority identity.
+const MCP_DEMAND_ID: &str = "mcp-stdio-demand";
+/// Connection identity minted for the MCP attach: one stdio process carries
+/// exactly one connection, so the identity is fixed for the process lifetime.
+const MCP_CONNECTION_ID: &str = "mcp-stdio-1";
+
+/// Live MCP front-door session: negotiated version plus bounded retention.
+///
+/// Retention maps are correlation-only, keyed by the type-qualified
+/// [`JsonRpcId::correlation_text`] (`int:`/`str:`) so numeric and string wire
+/// identities never share a handle or a cancellation mark. Handles are exact
+/// Kernel-issued operation identities and exact retained resource handles;
+/// nothing here mints, rebinds, or revives session, task, or authority state.
+struct McpFrontDoor {
+    version: NegotiatedWireVersion,
+    initialized: bool,
+    handles: Vec<(String, HostOperationHandle)>,
+    cancelled: Vec<String>,
+    resources: Vec<(String, eliot_agent_bridge::ResourceHandle)>,
+}
+
+impl McpFrontDoor {
+    fn new() -> Self {
+        Self {
+            version: NegotiatedWireVersion::Primary,
+            initialized: false,
+            handles: Vec::new(),
+            cancelled: Vec::new(),
+            resources: Vec::new(),
+        }
+    }
+
+    /// Retains the exact admitted operation for one correlation, retiring the
+    /// oldest entry past the bound.
+    fn retain_handle(&mut self, correlation: &str, handle: HostOperationHandle) {
+        if let Some(slot) = self
+            .handles
+            .iter_mut()
+            .find(|(known, _)| known == correlation)
+        {
+            slot.1 = handle;
+            return;
+        }
+        if self.handles.len() >= MAX_RETAINED_OPERATION_HANDLES {
+            self.handles.remove(0);
+        }
+        self.handles.push((correlation.to_owned(), handle));
+    }
+
+    /// Returns the exact admitted operation retained for one correlation.
+    fn find_handle(&self, correlation: &str) -> Option<&HostOperationHandle> {
+        self.handles
+            .iter()
+            .find(|(known, _)| known == correlation)
+            .map(|(_, handle)| handle)
+    }
+
+    /// Marks one correlation cancelled before (or without) dispatch, retiring
+    /// the oldest mark past the bound.
+    fn note_cancelled(&mut self, correlation: &str) {
+        if self.cancelled.iter().any(|known| known == correlation) {
+            return;
+        }
+        if self.cancelled.len() >= MAX_RETAINED_CANCELS {
+            self.cancelled.remove(0);
+        }
+        self.cancelled.push(correlation.to_owned());
+    }
+
+    /// Returns true when the correlation was cancelled before dispatch.
+    fn is_cancelled(&self, correlation: &str) -> bool {
+        self.cancelled.iter().any(|known| known == correlation)
+    }
+
+    /// Retains one exact hot-resource handle under its exact URI, retiring
+    /// the oldest entry past the bound.
+    fn retain_resource(&mut self, uri: &str, handle: eliot_agent_bridge::ResourceHandle) {
+        if let Some(slot) = self.resources.iter_mut().find(|(known, _)| known == uri) {
+            slot.1 = handle;
+            return;
+        }
+        if self.resources.len() >= MAX_RETAINED_RESOURCES {
+            self.resources.remove(0);
+        }
+        self.resources.push((uri.to_owned(), handle));
+    }
+
+    /// Returns the exact retained handle for one resource URI.
+    fn find_resource(&self, uri: &str) -> Option<&eliot_agent_bridge::ResourceHandle> {
+        self.resources
+            .iter()
+            .find(|(known, _)| known == uri)
+            .map(|(_, handle)| handle)
+    }
+
+    /// Lists every retained resource as its exact URI plus media type.
+    fn list_resources(&self) -> Vec<Value> {
+        self.resources
+            .iter()
+            .map(|(uri, _)| {
+                serde_json::json!({
+                    "uri": uri,
+                    "name": uri,
+                    "mimeType": HOT_RESOURCE_MEDIA_TYPE,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Outcome of one MCP frame: an optional response plus whether the frame
+/// counted as a valid wire exchange for the consecutive-invalid discipline.
+struct McpFrameOutcome {
+    response: Option<Value>,
+    dispatched: bool,
+}
+
+/// Serves the MCP front door on stdio until EOF or a fail-closed break.
+///
+/// Framing, record bounds, request ceilings, and the consecutive-invalid
+/// discipline mirror the private `op` loop; only the frame shapes differ
+/// (negotiated JSON-RPC instead of the private envelope). Returns the
+/// process exit code with the same provider-failure accounting.
+#[allow(
+    clippy::too_many_lines,
+    reason = "MCP stdio loop mirrors the private op loop frame discipline step for step"
+)]
+fn run_mcp_front_door(
+    gateway: &HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+) -> i32 {
+    let mut state = McpFrontDoor::new();
+    let mut provider_failure = false;
+    let mut stdin_lock = io::stdin().lock();
+    let mut total_records: u64 = 0;
+    let mut consecutive_invalid: u32 = 0;
+    loop {
+        let text = match read_mcp_record(&mut stdin_lock, &mut total_records) {
+            McpIntake::End => break,
+            McpIntake::Skip => continue,
+            McpIntake::Reject(frame) => {
+                let break_after = emit_mcp_frame(&frame);
+                consecutive_invalid = consecutive_invalid.saturating_add(1);
+                if break_after
+                    || consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+                {
+                    break;
+                }
+                continue;
+            }
+            McpIntake::Text(text) => text,
+        };
+        let outcome = handle_mcp_frame(
+            gateway,
+            port,
+            runner,
+            &mut state,
+            &text,
+            &mut provider_failure,
+        );
+        if outcome.dispatched {
+            consecutive_invalid = 0;
+        } else {
+            consecutive_invalid = consecutive_invalid.saturating_add(1);
+            if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records {
+                break;
+            }
+        }
+        if let Some(response) = outcome.response
+            && emit_mcp_frame(&response)
+        {
+            break;
+        }
+    }
+    if provider_failure {
+        PROVIDER_PORT_EXIT
+    } else {
+        0
+    }
+}
+
+/// One stdio intake classification for the MCP loop.
+enum McpIntake {
+    /// A line ready for wire decoding.
+    Text(String),
+    /// A blank line: skipped without touching any counter.
+    Skip,
+    /// A shaped JSON-RPC rejection frame to emit (framing failure).
+    Reject(Value),
+    /// EOF, request ceiling, or an unrecoverable intake failure: break.
+    End,
+}
+
+/// Reads one bounded stdio record for the MCP loop.
+///
+/// Mirrors the private `op` intake byte-for-byte except the rejection shape:
+/// framing failures render as negotiated JSON-RPC errors with a null
+/// identity (no usable correlation exists yet), never as the private
+/// envelope. Returns `End` exactly where the private loop breaks; the caller
+/// owns the consecutive-invalid accounting for `Reject` frames.
+fn read_mcp_record(stdin: &mut io::StdinLock<'_>, total_records: &mut u64) -> McpIntake {
+    let outcome = match read_bounded_record(stdin, REQUEST_INPUT_PROFILE) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return McpIntake::Reject(render_error(
+                None,
+                WIRE_INVALID_REQUEST,
+                "stdio intake failed before any frame decoded",
+                serde_json::json!({ "detail": error.to_string() }),
+            ));
+        }
+    };
+    let record_bytes = match outcome {
+        ReadOutcome::Eof => return McpIntake::End,
+        ReadOutcome::Oversize {
+            discarded_bytes,
+            found_terminator,
+        } => {
+            let frame = render_error(
+                None,
+                WIRE_INVALID_REQUEST,
+                "record exceeds the bounded input size and was discarded",
+                serde_json::json!({
+                    "profile": REQUEST_INPUT_PROFILE_ID,
+                    "limit_bytes": REQUEST_INPUT_PROFILE.max_record_bytes,
+                    "discarded_bytes": discarded_bytes,
+                }),
+            );
+            // Without a terminator the stream lost framing: the private loop
+            // breaks here too, after emitting the rejection.
+            if !found_terminator {
+                let _ = emit_mcp_frame(&frame);
+                return McpIntake::End;
+            }
+            return McpIntake::Reject(frame);
+        }
+        ReadOutcome::InvalidUtf8 => {
+            return McpIntake::Reject(render_error(
+                None,
+                WIRE_INVALID_REQUEST,
+                "record is not valid UTF-8",
+                serde_json::json!({ "profile": REQUEST_INPUT_PROFILE_ID }),
+            ));
+        }
+        ReadOutcome::Record(bytes) => bytes,
+    };
+    let Ok(text) = std::str::from_utf8(&record_bytes) else {
+        return McpIntake::Reject(render_error(
+            None,
+            WIRE_INVALID_REQUEST,
+            "record is not valid UTF-8",
+            serde_json::json!({ "profile": REQUEST_INPUT_PROFILE_ID }),
+        ));
+    };
+    if text.trim().is_empty() {
+        return McpIntake::Skip;
+    }
+    if *total_records >= REQUEST_INPUT_PROFILE.max_requests_per_process {
+        return McpIntake::End;
+    }
+    let Some(next_total) = total_records.checked_add(1) else {
+        return McpIntake::End;
+    };
+    *total_records = next_total;
+    McpIntake::Text(text.to_owned())
+}
+
+/// Emits one MCP frame with the shared bounded stdout discipline.
+///
+/// Returns true when the loop must break afterwards (zero bytes placed,
+/// unflushed, oversize, or slow consumer), exactly like the private
+/// emission receipt contract.
+fn emit_mcp_frame(frame: &Value) -> bool {
+    let receipt = write_mcp_frame(frame);
+    receipt.bytes_written() == 0 || receipt.should_break()
+}
+
+/// Frames one MCP response into its newline-delimited stdout bytes with the
+/// output bound enforced before any I/O, then emits through the shared
+/// bounded writer.
+fn write_mcp_frame(frame: &Value) -> StdioWriteReceipt {
+    let mut framed = match serde_json::to_vec(frame) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return StdioWriteReceipt {
+                bytes: 0,
+                flushed: false,
+                cause: StdioBreakCause::SerializeFailed,
+            };
+        }
+    };
+    framed.push(b'\n');
+    if framed.len() > MAX_OUTPUT_FRAME_BYTES {
+        emit_error(
+            "STDOUT_RESPONSE_TOO_LARGE",
+            &format!(
+                "framed MCP response exceeds {MAX_OUTPUT_FRAME_BYTES} bytes for {STDIO_OUTPUT_PROFILE_ID}; emission refused"
+            ),
+        );
+        return StdioWriteReceipt {
+            bytes: 0,
+            flushed: false,
+            cause: StdioBreakCause::OutputTooLarge,
+        };
+    }
+    emit_framed_bytes(framed)
+}
+
+/// Dispatches one decoded MCP frame.
+///
+/// Well-formed exchanges (including well-formed refusals) count as
+/// dispatched; only undecodable frames and unusable correlations extend the
+/// consecutive-invalid run without ever reaching a handler, gateway, port,
+/// or runner call.
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed MCP method table: one arm per negotiated method"
+)]
+fn handle_mcp_frame(
+    gateway: &HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    text: &str,
+    provider_failure: &mut bool,
+) -> McpFrameOutcome {
+    let valid = |response: Option<Value>| McpFrameOutcome {
+        response,
+        dispatched: true,
+    };
+    let request = match decode_wire_request(text) {
+        Ok(request) => request,
+        Err(error) => {
+            return McpFrameOutcome {
+                response: Some(error.render()),
+                dispatched: false,
+            };
+        }
+    };
+    match (request.id, request.method.as_str()) {
+        (None, "notifications/initialized") => valid(None),
+        (None, "notifications/cancelled") => {
+            handle_mcp_cancelled(gateway, port, state, &request.params);
+            valid(None)
+        }
+        (None, method) if method.starts_with("notifications/") => valid(None),
+        (None, _) => McpFrameOutcome {
+            response: Some(render_error(
+                None,
+                WIRE_INVALID_REQUEST,
+                "requests require an id; notifications carry none",
+                Value::Null,
+            )),
+            dispatched: false,
+        },
+        (Some(id), "initialize") => valid(Some(handle_mcp_initialize(
+            runner,
+            port,
+            state,
+            &id,
+            &request.params,
+            provider_failure,
+        ))),
+        (Some(id), "ping") => valid(Some(render_result(&id, serde_json::json!({})))),
+        (Some(id), _) if !state.initialized => valid(Some(render_error(
+            Some(&id),
+            WIRE_INVALID_REQUEST,
+            "session is not initialized; send initialize first",
+            Value::Null,
+        ))),
+        (Some(id), "tools/list") => valid(Some(handle_mcp_tools_list(&id, &request.params))),
+        (Some(id), "tools/call") => valid(Some(handle_mcp_tools_call(
+            gateway,
+            port,
+            runner,
+            state,
+            &id,
+            &request.params,
+        ))),
+        (Some(id), "resources/list") => {
+            valid(Some(handle_mcp_resources_list(state, &id, &request.params)))
+        }
+        (Some(id), "resources/read") => valid(Some(handle_mcp_resources_read(
+            runner,
+            state,
+            &id,
+            &request.params,
+        ))),
+        (Some(id), method) => valid(Some(render_error(
+            Some(&id),
+            WIRE_METHOD_NOT_FOUND,
+            "method is not implemented on this surface",
+            serde_json::json!({ "method": bound_mcp_method(method) }),
+        ))),
+    }
+}
+
+/// Serves one `initialize`: negotiates the wire version and attaches the
+/// runner through the real installation/Kernel route.
+///
+/// Initialization advertises the implemented surface and binds the
+/// transport; it creates no ELIOT Session, task, or authority. Attach uses
+/// the declaration-bound activation built at startup plus transport-owned
+/// connection identities, exactly like the private `op` attach.
+fn handle_mcp_initialize(
+    runner: &mut BridgeRunner,
+    port: &mut KernelHostRequestClient,
+    state: &mut McpFrontDoor,
+    id: &JsonRpcId,
+    params: &Value,
+    provider_failure: &mut bool,
+) -> Value {
+    if state.initialized {
+        return render_error(
+            Some(id),
+            WIRE_INVALID_REQUEST,
+            "session is already initialized on this connection",
+            Value::Null,
+        );
+    }
+    let version = match decode_initialize_version(params).and_then(negotiate_wire_version) {
+        Ok(version) => version,
+        Err(rejection) => return render_rejection(Some(id), &rejection),
+    };
+    let demand = match DemandId::new(MCP_DEMAND_ID) {
+        Ok(demand) => demand,
+        Err(_) => {
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                "transport demand identity is unavailable",
+                Value::Null,
+            );
+        }
+    };
+    let connection = match ConnectionId::new(MCP_CONNECTION_ID) {
+        Ok(connection) => connection,
+        Err(_) => {
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                "transport connection identity is unavailable",
+                Value::Null,
+            );
+        }
+    };
+    if let Err(error) = runner.attach(AttachRequest::managed(demand, connection)) {
+        *provider_failure |= matches!(error, BridgeError::PlanGap(_));
+        let (code, message) = bridge_error_code(&error);
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "attach was refused",
+            serde_json::json!({
+                "code": code,
+                "message": message,
+            }),
+        );
+    }
+    // Best-effort durable restore for the fresh attach, mirroring the private
+    // path: a refused restore keeps the empty-ledger behavior and is reported
+    // on stderr without failing the negotiation that already succeeded.
+    if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(runner, port, &[]) {
+        emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+    }
+    state.version = version;
+    state.initialized = true;
+    render_result(id, initialize_result(version, env!("CARGO_PKG_VERSION")))
+}
+
+/// Serves one `tools/list` from the generated canonical schemas.
+fn handle_mcp_tools_list(id: &JsonRpcId, params: &Value) -> Value {
+    if let Err(rejection) = eliot_mcp::reject_list_cursor(params, "tools/list") {
+        return render_rejection(Some(id), &rejection);
+    }
+    match tools_list_result() {
+        Ok(result) => render_result(id, result),
+        Err(rejection) => render_rejection(Some(id), &rejection),
+    }
+}
+
+/// Serves one `tools/call` through the authenticated host-request faces.
+///
+/// The wire name plus arguments become one inert `HostInvocationRequest`;
+/// the gateway plus trusted port admit it and the exact admitted operation
+/// is retained for later cancellation. The JSON-RPC identity is retained
+/// under its type-qualified correlation for the host request, handle lookup,
+/// and cancellation marks; response envelopes echo the original wire identity
+/// unchanged.
+fn handle_mcp_tools_call(
+    gateway: &HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    id: &JsonRpcId,
+    params: &Value,
+) -> Value {
+    let correlation = id.correlation_text();
+    if state.is_cancelled(&correlation) {
+        return render_error(
+            Some(id),
+            WIRE_REQUEST_CANCELLED,
+            "request was cancelled before dispatch; no kernel effect was issued",
+            Value::Null,
+        );
+    }
+    let (name, arguments) = match decode_tools_call(params) {
+        Ok(call) => call,
+        Err(rejection) => return render_rejection(Some(id), &rejection),
+    };
+    let request = match build_host_invocation(state.version, id, name, arguments) {
+        Ok(request) => request,
+        Err(rejection) => return render_rejection(Some(id), &rejection),
+    };
+    match gateway.invoke_with_receipt(port, &request) {
+        Ok((result, receipt)) => {
+            render_mcp_invocation(runner, state, id, &correlation, &result, &receipt)
+        }
+        Err(error) => {
+            let (code, message) = gateway_error_to_wire(&error);
+            emit_error("MCP_CALL_GATEWAY_REJECTED", &error.to_string());
+            render_error(
+                Some(id),
+                code,
+                message,
+                serde_json::json!({ "detail": error.to_string() }),
+            )
+        }
+    }
+}
+
+/// Renders one gateway invocation outcome as its negotiated `tools/call`
+/// result, retaining the exact admitted handle and any hot-resource
+/// evidence for later cancellation and expansion.
+fn render_mcp_invocation(
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    id: &JsonRpcId,
+    correlation: &str,
+    result: &HostInvocationResult,
+    receipt: &HostCorrelationReceipt,
+) -> Value {
+    match result.outcome() {
+        HostInvocationOutcome::Accepted { operation_handle } => {
+            state.retain_handle(correlation, operation_handle.clone());
+            match render_accepted_result(operation_handle, receipt) {
+                Ok(result) => render_result(id, result),
+                Err(rejection) => render_rejection(Some(id), &rejection),
+            }
+        }
+        HostInvocationOutcome::Responded {
+            operation_handle,
+            response,
+        } => {
+            state.retain_handle(correlation, operation_handle.clone());
+            let evidence = record_mcp_delivery(runner, state, result.outcome());
+            match render_responded_result(operation_handle, response, evidence.as_ref()) {
+                Ok(result) => render_result(id, result),
+                Err(rejection) => render_rejection(Some(id), &rejection),
+            }
+        }
+        HostInvocationOutcome::Rejected { failure } => {
+            match render_rejected_result(correlation, failure) {
+                Ok(result) => render_result(id, result),
+                Err(rejection) => render_rejection(Some(id), &rejection),
+            }
+        }
+    }
+}
+
+/// Records one supported tool-result delivery into the attach-scoped
+/// evidence projection and retains its exact handle for `resources/read`.
+///
+/// Mirrors the private `Invoke` delivery recording: only supported
+/// candidate/projection content beyond the hot preview bound snapshots, and
+/// only a UTF-8 preview rides the wire. Anything else leaves the owner
+/// response exactly as shaped.
+fn record_mcp_delivery(
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    outcome: &HostInvocationOutcome,
+) -> Option<Value> {
+    let view = runner.record_tool_result_delivery(outcome)?;
+    state.retain_resource(view.handle().uri().as_str(), view.handle().clone());
+    let preview = std::str::from_utf8(view.preview()).ok()?;
+    Some(serde_json::json!({
+        "uri": view.handle().uri().as_str(),
+        "digest": view.handle().digest(),
+        "preview": preview,
+        "total_bytes": view.total_bytes(),
+        "truncated": view.is_truncated(),
+    }))
+}
+
+/// Serves one `resources/list` from the exact retained handles.
+fn handle_mcp_resources_list(state: &McpFrontDoor, id: &JsonRpcId, params: &Value) -> Value {
+    if let Err(rejection) = eliot_mcp::reject_list_cursor(params, "resources/list") {
+        return render_rejection(Some(id), &rejection);
+    }
+    render_result(
+        id,
+        serde_json::json!({ "resources": state.list_resources() }),
+    )
+}
+
+/// Serves one `resources/read` by expanding the exact retained handle
+/// through the owning reader, which rechecks the live session and scope.
+///
+/// Unknown URIs fail explicitly: only handles retained from a real delivery
+/// on this connection expand, never an invented or stale identity.
+fn handle_mcp_resources_read(
+    runner: &BridgeRunner,
+    state: &McpFrontDoor,
+    id: &JsonRpcId,
+    params: &Value,
+) -> Value {
+    let uri = match decode_resource_uri(params) {
+        Ok(uri) => uri,
+        Err(rejection) => return render_rejection(Some(id), &rejection),
+    };
+    let handle = match state.find_resource(uri) {
+        Some(handle) => handle,
+        None => {
+            return render_error(
+                Some(id),
+                WIRE_INVALID_PARAMS,
+                "unknown resource uri; only exact retained handles expand",
+                serde_json::json!({ "uri": bound_mcp_method(uri) }),
+            );
+        }
+    };
+    let bytes = match runner.expand_resource(handle) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            emit_error("RESOURCE_EXPAND_REFUSED", &error.to_string());
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                "resource expansion was refused by the owning reader",
+                Value::Null,
+            );
+        }
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                "resource bytes are not UTF-8 text; binary expansion is not implemented on this path",
+                Value::Null,
+            );
+        }
+    };
+    render_result(
+        id,
+        serde_json::json!({
+            "contents": [{
+                "uri": handle.uri().as_str(),
+                "mimeType": HOT_RESOURCE_MEDIA_TYPE,
+                "text": text,
+            }],
+        }),
+    )
+}
+
+/// Handles one `notifications/cancelled`: targets the exact admitted
+/// operation retained for the cancelled identity and records the owner's
+/// real disposition on stderr.
+///
+/// A cancel for an in-flight-but-unadmitted correlation marks the identity
+/// so a later dispatch refuses instead of executing. An unknown target
+/// reconciles without executing anything new: the durable Kernel-side
+/// reconciliation entries remain the only recovery route, so this path never
+/// invents an outcome or retries the call.
+fn handle_mcp_cancelled(
+    gateway: &HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    state: &mut McpFrontDoor,
+    params: &Value,
+) {
+    let (target, reason) = match decode_cancel_notification(params) {
+        Ok(cancel) => cancel,
+        Err(rejection) => {
+            emit_error("CANCEL_REJECTED", rejection.message);
+            return;
+        }
+    };
+    let correlation = target.correlation_text();
+    state.note_cancelled(&correlation);
+    let handle = match state.find_handle(&correlation) {
+        Some(handle) => handle.clone(),
+        None => {
+            emit_error(
+                "CANCEL_UNKNOWN_TARGET",
+                &format!(
+                    "cancel names correlation {correlation:?} with no admitted operation; no new execution issued, durable reconciliation stays kernel-side"
+                ),
+            );
+            return;
+        }
+    };
+    let request = match build_host_cancellation(state.version, &target, &handle, reason) {
+        Ok(request) => request,
+        Err(rejection) => {
+            emit_error("CANCEL_REJECTED", rejection.message);
+            return;
+        }
+    };
+    match gateway.cancel(port, &request) {
+        Ok(result) => {
+            let disposition = match result.outcome() {
+                HostCancellationOutcome::Accepted => "ACCEPTED",
+                HostCancellationOutcome::AlreadyTerminal => "ALREADY_TERMINAL",
+                HostCancellationOutcome::Rejected { .. } => "REJECTED",
+            };
+            emit_error(
+                "CANCEL_DISPOSITION",
+                &format!(
+                    "cancel for correlation {correlation:?} targets exact operation {:?} and reports owner disposition {disposition}",
+                    result.operation_handle().as_str(),
+                ),
+            );
+        }
+        Err(error) => {
+            emit_error("CANCEL_GATEWAY_REJECTED", &error.to_string());
+        }
+    }
+}
+
+/// Reuses the private-loop bridge error codes for MCP initialize failures.
+///
+/// The code mapping stays identical across both stdio protocols; only the
+/// envelope differs (negotiated JSON-RPC instead of the private shape), so
+/// the legacy custom ERROR object never mixes into MCP.
+fn bridge_error_code(error: &BridgeError) -> (&'static str, String) {
+    match bridge_error(error) {
+        Response::Error { code, detail } => (code, detail),
+        _ => (
+            "BRIDGE_REQUEST_REJECTED",
+            "bridge request was refused".to_owned(),
+        ),
+    }
+}
+
+/// Bounds one wire control name echoed in diagnostics so diagnostics never
+/// echo unbounded client text.
+///
+/// The budget covers at most `LIMIT` retained input bytes, floored to the
+/// last UTF-8 character boundary so the prefix stays valid UTF-8; the `…`
+/// truncation marker rides outside the budget. Only the bounded prefix is
+/// allocated, never the full unbounded input.
+fn bound_mcp_method(method: &str) -> String {
+    const LIMIT: usize = 64;
+    if method.len() <= LIMIT {
+        method.to_owned()
+    } else {
+        let mut end = LIMIT;
+        while !method.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &method[..end])
     }
 }
 

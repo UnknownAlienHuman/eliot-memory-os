@@ -5,6 +5,13 @@
 //! campaign checkpoint or plateau, a route/model handoff, an accepted artifact
 //! outcome, a finish/cancel/supersession, or a delayed regression. A
 //! `read_file` or `grep` is not consequential.
+//!
+//! The classification is *derived* from [`LifecycleActivity`] values an owner
+//! recorded, never from a caller-asserted boundary: naming a
+//! [`ConsequentialBoundary`] value alone authorizes nothing. [`derive_boundaries`]
+//! is the only entry that turns observed activities into boundaries, it
+//! applies the ordinary-read exclusion through [`status_for_tool`], and an
+//! ordinary read is refused there even when other activities were observed.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use crate::{AttemptStatus, LearningDeltaError};
 
 /// The nine trigger classes that may authorize learning-delta derivation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ConsequentialBoundary {
     /// A material implementation attempt reached execution.
@@ -69,6 +78,80 @@ impl ConsequentialBoundary {
         let _ = self;
         AttemptStatus::Consequential
     }
+
+    /// Boundary class implied by one observed lifecycle activity.
+    ///
+    /// The mapping is total and one-to-one: every activity an owner can record
+    /// names exactly one boundary, so a recorded activity is never ambiguous
+    /// and never leaves the closed nine-value vocabulary.
+    pub const fn of(activity: LifecycleActivity) -> Self {
+        match activity {
+            LifecycleActivity::MaterialImplementationAttempt => Self::MaterialImplementationAttempt,
+            LifecycleActivity::VerifierOutcome => Self::VerifierOutcome,
+            LifecycleActivity::SubstantialRecovery => Self::SubstantialRecovery,
+            LifecycleActivity::RepeatedFailureSignature => Self::RepeatedFailureSignature,
+            LifecycleActivity::CampaignCheckpointPlateau => Self::CampaignCheckpointPlateau,
+            LifecycleActivity::RouteModelHandoff => Self::RouteModelHandoff,
+            LifecycleActivity::AcceptedArtifactOutcome => Self::AcceptedArtifactOutcome,
+            LifecycleActivity::AttemptSettled => Self::FinishCancelSupersession,
+            LifecycleActivity::DelayedRegression => Self::DelayedRegression,
+        }
+    }
+}
+
+/// One lifecycle activity an owner actually recorded for an attempt.
+///
+/// This is the closed input vocabulary of [`derive_boundaries`]. A caller that
+/// cannot name a recorded activity has no consequential boundary, and the
+/// ordinary-read exclusion applies before any activity is considered.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LifecycleActivity {
+    /// A material implementation attempt reached execution.
+    MaterialImplementationAttempt,
+    /// A verifier produced a finished outcome for the attempt.
+    VerifierOutcome,
+    /// A repeated attempt substantially recovered the work.
+    SubstantialRecovery,
+    /// A failure signature repeated across physical attempts.
+    RepeatedFailureSignature,
+    /// A campaign checkpoint or plateau was reached.
+    CampaignCheckpointPlateau,
+    /// A route or model handoff transferred the work.
+    RouteModelHandoff,
+    /// A verifier outcome was accepted for the produced artifact.
+    AcceptedArtifactOutcome,
+    /// The attempt finished, was cancelled, or was superseded.
+    AttemptSettled,
+    /// A delayed regression surfaced after the attempt.
+    DelayedRegression,
+}
+
+impl LifecycleActivity {
+    /// Every observable lifecycle activity, in declaration order.
+    pub const ALL: [Self; 9] = [
+        Self::MaterialImplementationAttempt,
+        Self::VerifierOutcome,
+        Self::SubstantialRecovery,
+        Self::RepeatedFailureSignature,
+        Self::CampaignCheckpointPlateau,
+        Self::RouteModelHandoff,
+        Self::AcceptedArtifactOutcome,
+        Self::AttemptSettled,
+        Self::DelayedRegression,
+    ];
+
+    /// Snake-case name of this observed activity.
+    pub const fn as_str(self) -> &'static str {
+        self.boundary().as_str()
+    }
+
+    /// The boundary class this activity implies.
+    pub const fn boundary(self) -> ConsequentialBoundary {
+        ConsequentialBoundary::of(self)
+    }
 }
 
 /// Reports whether a tool name is an ordinary read that must never emit deltas.
@@ -85,8 +168,10 @@ pub fn is_non_consequential_tool(tool_name: &str) -> bool {
 
 /// Maps an explicit boundary to its attempt status.
 ///
-/// `Some` boundary authorizes [`AttemptStatus::Consequential`]; `None` means no
-/// boundary was supplied and maps to [`AttemptStatus::NonConsequential`].
+/// `Some` boundary maps to [`AttemptStatus::Consequential`]; `None` means no
+/// boundary was supplied and maps to [`AttemptStatus::NonConsequential`]. This
+/// helper reports a caller's own label only; it is never an authorization to
+/// derive, which is [`derive_boundaries`] plus the evidence-bound derivation.
 pub fn status_for_boundary(boundary: Option<ConsequentialBoundary>) -> AttemptStatus {
     match boundary {
         Some(boundary) => boundary.status(),
@@ -94,24 +179,72 @@ pub fn status_for_boundary(boundary: Option<ConsequentialBoundary>) -> AttemptSt
     }
 }
 
-/// Maps a tool name to an attempt status, fail-closed.
+/// Maps a recorded activity name to an attempt status.
 ///
-/// Ordinary reads map to [`AttemptStatus::NonConsequential`], and every other
-/// tool name maps to [`AttemptStatus::NonConsequential`] as well: a tool name
-/// alone never authorizes derivation. The caller must supply an explicit
-/// [`ConsequentialBoundary`] via [`status_for_boundary`] or
-/// [`require_consequential`].
+/// The ordinary-read exclusion is the only tool-level rule I12.24 states, and
+/// this function applies it: an ordinary read maps to
+/// [`AttemptStatus::NonConsequential`] and every other recorded activity name
+/// maps to [`AttemptStatus::Consequential`] because it is *not* excluded by
+/// that rule.
+///
+/// A consequential tool verdict is still not an authorization to derive.
+/// [`derive_boundaries`] additionally requires at least one recorded
+/// [`LifecycleActivity`], and the derivation wrapper additionally requires a
+/// bound evidence bundle, so no tool name alone can produce a delta.
 pub fn status_for_tool(tool_name: &str) -> AttemptStatus {
-    let _ = is_non_consequential_tool(tool_name);
-    AttemptStatus::NonConsequential
+    if is_non_consequential_tool(tool_name) {
+        AttemptStatus::NonConsequential
+    } else {
+        AttemptStatus::Consequential
+    }
 }
 
-/// Requires an explicit consequential boundary for derivation.
+/// Derive the consequential boundaries one attempt actually crossed.
 ///
-/// Returns the supplied boundary, or [`LearningDeltaError::NonConsequential`]
-/// when none was provided.
+/// `activity_name` is the activity/tool identity an owner recorded for the
+/// observed step; `observed` are the lifecycle activities the same owner
+/// recorded. Returns the derived boundaries in [`ConsequentialBoundary::ALL`]
+/// order.
+///
+/// Fails closed with [`LearningDeltaError::NonConsequential`] when the recorded
+/// activity is an ordinary read (the I12.24 read exclusion, applied through
+/// [`status_for_tool`]) or when no lifecycle activity was recorded at all, and
+/// with [`LearningDeltaError::InvalidInput`] when the recorded activity name is
+/// blank.
+pub fn derive_boundaries(
+    activity_name: &str,
+    observed: &[LifecycleActivity],
+) -> Result<Vec<ConsequentialBoundary>, LearningDeltaError> {
+    if activity_name.trim().is_empty() {
+        return Err(LearningDeltaError::InvalidInput {
+            field: "boundary.activity",
+        });
+    }
+    if status_for_tool(activity_name) == AttemptStatus::NonConsequential {
+        return Err(LearningDeltaError::NonConsequential);
+    }
+    if observed.is_empty() {
+        return Err(LearningDeltaError::NonConsequential);
+    }
+    let recorded: std::collections::BTreeSet<ConsequentialBoundary> = observed
+        .iter()
+        .map(|activity| activity.boundary())
+        .collect();
+    Ok(ConsequentialBoundary::ALL
+        .into_iter()
+        .filter(|boundary| recorded.contains(boundary))
+        .collect())
+}
+
+/// Requires at least one derived consequential boundary for derivation.
+///
+/// Returns the first derived boundary of `boundaries`, or
+/// [`LearningDeltaError::NonConsequential`] when the derivation is empty.
 pub fn require_consequential(
-    boundary: Option<ConsequentialBoundary>,
+    boundaries: &[ConsequentialBoundary],
 ) -> Result<ConsequentialBoundary, LearningDeltaError> {
-    boundary.ok_or(LearningDeltaError::NonConsequential)
+    boundaries
+        .first()
+        .copied()
+        .ok_or(LearningDeltaError::NonConsequential)
 }

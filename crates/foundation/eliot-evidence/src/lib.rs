@@ -372,6 +372,121 @@ impl EvidenceEnvelope {
     }
 }
 
+/// Typed unknown outcome for a lookup that cannot prove absence (I10.8.6).
+///
+/// The wire spelling is the exact `snake_case` contract token, so persisted
+/// unknowns compare equal across crates without a shared string table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownOutcome {
+    /// The queried index covers only part of the declared scope.
+    NotFoundInPartialIndex,
+    /// Freshness is not exact for the candidate and scope.
+    UnknownDueToStaleness,
+    /// Configuration or macro coverage excludes the queried scope.
+    UnknownDueToCfgOrMacroCoverage,
+    /// A worktree overlay splits the queried view.
+    UnknownDueToWorktreeOverlay,
+    /// Truncation or tool failure prevents a sound answer.
+    UnknownDueToTruncationOrToolFailure,
+}
+
+impl UnknownOutcome {
+    /// Exact contract spelling of this outcome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFoundInPartialIndex => "not_found_in_partial_index",
+            Self::UnknownDueToStaleness => "unknown_due_to_staleness",
+            Self::UnknownDueToCfgOrMacroCoverage => "unknown_due_to_cfg_or_macro_coverage",
+            Self::UnknownDueToWorktreeOverlay => "unknown_due_to_worktree_overlay",
+            Self::UnknownDueToTruncationOrToolFailure => {
+                "unknown_due_to_truncation_or_tool_failure"
+            }
+        }
+    }
+}
+
+impl fmt::Display for UnknownOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Verdict of the I10.8.6 absence gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AbsenceVerdict {
+    /// All four absence preconditions hold; absence may be stated.
+    Admitted,
+    /// A precondition failed; the result is this typed unknown, never "not
+    /// found", and must not be treated as proof.
+    Unknown(UnknownOutcome),
+    /// Higher-authority contradictory evidence exists; the claim is contested.
+    Contested,
+}
+
+/// Validates the four I10.8.6 absence preconditions in root-cause order.
+///
+/// Contradiction is evaluated first because a contested claim has no absence
+/// reading at all. The instrument contract's own absence capability comes
+/// next: it bounds what the recorded labels can mean, and adapters derive
+/// stale labels from the same truncation or tool failure the capability
+/// already names, so the capability outcome is the more specific label.
+/// Freshness and coverage follow in contract order.
+#[must_use]
+pub const fn check_absence_preconditions(
+    freshness: EvidenceFreshness,
+    coverage: EvidenceCoverage,
+    absence_capability: Result<(), UnknownOutcome>,
+    contradicted_by_higher_authority: bool,
+) -> AbsenceVerdict {
+    if contradicted_by_higher_authority {
+        return AbsenceVerdict::Contested;
+    }
+    if let Err(outcome) = absence_capability {
+        return AbsenceVerdict::Unknown(outcome);
+    }
+    if !matches!(
+        freshness,
+        EvidenceFreshness::ExactCandidate
+            | EvidenceFreshness::ExactCommit
+            | EvidenceFreshness::ExactQuiescedWorktree
+    ) {
+        return AbsenceVerdict::Unknown(UnknownOutcome::UnknownDueToStaleness);
+    }
+    if !matches!(coverage, EvidenceCoverage::CompleteForScope) {
+        return AbsenceVerdict::Unknown(UnknownOutcome::NotFoundInPartialIndex);
+    }
+    AbsenceVerdict::Admitted
+}
+
+/// Composes per-source absence verdicts into one aggregate verdict.
+///
+/// Absence is admitted only when every source admits it. The first typed
+/// unknown wins over contested and admitted sources so aggregate
+/// verification preserves the most specific unknown label instead of
+/// collapsing it; contested wins over admitted. An empty aggregate proves
+/// nothing and reports a partial-index unknown.
+#[must_use]
+pub fn compose_absence_verdicts(verdicts: &[AbsenceVerdict]) -> AbsenceVerdict {
+    let mut contested = false;
+    for verdict in verdicts {
+        match verdict {
+            AbsenceVerdict::Unknown(outcome) => return AbsenceVerdict::Unknown(*outcome),
+            AbsenceVerdict::Contested => contested = true,
+            AbsenceVerdict::Admitted => {}
+        }
+    }
+    if contested {
+        return AbsenceVerdict::Contested;
+    }
+    if verdicts.is_empty() {
+        return AbsenceVerdict::Unknown(UnknownOutcome::NotFoundInPartialIndex);
+    }
+    AbsenceVerdict::Admitted
+}
+
 /// Immutable origin/snapshot/blob lineage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

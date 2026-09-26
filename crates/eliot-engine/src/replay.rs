@@ -17,14 +17,14 @@ use eliot_types::{
     LifecycleStatus, MailboxMessage, MailboxMessageId, MailboxMessageKind, MailboxMessageStatus,
     MailboxRecipient, MemoryRevision, MemorySynthesisTaint, MemorySynthesisTaintReason,
     MissingTracePart, ProhibitedDreamEffect, ProjectId, ReplayAudit, ReplayCase, ReplayCaseId,
-    ReplayCaseResult, ReplayCaseStatus, ReplayDecision, ReplayInputSnapshot, ReplayMeasurement,
-    ReplayMeasurementResult, ReplayRun, ReplayRunId, ReplayRunProfile, ReplayRunStatus, ReplaySet,
-    ReplaySetId, ReplaySetRole, ReplaySuccessCriterion, ReplayVerdict, SealedReplayCaseRecord,
-    SealedReplayInputSnapshotRecord, SealedReplaySetRecord, SemanticCommand,
-    SkillReplayRequirement, SleepCandidateArtifact, SleepCandidateArtifactKind,
-    SleepConsolidationBundle, SleepConsolidationRun, SleepConsolidationStatus, SleepInputScope,
-    SleepOutputKind, SleepOutputRef, TaintClass, TaskId, ToolObservationRecordCommand,
-    TraceCompletenessContract, Visibility, WriteId, WriteReceiptRef,
+    ReplayCaseResult, ReplayCaseStatus, ReplayDecision, ReplayEvaluationIntegrityReceipt,
+    ReplayInputSnapshot, ReplayMeasurement, ReplayMeasurementResult, ReplayRun, ReplayRunId,
+    ReplayRunProfile, ReplayRunStatus, ReplaySet, ReplaySetId, ReplaySetRole,
+    ReplaySuccessCriterion, ReplayVerdict, SealedReplayCaseRecord, SealedReplayInputSnapshotRecord,
+    SealedReplaySetRecord, SemanticCommand, SkillReplayRequirement, SleepCandidateArtifact,
+    SleepCandidateArtifactKind, SleepConsolidationBundle, SleepConsolidationRun,
+    SleepConsolidationStatus, SleepInputScope, SleepOutputKind, SleepOutputRef, TaintClass, TaskId,
+    ToolObservationRecordCommand, TraceCompletenessContract, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -515,6 +515,8 @@ impl ReplayRunnerService {
             sealed_input_hash: String::new(),
             reproducibility_hash: String::new(),
             uncertainty: String::new(),
+            // Unsealed inputs cannot yield a sealed receipt: unknown, never a claim.
+            evaluation_integrity_receipt: None,
             started_at,
             finished_at: Some(OffsetDateTime::now_utc()),
             status,
@@ -593,6 +595,8 @@ impl ReplayRunnerService {
             } else {
                 "deterministic replay is bounded to sealed declared observations".to_owned()
             },
+            // Sealed-input replay without a canonical sealed-set binding carries no receipt.
+            evaluation_integrity_receipt: None,
             started_at,
             finished_at: Some(OffsetDateTime::now_utc()),
             status,
@@ -629,19 +633,7 @@ impl ReplayRunnerService {
             .filter(|attempt| ReplaySafetyGate::mutation_attempt_blocked(attempt))
             .map(|attempt| vec![attempt.to_owned()])
             .unwrap_or_default();
-        let mut observation_projection = input.observations.clone();
-        observation_projection.sort_by_key(|observation| observation.replay_case_id.to_string());
-        for observation in &mut observation_projection {
-            observation.evidence.sort_by_key(|evidence| evidence.kind);
-        }
-        let observation_evidence_hash = canonical_hash(&observation_projection)?;
-        let sealed_input_hash = canonical_hash(&serde_json::json!({
-            "sealed_set_hash": input.sealed_set.sealed_hash,
-            "observation_evidence_hash": observation_evidence_hash,
-            "baseline_ref": input.baseline_ref,
-            "candidate_ref": input.candidate_ref,
-            "candidate_version": input.candidate_version,
-        }))?;
+        let (sealed_input_hash, observation_evidence_hash) = canonical_sealed_input_hashes(&input)?;
         let observations = input
             .observations
             .iter()
@@ -674,6 +666,13 @@ impl ReplayRunnerService {
         let replay_run_id =
             ReplayRunId::from_uuid(deterministic_uuid("canonical-replay-run", &execution_id));
         let executed_at = deterministic_timestamp("canonical-replay-execution", &execution_id)?;
+        let integrity_receipt = replay_evaluation_integrity_receipt(
+            &input,
+            &sealed_input_hash,
+            &observation_evidence_hash,
+            &profile,
+            executed_at,
+        )?;
         let run = ReplayRun {
             replay_run_id,
             project_id: input.sealed_set.set.project_id,
@@ -685,6 +684,7 @@ impl ReplayRunnerService {
             sealed_input_hash,
             reproducibility_hash: reproducibility_hash.clone(),
             uncertainty: "bounded to sealed canonical receipts and engine derivations".to_owned(),
+            evaluation_integrity_receipt: Some(integrity_receipt),
             started_at: executed_at,
             finished_at: Some(executed_at),
             status: ReplayRunStatus::Completed,
@@ -766,6 +766,100 @@ impl ReplayRunnerService {
     }
 }
 
+/// Replay-exact path identity recorded on evaluation-integrity receipts (issue #1922 W6a).
+const REPLAY_EXACT_PATH_KIND: &str = "replay-exact";
+const REPLAY_ONLY_EVIDENCE_ORIGIN: &str = "replay-only";
+/// The deciding oracle is the sealed replay evaluator; no Kernel semantic
+/// oracle exists on this path.
+const REPLAY_EVALUATION_ORACLE_OWNER: &str = concat!(module_path!(), "::ReplayRunnerService");
+const REPLAY_CANONICAL_ROUTE: &str =
+    concat!(module_path!(), "::ReplayRunnerService::run_canonical");
+const REPLAY_EVALUATION_ACCEPTANCE_RELATION: &str =
+    "required replay measurement matches sealed canonical evidence or the replay safety gate";
+const REPLAY_ONLY_PROOF_CEILING: &str = "REPLAY_ONLY";
+const REPLAY_EVALUATION_INCONCLUSIVE_STATUS: &str = "INCONCLUSIVE";
+
+/// Derive the canonical sealed-input and observation-evidence hashes for one
+/// canonical replay input.
+fn canonical_sealed_input_hashes(
+    input: &CanonicalReplayExecutionInput,
+) -> Result<(String, String), EngineError> {
+    let mut observation_projection = input.observations.clone();
+    observation_projection.sort_by_key(|observation| observation.replay_case_id.to_string());
+    for observation in &mut observation_projection {
+        observation.evidence.sort_by_key(|evidence| evidence.kind);
+    }
+    let observation_evidence_hash = canonical_hash(&observation_projection)?;
+    let sealed_input_hash = canonical_hash(&serde_json::json!({
+        "sealed_set_hash": input.sealed_set.sealed_hash,
+        "observation_evidence_hash": observation_evidence_hash,
+        "baseline_ref": input.baseline_ref,
+        "candidate_ref": input.candidate_ref,
+        "candidate_version": input.candidate_version,
+    }))?;
+    Ok((sealed_input_hash, observation_evidence_hash))
+}
+
+/// Build the sealed evaluation-integrity receipt for one canonical replay execution.
+///
+/// Values derive from the validated canonical input and the computed sealed
+/// hashes; the seal freezes the body so post-hoc mutation fails verification.
+fn replay_evaluation_integrity_receipt(
+    input: &CanonicalReplayExecutionInput,
+    sealed_input_hash: &str,
+    observation_evidence_hash: &str,
+    profile: &ReplayRunProfile,
+    created_at: OffsetDateTime,
+) -> Result<ReplayEvaluationIntegrityReceipt, EngineError> {
+    let mut artifact_binding = Vec::with_capacity(1 + input.cases.len() + input.snapshots.len());
+    artifact_binding.push(input.sealed_set.record_id.clone());
+    artifact_binding.extend(input.cases.iter().map(|record| record.record_id.clone()));
+    artifact_binding.extend(
+        input
+            .snapshots
+            .iter()
+            .map(|record| record.record_id.clone()),
+    );
+    let mut receipt = ReplayEvaluationIntegrityReceipt {
+        receipt_id: String::new(),
+        path_kind: REPLAY_EXACT_PATH_KIND.to_owned(),
+        evidence_origin: REPLAY_ONLY_EVIDENCE_ORIGIN.to_owned(),
+        property: format!(
+            "replay-exact outcome of sealed set '{}': {}",
+            input.sealed_set.set.name, input.sealed_set.set.purpose
+        ),
+        product_identity: format!(
+            "eliot-memory-os/eliot-replay-evaluator:product:{}",
+            input.sealed_set.set.project_id
+        ),
+        oracle_owner: REPLAY_EVALUATION_ORACLE_OWNER.to_owned(),
+        acceptance_relation: REPLAY_EVALUATION_ACCEPTANCE_RELATION.to_owned(),
+        evidence_family: format!("replay-exact:{sealed_input_hash}"),
+        shared_dependencies: vec![
+            format!("evaluator_hash:{}", input.sealed_set.evaluator_hash),
+            format!("profile_hash:{}", input.sealed_set.profile_hash),
+            format!("context_hash:{}", input.sealed_set.context_hash),
+            format!("observation_evidence_hash:{observation_evidence_hash}"),
+        ],
+        artifact_binding,
+        actual_route: REPLAY_CANONICAL_ROUTE.to_owned(),
+        resource_fingerprint: format!(
+            "declared:profile={};max_runtime_seconds={};services={}",
+            profile.profile_id,
+            profile.max_runtime_seconds,
+            profile.allowed_services.join(",")
+        ),
+        proof_ceiling: REPLAY_ONLY_PROOF_CEILING.to_owned(),
+        status: REPLAY_EVALUATION_INCONCLUSIVE_STATUS.to_owned(),
+        created_at,
+        seal: String::new(),
+    };
+    let seal = receipt.compute_seal()?;
+    receipt.receipt_id = ReplayEvaluationIntegrityReceipt::receipt_id_for_seal(&seal);
+    receipt.seal = seal;
+    Ok(receipt)
+}
+
 pub struct ReplayVerdictService;
 
 impl ReplayVerdictService {
@@ -774,7 +868,18 @@ impl ReplayVerdictService {
             .case_results
             .iter()
             .all(|result| result.status == ReplayCaseStatus::Passed);
+        // Sealed receipt gate (issue #1922 W6a): a carried receipt must verify
+        // against its seal and bind this run's sealed inputs. A broken seal or
+        // a transplant from another run fails closed; absence stays unknown.
+        let integrity_seal_broken = match &run.evaluation_integrity_receipt {
+            None => false,
+            Some(receipt) => {
+                receipt.evidence_family != format!("replay-exact:{}", run.sealed_input_hash)
+                    || !receipt.verify_seal()
+            }
+        };
         let decision = match run.status {
+            _ if integrity_seal_broken => ReplayDecision::Fail,
             ReplayRunStatus::Completed if all_passed => ReplayDecision::Pass,
             ReplayRunStatus::BlockedMissingTrace => ReplayDecision::RequiresMoreCases,
             ReplayRunStatus::BlockedUnsafeProfile => ReplayDecision::UnsafeToPromote,
@@ -786,12 +891,16 @@ impl ReplayVerdictService {
         } else {
             run.reproducibility_hash.clone()
         };
+        let mut reasons = vec!["verdict is marker-only and grants no apply authority".to_owned()];
+        if integrity_seal_broken {
+            reasons.push("evaluation integrity receipt failed seal or run binding".to_owned());
+        }
         ReplayVerdict {
             verdict_id: format!("replay-verdict:{identity}"),
             replay_run_id: run.replay_run_id,
             candidate_ref: run.candidate_ref.clone(),
             decision,
-            reasons: vec!["verdict is marker-only and grants no apply authority".to_owned()],
+            reasons,
             required_followups: Vec::new(),
             created_at: deterministic_timestamp("replay-verdict", &identity)
                 .unwrap_or(OffsetDateTime::UNIX_EPOCH),

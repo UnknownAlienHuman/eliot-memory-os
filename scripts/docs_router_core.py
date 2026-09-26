@@ -34,6 +34,7 @@ LEGACY_BOOKS = {
     "docs/architecture/ELIOT_IMPLEMENTATION.md",
 }
 SKIP_PARTS = {".git", "target", ".idea", ".vscode", "node_modules", "bin", "obj"}
+COVERAGE_KEYS = ("path", "topic", "expect_routes", "expect_required_handles", "expect_absent_routes")
 
 
 class RouteError(RuntimeError):
@@ -174,9 +175,29 @@ def load_config(root: Path, relative: str = DEFAULT_CONFIG) -> Config:
     for raw in raw_examples:
         if not isinstance(raw, dict):
             raise RouteError("coverage example must be a table")
+        unsupported = sorted(set(raw) - set(COVERAGE_KEYS))
+        if unsupported:
+            raise RouteError(
+                f"coverage example has unsupported key(s) {unsupported}; "
+                f"supported keys are {list(COVERAGE_KEYS)}"
+            )
         path = normalize_repo_path(str(raw.get("path", "")))
         expected = string_tuple(raw.get("expect_routes"), f"coverage example {path}.expect_routes")
-        examples.append({"path": path, "topic": str(raw.get("topic", "")), "expect_routes": expected})
+        examples.append(
+            {
+                "path": path,
+                "topic": str(raw.get("topic", "")),
+                "expect_routes": expected,
+                "expect_required_handles": string_tuple(
+                    raw.get("expect_required_handles"),
+                    f"coverage example {path}.expect_required_handles",
+                ),
+                "expect_absent_routes": string_tuple(
+                    raw.get("expect_absent_routes"),
+                    f"coverage example {path}.expect_absent_routes",
+                ),
+            }
+        )
 
     return Config(
         pair_schema=str(payload.get("pair_schema", "")),
@@ -414,6 +435,62 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
     return core
 
 
+def assert_required_handles(
+    root: Path,
+    handles: dict[str, dict[str, Any]],
+    payload: dict[str, Any],
+    expected: Sequence[str],
+    label: str,
+) -> None:
+    """Prove each expected handle is a REQUIRED fragment at its indexed path and current hash.
+
+    A route name match, an ``optional`` entry, or a textual link is not evidence: the
+    handle must resolve through the handle index to a required fragment whose recorded
+    SHA-256 still equals the fragment bytes on disk.
+    """
+    required_fragments = {
+        str(item["path"]): item
+        for item in payload["required"]
+        if item.get("kind") == "fragment"
+    }
+    optional_paths = {
+        str(item["path"]) for item in payload["optional"] if item.get("kind") == "fragment"
+    }
+    for handle in expected:
+        record = handles.get(handle)
+        if record is None:
+            raise RouteError(f"{label} expects handle {handle} which the index does not define")
+        index_path = str(record["path"])
+        index_sha = str(record["fragment_sha256"])
+        item = required_fragments.get(index_path)
+        if item is None:
+            if index_path in optional_paths:
+                raise RouteError(
+                    f"{label}: handle {handle} resolves to {index_path} only as optional; "
+                    "it must be a required read"
+                )
+            raise RouteError(
+                f"{label}: required payload has no fragment {index_path} for handle {handle}; "
+                f"required={sorted(required_fragments)}"
+            )
+        if handle not in item.get("handles", ()):
+            raise RouteError(
+                f"{label}: required fragment {index_path} does not carry handle {handle}; "
+                f"handles={item.get('handles', [])}"
+            )
+        if str(item["sha256"]) != index_sha:
+            raise RouteError(
+                f"{label}: required fragment {index_path} hash {item['sha256']} "
+                f"differs from the handle index {index_sha}"
+            )
+        current = sha256_file(root / index_path)
+        if current != index_sha:
+            raise RouteError(
+                f"{label}: required fragment {index_path} is stale upstream; "
+                f"indexed={index_sha} on-disk={current}"
+            )
+
+
 def render_route(payload: dict[str, Any]) -> str:
     lines = [
         "# Documentation read route",
@@ -498,8 +575,10 @@ def render_routes_markdown(config: Config) -> str:
             "## Enforcement",
             "",
             "`python scripts/docs_router.py check --root .` validates selectors, files,",
-            "representative route examples, tracked-path coverage, route-size ceilings, and",
-            "this generated projection. Unknown material paths fail closed.",
+            "route membership plus per-example merged payloads, expected required handles",
+            "at their indexed fragment path and current hash, routes a path must not gain,",
+            "tracked-path coverage, route-size ceilings, and this generated projection.",
+            "Unknown material paths fail closed.",
             "",
         ]
     )
@@ -591,6 +670,32 @@ def check(root: Path, config_relative: str = DEFAULT_CONFIG) -> dict[str, Any]:
             )
         examples_checked += 1
 
+    # Exercise every example's merged payload on its own and prove the expected
+    # handles are required fragments at the indexed path and current hash. Route
+    # name membership above cannot see a handle demoted to `optional`.
+    example_payloads_checked = 0
+    required_handle_expectations = 0
+    for example in config.examples:
+        label = f"coverage example {example['path']}"
+        absent = set(example["expect_absent_routes"]) - route_ids
+        if absent:
+            raise RouteError(f"{label} names unknown routes in expect_absent_routes: {sorted(absent)}")
+        if not (root / example["path"]).exists():
+            raise RouteError(f"{label} does not exist: {example['path']}")
+        actual_ids = {route.route_id for route in matched_routes(config, [example["path"]], example["topic"])}
+        gained = sorted(actual_ids & set(example["expect_absent_routes"]))
+        if gained:
+            raise RouteError(
+                f"{label} matched routes it must not gain by proximity: {gained}; "
+                f"actual={sorted(actual_ids)}"
+            )
+        payload = route_payload(root, config, [example["path"]], example["topic"])
+        assert_required_handles(
+            root, handles, payload, example["expect_required_handles"], label
+        )
+        required_handle_expectations += len(example["expect_required_handles"])
+        example_payloads_checked += 1
+
     uncovered: list[str] = []
     tracked = tracked_files(root)
     for path in tracked:
@@ -635,6 +740,8 @@ def check(root: Path, config_relative: str = DEFAULT_CONFIG) -> dict[str, Any]:
         "examples": examples_checked,
         "tracked_files": len(tracked),
         "payloads_checked": route_payloads_checked,
+        "example_payloads": example_payloads_checked,
+        "required_handles": required_handle_expectations,
     }
     print(
         "DOC_ROUTER_CHECK: PASS "

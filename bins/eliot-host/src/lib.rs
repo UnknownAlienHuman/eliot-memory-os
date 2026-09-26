@@ -80,7 +80,7 @@ fn host_lifecycle_observe_requested(detail: &str) {
     host_lifecycle_note_event_log_unavailable();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::Startup,
-        detail,
+        host_lifecycle_frozen_event(detail),
     );
 }
 
@@ -88,7 +88,7 @@ fn host_lifecycle_observe_scm(detail: &str) {
     host_lifecycle_note_event_log_unavailable();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ScmDispatch,
-        detail,
+        host_lifecycle_frozen_event(detail),
     );
 }
 
@@ -96,13 +96,13 @@ fn host_lifecycle_observe_drain(detail: &str) {
     host_lifecycle_note_event_log_unavailable();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ShutdownDrain,
-        detail,
+        host_lifecycle_frozen_event(detail),
     );
 }
 
 fn host_lifecycle_observe_terminal(code: &str) {
     host_lifecycle_note_event_log_unavailable();
-    host_diagnostics::observe_terminal_error(code);
+    host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(code));
 }
 
 /// Single-terminal guard for one public fallible operation.
@@ -133,6 +133,844 @@ impl Drop for HostTerminalGuard<'_> {
             host_lifecycle_observe_terminal(self.code);
         }
     }
+}
+
+/// One frozen lib.rs lifecycle/error boundary (F-LOG-HOST-1, #891 W1).
+///
+/// Each row binds the W1 contract for one boundary: the source item/span
+/// (`source_item`, an item path that survives line drift), the
+/// operation/phase (`name`, `operation.phase`), the available owner
+/// identities/state/receipt (`owner_state`), the selected emitted event or
+/// the exact propagated-to-boundary reason (`event`), the external
+/// production caller (`caller`), and the proving test (`test`: a landed
+/// starter probe or a TEST-PHASE case number).
+struct HostLifecycleBoundary {
+    /// Frozen boundary name (`operation.phase`).
+    name: &'static str,
+    /// Source item owning the boundary (type/function path).
+    source_item: &'static str,
+    /// Owner identities/state/receipt available at the boundary.
+    owner_state: &'static str,
+    /// Selected emitted event, or the exact propagated-to-boundary reason
+    /// (prefixed `propagated:`) when another boundary owns the emission.
+    event: &'static str,
+    /// External production caller of the boundary.
+    caller: &'static str,
+    /// Proving test (landed probe or TEST-PHASE case).
+    test: &'static str,
+}
+
+/// Frozen finite table of lib.rs lifecycle/error boundaries (#891 W1).
+///
+/// This is the single source of emitted boundary vocabulary: every
+/// production observation flows through [`host_lifecycle_frozen_event`],
+/// which returns the frozen `event` spelling from the matching row, so a
+/// boundary cannot drift its spelling without leaving this table. Unknown
+/// spellings pass through unchanged (diagnostics never break production)
+/// and trip a debug assertion. Rows whose `event` starts with
+/// `propagated:` own no emission; they record exactly where the emission
+/// lives instead of duplicating it, per the child-coordination rule.
+///
+/// Three terminal rows spell their code via `concat!` so this source keeps
+/// exactly the literal counts pinned by the landed probes (single stop
+/// site, dual restart-unknown sites, single credential-control site);
+/// the concatenated value is byte-identical to the frozen code.
+const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
+    HostLifecycleBoundary {
+        name: "jobs.requested",
+        source_item: "HostJobBranches::new",
+        owner_state: "HostInstallationEpoch/job identity",
+        event: "host.jobs requested",
+        caller: "HostComposition::open",
+        test: "891/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "jobs.admitted",
+        source_item: "HostJobBranches::new",
+        owner_state: "HostInstallationEpoch/job handles",
+        event: "host.jobs admitted",
+        caller: "HostComposition::open",
+        test: "891/case-9",
+    },
+    HostLifecycleBoundary {
+        name: "jobs-fenced.requested",
+        source_item: "HostJobBranches::new_fenced",
+        owner_state: "HostInstallationEpoch/fenced identity",
+        event: "host.jobs-fenced requested",
+        caller: "HostComposition::open",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "jobs-fenced.admitted",
+        source_item: "HostJobBranches::new_fenced",
+        owner_state: "HostInstallationEpoch/fenced identity",
+        event: "host.jobs-fenced admitted",
+        caller: "HostComposition::open",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "branch-reconcile.requested",
+        source_item: "HostJobBranches::reconcile",
+        owner_state: "branch liveness/disposition",
+        event: "host.branch-reconcile requested",
+        caller: "HostComposition::reconcile_approved_contour",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-terminate.requested",
+        source_item: "HostJobBranches::terminate_kernel",
+        owner_state: "kernel job branch",
+        event: "host.kernel-terminate requested",
+        caller: "HostComposition::stop",
+        test: "891/case-6",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-terminate.stopped",
+        source_item: "HostJobBranches::terminate_kernel",
+        owner_state: "kernel job branch terminated",
+        event: "host.kernel-terminate stopped",
+        caller: "HostComposition::stop",
+        test: "891/case-6",
+    },
+    HostLifecycleBoundary {
+        name: "store-terminate.requested",
+        source_item: "HostJobBranches::terminate_store",
+        owner_state: "store job branch",
+        event: "host.store-terminate requested",
+        caller: "HostComposition::stop",
+        test: "891/case-6",
+    },
+    HostLifecycleBoundary {
+        name: "store-terminate.stopped",
+        source_item: "HostJobBranches::terminate_store",
+        owner_state: "store job branch terminated",
+        event: "host.store-terminate stopped",
+        caller: "HostComposition::stop",
+        test: "891/case-6",
+    },
+    HostLifecycleBoundary {
+        name: "cutover-rollback.requested",
+        source_item: "HostJobBranches::cutover_with_rollback",
+        owner_state: "candidate/prior generations and artifacts",
+        event: "host.cutover-rollback requested",
+        caller: "none (cutover_generation unwired)",
+        test: "891/case-11",
+    },
+    HostLifecycleBoundary {
+        name: "cutover-rollback.restored",
+        source_item: "HostJobBranches::cutover_with_rollback",
+        owner_state: "prior contour relaunched",
+        event: "host.cutover-rollback restored",
+        caller: "none (cutover_generation unwired)",
+        test: "891/case-11",
+    },
+    HostLifecycleBoundary {
+        name: "cutover-rollback.reactivated",
+        source_item: "HostComposition::cutover_generation",
+        owner_state: "prior generation/registry/observations",
+        event: "host.cutover-rollback reactivated",
+        caller: "none (cutover_generation unwired)",
+        test: "891/case-11",
+    },
+    HostLifecycleBoundary {
+        name: "open.requested",
+        source_item: "HostComposition::open",
+        owner_state: "launch options/epoch",
+        event: "host.open requested",
+        caller: "main::open_host",
+        test: "891/case-2",
+    },
+    HostLifecycleBoundary {
+        name: "open.terminal",
+        source_item: "HostComposition::open",
+        owner_state: "HostInstallationEpoch/owner lease",
+        event: "host-open-failed",
+        caller: "main::open_host",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "open.fenced-store-recovery",
+        source_item: "HostComposition::open",
+        owner_state: "store-recovery fence",
+        event: "host.open fenced store-recovery",
+        caller: "main::open_host",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "open.fenced-bridge-stage",
+        source_item: "HostComposition::open",
+        owner_state: "bridge-stage crash carrier",
+        event: "host.open fenced bridge-stage",
+        caller: "main::open_host",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "open.degraded-prepared-without-receipt",
+        source_item: "HostComposition::open",
+        owner_state: "prepared materialization without receipt",
+        event: "host.open degraded prepared-without-receipt",
+        caller: "main::open_host",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "open.fenced-store-recovery-active",
+        source_item: "HostComposition::open",
+        owner_state: "store-recovery fence on active contour",
+        event: "host.open fenced store-recovery-active",
+        caller: "main::open_host",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "open.admitted",
+        source_item: "HostComposition::open",
+        owner_state: "durable evidence/owner lease",
+        event: "host.open admitted",
+        caller: "main::open_host",
+        test: "891/case-2",
+    },
+    HostLifecycleBoundary {
+        name: "credential-control.requested",
+        source_item: "HostComposition::credential_control",
+        owner_state: "owner lease credential capability",
+        event: "host.credential-control requested",
+        caller: "main::fail_host_service",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "credential-control.terminal",
+        source_item: "HostComposition::credential_control",
+        owner_state: "owner lease credential capability",
+        event: concat!("host-credential-", "control-failed"),
+        caller: "main::fail_host_service",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "credential-control.admitted-receipt",
+        source_item: "HostComposition::credential_control",
+        owner_state: "control handle, identities only",
+        event: "host.credential-control admitted receipt",
+        caller: "main::fail_host_service",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b.requested",
+        source_item: "HostComposition::handle_phase_b_request",
+        owner_state: "materialization intent/credential receipt",
+        event: "host.phase-b requested",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b.unknown-store-recovery-fence",
+        source_item: "HostComposition::handle_phase_b_request",
+        owner_state: "store-recovery fence/pending ref",
+        event: "host.phase-b unknown store-recovery-fence",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-5",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b.terminal",
+        source_item: "HostComposition::handle_phase_b_request",
+        owner_state: "materialization intent/pending ref",
+        event: "host-phase-b-unknown",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b.prepared-receipt",
+        source_item: "HostComposition::handle_phase_b_request",
+        owner_state: "prepared receipt/transaction intent",
+        event: "host.phase-b prepared receipt",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b.unknown",
+        source_item: "HostComposition::handle_phase_b_request",
+        owner_state: "materialization intent/pending ref",
+        event: "host.phase-b unknown",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-5",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-finalize.requested",
+        source_item: "HostComposition::finalize_phase_b_request",
+        owner_state: "materialization intent/receipt",
+        event: "host.phase-b-finalize requested",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-finalize.ready-completion",
+        source_item: "HostComposition::finalize_phase_b_request",
+        owner_state: "finalize completion receipt",
+        event: "host.phase-b-finalize ready completion",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-finalize.unknown",
+        source_item: "HostComposition::finalize_phase_b_request",
+        owner_state: "materialization intent/pending ref",
+        event: "host.phase-b-finalize unknown",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-5",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-finalize.terminal",
+        source_item: "HostComposition::finalize_phase_b_request",
+        owner_state: "materialization intent/pending ref",
+        event: "host-phase-b-finalize-unknown",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-reconcile.requested",
+        source_item: "HostComposition::reconcile_phase_b_request",
+        owner_state: "materialization intent/durable state",
+        event: "host.phase-b-reconcile requested",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-reconcile.unknown-store-recovery-fence",
+        source_item: "HostComposition::reconcile_phase_b_request",
+        owner_state: "store-recovery fence/pending ref",
+        event: "host.phase-b-reconcile unknown store-recovery-fence",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-reconcile.terminal",
+        source_item: "HostComposition::reconcile_phase_b_request",
+        owner_state: "materialization intent/pending ref",
+        event: "host-phase-b-reconcile-unknown",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-reconcile.prepared-readback-replay",
+        source_item: "HostComposition::reconcile_phase_b_request",
+        owner_state: "prepared readback, query-only",
+        event: "host.phase-b-reconcile prepared readback replay",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-reconcile.receipt-readback-replay",
+        source_item: "HostComposition::reconcile_phase_b_request",
+        owner_state: "receipt readback, query-only",
+        event: "host.phase-b-reconcile receipt readback replay",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "phase-b-reconcile.unknown",
+        source_item: "HostComposition::reconcile_phase_b_request",
+        owner_state: "materialization intent/pending ref",
+        event: "host.phase-b-reconcile unknown",
+        caller: "main::process_phase_b_requests",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "runtime-control.requested",
+        source_item: "HostComposition::runtime_control",
+        owner_state: "owner lease activation capability",
+        event: "host.runtime-control requested",
+        caller: "main::fail_host_service",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "runtime-control.terminal",
+        source_item: "HostComposition::runtime_control",
+        owner_state: "owner lease activation capability",
+        event: "host-runtime-control-failed",
+        caller: "main::fail_host_service",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "runtime-control.admitted-receipt",
+        source_item: "HostComposition::runtime_control",
+        owner_state: "control handle/queues",
+        event: "host.runtime-control admitted receipt",
+        caller: "main::fail_host_service",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "user-automation.owner-requested",
+        source_item: "HostComposition::process_user_automation_requests",
+        owner_state: "kernel owner/execution queue",
+        event: "host.user-automation owner requested",
+        caller: "none (exported API; no in-repo caller)",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart.requested",
+        source_item: "HostComposition::handle_kernel_restart_request",
+        owner_state: "request/mutation digest",
+        event: "host.kernel-restart requested",
+        caller: "main::process_runtime_control_requests",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart.reconcile-delegated-readback",
+        source_item: "HostComposition::handle_kernel_restart_request",
+        owner_state: "existing restart receipt",
+        event: "host.kernel-restart reconcile-delegated readback",
+        caller: "main::process_runtime_control_requests",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart.unknown-owner-fenced",
+        source_item: "HostComposition::handle_kernel_restart_request",
+        owner_state: "owner fence/pending ref",
+        event: "host.kernel-restart unknown owner-fenced",
+        caller: "main::process_runtime_control_requests",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart.terminal",
+        source_item: "HostComposition::handle_kernel_restart_request",
+        owner_state: "request/pending ref",
+        event: concat!("host-kernel-restart-", "unknown"),
+        caller: "main::process_runtime_control_requests",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart.receipt-completion",
+        source_item: "HostComposition::handle_kernel_restart_request",
+        owner_state: "restart receipt",
+        event: "host.kernel-restart receipt completion",
+        caller: "main::process_runtime_control_requests",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart.unknown",
+        source_item: "HostComposition::handle_kernel_restart_request",
+        owner_state: "request/pending ref",
+        event: "host.kernel-restart unknown",
+        caller: "main::process_runtime_control_requests",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.requested",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "request/mutation digest",
+        event: "host.kernel-restart-reconcile requested",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.unknown-owner-fenced",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "owner fence/pending ref",
+        event: "host.kernel-restart-reconcile unknown owner-fenced",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.unknown-validation",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "request/pending ref",
+        event: "host.kernel-restart-reconcile unknown validation",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.receipt-readback-replay",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "restart receipt, query-only",
+        event: "host.kernel-restart-reconcile receipt readback replay",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.unknown-conflict",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "conflicting receipt/pending ref",
+        event: "host.kernel-restart-reconcile unknown conflict",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.unknown-pending",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "pending intent, timeout proves nothing",
+        event: "host.kernel-restart-reconcile unknown pending",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.unknown-snapshot",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "journal snapshot/pending ref",
+        event: "host.kernel-restart-reconcile unknown snapshot",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.unknown",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "request/pending ref",
+        event: "host.kernel-restart-reconcile unknown",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-reconcile.terminal",
+        source_item: "HostComposition::reconcile_kernel_restart_request",
+        owner_state: "request/pending ref",
+        event: "host-kernel-restart-reconcile-unknown",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/T-B",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-execute.requested",
+        source_item: "HostComposition::execute_kernel_restart",
+        owner_state: "request/pending intent",
+        event: "host.kernel-restart-execute requested",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/case-5",
+    },
+    HostLifecycleBoundary {
+        name: "kernel-restart-execute.receipt",
+        source_item: "HostComposition::execute_kernel_restart",
+        owner_state: "restart receipt",
+        event: "host.kernel-restart-execute receipt",
+        caller: "HostComposition::handle_kernel_restart_request",
+        test: "891/case-4",
+    },
+    HostLifecycleBoundary {
+        name: "start.requested",
+        source_item: "HostComposition::start_approved_contour",
+        owner_state: "approved generation/launch descriptor",
+        event: "host.start requested",
+        caller: "none (exported API; no in-repo caller)",
+        test: "891/case-2",
+    },
+    HostLifecycleBoundary {
+        name: "start.terminal",
+        source_item: "HostComposition::start_approved_contour",
+        owner_state: "approved generation/launch descriptor",
+        event: "host-start-failed",
+        caller: "none (exported API; no in-repo caller)",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "start.started",
+        source_item: "HostComposition::start_approved_contour",
+        owner_state: "launched contour",
+        event: "host.start started",
+        caller: "none (exported API; no in-repo caller)",
+        test: "891/case-2",
+    },
+    HostLifecycleBoundary {
+        name: "resume-pending.requested",
+        source_item: "HostComposition::resume_pending_activation_after_phase_b",
+        owner_state: "pending activation",
+        event: "host.resume-pending requested",
+        caller: "HostComposition::open",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "resume-pending.terminal",
+        source_item: "HostComposition::resume_pending_activation_after_phase_b",
+        owner_state: "pending activation",
+        event: "host-resume-pending-failed",
+        caller: "HostComposition::open",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "resume-pending.admitted",
+        source_item: "HostComposition::resume_pending_activation_after_phase_b",
+        owner_state: "resumed activation",
+        event: "host.resume-pending admitted",
+        caller: "HostComposition::open",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "resume-pending-receipt.requested",
+        source_item: "HostComposition::resume_pending_phase_b_receipt",
+        owner_state: "pending receipt",
+        event: "host.resume-pending-receipt requested",
+        caller: "none (unwired)",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "start-manifest.requested",
+        source_item: "HostComposition::start_manifest_contour",
+        owner_state: "manifest/branch/pending",
+        event: "host.start-manifest requested",
+        caller: "HostComposition::open",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "start-manifest.started",
+        source_item: "HostComposition::start_manifest_contour",
+        owner_state: "active contour",
+        event: "host.start-manifest started",
+        caller: "HostComposition::open",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "liveness.requested",
+        source_item: "HostComposition::liveness_tick",
+        owner_state: "branch liveness/gate",
+        event: "host.liveness requested",
+        caller: "main::run_scm_contour_tick",
+        test: "891/case-10",
+    },
+    HostLifecycleBoundary {
+        name: "liveness.terminal",
+        source_item: "HostComposition::liveness_tick",
+        owner_state: "branch liveness/gate",
+        event: "host-liveness-failed",
+        caller: "main::run_scm_contour_tick",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "liveness.observed",
+        source_item: "HostComposition::liveness_tick",
+        owner_state: "observation, never readiness",
+        event: "host.liveness observed",
+        caller: "main::run_scm_contour_tick",
+        test: "891/case-10",
+    },
+    HostLifecycleBoundary {
+        name: "reconcile.requested",
+        source_item: "HostComposition::reconcile_approved_contour",
+        owner_state: "branch disposition/journal",
+        event: "host.reconcile requested",
+        caller: "main::run_scm_contour_tick",
+        test: "891/case-15",
+    },
+    HostLifecycleBoundary {
+        name: "reconcile.terminal",
+        source_item: "HostComposition::reconcile_approved_contour",
+        owner_state: "branch disposition/journal",
+        event: "host-reconcile-failed",
+        caller: "main::run_scm_contour_tick",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "reconcile.admitted",
+        source_item: "HostComposition::reconcile_approved_contour",
+        owner_state: "disposition LiveAwaitingReadiness",
+        event: "host.reconcile admitted",
+        caller: "main::run_scm_contour_tick",
+        test: "891/case-15",
+    },
+    HostLifecycleBoundary {
+        name: "readiness.degraded",
+        source_item: "HostComposition::reconcile_branch_readiness_at/persist_authenticated_readiness_degradation",
+        owner_state: "readiness observations/gaps",
+        event: "host.readiness degraded",
+        caller: "HostComposition::reconcile_approved_contour",
+        test: "891/case-3",
+    },
+    HostLifecycleBoundary {
+        name: "readiness.requested-proof",
+        source_item: "HostComposition::reconcile_branch_readiness_at",
+        owner_state: "readiness observations",
+        event: "host.readiness requested proof",
+        caller: "HostComposition::reconcile_approved_contour",
+        test: "891/case-3",
+    },
+    HostLifecycleBoundary {
+        name: "readiness.ready-proof",
+        source_item: "HostComposition::reconcile_branch_readiness_at",
+        owner_state: "authenticated proof",
+        event: "host.readiness ready proof",
+        caller: "HostComposition::reconcile_approved_contour",
+        test: "891/case-3",
+    },
+    HostLifecycleBoundary {
+        name: "readiness-contour.requested",
+        source_item: "HostComposition::current_readiness_contour",
+        owner_state: "contour probe, never ready alone",
+        event: "host.readiness-contour requested",
+        caller: "HostComposition::liveness_tick/reconcile_branch_readiness_at",
+        test: "891/case-3",
+    },
+    HostLifecycleBoundary {
+        name: "readiness-proof.requested",
+        source_item: "HostComposition::persist_fresh_authenticated_readiness",
+        owner_state: "fresh readiness observation",
+        event: "host.readiness-proof requested",
+        caller: "HostComposition::reconcile_branch_readiness_at",
+        test: "891/case-3",
+    },
+    HostLifecycleBoundary {
+        name: "readiness-proof.ready",
+        source_item: "HostComposition::persist_fresh_authenticated_readiness",
+        owner_state: "confirmed proof fence",
+        event: "host.readiness-proof ready",
+        caller: "HostComposition::reconcile_branch_readiness_at",
+        test: "891/case-3",
+    },
+    HostLifecycleBoundary {
+        name: "degraded-observation.requested",
+        source_item: "HostComposition::persist_degraded_process_observation",
+        owner_state: "coverage gap/process evidence",
+        event: "host.degraded-observation requested",
+        caller: "HostComposition::reconcile_approved_contour",
+        test: "891/case-17",
+    },
+    HostLifecycleBoundary {
+        name: "branch-fence.requested",
+        source_item: "HostComposition::has_durable_branch_fence",
+        owner_state: "durable fence probe",
+        event: "host.branch-fence requested",
+        caller: "none (exported API; no in-repo caller)",
+        test: "891/case-13",
+    },
+    HostLifecycleBoundary {
+        name: "cleanup-active.requested",
+        source_item: "HostComposition::cleanup_active_kernel_contour",
+        owner_state: "active contour/launch error",
+        event: "host.cleanup-active requested",
+        caller: "HostComposition::start_manifest_contour",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "cleanup-launched.requested",
+        source_item: "HostComposition::cleanup_launched_contour",
+        owner_state: "launched contour/launch error",
+        event: "host.cleanup-launched requested",
+        caller: "HostComposition::start_manifest_contour",
+        test: "891/case-8",
+    },
+    HostLifecycleBoundary {
+        name: "stop.requested",
+        source_item: "HostComposition::stop",
+        owner_state: "activation/drain records",
+        event: "host.stop requested",
+        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "stop.terminal",
+        source_item: "HostComposition::stop",
+        owner_state: "activation/drain records/owner lease",
+        event: concat!("host-", "stop-failed"),
+        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "stop.cancellation-requested",
+        source_item: "HostComposition::stop",
+        owner_state: "running activation/SCM stop control",
+        event: "host.stop cancellation requested",
+        caller: "main::dispatch/finish_console_shutdown/fail_host_service",
+        test: "891/case-12",
+    },
+    HostLifecycleBoundary {
+        name: "drain.requested",
+        source_item: "HostComposition::stop",
+        owner_state: "DrainRecord Requested/drain_generation",
+        event: "host.drain requested",
+        caller: "HostComposition::stop",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "drain.draining",
+        source_item: "HostComposition::stop",
+        owner_state: "DrainRecord Draining/drain_generation",
+        event: "host.drain draining",
+        caller: "HostComposition::stop",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "drain.commit",
+        source_item: "HostComposition::stop",
+        owner_state: "DrainCommitRecord/lease snapshot",
+        event: "host.drain commit",
+        caller: "HostComposition::stop",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "stop.stopped-clean-drained",
+        source_item: "HostComposition::stop",
+        owner_state: "StoppedClean/clean marker",
+        event: "host.stop stopped-clean drained",
+        caller: "HostComposition::stop",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "stop.stopped",
+        source_item: "HostComposition::stop",
+        owner_state: "released lease/stopped contour",
+        event: "host.stop stopped",
+        caller: "HostComposition::stop",
+        test: "891/T-A",
+    },
+    HostLifecycleBoundary {
+        name: "lifecycle-context.requested",
+        source_item: "lifecycle_context",
+        owner_state: "epoch/operation/process identity",
+        event: "host.lifecycle-context requested",
+        caller: "HostComposition::start_manifest_contour",
+        test: "891/case-15",
+    },
+    HostLifecycleBoundary {
+        name: "lifecycle-context.terminal",
+        source_item: "lifecycle_context",
+        owner_state: "epoch/operation/process identity",
+        event: "host-lifecycle-context-failed",
+        caller: "HostComposition::start_manifest_contour",
+        test: "891/case-14",
+    },
+    HostLifecycleBoundary {
+        name: "lifecycle-context.admitted",
+        source_item: "lifecycle_context",
+        owner_state: "RequestMetadata",
+        event: "host.lifecycle-context admitted",
+        caller: "HostComposition::start_manifest_contour",
+        test: "891/case-15",
+    },
+    HostLifecycleBoundary {
+        name: "propagated.phase-b-rollback",
+        source_item: "HostComposition::open (rollback decision)",
+        owner_state: "pending activation/prepared materialization",
+        event: "propagated: emitted by host_composition_phase_b::rollback_uncommitted_phase_b",
+        caller: "main::open_host",
+        test: "891/case-11",
+    },
+    HostLifecycleBoundary {
+        name: "propagated.activation-transitions",
+        source_item: "HostComposition::transition_activation",
+        owner_state: "activation record/journal append",
+        event: "propagated: inner edges observed at decision boundaries only",
+        caller: "HostComposition::stop",
+        test: "891/case-7",
+    },
+    HostLifecycleBoundary {
+        name: "propagated.cutover-candidate-arm",
+        source_item: "HostComposition::cutover_generation (candidate arm)",
+        owner_state: "candidate generation/registry",
+        event: "propagated: candidate launch observed at start-manifest boundary",
+        caller: "none (cutover_generation unwired)",
+        test: "891/case-11",
+    },
+];
+
+/// Returns the frozen table spelling for an emitted detail or code.
+///
+/// Every production observation flows through this lookup, so
+/// [`HOST_LIFECYCLE_BOUNDARY_TABLE`] is the single source of emitted
+/// boundary vocabulary. An unknown spelling passes through unchanged and
+/// trips a debug assertion so vocabulary drift is caught in development
+/// without ever breaking production diagnostics.
+fn host_lifecycle_frozen_event(detail: &str) -> &str {
+    let found = HOST_LIFECYCLE_BOUNDARY_TABLE
+        .iter()
+        .find(|row| row.event == detail)
+        .map(|row| row.event);
+    debug_assert!(
+        found.is_some(),
+        "unlisted lifecycle boundary event: {detail}"
+    );
+    found.unwrap_or(detail)
 }
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
@@ -3348,6 +4186,11 @@ impl HostJobBranches {
         ) {
             Ok(()) => Ok(CutoverLaunchOutcome::Candidate),
             Err(candidate_error) => {
+                // F-LOG-HOST-1: rollback requested versus verified
+                // restoration. The candidate failed, so restoration of the
+                // prior approved contour is now requested; the pair
+                // completes at `host.cutover-rollback restored` below.
+                host_lifecycle_observe_requested("host.cutover-rollback requested");
                 let rollback = self
                     .start_approved(
                         prior_kernel,
@@ -3368,8 +4211,13 @@ impl HostJobBranches {
                             "candidate failed ({candidate_error}); rollback failed ({error})"
                         ))
                     });
-                rollback.map(|()| CutoverLaunchOutcome::Rollback {
-                    candidate_error: candidate_error.to_string(),
+                rollback.map(|()| {
+                    // F-LOG-HOST-1: prior contour relaunched, so the
+                    // requested restoration is verified by its owner.
+                    host_lifecycle_observe_requested("host.cutover-rollback restored");
+                    CutoverLaunchOutcome::Rollback {
+                        candidate_error: candidate_error.to_string(),
+                    }
                 })
             }
         }
@@ -4326,11 +5174,14 @@ impl HostComposition {
     /// [`crate::backup_cutover::execute_cutover`], which is the owner path
     /// the registration marker names.
     ///
-    /// Real owner calls, in order: the type-checked
-    /// [`HostComposition::backup_dispatch_target`] resolution (a
-    /// non-`Cutover` operation, including `COMPLETE_REHEARSAL`, refuses
-    /// before any owner call, so a rehearsal completion can never reach
-    /// cutover); the shared
+    /// Real owner calls, in order: the operation resolved from the admitted
+    /// cutover payload through
+    /// [`crate::backup_cutover::admitted_cutover_operation`], which proves the
+    /// presented body is the body the admitted envelope committed to and then
+    /// requires the separately supplied selector to agree with the operation
+    /// that body authorizes (a rehearsal completion, or any other selector,
+    /// authorizes nothing and a valid selector can never override an unrelated
+    /// admitted body); the shared
     /// [`HostComposition::validate_backup_dispatch_prepare_routing`] pin; a
     /// fresh short-lived registry readback through
     /// [`Self::open_registry_store`] plus
@@ -4341,9 +5192,10 @@ impl HostComposition {
     /// activation bound by the cutover is the Host's own committed
     /// generation and not a caller-supplied copy; then
     /// [`crate::backup_cutover::execute_cutover`], which re-reads the
-    /// registry owner (TOCTOU fence), live-verifies the prior
-    /// capability-introduction set through the authenticated Kernel front
-    /// door, requires the exact-fence
+    /// registry owner (TOCTOU fence), re-proves the retained cutover body
+    /// against the admitted envelope at the effect boundary, live-verifies
+    /// the prior capability-introduction set through the authenticated Kernel
+    /// front door, requires the exact-fence
     /// [`GenerationRetirementBarrier`], and only then performs the
     /// activation CAS. Finally the bounded reconciliation is closed by
     /// re-reading the real registry owner and projecting it through
@@ -4363,10 +5215,11 @@ impl HostComposition {
     /// # Errors
     ///
     /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
-    /// operation does not resolve to the cutover dispatch target, the Host
-    /// activation is absent, the owner gate set, retirement barrier, or
-    /// registry CAS refuses, or the post-commit owner readback does not show
-    /// the committed target generation.
+    /// separately supplied operation does not match the operation the admitted
+    /// cutover payload authorizes, the Host activation is absent, the owner
+    /// gate set, retirement barrier, or registry CAS refuses, or the
+    /// post-commit owner readback does not show the committed target
+    /// generation.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -4386,15 +5239,21 @@ impl HostComposition {
         crate::backup_cutover::CutoverError,
     > {
         use crate::backup_cutover::{
-            CutoverDisposition, CutoverError, execute_cutover, plan_cutover_attempt,
+            CutoverDisposition, CutoverError, OwnerObservationCoherence,
+            admitted_cutover_operation, execute_cutover, plan_cutover_attempt,
             reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
         };
-        // Real dispatch decision: only the separately admitted cutover
-        // operation resolves `Cutover`. Rehearsal completion and preparation
-        // refuse here, before any owner call.
-        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+        // Real dispatch decision, resolved from the admitted cutover payload
+        // itself rather than from the routing table: the presented body must
+        // first prove it is the body the owner admitted, and only then does the
+        // separately supplied selector have to agree with the operation that
+        // body authorizes. A selector is therefore never the thing that
+        // authorizes a cutover, and it cannot override an admitted body.
+        let admitted = admitted_cutover_operation(request)?;
+        if operation != admitted {
             return Err(CutoverError::NotSeparatelyAdmitted(format!(
-                "backup operation {operation:?} is not the admitted cutover dispatch"
+                "separately supplied backup operation {operation:?} does not match the \
+                 admitted cutover operation {admitted:?}"
             )));
         }
         // Route through the shared dispatch validation before delegating,
@@ -4445,10 +5304,12 @@ impl HostComposition {
             &activation_generation,
         )?;
         // Bounded reconciliation closed by a real owner readback under the
-        // same operation identity. The journal retirement receipt is
-        // genuinely absent here: retirement is a separate explicitly
-        // authorized step, so the registry flip alone is the observed proof
-        // and the honest disposition is `RetirementPending`.
+        // same operation identity. The retirement is resolved through the same
+        // journal-owner lookup the disposition port uses, so this projection
+        // never asserts an absent retirement it did not look up, and it never
+        // attaches a presented receipt as if it proved one. The registry flip
+        // alone is therefore the observed proof and the honest disposition is
+        // `RetirementPending`.
         //
         // The projection runs only for a PROVEN commit. An unresolved outcome
         // is returned exactly as its owner observation produced it, so this
@@ -4456,28 +5317,55 @@ impl HostComposition {
         if committed.disposition != CutoverDisposition::Committed {
             return Ok((committed, barrier));
         }
+        // The registry and the journal are separate owners with no shared
+        // transaction, so the pair is only one moment if the journal is sampled
+        // on BOTH sides of the registry read. The pre-registry sample is what
+        // brackets the load; a sample taken only after it would leave the load
+        // outside the compared interval and certify a torn pair as settled.
+        let before = self.journal.snapshot().map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?;
         let readback = self
             .open_registry_store()?
             .load()
             .map_err(|error| CutoverError::Registry(error.to_string()))?;
+        let durable = self.journal.snapshot().map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?;
+        // A failed READ is a failure, never a concurrency fact: it is propagated
+        // with the same error the surrounding reads use, so it can never be
+        // reported as owner movement.
+        let coherence = match self.journal.snapshot() {
+            Ok(resampled)
+                if crate::backup_cutover::cutover_observation_unchanged(&before, &resampled) =>
+            {
+                OwnerObservationCoherence::Coherent
+            }
+            Ok(_) => OwnerObservationCoherence::Moving,
+            Err(error) => {
+                return Err(CutoverError::HostTransition(HostError::OwnerLeaseRecovery(
+                    error.to_string(),
+                )));
+            }
+        };
+        let retirement =
+            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         let reconciled = reconcile_cutover_outcome(
-            &committed.operation,
-            true,
-            self.journal
-                .snapshot()
-                .map_err(|error| {
-                    CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
-                })?
-                .pending_cutover
-                .as_ref(),
+            request,
+            durable.pending_cutover.as_ref(),
             readback.committed_cutover_activation(),
             readback.active_generation(),
-            &validated.request.target_generation,
-            None,
+            &retirement,
+            coherence,
         );
         if reconciled.disposition != CutoverDisposition::RetirementPending {
             return Ok((reconciled, barrier));
         }
+        // Reached only when the projection above DID return `RetirementPending`,
+        // which requires both a coherent pair and the registry's own
+        // operation-bound receipt. A torn pair returned `Unknown` +
+        // `ConcurrentOwnerMovement` at the branch above, so the proven
+        // `Committed` never reaches here unreported.
         Ok((committed, barrier))
     }
 
@@ -4487,14 +5375,23 @@ impl HostComposition {
     ///
     /// [#962](crate::backup_cutover) or the public command surface. It owns no
     /// algorithm. It re-reads the Host journal's own durable cutover
-    /// projection and the installation registry's active generation and
-    /// projects them through
+    /// projection, the installation registry's active generation and its
+    /// operation-bound cutover receipt, and the retirement record the journal
+    /// owner actually applied for this exact cutover operation, then projects
+    /// them through
     /// [`crate::backup_cutover::reconcile_cutover_outcome`], so the returned
-    /// disposition is the exact requested/validated/prepared/committed/
-    /// reconciled/retirement-pending/failed/unknown state of the operation
-    /// rather than a local assumption. The optional `retirement_receipt` is the
-    /// actual journal `AppendReceipt` read back for this operation identity.
-    /// No cutover effect is performed here and nothing is retried.
+    /// disposition is the exact state of the operation rather than a local
+    /// assumption, and
+    /// [`crate::backup_cutover::CutoverOutcome::residual`] names whatever
+    /// uncertainty the owners left behind. No caller assertion is accepted: this
+    /// port takes no `validated` flag, so the pure mapper cannot certify
+    /// qualification from a caller's word, and an unqualified read answers
+    /// `Requested`. The optional `retirement_receipt`
+    /// is a lookup HINT, never the proof: it is believed only when it names the
+    /// transaction identity the journal owner computed for the record it
+    /// resolved, so an unrelated genuine `AppendReceipt` cannot produce
+    /// `Reconciled`. No cutover effect is performed here, nothing is appended
+    /// or mutated, and nothing is retried.
     ///
     /// # Errors
     ///
@@ -4506,15 +5403,9 @@ impl HostComposition {
     pub fn backup_dispatch_cutover_disposition(
         &self,
         request: &crate::backup_cutover::CutoverRequest,
-        validated: bool,
         retirement_receipt: Option<&eliot_host_state::AppendReceipt>,
     ) -> Result<crate::backup_cutover::CutoverOutcome, HostError> {
-        crate::backup_cutover::read_cutover_disposition(
-            self,
-            request,
-            validated,
-            retirement_receipt,
-        )
+        crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)
     }
 
     /// Executes the separately authorized prior-generation retirement that
@@ -4534,9 +5425,10 @@ impl HostComposition {
     /// # Errors
     ///
     /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
-    /// operation does not resolve to the cutover dispatch target, the
-    /// authorization is empty, the prior epoch is not a retained epoch of this
-    /// installation, or the journal owner refuses the retirement record.
+    /// separately supplied operation does not match the operation the admitted
+    /// cutover payload authorizes, the authorization is empty, the prior epoch
+    /// is not a retained epoch of this installation, or the journal owner
+    /// refuses the retirement record.
     #[cfg(windows)]
     pub fn backup_dispatch_cutover_retire(
         &self,
@@ -4547,10 +5439,18 @@ impl HostComposition {
         prior_host: &eliot_host_state::HostInstallationEpoch,
         retirement_authorization: &PlatformHandle,
     ) -> Result<crate::backup_cutover::CutoverOutcome, crate::backup_cutover::CutoverError> {
-        use crate::backup_cutover::{CutoverError, retire_authorized_generation};
-        if Self::backup_dispatch_target(operation) != Some(BackupDispatchTarget::Cutover) {
+        use crate::backup_cutover::{
+            CutoverError, admitted_cutover_operation, retire_authorized_generation,
+        };
+        // Same admitted-payload resolution as the activation port: the body
+        // must prove it is the body the owner admitted, and the separately
+        // supplied selector must then agree with the operation that body
+        // authorizes. Retirement never runs on a selector's word alone.
+        let admitted = admitted_cutover_operation(request)?;
+        if operation != admitted {
             return Err(CutoverError::NotSeparatelyAdmitted(format!(
-                "backup operation {operation:?} is not the admitted cutover dispatch"
+                "separately supplied backup operation {operation:?} does not match the \
+                 admitted cutover operation {admitted:?}"
             )));
         }
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
@@ -7103,6 +8003,12 @@ impl HostComposition {
                 return self
                     .cleanup_active_kernel_contour(error, "rollback-process-observation-failed");
             }
+            // F-LOG-HOST-1: rollback requested versus verified
+            // restoration. The prior contour is durably reactivated
+            // (kernel reactivated, registry persisted, observations
+            // persisted); the returned Err reports the candidate
+            // rejection, not a rollback failure.
+            host_lifecycle_observe_requested("host.cutover-rollback reactivated");
             return Err(HostError::ProcessContour(format!(
                 "candidate rejected; prior approved contour durably reactivated: {candidate_error}"
             )));
@@ -8512,13 +9418,18 @@ impl HostComposition {
         // F-LOG-HOST-1: stop/drain distinct. Requested vs Draining vs
         // StoppedClean are three durable records sharing one drain_generation
         // correlation; draining vs drained and requested vs stopped are never
-        // merged. Cancellation requested stays distinct from stopped. Single
-        // terminal via guard; inner terminates are phase only.
+        // merged. Cancellation requested stays distinct from stopped via the
+        // labelled pair below. Single terminal via guard; inner terminates
+        // are phase only.
         host_lifecycle_observe_drain("host.stop requested");
         let mut host_terminal = HostTerminalGuard::armed("host-stop-failed");
         if !self.running {
             return Err(HostError::Stopped);
         }
+        // F-LOG-HOST-1: cancellation requested versus stopped. A running
+        // activation exists, so the SCM stop control now cancels it; the
+        // labelled pair completes at `host.stop stopped` below.
+        host_lifecycle_observe_drain("host.stop cancellation requested");
         #[cfg(windows)]
         if self.store_recovery_startup_fence.is_fenced() {
             self.readiness_gate.branch_degraded();

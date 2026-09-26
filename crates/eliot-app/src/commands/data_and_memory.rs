@@ -1229,6 +1229,12 @@ pub fn run_verify_profiles(config_path: &Path) -> Result<()> {
 }
 
 pub fn run_verify_plan(config_path: &Path, profile: &str) -> Result<()> {
+    if GovernedProfileService
+        .compile_governed(profile)?
+        .is_some()
+    {
+        return run_governed_verify_plan(config_path, profile);
+    }
     let root = runtime_root(config_path);
     let inventory = write_verification_inventory_report(&root)?.inventory;
     let report = write_verification_plan_report(&root, &inventory, profile)?;
@@ -1236,6 +1242,12 @@ pub fn run_verify_plan(config_path: &Path, profile: &str) -> Result<()> {
 }
 
 pub fn run_verify_run(config_path: &Path, profile: &str) -> Result<()> {
+    if GovernedProfileService
+        .compile_governed(profile)?
+        .is_some()
+    {
+        return run_governed_verify_run(config_path, profile);
+    }
     let root = runtime_root(config_path);
     let inventory = write_verification_inventory_report(&root)?.inventory;
     let plan = write_verification_plan_report(&root, &inventory, profile)?.plan;
@@ -1246,6 +1258,38 @@ pub fn run_verify_run(config_path: &Path, profile: &str) -> Result<()> {
         "verdict": verdict_report.verdict,
         "generated_at": time::OffsetDateTime::now_utc()
     }))
+}
+
+fn run_governed_verify_plan(config_path: &Path, profile: &str) -> Result<()> {
+    let config = load_config(config_path)?;
+    let root = runtime_root(config_path);
+    let blob_store = BlobStore::open(&config.blob_store)?;
+    let report =
+        GovernedProfileService.describe_execution(profile, Some(&blob_store))?;
+    write_verification_report(&root, "governed-profile", "Governed Profile Execution", &report)?;
+    write_json(&serde_json::json!({
+        "component": "governed_verification_plan",
+        "report": report,
+        "success": report.success,
+        "generated_at": time::OffsetDateTime::now_utc()
+    }))
+}
+
+fn run_governed_verify_run(config_path: &Path, profile: &str) -> Result<()> {
+    let config = load_config(config_path)?;
+    let root = runtime_root(config_path);
+    let blob_store = BlobStore::open(&config.blob_store)?;
+    let report =
+        GovernedProfileService.describe_execution(profile, Some(&blob_store))?;
+    write_verification_report(&root, "governed-profile", "Governed Profile Execution", &report)?;
+    write_json(&serde_json::json!({
+        "component": "governed_verification_run",
+        "report": report,
+        "success": report.success,
+        "generated_at": time::OffsetDateTime::now_utc()
+    }))?;
+    GovernedProfileService.enforce_success(&report)?;
+    Ok(())
 }
 
 pub fn run_verify_verdict(config_path: &Path, run: &str) -> Result<()> {

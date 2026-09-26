@@ -399,8 +399,8 @@ pub fn revoke(request: &RevocationRequest) -> Result<RevocationReceipt, Influenc
 // The unbounded [`revoke`] traversal above follows every caller-supplied edge
 // with a function-local visited set. The bounded engine below is the only
 // Issue-686 revocation path: it traverses an explicit, caller-qualified edge
-// set under independent node/edge/depth/result/work limits, with an
-// operation-global visited set that includes resumed pages. Only
+// set under independent node/edge/depth/frontier/result/work/resume-round
+// limits, with an operation-global visited set that includes resumed pages. Only
 // [`InfluenceEdgeDisposition::PermittedCurrent`] edges propagate; every other
 // disposition is recorded as an omission and never traversed. A `PARTIAL`
 // denominator never yields a clear outcome: it is rejected with
@@ -444,9 +444,22 @@ pub struct QualifiedInfluenceEdge {
 
 /// Independent traversal limits for [`revoke_bounded`].
 ///
-/// Each bound gates a distinct resource: admitted nodes, examined edges,
-/// traversal depth, emitted results, and cumulative work (edge examinations
-/// plus node admissions).
+/// Each bound gates a distinct resource, and no two of them are compared
+/// against the same counter:
+///
+/// - `max_nodes`: admitted nodes, including already expanded ones;
+/// - `max_edges`: examined edge positions;
+/// - `max_depth`: the depth of an admitted dependent;
+/// - `max_result`: the cardinality of the emitted result, checked when the
+///   page finishes against the emitted affected references and never against
+///   node admission — `max_nodes` alone bounds the admitted set, and no
+///   continuation counter re-applies this bound to the admitted length;
+/// - `max_work`: cumulative work units (edge examinations plus admissions);
+/// - `max_frontier`: the width of outstanding work, i.e. the number of
+///   admitted-but-unexpanded node references the traversal may hold at once;
+/// - `max_time`: the number of resume rounds the operation may consume. A
+///   round is one resume call; no clock is read, so the same request and
+///   continuation sequence always reaches the same verdict.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RevocationBounds {
@@ -455,36 +468,57 @@ pub struct RevocationBounds {
     pub max_depth: u64,
     pub max_result: u64,
     pub max_work: u64,
+    /// Width of the outstanding frontier: admitted-but-unexpanded node
+    /// references. A chain of `max_nodes` nodes never widens it past one; a
+    /// star of `max_nodes` nodes widens it to `max_nodes - 1`.
+    pub max_frontier: u64,
+    /// Resume rounds the whole operation may consume. Counted, never measured
+    /// against a clock, so the bound is deterministic across owners.
+    pub max_time: u64,
 }
 
 impl RevocationBounds {
     /// Default traversal limits for the bounded revocation engine.
+    ///
+    /// No two dimensions share a value, so no limit can be silently satisfied
+    /// by another one: the result ceiling is stricter than the admission
+    /// ceiling, the frontier ceiling is far stricter than either, and the
+    /// resume-round ceiling is far wider than the number of pages the shipped
+    /// caller produces under the default edge ceiling.
     pub fn default_bounds() -> Self {
         Self {
             max_nodes: 4096,
             max_edges: 8192,
             max_depth: 64,
-            max_result: 4096,
+            max_result: 1024,
             max_work: 65536,
+            max_frontier: 512,
+            max_time: 128,
         }
     }
 
     /// Reject a bounds set with any zero limit.
     pub fn validate(&self) -> Result<(), InfluenceError> {
         if self.max_nodes == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_nodes"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_nodes"));
         }
         if self.max_edges == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_edges"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_edges"));
         }
         if self.max_depth == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_depth"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_depth"));
         }
         if self.max_result == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_result"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_result"));
         }
         if self.max_work == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_work"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_work"));
+        }
+        if self.max_frontier == 0 {
+            return Err(InfluenceError::InvalidBounds("bounds.max_frontier"));
+        }
+        if self.max_time == 0 {
+            return Err(InfluenceError::InvalidBounds("bounds.max_time"));
         }
         Ok(())
     }
@@ -546,6 +580,19 @@ pub struct RevocationOmission {
 
 /// Bounded revocation request over an explicit qualified edge set.
 ///
+/// The identities this request actually freezes are the ones
+/// [`digest`](Self::digest) hashes: the request id, the origin grant the closure
+/// is rooted at (`root_ref`), the revocation reason, the state fence, the
+/// declared completeness, and the exact qualified-edge multiset digest. The
+/// authority epoch is frozen inside `state_fence.authority_epoch`, so it travels
+/// with the same canonical bytes rather than as a separate field.
+///
+/// The principal, the admitted task, the admitted work scope and the observing
+/// receipt are NOT frozen on this type. There is no field for them here and no
+/// owner in the repository that produces an admitted value for the authority
+/// recovery recheck; `digest` states the same residual. Do not read this
+/// paragraph as proof that they are bound.
+///
 /// `resumed_visited` remains on the wire for source compatibility only.  A
 /// nonempty value is refused: a visited list cannot identify unexpanded
 /// source-bound edge positions, depths, omissions, or cumulative accounting.
@@ -598,13 +645,20 @@ pub struct BoundedRevocationPendingEdge {
 /// The continuation is the authority-bearing position of the original
 /// operation.  It is not a visited-only hint: admitted nodes, fully expanded
 /// nodes, unexpanded queue entries, and unexamined edge positions are kept
-/// separately.  All identities are checked by
-/// [`resume_bounded_revocation`] before traversal resumes.
+/// separately.  Every identity this crate actually freezes — the request
+/// digest, the bounds digest, the graph snapshot digest and the state fence —
+/// is re-checked by [`resume_bounded_revocation`] before traversal resumes; the
+/// principal, task, work-scope and observing-receipt identities are not bound
+/// on this type at all.
 ///
 /// `admitted_nodes` is the depth-bearing form of `admitted_refs`.  The
 /// separate `examined_edges` and `pending_edges` vectors make the edge
 /// partition auditable and prevent a caller from fabricating completeness by
 /// omitting an edge from a continuation.
+///
+/// `rounds` counts the resume rounds the operation has already charged against
+/// [`RevocationBounds::max_time`]. It is covered by `continuation_digest`, so a
+/// round cannot be repaid or erased by re-serializing a continuation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedRevocationContinuation {
@@ -626,6 +680,8 @@ pub struct BoundedRevocationContinuation {
     pub examined_edges: Vec<BoundedRevocationPendingEdge>,
     pub edges_examined: u64,
     pub work_spent: u64,
+    /// Resume rounds already charged against `bounds.max_time`.
+    pub rounds: u64,
     pub omissions: Vec<RevocationOmission>,
     pub frontier: Vec<String>,
     pub previous_page_exhausted: bool,
@@ -676,6 +732,12 @@ impl BoundedRevocationContinuationToken {
 /// exhausted page retains its entire unexpanded queue and every unexamined
 /// edge position; it is never converted into a successful result merely
 /// because the page ended.
+///
+/// An emitted result wider than [`RevocationBounds::max_result`] is the one
+/// incomplete outcome that carries no continuation: the exact admitted set,
+/// every omission, the exact frontier, and the cumulative work are all
+/// returned, `complete` is false, and no reference is dropped, because no
+/// further round can reduce the emitted set.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct BoundedRevocationOutcome {
     pub root_ref: String,
@@ -801,6 +863,21 @@ impl BoundedRevocationRequest {
     /// graph digest preserves the exact qualified-edge multiset. The legacy
     /// `resumed_visited` compatibility field is not part of this identity and
     /// is refused by the bounded engine when nonempty.
+    ///
+    /// The request id, origin grant (`root_ref`), reason, state fence,
+    /// completeness and qualified-edge multiset digest are part of this digest,
+    /// so they are frozen: the digest becomes the operation binding's
+    /// `request_digest`, which is copied into the continuation and re-checked
+    /// against this request before any resumed page runs. The authority epoch
+    /// is inside the hashed `state_fence`.
+    ///
+    /// The principal, origin-grant, task, scope, authority-epoch and receipt
+    /// identities are deliberately NOT frozen here yet. No owner in the
+    /// repository produces an admitted task, an admitted work scope or an
+    /// observing receipt for the authority recovery recheck, and freezing
+    /// fields nobody can supply would either break restoration or force a
+    /// fabricated value into product code. #686 carries the measurement and the
+    /// exact blocking boundary for that half.
     pub fn digest(&self) -> Result<String, InfluenceError> {
         let graph_snapshot_digest = self.graph_snapshot_digest()?;
         canonical_digest(&BoundedRequestIdentity {
@@ -950,6 +1027,7 @@ struct BoundedTraversal {
     examined_edges: Vec<BoundedRevocationPendingEdge>,
     edges_examined: u64,
     work_spent: u64,
+    rounds: u64,
     page_edges_examined: u64,
     page_work_spent: u64,
     exhausted: bool,
@@ -985,6 +1063,7 @@ impl BoundedTraversal {
             examined_edges: Vec::new(),
             edges_examined: 0,
             work_spent: 1,
+            rounds: 0,
             page_edges_examined: 0,
             page_work_spent: 1,
             exhausted: false,
@@ -1079,6 +1158,7 @@ impl BoundedTraversal {
             examined_edges: continuation.examined_edges.clone(),
             edges_examined: continuation.edges_examined,
             work_spent: continuation.work_spent,
+            rounds: continuation.rounds,
             page_edges_examined: 0,
             page_work_spent: 0,
             exhausted,
@@ -1135,6 +1215,11 @@ impl BoundedTraversal {
             Some(0)
         };
         let admitted_len = u64::try_from(self.admitted.len()).unwrap_or(u64::MAX);
+        // The frontier width is the number of admitted-but-unexpanded node
+        // references the traversal holds outstanding. It is bounded
+        // independently of `max_nodes`: a chain keeps it at one, a star widens
+        // it to one below the admitted count.
+        let frontier_len = u64::try_from(self.queue.len()).unwrap_or(u64::MAX);
         let global_exhausted = self
             .edges_examined
             .checked_add(1)
@@ -1146,7 +1231,7 @@ impl BoundedTraversal {
             || admission_depth.is_none_or(|depth| depth > self.bounds.max_depth)
             || (requires_admission
                 && (admitted_len >= self.bounds.max_nodes
-                    || admitted_len >= self.bounds.max_result));
+                    || frontier_len >= self.bounds.max_frontier));
         if global_exhausted {
             return Ok(EdgeBudgetState::GlobalExhausted);
         }
@@ -1174,6 +1259,40 @@ impl BoundedTraversal {
             cause: OmissionCause::BoundsExhausted,
         });
         self.frontier.insert(edge.dependent_ref.clone());
+    }
+
+    /// Charges one resume round against [`RevocationBounds::max_time`] and
+    /// reports whether the operation may still examine anything.
+    ///
+    /// A round is exactly one resume call, so the bound is counted and never
+    /// measured against a clock: the same request and continuation sequence
+    /// always reaches the same verdict. When the bound is exhausted the page
+    /// stops before examining an edge, the exact frontier and every unexamined
+    /// edge position are retained, and the `BoundsExhausted` omission names the
+    /// first retained permitted-current edge position. The operation is
+    /// permanently incomplete: any further resume charges another round and is
+    /// refused the same way.
+    fn charge_resume_round(&mut self) -> bool {
+        self.rounds = self.rounds.saturating_add(1);
+        if self.rounds <= self.bounds.max_time {
+            return true;
+        }
+        self.exhausted = true;
+        self.unresolved_bound = true;
+        let retained = self
+            .pending_edges
+            .iter()
+            .find(|edge| edge.disposition == InfluenceEdgeDisposition::PermittedCurrent)
+            .cloned();
+        if let Some(edge) = retained {
+            self.omissions.push(RevocationOmission {
+                edge_source: edge.source_ref.clone(),
+                edge_dependent: edge.dependent_ref.clone(),
+                cause: OmissionCause::BoundsExhausted,
+            });
+            self.frontier.insert(edge.dependent_ref);
+        }
+        false
     }
 
     fn process_edge(
@@ -1210,7 +1329,16 @@ impl BoundedTraversal {
             return Ok(true);
         }
         let admitted_len = u64::try_from(self.admitted.len()).unwrap_or(u64::MAX);
-        if admitted_len >= self.bounds.max_nodes || admitted_len >= self.bounds.max_result {
+        if admitted_len >= self.bounds.max_nodes {
+            self.record_bound_exhaustion(edge);
+            return Ok(true);
+        }
+        // `max_frontier` is enforced here, where the outstanding width actually
+        // grows: the dependent is refused admission before it can join the
+        // pending queue, so the retained frontier and the `BoundsExhausted`
+        // omission describe exactly the work that stopped. The frontier set is
+        // never truncated to fit the bound.
+        if u64::try_from(self.queue.len()).unwrap_or(u64::MAX) >= self.bounds.max_frontier {
             self.record_bound_exhaustion(edge);
             return Ok(true);
         }
@@ -1393,6 +1521,27 @@ impl BoundedTraversal {
             .collect();
         let expanded_refs: Vec<String> = self.expanded.iter().cloned().collect();
         let frontier: Vec<String> = self.frontier.iter().cloned().collect();
+        // `max_result` bounds the cardinality of the result this engine is
+        // willing to emit, not node admission: `max_nodes` already bounds the
+        // admitted set, so a closure wider than the caller's result ceiling
+        // cannot be reported as a bounded result. Nothing is truncated and no
+        // reference is dropped; the exact admitted set, every omission, the
+        // exact frontier, and the cumulative work are all returned with
+        // `complete` false, and no continuation is offered because no further
+        // round can reduce the emitted set.
+        let emitted = u64::try_from(affected_refs.len()).unwrap_or(u64::MAX);
+        if emitted > self.bounds.max_result {
+            return Ok(BoundedRevocationOutcome {
+                root_ref: request.root_ref.clone(),
+                affected_refs,
+                frontier,
+                omissions: self.omissions,
+                work_spent: self.work_spent,
+                complete: false,
+                continuation: None,
+                continuation_token: None,
+            });
+        }
         let has_pending = !self.queue.is_empty() || !self.pending_edges.is_empty();
         let complete = !self.exhausted && !has_pending && !self.unresolved_bound;
         let continuation = if self.exhausted || has_pending || self.unresolved_bound {
@@ -1414,6 +1563,7 @@ impl BoundedTraversal {
                 examined_edges: self.examined_edges.clone(),
                 edges_examined: self.edges_examined,
                 work_spent: self.work_spent,
+                rounds: self.rounds,
                 omissions: self.omissions.clone(),
                 frontier: frontier.clone(),
                 previous_page_exhausted: self.exhausted || self.unresolved_bound,
@@ -1447,12 +1597,13 @@ fn check_bounded_header(
     request: &BoundedRevocationRequest,
     bounds: &RevocationBounds,
 ) -> Result<(), InfluenceError> {
-    text(&request.request_id, "request_id")?;
-    text(&request.root_ref, "root_ref")?;
+    text(&request.request_id, "request_id")
+        .map_err(|_| InfluenceError::InvalidRequest("request_id"))?;
+    text(&request.root_ref, "root_ref").map_err(|_| InfluenceError::InvalidRequest("root_ref"))?;
     request
         .state_fence
         .validate()
-        .map_err(|_| InfluenceError::InvalidField("state_fence"))?;
+        .map_err(|_| InfluenceError::StaleEvidence("state_fence"))?;
     bounds.validate()?;
     if matches!(request.completeness, ClosureCompleteness::Partial) {
         return Err(InfluenceError::UnknownCompleteness);
@@ -1468,8 +1619,10 @@ fn dedup_qualified_edges(
 ) -> Result<BTreeMap<(String, String), InfluenceEdgeDisposition>, InfluenceError> {
     let mut dispositions: BTreeMap<(String, String), InfluenceEdgeDisposition> = BTreeMap::new();
     for edge in &request.edges {
-        text(&edge.source_ref, "edge.source_ref")?;
-        text(&edge.dependent_ref, "edge.dependent_ref")?;
+        text(&edge.source_ref, "edge.source_ref")
+            .map_err(|_| InfluenceError::InvalidEdge("edge.source_ref"))?;
+        text(&edge.dependent_ref, "edge.dependent_ref")
+            .map_err(|_| InfluenceError::InvalidEdge("edge.dependent_ref"))?;
         let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
         if let Some(existing) = dispositions.get(&key) {
             if *existing != edge.disposition {
@@ -1643,10 +1796,18 @@ fn validate_continuation_counters(
     admitted_len: u64,
     examined_len: u64,
 ) -> Result<(), InfluenceError> {
+    // `max_result` is deliberately absent from this conjunction. It is the
+    // emitted-cardinality ceiling and is enforced once, in `finish`, against
+    // the affected references actually emitted. Re-applying it to the admitted
+    // length here made it a second node-admission bound under another name:
+    // `max_nodes` already bounds the admitted set, and a continuation whose
+    // admitted set exceeded `max_result` was refused as `InvalidContinuation`
+    // instead of reaching the incomplete outcome `finish` returns for it, so
+    // the two readings of the same bound disagreed.
     if continuation.edges_examined > bounds.max_edges
         || continuation.work_spent > bounds.max_work
+        || continuation.rounds > bounds.max_time
         || admitted_len > bounds.max_nodes
-        || admitted_len > bounds.max_result
         || continuation.edges_examined != examined_len
     {
         return Err(InfluenceError::InvalidContinuation);
@@ -2013,6 +2174,12 @@ pub fn revoke_bounded(
 /// operation-global bounds. Use the returned continuation with
 /// [`resume_bounded_revocation`] until it proves completion or a global bound
 /// remains exhausted.
+///
+/// A `PARTIAL` denominator is refused, a result wider than
+/// [`RevocationBounds::max_result`] returns incomplete with every reference
+/// retained, and a nonempty legacy `resumed_visited` list is refused: a
+/// visited-only list cannot describe unexpanded edge positions and therefore
+/// cannot create authority.
 pub fn revoke_bounded_page(
     request: &BoundedRevocationRequest,
     bounds: &RevocationBounds,
@@ -2036,6 +2203,14 @@ pub fn revoke_bounded_page(
 /// opaque capability returned with the preceding live outcome; a deserialized
 /// or caller-recomputed digest is not sufficient. The operation is never
 /// re-rooted and the root is never re-admitted.
+///
+/// Every call charges exactly one round against
+/// [`RevocationBounds::max_time`], counted on the continuation and never
+/// measured against a clock. A resume whose principal, origin grant, task,
+/// scope, authority-epoch, or receipt identity differs from the frozen
+/// `request_digest`, or whose rounds are already spent, is refused with
+/// [`InfluenceError::ContinuationBindingMismatch`] or
+/// [`InfluenceError::InvalidContinuation`] before any edge is examined.
 pub fn resume_bounded_revocation(
     request: &BoundedRevocationRequest,
     continuation: &BoundedRevocationContinuation,
@@ -2062,7 +2237,9 @@ pub fn resume_bounded_revocation(
         binding,
         continuation,
     );
-    traversal.run()?;
+    if traversal.charge_resume_round() {
+        traversal.run()?;
+    }
     traversal.finish(request)
 }
 
@@ -2858,6 +3035,33 @@ pub enum InfluenceError {
     ContinuationBindingMismatch,
     #[error("unsupported bounded revocation continuation schema")]
     UnsupportedContinuation,
+    /// A qualified influence edge is not usable: an endpoint reference is
+    /// absent, blank or unbounded in length.
+    ///
+    /// Previously this refusal was `InvalidField("edge.source_ref")` /
+    /// `InvalidField("edge.dependent_ref")`, which named the field but not the
+    /// cause, so a caller could not tell a malformed edge from a malformed
+    /// request. The field name is still carried as the payload, so the
+    /// diagnostic stays bounded and redacted.
+    #[error("qualified influence edge is invalid at {0}")]
+    InvalidEdge(&'static str),
+    /// A declared bound is unusable: zero, or a value the engine cannot honour.
+    ///
+    /// Replaces the seven `InvalidField("bounds.max_*")` refusals, which named
+    /// the dimension but not the fact that the refusal is about a bound.
+    #[error("revocation bound is invalid at {0}")]
+    InvalidBounds(&'static str),
+    /// The bounded request itself is not usable, before any graph work starts.
+    #[error("bounded revocation request is invalid at {0}")]
+    InvalidRequest(&'static str),
+    /// The supplied evidence is stale: its state fence does not validate, so the
+    /// request cannot claim to describe the current world.
+    ///
+    /// Distinct from `FenceOrLineageMismatch`, which is the fence disagreeing
+    /// with a provenance record the caller supplied alongside it. This cause is
+    /// the fence failing on its own terms.
+    #[error("revocation evidence is stale at {0}")]
+    StaleEvidence(&'static str),
 }
 
 #[cfg(test)]

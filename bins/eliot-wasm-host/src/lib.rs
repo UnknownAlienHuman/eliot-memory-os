@@ -33,23 +33,27 @@ mod installed_binary;
 mod parent_authority;
 mod parent_dispatch;
 mod parent_runtime;
+mod request_loop;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
 mod wasmtime_provider;
+// Pool sits with its sole consumer (the Wasmtime provider construction).
+mod pool;
 
-pub use admission::{PortGrantError, resolve_kernel_port_grant};
+pub use admission::{LiveAuthority, PortGrantError, ResolvedPortGrant, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
 pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
 pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
 pub use contour::{
-    AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
-    FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
-    PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
-    STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
-    authorize_host_call, check_activation_imports, check_admitted_request, experimental_manifest,
+    AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, CAPABILITY_GRANT_REVOKED,
+    CAPABILITY_INTRODUCTION_REQUIRED, Contour, ContourGateError, FS_CAPABILITY, GenerationManifest,
+    GovernorGrant, HostCallProposal, NET_CAPABILITY, PINNED_WASMTIME_VERSION,
+    PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET, STANDARD_GUEST_TARGET, admit_generation,
+    admit_generation_with_bytes, admit_prototype, authorize_host_call, check_activation_imports,
+    check_admitted_request, experimental_manifest,
 };
 pub use dispatch_drive::{
     DispatchDriveResponse, DriveAdmission, DriveError, GUEST_EXEC_ARGV0_HINT, LifecycleVerdicts,
@@ -78,7 +82,14 @@ pub use installed_binary::{
 };
 pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
-pub use parent_runtime::{GovernorPorts, drive_parent_runtime};
+pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime};
+pub use request_loop::{
+    AdmittedBinding, DeliverySetChannel, LoopError, MAX_RESULT_FRAME_BYTES, OP_CANCEL, OP_INVOKE,
+    OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError, OrdinaryOutcome, WASM_HOST_REQUEST_WIRE_ID,
+    WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID, WasmHostRequest,
+    WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame, run_ordinary_request_loop,
+    run_request_loop,
+};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
@@ -440,6 +451,9 @@ mod tests {
             privacy_policy: "project_code".to_owned(),
             comparator: "shadow-exact".to_owned(),
             rollback_generation: Some("gen-41".to_owned()),
+            state_fence_generation: 0,
+            state_fence_nonce: String::new(),
+            authority_epoch: String::new(),
         }
     }
 

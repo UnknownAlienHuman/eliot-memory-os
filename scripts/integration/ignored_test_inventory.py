@@ -239,6 +239,45 @@ def _validate_command(argv: Sequence[str]) -> None:
     raise InventoryError("COMMAND_NOT_ALLOWED", f"command is not fixed/allowed: {argv!r}")
 
 
+# Redaction for fixed-command failure details (issue #905: "Redact
+# secrets/user paths/payloads from diagnostics"). Secrets and high-risk
+# literals are redacted before persistence (I4.3.1); secrets and personal
+# data never cross the boundary raw (I15.12); credentials and user profiles
+# are denied by default (I18.32). "Payloads" maps to credential payloads
+# (opaque tokens, key blocks) plus the bounded tail itself: diagnostics stay
+# bounded (I16.7). Exit code, command identity, owner, and the tail structure
+# stay intact because redaction must not destroy required integrity metadata
+# (I18.45).
+_REDACT_SECRET_ASSIGNMENT: Final = re.compile(
+    r"(?i)\b(api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret"
+    r"|access[_-]?key|auth[_-]?token|oauth[_-]?token)([ \t]*[:=][ \t]*)\S+"
+)
+_REDACT_BEARER_TOKEN: Final = re.compile(r"\b[Bb]earer[ \t]+[A-Za-z0-9\-._~+/=]+")
+_REDACT_PRIVATE_KEY: Final = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_REDACT_OPAQUE_CREDENTIAL: Final = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]+)\b"
+)
+_REDACT_USER_HOME: Final = re.compile(
+    r"(?i)(?:[A-Za-z]:\\Users\\[^\\/:*?\"<>|\s]+|/home/[^/\s]+|/Users/[^/\s]+)"
+)
+_REDACTED_SECRET: Final = "<redacted-secret>"
+_REDACTED_USER_PATH: Final = "<redacted-user-path>"
+_STDERR_PRE_WINDOW: Final = 8192
+_STDERR_TAIL_CHARS: Final = 4096
+
+
+def _redact_detail(text: str) -> str:
+    """Redact secrets, user paths, and credential payloads from an error detail."""
+    redacted = _REDACT_PRIVATE_KEY.sub(_REDACTED_SECRET, text)
+    redacted = _REDACT_SECRET_ASSIGNMENT.sub(r"\1\2" + _REDACTED_SECRET, redacted)
+    redacted = _REDACT_BEARER_TOKEN.sub("Bearer " + _REDACTED_SECRET, redacted)
+    redacted = _REDACT_OPAQUE_CREDENTIAL.sub(_REDACTED_SECRET, redacted)
+    return _REDACT_USER_HOME.sub(_REDACTED_USER_PATH, redacted)
+
+
 def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> CommandResult:
     _validate_command(argv)
     env = {
@@ -268,12 +307,17 @@ def _run_fixed(root: Path, argv: Sequence[str], timeout: int | None = None) -> C
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"fixed command failed: {argv[0]}: {exc}") from exc
+        command = argv[0].replace("\\", "/").rsplit("/", 1)[-1] or argv[0]
+        raise InventoryError(
+            "COMPILED_GRAPH_UNAVAILABLE",
+            f"fixed command failed: {command}: {_redact_detail(str(exc))}",
+        ) from exc
     total = len(completed.stdout) + len(completed.stderr)
     if total > BOUNDS.max_command_output_bytes:
         raise InventoryError("COMMAND_OUTPUT_TOO_LARGE", f"fixed command output exceeds {BOUNDS.max_command_output_bytes} bytes")
     if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace")[-4096:]
+        tail = completed.stderr[-_STDERR_PRE_WINDOW:].decode("utf-8", errors="replace")
+        detail = _redact_detail(tail)[-_STDERR_TAIL_CHARS:]
         raise InventoryError("COMPILED_GRAPH_UNAVAILABLE", f"fixed command exited {completed.returncode}: {detail}")
     return CommandResult(completed.stdout, completed.stderr)
 
@@ -376,6 +420,20 @@ def _lex_rust(text: str) -> list[Token]:
             advance(text[index:end])
             index = end
             continue
+        if char == "'" and index + 1 < length and (text[index + 1].isalpha() or text[index + 1] == "_"):
+            end = index + 2
+            while end < length and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+            if end > index + 2 or end >= length or text[end] != "'":
+                # Rust lifetime or loop label (`'name`, `'static`, `'_`): an
+                # apostrophe followed by an identifier start opens a lifetime,
+                # not a character literal. Only the single-character form with
+                # an immediate closing quote (`'x'`) falls through to the
+                # character-literal scan below.
+                tokens.append(Token("punct", "'", index, index + 1, line))
+                tokens.append(Token("ident", text[index + 1 : end], index + 1, end, line))
+                index = end
+                continue
         if char in {'"', "'"} or (char in {"b", "c"} and index + 1 < length and text[index + 1] in {'"', "'"}):
             start = index
             if char in {"b", "c"}:

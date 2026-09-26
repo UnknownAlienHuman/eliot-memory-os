@@ -111,6 +111,16 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
+/// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
+///
+/// This is the exact string published as `USER_AUTOMATION_ROUTE` in
+/// `crates/surfaces/eliot-mcp/src/contract.rs` and used by
+/// `crates/surfaces/eliot-cli/src/lib.rs`. It carries the closed I11.12
+/// vocabulary `create; list/status/history; pause/resume; edit; run-now;
+/// remove; inspect last failure`. The Kernel derives the principal, State
+/// Fence, operation identity, and canonical request hash from authenticated
+/// evidence, so the selector itself grants no authority.
+pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -428,6 +438,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_reconcile" => "agent_activation_reconcile",
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        "semantic_observe_claim" => "semantic_observe_claim",
+        "semantic_observe_result" => "semantic_observe_result",
+        "semantic_observe_deferred" => "semantic_observe_deferred",
         "agent_host_request_submit" => "agent_host_request_submit",
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
@@ -450,6 +463,36 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
     request: NamedReadRequest,
+}
+
+/// Strips the daemon transport's routing key from one application body.
+///
+/// The retained daemon client inserts `operation` into every JSON body so the
+/// dispatcher can route it (`bins/eliotd/src/daemon_kernel_client/handshake.rs::operation_payload`),
+/// and the frame loop routes on exactly that key. A carrier that decodes the
+/// **whole** body with `#[serde(deny_unknown_fields)]` therefore sees a key it
+/// never declared, refuses the body, and the daemon frame loop propagates the
+/// resulting `SessionFenced` with `?` — fencing the Kernel connection, not just
+/// the one request. Removing the key before the closed decode is the shape the
+/// dispatcher already establishes for its own nested carriers
+/// (`daemon_supervision_progress_operation` removes its wrapper key before
+/// decoding, and `OwnerPublishOperation` *declares* `operation` and has its
+/// feeder omit it).
+///
+/// Only the carriers that need it call this. The key is routing, not
+/// application data: it is already bound to the dispatched `operation` string,
+/// so removing it cannot lose or invent a request field, and a body that is
+/// not an object still fails closed exactly as before.
+fn without_daemon_routing_key(
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, TransportError> {
+    match payload {
+        serde_json::Value::Object(mut object) => {
+            object.remove("operation");
+            Ok(serde_json::Value::Object(object))
+        }
+        _ => Err(TransportError::SessionFenced),
+    }
 }
 
 /// Closed local-read envelope for one admitted `eliot.query` (Implements #18).
@@ -889,6 +932,46 @@ struct UserAutomationRuntimeOperation {
     request: Option<UserAutomationHostExecutionOperation>,
     #[serde(default)]
     trigger: Option<UserAutomationDaemonTrigger>,
+    /// Front-door-authenticated request identity copied by the frame router.
+    ///
+    /// The daemon frame action carries no separate identity argument, so the
+    /// exact identity the front door already bound to this session travels
+    /// here and is re-validated against the session State Fence and request id
+    /// before any owner effect.
+    #[serde(default)]
+    request_identity: Option<RequestIdentity>,
+}
+
+#[cfg(windows)]
+/// Routing envelope read only to recover the front-door request identity.
+///
+/// The closed `UserAutomationRuntimeOperation` envelope owns the full shape
+/// check, so this envelope neither widens nor narrows it.
+#[derive(Deserialize)]
+struct UserAutomationRouteIdentity {
+    operation: String,
+    #[serde(default)]
+    request_identity: Option<RequestIdentity>,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationOperatorRoute {
+    operation: String,
+    /// Front-door-authenticated request identity copied by the frame router.
+    request_identity: RequestIdentity,
+    payload: UserAutomationOperatorIntent,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserAutomationOperatorIntent {
+    /// Closed operator operation selected by the authenticated surface.
+    operation: eliot_kernel_core::UserAutomationOperation,
+    /// Retry-stable idempotency key contributed by the caller.
+    idempotency_key: String,
 }
 
 #[cfg(windows)]
@@ -991,11 +1074,24 @@ impl KernelComposition {
                 observe_daemon_request("kernel.daemon_request_admitted", "success");
                 observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
                 observe_daemon_request("kernel.daemon_response_prepared", "success");
-                observe_daemon_request("kernel.daemon_response_delivered", "success");
+                // F-LOG-KERNEL-1 (#897 W3): the reply value is prepared here
+                // and handed to the front-door driver transport boundary. The
+                // only delivery witness is the driver-owned `send_checked`
+                // write (`front_door_driver.rs`, outside #897 scope), so
+                // delivery stays `unknown` at this boundary: a prepared
+                // response is not a delivered response.
+                observe_daemon_request("kernel.daemon_response_delivered", "unknown");
             }
             Err(error) => {
                 observe_daemon_request("kernel.daemon_request_validated", "fenced");
                 observe_daemon_operation(trusted_daemon_operation(operation), "fenced");
+                if matches!(error, TransportError::Cancelled) {
+                    // F-LOG-KERNEL-1 (#897 W3): cancellation observed as the
+                    // terminal disposition, distinct from the cancellation
+                    // request (`kernel.daemon_cancel_requested`). Info only;
+                    // the terminal below stays the single designated terminal.
+                    observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
+                }
                 super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
             }
         }
@@ -1044,6 +1140,29 @@ impl KernelComposition {
         payload: &serde_json::Value,
         request_identity: Option<&RequestIdentity>,
     ) -> Result<Frame, TransportError> {
+        #[cfg(windows)]
+        if operation == USER_AUTOMATION_OPERATOR_OPERATION {
+            // The closed UserAutomation operator vocabulary is authenticated by
+            // the front-door session, not by the daemon module binding: the
+            // principal comes from the authenticated peer, the State Fence from
+            // the session, and the canonical request hash is sealed by the
+            // canonical Store owner over the exact prepared transition. No
+            // other daemon operation is reachable from this branch.
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let value = Box::pin(self.user_automation_operator_operation(
+                session,
+                request_id.clone(),
+                payload,
+            ))
+            .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
         if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err(TransportError::SessionFenced);
         }
@@ -1157,10 +1276,18 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             USER_AUTOMATION_RUNTIME_OPERATION => {
+                let route: UserAutomationRouteIdentity = serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if route.operation != USER_AUTOMATION_RUNTIME_OPERATION {
+                    return Err(TransportError::SessionFenced);
+                }
+                let Some(identity) = request_identity.cloned().or(route.request_identity) else {
+                    return Err(TransportError::SessionFenced);
+                };
                 Box::pin(self.user_automation_runtime_operation(
                     session,
                     payload.clone(),
-                    request_identity.ok_or(TransportError::SessionFenced)?,
+                    &identity,
                 ))
                 .await
             }
@@ -1451,6 +1578,131 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            "semantic_observe_claim" => {
+                // Outbound-only eliotd observe poller for admitted
+                // `eliot.observe` pairs (issue #2565): mirrors
+                // `local_read_claim` — same session/auth/ready/fence gates
+                // via the dispatcher head and `frame_dispatch` allowlist,
+                // same single-`operation`-key payload shape, same null poll
+                // (not error) when empty. The claimed pair carries the
+                // Kernel-minted fenced attempt capability (admitted
+                // `facet_method: eliot.observe`) the daemon must present back
+                // on the submit and defer legs; no time lease is involved.
+                // Local-read pairs are never served here.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_observe_pair(session).map(|pair| match pair {
+                        Some((envelope, tool, attempt)) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "semantic_observe_result" => {
+                // Daemon submit leg for the claimed observe pair (issue
+                // #2565): validates plus fence-checks the submitted
+                // `HostRequestResultBody` and binds it to the waiting host
+                // request through the ORS result path. Only the current
+                // fencing generation presented by the owning session persists;
+                // a late, duplicate, or revoked attempt projects as a known
+                // stale outcome (never a bound result, never a transport
+                // error). Exact replay stays idempotent (even across deadline
+                // expiry); a changed body under the same identity conflicts;
+                // an elapsed deadline is the expected race and projects as a
+                // known expired outcome so the caller retains liveness without
+                // parsing errors.
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_observe_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "semantic_observe_deferred" => {
+                // Daemon deferral leg for the claimed observe pair (issue
+                // #2565): the flight consumed the pair but the Governor
+                // observation owner has no connected admission yet, so no
+                // effect was produced and none is claimed. The presenting
+                // attempt must be the live triple; anything else quarantines
+                // as the known stale outcome. The durable record advances
+                // `Admitted -> Routed`, the queue pair retires, and the
+                // pending handle stays live with its exact resume condition
+                // (resubmit the same logical request once the owner
+                // connects). An already-terminal record settles: consult it.
+                #[cfg(windows)]
+                {
+                    let operation_id = payload
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let request_digest = payload
+                        .get("request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let attempt_value = payload
+                        .get("attempt")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let attempt: LocalReadAttempt = serde_json::from_value(attempt_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.defer_observe_claim(session, operation_id, request_digest, &attempt)
+                    {
+                        Ok(host_request_route::ObserveDeferDisposition::Deferred(record)) => Ok(
+                            Self::deferred_observe_daemon_response(record.operation_id.as_str()),
+                        ),
+                        Ok(host_request_route::ObserveDeferDisposition::Settled(record)) => Ok(
+                            Self::settled_observe_daemon_response(record.operation_id.as_str()),
+                        ),
+                        Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             #[cfg(windows)]
             "agent_host_request_submit" => {
                 // Typed P-04 host-request envelopes through the same closed
@@ -1458,16 +1710,39 @@ impl KernelComposition {
                 // connection/descriptor/fence/generation/durability join; a
                 // changed binding under a known identity conflicts, an unknown
                 // parent is unknown, and an elapsed deadline times out there.
+                // Observe bytes ride this entry exactly like the bridge
+                // front-door submit arm (issue #2565): linkage before
+                // staging, retention enqueue after admission.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
+                let observe_tool = payload.get("tool").cloned();
+                if let Some(ref tool) = observe_tool
+                    && envelope.identity.capability == host_request_route::OBSERVE_CAPABILITY
+                {
+                    host_request_route::check_observe_tool_linkage(&envelope, tool)?;
+                }
                 let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+                self.maybe_enqueue_observe_pair_for_submit(
+                    &envelope,
+                    &record,
+                    observe_tool.as_ref(),
+                );
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
             }
             #[cfg(windows)]
             "agent_host_request_cancel" => {
+                // F-LOG-KERNEL-1 (#897 W3): cancellation requested through the
+                // closed daemon dispatcher. Info only; the observed wrapper
+                // owns the single designated terminal for this operation.
+                observe_daemon_request("kernel.daemon_cancel_requested", "attempt");
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
-                let (receipt, record) = self.cancel_host_request(&envelope)?;
+                let cancel = self.cancel_host_request(&envelope);
+                match &cancel {
+                    Ok(_) => observe_daemon_request("kernel.daemon_cancel_requested", "success"),
+                    Err(_) => observe_daemon_request("kernel.daemon_cancel_requested", "fenced"),
+                }
+                let (receipt, record) = cancel?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
@@ -2100,6 +2375,16 @@ impl KernelComposition {
         if envelope.operation != USER_AUTOMATION_RUNTIME_OPERATION {
             return Err(TransportError::SessionFenced);
         }
+        // The payload copy of the front-door identity and the identity this
+        // route was invoked with must be the same value. A caller cannot
+        // substitute one, and neither copy widens the session authority.
+        if envelope
+            .request_identity
+            .as_ref()
+            .is_some_and(|embedded| embedded != request_identity)
+        {
+            return Err(TransportError::SessionFenced);
+        }
         if envelope.request.is_some() == envelope.trigger.is_some() {
             return Err(TransportError::SessionFenced);
         }
@@ -2251,6 +2536,175 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    /// Serves the authenticated `eliot_user_automation` operator route.
+    ///
+    /// The route implements the I11.12 operations `create;
+    /// list/status/history; pause/resume; edit; run-now; remove; inspect last
+    /// failure`. The selector carries only the closed operation plus the
+    /// caller's retry-stable idempotency key; the principal comes from the
+    /// authenticated peer, the State Fence and `RequestMetadata` from the
+    /// front-door identity, and the canonical Store operation identity and
+    /// canonical request hash are sealed by the canonical Store owner over the
+    /// exact prepared transition. The route therefore creates no authority, no
+    /// principal, and no second canonical writer.
+    pub(crate) async fn user_automation_operator_operation(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let route: UserAutomationOperatorRoute =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        let identity = route.request_identity;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != session.module_generation.state_fence
+            || route.payload.idempotency_key != identity.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
+        let principal = authenticated_user_automation_principal(session)?;
+        let operation_id = eliot_contracts::OperationId::new(format!(
+            "user-automation-operation:{}",
+            route.payload.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let intent = eliot_kernel_core::UserAutomationOperatorIntent {
+            intent_id: format!("user-automation-intent:{}", route.payload.idempotency_key),
+            principal_ref: principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+            operation: route.payload.operation,
+        };
+        let request = eliot_kernel_service::UserAutomationServiceRequest {
+            context: identity.request.metadata.clone(),
+            authenticated_principal: principal,
+            identity: OperationIdentity {
+                operation_id,
+                idempotency_key: route.payload.idempotency_key,
+                canonical_request_hash: String::new(),
+            },
+            intent,
+        };
+        let gateway = self.retained_store_gateway()?;
+        let response = Box::pin(gateway.execute_user_automation_operation(request))
+            .await
+            .map_err(|_error| {
+                super::kernel_diagnostics::observe_terminal_error(
+                    "daemon_user_automation_operator_store",
+                );
+                TransportError::SessionFenced
+            })?;
+        let outcome = match &response.outcome {
+            eliot_kernel_service::UserAutomationStoreOutcome::Read { .. } => "read",
+            eliot_kernel_service::UserAutomationStoreOutcome::Committed { .. } => "committed",
+            eliot_kernel_service::UserAutomationStoreOutcome::Replayed { .. } => "replayed",
+        };
+        // The Human inspect surface shows the deterministic schedule
+        // projection before activation: the same normalized occurrence set the
+        // trigger contract uses, compiled here into the immutable
+        // revision-bound occurrence identities. A schedule the compiler cannot
+        // compile fails closed instead of projecting a guessed occurrence.
+        let occurrences =
+            Self::user_automation_inspection_occurrences(&response.outcome).map_err(|_error| {
+                super::kernel_diagnostics::observe_terminal_error(
+                    "daemon_user_automation_occurrence_projection",
+                );
+                TransportError::SessionFenced
+            })?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "outcome": outcome,
+                "state_fence": response.state_fence,
+                "result": response.outcome,
+                "occurrences": occurrences,
+            },
+            "recovery": null,
+        }))
+    }
+
+    /// Compiles the deterministic next-occurrence projection of every revision
+    /// a read operation returned.
+    ///
+    /// A mutation answer carries no schedule projection, so it yields an empty
+    /// list rather than re-deriving a revision the caller did not ask for.
+    #[cfg(windows)]
+    fn user_automation_inspection_occurrences(
+        outcome: &eliot_kernel_service::UserAutomationStoreOutcome,
+    ) -> Result<Vec<serde_json::Value>, UserAutomationRuntimeError> {
+        use eliot_kernel_service::UserAutomationReadResult;
+        let eliot_kernel_service::UserAutomationStoreOutcome::Read { result } = outcome else {
+            return Ok(Vec::new());
+        };
+        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result {
+            UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
+            UserAutomationReadResult::Status { revision, .. }
+            | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
+            UserAutomationReadResult::History { .. } => Vec::new(),
+        };
+        let mut projections = Vec::with_capacity(revisions.len());
+        for revision in revisions {
+            let identities = revision
+                .compile_occurrence_identities()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+            // Each compiled identity is projected together with the
+            // deterministic successor the same revision compiler resolves. The
+            // Human surface therefore sees the whole next-occurrence chain,
+            // including the terminal occurrence whose successor is `None`,
+            // instead of an unlabelled list it would have to re-derive.
+            let mut occurrences = Vec::with_capacity(identities.len());
+            for identity in &identities {
+                let occurrence_key = match &identity.trigger {
+                    eliot_kernel_core::user_automation::UserAutomationTrigger::Scheduled {
+                        occurrence_key,
+                    } => occurrence_key.as_str(),
+                    eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
+                        ..
+                    } => {
+                        return Err(UserAutomationRuntimeError::Rejected(
+                            "compiled UserAutomation occurrence is not a calendar occurrence"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                let next_occurrence = revision
+                    .next_occurrence_after(occurrence_key)
+                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+                occurrences.push(serde_json::json!({
+                    "identity": identity,
+                    "next_occurrence": next_occurrence,
+                }));
+            }
+            projections.push(
+                serde_json::to_value(serde_json::json!({
+                    "automation_id": revision.automation_id,
+                    "revision": revision.revision,
+                    "kind": revision.schedule.kind,
+                    "expression": revision.schedule.expression,
+                    "calendar": revision.schedule.calendar,
+                    "timezone": revision.schedule.timezone,
+                    "dst_fold": revision.schedule.dst_fold,
+                    "dst_gap": revision.schedule.dst_gap,
+                    "configuration_state": revision.configuration_state,
+                    "occurrences": occurrences,
+                }))
+                .map_err(|error| {
+                    UserAutomationRuntimeError::Rejected(format!(
+                        "UserAutomation occurrence projection encoding failed: {error}"
+                    ))
+                })?,
+            );
+        }
+        Ok(projections)
+    }
+
+    #[cfg(windows)]
     /// Acquires the canonical owner material for a daemon/operator trigger.
     ///
     /// The wire carrier is only `(automation_id, requested_revision,
@@ -2303,16 +2757,28 @@ impl KernelComposition {
                 ),
             ));
         }
-        let manual_trigger = eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
-            nonce: manual_nonce.clone(),
+        // The run-now trigger is compiled by the same immutable revision
+        // compiler that compiles a calendar occurrence, so the explicit manual
+        // nonce is validated against the stored revision and receives a
+        // distinct, stable, revision-bound identity instead of a value built
+        // here beside the schedule. A nonce the revision cannot compile is a
+        // typed rejection, not a second trigger vocabulary.
+        let manual_trigger = match owner.revision.manual_trigger(&manual_nonce) {
+            Ok(trigger) => trigger,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
         };
-        let occurrence_id =
-            eliot_kernel_core::user_automation::UserAutomationInvocation::occurrence_identity_for(
-                &owner.revision.automation_id,
-                &owner.revision.revision,
-                &manual_trigger,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
+        let occurrence_id = match owner.revision.occurrence_identity_for(&manual_trigger) {
+            Ok(occurrence_id) => occurrence_id,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
+        };
         let invocation = gateway
             .read_user_automation_invocation(
                 &lookup.state_fence,
@@ -3258,6 +3724,43 @@ impl KernelComposition {
         })
     }
 
+    /// Typed outcome for an honestly deferred observe pair (issue #2565).
+    ///
+    /// The flight consumed the claimed pair and the durable record advanced
+    /// to `Routed`, but the Governor observation owner has no connected
+    /// admission yet: no effect was produced and none is claimed. `accepted`
+    /// records the deferral itself (pair retired, phase advanced); `deferred`
+    /// distinguishes it from a result persist, and the operation identity is
+    /// the exact resume handle the waiter keeps polling.
+    fn deferred_observe_daemon_response(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "deferred": true,
+                "operation_id": operation_id,
+            },
+            "recovery": null,
+        })
+    }
+
+    /// Typed outcome when a deferral arrives for an already-terminal record.
+    ///
+    /// Nothing is outstanding: the waiter path serves the stored truth, so
+    /// the daemon idles. `settled` distinguishes this from a fresh deferral;
+    /// the operation identity names the record to consult.
+    fn settled_observe_daemon_response(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "settled": true,
+                "operation_id": operation_id,
+            },
+            "recovery": null,
+        })
+    }
+
     /// Typed acknowledgement for a v2 semantic-result submit: the exact
     /// retained result (with its full disposition) travels inside `ack`, so
     /// the daemon leg stays lossless without parsing error strings.
@@ -3560,8 +4063,13 @@ impl KernelComposition {
         request_id: RequestId,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
+        // The daemon client routes on the `operation` key it inserts into every
+        // body; this carrier decodes the whole body, so that routing key is
+        // removed before the closed decode instead of being refused as unknown
+        // (see `without_daemon_routing_key`).
         let operation: NotificationStateApplyOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Some(refusal) =
             Self::validate_notification_state_apply(session, &request_id, &operation)?
         {
@@ -3805,8 +4313,13 @@ impl KernelComposition {
         session: &Session,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
+        // The daemon client routes on the `operation` key it inserts into every
+        // body; this carrier decodes the whole body, so that routing key is
+        // removed before the closed decode instead of being refused as unknown
+        // (see `without_daemon_routing_key`).
         let operation: StoreNamedOperation =
-            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
         if let Err(error) = operation.request.validate() {
             return Ok(Self::store_error_response_text(
                 "store_named",

@@ -23,7 +23,7 @@ use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile,
+    AgentActivationResultReconcile, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
@@ -43,8 +43,8 @@ use eliotd::testd_terminal_completion::{
 use eliotd::{
     ActivationClaim, DaemonComposition, DaemonConfig, DaemonError, DaemonKernelClient,
     DaemonStatus, LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, forward_admitted_local_read,
-    terminal_for_invalid_ticket,
+    ObserveDeferOutcome, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME,
+    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -1049,6 +1049,11 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // Sole owner of observe poll state (issue #2565). The same tick drives
+    // it independently of every other flight: a null claim backs off until
+    // the next tick, while a claimed observe pair serves through the closed
+    // vocabulary and defers through the Kernel defer leg before idling.
+    let mut observe_flight = ObserveFlight::Idle;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -1091,6 +1096,7 @@ async fn run_loop(
                     &composition,
                     &mut flight,
                     &mut local_read_flight,
+                    &mut observe_flight,
                     &mut testd_owner_flight,
                     &mut owner_feed_flight,
                     &mut owner_feed,
@@ -1109,6 +1115,7 @@ async fn run_loop(
                     &composition,
                     &startup_readiness,
                     &mut local_read_flight,
+                    &mut observe_flight,
                     &mut testd_owner_flight,
                     &mut flight,
                 );
@@ -1135,6 +1142,9 @@ async fn run_loop(
                     &mut local_read_flight,
                     &mut startup_readiness,
                 )?;
+            }
+            observe_completion = next_observe_completion(&mut observe_flight) => {
+                settle_observe_completion(observe_completion, &mut observe_flight)?;
             }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, &mut testd_owner_flight)?;
@@ -1265,10 +1275,12 @@ fn start_tick_work(
     composition: &SharedComposition,
     startup_readiness: &StartupReadinessProjection,
     local_read_flight: &mut LocalReadFlight,
+    observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
     flight: &mut ActivationFlight,
 ) {
     maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
+    maybe_start_observe_poll(kernel, observe_flight);
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
         *flight = ActivationFlight::InFlight(ActivationFlightState {
@@ -1305,6 +1317,31 @@ fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressPro
     }
 }
 
+/// Builds the sanitized maintenance observation for one wired trigger site.
+///
+/// Shared by every trigger arm so each one names the same self-observed family
+/// and passes its evidence identities through the shared diagnostics sanitizer:
+/// a trigger can never carry control characters, secrets, or unbounded detail
+/// into the evaluator's own field validation. The family is the one
+/// self-observed family this daemon can honestly name today; the registered
+/// per-observation family catalog is #1693's to supply.
+fn maintenance_observation(
+    origin: MaintenanceTriggerOrigin,
+    evidence_refs: Vec<String>,
+    activation_in_flight: bool,
+) -> MaintenanceObservation {
+    let evidence_refs = evidence_refs
+        .iter()
+        .map(|reference| eliotd::diagnostics::sanitize_identity(reference))
+        .collect();
+    MaintenanceObservation {
+        origin,
+        family: SELF_OBSERVED_FAMILY,
+        evidence_refs,
+        activation_in_flight,
+    }
+}
+
 /// Runs one Governor maintenance trigger evaluation from a real durable
 /// trigger site (I14.22, issue #1688).
 ///
@@ -1315,28 +1352,17 @@ fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressPro
 /// startup gate, a readiness gate, or a daemon-killing error. I14.22 keeps an
 /// unevaluable trigger durable and surfaces it on the next eligible startup
 /// rather than dropping it.
-///
-/// Evidence identities are passed through the shared diagnostics sanitizer so
-/// a trigger can never carry control characters, secrets or unbounded detail
-/// into the evaluator's own field validation. The family is the one
-/// self-observed family this daemon can honestly name today; the registered
-/// per-observation family catalog is #1693's to supply.
 fn note_maintenance_trigger_at(
     composition: &DaemonComposition,
     origin: MaintenanceTriggerOrigin,
     evidence_refs: Vec<String>,
     activation_in_flight: bool,
 ) {
-    let evidence_refs = evidence_refs
-        .iter()
-        .map(|reference| eliotd::diagnostics::sanitize_identity(reference))
-        .collect();
-    composition.note_maintenance_trigger(MaintenanceObservation {
+    composition.note_maintenance_trigger(maintenance_observation(
         origin,
-        family: SELF_OBSERVED_FAMILY,
         evidence_refs,
         activation_in_flight,
-    });
+    ));
 }
 
 /// Evaluates the idle trigger from the activation-poll cadence branch.
@@ -1355,6 +1381,55 @@ async fn note_idle_maintenance_trigger(composition: &SharedComposition, flight: 
         vec![format!("activation_in_flight={activation_in_flight}")],
         activation_in_flight,
     );
+}
+
+/// Submits one owner-side canonical notification for a blocked automation
+/// decision (issue #1780, I11.5).
+///
+/// I11.5 makes the persistent record the durable obligation and delivery only
+/// the presentation, so a refused emission is an explicit typed gap recorded
+/// through the existing minimal operational diagnostics — never a silent drop
+/// and never a daemon-killing error. The Kernel health poll has already
+/// completed by this point, so a refused emission never rolls the daemon back
+/// to a failed poll; it is awaited before the supervision submit below, so it
+/// does delay that one submit for the length of one bounded exchange. A
+/// notification exchange is bounded by the transport's own operation deadline
+/// and normally never runs at all, because a recorded decision is skipped
+/// without any write. That is the A13.8 visible-degradation contract: the
+/// daemon stays alive and observable while the operator can see the refusal.
+async fn note_blocked_automation_notification(
+    kernel: &Arc<DaemonKernelClient>,
+    fence: eliot_contracts::StateFence,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) {
+    match eliotd::notification_state_emit::emit_blocked_automation_notification(
+        kernel, fence, decision,
+    )
+    .await
+    {
+        Ok(Some(eliotd::notification_state_emit::NotificationStateEmit::Committed {
+            dedup_key,
+            notification_id,
+            operation_id,
+        })) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.notification_state_emitted",
+                dedup_key = %dedup_key,
+                notification_id = %notification_id,
+                operation_id = %operation_id,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "notification-state",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
 }
 
 /// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
@@ -1390,7 +1465,13 @@ async fn run_health_heartbeat_tick(
     // what this tick actually did.
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
     let readiness_verdict;
-    {
+    // Issue #1780 (I11.5): an admitted automation decision that admits no job
+    // is an automation failure, and I11.5 requires it to become one persistent
+    // canonical notification instead of a log line. The decision and the
+    // admission fence are both taken from the composition under this one lock;
+    // the canonical write itself happens after the lock is released, so no
+    // Kernel exchange ever crosses the composition mutex (issue #18 N3).
+    let blocked_automation = {
         let guard = composition.lock().await;
         // #2560: re-read the composition's own owner facts once per heartbeat.
         // This performs no capability IO and re-files no slot, so a slow
@@ -1408,15 +1489,36 @@ async fn run_health_heartbeat_tick(
             &guard.status(),
             false,
         );
-        note_maintenance_trigger_at(
-            &guard,
+        // Same tolerance as `DaemonComposition::note_maintenance_trigger`: a
+        // rejected evaluation is an explicit typed gap, never a daemon-killing
+        // error, and the trigger stays durable for the next eligible pass.
+        match guard.evaluate_maintenance_trigger(maintenance_observation(
             MaintenanceTriggerOrigin::AdmittedObservation,
             vec![
                 format!("store_health={:?}", health.status),
                 health.manifest_digest.as_str().to_owned(),
             ],
             activation_in_flight,
-        );
+        )) {
+            Ok(decision) if decision.admits_job => None,
+            Ok(decision) => match guard.notification_state_admission_fence() {
+                Ok(fence) => Some((fence, decision)),
+                // A not-ready composition is a typed refusal, not a reason to
+                // pretend there is no blocked automation: it is recorded with
+                // the same minimal diagnostics the evaluation refusal uses.
+                Err(error) => {
+                    let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                    None
+                }
+            },
+            Err(error) => {
+                let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+                None
+            }
+        }
+    };
+    if let Some((fence, decision)) = blocked_automation {
+        note_blocked_automation_notification(kernel, fence, &decision).await;
     }
     // #2560: the same readiness evaluation that produced the startup record
     // reaches diagnostics here, so an operator sees exactly when a core
@@ -1640,8 +1742,8 @@ fn start_activation_dispatch(
 
 /// Stage-aware shutdown drain for every already-started flight (issue
 /// #2559). No new claim starts here; already-started claim, resolve-wait,
-/// dispatch, local-read, `TestD` owner and owner-feed steps keep being polled
-/// together inside one declared finite budget.
+/// dispatch, local-read, observe, `TestD` owner and owner-feed steps keep
+/// being polled together inside one declared finite budget.
 ///
 /// A claimed/waiting ticket carries no result digest yet, so exhausting the
 /// budget while waiting or resolving settles as a clean shutdown: nothing
@@ -1649,18 +1751,23 @@ fn start_activation_dispatch(
 /// submitting result keeps its retained identity instead: an unknown
 /// acknowledgement or a budget exhausted mid-submit settles as a typed
 /// unknown carrying the original ticket/result verbatim, never a fabricated
-/// hash. Local-read, `TestD` owner and owner-feed steps always settle as plain
-/// shutdown: an un-submitted pair's attempt capability is revoked on
-/// disconnect, an already-persisted `TestD` decision exact-replays, and a
-/// pending owner-feed publication leaves dependent grants pending. Only a
-/// step failure fails closed. Dropping every flight here also releases all
-/// owned composition references before the existing final shutdown, without
-/// leaking detached work.
+/// hash. Local-read, observe, `TestD` owner and owner-feed steps always
+/// settle as plain shutdown: an un-submitted pair's attempt capability is
+/// revoked on disconnect, an already-persisted `TestD` decision
+/// exact-replays, and a pending owner-feed publication leaves dependent
+/// grants pending. Only a step failure fails closed. Dropping every flight
+/// here also releases all owned composition references before the existing
+/// final shutdown, without leaking detached work.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shutdown drain polls every flight's own borrowed state in one select; bundling them would hide which flight is outstanding"
+)]
 async fn drain_flights_on_shutdown(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     flight: &mut ActivationFlight,
     local_read_flight: &mut LocalReadFlight,
+    observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
@@ -1674,6 +1781,7 @@ async fn drain_flights_on_shutdown(
     loop {
         if matches!(flight, ActivationFlight::Idle)
             && matches!(local_read_flight, LocalReadFlight::Idle)
+            && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
         {
@@ -1734,7 +1842,16 @@ async fn drain_flights_on_shutdown(
                 // a capability-refused pair still settles here exactly like any
                 // other. The loop's projection is untouched by this path.
                 settle_local_read_completion(local_read_completion, local_read_flight)?;
-            }            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
+            }
+            observe_completion = next_observe_completion(observe_flight) => {
+                // The observe drain owns no readiness state either: a
+                // deferred, settled, expired, or stale pair settles here
+                // exactly like any other. An un-submitted pair's attempt
+                // capability is revoked on disconnect, mirroring the
+                // local-read drain.
+                settle_observe_completion(observe_completion, observe_flight)?;
+            }
+            testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
             }
             owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
@@ -1766,6 +1883,7 @@ async fn drain_flights_on_shutdown(
                     },
                 };
                 *local_read_flight = LocalReadFlight::Idle;
+                *observe_flight = ObserveFlight::Idle;
                 *testd_owner_flight = TestdOwnerFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 return Ok(exit);
@@ -2104,6 +2222,58 @@ async fn run_local_read_poll(
         };
         return Ok(step(outcome, delta));
     }
+    // #1187 W1/A1: a claimed pair naming the broker-owned operator read
+    // capability is served here, not forwarded on the Kernel `local_read` leg,
+    // because that leg serves store reads only. The branch builds one board
+    // over one immutable Governor snapshot and performs exactly one
+    // authenticated role-filtered read on it, so the canonical role-filtered
+    // view — or the board's exact typed refusal, including a `PlanGap` naming
+    // the missing owner — is served from the live daemon path instead of being
+    // composed into a board nobody reads. Every claimed pair, refusal included,
+    // settles through the same idempotent submit leg below, so a ControlBoard
+    // read can never poison the poller or drop a pair. The composition guard is
+    // held only around the read; it never crosses the submit leg.
+    //
+    // NOT REACHABLE AT RUNTIME (#1187 piece C, verified against the current
+    // Kernel source). No claimed pair can carry `controlboard.read`, so the
+    // predicate below is always false and this branch is source-reachable only.
+    // The Kernel queues a host request for this outbound poller exactly when
+    // `host_request_route::check_local_read_admission` resolves selectors, and
+    // `host_request_route::local_read_selectors_from_tool` returns selectors
+    // only for `tool.name == "eliot.query"` whose `envelope.identity.capability`
+    // equals it; `host_request_route::KernelComposition::claim_local_read_pair`
+    // then independently skips every candidate whose
+    // `envelope.identity.capability != "eliot.query"`. Both gates are in
+    // `bins/eliot-kernel/src/host_request_route.rs`, cited by symbol rather than
+    // by line, because a line number in a comment is wrong the next time the
+    // file moves. No host request naming the broker-admitted
+    // `controlboard.read` or `operator.command` capability is ever queued for, or
+    // claimed by, this poller, so neither reaches a daemon branch here. The same
+    // two gates make the `is_skill_tool` branches above unreachable as well; that
+    // is recorded for root, not claimed here.
+    //
+    // Consequence for the operator command: adding an `operator.command` branch
+    // here would NOT create a production caller, and claiming one would be false.
+    // The missing owner act is the Kernel's poller routing for that
+    // broker-admitted capability, which is outside `bins/eliotd` and outside this
+    // issue's mutable scope.
+    if eliotd::is_controlboard_read_tool(&tool) {
+        let body = {
+            let guard = composition.lock().await;
+            eliotd::serve_controlboard_view(&guard, &envelope, &attempt)
+        };
+        let outcome = match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+        };
+        // #2647: this leg builds a board over the composition and reads it; it
+        // attaches no startup capability and re-evaluates no readiness, so the
+        // flight observed nothing and carries no delta. Settling it therefore
+        // cannot overwrite owner observations the loop recorded meanwhile, the
+        // same contract the ordinary forwarded read below settles under.
+        return Ok(step(outcome, None));
+    }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
@@ -2187,6 +2357,214 @@ async fn submit_local_read_result_idempotent(
             .map_err(|error| {
                 format!("Kernel local-read result submit: {first_error}; retry: {error}")
             }),
+    }
+}
+
+/// What one settled observe poll step produced (issue #2565).
+///
+/// `Deferred` is the honest steady state while the Governor observation
+/// owner has no connected admission: the pair retired, the durable record
+/// `Routed`, no effect produced. `Settled` means the record already closed.
+/// `Expired` is the expected claim/defer race; `StaleAttempt` quarantines a
+/// superseded capability (the next claim mints the current generation anew).
+/// Every outcome idles until the next tick; only a step failure fails the
+/// daemon closed.
+enum ObservePollOutcome {
+    IdleBackoff,
+    Deferred,
+    Settled,
+    Expired,
+    StaleAttempt,
+}
+
+/// Completion of one in-flight observe step. Claim, serve, and defer share
+/// one flight branch so health and shutdown stay pollable while the step is
+/// outstanding; the step handles at most one pair per tick.
+enum ObserveCompletion {
+    Settled(Result<ObserveStep, String>),
+}
+
+/// What one settled observe step produced: its poll outcome plus the exact
+/// owner identity the serve named, so the loop's own record distinguishes
+/// which admission is still missing without reading payload bytes.
+struct ObserveStep {
+    /// The poll outcome the loop acts on.
+    outcome: ObservePollOutcome,
+    /// Served suboperation discriminator (`None` on an empty claim).
+    suboperation: Option<&'static str>,
+    /// Missing owner admission the serve named (`None` on an empty claim).
+    owner_capability: Option<&'static str>,
+    /// Residual program that owns the missing semantics (`None` on an empty claim).
+    residual_owner: Option<&'static str>,
+    /// Exact condition that resumes the deferred pair (`None` on an empty claim).
+    resume: Option<&'static str>,
+}
+
+struct ObserveFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = ObserveCompletion>>>,
+}
+
+/// Sole owner of observe poll state in `run_loop`, mirroring
+/// [`LocalReadFlight`]. `Idle` means no observe work is outstanding;
+/// `InFlight` holds the one pending poll step. No second owner and no second
+/// concurrent observe step exist.
+enum ObserveFlight {
+    Idle,
+    InFlight(ObserveFlightState),
+}
+
+/// Pure tick gate: the observe timer starts work only when the flight is
+/// idle. The in-flight step is polled in its own `select!` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObserveTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_observe_tick(flight: &ObserveFlight) -> ObserveTickDecision {
+    match flight {
+        ObserveFlight::Idle => ObserveTickDecision::StartPoll,
+        ObserveFlight::InFlight(_) => ObserveTickDecision::SkipInFlight,
+    }
+}
+
+fn start_observe_poll(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Pin<Box<dyn std::future::Future<Output = ObserveCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move { ObserveCompletion::Settled(run_observe_poll(&kernel_clone).await) })
+}
+
+/// Starts the observe poll step when its flight is idle. Checked on the same
+/// tick as the other pollers so the observe queue stays live while an
+/// activation or a local read is in flight.
+fn maybe_start_observe_poll(kernel: &Arc<DaemonKernelClient>, flight: &mut ObserveFlight) {
+    if decide_observe_tick(flight) == ObserveTickDecision::StartPoll {
+        *flight = ObserveFlight::InFlight(ObserveFlightState {
+            future: start_observe_poll(kernel),
+        });
+    }
+}
+
+/// Polls the one in-flight observe step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding.
+async fn next_observe_completion(flight: &mut ObserveFlight) -> ObserveCompletion {
+    match flight {
+        ObserveFlight::Idle => std::future::pending::<ObserveCompletion>().await,
+        ObserveFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed observe step back to idle. Every outcome — null-poll
+/// backoff, honest deferral, settled record, the expected expiry race, or a
+/// stale attempt quarantine (the next claim mints or returns the current
+/// generation) — simply idles until the next tick; only a step failure fails
+/// the daemon closed.
+fn settle_observe_completion(
+    completion: ObserveCompletion,
+    flight: &mut ObserveFlight,
+) -> Result<(), String> {
+    match completion {
+        ObserveCompletion::Settled(Ok(step)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.observe_settled",
+                outcome = observe_outcome_name(&step.outcome),
+                suboperation = step.suboperation.unwrap_or("none"),
+                owner_capability = step.owner_capability.unwrap_or("none"),
+                residual_owner = step.residual_owner.unwrap_or("none"),
+                resume = step.resume.unwrap_or("none"),
+            );
+            *flight = ObserveFlight::Idle;
+            Ok(())
+        }
+        ObserveCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Names one settled observe poll outcome for the loop's own record.
+fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
+    match outcome {
+        ObservePollOutcome::IdleBackoff => "idle_backoff",
+        ObservePollOutcome::Deferred => "deferred",
+        ObservePollOutcome::Settled => "settled",
+        ObservePollOutcome::Expired => "expired",
+        ObservePollOutcome::StaleAttempt => "stale_attempt",
+    }
+}
+
+/// Runs one observe poll step: `semantic_observe_claim` (pair plus fenced
+/// attempt capability, or null meaning backoff), then
+/// [`serve_admitted_observe`] for the admitted pair under that attempt, then
+/// `semantic_observe_deferred` with the served deferral (deferred, settled,
+/// the expected expiry race, or the stale-attempt quarantine). Exact
+/// replays stay idempotent by Kernel contract. Any step failure fails the
+/// daemon closed — a claimed pair that cannot serve or defer is never
+/// silently discarded. A stale capability is never retried: the step settles
+/// and the next tick claims the current generation anew.
+async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, String> {
+    // #740: receipt span over the claim/serve/defer poll step. Pair
+    // presence and defer outcome are named; payload bytes never are.
+    let _span = tracing::info_span!("eliotd.observe_poll").entered();
+    let pair = kernel
+        .claim_observe_pair_async()
+        .await
+        .map_err(|error| format!("Kernel observe pair claim: {error}"))?;
+    let Some((envelope, tool, attempt)) = pair else {
+        return Ok(ObserveStep {
+            outcome: ObservePollOutcome::IdleBackoff,
+            suboperation: None,
+            owner_capability: None,
+            residual_owner: None,
+            resume: None,
+        });
+    };
+    let operation_id = host_request_operation_id(&envelope);
+    let request_digest = envelope.envelope_sha256.clone();
+    let deferral = serve_admitted_observe(&envelope, &tool, &attempt)
+        .map_err(|error| format!("daemon observe serve: {error}"))?;
+    let step = |outcome: ObservePollOutcome| ObserveStep {
+        outcome,
+        suboperation: Some(deferral.suboperation.as_str()),
+        owner_capability: Some(deferral.owner_capability),
+        residual_owner: Some(deferral.residual_owner),
+        resume: Some(deferral.resume),
+    };
+    let outcome =
+        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
+            .await?
+        {
+            ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
+            ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
+            ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
+            ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+        };
+    Ok(step(outcome))
+}
+
+/// Defers one served observe pair, retrying once with byte-identical
+/// arguments when the first defer fails.
+///
+/// The retry is safe because the Kernel defer leg is idempotent — an
+/// identical defer under the same live attempt retires once and replays
+/// (`Routed` stays `Routed`), never duplicates. Only transport failures
+/// retry: `Expired`, `Settled`, and `StaleAttempt` are settled outcomes, so
+/// a quarantined capability is never resubmitted.
+async fn defer_observe_pair_idempotent(
+    kernel: &DaemonKernelClient,
+    operation_id: &str,
+    request_digest: &str,
+    attempt: &eliot_protocol::LocalReadAttempt,
+) -> Result<ObserveDeferOutcome, String> {
+    match kernel
+        .defer_observe_claim_async(operation_id, request_digest, attempt)
+        .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .defer_observe_claim_async(operation_id, request_digest, attempt)
+            .await
+            .map_err(|error| format!("Kernel observe defer: {first_error}; retry: {error}")),
     }
 }
 
@@ -2812,12 +3190,14 @@ pub(super) fn project_daemon_position_response(
 /// The seven provider-role keys follow the T11 acquisition table: task frame,
 /// critical attention, current epistemic position, cue activation,
 /// negative memory, evidence/source assurance, and affordances. The
-/// understanding-projection read serves both the cue-activation and
-/// negative-memory roles through distinct closed selectors; the
-/// current-epistemic-position role payload doubles as the activation evidence
-/// bound to the admitted fence. An eighth role key, a missing role, or a
-/// duplicate role is a denominator mismatch and fails closed — never silent
-/// absorption.
+/// understanding-projection read carries one exact closed `selector`; the
+/// cue-activation and negative-memory roles share a single physical read only
+/// when they deliberately address the same source snapshot, and otherwise each
+/// plans its own read, so this denominator stays seven roles over six or seven
+/// physical reads. The current-epistemic-position role payload doubles as the
+/// activation evidence bound to the admitted fence. An eighth role key, a
+/// missing role, or a duplicate role is a denominator mismatch and fails
+/// closed — never silent absorption.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -2863,24 +3243,105 @@ impl RoleReadout {
     }
 }
 
-/// Plans one closed parameter-free reconstruction role read.
+/// The catalogue-declared explicit bound key every owner handler parses.
 ///
-/// Shared shape check for the four T11.3 task-bound reads (`GetTaskState`,
+/// `eliot_store_api::operation_parameters` declares `max_records` as
+/// `Subject`-shaped text, so the bound travels as its **decimal string**; this
+/// is the only place the daemon renders one.
+const DAEMON_MAX_RECORDS_KEY: &str = "max_records";
+
+/// Fills the store catalogue's declared selector map for one T11.3
+/// reconstruction role read from the caller-resolved exact values.
+///
+/// The key set, the required/optional shape and the declared text shape all
+/// come from [`eliot_store_api::declared_read_parameters`] — the single
+/// catalogue that the Governor producer builds its own `NamedParameters` from
+/// and that the Kernel capability gate validates with
+/// [`eliot_store_api::validate_typed_read_parameters`]. This seam therefore
+/// keeps no second parameter list and cannot drift from the owner: it fills
+/// exactly the declared keys, refuses a resolved value the operation does not
+/// declare, and refuses a missing required declaration.
+///
+/// The declared bound key takes the caller's explicit bound as its decimal
+/// string (the exact form every owner handler parses). Every other declared
+/// key takes the caller's exact resolved text; a blank, control-bearing or
+/// numeric value is refused here, and an OPTIONAL declared key with no
+/// resolved value is OMITTED entirely rather than sent as null — the declared
+/// "no specific problem is requested" contract option, which the
+/// `GetAttentionAndProblems` handler answers with its own exact null.
+///
+/// A bound outside `1..=EVIDENCE_PACK_MAX_RECORDS` fails closed: that numeric
+/// range is the one restriction the declaration does not carry, and the store
+/// owner enforces it on every handler.
+fn daemon_reconstruction_parameters(
+    operation: eliot_store_api::NamedReadOperation,
+    role: &'static str,
+    resolved: &[(&str, &str)],
+    max_records: u32,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    if max_records == 0 || max_records > eliot_store_api::EVIDENCE_PACK_MAX_RECORDS {
+        return Err(format!(
+            "daemon reconstruction {role} read max_records must be within 1..=EVIDENCE_PACK_MAX_RECORDS"
+        ));
+    }
+    let mut parameters = std::collections::BTreeMap::new();
+    for declaration in eliot_store_api::declared_read_parameters(operation) {
+        let value = if declaration.name == DAEMON_MAX_RECORDS_KEY {
+            Some(max_records.to_string())
+        } else {
+            resolved
+                .iter()
+                .find(|(name, _)| *name == declaration.name)
+                .map(|(_, value)| (*value).to_owned())
+        };
+        match value {
+            Some(text) if text.trim().is_empty() || text.chars().any(char::is_control) => {
+                return Err(format!(
+                    "daemon reconstruction {role} read {} must be non-blank text with no control characters",
+                    declaration.name
+                ));
+            }
+            Some(text) => {
+                parameters.insert(declaration.name.to_owned(), serde_json::Value::String(text));
+            }
+            None if declaration.required => {
+                return Err(format!(
+                    "daemon reconstruction {role} read requires its declared {} selector",
+                    declaration.name
+                ));
+            }
+            None => {}
+        }
+    }
+    for (name, _) in resolved {
+        if !parameters.contains_key(*name) {
+            return Err(format!(
+                "daemon reconstruction {role} read selector {name} is not declared for this operation"
+            ));
+        }
+    }
+    eliot_store_api::validate_typed_read_parameters(operation, &parameters)
+        .map_err(|error| format!("daemon reconstruction {role} read selectors: {error}"))?;
+    Ok(parameters)
+}
+
+/// Plans one closed T11.3 reconstruction role read with the catalogue's exact
+/// selectors.
+///
+/// Shared shape check for the four task-bound reads (`GetTaskState`,
 /// `GetAttentionAndProblems`, `GetUnderstandingProjectionInputs`,
 /// `GetCapabilityEvidenceState`): scope-bound, `ExactFence` against the exact
-/// admitted fence, and no parameters. The closed store catalogue (T11.3 store
-/// activation) declares bounded exact selectors for these reads
-/// (`task_id`+`max_records`, optional `problem_id`+`max_records`,
-/// `selector`+`max_records`, `skill_id`+`max_records`), so a parameter-free
-/// plan does not pass catalogue validation: it reports unadmitted through
-/// [`context_reconstruction_role_admission`] and production dispatch must not
-/// call it until a follow-up threads the closed selectors. A fence change
-/// surfaces as a mismatch, never as a previous generation served as current.
+/// admitted fence, and carrying the closed selector map the store catalogue
+/// declares for `operation` — no fabricated `all` selector, no empty default,
+/// and no second parameter list. A fence change surfaces as a mismatch, never
+/// as a previous generation served as current.
 fn plan_daemon_reconstruction_role_read(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
     operation: eliot_store_api::NamedReadOperation,
     role: &'static str,
+    resolved: &[(&str, &str)],
+    max_records: u32,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
         return Err(format!(
@@ -2889,12 +3350,13 @@ fn plan_daemon_reconstruction_role_read(
     }
     let scope = eliot_store_api::ScopeId::new(scope_id)
         .map_err(|error| format!("daemon reconstruction {role} read scope: {error}"))?;
+    let parameters = daemon_reconstruction_parameters(operation, role, resolved, max_records)?;
     let request = eliot_store_api::NamedReadRequest {
         operation,
         scope_id: Some(scope),
         consistency: eliot_store_api::ReadConsistency::ExactFence,
         state_fence: fence.clone(),
-        parameters: std::collections::BTreeMap::new(),
+        parameters,
     };
     request
         .validate()
@@ -2902,21 +3364,39 @@ fn plan_daemon_reconstruction_role_read(
     Ok(request)
 }
 
-/// Projects one successful parameter-free role response into daemon content.
+/// Projects one successful T11.3 role response into daemon content.
 ///
-/// Returns the exact store payload crossed unchanged under its role key with
-/// the operation identity. Fails closed when the operation does not match the
-/// planned role read or the fence does not match the admitted fence. No
-/// payload-field requirements live here: the owning Governor reconstruction
-/// composition interprets owner payload shapes; this seam only preserves
-/// operation/fence identity.
+/// Binds the answer to the exact read it was asked for before it becomes daemon
+/// content: the planned operation, the admitted fence, the requested scope,
+/// the requested selector the owner handler echoes (`selector_key` must equal
+/// `expected_selector`, or be the handler's exact null when no specific
+/// identity was requested), the source-envelope version, a `records` array,
+/// and the authoritative `matched_total`/`returned`/`truncated` provenance.
+/// A response answering a different task, problem, source selector or skill is
+/// refused even when its operation and fence match, and a payload whose
+/// provenance does not describe its own records is never projected as
+/// present.
+///
+/// The exact counts cross unchanged beside the payload so the owning Governor
+/// reconstruction composition can derive the role disposition from them; this
+/// seam does not decide admission, capability qualification or packet
+/// readiness from a successful retrieval.
 fn project_daemon_role_response(
     response: &eliot_store_api::NamedReadResponse,
     admitted_fence: &eliot_contracts::StateFence,
+    scope_id: &str,
     operation: eliot_store_api::NamedReadOperation,
     operation_name: &'static str,
     role: &'static str,
+    selector_key: &'static str,
+    expected_selector: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+        return Err(
+            "daemon reconstruction role scope must be non-blank with no control characters"
+                .to_owned(),
+        );
+    }
     if response.operation != operation {
         return Err(format!(
             "daemon reconstruction {role} response operation must be {operation_name}"
@@ -2930,10 +3410,70 @@ fn project_daemon_role_response(
     response
         .validate()
         .map_err(|error| format!("daemon reconstruction {role} response: {error}"))?;
+    let payload = &response.payload;
+    if payload.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(format!(
+            "daemon reconstruction {role} response payload version is unsupported"
+        ));
+    }
+    if payload.get("scope_id").and_then(serde_json::Value::as_str) != Some(scope_id) {
+        return Err(format!(
+            "daemon reconstruction {role} response scope does not match the requested scope"
+        ));
+    }
+    match (payload.get(selector_key), expected_selector) {
+        (Some(serde_json::Value::String(echoed)), Some(expected)) if echoed == expected => {}
+        (Some(serde_json::Value::Null), None) => {}
+        _ => {
+            return Err(format!(
+                "daemon reconstruction {role} response {selector_key} does not match the requested selector"
+            ));
+        }
+    }
+    let Some(records) = payload.get("records").and_then(serde_json::Value::as_array) else {
+        return Err(format!(
+            "daemon reconstruction {role} response payload misses its records array"
+        ));
+    };
+    let provenance = payload
+        .get("provenance")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!("daemon reconstruction {role} response payload misses its provenance")
+        })?;
+    let matched_total = provenance
+        .get("matched_total")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            format!("daemon reconstruction {role} response provenance misses matched_total")
+        })?;
+    let returned = provenance
+        .get("returned")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            format!("daemon reconstruction {role} response provenance misses returned")
+        })?;
+    let truncated = provenance
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            format!("daemon reconstruction {role} response provenance misses truncated")
+        })?;
+    if truncated != (matched_total > returned) {
+        return Err(format!(
+            "daemon reconstruction {role} response provenance truncation flag contradicts its counts"
+        ));
+    }
+    if returned != records.len() as u64 {
+        return Err(format!(
+            "daemon reconstruction {role} response provenance returned count contradicts its records"
+        ));
+    }
     // Dynamic role key: `serde_json::json!` would freeze an identifier key as
     // a literal, so the object is built imperatively to carry the payload
-    // under its exact role key alongside the operation/role identity.
-    let mut object = serde_json::Map::with_capacity(3);
+    // under its exact role key alongside the operation/role identity and the
+    // observed counts.
+    let mut object = serde_json::Map::with_capacity(6);
     object.insert(
         "operation".to_owned(),
         serde_json::Value::String(operation_name.to_owned()),
@@ -2943,10 +3483,14 @@ fn project_daemon_role_response(
         serde_json::Value::String(role.to_owned()),
     );
     object.insert(role.to_owned(), response.payload.clone());
+    object.insert("matched_total".to_owned(), matched_total.into());
+    object.insert("returned".to_owned(), returned.into());
+    object.insert("truncated".to_owned(), truncated.into());
     Ok(serde_json::Value::Object(object))
 }
 
-/// Plans one closed T11.3 `GetTaskState` read for the daemon reconstruction path.
+/// Plans one closed T11.3 `GetTaskState` read for the daemon reconstruction
+/// path, carrying the catalogue's exact `task_id` + `max_records` selectors.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -2954,17 +3498,25 @@ fn project_daemon_role_response(
 pub(super) fn plan_daemon_task_state_read(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
+    task_id: &str,
+    max_records: u32,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     plan_daemon_reconstruction_role_read(
         fence,
         scope_id,
         eliot_store_api::NamedReadOperation::GetTaskState,
         "task frame",
+        &[("task_id", task_id)],
+        max_records,
     )
 }
 
 /// Plans one closed T11.3 `GetAttentionAndProblems` read for the daemon
-/// reconstruction path.
+/// reconstruction path, carrying the catalogue's `max_records` bound plus the
+/// exact `problem_id` when one is requested. `None` is the declared "no
+/// specific problem is requested" contract option: the `problem_id` key is
+/// then omitted rather than sent as a substituted identity, and the handler
+/// answers with its own exact null.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -2972,19 +3524,28 @@ pub(super) fn plan_daemon_task_state_read(
 pub(super) fn plan_daemon_attention_read(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
+    problem_id: Option<&str>,
+    max_records: u32,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
+    let resolved: &[(&str, &str)] = match problem_id {
+        Some(problem_id) => &[("problem_id", problem_id)],
+        None => &[],
+    };
     plan_daemon_reconstruction_role_read(
         fence,
         scope_id,
         eliot_store_api::NamedReadOperation::GetAttentionAndProblems,
         "critical attention",
+        resolved,
+        max_records,
     )
 }
 
 /// Plans one closed T11.3 `GetUnderstandingProjectionInputs` read for the
-/// daemon reconstruction path. The single read serves both the cue-activation
-/// and negative-memory roles through distinct closed selectors interpreted by
-/// the owning Governor reconstruction composition.
+/// daemon reconstruction path, carrying the catalogue's exact `selector` +
+/// `max_records` for one resolved source set. The cue-activation and
+/// negative-memory roles plan their OWN selector, so one unrelated source
+/// snapshot is never relabelled into both roles.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -2992,17 +3553,22 @@ pub(super) fn plan_daemon_attention_read(
 pub(super) fn plan_daemon_understanding_inputs_read(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
+    selector: &str,
+    max_records: u32,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     plan_daemon_reconstruction_role_read(
         fence,
         scope_id,
         eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs,
         "understanding inputs",
+        &[("selector", selector)],
+        max_records,
     )
 }
 
 /// Plans one closed T11.3 `GetCapabilityEvidenceState` read for the daemon
-/// reconstruction path (affordances role).
+/// reconstruction path (affordances role), carrying the catalogue's exact
+/// `skill_id` + `max_records` selectors instead of an empty map.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3010,16 +3576,21 @@ pub(super) fn plan_daemon_understanding_inputs_read(
 pub(super) fn plan_daemon_capability_evidence_read(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
+    skill_id: &str,
+    max_records: u32,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     plan_daemon_reconstruction_role_read(
         fence,
         scope_id,
         eliot_store_api::NamedReadOperation::GetCapabilityEvidenceState,
         "affordances",
+        &[("skill_id", skill_id)],
+        max_records,
     )
 }
 
-/// Projects a successful task-state response into the daemon query content.
+/// Projects a successful task-state response into the daemon query content,
+/// bound to the exact `task_id` this read was asked for.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3027,18 +3598,24 @@ pub(super) fn plan_daemon_capability_evidence_read(
 pub(super) fn project_daemon_task_state_response(
     response: &eliot_store_api::NamedReadResponse,
     admitted_fence: &eliot_contracts::StateFence,
+    scope_id: &str,
+    expected_task_id: &str,
 ) -> Result<serde_json::Value, String> {
     project_daemon_role_response(
         response,
         admitted_fence,
+        scope_id,
         eliot_store_api::NamedReadOperation::GetTaskState,
         "GetTaskState",
         "task_frame",
+        "task_id",
+        Some(expected_task_id),
     )
 }
 
 /// Projects a successful attention-and-problems response into the daemon
-/// query content.
+/// query content, bound to the requested scope and to the exact `problem_id`
+/// (or to the handler's exact null when no specific problem was requested).
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3046,21 +3623,26 @@ pub(super) fn project_daemon_task_state_response(
 pub(super) fn project_daemon_attention_response(
     response: &eliot_store_api::NamedReadResponse,
     admitted_fence: &eliot_contracts::StateFence,
+    scope_id: &str,
+    expected_problem_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     project_daemon_role_response(
         response,
         admitted_fence,
+        scope_id,
         eliot_store_api::NamedReadOperation::GetAttentionAndProblems,
         "GetAttentionAndProblems",
         "critical_attention",
+        "problem_id",
+        expected_problem_id,
     )
 }
 
 /// Projects a successful understanding-projection-inputs response into the
-/// daemon query content. Both the cue-activation and negative-memory roles
-/// project from this one payload in the owning Governor reconstruction
-/// composition; this seam preserves the payload unchanged under the shared
-/// role key.
+/// daemon query content, bound to the exact `selector` that read requested.
+/// The cue-activation and negative-memory roles project from their OWN
+/// selector, so an answer to a different source set is never relabelled into
+/// both roles.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3068,18 +3650,24 @@ pub(super) fn project_daemon_attention_response(
 pub(super) fn project_daemon_understanding_inputs_response(
     response: &eliot_store_api::NamedReadResponse,
     admitted_fence: &eliot_contracts::StateFence,
+    scope_id: &str,
+    expected_selector: &str,
 ) -> Result<serde_json::Value, String> {
     project_daemon_role_response(
         response,
         admitted_fence,
+        scope_id,
         eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs,
         "GetUnderstandingProjectionInputs",
         "understanding_inputs",
+        "selector",
+        Some(expected_selector),
     )
 }
 
 /// Projects a successful capability-evidence response into the daemon query
-/// content (affordances role).
+/// content (affordances role), bound to the exact `skill_id` this read was
+/// asked for.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3087,32 +3675,79 @@ pub(super) fn project_daemon_understanding_inputs_response(
 pub(super) fn project_daemon_capability_evidence_response(
     response: &eliot_store_api::NamedReadResponse,
     admitted_fence: &eliot_contracts::StateFence,
+    scope_id: &str,
+    expected_skill_id: &str,
 ) -> Result<serde_json::Value, String> {
     project_daemon_role_response(
         response,
         admitted_fence,
+        scope_id,
         eliot_store_api::NamedReadOperation::GetCapabilityEvidenceState,
         "GetCapabilityEvidenceState",
         "affordances",
+        "skill_id",
+        Some(expected_skill_id),
     )
 }
 
-/// Plans the closed six-read `ContextReconstruction` closure for the daemon.
+/// Exact owner-resolved selectors for one daemon-side T11.3 reconstruction
+/// closure.
 ///
-/// Canonical role order: the four T11.3 role reads (currently parameter-free
-/// plans; the store catalogue requires their bounded exact selectors, so they
-/// report unadmitted until a follow-up threads them), then the
-/// T11.1 evidence-pack read (explicit `subject`/`max_records` selectors) and
-/// the T11.2 position read (explicit `position` selector, doubling as the
-/// activation evidence). This mirrors the Governor read facade's
-/// `ContextReconstruction` intent gate without depending on it: `bins/eliotd`
-/// owns no `eliot-read` dependency, so the six operations are listed
-/// explicitly here and must stay in parity with that gate. Free text never
-/// becomes a selector and no second consistency algorithm lives here. The
-/// store catalogue remains the authority: use
+/// One closed carrier instead of a positional argument list: every member is an
+/// exact value the store catalogue declares for one reconstruction read, and
+/// the closure cannot be planned without all of them. There is no fabricated
+/// `all` selector and no empty default anywhere in this shape — the daemon must
+/// say which task, problem, source sets and skill it means before any read is
+/// planned, exactly as the Governor producer's own request does.
+///
+/// `problem_id` is the only optional member: `None` is the declared "no
+/// specific problem is requested" contract option, and the `problem_id` key is
+/// then omitted rather than sent as a substituted identity. `max_records` is
+/// the shared explicit bound for the four task-bound reads and travels as its
+/// decimal string; the T11.1 evidence bound and the T11.2 position selector
+/// stay separate closure members, so no role silently reuses another's bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "T11.3 registration API; production bridge dispatch carries it once the daemon dispatches the query route"
+)]
+pub(super) struct DaemonReconstructionSelectors<'a> {
+    /// Exact `task_id` for the task-frame read.
+    pub(super) task_id: &'a str,
+    /// Exact `problem_id` for the attention read, or `None` when no specific
+    /// problem is requested.
+    pub(super) problem_id: Option<&'a str>,
+    /// Exact `selector` for the cue-activation projection read.
+    pub(super) cue_selector: &'a str,
+    /// Exact `selector` for the negative-memory projection read.
+    pub(super) negative_memory_selector: &'a str,
+    /// Exact `skill_id` for the affordances read.
+    pub(super) skill_id: &'a str,
+    /// Explicit shared bound for the four task-bound reads.
+    pub(super) max_records: u32,
+}
+
+/// Plans the closed `ContextReconstruction` closure for the daemon.
+///
+/// Canonical role order: the four T11.3 role reads (each carrying the closed
+/// selectors the store catalogue declares for it, so the plans this produces
+/// are exactly the requests the Kernel capability gate admits and the store
+/// handlers serve), then the T11.1 evidence-pack read (explicit
+/// `subject`/`max_records` selectors) and the T11.2 position read (explicit
+/// `position` selector, doubling as the activation evidence). This mirrors the
+/// Governor read facade's `ContextReconstruction` intent gate without
+/// depending on it: `bins/eliotd` owns no `eliot-read` dependency, so the
+/// operations are listed explicitly here and must stay in parity with that
+/// gate. Free text never becomes a selector and no second consistency
+/// algorithm lives here.
+///
+/// The closure is six physical reads when the cue-activation and
+/// negative-memory slots deliberately address the SAME exact source snapshot
+/// (identical `selector`), and seven when they address different source sets:
+/// a differing selector gets its own read, so one unrelated result is never
+/// relabelled into both roles. The store catalogue remains the authority: use
 /// [`context_reconstruction_role_admission`] to check manifest admission
-/// before dispatch — production bridge dispatch calls this planner once the
-/// manifest admits the query route.
+/// before dispatch.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3120,18 +3755,43 @@ pub(super) fn project_daemon_capability_evidence_response(
 pub(super) fn plan_daemon_context_reconstruction(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
+    selectors: DaemonReconstructionSelectors<'_>,
     subject: &str,
     max_records: &str,
     position: &str,
 ) -> Result<Vec<eliot_store_api::NamedReadRequest>, String> {
-    Ok(vec![
-        plan_daemon_task_state_read(fence, scope_id)?,
-        plan_daemon_attention_read(fence, scope_id)?,
-        plan_daemon_understanding_inputs_read(fence, scope_id)?,
-        plan_daemon_capability_evidence_read(fence, scope_id)?,
-        plan_daemon_evidence_read(fence, scope_id, subject, max_records)?,
-        plan_daemon_position_read(fence, scope_id, position)?,
-    ])
+    let mut planned = vec![
+        plan_daemon_task_state_read(fence, scope_id, selectors.task_id, selectors.max_records)?,
+        plan_daemon_attention_read(fence, scope_id, selectors.problem_id, selectors.max_records)?,
+        plan_daemon_understanding_inputs_read(
+            fence,
+            scope_id,
+            selectors.cue_selector,
+            selectors.max_records,
+        )?,
+    ];
+    if selectors.negative_memory_selector != selectors.cue_selector {
+        planned.push(plan_daemon_understanding_inputs_read(
+            fence,
+            scope_id,
+            selectors.negative_memory_selector,
+            selectors.max_records,
+        )?);
+    }
+    planned.push(plan_daemon_capability_evidence_read(
+        fence,
+        scope_id,
+        selectors.skill_id,
+        selectors.max_records,
+    )?);
+    planned.push(plan_daemon_evidence_read(
+        fence,
+        scope_id,
+        subject,
+        max_records,
+    )?);
+    planned.push(plan_daemon_position_read(fence, scope_id, position)?);
+    Ok(planned)
 }
 
 /// Reports per-operation catalogue admission for the reconstruction closure.
@@ -3142,6 +3802,11 @@ pub(super) fn plan_daemon_context_reconstruction(
 /// reports `false` and production dispatch must not call it; an unadmitted
 /// role is reported `Unsupported` by the assembly, distinctly from an
 /// authoritative `KnownEmpty`.
+///
+/// The four T11.3 role plans are now selector-complete, so their admission
+/// result reflects the real catalogue decision for the exact requested
+/// selectors instead of a parameter-free request the catalogue can only
+/// refuse.
 #[allow(
     dead_code,
     reason = "T11.3 registration API; production bridge dispatch calls it once the manifest admits the query route"
@@ -3149,12 +3814,19 @@ pub(super) fn plan_daemon_context_reconstruction(
 pub(super) fn context_reconstruction_role_admission(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
+    selectors: DaemonReconstructionSelectors<'_>,
     subject: &str,
     max_records: &str,
     position: &str,
 ) -> Result<Vec<(&'static str, bool)>, String> {
-    let planned =
-        plan_daemon_context_reconstruction(fence, scope_id, subject, max_records, position)?;
+    let planned = plan_daemon_context_reconstruction(
+        fence,
+        scope_id,
+        selectors,
+        subject,
+        max_records,
+        position,
+    )?;
     let entries = eliot_store_api::generated_operation_manifests()
         .map_err(|error| format!("daemon reconstruction admission manifests: {error}"))?;
     let mut admission = Vec::with_capacity(planned.len());

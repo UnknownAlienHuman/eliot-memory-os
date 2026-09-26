@@ -133,6 +133,19 @@ fn valid_revision(
     }
 }
 
+/// Builds the owner-issued denominator completeness block this double
+/// serves. The double answers with an empty revision-head set, so the
+/// read revision is the digest of exactly that empty set and the page is
+/// owner-proven complete (it is the whole recorded projection).
+fn empty_head_completeness(returned: usize) -> Value {
+    serde_json::json!({
+        "read_revision": eliot_store_api::audit_heads_digest(&[])
+            .expect("empty revision-head set digest"),
+        "returned": returned,
+        "coverage": "COMPLETE",
+    })
+}
+
 /// Echo store double: records admitted transitions and serves read
 /// projections derived from exactly what was applied. Manufactured
 /// frames only, never admission authority.
@@ -403,10 +416,12 @@ impl CanonicalStoreClient for FakeStore {
                         })
                     })
                     .collect();
+                let returned = revisions.len();
                 serde_json::json!({
                     "revisions": revisions,
-                    "revision": revisions.len(),
+                    "revision": returned,
                     "state_fence": query.state_fence,
+                    "completeness": empty_head_completeness(returned),
                 })
             }
             "invocations" => {
@@ -423,10 +438,12 @@ impl CanonicalStoreClient for FakeStore {
                         })
                     })
                     .collect();
+                let returned = invocations.len();
                 serde_json::json!({
                     "invocations": invocations,
-                    "revision": invocations.len(),
+                    "revision": returned,
                     "state_fence": query.state_fence,
+                    "completeness": empty_head_completeness(returned),
                 })
             }
             "failure" => serde_json::json!({

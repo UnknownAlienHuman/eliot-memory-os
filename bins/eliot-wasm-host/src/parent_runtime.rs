@@ -1,72 +1,71 @@
-//! Production parent-drive runtime assembly (issue #1955).
+//! Production parent-drive runtime assembly (issue #1955, #2568).
 //!
-//! Connects staged owner-admitted dispatch material to the injected WASM
-//! runtime through live-constructed execution ports. Every input is
-//! owner-issued or caller-provided: the material (owner-published bytes),
-//! the governor ports (central-built from live Governor records — the typed
-//! handoff this path consumes), the installed image (re-hashed real bytes),
-//! and edge time (read once at composition, enforced against the owner
-//! window by the contour and permit types). Nothing here mints authority,
-//! issues caller-clock freshness, or fabricates receipts: the ephemeral
-//! permit authority binds only the owner grant, and unbound inputs refuse
+//! Connects the owner-admitted delivery set to the injected WASM runtime
+//! through live-constructed execution ports. Every input is owner-issued or
+//! caller-provided: the material (owner-published bytes), the local owner
+//! adapters (built from those same records inside
+//! [`resolve_kernel_port_grant`](crate::admission::resolve_kernel_port_grant)),
+//! the installed image (re-hashed real bytes), and edge time (read once at
+//! the composition boundary, enforced against the owner window by the
+//! contour and permit types). Nothing here mints authority, issues
+//! caller-clock freshness, or fabricates receipts: the ephemeral permit
+//! authority binds only the owner grant, and unbound inputs refuse
 //! fail-closed before any spawn.
+//!
+//! Exactly one engine mode is seated per granted execution, inside the port
+//! resolution: the isolated parent/child owner this P-03 profile requires.
+//! The in-process Wasmtime provider is never paired with it, and the
+//! one-shot guest-child protocol and the experimental describe path stay
+//! separate modes reachable only through their own CLI branches.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eliot_process::{
-    CancellationReceipt, EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError,
-    Generation, ImageId, JobId, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessIntent,
-    ProcessStartReceipt, ProcessTreeId, ResourceLimits, SessionId,
+    EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError, Generation, ImageId, JobId,
+    OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessIntent, ProcessTreeId,
+    ResourceLimits, SessionId,
 };
-use eliot_process_executor::{WindowsProcessExecutor, wasm_p03_adapter::WasmP03ProcessAdapter};
-use eliot_wasm_runtime::{
-    AuthorityResolutionPort, EngineBinding, GovernorResolutionPort, P03ReceiptVerifierPort,
-    PortError, ProcessBinding, ProcessLaunchEnvelope, PromotionVerificationPort, RuntimePorts,
-    Sha256Digest, SourceVerificationPort, WasmRuntime,
-};
+use eliot_wasm_runtime::{EngineBinding, InvocationRequest, Sha256Digest, WasmRuntime};
 
-use crate::child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
-use crate::contour::PINNED_WASMTIME_VERSION;
-use crate::dispatch_drive::{
-    DispatchDriveResponse, DriveError, drive_admission, guest_exec_argv, map_invocation_result,
-};
+use crate::WasmHostRunner;
+use crate::admission::{LiveAuthority, PortGrantError, resolve_kernel_port_grant};
+use crate::contour::AdmittedGeneration;
+use crate::dispatch_drive::{DriveError, drive_admission};
 use crate::dispatch_material::{
     ValidatedDispatchMaterial, WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
 };
-use crate::installed_binary::{WasmHostBinaryBinding, resolve_installed_binary};
-use crate::parent_authority::ParentDispatchAuthority;
-use crate::typed_bindings::typed_wit_digest;
-use crate::wasmtime_provider::provider_configuration_digest;
+use crate::installed_binary::WasmHostBinaryBinding;
 
-/// Central-built governor ports this drive consumes.
-///
-/// Constructed by the invocation owner from live Governor records (never
-/// locally); the drive builds the process, receipt-verifier, and engine
-/// slots itself from the admitted material because only the drive holds the
-/// per-drive one-shot permit they must validate. Central MUST NOT depend on
-/// its own process/engine slots being used on this path.
-pub struct GovernorPorts {
-    /// Manifest, generation, lease, revision, and limit resolution.
-    pub governor: Box<dyn GovernorResolutionPort>,
-    /// Owner, `WorkScope`, work-unit, and ceiling resolution.
-    pub authority: Box<dyn AuthorityResolutionPort>,
-    /// Independent source verification.
-    pub source_verifier: Box<dyn SourceVerificationPort>,
-    /// Conformance/shadow/canary/rollback verification.
-    pub promotion_verifier: Box<dyn PromotionVerificationPort>,
-}
+/// Mailbox capacity ceiling: the loop is a bounded request surface, never
+/// an unbounded queue.
+const MAX_MAILBOX_CAPACITY: usize = 8;
+/// Data-concurrency ceiling: the admitted profile's instance ceiling
+/// bounds it further, so this is only the outer guard.
+const MAX_CONCURRENCY: usize = 4;
+/// One reserved control slot per mailbox, so cancellation, reconciliation,
+/// and shutdown stay processable while guest work is pending.
+const CONTROL_RESERVE: usize = 1;
+/// One selection per ready lane before the scheduler rotates.
+const FAIRNESS_QUANTUM: usize = 1;
+/// A single admission runs one operation; a second failure has no budget.
+const RESTART_BUDGET: usize = 0;
+/// Rolling restart window in seconds.
+const RESTART_WINDOW_SECONDS: u64 = 1;
+/// Initial restart delay in milliseconds.
+const RESTART_BACKOFF_MS: u64 = 1;
 
 /// Bounded production evidence sink: retains evidence up to the cap, then
 /// fails closed (never drops retained evidence silently).
-struct BoundedParentSink {
+pub(crate) struct BoundedParentSink {
     retained: Mutex<Vec<ProcessEvidence>>,
 }
 
 impl BoundedParentSink {
     const CAP: usize = 1024;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             retained: Mutex::new(Vec::new()),
         }
@@ -88,60 +87,9 @@ impl ProcessEvidenceSink for BoundedParentSink {
     }
 }
 
-/// Narrow P-03 receipt verifier: re-proves binding/receipt/envelope
-/// agreement on real records without minting proof. Start requires the
-/// receipt to name the bound operation and digest plus the envelope
-/// invocation; cancellation checks the same binding; reconciliation
-/// requires a terminal lifecycle on the bound operation.
-struct ParentReceiptVerifier;
-
-impl P03ReceiptVerifierPort for ParentReceiptVerifier {
-    fn verify_start(
-        &mut self,
-        binding: &ProcessBinding,
-        receipt: &ProcessStartReceipt,
-        envelope: &ProcessLaunchEnvelope,
-    ) -> Result<(), PortError> {
-        if receipt.operation_id() != binding.operation_id()
-            || receipt.request_digest() != binding.request_digest()
-            || envelope.invocation_id.as_str() != binding.operation_id().as_str()
-        {
-            return Err(PortError::Denied);
-        }
-        Ok(())
-    }
-
-    fn verify_cancellation(
-        &mut self,
-        binding: &ProcessBinding,
-        _receipt: &CancellationReceipt,
-        envelope: &ProcessLaunchEnvelope,
-    ) -> Result<(), PortError> {
-        if envelope.invocation_id.as_str() != binding.operation_id().as_str() {
-            return Err(PortError::Denied);
-        }
-        Ok(())
-    }
-
-    fn verify_reconciliation(
-        &mut self,
-        binding: &ProcessBinding,
-        evidence: &ProcessEvidence,
-        envelope: &ProcessLaunchEnvelope,
-    ) -> Result<(), PortError> {
-        if envelope.invocation_id.as_str() != binding.operation_id().as_str() {
-            return Err(PortError::Denied);
-        }
-        if !evidence.view().lifecycle().is_terminal() {
-            return Err(PortError::UnknownOutcome);
-        }
-        Ok(())
-    }
-}
-
 /// Derives the exact immutable `ProcessIntent` for the admitted child.
 /// Every identity is admitted material; paths are the OS loader layout.
-fn derive_parent_intent(
+pub(crate) fn derive_parent_intent(
     material: &ValidatedDispatchMaterial,
     executable: &std::path::Path,
     host_digest: &Sha256Digest,
@@ -176,7 +124,7 @@ fn derive_parent_intent(
     let directory = executable
         .parent()
         .ok_or_else(|| intent_field("executable-dir"))?;
-    let argv = guest_exec_argv(
+    let argv = crate::dispatch_drive::guest_exec_argv(
         material.profile,
         &directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME),
         &directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME),
@@ -199,77 +147,79 @@ fn derive_parent_intent(
     .map_err(|_| intent_field("intent"))
 }
 
-/// Drives one owner-admitted parent dispatch through a fully assembled
-/// runtime to the canonical response.
+/// A granted execution assembled and ready to serve requests: the runner
+/// with its single admitted engine mode, the exact sealed invocation, the
+/// admitted generation the request must match, the seated engine binding,
+/// and the live authority cell the loop keeps current.
+pub struct AdmittedRuntime {
+    /// Runner over the resolved local port set.
+    pub runner: WasmHostRunner,
+    /// The exact sealed invocation assembled from admitted material.
+    pub invocation: InvocationRequest,
+    /// The admitted generation the request is gated against.
+    pub admitted: AdmittedGeneration,
+    /// The engine mode actually seated.
+    pub engine_binding: EngineBinding,
+    /// Shared live authority cell for the granted window.
+    pub live: Arc<LiveAuthority>,
+}
+
+/// Bounds the composed scheduler by the admitted profile: instance ceiling
+/// for data capacity, a fixed reserved control slot, and the granted wall
+/// deadline as the shutdown grace so drain work can never outlive the grant.
+fn runtime_config(material: &ValidatedDispatchMaterial) -> eliot_runtime::RuntimeConfig {
+    let instances = usize::try_from(material.ceilings.max_instances)
+        .unwrap_or(1)
+        .max(1);
+    eliot_runtime::RuntimeConfig {
+        mailbox_capacity: instances.min(MAX_MAILBOX_CAPACITY),
+        control_reserve: CONTROL_RESERVE,
+        concurrency: instances.min(MAX_CONCURRENCY),
+        control_concurrency_reserve: CONTROL_RESERVE,
+        fairness_quantum: FAIRNESS_QUANTUM,
+        restart_budget: RESTART_BUDGET,
+        restart_window: Duration::from_secs(RESTART_WINDOW_SECONDS),
+        restart_backoff: Duration::from_millis(RESTART_BACKOFF_MS),
+        shutdown_grace: Duration::from_millis(material.ceilings.wall_deadline_ms),
+    }
+}
+
+/// Assembles the granted execution for one owner-admitted delivery set.
 ///
-/// Assembles the pure admission (`drive_admission`), the ephemeral permit
-/// authority bound to the owner grant, the real executor/sink/adapter, the
-/// seated child engine over re-hashed image bytes, and the complete port
-/// set (central governor 4-tuple plus drive-built process, receipt
-/// verifier, and engine). `now_ms` is composition-edge time, read once by
-/// the caller. Any unbound input refuses before any spawn.
-pub fn drive_parent_runtime(
+/// Order: pure admission over admitted values, the installation binding for
+/// this process's own image, the local port-set resolution (one-shot P-03
+/// permit over the real executor plus the local owner proxies), and finally
+/// the runner over exactly that port set. Any unbound or substituted input
+/// refuses before any spawn.
+pub fn build_admitted_runtime(
     material: &ValidatedDispatchMaterial,
-    governor: GovernorPorts,
     now_ms: u64,
-) -> Result<DispatchDriveResponse, DriveError> {
-    let (request, _admitted) = drive_admission(material)?;
-    let grant = &material.grant;
-    let epoch: eliot_contracts::EpochId = serde_json::from_str(&grant.authority_epoch_json)
-        .map_err(|_| DriveError::Admission {
-            field: "authority-epoch",
-        })?;
+) -> Result<AdmittedRuntime, DriveError> {
+    let (invocation, admitted) = drive_admission(material)?;
+    // The host bootstraps only through the approved launch path: its own
+    // installation-approved image, re-proven against the owner-measured
+    // digest. No ambient path, build output, or environment participates.
     let executable =
         std::env::current_exe().map_err(|_| DriveError::Execution { stage: "locator" })?;
     let binding = WasmHostBinaryBinding::new(executable, material.host_artifact_digest.clone())
         .map_err(|_| DriveError::Admission {
             field: "image-binding",
         })?;
-    let installed = resolve_installed_binary(&binding).map_err(|_| DriveError::Admission {
-        field: "image-resolve",
-    })?;
-    let host_digest = installed.digest().clone();
-    let executable_path = installed.path().to_path_buf();
-    let working_directory = executable_path
-        .parent()
-        .ok_or(DriveError::Intent {
-            field: "working-directory",
-        })?
-        .to_path_buf();
-    let authority = ParentDispatchAuthority::activate(material, &epoch)?;
-    let intent =
-        derive_parent_intent(material, &executable_path, &host_digest, &working_directory)?;
-    let issued = authority.issue_permit(&intent, now_ms)?;
-    let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(authority)));
-    let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(BoundedParentSink::new());
-    let process = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink));
-    process
-        .stage_admitted_request(issued)
-        .map_err(|_| DriveError::Execution { stage: "stage" })?;
-    let engine_binding = EngineBinding {
-        implementation_id: ISOLATED_CHILD_IMPLEMENTATION_ID.to_owned(),
-        exact_version: PINNED_WASMTIME_VERSION.to_owned(),
-        engine_artifact_digest: host_digest.clone(),
-        engine_configuration_digest: provider_configuration_digest(),
-        wit_interface_digest: typed_wit_digest(),
-    };
-    let engine = IsolatedChildEngine::new(
-        Arc::clone(&executor),
-        Arc::clone(&sink),
-        engine_binding,
-        material.ceilings.artifact_digest.clone(),
-        provider_configuration_digest(),
-    );
-    let ports = RuntimePorts::new(
-        governor.governor,
-        governor.authority,
-        governor.source_verifier,
-        governor.promotion_verifier,
-        Box::new(process),
-        Box::new(ParentReceiptVerifier),
-        Box::new(engine),
-    );
-    let mut runtime = WasmRuntime::new(Some(ports));
-    let result = runtime.execute(request);
-    map_invocation_result(&result, material)
+    let grant = resolve_kernel_port_grant(material, &binding, now_ms)
+        .map_err(|error: PortGrantError| DriveError::Grant { code: error.code() })?;
+    let runtime = eliot_runtime::Runtime::new(runtime_config(material), None)
+        .map_err(|_| DriveError::Admission { field: "runtime" })?;
+    let runner = WasmHostRunner::new(
+        material.profile,
+        runtime,
+        WasmRuntime::new(Some(grant.ports)),
+    )
+    .map_err(|_| DriveError::Admission { field: "runner" })?;
+    Ok(AdmittedRuntime {
+        runner,
+        invocation,
+        admitted,
+        engine_binding: grant.engine_binding,
+        live: grant.live,
+    })
 }

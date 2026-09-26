@@ -4076,14 +4076,19 @@ def _collect_external_evidence(root: Path, manifest_data: dict) -> tuple[list[Fi
 
 
 def check_external_executables(
-    root: Path | dict, manifest_data: dict | None = None
+    root: Path | dict, manifest_data: dict | None = None, *, evidence_out: dict | None = None
 ) -> list[Finding]:
     # Keep the one-argument helper form compatible with the existing focused
     # verifier tests while allowing the real run to probe from its repository root.
+    # Production callers pass evidence_out to retain the exact observation from
+    # the same single collection run instead of probing external binaries twice.
     if manifest_data is None:
         manifest_data = root if isinstance(root, dict) else {}
         root = Path(".")
-    findings, _ = _collect_external_evidence(root, manifest_data)
+    findings, evidence = _collect_external_evidence(root, manifest_data)
+    if evidence_out is not None:
+        evidence_out.clear()
+        evidence_out.update(evidence)
     return findings
 
 
@@ -5990,7 +5995,8 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     all_findings.extend(check_exception_lock_drift(manifest_data, ecosystem_denominator))
 
     # 7. Check external executables and retain the exact observation for the receipt.
-    ext_findings, external_evidence = _collect_external_evidence(root, manifest_data)
+    external_evidence: dict = {}
+    ext_findings = check_external_executables(root, manifest_data, evidence_out=external_evidence)
     all_findings.extend(ext_findings)
 
     # 8. Run cargo deny scanner

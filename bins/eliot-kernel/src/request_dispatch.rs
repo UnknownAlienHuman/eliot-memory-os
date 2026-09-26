@@ -3,20 +3,30 @@
 //! Closed backup entry: exactly three operations (`backup.create`,
 //! `backup.verify`, `backup.restore-test`) selected by the operation string,
 //! each validated to its exact payload shape before any owner is named.
-//! Rehearsal only: this route performs no capture, no coordination commit,
-//! no store import, and no activation/retirement/cutover. Missing owners
-//! refuse as typed replies (`refused`/`blocked` with `code = plan_gap`),
-//! never as fake success and never silently.
+//! `backup.verify` reaches the real capture owner and answers from it; the
+//! other two remain rehearsal-only and perform no capture, no coordination
+//! commit, no store import, and no activation/retirement/cutover. Missing
+//! owners refuse as typed replies (`refused`/`blocked` with
+//! `code = plan_gap`), never as fake success and never silently.
 //!
 //! Why each refusal is honest rather than a validation gap:
 //! - `backup.create` admits bounded capture descriptors, then refuses naming
 //!   the capture owner (`backup-capture-owner (#959)`, open): admitting
 //!   capture here would invent authority.
-//! - `backup.verify` admits the bounded inline bundle bytes (hex shape only),
-//!   then refuses naming the decode owner (`backup-verify-owner`;
-//!   eliot-backup decode edge, owning lane #960 follow-up): archive decode
-//!   goes real when the Cargo edge lands. No new Cargo dependency is added
-//!   here.
+//! - `backup.verify` admits the bounded inline bundle bytes, then decodes and
+//!   validates them through the real capture owner
+//!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
+//!   and reachable through [`KernelComposition::backup_capture`]). The
+//!   manifest, every member disposition, the evidenced class and the
+//!   archive/kernel fence join are the owner's answers: a hex shape and a
+//!   self-reported checksum are never verification. What this proves is
+//!   STRUCTURAL validity plus a join to the live generation - recomputed
+//!   checksums, the class's own requirements and `export_fence.state_fence`
+//!   equality. It is NOT provenance: nothing in the path is signed, `StateFence`
+//!   is publicly observable through `ServerHello`, and no member denominator is
+//!   checked on the verify path. The `eliot-backup` edge this route needs is
+//!   already declared in `bins/eliot-kernel/Cargo.toml`, so no dependency is
+//!   added here. Verification publishes nothing and mutates nothing.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
 //!   admissibility, provisioning shape, store-level isolation inequality),
@@ -39,12 +49,20 @@
 use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
-use eliot_ipc::{Session, TransportError};
+use eliot_ipc::{PeerIdentity, Session, TransportError};
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde_json::{Map, Value};
 
-use super::{KernelFrameAction, status_frame};
+use super::backup_capture::{
+    MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT, class_name,
+    member_domain_count,
+};
+use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
+use super::{
+    CaptureCallerAuth, CaptureReport, CaptureState, KernelCaptureError, KernelComposition,
+    KernelFrameAction, status_frame,
+};
 
 /// Closed backup create operation selector (mirrored by the operator CLI
 /// surface; the string only selects this entry, never authority).
@@ -373,69 +391,249 @@ fn handle_backup_create(payload: &Value, idempotency_key: &str) -> Value {
     )
 }
 
-/// Handles one backup verify frame: admits the bounded inline bundle bytes by
-/// hex shape, then refuses with the exact missing decode owner.
+/// Projects this transport's own admission into the capture owner's
+/// caller-admission shape, or fences the session.
 ///
-/// Archive decode belongs to the eliot-backup edge (owning lane #960
-/// follow-up, open): decoding without it would invent the owner library, so
-/// the only honest outcome after shape admission is a typed `plan_gap`
-/// naming that edge. Shape failures refuse as `invalid` before any owner is
-/// named. Decode goes real when the Cargo edge lands; no new Cargo
-/// dependency is added here.
-fn handle_backup_verify(payload: &Value, idempotency_key: &str) -> Value {
-    let Some(object) = payload.as_object() else {
-        return invalid_reply(
-            BACKUP_VERIFY_OPERATION,
-            idempotency_key,
-            "backup.verify",
-            "payload must be a JSON object",
-        );
+/// The capture owner takes [`CaptureCallerAuth`] as owner-supplied admission
+/// evidence and refuses an unadmitted caller before it touches a protected
+/// owner source or publishes anything. Nothing here is taken from the payload,
+/// the archive or the caller:
+///
+/// - the peer identity was proved by the platform adapter's SID/ACL/
+///   impersonation proof ([`PeerIdentity::Authenticated`]);
+/// - the session must carry exactly one capability, and it must be
+///   [`DAEMON_FRONT_DOOR_CAPABILITY`] - this Kernel's own server-allowed
+///   capability for the daemon/operator front-door class, read from the policy
+///   declaration itself. The Host `UserAutomation` capability is the policy's
+///   only other entry and its binder asserts an exact single value, and the
+///   Doctor, `TestD` and native-worker binders overwrite the field with their own
+///   server-minted wire ids. So an exact `daemon` match excludes every
+///   specialised owner session instead of admitting "any session that happens
+///   to carry one capability".
+///
+/// A session that fails either check is **fenced**, not answered: an
+/// authorisation refusal is not a malformed request, and replying `invalid`
+/// would tell the operator to correct a field they do not control. This mirrors
+/// [`crate::dreamer_job_dispatch`]'s exact module-and-capability admission and
+/// the `daemon_request_dispatch` module gate.
+fn admit_backup_caller(session: &Session) -> Result<CaptureCallerAuth, TransportError> {
+    let PeerIdentity::Authenticated {
+        user_identity,
+        session_identity,
+        ..
+    } = &session.peer
+    else {
+        return Err(TransportError::SessionFenced);
     };
-    if let Err(reason) = require_exact_keys(object, &["bundle_hex"]) {
-        return invalid_reply(
-            BACKUP_VERIFY_OPERATION,
-            idempotency_key,
-            "backup.verify",
-            &reason,
-        );
+    if session.capabilities.len() != 1 || session.capabilities[0] != DAEMON_FRONT_DOOR_CAPABILITY {
+        return Err(TransportError::SessionFenced);
     }
-    let bundle_hex = match get_str(object, "bundle_hex") {
-        Ok(bundle_hex) => bundle_hex,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                "backup.bundle_hex",
-                &reason,
-            );
-        }
-    };
-    let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
-        Ok(bundle_raw) => bundle_raw,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                "backup.bundle_hex",
-                &reason,
-            );
-        }
-    };
-    if bundle_raw.is_empty() {
-        return invalid_reply(
-            BACKUP_VERIFY_OPERATION,
-            idempotency_key,
-            "backup.bundle_hex",
-            "bundle bytes must be non-empty",
-        );
+    Ok(CaptureCallerAuth {
+        principal: format!("{user_identity}@{session_identity}"),
+        capability: session.capabilities[0].clone(),
+        admitted: true,
+    })
+}
+
+/// Bounds one owner-supplied reason before it reaches the operator wire.
+///
+/// Owner error text can embed archive-controlled identifiers, and the operator
+/// surface documents `reason` as bounded and prints it verbatim, so a reason is
+/// truncated at the route's own operator text bound instead of being relayed
+/// unbounded. Truncation is on a char boundary and never splits a UTF-8
+/// sequence.
+fn bounded_reason(reason: &str) -> String {
+    if reason.len() <= BACKUP_TEXT_MAX {
+        return reason.to_owned();
     }
-    refused_reply(
+    let mut end = BACKUP_TEXT_MAX;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
+}
+
+/// Maps one typed capture-owner refusal onto the route's closed reply set.
+///
+/// The operator surface admits exactly three verify statuses: `ok`, `invalid`,
+/// and a `plan_gap` refusal, and it treats any other `code` on a `refused`
+/// reply as a result mismatch. Verify has no missing owner left to name, so
+/// every owner refusal - an unadmitted caller, an incoherent archive relation,
+/// an unsupported class, a budget or publication failure - is reported as a
+/// typed `invalid` naming the causal class. The reason is the OWNER's own
+/// `Display` text, bounded: this route never invents a second reason vocabulary
+/// next to the owner's, and never renders an owner state as a Rust `Debug`
+/// name on the operator wire.
+fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Value {
+    let field = match error {
+        KernelCaptureError::NotAdmitted => "backup.caller",
+        KernelCaptureError::InvalidInput { field, .. }
+        | KernelCaptureError::BudgetExceeded { field } => field,
+        KernelCaptureError::ClassCapabilityUnsupported { .. } => "backup.class",
+        KernelCaptureError::RelationIncoherent(_)
+        | KernelCaptureError::DenominatorIncomplete(_)
+        | KernelCaptureError::OwnerEvidenceInvalid(_)
+        | KernelCaptureError::ArchiveInvalid(_)
+        | KernelCaptureError::PublicationUnknown(_) => "backup.archive",
+        KernelCaptureError::Cancelled | KernelCaptureError::Unsupported { .. } => "backup.verify",
+    };
+    invalid_reply(
         BACKUP_VERIFY_OPERATION,
         idempotency_key,
-        "plan_gap",
-        "backup-verify-owner (eliot-backup decode edge; owning lane: #960 follow-up)",
-        "inline bundle bytes admit bounded hex shape here; archive decode goes real when the Cargo edge lands",
+        field,
+        &bounded_reason(&error.to_string()),
     )
+}
+
+/// Projects a complete capture-owner verification report into the route's `ok`
+/// envelope.
+///
+/// Every field is the owner's own answer: the archive identity (bounded to the
+/// same operator text limit the surface applies, so a structurally valid
+/// archive with an over-long identity cannot make the surface return a result
+/// mismatch), the evidenced class under the owner's single class-name spelling,
+/// the archive digest, the verify-only operation identity, the verification
+/// level the owner performed, and the per-domain member counts read from the
+/// owner's own dispositions through the owner's own count helper.
+fn verified_reply(report: &CaptureReport, idempotency_key: &str) -> Value {
+    let event_count = member_domain_count(report, MEMBER_DOMAIN_CANONICAL);
+    let receipt_count = member_domain_count(report, MEMBER_DOMAIN_RECEIPT);
+    let blob_count = member_domain_count(report, MEMBER_DOMAIN_BLOB);
+    // The operator surface applies its own bounded-text check to `bundle_id`
+    // and would answer a result mismatch for an over-long identity, so the
+    // route refuses with the owner's own class reason instead of emitting an
+    // `ok` the surface cannot project.
+    if report.backup_id.len() > BACKUP_TEXT_MAX {
+        return invalid_reply(
+            BACKUP_VERIFY_OPERATION,
+            idempotency_key,
+            "backup.archive",
+            "archive identity exceeds the bounded operator text length",
+        );
+    }
+    backup_reply(
+        BACKUP_VERIFY_OPERATION,
+        "ok",
+        idempotency_key,
+        vec![
+            ("bundle_id", Value::String(report.backup_id.clone())),
+            ("class", Value::String(class_name(report.class).to_owned())),
+            (
+                "integrity_sha256",
+                Value::String(report.archive_sha256.clone()),
+            ),
+            ("operation_id", Value::String(report.operation_id.clone())),
+            (
+                "verification_level",
+                Value::String(report.verification_level.to_owned()),
+            ),
+            ("event_count", Value::from(event_count)),
+            ("receipt_count", Value::from(receipt_count)),
+            ("blob_count", Value::from(blob_count)),
+        ],
+    )
+}
+
+impl KernelComposition {
+    /// Handles one backup verify frame: admits the bounded inline bundle bytes,
+    /// then decodes and validates them through the real capture owner.
+    ///
+    /// The owner is [`super::backup_capture::KernelBackupCapture`], already bound
+    /// on the composition by #959; this route supplies only what a front door
+    /// legitimately holds: the presented bytes, the session's own admission
+    /// projection, and the Kernel's live state fence. Manifest, member integrity,
+    /// the closed class rules and the archive/kernel fence join are the owner's
+    /// answers, so a corrupted archive refuses as a typed `invalid` carrying the
+    /// owner's own reason instead of a shape check passing. Shape failures refuse
+    /// as `invalid` before the owner is called at all.
+    fn handle_backup_verify(
+        &self,
+        session: &Session,
+        payload: &Value,
+        idempotency_key: &str,
+    ) -> Result<Value, TransportError> {
+        let Some(object) = payload.as_object() else {
+            return Ok(invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "backup.verify",
+                "payload must be a JSON object",
+            ));
+        };
+        if let Err(reason) = require_exact_keys(object, &["bundle_hex"]) {
+            return Ok(invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "backup.verify",
+                &reason,
+            ));
+        }
+        let bundle_hex = match get_str(object, "bundle_hex") {
+            Ok(bundle_hex) => bundle_hex,
+            Err(reason) => {
+                return Ok(invalid_reply(
+                    BACKUP_VERIFY_OPERATION,
+                    idempotency_key,
+                    "backup.bundle_hex",
+                    &reason,
+                ));
+            }
+        };
+        let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
+            Ok(bundle_raw) => bundle_raw,
+            Err(reason) => {
+                return Ok(invalid_reply(
+                    BACKUP_VERIFY_OPERATION,
+                    idempotency_key,
+                    "backup.bundle_hex",
+                    &reason,
+                ));
+            }
+        };
+        if bundle_raw.is_empty() {
+            return Ok(invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "backup.bundle_hex",
+                "bundle bytes must be non-empty",
+            ));
+        }
+        let caller = admit_backup_caller(session)?;
+        let report = match self.backup_capture().verify_only(
+            &bundle_raw,
+            &caller,
+            &session.module_generation.state_fence,
+        ) {
+            Ok(report) => report,
+            Err(error) => return Ok(capture_error_reply(idempotency_key, &error)),
+        };
+        // The owner reports class completeness, and the operator surface promotes
+        // an `ok` envelope to a verified archive. A degraded or scope class is
+        // structurally valid but cannot claim completeness, so it refuses with the
+        // owner's own reason instead of being promoted.
+        if !matches!(report.state, CaptureState::Complete) {
+            let reason = match &report.state {
+                CaptureState::Incomplete { reason } | CaptureState::Unknown { reason } => {
+                    reason.clone()
+                }
+                // Every remaining terminal state is reported with stable prose
+                // rather than a Rust `Debug` name, so no owner state leaks an
+                // internal enum spelling onto the operator wire.
+                CaptureState::Cancelled => "capture owner cancelled the verification".to_owned(),
+                CaptureState::Unsupported { reason } => reason.clone(),
+                CaptureState::Complete => {
+                    "capture owner reported completeness after a completeness refusal".to_owned()
+                }
+            };
+            return Ok(invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "backup.class",
+                &bounded_reason(&reason),
+            ));
+        }
+        Ok(verified_reply(&report, idempotency_key))
+    }
 }
 
 /// Validates the restore target shape and binds the exact authority tuple,
@@ -801,86 +999,97 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
     )
 }
 
-/// Dispatches one backup frame from an admitted session.
-///
-/// Mirrors the sibling native-worker route entry shape: request identity
-/// presence, session fence join, connection join, JSON payload, and exact
-/// operation allowlist are all re-checked here so direct callers cannot
-/// bypass them. The `operation` routing selector is stripped before the
-/// params object reaches the handlers so their exact-key shape checks see
-/// only command fields. Domain outcomes return as typed reply frames; only
-/// authentication, session, fence, and routing failures fence.
-///
-/// Service-readiness and peer-authentication gates stay with the
-/// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
-/// this free function must not duplicate.
-pub(crate) fn dispatch_backup_frame(
-    session: &Session,
-    frame: &Frame,
-) -> Result<KernelFrameAction, TransportError> {
-    let request_id = frame
-        .request_id
-        .clone()
-        .ok_or(TransportError::SessionFenced)?;
-    let identity = frame
-        .request_identity
-        .as_ref()
-        .ok_or(TransportError::SessionFenced)?;
-    if !session
-        .module_generation
-        .state_fence
-        .is_compatible_with(&identity.request.state_fence)
-    {
-        return Err(TransportError::SessionFenced);
-    }
-    if frame.connection_id != session.connection_id {
-        return Err(TransportError::SessionFenced);
-    }
-    let payload = match &frame.payload {
-        ProtocolPayload::Json(payload) => payload.clone(),
-        _ => return Err(TransportError::SessionFenced),
-    };
-    let operation = payload
-        .get("operation")
-        .and_then(Value::as_str)
-        .ok_or(TransportError::SessionFenced)?
-        .to_owned();
-    if !is_backup_operation(&operation) {
-        return Err(TransportError::SessionFenced);
-    }
-    let idempotency_key = identity.idempotency_key.as_str();
-    if idempotency_key.trim().is_empty() {
-        return Err(TransportError::SessionFenced);
-    }
-    let params = match payload {
-        Value::Object(mut map) => {
-            map.remove("operation");
-            // The one canonical EBP envelope is `{operation, payload}`: the
-            // authenticated `KernelClient` sets `operation` as the routing
-            // selector and carries the command fields inside `payload`.
-            // Descend exactly one level and no deeper, so the handlers'
-            // exact-key checks still see only command fields and no caller can
-            // smuggle extra top-level keys past them. A frame with no
-            // `payload` member keeps the flat shape, and a non-object
-            // `payload` is handed on so the handlers refuse it on shape.
-            match map.remove("payload") {
-                Some(Value::Object(fields)) => Value::Object(fields),
-                Some(other) => other,
-                None => Value::Object(map),
-            }
+impl KernelComposition {
+    /// Dispatches one backup frame from an admitted session.
+    ///
+    /// Mirrors the sibling native-worker route entry shape: request identity
+    /// presence, session fence join, connection join, JSON payload, and exact
+    /// operation allowlist are all re-checked here so direct callers cannot
+    /// bypass them. The `operation` routing selector is stripped before the
+    /// params object reaches the handlers so their exact-key shape checks see
+    /// only command fields. Domain outcomes return as typed reply frames; only
+    /// authentication, session, fence, and routing failures fence.
+    ///
+    /// The receiver is the composition, exactly like the sibling `TestD` and
+    /// Dreamer route entries: `backup.verify` reaches the real capture owner held at
+    /// [`KernelComposition::backup_capture`], and no second dispatch entry is
+    /// introduced. `backup.create` and `backup.restore-test` still refuse naming
+    /// their missing owners, so binding the receiver changes no other behaviour.
+    ///
+    /// Service-readiness and peer-authentication gates stay with the
+    /// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
+    /// this method must not duplicate.
+    pub(crate) fn dispatch_backup_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
         }
-        other => other,
-    };
-    let reply = match operation.as_str() {
-        BACKUP_CREATE_OPERATION => handle_backup_create(&params, idempotency_key),
-        BACKUP_VERIFY_OPERATION => handle_backup_verify(&params, idempotency_key),
-        BACKUP_RESTORE_TEST_OPERATION => handle_backup_restore_test(&params, idempotency_key),
-        _ => return Err(TransportError::SessionFenced),
-    };
-    let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, reply)?;
-    frame.request_id = Some(request_id);
-    frame
-        .validate()
-        .map_err(|_| TransportError::SessionFenced)?;
-    Ok(KernelFrameAction::Reply(frame))
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(Value::as_str)
+            .ok_or(TransportError::SessionFenced)?
+            .to_owned();
+        if !is_backup_operation(&operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        let idempotency_key = identity.idempotency_key.as_str();
+        if idempotency_key.trim().is_empty() {
+            return Err(TransportError::SessionFenced);
+        }
+        let params = match payload {
+            Value::Object(mut map) => {
+                map.remove("operation");
+                // The one canonical EBP envelope is `{operation, payload}`: the
+                // authenticated `KernelClient` sets `operation` as the routing
+                // selector and carries the command fields inside `payload`.
+                // Descend exactly one level and no deeper, so the handlers'
+                // exact-key checks still see only command fields and no caller can
+                // smuggle extra top-level keys past them. A frame with no
+                // `payload` member keeps the flat shape, and a non-object
+                // `payload` is handed on so the handlers refuse it on shape.
+                match map.remove("payload") {
+                    Some(Value::Object(fields)) => Value::Object(fields),
+                    Some(other) => other,
+                    None => Value::Object(map),
+                }
+            }
+            other => other,
+        };
+        let reply = match operation.as_str() {
+            BACKUP_CREATE_OPERATION => handle_backup_create(&params, idempotency_key),
+            BACKUP_VERIFY_OPERATION => {
+                self.handle_backup_verify(session, &params, idempotency_key)?
+            }
+            BACKUP_RESTORE_TEST_OPERATION => handle_backup_restore_test(&params, idempotency_key),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, reply)?;
+        frame.request_id = Some(request_id);
+        frame
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(frame))
+    }
 }

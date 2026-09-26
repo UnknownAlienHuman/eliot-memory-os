@@ -22,8 +22,8 @@
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
     ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
-    detect_no_progress, proposal_digest, reconcile_unknown_activation,
+    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, ProposalCommitment,
+    RollbackContract, assess_improvement_replay, reconcile_unknown_activation,
     run_improvement_candidate_pipeline,
 };
 
@@ -57,13 +57,16 @@ pub struct ImprovementRouteRequest<'a> {
 /// of `admit_improvement_candidate`). Pure thin forwarder: it constructs the
 /// Governor-owned [`eliot_maintenance::ImprovementPipelineInputs`] from the
 /// borrowed request and returns the advisory-only terminal disposition.
-/// Never promotes, activates, or completes; a `CanaryAdmitted` disposition
-/// carries only a handoff request for Kernel (`#11`) authorization.
+///
+/// The route deliberately computes no proposal digest of its own. The checked
+/// pipeline joins the inputs, computes exactly one commitment, and carries that
+/// commitment into the joined result, so a pre-validation digest computed here
+/// could only disagree with the committed one. Never promotes, activates, or
+/// completes; a `CanaryAdmitted` disposition carries an inspectable,
+/// non-authorizing handoff for Kernel (`#11`) authorization.
 pub fn route_improvement_candidate(
     request: ImprovementRouteRequest<'_>,
 ) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
-    let _proposal_digest = proposal_digest(request.proposal);
-    let _operation_owners = improvement_operation_owners(&request.rollback.rollback_owner_id);
     run_improvement_candidate_pipeline(ImprovementPipelineInputs {
         proposal: request.proposal,
         experiment: request.experiment,
@@ -135,16 +138,19 @@ pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, 
     ]
 }
 
-/// Reports whether a proposal repeats a prior digest without new signal.
+/// Assesses one current proposal against a retained prior commitment.
 ///
-/// Production caller of [`detect_no_progress`].
-#[must_use]
-pub fn check_improvement_repeat(
-    prior_digest: &str,
+/// Production caller of [`assess_improvement_replay`]. The retained commitment
+/// carries its own domain, encoding revision, and algorithm identity, so a
+/// legacy value is never matched as a current commitment. The caller supplies no
+/// progress boolean: a new proposal identity, a different digest, or a repeat
+/// all establish no progress by themselves, and no unknown external effect is
+/// cleared here. Effect retry stays with its own owner.
+pub fn assess_improvement_repeat(
+    prior: &ProposalCommitment,
     proposal: &ImprovementProposal,
-    new_discriminator: bool,
-) -> bool {
-    detect_no_progress(prior_digest, proposal, new_discriminator)
+) -> Result<eliot_maintenance::ImprovementReplayAssessment, eliot_maintenance::PipelineError> {
+    assess_improvement_replay(prior, proposal)
 }
 
 /// Reconciles an unknown external activation outcome without retrying blindly.

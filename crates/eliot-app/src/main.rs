@@ -21,7 +21,7 @@ mod security_scan;
 mod ul_cross_agent_runner;
 mod windows_service;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use disposition::run_facade_disposition_guards;
 use std::io::Write as _;
@@ -2058,12 +2058,203 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("eliot-governor main thread panicked"))?
 }
 
+/// Flagged Claude MCP front-door delegation (issue #2562; flag owned by
+/// #1719, refusal gate owned by #1858).
+///
+/// Once `ELIOT_CLAUDE_FRONT_DOOR=agent-bridge` retires the `claude` host
+/// edge, this process never serves MCP itself: it launches exactly one owned
+/// `eliot-agent-bridge.exe` child with the documented MCP argv and transfers
+/// the stdio session to it, then reports the child's exit status. The
+/// delegation is mechanical and runs before any legacy semantic
+/// initialization: no Governor, Store, WAL, or writer object is constructed
+/// on this path, and the shared `daemon run` runtime is never touched.
+///
+/// Resolution is anchored at the actual running executable, never at PATH or
+/// the working directory: the approved Bridge artifact must sit beside the
+/// launched Governor, and the installation-owned
+/// `agent-bridge/client-declaration-v2.json` must sit beside it. A missing
+/// or mismatched artifact or declaration fails here with an explicit
+/// diagnostic and no legacy fallback; the Bridge itself re-validates the
+/// declaration digest plus the live Kernel challenge before serving.
+/// Exactly one child is spawned through the argument vector (no shell, so
+/// Windows paths with spaces need no interpolation), with the protocol
+/// handles inherited so the child's stdout stays the MCP session. The wait
+/// is synchronous because this process has no other work once delegated:
+/// the delegation lifetime is exactly the child lifetime, nothing detaches,
+/// and the MCP session ends when the child ends.
+fn delegate_claude_mcp_to_agent_bridge() -> Result<std::process::ExitStatus> {
+    use std::process::{Command, Stdio};
+
+    const GOVERNOR_BINARY: &str = "eliot-governor.exe";
+    const BRIDGE_BINARY: &str = "eliot-agent-bridge.exe";
+    const DECLARATION_DIR: &str = "agent-bridge";
+    const DECLARATION_FILE: &str = "client-declaration-v2.json";
+
+    let governor = std::env::current_exe()
+        .context("resolve running Governor executable")?
+        .canonicalize()
+        .context("canonicalize running Governor executable")?;
+    if governor.file_name().and_then(|name| name.to_str()) != Some(GOVERNOR_BINARY) {
+        anyhow::bail!(
+            "refuse front-door delegation from unexpected binary {}: expected {GOVERNOR_BINARY}",
+            governor.display()
+        );
+    }
+    let exe_dir = governor
+        .parent()
+        .context("running Governor executable has no parent directory")?;
+    let bridge = exe_dir.join(BRIDGE_BINARY);
+    if !bridge.is_file() {
+        anyhow::bail!(
+            "flagged Claude MCP front door is selected but the approved Bridge artifact is missing: {} (Bridge exe ships beside the installed Governor; refusing without legacy fallback)",
+            bridge.display()
+        );
+    }
+    // Canonicalize before comparing so a symlinked or aliased layout cannot
+    // disguise a recursive delegation back into this binary.
+    let bridge_canonical = bridge
+        .canonicalize()
+        .context("canonicalize Bridge artifact")?;
+    if bridge_canonical == governor {
+        anyhow::bail!(
+            "refuse recursive front-door delegation: Bridge artifact resolves to the running Governor {}",
+            governor.display()
+        );
+    }
+    let declaration = exe_dir.join(DECLARATION_DIR).join(DECLARATION_FILE);
+    if !declaration.is_file() {
+        anyhow::bail!(
+            "flagged Claude MCP front door is selected but the installation-owned client declaration is missing: {} (refusing without legacy fallback; the bundle never invents it)",
+            declaration.display()
+        );
+    }
+    let mut child = Command::new(&bridge_canonical)
+        .arg("mcp")
+        .arg("--profile")
+        .arg("SPINE_FUNCTIONAL")
+        .arg("--transport")
+        .arg("stdio")
+        .arg("--client-declaration")
+        .arg(&declaration)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "launch flagged Claude MCP front door {}",
+                bridge_canonical.display()
+            )
+        })?;
+    child.wait().with_context(|| {
+        format!(
+            "wait for flagged Claude MCP front door {}",
+            bridge_canonical.display()
+        )
+    })
+}
+
+/// #1858 (I19.10): human-stable legacy entrypoint label for the front-door
+/// cutover diagnostic. Names every top-level `Command` arm so the single
+/// `dispatch_command` entry gate preserves identity/route evidence for
+/// whichever arm was invoked. Labels are diagnostic only; adding a `Command`
+/// variant without a label here fails to compile, so no arm can silently miss
+/// the gate's detail text.
+fn legacy_entrypoint_label(command: &Command) -> &'static str {
+    match command {
+        Command::Dogfood { .. } => "eliot-governor dogfood",
+        Command::Doctor { .. } => "eliot-governor doctor",
+        Command::DataRoot { .. } => "eliot-governor data-root",
+        Command::Backup { .. } => "eliot-governor backup",
+        Command::Restore { .. } => "eliot-governor restore",
+        Command::Export { .. } => "eliot-governor export",
+        Command::Import { .. } => "eliot-governor import",
+        Command::Blob { .. } => "eliot-governor blob",
+        Command::Cutover { .. } => "eliot-governor cutover",
+        Command::Maintenance { .. } => "eliot-governor maintenance",
+        Command::Incident { .. } => "eliot-governor incident",
+        Command::Daemon { .. } => "eliot-governor daemon",
+        Command::Service { .. } => "eliot-governor service",
+        Command::Ipc { .. } => "eliot-governor ipc",
+        Command::Credentials { .. } => "eliot-governor credentials",
+        Command::Security { .. } => "eliot-governor security",
+        Command::Readiness { .. } => "eliot-governor readiness",
+        Command::StartupRecovery { .. } => "eliot-governor startup-recovery",
+        Command::Db { .. } => "eliot-governor db",
+        Command::Writer { .. } => "eliot-governor writer",
+        Command::Memory { .. } => "eliot-governor memory",
+        Command::MemoryLifecycle { .. } => "eliot-governor memory-lifecycle",
+        Command::Skill { .. } => "eliot-governor skill",
+        Command::SkillCurator { .. } => "eliot-governor skill-curator",
+        Command::Graph { .. } => "eliot-governor graph",
+        Command::Ul { .. } => "eliot-governor ul",
+        Command::Codecortex { .. } => "eliot-governor codecortex",
+        Command::ExternalReview { .. } => "eliot-governor external-review",
+        Command::Delegate { .. } => "eliot-governor delegate",
+        Command::DelegationCalibration { .. } => "eliot-governor delegation-calibration",
+        Command::Antigravity { .. } => "eliot-governor antigravity",
+        Command::Eval { .. } => "eliot-governor eval",
+        Command::Verify { .. } => "eliot-governor verify",
+        Command::Metrics { .. } => "eliot-governor metrics",
+        Command::Trace { .. } => "eliot-governor trace",
+        Command::Replay { .. } => "eliot-governor replay",
+        Command::Sleep { .. } => "eliot-governor sleep",
+        Command::Dream { .. } => "eliot-governor dream",
+        Command::Action { .. } => "eliot-governor action",
+        Command::Patch { .. } => "eliot-governor patch",
+        Command::Work { .. } => "eliot-governor work",
+        Command::Worktree { .. } => "eliot-governor worktree",
+        Command::Blackboard { .. } => "eliot-governor blackboard",
+        Command::Mailbox { .. } => "eliot-governor mailbox",
+        Command::Recovery { .. } => "eliot-governor recovery",
+        Command::Legacy { .. } => "eliot-governor legacy",
+        Command::Collective { .. } => "eliot-governor collective",
+        Command::Runtime { .. } => "eliot-governor runtime",
+        Command::Module { .. } => "eliot-governor module",
+        Command::Logs { .. } => "eliot-governor logs",
+        Command::Adapter { .. } => "eliot-governor adapter",
+        Command::Verifier { .. } => "eliot-governor verifier",
+        Command::Hook { .. } => "eliot-governor hook",
+        Command::Mcp { command } => match command {
+            McpCommand::Stdio { .. } => "eliot-governor mcp stdio",
+            McpCommand::Catalog { .. } => "eliot-governor mcp catalog",
+        },
+        Command::Host { .. } => "eliot-governor host",
+        Command::ExternalAgent { .. } => "eliot-governor external-agent",
+        Command::CognitiveField { .. } => "eliot-governor cognitive-field",
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_command(
     config: &Path,
     command: Command,
     implicit_instance: Option<&str>,
 ) -> Result<()> {
+    // #1858 (I19.10): single front-door entry gate. Once the flag selects the
+    // new stack, every legacy entrypoint except `mcp stdio` refuses here with
+    // the stable cutover code plus the canonical-route receipt, before any arm
+    // handler runs — so no arm can reach a store start, WAL open, writer
+    // channel, daemon launch, or service dispatcher under the flag. `mcp
+    // stdio` falls through to its own arm, which emits the redirect receipt
+    // and delegates the session to the approved Bridge. Absent flag preserves
+    // today's behavior on every arm.
+    if front_door_cutover::front_door_cutover_selected()
+        && !matches!(
+            command,
+            Command::Mcp {
+                command: McpCommand::Stdio { .. },
+            }
+        )
+        && let Err(detail) =
+            front_door_cutover::gate_legacy_entrypoint(legacy_entrypoint_label(&command), None)
+    {
+        front_door_cutover::write_cutover_rejection(
+            front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+            &detail,
+        );
+        return Err(anyhow::anyhow!(detail));
+    }
     match command {
         Command::Dogfood { command } => match command {
             DogfoodCommand::Init {
@@ -2122,20 +2313,9 @@ async fn dispatch_command(
                 force,
             } => commands::run_daemon_init_default(config, &source_config, force),
             DaemonCommand::Run { instance } => {
-                // #1858 (I19.10): once the front-door flag selects the new
-                // stack, `daemon run` refuses with the stable cutover code plus
-                // the canonical-route receipt instead of starting DbClientSet,
-                // CanonicalStore, ControlWal, or WriterActor. Absent flag
-                // preserves the retained shared runtime.
-                if let Err(detail) =
-                    front_door_cutover::gate_legacy_entrypoint("eliot-governor daemon run", None)
-                {
-                    front_door_cutover::write_cutover_rejection(
-                        front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
-                        &detail,
-                    );
-                    return Err(anyhow::anyhow!(detail));
-                }
+                // #1858 (I19.10): refused at the `dispatch_command` entry gate
+                // once the front-door flag selects the new stack, before
+                // DbClientSet, CanonicalStore, ControlWal, or WriterActor.
                 commands::run_daemon(
                     config,
                     selected_instance(instance, implicit_instance).as_deref(),
@@ -2161,20 +2341,9 @@ async fn dispatch_command(
         },
         Command::Service { command } => match command {
             ServiceCommand::Run => {
-                // #1858 (I19.10): `service run` enters the same shared runtime
-                // as `daemon run`, so it carries the same front-door gate on
-                // the same terms: refuse with the stable cutover code plus the
-                // canonical-route receipt once the flag selects the new stack,
-                // before the Windows service dispatcher starts.
-                if let Err(detail) =
-                    front_door_cutover::gate_legacy_entrypoint("eliot-governor service run", None)
-                {
-                    front_door_cutover::write_cutover_rejection(
-                        front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
-                        &detail,
-                    );
-                    return Err(anyhow::anyhow!(detail));
-                }
+                // #1858 (I19.10): refused at the `dispatch_command` entry gate
+                // on the same terms as `daemon run`, before the Windows
+                // service dispatcher starts.
                 windows_service::run_dispatcher().map_err(Into::into)
             }
             ServiceCommand::Validate => commands::run_service_validate(config),
@@ -2470,20 +2639,9 @@ async fn dispatch_command(
         Command::Adapter { command } => dispatch_adapter_command(config, command).await,
         Command::Verifier { command } => dispatch_verifier_command(config, command).await,
         Command::Hook { command } => {
-            // #1858 (I19.10): hook arms are a legacy entrypoint on the same
-            // terms as the other dispatch arms. Once the front-door flag
-            // selects the new stack, every hook event refuses with the stable
-            // cutover code plus the canonical-route receipt before any hook
+            // #1858 (I19.10): refused at the `dispatch_command` entry gate
+            // once the front-door flag selects the new stack, before any hook
             // processing or store-backed work starts.
-            if let Err(detail) =
-                front_door_cutover::gate_legacy_entrypoint("eliot-governor hook", None)
-            {
-                front_door_cutover::write_cutover_rejection(
-                    front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
-                    &detail,
-                );
-                return Err(anyhow::anyhow!(detail));
-            }
             dispatch_hook_command(config, command)
         }
         Command::Mcp {
@@ -2495,21 +2653,40 @@ async fn dispatch_command(
                 },
         } => {
             // #1858 (I19.5, I19.10): once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge
-            // selects the new stack, every `mcp stdio` host edge refuses
-            // with a stable cutover code plus the canonical-route receipt.
-            // The refusal precedes ensure_daemon_ready, so a cut-over
-            // invocation never auto-launches the daemon, starts a store, or
-            // constructs a ControlWal/WriterActor. Absent flag preserves
-            // today's behavior on every host edge.
+            // selects the new stack, every `mcp stdio` host edge emits the
+            // stable cutover code plus the canonical-route receipt as an
+            // observable redirect receipt (on stderr, so the delegated stdio
+            // session on stdout stays a clean JSON-RPC stream), then delegates
+            // to the approved Bridge instead of serving MCP itself. The
+            // receipt precedes ensure_daemon_ready, so a cut-over invocation
+            // never auto-launches the daemon, starts a store, or constructs
+            // a ControlWal/WriterActor. Absent flag preserves today's behavior
+            // on every host edge.
+            //
+            // #2562: on the selected path this process additionally delegates
+            // to the approved Bridge instead of stopping at the refusal. A
+            // successful delegation never returns: the single owned child
+            // owns the stdio session from here. Resolution or launch failures
+            // keep the refusal receipt and return fail-closed with no legacy
+            // fallback.
             if let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
                 "eliot-governor mcp stdio",
                 host.as_deref(),
             ) {
-                front_door_cutover::write_cutover_rejection(
+                front_door_cutover::write_cutover_redirect_receipt(
                     front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
                     &detail,
                 );
-                return Err(anyhow::anyhow!(detail));
+                match delegate_claude_mcp_to_agent_bridge() {
+                    Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                    Err(error) => {
+                        front_door_cutover::write_cutover_rejection(
+                            front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                            &detail,
+                        );
+                        return Err(error);
+                    }
+                }
             }
             mcp_stdio::run(
                 config,

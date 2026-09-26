@@ -602,5 +602,6 @@ COMMIT TRANSACTION;
 RETURN IF $idempotency_result != NONE {
   $idempotency_result
 } ELSE {
-  SELECT * FROM ONLY type::record('write_receipt', $receipt_id)
+  -- OMIT id: WriteReceipt decodes the CONTENT keys; the schemaless record id is not part of the receipt contract.
+  SELECT * OMIT id FROM ONLY type::record('write_receipt', $receipt_id)
 };

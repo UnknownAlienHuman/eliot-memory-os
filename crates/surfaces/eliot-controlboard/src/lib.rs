@@ -1075,6 +1075,37 @@ pub enum CommandDisposition {
     Unknown,
 }
 
+/// Typed reconcile query for one already-issued operator operation.
+///
+/// The query carries the owner-issued [`OperationId`] and nothing else. A
+/// caller reconnecting after an unknown outcome holds the original operation
+/// identity, not permission to send the command again, so resubmission is
+/// structurally impossible here: the action, target, fence, and ceilings of the
+/// original [`CommandRequest`] are not accepted on this type and therefore
+/// cannot be compared, and an owner answer can only be the *current known
+/// disposition* of the original operation — never a second effect and never a
+/// newly minted identity.
+///
+/// This is not a second command DTO or ontology: it adds no variant, target,
+/// ceiling, role, or lifecycle, and its result reuses the existing
+/// [`CommandReceipt`] / [`CommandDisposition`] vocabulary verbatim. As in
+/// `StoredReplay::matches`, the operation identity is the lookup key rather
+/// than a compared field, so it is never checked against the receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandQuery {
+    /// Owner-issued identity of the already-submitted operation.
+    pub operation_id: OperationId,
+}
+
+impl CommandQuery {
+    /// Creates a typed reconcile query for one already-issued operation.
+    #[must_use]
+    pub fn new(operation_id: OperationId) -> Self {
+        Self { operation_id }
+    }
+}
+
 impl OperatorAction {
     fn required_capability(&self) -> ActionCapability {
         match self {
@@ -1116,10 +1147,24 @@ pub trait AccessResolverPort: Send {
     fn resolve(&mut self, request: &ReadRequest) -> Result<AccessBinding, PortError>;
 }
 
-/// Operator command owner port. It is the only route for mutation requests.
+/// Operator command owner port. It is the only route for mutation requests
+/// and the only route for reading back an operation it already admitted.
 pub trait OperatorCommandPort: Send {
     /// Submits one exact-fence typed action to its owning authority path.
     fn submit(&mut self, request: &CommandRequest) -> Result<CommandReceipt, PortError>;
+
+    /// Reconciles one already-issued operation identity to the owner's current
+    /// known disposition of it.
+    ///
+    /// This is a read of the owner's record for the original operation, never a
+    /// resubmission: the query carries no action, target, fence, or ceiling, so
+    /// an implementation has nothing to re-admit, re-execute, or re-bind here
+    /// and cannot mint a new identity. An exact replay under the same operation
+    /// identity must return the same command receipt; an operation the owner
+    /// cannot yet resolve must be returned as the exact typed failure the owner
+    /// produced — never as a synthesised `Accepted`/`Rejected` — so the caller
+    /// keeps it reconciling instead of repeating it.
+    fn reconcile(&mut self, query: &CommandQuery) -> Result<CommandReceipt, PortError>;
 }
 
 /// Typed Skill candidate submission. All fields are owner-neutral data; the
@@ -1447,6 +1492,52 @@ impl ControlBoard {
             .insert(operation_key, StoredReplay::bind(&command, receipt.clone()));
         Ok(receipt)
     }
+
+    /// Reconciles one already-issued operation identity to its current known
+    /// disposition.
+    ///
+    /// The authenticated session is resolved exactly as it is for
+    /// [`Self::submit`], and the query is then forwarded to the same
+    /// [`OperatorCommandPort`] that owns the command. The board deliberately
+    /// does **not** answer from its own in-memory `StoredReplay` record: a
+    /// reconnecting caller is served a freshly built board whose private record
+    /// is empty, and the owner's record is the only one that can say anything
+    /// true about an operation this process may or may not still hold.
+    ///
+    /// Nothing is resubmitted on this path. The query cannot carry an action, so
+    /// there is no route from here to a second effect, and the reply is
+    /// constrained by `validate_reconciled_receipt` to the requesting session.
+    ///
+    /// The reply is the board's own closed vocabulary, never a synthesised one:
+    /// an absent port stays `PlanGap(OperatorCommand)`, a port that cannot
+    /// establish the outcome stays `UnknownOutcome` (`UNKNOWN`/`RECONCILING`),
+    /// and a named missing read contract stays `Provider(..)` with that name
+    /// intact. `Accepted` is only ever returned when the owner actually holds
+    /// that exact operation's receipt.
+    ///
+    /// Unlike [`Self::submit`] the query is borrowed: it is a read input, not a
+    /// submission the board takes ownership of, and nothing downstream can be
+    /// built from it.
+    pub fn reconcile(
+        &mut self,
+        request: &ReadRequest,
+        query: &CommandQuery,
+    ) -> Result<CommandReceipt, ControlBoardError> {
+        request.validate()?;
+        let access = self.resolve_access(request)?;
+        let receipt = self
+            .commands
+            .as_mut()
+            .ok_or(ControlBoardError::PlanGap(
+                RequiredProvider::OperatorCommand,
+            ))?
+            .reconcile(query)
+            .map_err(|error| {
+                ControlBoardError::from_port(RequiredProvider::OperatorCommand, error)
+            })?;
+        validate_reconciled_receipt(&receipt, &access)?;
+        Ok(receipt)
+    }
 }
 
 impl ControlBoard {
@@ -1618,6 +1709,34 @@ fn validate_receipt(
         || !effect_is_at_most(receipt.effect_ceiling, request.effect_ceiling)
     {
         return Err(ControlBoardError::ReceiptOverclaim);
+    }
+    Ok(())
+}
+
+/// Validates a reconciled receipt against the session it is returned to.
+///
+/// A reconcile carries no action, target, fence, revision, or ceiling to
+/// compare, so this checks exactly what the query path still binds: the
+/// receipt identity fields are well-formed, and the answer belongs to the
+/// session the access resolver just admitted. Nothing else is re-checked —
+/// `action_digest`, `observed_revision`, `observed_fence`, and both ceilings
+/// belong to the original [`CommandRequest`], which the query does not carry.
+///
+/// `access_digest` is deliberately shape-checked but *not* compared with the
+/// current access binding: that binding legitimately advances after a command
+/// is admitted, and pinning the historical digest to it would refuse a
+/// truthful answer after any state change. The operation identity is the
+/// lookup key, not a compared field, exactly as in
+/// [`StoredReplay::matches`].
+fn validate_reconciled_receipt(
+    receipt: &CommandReceipt,
+    access: &ResolvedAccess,
+) -> Result<(), ControlBoardError> {
+    text(&receipt.receipt_ref, "receipt_ref")?;
+    text(&receipt.session_id, "receipt.session_id")?;
+    text(&receipt.access_digest, "receipt.access_digest")?;
+    if receipt.session_id != access.binding.session_id {
+        return Err(ControlBoardError::ReceiptBindingMismatch);
     }
     Ok(())
 }
@@ -1825,6 +1944,13 @@ mod tests {
                 observed_fence: request.expected_fence.clone(),
             })
         }
+
+        /// The fixture holds no operation record, so a reconcile cannot
+        /// establish an outcome. The honest non-success keeps a possibly
+        /// submitted command reconciling rather than fabricating a receipt.
+        fn reconcile(&mut self, _query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            Err(PortError::Unknown)
+        }
     }
 
     struct BadCommand;
@@ -1843,6 +1969,10 @@ mod tests {
                 observed_fence: request.expected_fence.clone(),
             })
         }
+
+        fn reconcile(&mut self, _query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            Err(PortError::Unknown)
+        }
     }
 
     struct WrongAccessCommand;
@@ -1860,6 +1990,10 @@ mod tests {
                 observed_revision: request.expected_revision,
                 observed_fence: request.expected_fence.clone(),
             })
+        }
+
+        fn reconcile(&mut self, _query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            Err(PortError::Unknown)
         }
     }
 
@@ -2735,6 +2869,10 @@ mod tests {
                 observed_revision: request.expected_revision,
                 observed_fence: request.expected_fence.clone(),
             })
+        }
+
+        fn reconcile(&mut self, _query: &CommandQuery) -> Result<CommandReceipt, PortError> {
+            Err(PortError::Unknown)
         }
     }
 

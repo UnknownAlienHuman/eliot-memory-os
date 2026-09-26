@@ -335,6 +335,21 @@ pub struct IndependentKernelSensor {
     /// selected manifest. It is observation lineage for a later reconciliation,
     /// never a claim about the Kernel's current epoch.
     epoch_lineage: eliot_contracts::EpochLineageId,
+    /// The installation-approved runtime authority epoch **sequence** of the same
+    /// retained binding that supplied [`Self::epoch_lineage`].
+    ///
+    /// This is the second half of one already-retained `EpochId`, not a new
+    /// identity: it is what a gap-only sensor binds to a spooled intent when it
+    /// has never held a supervision lease and therefore owns no supervision
+    /// epoch of its own. I8.1 requires a Governor outage to produce a
+    /// `problem_intent` / `incident_intent` in `watchdog.redb`, and the
+    /// `Watchdog` object that would otherwise supply that epoch is created only
+    /// inside `record_heartbeat`, which itself requires an already admitted
+    /// lease — so without this basis a cold-start outage could only ever leave a
+    /// durable gap. The value is a `NonZeroU64` sequence carried by the
+    /// digest-bound `StateFence` of the approved generation, so it is real,
+    /// retained, and can never be an invented placeholder.
+    approved_authority_epoch: u64,
     /// The supervision lease identity last accepted by this sensor, retained so a
     /// later fenced-Kernel reconciliation can name the exact lease the Kernel
     /// holds. `None` until a lease has been verified at least once.
@@ -373,6 +388,13 @@ impl IndependentKernelSensor {
             .authority_epoch
             .lineage_id
             .clone();
+        let approved_authority_epoch = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .sequence
+            .get();
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -386,6 +408,7 @@ impl IndependentKernelSensor {
             installation_id,
             watchdog_generation,
             epoch_lineage,
+            approved_authority_epoch,
             supervision_lease_id: Mutex::new(None),
         })
     }
@@ -421,6 +444,13 @@ impl IndependentKernelSensor {
             .authority_epoch
             .lineage_id
             .clone();
+        let approved_authority_epoch = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .sequence
+            .get();
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
@@ -429,6 +459,7 @@ impl IndependentKernelSensor {
             installation_id,
             watchdog_generation,
             epoch_lineage,
+            approved_authority_epoch,
             supervision_lease_id: Mutex::new(None),
         })
     }
@@ -656,6 +687,11 @@ impl IndependentKernelSensor {
             installation_id: installation_id.to_owned(),
             watchdog_generation,
             epoch_lineage,
+            // The test contour has no approved binding, so it supplies the same
+            // epoch it establishes above: the gap-only basis can never differ
+            // from the established one here, and a zero still fails the same
+            // closed check both production contours keep.
+            approved_authority_epoch: watchdog_epoch,
             supervision_lease_id: Mutex::new(None),
         })
     }
@@ -731,14 +767,20 @@ impl IndependentKernelSensor {
 
     /// Closes an open escalation episode after a live Governor admission.
     ///
-    /// A live admission is the only recovery signal the rule accepts. Spooled
-    /// intents are untouched here: they stay retained until the fenced Kernel
-    /// route acknowledges them.
+    /// A live admission is the only recovery signal the rule accepts. The
+    /// presenting Watchdog generation travels with it so a late success from a
+    /// superseded admission generation is refused instead of closing an episode
+    /// a newer generation is still advancing. Spooled intents are untouched
+    /// here: they stay retained, and unacknowledged, until the fenced Kernel
+    /// route acknowledges them. Closing claims no canonical resolution.
     pub fn observe_governor_recovered(&self) {
         let Ok(observed_at_ms) = current_unix_ms().map(|value| value.max(1)) else {
             return;
         };
-        match self.spool.observe_governor_recovery(observed_at_ms) {
+        match self
+            .spool
+            .observe_governor_recovery(self.watchdog_generation, observed_at_ms)
+        {
             Ok(true) => tracing::debug!(
                 event = "watchdog.intent_episode_closed",
                 observation = "reconciled",
@@ -819,19 +861,28 @@ impl IndependentKernelSensor {
             reason,
             observed_at_ms,
         );
-        // A gap-only sensor has no established supervision epoch, so it has no
-        // fenced lineage for a later reconciliation to bind against. It still
-        // records the observation as a gap, but it mints no intent: an intent
-        // whose lineage can never be admitted would be a retained record with no
-        // fenced path home.
-        let Some(epoch) = self.established_watchdog_epoch() else {
+        // A gap-only sensor has never verified a supervision lease, so it owns
+        // no supervision epoch; it binds the installer-approved authority epoch
+        // of its own retained binding instead. That basis is real, retained,
+        // and non-zero, so a cold-start Governor outage escalates through the
+        // same deterministic rule as a warm one instead of leaving only a
+        // durable gap. The record stays observation evidence in both cases: the
+        // fenced reconciliation still names a verified supervision lease.
+        let Some(epoch) = self.intent_observation_epoch() else {
             tracing::debug!(
                 event = "watchdog.intent_epoch_unestablished",
                 observation = "unavailable",
-                "watchdog has no established supervision epoch; the observation stays a gap, not an intent"
+                "watchdog owns neither an established supervision epoch nor an approved authority epoch; the observation stays a gap, not an intent"
             );
             return;
         };
+        if self.established_watchdog_epoch().is_none() {
+            tracing::debug!(
+                event = "watchdog.intent_epoch_from_approved_binding",
+                observation = "counted",
+                "gap-only watchdog binds the installer-approved authority epoch of its retained binding to the intent lineage"
+            );
+        }
         let lineage = match IntentLineage::new(
             self.installation_id.clone(),
             self.watchdog_generation,
@@ -848,22 +899,23 @@ impl IndependentKernelSensor {
                 return;
             }
         };
-        let outcome =
-            match self
-                .spool
-                .observe_governor_unavailability(proof, digest, lineage, observed_at_ms)
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    tracing::debug!(
-                        event = "watchdog.intent_spool_failed",
-                        observation = "fenced",
-                        detail = error.to_string().as_str(),
-                        "watchdog could not spool an intent; the observation stays an observation"
-                    );
-                    return;
-                }
-            };
+        let outcome = match self.spool.observe_governor_unavailability(
+            proof,
+            digest.as_str(),
+            lineage,
+            observed_at_ms,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.intent_spool_failed",
+                    observation = "fenced",
+                    detail = error.to_string().as_str(),
+                    "watchdog could not spool an intent; the observation stays an observation"
+                );
+                return;
+            }
+        };
         match outcome {
             GovernorIntentOutcome::Counting { consecutive } => {
                 tracing::debug!(
@@ -900,6 +952,28 @@ impl IndependentKernelSensor {
             .ok()
             .and_then(|watchdog| watchdog.as_ref().map(|value| value.epoch().0))
             .filter(|epoch| *epoch != 0)
+    }
+
+    /// Returns the epoch contour one spooled intent record binds to.
+    ///
+    /// An epoch-bound sensor binds its own established supervision epoch, so a
+    /// warm record is byte-identical to the epoch its verified lease admitted.
+    /// A gap-only sensor owns no supervision epoch yet and falls back to the
+    /// installer-approved authority epoch sequence of its retained binding — the
+    /// missing second half of the same `EpochId` that already supplies
+    /// [`Self::epoch_lineage`] — so a Governor outage at Watchdog start reaches
+    /// the configured Problem threshold like any other observation.
+    ///
+    /// `None` is returned only when this sensor owns neither basis, which the
+    /// production contours cannot reach: a retained binding always carries a
+    /// `NonZeroU64` authority epoch sequence. The fail-closed refusal is kept so
+    /// a contour without any real epoch never mints a record against an invented
+    /// one.
+    fn intent_observation_epoch(&self) -> Option<u64> {
+        let epoch = self
+            .established_watchdog_epoch()
+            .unwrap_or(self.approved_authority_epoch);
+        (epoch != 0).then_some(epoch)
     }
 
     /// Records the exact outcome of one supervision leg against the escalation

@@ -519,7 +519,16 @@ impl KernelComposition {
         let _transition = self.agent_bridge_transition_read()?;
         let result = self.agent_bridge_admission_receipt_frame_inner(connection_id);
         match &result {
-            Ok(_) => observe_bridge("kernel.bridge_receipt_prepared", "success"),
+            Ok(_) => {
+                observe_bridge("kernel.bridge_receipt_prepared", "success");
+                // F-LOG-KERNEL-1 (#897 W2): the receipt value is prepared here
+                // and handed to the front-door driver transport boundary. The
+                // only write witness is the driver-owned `send_checked` write
+                // (`front_door_driver.rs`, outside #897 scope), so the write
+                // stays `unknown` at this boundary: a prepared receipt is a
+                // partial outcome, never a delivered one.
+                observe_bridge("kernel.bridge_receipt_unknown", "unknown");
+            }
             Err(error) => {
                 observe_bridge("kernel.bridge_receipt_prepared", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
@@ -1577,140 +1586,6 @@ impl KernelComposition {
         }
     }
 
-    /// Completes one waiting bridge exchange from a full typed result.
-    ///
-    /// The retained result is re-validated against its exact pending ticket
-    /// before anything is consumed; a tampered, wrong-ticket, or wrong-fence
-    /// result is rejected with the pending evidence preserved.
-    /// A `Resolved` disposition builds the Authenticated transport binding by
-    /// copying the Governor-owned resolved fields and the exact ticket fence;
-    /// Kernel performs no semantic selection or retry interpretation. Any
-    /// other disposition revokes the connection and returns the immediate
-    /// typed denial carrying that disposition's exact denial code, without
-    /// creating a Session. The match stays exhaustive with no wildcard arm.
-    #[cfg(all(test, windows))]
-    pub(super) fn activation_result_response(
-        &self,
-        connection_id: &str,
-        frame: &Frame,
-        ticket_id: &str,
-        result: &AgentActivationResolutionResult,
-    ) -> Result<Frame, TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        self.activation_result_response_under_transition(connection_id, frame, ticket_id, result)
-    }
-
-    #[cfg(all(test, windows))]
-    fn activation_result_response_under_transition(
-        &self,
-        connection_id: &str,
-        frame: &Frame,
-        ticket_id: &str,
-        result: &AgentActivationResolutionResult,
-    ) -> Result<Frame, TransportError> {
-        let mut pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let mut pending_entry = pending
-            .entries
-            .get(ticket_id)
-            .ok_or(TransportError::SessionFenced)?
-            .clone();
-        if let Some(evidence) = result.owner_evidence.clone() {
-            pending_entry.owner_readback = Some(
-                AgentActivationOwnerReadback::from_evidence(evidence, result.resolved_at_unix_ms)
-                    .map_err(|_| TransportError::SessionFenced)?,
-            );
-        }
-        // #203: reject a tampered, wrong-ticket, or wrong-fence retained
-        // result before mutating any ledger. The submit path validates before
-        // retaining, so this is defense-in-depth; a failure here preserves
-        // both the pending entry and the retained result verbatim. This
-        // closes the negative-disposition arm, which otherwise projects
-        // without any ticket binding check.
-        result
-            .validate_against(&pending_entry.ticket)
-            .map_err(|_| TransportError::SessionFenced)?;
-        self.validate_result_bridge_leg(&pending_entry.ticket)?;
-        // Exhaustive per-disposition projection with no wildcard arm: a
-        // future disposition breaks compilation here instead of silently
-        // reusing another denial code. Only `Resolved` reaches the binding
-        // projector; every other disposition is revoked and denied with its
-        // exact code, creating no Session.
-        match &result.disposition {
-            AgentActivationResolutionDisposition::Resolved { binding } => {
-                let reply = self.activation_response_frame_for_resolution(
-                    connection_id,
-                    frame,
-                    &pending_entry,
-                    result,
-                    binding,
-                )?;
-                pending.entries.remove(ticket_id);
-                Ok(reply)
-            }
-            AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
-            | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
-            | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
-            | AgentActivationResolutionDisposition::NotReady { .. }
-            | AgentActivationResolutionDisposition::StaleFence { .. }
-            | AgentActivationResolutionDisposition::FailedInternal { .. } => {
-                let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
-                    .ok_or(TransportError::SessionFenced)?;
-                let reply = self.denied_result_response_frame(
-                    connection_id,
-                    frame,
-                    &pending_entry,
-                    reason_code,
-                    Some(result.disposition.clone()),
-                )?;
-                pending.entries.remove(ticket_id);
-                self.revoke_agent_bridge_under_transition(connection_id, &mut pending)?;
-                Ok(reply)
-            }
-        }
-    }
-
-    /// Builds the Authenticated transport binding for a `Resolved` result.
-    ///
-    /// This is the mechanical twin of [`Self::activation_response_frame`]:
-    /// the binding fields and the ticket fence come from the exact retained
-    /// ticket and Governor-owned result, and the fresh Session nonce is the
-    /// only Kernel-minted value. It is never called for a non-`Resolved`
-    /// disposition.
-    #[cfg(all(test, windows))]
-    fn activation_response_frame_for_resolution(
-        &self,
-        connection_id: &str,
-        original: &Frame,
-        pending: &AgentActivationPending,
-        result: &AgentActivationResolutionResult,
-        binding: &eliot_protocol::AgentActivationResolvedBinding,
-    ) -> Result<Frame, TransportError> {
-        result
-            .validate_against(&pending.ticket)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let owner_evidence = result
-            .owner_evidence
-            .as_ref()
-            .ok_or(TransportError::SessionFenced)?;
-        owner_evidence
-            .validate_against_binding(binding, &pending.ticket.state_fence)
-            .map_err(|_| TransportError::SessionFenced)?;
-        if pending.ticket.ticket_id != result.ticket_id
-            || pending.ticket.connection_id != connection_id
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        // The ticket binding is exact on both legs here: `validate_against`
-        // above enforces `result.ticket_state_fence == pending.ticket.state_fence`,
-        // so the shared `Resolved` projector below builds the identical fence
-        // the inline P-04 construction built. This path keeps its own
-        // ticket/connection checks and performs no additional v2 bridge-leg
-        // validation.
-        self.resolved_result_response_frame(connection_id, original, pending, binding)
-    }
     /// Creates the bridge Session for exactly one valid `Resolved` binding.
     ///
     /// Binding validation rechecks every Kernel-owned property: the result
