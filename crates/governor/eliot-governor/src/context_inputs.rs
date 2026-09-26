@@ -55,6 +55,15 @@
 //! different task/problem/skill is never adopted just because its operation
 //! and fence match.
 //!
+//! Page-provenance discipline (#2857): one shared rule
+//! ([`classify_role_page`]) judges every role page's declared extent, so a
+//! bounded partial page is only ever `Partial` when its three declared counts
+//! are present, correctly typed, and coherent with the records that travelled
+//! (`returned == records.len()`, `matched_total >= returned`, and
+//! `truncated == (matched_total > returned)`). Absent or contradictory counts
+//! are `Unknown` — a truncation flag on its own is a claim about the other two
+//! counts and never promotes a page on its own.
+//!
 //! Downstream limit, kept explicit: a successful retrieval of a versioned
 //! source envelope is NOT proof of Cue admission, capability qualification or
 //! packet readiness. The four handlers return retained authority-record
@@ -1053,6 +1062,80 @@ fn classify_read_outcome(outcome: ReadOutcome) -> ProjectionState {
     }
 }
 
+/// What one role page's own provenance says about the records it returned.
+///
+/// The three declared counts are the ONLY evidence a page has about the extent
+/// of its source, so they are read as one tuple and judged together. `Empty`,
+/// `Complete` and `Truncated` each name a page that describes itself
+/// coherently; `Undescribed` names a page that does not, whether the counts are
+/// absent, mistyped, or contradict the array the page actually carries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RolePage {
+    /// An authoritative completed lookup that matched no rows and returned none.
+    Empty,
+    /// An authoritative completed lookup that returned every matched row.
+    Complete,
+    /// A coherent bounded page: the source matched strictly more rows than the
+    /// declared bound returned.
+    Truncated,
+    /// The declared counts are absent, mistyped, or contradict the records.
+    Undescribed,
+}
+
+/// The one shared role-page provenance rule for every reconstructed role.
+///
+/// Every `ProjectionState` a role may take other than `Unavailable`/`Stale`/
+/// `Unknown` from the read itself is read off this verdict, so a role page is
+/// judged by exactly one function and the task-bound envelopes and the evidence
+/// pack cannot drift into two different notions of a bounded partial page.
+/// #2857: the previous shape accepted EVERY `(truncated = true, …)` tuple as a
+/// bounded partial scan, so a page with one record and `returned = 50`, or a
+/// `truncated: true` with neither count present, was trusted. A truncation flag
+/// is a claim about the OTHER two counts, so it is only honoured when the whole
+/// tuple is coherent:
+///
+/// 1. all three of `truncated`, `matched_total` and `returned` are present and
+///    correctly typed (a JSON number-as-string, a float, a negative or a missing
+///    member is `Undescribed`);
+/// 2. `returned == records.len()` — the declared count is the array that
+///    actually travelled;
+/// 3. `matched_total >= returned` — a page cannot return more than it matched;
+/// 4. `truncated == (matched_total > returned)` — the flag is exactly the
+///    statement that the source holds rows this bound did not return.
+///
+/// Every failure is `Undescribed`, which the callers report as `Unknown`. A
+/// coherent zero-row page is the only `KnownEmpty`; a coherent page that
+/// returned every matched row is the only `Complete`; a coherent bounded page is
+/// the only `Partial`.
+fn classify_role_page(records: &[Value], provenance: Option<&Value>) -> RolePage {
+    let read_count = |key: &str| {
+        provenance
+            .and_then(|provenance| provenance.get(key))
+            .and_then(Value::as_u64)
+    };
+    let (Some(truncated), Some(matched), Some(returned)) = (
+        provenance
+            .and_then(|provenance| provenance.get("truncated"))
+            .and_then(Value::as_bool),
+        read_count("matched_total"),
+        read_count("returned"),
+    ) else {
+        return RolePage::Undescribed;
+    };
+    let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+    if returned != count || matched < returned || truncated != (matched > returned) {
+        return RolePage::Undescribed;
+    }
+    if matched == 0 {
+        return RolePage::Empty;
+    }
+    if truncated {
+        RolePage::Truncated
+    } else {
+        RolePage::Complete
+    }
+}
+
 /// Classifies one task-bound role payload against the exact selector it answers.
 ///
 /// The four activated handlers return a versioned source envelope
@@ -1062,9 +1145,11 @@ fn classify_read_outcome(outcome: ReadOutcome) -> ProjectionState {
 ///
 /// `KnownEmpty` requires an authoritative completed lookup for the REQUESTED
 /// selector: zero records with `truncated: false` and matching totals. A bound
-/// the store truncated is `Partial`, records without a describing provenance
-/// are `Unknown`, and a substituted scope, selector or payload version is
-/// `Unavailable` — a matching operation and fence are never enough.
+/// the store truncated is `Partial`, records whose declared counts are absent or
+/// contradict the records are `Unknown`, and a substituted scope, selector or
+/// payload version is `Unavailable` — a matching operation and fence are never
+/// enough. The extent judgement itself is
+/// [`classify_role_page`], shared with the evidence pack.
 fn classify_role_envelope(
     payload: &Value,
     scope: &ScopeId,
@@ -1087,28 +1172,13 @@ fn classify_role_envelope(
     let Some(records) = payload.get("records").and_then(Value::as_array) else {
         return unavailable("role payload has no records array");
     };
-    let provenance = payload.get("provenance");
-    let truncated = provenance
-        .and_then(|provenance| provenance.get("truncated"))
-        .and_then(Value::as_bool);
-    let matched = provenance
-        .and_then(|provenance| provenance.get("matched_total"))
-        .and_then(Value::as_u64);
-    let returned = provenance
-        .and_then(|provenance| provenance.get("returned"))
-        .and_then(Value::as_u64);
-    let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
-    match (truncated, matched, returned) {
-        (Some(false), Some(0), Some(0)) if records.is_empty() => ProjectionState::KnownEmpty,
-        (Some(false), Some(matched), Some(returned))
-            if matched == returned && returned == count =>
-        {
-            ProjectionState::Complete
-        }
-        (Some(true), _, _) => ProjectionState::Partial {
+    match classify_role_page(records, payload.get("provenance")) {
+        RolePage::Empty => ProjectionState::KnownEmpty,
+        RolePage::Complete => ProjectionState::Complete,
+        RolePage::Truncated => ProjectionState::Partial {
             reason: "role payload truncated at the declared bound".to_owned(),
         },
-        _ => ProjectionState::Unknown {
+        RolePage::Undescribed => ProjectionState::Unknown {
             reason: "role provenance does not authoritatively describe the records".to_owned(),
         },
     }
@@ -1151,7 +1221,10 @@ fn decode_epistemic_payload(
 /// `KnownEmpty` requires the exact empty result: zero records with an
 /// explicit `truncated: false` and matching totals. A truncated pack is
 /// `Partial`; a payload whose provenance does not describe its records is
-/// `Unknown`. Transport and catalogue failures never reach this function.
+/// `Unknown`. Transport and catalogue failures never reach this function. The
+/// extent judgement is [`classify_role_page`], the same shared rule the
+/// task-bound role envelopes use, so the two payload families cannot disagree
+/// about what a bounded partial page is.
 fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) -> ProjectionState {
     let unavailable = |detail: &str| ProjectionState::Unavailable {
         reason: bounded_reason("evidence payload fails its contract", detail),
@@ -1168,28 +1241,13 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
     let Some(records) = payload.get("records").and_then(Value::as_array) else {
         return unavailable("evidence payload has no records array");
     };
-    let provenance = payload.get("provenance");
-    let truncated = provenance
-        .and_then(|provenance| provenance.get("truncated"))
-        .and_then(Value::as_bool);
-    let matched = provenance
-        .and_then(|provenance| provenance.get("matched_total"))
-        .and_then(Value::as_u64);
-    let returned = provenance
-        .and_then(|provenance| provenance.get("returned"))
-        .and_then(Value::as_u64);
-    let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
-    match (truncated, matched, returned) {
-        (Some(false), Some(0), Some(0)) if records.is_empty() => ProjectionState::KnownEmpty,
-        (Some(false), Some(matched), Some(returned))
-            if matched == returned && returned == count =>
-        {
-            ProjectionState::Complete
-        }
-        (Some(true), _, _) => ProjectionState::Partial {
+    match classify_role_page(records, payload.get("provenance")) {
+        RolePage::Empty => ProjectionState::KnownEmpty,
+        RolePage::Complete => ProjectionState::Complete,
+        RolePage::Truncated => ProjectionState::Partial {
             reason: "evidence pack truncated at the declared bound".to_owned(),
         },
-        _ => ProjectionState::Unknown {
+        RolePage::Undescribed => ProjectionState::Unknown {
             reason: "evidence provenance does not authoritatively describe the records".to_owned(),
         },
     }
