@@ -221,6 +221,7 @@ use cognition::*;
 #[allow(clippy::wildcard_imports)]
 use verification::*;
 pub(crate) mod catalog;
+pub(crate) mod correlation;
 mod delegation;
 mod dispatch;
 mod evaluation;
