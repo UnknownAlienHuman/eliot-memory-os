@@ -25,7 +25,9 @@ pub use host_event_producer::{
 mod persistence_owner;
 pub use persistence_owner::HostEventPersistenceOwner;
 mod reconnect_driver;
-pub use reconnect_driver::{ReconnectOutcome, drive_reconnect};
+pub use reconnect_driver::{
+    ObservedReconnectOutcome, ReconnectOutcome, drive_reconnect, drive_reconnect_observed,
+};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
