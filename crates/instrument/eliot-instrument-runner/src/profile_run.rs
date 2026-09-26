@@ -599,6 +599,24 @@ impl StageOrchestrator {
                 );
             }
         };
+        if invocation.instrument.as_str() != planned.stage.spec.as_str() {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: invocation instrument differs from admitted stage",
+            );
+        }
+        if invocation.kind != planned.stage.kind {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: invocation kind differs from admitted stage",
+            );
+        }
+        if invocation.profile.as_str() != route.stage().profile.as_str() {
+            return InstrumentRun::missing(
+                route,
+                "stage admission refused: invocation profile differs from admitted stage",
+            );
+        }
         let mut binding = match InstrumentBinding::bind(invocation, launcher.port(planned)) {
             Ok(binding) => binding,
             Err(error) => {
