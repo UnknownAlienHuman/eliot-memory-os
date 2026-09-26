@@ -789,6 +789,19 @@ pub trait McpForwardingPort {
         binding: &AttachBinding,
     ) -> Result<ReconciliationPortOutcome, ProviderFailure>;
 
+    /// Confirms process-local cursor-cache effects only after the core has
+    /// accepted the complete owner response into its recovery view.
+    ///
+    /// Every implementation must state how it commits those effects. The
+    /// production Kernel forwarding port applies owner ack bases and only
+    /// owner-confirmed offered consumed frontiers after import; fixtures with
+    /// no process-local cursor cache implement this as an explicit no-op.
+    fn reconciliation_imported(
+        &mut self,
+        binding: &AttachBinding,
+        result: &ReconciliationPortResult,
+    );
+
     /// Reads one bounded recovery page inside the declared window.
     ///
     /// A pure continuation read: it changes no producer/consumer cursor and
@@ -1075,6 +1088,32 @@ pub struct ReconciliationPortResult {
     task_binding: Box<TaskBinding>,
     receipt_ref: ReconciliationReceiptRef,
     window: Option<Box<RecoveryWindowFacts>>,
+    consumed_frontiers: Vec<ReconciliationConsumedFrontier>,
+}
+
+/// A locally derived consumed frontier offered to the owner in a reconcile
+/// request. It becomes confirmed only after the response page is imported.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationConsumedFrontier {
+    stream_id: String,
+    sequence: u64,
+}
+
+impl ReconciliationConsumedFrontier {
+    pub fn new(stream_id: String, sequence: u64) -> Self {
+        Self {
+            stream_id,
+            sequence,
+        }
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
 }
 
 impl ReconciliationPortResult {
@@ -1094,6 +1133,7 @@ impl ReconciliationPortResult {
             task_binding: Box::new(binding.task_binding.clone()),
             receipt_ref,
             window: None,
+            consumed_frontiers: Vec::new(),
         })
     }
 
@@ -1140,7 +1180,19 @@ impl ReconciliationPortResult {
             task_binding: Box::new(binding.task_binding.clone()),
             receipt_ref,
             window: Some(Box::new(window)),
+            consumed_frontiers: Vec::new(),
         })
+    }
+
+    /// Carries the exact frontiers included in the request so the real
+    /// forwarding port can confirm them only after core import succeeds.
+    #[must_use]
+    pub fn with_consumed_frontiers(
+        mut self,
+        consumed_frontiers: Vec<ReconciliationConsumedFrontier>,
+    ) -> Self {
+        self.consumed_frontiers = consumed_frontiers;
+        self
     }
 
     pub const fn receipt_ref(&self) -> &ReconciliationReceiptRef {
@@ -1149,6 +1201,10 @@ impl ReconciliationPortResult {
 
     pub fn window(&self) -> Option<&RecoveryWindowFacts> {
         self.window.as_deref()
+    }
+
+    pub fn consumed_frontiers(&self) -> &[ReconciliationConsumedFrontier] {
+        &self.consumed_frontiers
     }
 }
 
@@ -1531,10 +1587,17 @@ impl RecoveredStreamFacts {
         Ok(())
     }
 
-    /// Rejects scoped gaps that name a stream other than the page's own.
+    /// Rejects duplicate page gap identities and scopes naming another stream.
     #[allow(clippy::result_large_err)]
     fn check_gap_scope(stream_id: &str, gaps: &[RecoveredGapFact]) -> Result<(), BridgeError> {
+        let mut seen_gap_ids = BTreeSet::new();
         for gap in gaps {
+            if !seen_gap_ids.insert(gap.gap_id.clone()) {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_stream.gap",
+                    reason: "duplicate gap identity in one stream page",
+                });
+            }
             if !gap.stream_id.is_empty() && gap.stream_id != stream_id {
                 return Err(BridgeError::InvalidContract {
                     field: "recovered_stream.gap",
@@ -1682,6 +1745,7 @@ impl RecoveryWindowFacts {
             });
         }
         let mut seen = BTreeSet::new();
+        let mut seen_gap_ids = BTreeSet::new();
         for facts in &stream_facts {
             if !seen.insert(facts.stream_id.clone()) {
                 return Err(BridgeError::InvalidContract {
@@ -1689,12 +1753,26 @@ impl RecoveryWindowFacts {
                     reason: "duplicate stream scope in one recovery window",
                 });
             }
+            for gap in facts.gaps() {
+                if !seen_gap_ids.insert(gap.gap_id.clone()) {
+                    return Err(BridgeError::InvalidContract {
+                        field: "recovery_window.gap",
+                        reason: "duplicate gap identity in one recovery window",
+                    });
+                }
+            }
         }
         for gap in &unscoped_gaps {
             if !gap.stream_id.is_empty() {
                 return Err(BridgeError::InvalidContract {
                     field: "recovery_window.unscoped_gap",
                     reason: "top-level gap must carry no stream scope",
+                });
+            }
+            if !seen_gap_ids.insert(gap.gap_id.clone()) {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovery_window.gap",
+                    reason: "duplicate gap identity in one recovery window",
                 });
             }
         }
@@ -1961,6 +2039,7 @@ struct ActiveAttach {
 /// are the walk's required material. `events` retains every checked fact
 /// by sequence, including durable out-of-order events above the contiguous
 /// frontier, so holes are preserved instead of excluded.
+#[derive(Clone)]
 struct RecoveryStreamProgress {
     acked_base: u64,
     acked_high: u64,
@@ -1983,6 +2062,7 @@ struct RecoveryStreamProgress {
 /// pending work. No database transaction is held across network calls —
 /// each page is validated whole against this window before anything is
 /// applied.
+#[derive(Clone)]
 struct RecoveryWindow {
     window_key: String,
     live_generation: u64,
@@ -2204,52 +2284,55 @@ impl AgentBridgeCore {
 
     pub fn reconcile_external(&mut self) -> Result<AttachView, BridgeError> {
         self.ensure_contracts()?;
-        let binding = {
+        let (binding, reconciliation_required) = {
             let active = self.active.as_ref().ok_or(BridgeError::NotAttached)?;
-            if active.blind_interval.is_none() || !active.reconciliation_required {
+            if active.reconciliation_required && active.blind_interval.is_none() {
                 return Err(BridgeError::InvalidTransition(
-                    "only an unreconciled external attach accepts a reconciliation result",
+                    "an unreconciled attach requires its declared blind interval",
                 ));
             }
-            active.binding.clone()
+            (active.binding.clone(), active.reconciliation_required)
         };
         let outcome = self.forwarder()?.reconcile_external(&binding)?;
-        let permit = match outcome {
-            ReconciliationPortOutcome::Reconciled(result) => ReconciliationPermit::seal(result)?,
+        let result = match outcome {
+            ReconciliationPortOutcome::Reconciled(result) => result,
             ReconciliationPortOutcome::Denied { reason_code } => {
                 validate_text(reason_code, "reconciliation_denial.reason_code")?;
                 return Err(BridgeError::ExternalReconciliationDenied(reason_code));
             }
         };
-        let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
-        if active.blind_interval.is_none() || !active.reconciliation_required {
-            return Err(BridgeError::InvalidTransition(
-                "external attach changed during reconciliation",
-            ));
-        }
-        if !active.binding.authority_matches(
-            &permit.session_id,
-            permit.activation_generation,
-            &permit.state_fence,
-            &permit.task_binding,
-        ) {
-            return Err(BridgeError::StaleAuthority);
-        }
-        validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
-        // A legacy port attests an empty inventory and keeps the historical
-        // gate-clearing semantics. A bounded recovery read imports its
-        // checked facts and clears the gate only on a complete walk:
-        // missing required pages or owner evidence keep
-        // `reconciliation_required` raised, while recovery-only reads stay
-        // reachable through `recover_next_page` below.
-        if let Some(window) = permit.window {
-            let disposition =
-                Self::apply_recovery_window(&active.binding, &mut active.recovery, &window)?;
-            if disposition == RecoveryDisposition::Complete {
-                active.reconciliation_required = false;
+        let permit = ReconciliationPermit::seal(result.clone())?;
+        {
+            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            if active.binding != binding {
+                return Err(BridgeError::StaleAuthority);
             }
-        } else {
-            active.reconciliation_required = false;
+            if !active.binding.authority_matches(
+                &permit.session_id,
+                permit.activation_generation,
+                &permit.state_fence,
+                &permit.task_binding,
+            ) {
+                return Err(BridgeError::StaleAuthority);
+            }
+            validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
+            if let Some(window) = permit.window.as_deref() {
+                // Validate and merge into an isolated candidate. A malformed
+                // or contradictory later stream/gap cannot leave earlier
+                // facts from this same page applied to the live window.
+                let mut candidate = active.recovery.clone();
+                let disposition =
+                    Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
+                active.recovery = candidate;
+                if reconciliation_required && disposition == RecoveryDisposition::Complete {
+                    active.reconciliation_required = false;
+                }
+            }
+        }
+        // The production adapter commits its process-local ack/frontier cache
+        // only after the checked window is now the live core state.
+        if result.window().is_some() {
+            self.forwarder()?.reconciliation_imported(&binding, &result);
         }
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
@@ -2312,33 +2395,44 @@ impl AgentBridgeCore {
             return Err(BridgeError::StaleAuthority);
         }
         let outcome = self.forwarder()?.reconcile_continue(&binding, &request)?;
-        let permit = match outcome {
-            ReconciliationPortOutcome::Reconciled(result) => ReconciliationPermit::seal(result)?,
+        let result = match outcome {
+            ReconciliationPortOutcome::Reconciled(result) => result,
             ReconciliationPortOutcome::Denied { reason_code } => {
                 validate_text(reason_code, "reconciliation_denial.reason_code")?;
                 return Err(BridgeError::ExternalReconciliationDenied(reason_code));
             }
         };
-        let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
-        if !active.binding.authority_matches(
-            &permit.session_id,
-            permit.activation_generation,
-            &permit.state_fence,
-            &permit.task_binding,
-        ) {
-            return Err(BridgeError::StaleAuthority);
+        let permit = ReconciliationPermit::seal(result.clone())?;
+        {
+            let active = self.active.as_mut().ok_or(BridgeError::NotAttached)?;
+            if active.binding != binding {
+                return Err(BridgeError::StaleAuthority);
+            }
+            if !active.binding.authority_matches(
+                &permit.session_id,
+                permit.activation_generation,
+                &permit.state_fence,
+                &permit.task_binding,
+            ) {
+                return Err(BridgeError::StaleAuthority);
+            }
+            validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
+            let window = permit
+                .window
+                .as_deref()
+                .ok_or(BridgeError::InvalidTransition(
+                    "bounded recovery continuation requires a windowed owner answer",
+                ))?;
+            // See the initial page path above: stage the entire continuation
+            // before publishing any fact or acknowledging its consumed offer.
+            let mut candidate = active.recovery.clone();
+            let disposition = Self::apply_recovery_window(&active.binding, &mut candidate, window)?;
+            active.recovery = candidate;
+            if disposition == RecoveryDisposition::Complete {
+                active.reconciliation_required = false;
+            }
         }
-        validate_text(permit.receipt_ref.as_str(), "reconciliation_receipt_ref")?;
-        let window = permit.window.ok_or(BridgeError::InvalidTransition(
-            "bounded recovery continuation requires a windowed owner answer",
-        ))?;
-        // The reply carries its own freshly verified key; continuity with
-        // the declared walk is enforced by authority, generation,
-        // connection, and per-stream monotonicity inside
-        // `apply_recovery_window`, never by key equality — while a bare
-        // legacy answer carries no window at all and cannot continue a walk.
-        let _disposition =
-            Self::apply_recovery_window(&active.binding, &mut active.recovery, &window)?;
+        self.forwarder()?.reconciliation_imported(&binding, &result);
         self.recovery_view().ok_or(BridgeError::NotAttached)
     }
 
@@ -2438,7 +2532,9 @@ impl AgentBridgeCore {
             window.incomplete_reason = Some(RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED);
         }
         for stream_facts in &facts.stream_facts {
-            Self::apply_recovery_stream(&mut *window, stream_facts);
+            if !Self::apply_recovery_stream(&mut *window, stream_facts) {
+                return Err(BridgeError::StaleAuthority);
+            }
         }
         // Required scope that vanishes from the enumeration is unknown
         // coverage, not completion: a previously incomplete stream absent
@@ -2466,7 +2562,7 @@ impl AgentBridgeCore {
                 }
                 Some(existing) => {
                     if existing != gap {
-                        window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
+                        return Err(BridgeError::StaleAuthority);
                     }
                 }
             }
@@ -2482,7 +2578,33 @@ impl AgentBridgeCore {
     /// an already-applied sequence marks movement; new facts extend the
     /// retained set, including durable out-of-order events above the
     /// contiguous frontier.
-    fn apply_recovery_stream(window: &mut RecoveryWindow, facts: &RecoveredStreamFacts) {
+    fn apply_recovery_stream(window: &mut RecoveryWindow, facts: &RecoveredStreamFacts) -> bool {
+        if let Some(progress) = window.streams.get(&facts.stream_id) {
+            if facts.durable_cursor < progress.durable_cursor
+                || facts.acked_cursor < progress.acked_high
+            {
+                return false;
+            }
+            for event in facts.events() {
+                if let Some(existing) = progress.events.get(&event.sequence)
+                    && existing != event
+                {
+                    return false;
+                }
+                if progress.events.values().any(|existing| {
+                    existing.event_id == event.event_id && existing.sequence != event.sequence
+                }) {
+                    return false;
+                }
+            }
+            for gap in facts.gaps() {
+                if let Some(existing) = progress.gaps.get(&gap.gap_id)
+                    && existing != gap
+                {
+                    return false;
+                }
+            }
+        }
         let progress = window
             .streams
             .entry(facts.stream_id.clone())
@@ -2500,47 +2622,18 @@ impl AgentBridgeCore {
         if !window.stream_order.contains(&facts.stream_id) {
             window.stream_order.push(facts.stream_id.clone());
         }
-        if facts.durable_cursor < progress.durable_cursor
-            || facts.acked_cursor < progress.acked_high
-        {
-            progress.page_complete = false;
-            if window.incomplete_reason.is_none() {
-                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
-            }
-            return;
-        }
         progress.acked_high = progress.acked_high.max(facts.acked_cursor);
-        let mut moved = false;
         for event in facts.events() {
-            match progress.events.get(&event.sequence) {
-                None => {
-                    progress.events.insert(event.sequence, event.clone());
-                }
-                Some(existing) => {
-                    if existing != event {
-                        moved = true;
-                    }
-                }
-            }
+            progress
+                .events
+                .entry(event.sequence)
+                .or_insert_with(|| event.clone());
         }
         for gap in facts.gaps() {
-            match progress.gaps.get(&gap.gap_id) {
-                None => {
-                    progress.gaps.insert(gap.gap_id.clone(), gap.clone());
-                }
-                Some(existing) => {
-                    if existing != gap {
-                        moved = true;
-                    }
-                }
-            }
-        }
-        if moved {
-            progress.page_complete = false;
-            if window.incomplete_reason.is_none() {
-                window.incomplete_reason = Some(RECOVERY_PARTIAL_WINDOW_MOVED);
-            }
-            return;
+            progress
+                .gaps
+                .entry(gap.gap_id.clone())
+                .or_insert_with(|| gap.clone());
         }
         progress.durable_cursor = progress.durable_cursor.max(facts.durable_cursor);
         let acked = progress.acked_base.max(facts.acked_cursor);
@@ -2560,11 +2653,10 @@ impl AgentBridgeCore {
         progress.next_after = progress
             .events
             .last_key_value()
-            .map_or(acked.saturating_add(1), |(sequence, _)| {
-                sequence.saturating_add(1)
-            })
+            .map_or(acked, |(sequence, _)| *sequence)
             .max(facts.page_continuation.unwrap_or(0));
         progress.page_complete = facts.page_complete;
+        true
     }
 
     pub fn attach_view(&self) -> Option<AttachView> {
