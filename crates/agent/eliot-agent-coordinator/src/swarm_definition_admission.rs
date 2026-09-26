@@ -126,7 +126,11 @@ impl SwarmDefinitionAdmissionPrep {
 /// 3. definition WIP ceilings are nonzero;
 /// 4. the work-item count fits the coordinator ready-item ceiling, otherwise
 ///    `CoordinatorError::Backpressure`;
-/// 5. the exact Governor admission artifact is compiled through the existing
+/// 5. the proposal lineage agrees with the sealed-map coordination binding
+///    (plan and root-context revisions equal the bound revisions, mirroring
+///    the owner validator `eliot_swarm::admit_plan`), otherwise
+///    `CoordinatorError::IdentityConflict`;
+/// 6. the exact Governor admission artifact is compiled through the existing
 ///    `eliot_swarm::plan_admission_request` owner entrypoint.
 ///
 /// A Governor admission receipt is never required nor produced: unavailable
@@ -136,8 +140,10 @@ impl SwarmDefinitionAdmissionPrep {
 ///
 /// Returns `CoordinatorError::InvalidField` for a degenerate configuration or
 /// definition, `CoordinatorError::Backpressure` when the work graph alone
-/// exceeds the ready-item ceiling, or `CoordinatorError::Serialization` when
-/// the admission artifact cannot be canonically digested.
+/// exceeds the ready-item ceiling, `CoordinatorError::IdentityConflict` when
+/// the proposal lineage differs from the sealed-map binding, or
+/// `CoordinatorError::Serialization` when the admission artifact cannot be
+/// canonically digested.
 pub fn compile_swarm_definition_admission(
     config: &CoordinatorConfig,
     proposal: &SwarmPlanProposal,
@@ -158,6 +164,10 @@ pub fn compile_swarm_definition_admission(
             requested: proposal.work_items.len(),
             limit: config.max_ready_items,
         });
+    }
+    let (bound_plan, bound_root) = maps.admission_plan_lineage();
+    if proposal.plan_revision != *bound_plan || proposal.root_context_revision != *bound_root {
+        return Err(CoordinatorError::IdentityConflict("swarm_lineage"));
     }
     let admission_request = plan_admission_request(proposal, maps)
         .map_err(|_| CoordinatorError::Serialization("swarm plan admission request".to_owned()))?;

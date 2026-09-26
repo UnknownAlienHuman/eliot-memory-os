@@ -109,7 +109,8 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    daemon_coordinator_config, plan_candidate, prereq_ports,
+    daemon_coordinator_config, plan_candidate, prepare_swarm_definition_admission_candidate,
+    prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
@@ -2144,6 +2145,32 @@ impl DaemonComposition {
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Prepares one Task Controller-authored swarm definition for Governor
+    /// admission through the real coordinator owner on the admitted daemon
+    /// path (issue #1699).
+    ///
+    /// Readiness gates the call; preparation delegates to
+    /// [`prepare_swarm_definition_admission_candidate`], so the production
+    /// caller and the wired tests share one implementation. The prep is
+    /// candidate-only: no Governor receipt is minted, no durable write
+    /// occurs, and nothing is launched. Launch stays with the existing
+    /// injected admission/activation/dispatch ports.
+    pub fn agent_fabric_prepare_swarm_definition_admission(
+        &self,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+    ) -> Result<eliot_agent_coordinator::SwarmDefinitionAdmissionPrep, DaemonError> {
+        let _span =
+            tracing::info_span!("eliotd.fabric_prepare_swarm_definition_admission").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        prepare_swarm_definition_admission_candidate(&config, proposal, maps)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Resolves one admitted provider capability from live session-observed

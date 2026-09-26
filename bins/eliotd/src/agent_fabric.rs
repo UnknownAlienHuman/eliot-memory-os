@@ -48,7 +48,7 @@ use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
     CoordinatorError, CoordinatorSnapshot, OwnerCurrentness, PlanGap, PresentedClaimMaterial,
     ProviderBindingSnapshot, ProviderIdentity, ProviderSelectionHealth, StaffingPlanCandidate,
-    StaffingPlanRequest, WorkClass,
+    StaffingPlanRequest, SwarmDefinitionAdmissionPrep, WorkClass,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
@@ -707,6 +707,33 @@ pub fn plan_candidate(
         },
     )?;
     Ok(coordinator.plan(request)?)
+}
+
+/// Prepares one Task Controller-authored swarm definition for Governor
+/// admission through the real coordinator owner (issue #1699).
+///
+/// Load-bearing order mirrors [`plan_candidate`]: the caller supplies an
+/// already-authored `eliot_swarm::SwarmPlanProposal` plus the sealed P1
+/// `eliot_swarm::SealedIndependentMaps`, and this function only compiles the
+/// candidate-only admission preparation via
+/// [`AgentCoordinator::prepare_swarm_definition_admission`]. No Governor
+/// receipt is minted, no durable write occurs, and nothing is launched: the
+/// prep carries the exact `swarm.plan.admit` provider request the Governor
+/// admission port must seal, and launch stays with the existing injected
+/// admission/activation/dispatch ports.
+pub fn prepare_swarm_definition_admission_candidate(
+    config: &CoordinatorConfig,
+    proposal: &eliot_swarm::SwarmPlanProposal,
+    maps: &eliot_swarm::SealedIndependentMaps,
+) -> Result<SwarmDefinitionAdmissionPrep, FabricError> {
+    let _span = tracing::info_span!("eliotd.fabric_prepare_swarm_definition_admission").entered();
+    let coordinator = AgentCoordinator::new(
+        config.clone(),
+        PlanGap::G11Unavailable {
+            reason: FABRIC_PLAN_GAP_REASON.to_owned(),
+        },
+    )?;
+    Ok(coordinator.prepare_swarm_definition_admission(proposal, maps)?)
 }
 
 /// Frozen Task-Controller definition as accepted at the admitted boundary.

@@ -510,6 +510,19 @@ impl SealedIndependentMaps {
         &self.expected_lanes
     }
 
+    /// Plan/lineage revisions bound by the sealed P1 coordination binding.
+    ///
+    /// Coordinator-side admission preparation (issue #1699) must refuse a
+    /// proposal whose revisions differ from these bound revisions, mirroring
+    /// the owner validator `admit_plan`: stamping the proposal lineage onto
+    /// the request via `plan_admission_request` alone cannot establish
+    /// lineage agreement.
+    #[must_use]
+    pub fn admission_plan_lineage(&self) -> (&RevisionId, &RootContextRevision) {
+        let binding = self.coordination_binding();
+        (&binding.plan_revision, &binding.root_context_revision)
+    }
+
     fn coordination_binding(&self) -> &ProviderBinding {
         &self.maps[0].provider_binding
     }
