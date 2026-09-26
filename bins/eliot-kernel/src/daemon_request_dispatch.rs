@@ -3254,6 +3254,31 @@ impl KernelComposition {
             Ok(transition) => transition,
             Err(response) => return Ok(response),
         };
+        // The Store owner may return an exact prior result for replay, but its
+        // semantic identity and fence must still answer this authenticated
+        // request before any occurrence projection or publication is produced.
+        // The request has no Store-sealed canonical hash yet; compare it when
+        // one is present and always validate the returned hash through the
+        // transition/receipt contract.
+        let returned_identity_matches = transition.identity.operation_id
+            == request.identity.operation_id
+            && transition.identity.idempotency_key == request.identity.idempotency_key
+            && (request.identity.canonical_request_hash.is_empty()
+                || transition.identity.canonical_request_hash
+                    == request.identity.canonical_request_hash);
+        let returned_fence_matches = transition.state_fence == request.context.state_fence
+            && transition.state_fence == session.module_generation.state_fence;
+        if transition.validate().is_err() || !returned_identity_matches || !returned_fence_matches {
+            // The canonical Store call has already happened, so this remains
+            // unresolved and requires reconciliation under the submitted
+            // operation identity. Do not publish the foreign transition.
+            observe_daemon_request("kernel.daemon_user_automation_result_binding", "unknown");
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "user_automation_result_binding_requires_reconciliation".to_owned(),
+                ),
+            ));
+        }
         // The Human inspect surface shows the deterministic schedule
         // projection before activation: the same normalized occurrence set the
         // trigger contract uses, compiled here into the immutable
@@ -3273,35 +3298,31 @@ impl KernelComposition {
                 ),
             ));
         };
-        let recovery = transition.recovery();
-        let known = transition.is_known();
-        if !known {
+        let Ok(envelope) = eliot_kernel_service::UserAutomationOperatorResultEnvelope::new(
+            transition,
+            occurrences,
+        ) else {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "user_automation_result_binding_requires_reconciliation".to_owned(),
+                ),
+            ));
+        };
+        if envelope.status == eliot_kernel_service::UserAutomationOperatorResultStatus::Unknown {
             // F-LOG-KERNEL-1 (#897 T19): the store transition reports an
             // unknown wake/execution outcome after possible work. The
-            // response body carries `"status": "unknown"` below; this record
-            // keeps the diagnostic stream honest alongside it. Observation
-            // only; the response value is unchanged.
+            // typed response envelope carries the same unknown disposition.
+            // Observation only; the response value is unchanged.
             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
         }
-        Ok(serde_json::json!({
-            "status": if known { "known" } else { "unknown" },
-            "value": {
-                "identity": transition.identity,
-                "state_fence": transition.state_fence,
-                "configuration": transition.configuration,
-                "wake": transition.wake,
-                "horizon": transition.horizon,
-                // The one post-commit orchestration record of this parent
-                // operation: the runtime obligations retained durably before any
-                // owner effect was issued, each with its original owner
-                // operation identity and its durable disposition. It is absent
-                // exactly when the operation owns no runtime obligation.
-                "orchestration": transition.orchestration,
-                "execution": transition.execution,
-                "occurrences": occurrences,
-            },
-            "recovery": recovery,
-        }))
+        match serde_json::to_value(envelope) {
+            Ok(response) => Ok(response),
+            Err(_) => Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(
+                    "user_automation_result_binding_requires_reconciliation".to_owned(),
+                ),
+            )),
+        }
     }
 
     #[cfg(windows)]
@@ -3478,11 +3499,8 @@ impl KernelComposition {
             "value": {
                 "kind": "user_automation_refusal",
                 "schema_version": 1,
-                "operation": {
-                    "operation_id": request.identity.operation_id.as_str(),
-                    "request_id": &request.context.request_id,
-                    "idempotency_key": request.identity.idempotency_key.as_str(),
-                },
+                "operation": &request.identity,
+                "request_id": &request.context.request_id,
                 "state_fence": &request.context.state_fence,
                 "attempt_state": "store_not_called",
                 "refusal": refusal,

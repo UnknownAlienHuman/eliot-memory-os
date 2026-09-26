@@ -253,11 +253,13 @@ pub use user_automation_orchestration::{
     runtime_obligation_request_digest,
 };
 pub use user_automation_runtime_handoff::{
+    USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_ID, USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_VERSION,
     USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
     UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
-    UserAutomationHorizonPhase, UserAutomationOperatorRuntime, UserAutomationOperatorTransition,
-    UserAutomationRecoveryPhase, UserAutomationWakePhase, committed_configuration_state,
-    run_now_wake_read_request,
+    UserAutomationHorizonPhase, UserAutomationOperatorResultEnvelope,
+    UserAutomationOperatorResultStatus, UserAutomationOperatorResultValue,
+    UserAutomationOperatorRuntime, UserAutomationOperatorTransition, UserAutomationRecoveryPhase,
+    UserAutomationWakePhase, committed_configuration_state, run_now_wake_read_request,
 };
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,

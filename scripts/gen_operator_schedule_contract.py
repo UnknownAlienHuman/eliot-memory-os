@@ -45,6 +45,11 @@ from dataclasses import dataclass
 
 USER_AUTOMATION_RS = "crates/kernel/eliot-kernel-core/src/user_automation.rs"
 USER_AUTOMATION_ZONES_RS = "crates/kernel/eliot-kernel-core/src/user_automation_zones.rs"
+USER_AUTOMATION_EXECUTION_RS = "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs"
+USER_AUTOMATION_ORCHESTRATION_RS = "crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs"
+USER_AUTOMATION_SERVICE_RS = "crates/kernel/eliot-kernel-service/src/user_automation.rs"
+USER_AUTOMATION_HANDOFF_RS = "crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs"
+STORE_API_RS = "crates/storage/eliot-store-api/src/lib.rs"
 
 ARTEFACT = "apps/Eliot.Operator/Protocol/Generated/OperatorScheduleContract.g.cs"
 
@@ -55,6 +60,11 @@ ARTEFACT = "apps/Eliot.Operator/Protocol/Generated/OperatorScheduleContract.g.cs
 SOURCE_FILES = (
     "crates/kernel/eliot-kernel-core/src/user_automation.rs",
     "crates/kernel/eliot-kernel-core/src/user_automation_zones.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_orchestration.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation.rs",
+    "crates/kernel/eliot-kernel-service/src/user_automation_runtime_handoff.rs",
+    "crates/storage/eliot-store-api/src/lib.rs",
 )
 
 #: Constants the mirror needs as C# constants, in the order they are emitted.
@@ -82,6 +92,10 @@ PINNED_CONSTANTS = (
     ("MIN_CIVIL_YEAR", USER_AUTOMATION_RS, "int"),
     ("MAX_CIVIL_YEAR", USER_AUTOMATION_RS, "int"),
     ("USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION", USER_AUTOMATION_RS, "string"),
+    ("USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_ID", USER_AUTOMATION_HANDOFF_RS, "string"),
+    ("USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_VERSION", USER_AUTOMATION_HANDOFF_RS, "int"),
+    ("USER_AUTOMATION_TRANSITION_WIRE_ID", USER_AUTOMATION_HANDOFF_RS, "string"),
+    ("USER_AUTOMATION_TRANSITION_WIRE_VERSION", USER_AUTOMATION_HANDOFF_RS, "int"),
     # The only zone database release this build admits, and the token every
     # owner occurrence record must carry verbatim.
     ("PINNED_ZONE_DATABASE_RELEASE", USER_AUTOMATION_ZONES_RS, "string"),
@@ -130,6 +144,237 @@ PINNED_GRAMMAR_FUNCTIONS = (
     "is_legacy_occurrence_key",
     "is_canonical_zone_database_revision",
 )
+
+#: Closed public JSON shapes used by the Operator result decoder. The field
+#: names, Rust types and omitted-Option semantics are read from their public
+#: Rust declarations and emitted into the generated mirror. OperationIdentity
+#: is the Store API type shared by the known transition and typed refusal.
+RESULT_SCHEMA_STRUCTS = (
+    ("UserAutomationOperatorResultEnvelopeFields", USER_AUTOMATION_HANDOFF_RS, "UserAutomationOperatorResultEnvelope"),
+    ("UserAutomationOperatorResultValueFields", USER_AUTOMATION_HANDOFF_RS, "UserAutomationOperatorResultValue"),
+    ("UserAutomationOperatorTransitionRequiredFields", USER_AUTOMATION_HANDOFF_RS, "UserAutomationOperatorTransition"),
+    ("OperationIdentityFields", STORE_API_RS, "OperationIdentity"),
+    ("UserAutomationHorizonPhaseFields", USER_AUTOMATION_HANDOFF_RS, "UserAutomationHorizonPhase"),
+    ("UserAutomationOrchestrationRecordFields", USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationOrchestrationRecord"),
+    ("UserAutomationRuntimeObligationFields", USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligation"),
+    ("UserAutomationWakeReadbackFields", USER_AUTOMATION_EXECUTION_RS, "UserAutomationWakeReadback"),
+)
+RESULT_SCHEMA_OPTIONAL_STRUCT = (
+    "UserAutomationOperatorTransitionOptionalFields",
+    USER_AUTOMATION_HANDOFF_RS,
+    "UserAutomationOperatorTransition",
+)
+RESULT_SCHEMA_ENUMS = (
+    ("UserAutomationOperatorResultStatuses", USER_AUTOMATION_HANDOFF_RS, "UserAutomationOperatorResultStatus"),
+    ("UserAutomationRecoveryPhaseKinds", USER_AUTOMATION_HANDOFF_RS, "UserAutomationRecoveryPhase"),
+    ("UserAutomationConfigurationPhaseKinds", USER_AUTOMATION_HANDOFF_RS, "UserAutomationConfigurationPhase"),
+    ("UserAutomationWakePhaseKinds", USER_AUTOMATION_HANDOFF_RS, "UserAutomationWakePhase"),
+    ("UserAutomationExecutionPhaseKinds", USER_AUTOMATION_HANDOFF_RS, "UserAutomationExecutionPhase"),
+    ("UserAutomationHorizonOutcomeKinds", USER_AUTOMATION_HANDOFF_RS, "UserAutomationHorizonOutcome"),
+    ("UserAutomationHorizonTriggers", USER_AUTOMATION_EXECUTION_RS, "UserAutomationHorizonTrigger"),
+    ("UserAutomationReadResultKinds", USER_AUTOMATION_SERVICE_RS, "UserAutomationReadResult"),
+    ("UserAutomationMutationResultKinds", USER_AUTOMATION_SERVICE_RS, "UserAutomationMutationResult"),
+    ("UserAutomationRuntimeObligationKinds", USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationKind"),
+    ("UserAutomationRuntimeObligationAnswerKinds", USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationAnswer"),
+    ("UserAutomationRuntimeObligationDispositionKinds", USER_AUTOMATION_ORCHESTRATION_RS, "UserAutomationRuntimeObligationDisposition"),
+)
+RESULT_SCHEMA_RECOVERY_FIELDS = (USER_AUTOMATION_HANDOFF_RS, "UserAutomationRecoveryPhase")
+
+# Updating these pins requires a deliberate C# decoder review. A public Rust
+# field, optionality, enum value or version change therefore refuses both
+# generation and the Operator build gate until the decoder and its pin move
+# together.
+EXPECTED_RESULT_SCHEMA_ID = "eliot.kernel.user-automation.operator-result"
+EXPECTED_RESULT_SCHEMA_VERSION = 1
+EXPECTED_TRANSITION_WIRE_ID = "eliot.kernel.user-automation.transition"
+EXPECTED_TRANSITION_WIRE_VERSION = 1
+SUPPORTED_RESULT_SCHEMA_LAYOUT = {
+    "UserAutomationOperatorResultEnvelopeFields": (
+        "schema_id", "schema_version", "status", "value", "recovery",
+    ),
+    "UserAutomationOperatorResultValueFields": ("transition", "occurrences"),
+    "UserAutomationOperatorTransitionRequiredFields": (
+        "wire_id", "wire_version", "identity", "state_fence", "configuration", "wake", "execution",
+    ),
+    "UserAutomationOperatorTransitionOptionalFields": ("horizon", "orchestration"),
+    "OperationIdentityFields": ("operation_id", "idempotency_key", "canonical_request_hash"),
+    "UserAutomationRecoveryPhaseFields": ("kind", "reason"),
+    "UserAutomationOperatorResultStatuses": ("known", "unknown"),
+    "UserAutomationRecoveryPhaseKinds": ("unavailable", "unknown_outcome"),
+    "UserAutomationHorizonPhaseFields": (
+        "trigger", "automation_id", "automation_revision", "revision_digest",
+        "requested_occurrence_ids", "remaining_occurrence_ids", "retry_handle", "outcome",
+    ),
+    "UserAutomationOrchestrationRecordFields": (
+        "parent", "state_fence", "automation_id", "automation_revision",
+        "revision_digest", "committed_receipt_digest", "obligations",
+    ),
+    "UserAutomationRuntimeObligationFields": (
+        "kind", "owner_operation_id", "request_digest", "subject_ids", "disposition",
+    ),
+    "UserAutomationWakeReadbackFields": (
+        "intent", "operation_id", "idempotency_key", "record_checksum",
+    ),
+    "UserAutomationConfigurationPhaseKinds": ("read", "committed", "replayed"),
+    "UserAutomationWakePhaseKinds": ("not_applicable", "published", "cancelled", "unknown_outcome", "unavailable"),
+    "UserAutomationExecutionPhaseKinds": ("not_applicable", "admitted", "deferred", "blocked_config", "unknown_outcome", "unavailable"),
+    "UserAutomationHorizonOutcomeKinds": ("published", "partial", "unavailable", "unknown_outcome"),
+    "UserAutomationHorizonTriggers": ("ACCEPTED_REVISION", "SUPERSEDING_EDIT", "RESUMED_REVISION", "DISPOSITION_ADVANCE"),
+    "UserAutomationReadResultKinds": ("list", "status", "history", "inspect_last_failure"),
+    "UserAutomationMutationResultKinds": ("revision", "run_now"),
+    "UserAutomationRuntimeObligationKinds": ("wake_horizon_publication", "wake_cancellation"),
+    "UserAutomationRuntimeObligationAnswerKinds": ("wake_horizon_publication", "wake_cancellation"),
+    "UserAutomationRuntimeObligationDispositionKinds": ("retained", "reconciling", "answered", "unavailable"),
+}
+
+# Exact nested JSON wire shapes are pinned separately from the short sets used
+# by the decoder. Descriptors include serde tags/casing, named variant payload
+# fields, Rust payload types, field renames, and omitted-Option behavior.
+SUPPORTED_RESULT_SCHEMA_WIRE_SHAPES = {
+    "UserAutomationOperatorResultEnvelopeWireShape": (
+        "serde=deny_unknown_fields",
+        "field=schema_id:String:omitted=0",
+        "field=schema_version:u16:omitted=0",
+        "field=status:UserAutomationOperatorResultStatus:omitted=0",
+        "field=value:UserAutomationOperatorResultValue:omitted=0",
+        "field=recovery:Option<UserAutomationRecoveryPhase>:omitted=0",
+    ),
+    "UserAutomationOperatorResultValueWireShape": (
+        "serde=deny_unknown_fields",
+        "field=transition:UserAutomationOperatorTransition:omitted=0",
+        "field=occurrences:Vec<serde_json::Value>:omitted=0",
+    ),
+    "UserAutomationOperatorTransitionWireShape": (
+        "serde=deny_unknown_fields",
+        "field=wire_id:String:omitted=0",
+        "field=wire_version:u16:omitted=0",
+        "field=identity:OperationIdentity:omitted=0",
+        "field=state_fence:StateFence:omitted=0",
+        "field=configuration:UserAutomationConfigurationPhase:omitted=0",
+        "field=wake:UserAutomationWakePhase:omitted=0",
+        "field=execution:UserAutomationExecutionPhase:omitted=0",
+        "field=horizon:Option<Box<UserAutomationHorizonPhase>>:omitted=1:defaulted=1",
+        "field=orchestration:Option<Box<UserAutomationOrchestrationRecord>>:omitted=1:defaulted=1",
+    ),
+    "OperationIdentityWireShape": (
+        "serde=deny_unknown_fields",
+        "field=operation_id:OperationId:omitted=0",
+        "field=idempotency_key:String:omitted=0",
+        "field=canonical_request_hash:String:omitted=0",
+    ),
+    "UserAutomationHorizonPhaseWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "field=trigger:UserAutomationHorizonTrigger:omitted=0",
+        "field=automation_id:String:omitted=0",
+        "field=automation_revision:String:omitted=0",
+        "field=revision_digest:String:omitted=0",
+        "field=requested_occurrence_ids:Vec<String>:omitted=0",
+        "field=remaining_occurrence_ids:Vec<String>:omitted=0",
+        "field=retry_handle:String:omitted=0",
+        "field=outcome:UserAutomationHorizonOutcome:omitted=0",
+    ),
+    "UserAutomationOrchestrationRecordWireShape": (
+        "serde=deny_unknown_fields",
+        "field=parent:OperationIdentity:omitted=0",
+        "field=state_fence:StateFence:omitted=0",
+        "field=automation_id:String:omitted=0",
+        "field=automation_revision:String:omitted=0",
+        "field=revision_digest:String:omitted=0",
+        "field=committed_receipt_digest:String:omitted=0",
+        "field=obligations:Vec<UserAutomationRuntimeObligation>:omitted=0",
+    ),
+    "UserAutomationRuntimeObligationWireShape": (
+        "serde=deny_unknown_fields",
+        "field=kind:UserAutomationRuntimeObligationKind:omitted=0",
+        "field=owner_operation_id:String:omitted=0",
+        "field=request_digest:String:omitted=0",
+        "field=subject_ids:Vec<String>:omitted=0",
+        "field=disposition:UserAutomationRuntimeObligationDisposition:omitted=0",
+    ),
+    "UserAutomationWakeReadbackWireShape": (
+        "serde=deny_unknown_fields",
+        "field=intent:WakeIntent:omitted=0",
+        "field=operation_id:String:omitted=0",
+        "field=idempotency_key:String:omitted=0",
+        "field=record_checksum:String:omitted=0",
+    ),
+    "UserAutomationOperatorResultStatusWireShape": (
+        "serde=allow_unknown_fields;rename_all=snake_case",
+        "variant=known",
+        "variant=unknown",
+    ),
+    "UserAutomationRecoveryPhaseWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=unavailable|reason:String:omitted=0",
+        "variant=unknown_outcome|reason:String:omitted=0",
+    ),
+    "UserAutomationConfigurationPhaseWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=read|result:Box<UserAutomationReadResult>:omitted=0",
+        "variant=committed|receipt:Box<WriteReceipt>:omitted=0,result:Box<UserAutomationMutationResult>:omitted=0",
+        "variant=replayed|receipt:Box<WriteReceipt>:omitted=0,result:Box<UserAutomationMutationResult>:omitted=0",
+    ),
+    "UserAutomationWakePhaseWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=not_applicable|reason:String:omitted=0",
+        "variant=published|readback:UserAutomationWakeReadback:omitted=0",
+        "variant=cancelled|cancelled_wake_ids:Vec<String>:omitted=0",
+        "variant=unknown_outcome|reason:String:omitted=0",
+        "variant=unavailable|reason:String:omitted=0",
+    ),
+    "UserAutomationExecutionPhaseWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=not_applicable|reason:String:omitted=0",
+        "variant=admitted|execution:Box<AutomationExecutionReference>:omitted=0",
+        "variant=deferred|reason:UserAutomationDeferReason:omitted=0",
+        "variant=blocked_config|failure_fingerprint:String:omitted=0",
+        "variant=unknown_outcome|reason:String:omitted=0",
+        "variant=unavailable|reason:String:omitted=0",
+    ),
+    "UserAutomationHorizonOutcomeWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=published|publication_operation_id:Box<eliot_store_api::OperationId>:omitted=0",
+        "variant=partial|publication_operation_id:Box<eliot_store_api::OperationId>:omitted=0,reason:String:omitted=0",
+        "variant=unavailable|reason:String:omitted=0",
+        "variant=unknown_outcome|reason:String:omitted=0",
+    ),
+    "UserAutomationHorizonTriggerWireShape": (
+        "serde=allow_unknown_fields;rename_all=SCREAMING_SNAKE_CASE",
+        "variant=ACCEPTED_REVISION",
+        "variant=SUPERSEDING_EDIT",
+        "variant=RESUMED_REVISION",
+        "variant=DISPOSITION_ADVANCE",
+    ),
+    "UserAutomationReadResultWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=list|revisions:Vec<UserAutomationRevision>:omitted=0",
+        "variant=status|revision:UserAutomationRevision:omitted=0,execution:UserAutomationExecutionProjection:omitted=0",
+        "variant=history|automation_id:String:omitted=0,execution:UserAutomationExecutionProjection:omitted=0",
+        "variant=inspect_last_failure|automation_id:String:omitted=0,revision:UserAutomationRevision:omitted=0,failure:Option<UserAutomationFailureProjection>:omitted=0",
+    ),
+    "UserAutomationMutationResultWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=revision|revision:UserAutomationRevision:omitted=0,cancelled_wake_ids:Vec<String>:omitted=0",
+        "variant=run_now|invocation:UserAutomationInvocation:omitted=0,wake_intent:WakeIntent:omitted=0",
+    ),
+    "UserAutomationRuntimeObligationKindWireShape": (
+        "serde=allow_unknown_fields;rename_all=snake_case",
+        "variant=wake_horizon_publication",
+        "variant=wake_cancellation",
+    ),
+    "UserAutomationRuntimeObligationAnswerWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=wake_horizon_publication|acknowledgement:Box<UserAutomationWakePublication>:omitted=0",
+        "variant=wake_cancellation|cancelled_wake_ids:Vec<String>:omitted=0",
+    ),
+    "UserAutomationRuntimeObligationDispositionWireShape": (
+        "serde=deny_unknown_fields;rename_all=snake_case;tag=kind",
+        "variant=retained",
+        "variant=reconciling|reason:String:omitted=0",
+        "variant=answered|answer:Box<UserAutomationRuntimeObligationAnswer>:omitted=0",
+        "variant=unavailable|reason:String:omitted=0",
+    ),
+}
 
 
 class Refused(Exception):
@@ -375,6 +620,30 @@ class RustRefusal:
     display: str
 
 
+@dataclass(frozen=True)
+class RustWireField:
+    name: str
+    rust_type: str
+    omitted_when_none: bool
+    defaulted: bool = False
+
+
+@dataclass(frozen=True)
+class RustWireStruct:
+    name: str
+    fields: tuple[RustWireField, ...]
+    wire_shape: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RustWireEnum:
+    name: str
+    variants: tuple[str, ...]
+    tag: str | None
+    shared_fields: tuple[str, ...]
+    wire_shape: tuple[str, ...]
+
+
 def collapse(text: str) -> str:
     return " ".join(text.split())
 
@@ -438,6 +707,353 @@ def collect_constants(lines: list[str]) -> dict[str, RustConstant]:
         )
         index = end + 1
     return found
+
+
+def collect_declaration_block(
+    lines: list[str],
+    declaration_kind: str,
+    name: str,
+) -> tuple[int, list[str]]:
+    """Read one public struct/enum body with simple brace matching."""
+    header = re.compile(rf"^\s*pub\s+{declaration_kind}\s+{re.escape(name)}\b")
+    for index, line in enumerate(lines):
+        if header.match(line) is None:
+            continue
+        depth = 0
+        opened = False
+        body: list[str] = []
+        for offset, candidate in enumerate(lines[index:]):
+            depth += candidate.count("{") - candidate.count("}")
+            if "{" in candidate:
+                opened = True
+            if opened and offset > 0:
+                body.append(candidate)
+            if opened and depth == 0:
+                return index, body[:-1]
+        raise Refused(f"{declaration_kind} {name!r} has no closed body")
+    raise Refused(f"public {declaration_kind} {name!r} is absent from the owner source")
+
+
+def preceding_attributes(lines: list[str], index: int) -> str:
+    attributes: list[str] = []
+    cursor = index - 1
+    while cursor >= 0:
+        stripped = lines[cursor].strip()
+        if stripped.startswith("#["):
+            attributes.append(stripped)
+        elif stripped.startswith("///") or not stripped:
+            pass
+        else:
+            break
+        cursor -= 1
+    return "\n".join(reversed(attributes))
+
+
+def serde_options(attributes: str, allowed: set[str], declaration: str) -> dict[str, str | None]:
+    """Read the small explicit serde attribute vocabulary used by pinned shapes."""
+    options: dict[str, str | None] = {}
+    for line in attributes.splitlines():
+        match = re.fullmatch(r"\s*#\[serde\((.*)\)\]\s*", line)
+        if match is None:
+            continue
+        for item in match.group(1).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            key, separator, raw_value = item.partition("=")
+            key = key.strip()
+            if key not in allowed:
+                raise Refused(f"{declaration} uses unsupported serde option {key!r}")
+            value = raw_value.strip().strip('"') if separator else None
+            if key in options:
+                raise Refused(f"{declaration} repeats serde option {key!r}")
+            options[key] = value
+    return options
+
+
+def serde_container_shape(attributes: str, options: dict[str, str | None]) -> str:
+    """Canonical container-level wire metadata retained in the generated pin."""
+    ordered = ["deny_unknown_fields" if "deny_unknown_fields" in attributes else "allow_unknown_fields"]
+    for key in ("rename_all", "rename_all_fields", "tag", "content"):
+        if key in options:
+            ordered.append(f"{key}={options[key] or ''}")
+    if "untagged" in options:
+        ordered.append("untagged")
+    return "serde=" + ";".join(ordered)
+
+
+def collect_wire_struct(lines: list[str], name: str) -> RustWireStruct:
+    """Read JSON field names/types and omitted-Option semantics for one type."""
+    index, body = collect_declaration_block(lines, "struct", name)
+    attributes = preceding_attributes(lines, index)
+    options = serde_options(
+        attributes,
+        {"deny_unknown_fields", "rename_all", "tag", "content"},
+        f"wire struct {name!r}",
+    )
+    if "deny_unknown_fields" not in attributes:
+        raise Refused(f"public wire struct {name!r} must deny unknown fields")
+    rename_all = options.get("rename_all")
+    if rename_all not in (None, "snake_case"):
+        raise Refused(f"wire struct {name!r} has unsupported rename_all {rename_all!r}")
+
+    fields: list[RustWireField] = []
+    pending_attributes: list[str] = []
+    field_declaration = re.compile(r"^\s*pub\s+([a-z][a-z0-9_]*)\s*:\s*(.+?),\s*$")
+    for line in body:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("///"):
+            continue
+        if stripped.startswith("#["):
+            pending_attributes.append(stripped)
+            continue
+        match = field_declaration.match(line)
+        if match is None:
+            if stripped.startswith("pub "):
+                raise Refused(f"wire field in {name!r} is not one bounded declaration line: {stripped!r}")
+            continue
+
+        rust_name, rust_type = match.groups()
+        field_attributes = " ".join(pending_attributes)
+        field_options = serde_options(
+            field_attributes,
+            {"rename", "skip_serializing_if", "default"},
+            f"wire field {name}.{rust_name}",
+        )
+        wire_name = field_options.get("rename") or rust_name
+        skip_if = field_options.get("skip_serializing_if")
+        if skip_if not in (None, "Option::is_none"):
+            raise Refused(f"wire field {name}.{rust_name} has unsupported skip_serializing_if {skip_if!r}")
+        omitted_when_none = skip_if == "Option::is_none"
+        if omitted_when_none and not rust_type.startswith("Option<"):
+            raise Refused(f"wire field {name}.{rust_name} skips serialization but is not an Option")
+        if any(field.name == wire_name for field in fields):
+            raise Refused(f"wire struct {name!r} repeats JSON field {wire_name!r}")
+        fields.append(
+            RustWireField(
+                name=wire_name,
+                rust_type=collapse(rust_type),
+                omitted_when_none=omitted_when_none,
+                defaulted="default" in field_options,
+            )
+        )
+        pending_attributes.clear()
+
+    if not fields:
+        raise Refused(f"wire struct {name!r} has no public JSON fields")
+    wire_shape = [serde_container_shape(attributes, options)]
+    wire_shape.extend(
+        f"field={field.name}:{field.rust_type}:omitted={int(field.omitted_when_none)}"
+        + (":defaulted=1" if field.defaulted else "")
+        for field in fields
+    )
+    return RustWireStruct(name=name, fields=tuple(fields), wire_shape=tuple(wire_shape))
+
+
+def to_snake_case(value: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
+
+
+def collect_wire_enum(lines: list[str], name: str) -> RustWireEnum:
+    """Read one bounded serde enum, including every named variant payload."""
+    index, body = collect_declaration_block(lines, "enum", name)
+    attributes = preceding_attributes(lines, index)
+    options = serde_options(
+        attributes,
+        {"rename_all", "rename_all_fields", "tag", "content", "deny_unknown_fields", "untagged"},
+        f"wire enum {name!r}",
+    )
+    rename_all = options.get("rename_all")
+    if rename_all not in ("snake_case", "SCREAMING_SNAKE_CASE"):
+        raise Refused(f"public wire enum {name!r} has unsupported rename_all {rename_all!r}")
+    tag = options.get("tag")
+    if tag is not None and "deny_unknown_fields" not in attributes:
+        raise Refused(f"tagged wire enum {name!r} must deny unknown fields")
+
+    variants: list[str] = []
+    variant_fields: list[tuple[RustWireField, ...]] = []
+    wire_shape = [serde_container_shape(attributes, options)]
+    index = 0
+    variant_declaration = re.compile(r"^\s{4}([A-Z][A-Za-z0-9_]*)\s*(.*)$")
+    field_declaration = re.compile(r"^\s{8}([a-z][a-z0-9_]*)\s*:\s*(.+?)(?:,\s*)?$")
+    while index < len(body):
+        stripped = body[index].strip()
+        if not stripped or stripped.startswith("///"):
+            index += 1
+            continue
+        if stripped.startswith("#["):
+            index += 1
+            continue
+        match = variant_declaration.match(body[index])
+        if match is None:
+            raise Refused(
+                f"wire enum {name!r} has an unsupported declaration line: {stripped!r}"
+            )
+        variant, tail = match.groups()
+        variant_options = serde_options(
+            preceding_attributes(body, index),
+            {"rename"},
+            f"wire enum variant {name}.{variant}",
+        )
+        if variant_options.get("rename") is not None:
+            wire_variant = variant_options["rename"]
+        else:
+            wire_variant = to_snake_case(variant)
+            if rename_all == "SCREAMING_SNAKE_CASE":
+                wire_variant = wire_variant.upper()
+        if wire_variant in variants:
+            raise Refused(f"wire enum {name!r} repeats variant {wire_variant!r}")
+        variants.append(wire_variant)
+        fields: list[RustWireField] = []
+        tail = tail.strip().rstrip(",").strip()
+        if "(" in tail:
+            raise Refused(f"wire enum variant {name}.{variant} uses an unsupported tuple payload")
+        if "{" in tail:
+            if "}" in tail:
+                raise Refused(f"wire enum variant {name}.{variant} uses an unsupported inline payload")
+            index += 1
+            pending_field_attributes: list[str] = []
+            while index < len(body) and "}" not in body[index]:
+                field_line = body[index]
+                field_stripped = field_line.strip()
+                if not field_stripped or field_stripped.startswith("///"):
+                    index += 1
+                    continue
+                if field_stripped.startswith("#["):
+                    pending_field_attributes.append(field_stripped)
+                    index += 1
+                    continue
+                field = field_declaration.match(body[index])
+                if field is None:
+                    raise Refused(
+                        f"wire enum field in {name}.{variant} is not one bounded declaration line: "
+                        f"{field_stripped!r}"
+                    )
+                rust_name, rust_type = field.groups()
+                field_options = serde_options(
+                    " ".join(pending_field_attributes),
+                    {"rename", "skip_serializing_if", "default"},
+                    f"wire enum field {name}.{variant}.{rust_name}",
+                )
+                skip_if = field_options.get("skip_serializing_if")
+                if skip_if not in (None, "Option::is_none"):
+                    raise Refused(
+                        f"wire enum field {name}.{variant}.{rust_name} has unsupported "
+                        f"skip_serializing_if {skip_if!r}"
+                    )
+                wire_name = field_options.get("rename") or rust_name
+                omitted_when_none = skip_if == "Option::is_none"
+                if omitted_when_none and not rust_type.strip().startswith("Option<"):
+                    raise Refused(
+                        f"wire enum field {name}.{variant}.{rust_name} skips serialization but is not an Option"
+                    )
+                fields.append(
+                    RustWireField(
+                        wire_name,
+                        collapse(rust_type.rstrip(",").strip()),
+                        omitted_when_none,
+                        "default" in field_options,
+                    )
+                )
+                pending_field_attributes.clear()
+                index += 1
+            if index >= len(body):
+                raise Refused(f"wire enum variant {name}.{variant} has no closing brace")
+        elif tail not in ("",):
+            raise Refused(f"wire enum variant {name}.{variant} has unsupported payload {tail!r}")
+        if len({field.name for field in fields}) != len(fields):
+            raise Refused(f"wire enum variant {name}.{variant} repeats a JSON field")
+        variant_fields.append(tuple(fields))
+        field_shape = ",".join(
+            f"{field.name}:{field.rust_type}:omitted={int(field.omitted_when_none)}"
+            + (":defaulted=1" if field.defaulted else "")
+            for field in fields
+        )
+        wire_shape.append(f"variant={wire_variant}" + (f"|{field_shape}" if field_shape else ""))
+        index += 1
+
+    if not variants:
+        raise Refused(f"wire enum {name!r} has no public variants")
+    field_names = [tuple(field.name for field in fields) for fields in variant_fields]
+    common_fields = field_names[0] if tag is not None and all(item == field_names[0] for item in field_names) else ()
+    return RustWireEnum(
+        name=name,
+        variants=tuple(variants),
+        tag=tag,
+        shared_fields=tuple(common_fields),
+        wire_shape=tuple(wire_shape),
+    )
+
+
+def collect_result_schema(
+    sources: dict[str, list[str]],
+) -> tuple[dict[str, tuple[str, ...]], str]:
+    """Return generated member sets and a digest of the pinned public schema."""
+    members: dict[str, tuple[str, ...]] = {}
+    schema_lines: list[str] = []
+    for output_name, path, type_name in RESULT_SCHEMA_STRUCTS:
+        schema = collect_wire_struct(sources[path], type_name)
+        if output_name.endswith("RequiredFields"):
+            fields = tuple(field.name for field in schema.fields if not field.omitted_when_none)
+        else:
+            fields = tuple(field.name for field in schema.fields)
+        members[output_name] = fields
+        shape_name = f"{schema.name}WireShape"
+        members[shape_name] = schema.wire_shape
+        schema_lines.extend(
+            f"struct\t{schema.name}\t{field.name}\t{field.rust_type}\tomitted={int(field.omitted_when_none)}"
+            for field in schema.fields
+        )
+        schema_lines.extend(f"shape\t{shape_name}\t{item}" for item in schema.wire_shape)
+
+    optional_name, optional_path, optional_type = RESULT_SCHEMA_OPTIONAL_STRUCT
+    optional_schema = collect_wire_struct(sources[optional_path], optional_type)
+    members[optional_name] = tuple(field.name for field in optional_schema.fields if field.omitted_when_none)
+    optional_shape_name = f"{optional_schema.name}WireShape"
+    members[optional_shape_name] = optional_schema.wire_shape
+    schema_lines.extend(f"shape\t{optional_shape_name}\t{item}" for item in optional_schema.wire_shape)
+    if not members[optional_name]:
+        raise Refused(f"wire struct {optional_type!r} has no omitted optional fields")
+
+    for output_name, path, type_name in RESULT_SCHEMA_ENUMS:
+        schema = collect_wire_enum(sources[path], type_name)
+        members[output_name] = schema.variants
+        shape_name = f"{schema.name}WireShape"
+        members[shape_name] = schema.wire_shape
+        schema_lines.append(
+            f"enum\t{schema.name}\ttag={schema.tag or ''}\tshared={','.join(schema.shared_fields)}"
+        )
+        schema_lines.extend(f"shape\t{shape_name}\t{item}" for item in schema.wire_shape)
+
+    recovery_path, recovery_type = RESULT_SCHEMA_RECOVERY_FIELDS
+    recovery = collect_wire_enum(sources[recovery_path], recovery_type)
+    if recovery.tag is None:
+        raise Refused(f"wire enum {recovery_type!r} has no serde tag")
+    members["UserAutomationRecoveryPhaseFields"] = (recovery.tag, *recovery.shared_fields)
+    members[f"{recovery.name}WireShape"] = recovery.wire_shape
+    schema_lines.append(
+        f"enum\t{recovery.name}\ttag={recovery.tag}\tshared={','.join(recovery.shared_fields)}"
+    )
+    schema_lines.extend(
+        f"shape\t{recovery.name}WireShape\t{item}" for item in recovery.wire_shape
+    )
+
+    for name, expected in SUPPORTED_RESULT_SCHEMA_LAYOUT.items():
+        if members.get(name) != expected:
+            found = members.get(name)
+            raise Refused(
+                f"public result schema {name} changed from {expected!r} to {found!r}; "
+                "update and review the C# decoder before changing its schema pin"
+            )
+    for name, expected in SUPPORTED_RESULT_SCHEMA_WIRE_SHAPES.items():
+        if members.get(name) != expected:
+            found = members.get(name)
+            raise Refused(
+                f"public nested wire shape {name} changed from {expected!r} to {found!r}; "
+                "review the affected C# decoder before changing its schema pin"
+            )
+    digest = hashlib.sha256("\n".join(schema_lines).encode("utf-8")).hexdigest()
+    return members, digest
 
 
 def collect_functions(lines: list[str], name: str) -> RustFunction:
@@ -534,6 +1150,7 @@ def render_artefact(
     dispositions: list[str],
     refusals: list[RustRefusal],
     functions: list[RustFunction],
+    result_schema_members: dict[str, tuple[str, ...]],
     digests: dict[str, str],
 ) -> str:
     lines: list[str] = []
@@ -543,7 +1160,7 @@ def render_artefact(
     add("//     Generated by scripts/gen_operator_schedule_contract.py. Do not edit.")
     add("// </auto-generated>")
     add("//")
-    add("// Bounded C# mirror of the Kernel UserAutomation schedule/occurrence contract")
+    add("// Bounded C# mirror of the Kernel UserAutomation schedule/occurrence/result contracts")
     add(f"// ({REFUSAL_ENUM} owner, crates/kernel/eliot-kernel-core/src/user_automation.rs).")
     add("//")
     add("// Every value below is GENERATED from the owner Rust source, and")
@@ -560,6 +1177,7 @@ def render_artefact(
     add(f"// dispositions_source_sha256: {digests['dispositions']}")
     add(f"// refusals_source_sha256: {digests['refusals']}")
     add(f"// grammar_source_sha256: {digests['grammar']}")
+    add(f"// result_schema_source_sha256: {digests['result_schema']}")
     add("//")
     add("// Stated boundary of this mirror. The Operator validates the bounded wire")
     add("// shape, the exact supported contract version and the self-consistency of the")
@@ -603,6 +1221,17 @@ def render_artefact(
         add(f"        {csharp_string(constant.source)},")
     add("    ];")
     add("")
+    add("    /// <summary>")
+    add("    /// Closed field/variant sets and nested wire descriptors read from")
+    add("    /// public Rust phase, projection, and Store identity types.")
+    add("    /// </summary>")
+    for name, members in result_schema_members.items():
+        add(f"    public static readonly IReadOnlyList<string> {name} =")
+        add("    [")
+        for member in members:
+            add(f"        {csharp_string(member)},")
+        add("    ];")
+        add("")
     add("    /// <summary>")
     add("    /// Owner functions the C# mirror reimplements, as `name<TAB>sha256`.")
     add("    /// </summary>")
@@ -695,6 +1324,19 @@ def build(root: str) -> tuple[str, dict[str, int]]:
             )
         )
 
+    expected_constants = {
+        "USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_ID": EXPECTED_RESULT_SCHEMA_ID,
+        "USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_VERSION": EXPECTED_RESULT_SCHEMA_VERSION,
+        "USER_AUTOMATION_TRANSITION_WIRE_ID": EXPECTED_TRANSITION_WIRE_ID,
+        "USER_AUTOMATION_TRANSITION_WIRE_VERSION": EXPECTED_TRANSITION_WIRE_VERSION,
+    }
+    for name, expected in expected_constants.items():
+        if resolved.get(name) != expected:
+            raise Refused(
+                f"public result schema constant {name} changed from {expected!r} "
+                f"to {resolved.get(name)!r}; update and review the C# decoder before changing its schema pin"
+            )
+
     for name, expression in DERIVED_CONSTANTS:
         value = evaluate_rust_expression(expression, resolved)
         if not isinstance(value, int):
@@ -739,25 +1381,36 @@ def build(root: str) -> tuple[str, dict[str, int]]:
         ).encode("utf-8")
     ).hexdigest()
 
+    result_schema_members, result_schema_digest = collect_result_schema(sources)
+
     digests = {
         "constants": constants_digest,
         "dispositions": dispositions_digest,
         "refusals": refusals_digest,
         "grammar": grammar_digest,
+        "result_schema": result_schema_digest,
     }
     digests.update(function_digests)
     digests["contract"] = hashlib.sha256(
         "".join(
             f"{key}\t{digests[key]}\n"
-            for key in ("constants", "dispositions", "refusals", "grammar")
+            for key in ("constants", "dispositions", "refusals", "grammar", "result_schema")
         ).encode("utf-8")
     ).hexdigest()
 
-    return render_artefact(rendered, dispositions, refusals, functions, digests), {
+    return render_artefact(
+        rendered,
+        dispositions,
+        refusals,
+        functions,
+        result_schema_members,
+        digests,
+    ), {
         "constants": len(rendered),
         "dispositions": len(dispositions),
         "refusals": len(refusals),
         "grammar_functions": len(functions),
+        "result_schema_members": sum(len(value) for value in result_schema_members.values()),
     }
 
 

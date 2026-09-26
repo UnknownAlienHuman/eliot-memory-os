@@ -20,11 +20,12 @@
 //! [`UserAutomationHostExecutionClient`] and fails closed where this contour
 //! has no owner to reach.
 
-use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_contracts::{RequestMetadata, StateFence, sha256_hex};
 use eliot_kernel_core::user_automation::{
     AutomationExecutionReference, UserAutomationConfigurationState, UserAutomationDeferReason,
+    UserAutomationRevision,
 };
-use eliot_store_api::{OperationIdentity, WriteReceipt};
+use eliot_store_api::{OperationIdentity, WriteReceipt, WriteReceiptStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -506,6 +507,7 @@ impl UserAutomationOperatorTransition {
         self.state_fence
             .validate()
             .map_err(|error| error.to_string())?;
+        self.validate_configuration_receipt_binding()?;
         if let UserAutomationWakePhase::Cancelled { cancelled_wake_ids } = &self.wake {
             if cancelled_wake_ids.is_empty() {
                 return Err(
@@ -520,47 +522,8 @@ impl UserAutomationOperatorTransition {
                 }
             }
         }
-        if let Some(horizon) = &self.horizon {
-            validate_horizon_phase(horizon)?;
-            if horizon.published() {
-                // A published horizon is an owner-acknowledged wake set, never a
-                // configuration fact: the transition may only report one beside
-                // a committed revision of the same immutable identity.
-                if committed_revision_id(&self.configuration).as_deref()
-                    != Some(horizon.automation_revision.as_str())
-                {
-                    return Err(
-                        "a published horizon does not belong to the committed revision".to_owned(),
-                    );
-                }
-            }
-        }
-        if let Some(orchestration) = &self.orchestration {
-            orchestration
-                .validate()
-                .map_err(|error| error.to_string())?;
-            if orchestration.parent != self.identity
-                || orchestration.state_fence != self.state_fence
-            {
-                return Err(
-                    "a post-commit orchestration record is not bound to this parent operation and \
-                     State Fence"
-                        .to_owned(),
-                );
-            }
-            if !orchestration.resolved() && self.recovery().is_none() {
-                // The one invariant that makes a retained obligation visible: a
-                // runtime obligation this operation still owns, whose owner
-                // effect is not durably answered, can never be reported beside a
-                // null recovery directive. `recovery` derives its directive from
-                // the same record, so this check refuses any projection where the
-                // two could disagree.
-                return Err(
-                    "an unanswered post-commit runtime obligation requires a recovery directive"
-                        .to_owned(),
-                );
-            }
-        }
+        self.validate_horizon_binding()?;
+        self.validate_orchestration_binding()?;
         for reason in [
             match &self.wake {
                 UserAutomationWakePhase::NotApplicable { reason }
@@ -587,15 +550,215 @@ impl UserAutomationOperatorTransition {
         }
         Ok(())
     }
+
+    fn validate_configuration_receipt_binding(&self) -> Result<(), String> {
+        let Some(receipt) = configuration_receipt(&self.configuration) else {
+            return Ok(());
+        };
+        receipt.validate().map_err(|error| error.to_string())?;
+        if receipt.status != WriteReceiptStatus::Committed
+            || receipt.operation_id != self.identity.operation_id
+            || receipt.idempotency_key != self.identity.idempotency_key
+            || receipt.canonical_request_hash != self.identity.canonical_request_hash
+            || receipt.state_fence != self.state_fence
+        {
+            return Err(
+                "the canonical configuration receipt is not bound to this parent identity and State Fence"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_horizon_binding(&self) -> Result<(), String> {
+        let Some(horizon) = self.horizon.as_deref() else {
+            return Ok(());
+        };
+        validate_horizon_phase(horizon)?;
+        // A horizon, including an unresolved one, belongs to the exact
+        // immutable revision that this committed mutation produced.
+        let revision = committed_revision(&self.configuration)
+            .ok_or_else(|| "a horizon phase has no committed configuration revision".to_owned())?;
+        if horizon.automation_id != revision.automation_id
+            || horizon.automation_revision != revision.revision
+            || horizon.revision_digest != revision.digest().map_err(|e| e.to_string())?
+        {
+            return Err("a horizon phase does not belong to the committed revision".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_orchestration_binding(&self) -> Result<(), String> {
+        let Some(orchestration) = self.orchestration.as_deref() else {
+            return Ok(());
+        };
+        orchestration
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if orchestration.parent != self.identity || orchestration.state_fence != self.state_fence {
+            return Err(
+                "a post-commit orchestration record is not bound to this parent operation and \
+                 State Fence"
+                    .to_owned(),
+            );
+        }
+        let receipt = configuration_receipt(&self.configuration).ok_or_else(|| {
+            "a post-commit orchestration record has no canonical configuration receipt".to_owned()
+        })?;
+        if orchestration.committed_receipt_digest != operator_receipt_evidence_digest(receipt)? {
+            return Err(
+                "a post-commit orchestration record is not bound to the configuration receipt"
+                    .to_owned(),
+            );
+        }
+        let revision = committed_revision(&self.configuration).ok_or_else(|| {
+            "a post-commit orchestration record has no committed configuration revision".to_owned()
+        })?;
+        if orchestration.automation_id != revision.automation_id
+            || orchestration.automation_revision != revision.revision
+            || orchestration.revision_digest != revision.digest().map_err(|e| e.to_string())?
+        {
+            return Err(
+                "a post-commit orchestration record does not belong to the committed revision"
+                    .to_owned(),
+            );
+        }
+        if !orchestration.resolved() && self.recovery().is_none() {
+            // The one invariant that makes a retained obligation visible: a
+            // runtime obligation this operation still owns, whose owner effect
+            // is not durably answered, can never be reported beside a null
+            // recovery directive. `recovery` derives its directive from this
+            // record, so the two cannot disagree.
+            return Err(
+                "an unanswered post-commit runtime obligation requires a recovery directive"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
-/// Returns the exact revision identity a committed or replayed configuration
-/// mutation produced, if this phase is one.
-fn committed_revision_id(phase: &UserAutomationConfigurationPhase) -> Option<String> {
+/// Stable schema identity for the public `UserAutomation` operator result.
+pub const USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_ID: &str =
+    "eliot.kernel.user-automation.operator-result";
+/// Current schema revision for the public `UserAutomation` operator result.
+pub const USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_VERSION: u16 = 1;
+
+/// Closed status of one versioned `UserAutomation` operator result.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAutomationOperatorResultStatus {
+    /// Every required owner phase is proven by the transition.
+    Known,
+    /// A required owner phase remains unresolved and requires recovery.
+    Unknown,
+}
+
+/// Typed payload of one public `UserAutomation` operator result.
+#[derive(Clone, Debug, PartialEq, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOperatorResultValue {
+    /// The exact owner transition, including its own wire identity and version.
+    pub transition: UserAutomationOperatorTransition,
+    /// Bounded schedule occurrence projections for inspection answers.
+    pub occurrences: Vec<serde_json::Value>,
+}
+
+/// Public, explicitly versioned envelope for one `UserAutomation` operator result.
+///
+/// The envelope binds the status and recovery directive to the validated owner
+/// transition. The transition remains an intact typed value, so its
+/// `wire_id`/`wire_version` and optional phase semantics cannot be inferred from
+/// a daemon-maintained list of JSON properties.
+#[derive(Clone, Debug, PartialEq, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOperatorResultEnvelope {
+    /// Stable identity of this public result shape.
+    pub schema_id: String,
+    /// Semantic version of this public result shape.
+    pub schema_version: u16,
+    /// Whether every required owner phase is proven.
+    pub status: UserAutomationOperatorResultStatus,
+    /// Typed transition and its inspection occurrence projection.
+    pub value: UserAutomationOperatorResultValue,
+    /// Recovery directive derived from the same transition; serialized as null
+    /// exactly when the result status is `known`.
+    pub recovery: Option<UserAutomationRecoveryPhase>,
+}
+
+impl UserAutomationOperatorResultEnvelope {
+    /// Builds the public result from one validated owner transition.
+    pub fn new(
+        transition: UserAutomationOperatorTransition,
+        occurrences: Vec<serde_json::Value>,
+    ) -> Result<Self, String> {
+        transition.validate()?;
+        let recovery = transition.recovery();
+        let status = if recovery.is_some() {
+            UserAutomationOperatorResultStatus::Unknown
+        } else {
+            UserAutomationOperatorResultStatus::Known
+        };
+        let envelope = Self {
+            schema_id: USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_ID.to_owned(),
+            schema_version: USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_VERSION,
+            status,
+            value: UserAutomationOperatorResultValue {
+                transition,
+                occurrences,
+            },
+            recovery,
+        };
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Rejects a schema or status/recovery pair inconsistent with its transition.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_id != USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_ID
+            || self.schema_version != USER_AUTOMATION_OPERATOR_RESULT_SCHEMA_VERSION
+        {
+            return Err("UserAutomation operator result schema is not current".to_owned());
+        }
+        self.value.transition.validate()?;
+        let expected_recovery = self.value.transition.recovery();
+        let expected_status = if expected_recovery.is_some() {
+            UserAutomationOperatorResultStatus::Unknown
+        } else {
+            UserAutomationOperatorResultStatus::Known
+        };
+        if self.status != expected_status || self.recovery != expected_recovery {
+            return Err(
+                "UserAutomation operator result status/recovery does not match its transition"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Returns the receipt carried by a committed or replayed configuration phase.
+fn configuration_receipt(phase: &UserAutomationConfigurationPhase) -> Option<&WriteReceipt> {
+    match phase {
+        UserAutomationConfigurationPhase::Read { .. } => None,
+        UserAutomationConfigurationPhase::Committed { receipt, .. }
+        | UserAutomationConfigurationPhase::Replayed { receipt, .. } => Some(receipt),
+    }
+}
+
+/// Returns the revision a committed or replayed configuration mutation produced.
+fn committed_revision(phase: &UserAutomationConfigurationPhase) -> Option<&UserAutomationRevision> {
     match phase.mutation_result()? {
-        UserAutomationMutationResult::Revision { revision, .. } => Some(revision.revision.clone()),
+        UserAutomationMutationResult::Revision { revision, .. } => Some(revision),
         UserAutomationMutationResult::RunNow { .. } => None,
     }
+}
+
+/// Computes the same SHA-256 over `serde_json` receipt bytes as
+/// `store_gateway::committed_receipt_digest` and `receipt_evidence_digest`.
+fn operator_receipt_evidence_digest(receipt: &WriteReceipt) -> Result<String, String> {
+    let bytes = serde_json::to_vec(receipt).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Recovery directive for one runtime obligation that is not durably answered.
