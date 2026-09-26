@@ -1087,12 +1087,48 @@ impl GrantGraph {
     /// exact suppressed set and reasons are reported in the outcome.
     /// Unrelated valid grants restore exactly as the snapshot carries them.
     ///
+    /// The production recheck refuses by named cause through
+    /// [`RevocationHistoryError::BoundedRevocation`], so a caller can tell the
+    /// four failure classes apart instead of reading one untyped refusal:
+    /// [`UnsupportedSchema`](eliot_influence::InfluenceError::UnsupportedSchema)
+    /// for a snapshot whose declared schema or version is not the supported one
+    /// (decided before any other wire field is validated),
+    /// [`UnverifiedRecovery`](eliot_influence::InfluenceError::UnverifiedRecovery)
+    /// for a committed closure whose declared origin this graph cannot relate to
+    /// its own lineage while the closure still names in-graph targets,
+    /// [`IncompleteCoverage`](eliot_influence::InfluenceError::IncompleteCoverage)
+    /// when the bounded evaluator could not prove the whole dependent closure
+    /// inside the declared bounds, and
+    /// [`TargetDrift`](eliot_influence::InfluenceError::TargetDrift) when the
+    /// closure recomputed from the live graph reaches an in-graph target the
+    /// committed closure does not name. The first, third, and fourth of these
+    /// refused before this change as well, under `InvalidSnapshot` or the
+    /// untyped `UnknownHistory`; only the cause is named there. The second is a
+    /// strictly new refusal: a foreign-origin closure naming in-graph targets
+    /// used to restore unrecheckable, and now refuses. Nothing that restored
+    /// before stops restoring, and no field is newly ignored.
+    ///
     /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
     /// preserves its exact prior behavior for previously-admitted callers.
     pub fn from_recovery_snapshot_with_revocation_history(
         snapshot: &GrantGraphRecoverySnapshot,
         history: Option<&crate::RevocationHistoryEvidence>,
     ) -> Result<GrantRestoreOutcome, RevocationHistoryError> {
+        // Schema identity is decided before any other wire field is validated,
+        // so a snapshot persisted under an unsupported revision refuses by
+        // cause instead of being read as if its protected fields had been
+        // defaulted. The two checks below are the same refusals `validate_wire`
+        // still makes; running them first only names the cause.
+        if snapshot.schema != GRANT_GRAPH_RECOVERY_SCHEMA {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnsupportedSchema("grant_graph_recovery.schema"),
+            ));
+        }
+        if snapshot.version != GRANT_GRAPH_RECOVERY_VERSION {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnsupportedSchema("grant_graph_recovery.version"),
+            ));
+        }
         snapshot
             .validate_wire()
             .map_err(RevocationHistoryError::InvalidSnapshot)?;
@@ -1125,40 +1161,12 @@ impl GrantGraph {
             .map(|entry| entry.grant_id.as_str())
             .collect();
         for closure in &closures {
-            for affected_ref in &closure.affected {
-                let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
-                    continue;
-                };
-                if graph.grant(grant_id.as_str()).is_none() {
-                    continue;
-                }
-                let verdict = graph
-                    .revocation_closure_verdict(
-                        &grant_id,
-                        &evidence.state_fence,
-                        &eliot_influence::RevocationBounds::default_bounds(),
-                    )
-                    .map_err(map_bounded_history_error)?;
-                if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
-                    return Err(RevocationHistoryError::UnknownHistory);
-                }
-                let denied = verdict
-                    .members
-                    .iter()
-                    .map(|member| member.grant_id.as_str())
-                    .chain(
-                        verdict
-                            .authorized_cross_root
-                            .iter()
-                            .map(|member| member.grant_id.as_str()),
-                    )
-                    .any(|denied_ref| {
-                        graph.grant(denied_ref).is_some() && !suppressed_ids.contains(denied_ref)
-                    });
-                if denied {
-                    return Err(RevocationHistoryError::UnknownHistory);
-                }
-            }
+            Self::recheck_committed_closure(
+                &graph,
+                closure,
+                &evidence.state_fence,
+                &suppressed_ids,
+            )?;
         }
         for entry in &suppressed {
             if let Ok(grant_id) = GrantId::new(entry.grant_id.clone()) {
@@ -1166,6 +1174,105 @@ impl GrantGraph {
             }
         }
         Ok(GrantRestoreOutcome { graph, suppressed })
+    }
+
+    /// Fail-closed recheck of one committed revocation closure against the
+    /// restored graph, naming the cause of every refusal.
+    ///
+    /// Three decisions, all reached from
+    /// [`from_recovery_snapshot_with_revocation_history`](Self::from_recovery_snapshot_with_revocation_history):
+    ///
+    /// 1. the closure's declared origin must be relatable to this graph's own
+    ///    lineage, because `derive_suppressions` will revoke the in-graph
+    ///    targets the closure names and an origin outside the graph cannot be
+    ///    rechecked against live lineage. An in-graph grant origin and an
+    ///    authority-root origin both stay admissible, and a closure naming no
+    ///    in-graph grant still refuses nothing. This is the A0.3 hard boundary
+    ///    "restoration of revoked influence after recovery" refused by cause
+    ///    instead of accepted unrecheckable;
+    /// 2. the bounded evaluator must prove the whole dependent closure inside
+    ///    the declared bounds, otherwise the affected set is a bounded prefix
+    ///    and I15.7's explicit incomplete-coverage refusal applies;
+    /// 3. every in-graph grant the verdict can reach - a same-root member or a
+    ///    receipt-authorized cross-root member - must already be suppressed,
+    ///    otherwise the committed closure under-claims its transitive
+    ///    descendants and the stored target set drifted.
+    ///
+    /// The recheck reads the verdict owner, not the bounded engine directly:
+    /// [`GrantGraph::revocation_closure_verdict`] reconciles the engine outcome
+    /// against the live graph, follows same-root and receipt-authorized parent
+    /// links, binds every omitted cross-root dependent to its verified
+    /// separate-quarantine receipt, and reports anything less as
+    /// [`RevocationClosureState::PartialOrUnknown`] - so a partial verdict, or a
+    /// closure that under-claims its descendants, still refuses, and an omitted
+    /// dependent without a bound receipt is never silently cleared.
+    ///
+    /// An affected reference naming no grant in this graph belongs to another
+    /// graph's denominator and refuses nothing.
+    fn recheck_committed_closure(
+        graph: &GrantGraph,
+        closure: &crate::revocation_history::ValidatedRevocationClosure,
+        fence: &StateFence,
+        suppressed_ids: &BTreeSet<&str>,
+    ) -> Result<(), RevocationHistoryError> {
+        let origin_is_local = graph.grant(closure.root_ref.as_str()).is_some()
+            || graph
+                .grants
+                .values()
+                .any(|grant| grant.authority_root_ref == closure.root_ref);
+        if !origin_is_local
+            && closure
+                .affected
+                .iter()
+                .any(|reference| graph.grant(reference.as_str()).is_some())
+        {
+            return Err(RevocationHistoryError::BoundedRevocation(
+                eliot_influence::InfluenceError::UnverifiedRecovery("recovery.closure_origin"),
+            ));
+        }
+        for affected_ref in &closure.affected {
+            let Ok(grant_id) = GrantId::new(affected_ref.as_str()) else {
+                continue;
+            };
+            if graph.grant(grant_id.as_str()).is_none() {
+                continue;
+            }
+            let verdict = graph
+                .revocation_closure_verdict(
+                    &grant_id,
+                    fence,
+                    &eliot_influence::RevocationBounds::default_bounds(),
+                )
+                .map_err(map_bounded_history_error)?;
+            // The verdict has exactly two states, so a non-`Complete` verdict IS
+            // the incomplete-coverage cause: the closure could not be proven
+            // whole inside the declared bounds, or an omitted cross-root
+            // dependent carried no verified separate-quarantine receipt.
+            if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
+                return Err(RevocationHistoryError::BoundedRevocation(
+                    eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_verdict"),
+                ));
+            }
+            let denied = verdict
+                .members
+                .iter()
+                .map(|member| member.grant_id.as_str())
+                .chain(
+                    verdict
+                        .authorized_cross_root
+                        .iter()
+                        .map(|member| member.grant_id.as_str()),
+                )
+                .any(|denied_ref| {
+                    graph.grant(denied_ref).is_some() && !suppressed_ids.contains(denied_ref)
+                });
+            if denied {
+                return Err(RevocationHistoryError::BoundedRevocation(
+                    eliot_influence::InfluenceError::TargetDrift("recovery.closure_affected"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn revoke(&mut self, grant_id: &GrantId) -> Result<(), AuthorityError> {

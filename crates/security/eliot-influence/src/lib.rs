@@ -1250,10 +1250,14 @@ impl BoundedTraversal {
     ) -> Result<EdgeBudgetState, InfluenceError> {
         let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
         let Some(disposition) = self.dispositions.get(&key).copied() else {
-            return Err(InfluenceError::ContinuationBindingMismatch);
+            return Err(InfluenceError::InternalInconsistency(
+                "traversal.disposition_missing",
+            ));
         };
         if disposition != edge.disposition {
-            return Err(InfluenceError::ContinuationBindingMismatch);
+            return Err(InfluenceError::InternalInconsistency(
+                "traversal.disposition_drift",
+            ));
         }
         let requires_admission = disposition == InfluenceEdgeDisposition::PermittedCurrent
             && !self.admitted.contains_key(&edge.dependent_ref);
@@ -1349,10 +1353,14 @@ impl BoundedTraversal {
     ) -> Result<bool, InfluenceError> {
         let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
         let Some(disposition) = self.dispositions.get(&key).copied() else {
-            return Err(InfluenceError::ContinuationBindingMismatch);
+            return Err(InfluenceError::InternalInconsistency(
+                "traversal.disposition_missing",
+            ));
         };
         if disposition != edge.disposition {
-            return Err(InfluenceError::ContinuationBindingMismatch);
+            return Err(InfluenceError::InternalInconsistency(
+                "traversal.disposition_drift",
+            ));
         }
         if let Some(cause) = omission_cause_for(disposition) {
             self.omissions.push(RevocationOmission {
@@ -2234,7 +2242,9 @@ fn validate_reachability_and_frontier(
             .map(|((_, dependent_ref), _)| dependent_ref.clone()),
     );
     if state.frontier != expected_frontier {
-        return Err(InfluenceError::InvalidContinuation);
+        return Err(InfluenceError::ReconciliationMismatch(
+            "continuation.frontier",
+        ));
     }
     Ok(())
 }
@@ -3176,6 +3186,125 @@ pub enum InfluenceError {
     /// the fence failing on its own terms.
     #[error("revocation evidence is stale at {0}")]
     StaleEvidence(&'static str),
+    /// Carries the `schema` cause: a durable record declares a schema identity
+    /// or revision this engine does not support, so it cannot be read under an
+    /// understood contract.
+    ///
+    /// Produced by
+    /// `GrantGraph::from_recovery_snapshot_with_revocation_history` in
+    /// `eliot-authority`, on the owner-feed recovery chain, when the durable
+    /// grant-graph recovery snapshot's `schema` or `version` is not the
+    /// supported one. That decision runs before any other wire field of the
+    /// snapshot is validated, so a snapshot written by another revision refuses
+    /// by cause instead of being read as if its protected fields had been
+    /// defaulted.
+    ///
+    /// The payload is a bounded, redacted static field coordinate. No snapshot
+    /// bytes, grant id, owner text, principal or user data is interpolated.
+    #[error("influence input schema is unsupported at {0}")]
+    UnsupportedSchema(&'static str),
+    /// Carries the `coverage` cause: the bounded evaluator could not prove the
+    /// whole dependent closure inside the declared bounds, so the affected set
+    /// is a bounded prefix rather than the closure.
+    ///
+    /// Produced by
+    /// `GrantGraph::from_recovery_snapshot_with_revocation_history` in
+    /// `eliot-authority`, on the owner-feed recovery chain, when the production
+    /// recheck's `revoke_bounded_page` result is incomplete, still carries an
+    /// unresolved frontier, or records a `BoundsExhausted` omission. I15.7
+    /// requires exactly this outcome: the result returns the applicable
+    /// denial/revocation reason together with an explicit incomplete-coverage
+    /// refusal rather than a short set that reads as clear.
+    ///
+    /// Previously the same condition refused as the untyped
+    /// `RevocationHistoryError::UnknownHistory`, which a caller could not
+    /// distinguish from evidence that is merely contradictory. The refusal set
+    /// is unchanged; only the cause is named. The payload is a bounded,
+    /// redacted static field coordinate.
+    #[error("revocation coverage is incomplete at {0}")]
+    IncompleteCoverage(&'static str),
+    /// Carries the `target-drift` cause: the closure recomputed from the live
+    /// graph reaches an in-graph target that the committed closure's affected
+    /// set does not name, so the stored target set has drifted from the one the
+    /// current graph actually implies.
+    ///
+    /// Produced by
+    /// `GrantGraph::from_recovery_snapshot_with_revocation_history` in
+    /// `eliot-authority`, on the owner-feed recovery chain, by the fail-closed
+    /// recheck that requires every grant the bounded evaluator can reach from a
+    /// committed affected reference to already be suppressed. A committed
+    /// closure that under-claims its transitive same-root descendants lands
+    /// here instead of restoring them.
+    ///
+    /// Previously the same condition refused as the untyped
+    /// `RevocationHistoryError::UnknownHistory`. The refusal set is unchanged;
+    /// only the cause is named, so a caller can tell target drift from an
+    /// internal fault. The payload is a bounded, redacted static field
+    /// coordinate: no grant id, closure id, owner text or user data.
+    #[error("committed revocation target drifted at {0}")]
+    TargetDrift(&'static str),
+    /// Carries the `recovery` cause: a committed revocation closure declares an
+    /// origin this restore cannot relate to the graph it is rebuilding, so the
+    /// revocation it claims cannot be rechecked against live lineage before any
+    /// grant is suppressed.
+    ///
+    /// Produced by
+    /// `GrantGraph::from_recovery_snapshot_with_revocation_history` in
+    /// `eliot-authority`, on the owner-feed recovery chain, when a closure's
+    /// declared origin is neither a grant in the restored graph nor an
+    /// authority root that any grant in it belongs to, while the closure still
+    /// names in-graph grants that suppression would revoke. An in-graph grant
+    /// origin and an authority-root origin both stay admissible, and a closure
+    /// naming no in-graph grant still refuses nothing. Before this cause
+    /// existed that input restored unrecheckable; it now refuses, which is
+    /// strictly stricter and is the A0.3 hard boundary "restoration of revoked
+    /// influence after recovery" refused by cause.
+    ///
+    /// The payload is a bounded, redacted static field coordinate.
+    #[error("recovery revocation is unverifiable at {0}")]
+    UnverifiedRecovery(&'static str),
+    /// Carries the `internal` cause: this engine's own derived state disagrees
+    /// with itself, so the refusal is not attributable to any caller input.
+    ///
+    /// Produced by `BoundedTraversal::edge_budget_state` and
+    /// `BoundedTraversal::process_edge` on the bounded revocation path, when a
+    /// queued edge position is absent from, or disagrees with, the
+    /// `dispositions` map that the same call used to build that edge. Every
+    /// queued edge is copied out of `adjacency`, and `adjacency` is built from
+    /// `dispositions` in the same invocation, so no admitted request or
+    /// continuation can produce this; it is the guard for a defect in this
+    /// crate's edge bookkeeping.
+    ///
+    /// Previously these two decisions refused as
+    /// `ContinuationBindingMismatch`, which blames a caller's continuation or
+    /// request. The refusal set is unchanged and still fail-closed — nothing is
+    /// emitted, no omission is recorded and no dependent is admitted — but the
+    /// cause now separates an internal fault from caller drift, which I15
+    /// requires a diagnostic to name. The payload is a bounded, redacted static
+    /// field coordinate.
+    #[error("revocation engine is internally inconsistent at {0}")]
+    InternalInconsistency(&'static str),
+    /// Carries the `reconciliation` cause: state retained by a bounded
+    /// revocation operation does not reconcile with the denominator recomputed
+    /// from the current request.
+    ///
+    /// Produced by `validate_reachability_and_frontier` on the bounded
+    /// revocation resume path, which `eliot-authority` reaches from the
+    /// owner-feed recovery chain for any grant graph whose closure needs more
+    /// than one page. The retained frontier is compared against the outstanding
+    /// work recomputed from the retained pending nodes, the retained unexamined
+    /// edge positions and the `BoundsExhausted` omissions; a frontier that does
+    /// not reconcile with them would misreport what the operation still owes.
+    ///
+    /// A live continuation is emitted by this crate and its digest plus its
+    /// unforgeable token are re-checked before this decision runs, so no
+    /// admitted continuation reaches it; it is the fail-closed guard for a
+    /// reconciliation defect, distinct from `InternalInconsistency`, which is a
+    /// defect in derived edge state rather than in retained accounting. The
+    /// refusal set is unchanged. The payload is a bounded, redacted static
+    /// field coordinate.
+    #[error("revocation state does not reconcile at {0}")]
+    ReconciliationMismatch(&'static str),
 }
 
 #[cfg(test)]
