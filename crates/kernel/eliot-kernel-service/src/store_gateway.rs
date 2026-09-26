@@ -18,17 +18,24 @@ use eliot_contracts::{OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_kernel_core::user_automation::UserAutomationInvocation;
-use eliot_ors::{RedbRecoveryStore, ReservationRecord, WriterReservationToken};
-use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
+use eliot_ors::{
+    RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
+    WriterReservationToken,
+};
+use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
-    NamedReadResponse, OrderingHeadExpectation, PreparedTransition, RequestMeta,
+    NamedReadResponse, OperationIdentity, OrderingHeadExpectation, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
     verify_canonical_request_hash,
 };
 
-use crate::commit_recovery::recover_commit;
+use crate::commit_recovery::{
+    CommitRecoveryClass, CommitRecoveryError, classify_commit_receipt, open_record_for,
+    receipt_evidence_digest, recover_commit,
+};
+use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
@@ -45,6 +52,109 @@ const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
 #[path = "store_receipt_gateway.rs"]
 mod store_receipt_gateway;
+
+/// Kernel answer for one Dreamer ledger mutation whose ledger answer could not
+/// be observed on the wire (I14.21, issue #1690).
+///
+/// `commit_recovery::recover_commit` shapes the commits that answer with a
+/// `WriteReceipt`; a Dreamer commit answers with a ledger projection instead,
+/// so this leg states the same three mandated branches over its own typed
+/// answer and never collapses them into a success or a retry permission.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum DreamerCommitUncertain {
+    /// The commit outcome is proven by an exact receipt and this leg
+    /// reconciled the durable record with that receipt digest bound as its
+    /// terminal evidence. Exactly one canonical operation exists under the
+    /// admitted identity, this leg issues no second mutation, and the ledger
+    /// projection stays unknown, so the caller follows up with a ledger
+    /// `Status`/`Reconcile` observation.
+    #[error(
+        "dreamer ledger mutation {idempotency_key} is reconciled exactly once ({outcome:?}): the durable unknown-commit record is bound to receipt evidence {evidence_receipt_digest} and no second mutation is issued; the ledger answer is still unknown and needs a Status/Reconcile observation"
+    )]
+    Reconciled {
+        /// Admitted idempotency key whose commit outcome is proven.
+        idempotency_key: String,
+        /// SHA-256 of the exact observed receipt bytes.
+        evidence_receipt_digest: String,
+        /// Terminal outcome the receipt evidence supports.
+        outcome: UnknownCommitOutcome,
+    },
+    /// The key already carries an evidence-backed disposition. A resolved
+    /// record never reopens, so this leg neither restages, re-resolves, nor
+    /// pauses an Ordering Scope for it.
+    #[error(
+        "dreamer ledger mutation {idempotency_key} is already dispositioned with receipt evidence {evidence_receipt_digest}; the durable record is not reopened, no Ordering Scope is paused, and no mutation is resent"
+    )]
+    AlreadyDispositioned {
+        /// Admitted idempotency key.
+        idempotency_key: String,
+        /// SHA-256 already bound by the earlier disposition.
+        evidence_receipt_digest: String,
+    },
+    /// The outcome stays unknown: the operation is preserved in the durable ORS
+    /// record and its Ordering Scopes are paused while this recoverable Problem
+    /// State remains open. This is the same Problem State
+    /// `commit_recovery::open_problem_state` opens for a `WriteReceipt` commit.
+    #[error(
+        "dreamer ledger mutation {idempotency_key} has an unknown commit outcome: the operation is preserved, these Ordering Scopes are paused ({paused_scopes:?}) and a recoverable Problem State is open for Doctor or Human disposition"
+    )]
+    UnknownCommitOpen {
+        /// Admitted idempotency key whose outcome is unknown.
+        idempotency_key: String,
+        /// Ordering Scopes paused while the record is open.
+        paused_scopes: Vec<String>,
+    },
+}
+
+/// Renders an ORS failure as the fail-closed recovery refusal (I14.24).
+fn ors_unavailable(error: impl std::fmt::Display) -> String {
+    CommitRecoveryError::OrsUnavailable {
+        detail: error.to_string(),
+    }
+    .to_string()
+}
+
+/// Projects one already-resolved durable record into its typed answer.
+fn dreamer_dispositioned(
+    idempotency_key: &str,
+    record: UnknownCommitRecord,
+) -> Result<DreamerCommitUncertain, String> {
+    // `UnknownCommitRecord::validate` (run by the load) rejects a resolved
+    // record that binds no evidence, so this branch is unreachable from ORS
+    // and stays a typed refusal rather than a substituted value.
+    let Some(evidence_receipt_digest) = record.evidence_receipt_digest else {
+        return Err(CommitRecoveryError::ReceiptQueryFailed {
+            idempotency_key: idempotency_key.to_owned(),
+            detail: "resolved unknown-commit record binds no receipt evidence".to_owned(),
+        }
+        .to_string());
+    };
+    Ok(DreamerCommitUncertain::AlreadyDispositioned {
+        idempotency_key: idempotency_key.to_owned(),
+        evidence_receipt_digest,
+    })
+}
+
+/// Ordering Scopes one admitted Dreamer ledger mutation belongs to.
+///
+/// A Dreamer ledger is ordered inside its Work Scope, and only the closed
+/// kinds that select a job by scope carry that identity on the request:
+/// `Submit` names its submission's work scope, and `LeaseNext`/`LeaseExact`
+/// name their selector's scope. The remaining closed kinds bind a lease, a job
+/// id, or a pure observation and therefore prove no Ordering Scope, so they
+/// are handled exactly like a scopeless genesis commit — the durable
+/// unknown-commit record is preserved and the Problem State stays open, but
+/// nothing is fenced on a guess.
+fn dreamer_ordering_scopes(request: &DurableJobRequest) -> Vec<String> {
+    let scope = match &request.operation {
+        JobOperation::Submit { submission } => submission.work_scope.scope_id.as_str(),
+        JobOperation::LeaseNext { selector } | JobOperation::LeaseExact { selector, .. } => {
+            selector.scope_id.as_str()
+        }
+        _ => return Vec::new(),
+    };
+    vec![scope.to_owned()]
+}
 
 /// The in-flight synchronization state for one canonical Store gateway.
 #[derive(Default)]
@@ -909,8 +1019,27 @@ impl KernelStoreGateway {
     /// rule: the closed K0 `JobRole` projection decides, never the
     /// `eliotd` source check. The presented role agrees with the operation
     /// but grants nothing by itself; K2 binds the authenticated principal.
-    /// Unknown outcome handling stays owned by the EBP client, which
-    /// reconciles the exact admitted operation identity.
+    ///
+    /// Unknown-commit recovery (I14.21, issue #1690) is Kernel-owned here, as
+    /// it already is for [`Self::apply`] and [`Self::initialize_genesis`]:
+    ///
+    /// ```text
+    /// pause gate (paused scope? refuse, naming the open Problem State)
+    ///   -> send once through the EBP client
+    ///   -> Ok(answer)          -> return it (exactly one mutation)
+    ///   -> proven receipt      -> reconcile the durable ORS record with the
+    ///                             receipt digest bound as its evidence
+    ///   -> still unknown      -> preserve the operation, pause its Ordering
+    ///                             Scopes, open a recoverable Problem State
+    ///   -> deterministic refusal -> returned unchanged
+    /// ```
+    ///
+    /// The EBP client still owns the exact receipt lookup performed before any
+    /// retry, but the receipt it proves is no longer discarded: the outcome is
+    /// reconciled into the durable record that `I14.21` requires to survive a
+    /// restart, and a still-unknown outcome opens a recoverable Problem State
+    /// instead of vanishing. Nothing is ever resent under a fresh identity and
+    /// no acceptance is synthesized.
     pub async fn dreamer_job(
         &self,
         context: &RequestMeta,
@@ -953,13 +1082,194 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
-        let result = self
-            .store
-            .dreamer_job(context, request)
-            .await
-            .map_err(|error| error.to_string());
+        // I14.21 (#1690) write-attempt identity: the admitted Dreamer mutation
+        // identity, taken from the stable operation binding only. Fresh
+        // transport correlation never enters it, so a retry under the same
+        // identity always reuses this record.
+        let identity = OperationIdentity {
+            operation_id: request.request_identity.operation.operation_id.clone(),
+            idempotency_key: request.request_identity.operation.idempotency_key.clone(),
+            canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
+        };
+        let ordering_scopes = dreamer_ordering_scopes(&request);
+        // Pause gate: no dependent Dreamer operation is admitted into an
+        // Ordering Scope that an open unknown-commit record still pauses.
+        // `Self::paused_ordering_scopes` is the visible Problem State — it
+        // names the scope and the idempotency key a Doctor or Human must
+        // disposition with receipt evidence before this scope admits another
+        // mutation.
+        for (scope, paused_by_key) in self.paused_ordering_scopes() {
+            if !ordering_scopes.iter().any(|candidate| candidate == &scope) {
+                continue;
+            }
+            // A pause with no durable record behind it cannot be disposed from
+            // receipt evidence, so I14.24 closes durable mutation admission
+            // instead of inventing a key to blame.
+            let refusal = if paused_by_key.is_empty() {
+                CommitRecoveryError::OrsUnavailable {
+                    detail: format!(
+                        "ordering scope {scope} is held paused by an unknown commit whose durable record is absent: its receipt evidence cannot be disposed, so durable Dreamer admission stays closed"
+                    ),
+                }
+            } else {
+                CommitRecoveryError::ScopePaused {
+                    scope,
+                    paused_by_key,
+                }
+            };
+            return Err(refusal.to_string());
+        }
+        let result = match self.store.dreamer_job_recovery(context, request).await {
+            Ok(response) => Ok(response),
+            Err(DreamerCommitEvidence::Refused(error)) => Err(error.to_string()),
+            Err(DreamerCommitEvidence::Reconciled(receipt)) => Err(self
+                .reconcile_dreamer_commit(&identity, &ordering_scopes, &receipt)?
+                .to_string()),
+            Err(DreamerCommitEvidence::Unknown) => Err(self
+                .preserve_dreamer_operation(&identity, &ordering_scopes)?
+                .to_string()),
+        };
         drop(lease);
         result
+    }
+
+    /// Reconciles one proven Dreamer commit into the durable ORS record
+    /// (I14.21, issue #1690).
+    ///
+    /// The client proved the outcome with an exact receipt bound to the
+    /// admitted identity, so exactly one canonical operation exists under that
+    /// identity and this path never resends it. It stages the durable
+    /// pending-operation record and resolves it exactly once with the receipt
+    /// digest bound as its terminal evidence, so the preserved evidence
+    /// survives a restart and an operator can read what the commit was. The
+    /// terminal outcome is the receipt's own classification, so a proven
+    /// rollback is recorded as `RolledBack` and a dead-lettered one as
+    /// `DeadLetter` — this leg never upgrades a non-commit into a commit. A
+    /// proven outcome pauses nothing: it only lifts the pause an earlier
+    /// unknown outcome opened for the same key, through
+    /// [`Self::release_dreamer_scopes`]. A key already dispositioned keeps its
+    /// earlier evidence-backed disposition, because a resolved record never
+    /// reopens.
+    fn reconcile_dreamer_commit(
+        &self,
+        identity: &OperationIdentity,
+        ordering_scopes: &[String],
+        receipt: &WriteReceipt,
+    ) -> Result<DreamerCommitUncertain, String> {
+        // The receipt must bind the exact admitted write-attempt identity. A
+        // receipt for another attempt is never adopted as this operation's
+        // evidence, however it was observed.
+        if receipt.idempotency_key != identity.idempotency_key {
+            return Err(CommitRecoveryError::ReceiptIdentityConflict {
+                idempotency_key: identity.idempotency_key.clone(),
+            }
+            .to_string());
+        }
+        let ors = self.commit_ors.as_deref().ok_or_else(|| {
+            CommitRecoveryError::OrsUnavailable {
+                detail: format!(
+                    "ORS recovery unavailable: the exact receipt for Dreamer operation {} cannot be bound as durable unknown-commit evidence, so no reconciled canonical operation is claimed",
+                    identity.idempotency_key
+                ),
+            }
+            .to_string()
+        })?;
+        let key = identity.idempotency_key.as_str();
+        let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
+        if let Some(record) = staged
+            && record.outcome.is_some()
+        {
+            return dreamer_dispositioned(key, record);
+        }
+        let record =
+            open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
+        ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
+        let outcome = match classify_commit_receipt(receipt) {
+            CommitRecoveryClass::Committed => UnknownCommitOutcome::Committed,
+            CommitRecoveryClass::KnownRollback => UnknownCommitOutcome::RolledBack,
+            CommitRecoveryClass::NeedsNewIdentity(outcome) => outcome,
+        };
+        let evidence_receipt_digest = receipt_evidence_digest(receipt);
+        ors.resolve_unknown_commit(key, outcome, &evidence_receipt_digest)
+            .map_err(ors_unavailable)?;
+        self.release_dreamer_scopes(ors, &record.ordering_scopes);
+        Ok(DreamerCommitUncertain::Reconciled {
+            idempotency_key: key.to_owned(),
+            evidence_receipt_digest,
+            outcome,
+        })
+    }
+
+    /// Releases the Ordering Scopes this leg paused that no open
+    /// unknown-commit record still covers (I14.21, issue #1690).
+    ///
+    /// The in-process pause index is the fast admission gate, so it has to
+    /// follow the durable disposition exactly: leaving a scope paused after its
+    /// evidence-backed disposition would fence a scope forever, and releasing
+    /// one an unresolved record still covers would admit a dependent mutation.
+    /// The durable open set therefore decides, and a failed read releases
+    /// nothing — fail-closed, never fail-open.
+    fn release_dreamer_scopes(&self, ors: &RedbRecoveryStore, scopes: &[String]) {
+        let Ok(open) = ors.list_open_unknown_commits() else {
+            return;
+        };
+        let still_open: BTreeSet<String> = open
+            .into_iter()
+            .flat_map(|record| record.ordering_scopes)
+            .collect();
+        if let Ok(mut index) = self.paused_scopes.lock() {
+            for scope in scopes {
+                if !still_open.contains(scope) {
+                    index.remove(scope);
+                }
+            }
+        }
+    }
+
+    /// Preserves one still-unknown Dreamer operation and opens its recoverable
+    /// Problem State (I14.21, issue #1690).
+    ///
+    /// The durable stage happens first and the in-process pause index is
+    /// updated only after it, so the pause this leg reports is always backed
+    /// by a record a Doctor or Human can dispose. The durable open set in ORS
+    /// remains authoritative for every later admission gate. With no ORS
+    /// handle there is nowhere to preserve the receipt evidence, so durable
+    /// mutation admission fails closed (I14.24) instead of pretending it
+    /// exists.
+    fn preserve_dreamer_operation(
+        &self,
+        identity: &OperationIdentity,
+        ordering_scopes: &[String],
+    ) -> Result<DreamerCommitUncertain, String> {
+        let ors = self.commit_ors.as_deref().ok_or_else(|| {
+            CommitRecoveryError::OrsUnavailable {
+                detail: format!(
+                    "ORS recovery unavailable for unknown Dreamer commit {}: the exact receipt evidence is unpreserved, so durable admission fails closed and no blind retry follows",
+                    identity.idempotency_key
+                ),
+            }
+            .to_string()
+        })?;
+        let key = identity.idempotency_key.as_str();
+        let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
+        if let Some(record) = staged
+            && record.outcome.is_some()
+        {
+            // A resolved record never reopens: the earlier evidence-backed
+            // disposition stands, so this leg neither restages the record nor
+            // pauses an Ordering Scope for a key that is already closed.
+            return dreamer_dispositioned(key, record);
+        }
+        let record =
+            open_record_for(identity, ordering_scopes).map_err(|error| error.to_string())?;
+        ors.stage_unknown_commit(&record).map_err(ors_unavailable)?;
+        if let Ok(mut index) = self.paused_scopes.lock() {
+            index.extend(ordering_scopes.iter().cloned());
+        }
+        Ok(DreamerCommitUncertain::UnknownCommitOpen {
+            idempotency_key: key.to_owned(),
+            paused_scopes: ordering_scopes.to_owned(),
+        })
     }
 
     /// Reads one Host-bound canonical validation snapshot.
