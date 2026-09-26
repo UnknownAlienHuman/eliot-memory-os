@@ -12,10 +12,14 @@
 //! images, audio/video, GUI state, services and professional workflows
 //! without pretending that a text summary is equivalent to the source
 //! modality. Ingestion is fail-closed: [`admit_continuity_observation`]
-//! enforces type-relative identity, stores competing hypotheses side by
+//! enforces type-relative identity — per kind *and* per subject, so a rename,
+//! crop, render, export, restart, merge or split never inherits a proof from
+//! another kind or another subject — stores competing hypotheses side by
 //! side instead of merging by filename or similarity, keeps an unmeasured
 //! property unknown or degraded, and rejects prose proof for properties the
-//! prose did not measure.
+//! prose did not measure, binding that refusal to the source modality as well
+//! as to the claim's own self-declared modality so neither can be relabelled
+//! past the gate.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
@@ -38,6 +42,12 @@ pub const MAX_CONTINUITY_RELATIONS: usize = 32;
 pub const MAX_DERIVED_TEXT_CLAIMS: usize = 16;
 /// Maximum contrary-evidence references carried by one hypothesis.
 pub const MAX_CONTRARY_EVIDENCE: usize = 16;
+/// Maximum identity kinds one transform may list as preserved or changed.
+///
+/// Above the `IdentityKind` variant count on purpose: the bound is an
+/// allocation guard on a deserialized list, while repeated kinds inside one
+/// list are refused separately as malformed rather than as oversized.
+pub const MAX_TRANSFORM_KINDS: usize = 8;
 
 /// Validation and ingestion failures at the continuity boundary.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -68,13 +78,14 @@ pub enum ContinuityError {
     /// A transform claims to preserve and change the same identity kind.
     #[error("transform preserves and changes the same identity kind")]
     IdentityKindConflict,
-    /// A claimed preservation has no per-kind hypothesis behind it.
+    /// A claimed preservation has no per-kind, per-subject hypothesis behind it.
     #[error("preserved identity kind has no supporting hypothesis")]
     UnsupportedPreservation,
     /// Filename or similarity evidence is the sole proof of identity.
     #[error("filename or similarity evidence cannot be the sole proof of identity")]
     FilenameOrSimilarityMerge,
-    /// A property is claimed measured without a modality-competent evaluator.
+    /// A property is claimed measured by a source or evaluator that is not
+    /// modality-competent, including a model-generated derived source.
     #[error("measured property requires a modality-competent evaluator")]
     UnevaluatedMeasurement,
     /// Derived prose claims a property it did not measure.
@@ -249,6 +260,27 @@ pub struct ContinuityTransform {
 
 impl ContinuityTransform {
     fn validate(&self) -> Result<(), ContinuityError> {
+        // A repeated kind inside one list is malformed input, not a second
+        // piece of evidence: the fold that decides preservation is keyed by
+        // kind, so a duplicate can only pad the list past a bound or imply a
+        // consequence the transform never declared.
+        for (kinds, field) in [
+            (&self.preserved_kinds, "transform.preserved_kinds"),
+            (&self.changed_kinds, "transform.changed_kinds"),
+        ] {
+            if kinds.len() > MAX_TRANSFORM_KINDS {
+                return Err(ContinuityError::Bounds { field });
+            }
+            let mut declared = std::collections::BTreeSet::new();
+            for kind in kinds {
+                if !declared.insert(*kind) {
+                    return Err(ContinuityError::InvalidField {
+                        field,
+                        reason: "must not repeat an identity kind",
+                    });
+                }
+            }
+        }
         for kind in self.preserved_kinds.iter().chain(self.changed_kinds.iter()) {
             if self.preserved_kinds.contains(kind) && self.changed_kinds.contains(kind) {
                 return Err(ContinuityError::IdentityKindConflict);
@@ -524,18 +556,45 @@ fn check_no_silent_merge(hypotheses: &[IdentityHypothesis]) -> Result<(), Contin
 }
 
 /// Requires every preserved identity kind to be backed by a non-weak
-/// hypothesis for that kind: preservation is declared per kind, never
-/// inherited across kinds by rename, crop, render, export, restart,
-/// merge, or split.
+/// hypothesis for that kind *and* for every subject that kind speaks about:
+/// preservation is declared per kind, never inherited across kinds by rename,
+/// crop, render, export, restart, merge, or split, and never inherited across
+/// subjects either.
+///
+/// A set-level `any()` was the wrong quantifier twice over. It let a strong
+/// hypothesis about one subject prove a preservation for a different subject,
+/// and it let a strong hypothesis about a *different kind* prove a
+/// preservation for this kind. Either escape is the silent filename merge the
+/// canon forbids: a `SemanticIdentity` checksum on `object:a` says nothing
+/// about the semantic identity of `object:b`, and a byte-identity checksum on
+/// `object:b` says nothing about its semantic identity either. The fold is
+/// therefore keyed per `(subject, kind)`, mirroring
+/// [`check_no_silent_merge`], and the refusal is decided deterministically on
+/// the first unproven pair regardless of the caller's hypothesis order.
+///
+/// The asymmetry with `changed_kinds` is deliberate and load-bearing: a
+/// *changed* kind needs no support, and a weak basis for a changed kind is
+/// competing evidence about what the transform did, not a merge key. A
+/// hypothesis that competes with a strong one for the same preserved kind and
+/// subject is still admitted — only a subject left with nothing but weak bases
+/// for a kind it is said to have kept is refused.
 fn check_preservation_supported(
     transform: &ContinuityTransform,
     hypotheses: &[IdentityHypothesis],
 ) -> Result<(), ContinuityError> {
     for kind in &transform.preserved_kinds {
-        let supported = hypotheses
-            .iter()
-            .any(|hypothesis| &hypothesis.kind == kind && !hypothesis.basis.is_weak());
-        if !supported {
+        let mut proven_by_subject = std::collections::BTreeMap::new();
+        for hypothesis in hypotheses.iter().filter(|h| &h.kind == kind) {
+            let proven = proven_by_subject
+                .entry(hypothesis.subject_ref.as_str())
+                .or_insert(false);
+            *proven |= !hypothesis.basis.is_weak();
+        }
+        // An empty fold means no hypothesis of this kind exists at all, so the
+        // declared preservation has nothing behind it. The explicit refusal
+        // keeps the guard fail-closed on its own instead of silently
+        // inheriting a bound checked by an earlier step.
+        if proven_by_subject.is_empty() || proven_by_subject.values().any(|proven| !*proven) {
             return Err(ContinuityError::UnsupportedPreservation);
         }
     }
@@ -570,7 +629,17 @@ fn check_modality_status(observation: &ContinuityObservation) -> Result<(), Cont
         // enforced separately by `check_loss_warnings`.
         return Ok(());
     }
-    if observation.source_modality == SourceModality::Unknown {
+    // A source that measured nothing cannot have measured anything. `Unknown`
+    // is a modality never established at capture, and `TextDerived` is
+    // model-generated prose: prose is a derived candidate, not a measuring
+    // instrument, so nothing is modality-competent in it. Refusing the
+    // derived source here is what closes the escape in which a visual or
+    // acoustic claim is filed as `TextDerived` precisely so that
+    // `check_prose_proof` will not bind to it.
+    if matches!(
+        observation.source_modality,
+        SourceModality::Unknown | SourceModality::TextDerived
+    ) {
         return Err(ContinuityError::UnevaluatedMeasurement);
     }
     let evaluator_present = observation
@@ -587,16 +656,33 @@ fn check_modality_status(observation: &ContinuityObservation) -> Result<(), Cont
 /// Rejects prose proof: a derived textual description is a derived
 /// candidate and cannot prove a visual, acoustic, spatial, or interaction
 /// property that it did not measure.
+///
+/// The refusal binds to two independent signals, because either one alone can
+/// be dodged by the producer. A claim's own `modality` is
+/// producer-controlled, so a rule reading only that field is defeated by
+/// relabelling a visual claim as `TextDerived`. The observation's
+/// `source_modality` is the field the rest of this gate already refuses to
+/// take on trust, so a claim riding a source that needs a competent evaluator
+/// is prose proof of that property whatever the claim calls itself. Refusing
+/// on either signal is a superset of refusing on the claim's declaration
+/// alone.
 fn check_prose_proof(observation: &ContinuityObservation) -> Result<(), ContinuityError> {
-    for claim in &observation.derived_text_claims {
-        if claim.modality.requires_modality_competent_evaluator()
-            && matches!(
-                observation.property_status,
-                ModalityPropertyStatus::Measured
-            )
-        {
-            return Err(ContinuityError::ProseProof);
-        }
+    let measured = matches!(
+        observation.property_status,
+        ModalityPropertyStatus::Measured
+    );
+    if !measured || observation.derived_text_claims.is_empty() {
+        return Ok(());
+    }
+    let claim_requires_evaluator = observation
+        .derived_text_claims
+        .iter()
+        .any(|claim| claim.modality.requires_modality_competent_evaluator());
+    let source_requires_evaluator = observation
+        .source_modality
+        .requires_modality_competent_evaluator();
+    if claim_requires_evaluator || source_requires_evaluator {
+        return Err(ContinuityError::ProseProof);
     }
     Ok(())
 }
