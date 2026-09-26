@@ -385,6 +385,7 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         checkpoint: None,
         result_under_verification: None,
         outcome: None,
+        applicability_history: Vec::new(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     }
@@ -2293,6 +2294,7 @@ fn no_candidate_application_or_effect_authority() {
             JobOperationKind::Status => "STATUS",
             JobOperationKind::RequestCancel => "REQUEST_CANCEL",
             JobOperationKind::Reconcile => "RECONCILE_MUTATION",
+            JobOperationKind::RecordApplicability => "RECORD_APPLICABILITY",
         };
         assert_eq!(observed, wire);
         assert_eq!(kind.as_str(), wire);

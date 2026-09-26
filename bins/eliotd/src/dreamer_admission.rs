@@ -617,6 +617,7 @@ mod tests {
             outcome: None,
             selection_coverage: Vec::new(),
             selection_frontier: None,
+            applicability_history: Vec::new(),
         })
     }
 
@@ -659,6 +660,7 @@ mod tests {
             outcome: None,
             selection_coverage: Vec::new(),
             selection_frontier: None,
+            applicability_history: Vec::new(),
         })
     }
 

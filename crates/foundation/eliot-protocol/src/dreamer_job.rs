@@ -22,7 +22,7 @@ use thiserror::Error;
 /// Stable identity of the `DurableJob` control family.
 pub const DURABLE_JOB_CONTRACT_NAME: &str = "eliot.foundation.protocol.durable-job";
 /// Current semantic revision of the `DurableJob` control family.
-pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const DURABLE_JOB_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 /// Versioned namespace used when hashing a mutation request.
 pub const DURABLE_JOB_CANONICAL_ENCODING: &str = "eliot.durable-job.canonical.v1";
 /// Maximum bounded text field size in bytes.
@@ -111,6 +111,8 @@ pub enum JobOperationKind {
     RequestCancel,
     #[serde(rename = "RECONCILE_MUTATION")]
     Reconcile,
+    #[serde(rename = "RECORD_APPLICABILITY")]
+    RecordApplicability,
 }
 
 impl JobOperationKind {
@@ -129,6 +131,7 @@ impl JobOperationKind {
             Self::Status => "STATUS",
             Self::RequestCancel => "REQUEST_CANCEL",
             Self::Reconcile => "RECONCILE_MUTATION",
+            Self::RecordApplicability => "RECORD_APPLICABILITY",
         }
     }
 }
@@ -163,6 +166,7 @@ pub enum JobCapability {
     Status,
     RequestCancel,
     Reconcile,
+    RecordApplicability,
 }
 
 impl JobRole {
@@ -175,6 +179,7 @@ impl JobRole {
                 JobCapability::Status,
                 JobCapability::RequestCancel,
                 JobCapability::Reconcile,
+                JobCapability::RecordApplicability,
             ],
             Self::Worker => &[
                 JobCapability::Lease,
@@ -209,6 +214,7 @@ impl JobRole {
             JobOperationKind::Status => JobCapability::Status,
             JobOperationKind::RequestCancel => JobCapability::RequestCancel,
             JobOperationKind::Reconcile => JobCapability::Reconcile,
+            JobOperationKind::RecordApplicability => JobCapability::RecordApplicability,
         };
         self.capabilities().contains(&capability)
     }
@@ -378,6 +384,9 @@ fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
         }
         JobOperation::Reconcile { mutation } => {
             serde_json::json!({ "operation": "RECONCILE_MUTATION", "mutation": mutation })
+        }
+        JobOperation::RecordApplicability { update } => {
+            serde_json::json!({ "operation": "RECORD_APPLICABILITY", "update": update })
         }
     }
 }
@@ -676,6 +685,326 @@ impl JobOutcome {
         }
         Ok(())
     }
+
+    /// Returns the canonical digest used to bind later applicability evidence
+    /// to this immutable terminal outcome.
+    pub fn canonical_digest(&self) -> Result<String, DurableJobError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| DurableJobError::Serialization(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+/// A reason an existing output can no longer be treated as applicable.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutputApplicabilityAxis {
+    StateFence,
+    Route,
+    Dependency,
+    Parent,
+}
+
+/// Applicability can only be withheld; this contract has no positive freshness
+/// or verification disposition.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutputApplicabilityDisposition {
+    Unknown,
+    NotApplicable,
+    Stale,
+}
+
+/// Next owner action after applicability is withheld.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutputApplicabilityNextAction {
+    ReconcileOwner,
+    Revalidate,
+    NewAdmission,
+}
+
+/// One exact source-to-observed change that invalidates an output projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutputApplicabilityChange {
+    pub axis: OutputApplicabilityAxis,
+    pub source_ref: String,
+    pub observed_ref: String,
+    pub observed_state_fence: Option<StateFence>,
+    pub evidence: Vec<ArtifactBinding>,
+}
+
+impl OutputApplicabilityChange {
+    pub fn validate(&self, current_state_fence: &StateFence) -> Result<(), DurableJobError> {
+        bounded_text(&self.source_ref, "applicability_change.source_ref")?;
+        bounded_text(&self.observed_ref, "applicability_change.observed_ref")?;
+        validate_artifacts(&self.evidence, "applicability_change.evidence")?;
+        if self.evidence.is_empty() {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability_change.evidence",
+                reason: "a changed basis requires evidence",
+            });
+        }
+        match (self.axis, &self.observed_state_fence) {
+            (OutputApplicabilityAxis::StateFence, Some(observed)) => {
+                observed.validate().map_err(DurableJobError::Foundation)?;
+                if observed != current_state_fence {
+                    return Err(DurableJobError::FenceMismatch);
+                }
+            }
+            (OutputApplicabilityAxis::StateFence, None) | (_, Some(_)) => {
+                return Err(DurableJobError::InvalidField {
+                    field: "applicability_change.observed_state_fence",
+                    reason: "required only for a StateFence change and must match the current fence",
+                });
+            }
+            (_, None) => {}
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated request to withhold applicability from an existing result.
+/// The Store binds the original outcome and source fence from durable history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobOutputApplicabilityUpdate {
+    pub job_id: TaskId,
+    pub attempt_id: ArtifactId,
+    pub expected_applicability_revision: u64,
+    pub current_state_fence: StateFence,
+    pub disposition: OutputApplicabilityDisposition,
+    pub changed_axes: Vec<OutputApplicabilityChange>,
+    pub evidence: Vec<ArtifactBinding>,
+    pub next_action: OutputApplicabilityNextAction,
+}
+
+impl JobOutputApplicabilityUpdate {
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        if self.expected_applicability_revision > DURABLE_JOB_MAX_REFERENCES as u64 {
+            return Err(DurableJobError::LimitExceeded(
+                "applicability.expected_revision",
+            ));
+        }
+        self.current_state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        if self.changed_axes.is_empty() || self.changed_axes.len() > DURABLE_JOB_MAX_REFERENCES {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.changed_axes",
+                reason: "must contain a bounded changed basis",
+            });
+        }
+        for change in &self.changed_axes {
+            change.validate(&self.current_state_fence)?;
+        }
+        validate_artifacts(&self.evidence, "applicability.evidence")?;
+        if self.evidence.is_empty() {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.evidence",
+                reason: "an applicability update requires evidence",
+            });
+        }
+        if self.disposition == OutputApplicabilityDisposition::Unknown
+            && self.next_action != OutputApplicabilityNextAction::ReconcileOwner
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.next_action",
+                reason: "UNKNOWN applicability requires owner reconciliation",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable history entry preserving the execution outcome while recording
+/// why its existing artifacts must be withheld from current proof/integration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobOutputApplicabilityRevision {
+    pub job_id: TaskId,
+    pub attempt_id: ArtifactId,
+    pub revision: u64,
+    pub original_state_fence: StateFence,
+    pub original_outcome_digest: String,
+    pub original_result: Option<OpaqueContentRef>,
+    pub original_evidence: Vec<ArtifactBinding>,
+    pub current_state_fence: StateFence,
+    pub disposition: OutputApplicabilityDisposition,
+    pub changed_axes: Vec<OutputApplicabilityChange>,
+    pub evidence: Vec<ArtifactBinding>,
+    pub next_action: OutputApplicabilityNextAction,
+}
+
+impl JobOutputApplicabilityRevision {
+    /// Constructs one invalidation revision from the exact immutable outcome
+    /// already recorded on the job. It cannot make an output current.
+    pub fn from_update(
+        update: &JobOutputApplicabilityUpdate,
+        record: &DurableJobRecord,
+        revision: u64,
+    ) -> Result<Self, DurableJobError> {
+        update.validate()?;
+        if !record.state.is_terminal()
+            || record.submission.job_id != update.job_id
+            || record.submission.attempt_id != update.attempt_id
+            || update.expected_applicability_revision.checked_add(1) != Some(revision)
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        let outcome = record
+            .outcome
+            .as_ref()
+            .ok_or(DurableJobError::InvalidOutcome)?;
+        let applicability = Self {
+            job_id: update.job_id.clone(),
+            attempt_id: update.attempt_id.clone(),
+            revision,
+            original_state_fence: record.submission.work_scope.state_fence.clone(),
+            original_outcome_digest: outcome.canonical_digest()?,
+            original_result: outcome.result.clone(),
+            original_evidence: outcome.evidence.clone(),
+            current_state_fence: update.current_state_fence.clone(),
+            disposition: update.disposition,
+            changed_axes: update.changed_axes.clone(),
+            evidence: update.evidence.clone(),
+            next_action: update.next_action,
+        };
+        applicability.validate_against_record(record)?;
+        Ok(applicability)
+    }
+
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        if self.revision == 0 || self.revision > DURABLE_JOB_MAX_REFERENCES as u64 {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.revision",
+                reason: "must be positive and bounded",
+            });
+        }
+        self.original_state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        self.current_state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        lowercase_digest(
+            &self.original_outcome_digest,
+            "applicability.original_outcome_digest",
+        )?;
+        if let Some(result) = &self.original_result {
+            result.validate("applicability.original_result.sha256")?;
+        }
+        validate_artifacts(&self.original_evidence, "applicability.original_evidence")?;
+        if self.original_evidence.is_empty()
+            || self.changed_axes.is_empty()
+            || self.changed_axes.len() > DURABLE_JOB_MAX_REFERENCES
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability",
+                reason: "original outcome evidence and a bounded changed basis are required",
+            });
+        }
+        for change in &self.changed_axes {
+            change.validate(&self.current_state_fence)?;
+            if change.axis == OutputApplicabilityAxis::StateFence
+                && change.observed_state_fence.as_ref() == Some(&self.original_state_fence)
+            {
+                return Err(DurableJobError::InvalidField {
+                    field: "applicability.changed_axes",
+                    reason: "StateFence invalidation must observe a different fence",
+                });
+            }
+        }
+        validate_artifacts(&self.evidence, "applicability.evidence")?;
+        if self.evidence.is_empty() {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.evidence",
+                reason: "an applicability revision requires evidence",
+            });
+        }
+        if self.disposition == OutputApplicabilityDisposition::Unknown
+            && self.next_action != OutputApplicabilityNextAction::ReconcileOwner
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.next_action",
+                reason: "UNKNOWN applicability requires owner reconciliation",
+            });
+        }
+        Ok(())
+    }
+
+    /// Verifies that this revision is bound to the durable execution result it
+    /// describes; applicability evidence cannot replace or rewrite that result.
+    pub fn validate_against_record(
+        &self,
+        record: &DurableJobRecord,
+    ) -> Result<(), DurableJobError> {
+        record.validate()?;
+        if !record.state.is_terminal() {
+            return Err(DurableJobError::InvalidOutcome);
+        }
+        let outcome = record
+            .outcome
+            .as_ref()
+            .ok_or(DurableJobError::InvalidOutcome)?;
+        if self.job_id != record.submission.job_id
+            || self.attempt_id != record.submission.attempt_id
+            || self.original_state_fence != record.submission.work_scope.state_fence
+            || self.original_outcome_digest != outcome.canonical_digest()?
+            || self.original_result != outcome.result
+            || self.original_evidence != outcome.evidence
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        self.validate_against_outcome(outcome, &record.submission.work_scope.state_fence)?;
+        for change in &self.changed_axes {
+            if change.axis == OutputApplicabilityAxis::Route
+                && change.source_ref != record.submission.admission.route_class
+            {
+                return Err(DurableJobError::OperationMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Verifies outcome identity and ensures that the selected next action does
+    /// not exceed the execution or freshness evidence.
+    pub fn validate_against_outcome(
+        &self,
+        outcome: &JobOutcome,
+        source_state_fence: &StateFence,
+    ) -> Result<(), DurableJobError> {
+        self.validate()?;
+        if self.original_state_fence != *source_state_fence
+            || self.original_outcome_digest != outcome.canonical_digest()?
+            || self.original_result != outcome.result
+            || self.original_evidence != outcome.evidence
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        let state_fence_changed = self.changed_axes.iter().any(|change| {
+            change.axis == OutputApplicabilityAxis::StateFence
+                && change.observed_state_fence.as_ref() != Some(source_state_fence)
+        });
+        let expected_action = if outcome.state == JobState::UnknownOutcome
+            || self.disposition == OutputApplicabilityDisposition::Unknown
+        {
+            OutputApplicabilityNextAction::ReconcileOwner
+        } else if self.disposition == OutputApplicabilityDisposition::Stale || state_fence_changed {
+            OutputApplicabilityNextAction::NewAdmission
+        } else {
+            self.next_action
+        };
+        if self.next_action != expected_action {
+            return Err(DurableJobError::InvalidField {
+                field: "applicability.next_action",
+                reason: "next action exceeds the outcome or freshness evidence",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Store/transport mutation outcome.  It is deliberately separate from the
@@ -844,6 +1173,10 @@ pub enum JobOperation {
     Reconcile {
         mutation: Box<MutationReconciliation>,
     },
+    #[serde(rename = "RECORD_APPLICABILITY")]
+    RecordApplicability {
+        update: Box<JobOutputApplicabilityUpdate>,
+    },
 }
 
 impl JobOperation {
@@ -862,6 +1195,7 @@ impl JobOperation {
             Self::Status { .. } => JobOperationKind::Status,
             Self::RequestCancel { .. } => JobOperationKind::RequestCancel,
             Self::Reconcile { .. } => JobOperationKind::Reconcile,
+            Self::RecordApplicability { .. } => JobOperationKind::RecordApplicability,
         }
     }
 
@@ -922,6 +1256,10 @@ impl JobOperation {
             } => DreamerOrderingScopes {
                 work_scope: None,
                 job_ledger: Some((job_id, attempt_id)),
+            },
+            Self::RecordApplicability { update } => DreamerOrderingScopes {
+                work_scope: None,
+                job_ledger: Some((&update.job_id, &update.attempt_id)),
             },
             Self::Reconcile { mutation } => DreamerOrderingScopes {
                 work_scope: None,
@@ -1010,6 +1348,7 @@ impl JobOperation {
                     .map_err(DurableJobError::Foundation)
             }
             Self::Reconcile { mutation } => mutation.validate(),
+            Self::RecordApplicability { update } => update.validate(),
         }
     }
 }
@@ -1247,6 +1586,10 @@ pub struct DurableJobResponse {
     pub result_under_verification: Option<OpaqueContentRef>,
     /// Terminal outcome (terminal states only).
     pub outcome: Option<JobOutcome>,
+    /// Append-only output applicability history. Missing/empty history means
+    /// applicability is unknown, never implicitly current.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applicability_history: Vec<JobOutputApplicabilityRevision>,
     /// Bounded candidate coverage for `LeaseNext` selection.
     pub selection_coverage: Vec<String>,
     /// Opaque frontier cursor for `LeaseNext` selection.
@@ -1254,6 +1597,28 @@ pub struct DurableJobResponse {
 }
 
 impl DurableJobResponse {
+    /// Returns `UNKNOWN` when no applicability revision is recorded; absence
+    /// of invalidation evidence never proves freshness.
+    #[must_use]
+    pub fn output_applicability(&self) -> OutputApplicabilityDisposition {
+        self.applicability_history
+            .last()
+            .map_or(OutputApplicabilityDisposition::Unknown, |revision| {
+                revision.disposition
+            })
+    }
+
+    /// Returns the owner action for the latest applicability revision, or
+    /// reconciliation when legacy history has no applicability evidence.
+    #[must_use]
+    pub fn next_applicability_action(&self) -> OutputApplicabilityNextAction {
+        self.applicability_history
+            .last()
+            .map_or(OutputApplicabilityNextAction::ReconcileOwner, |revision| {
+                revision.next_action
+            })
+    }
+
     /// Validates response shape without binding it to a request.
     pub fn validate(&self) -> Result<(), DurableJobError> {
         self.request_identity.validate()?;
@@ -1326,6 +1691,7 @@ impl DurableJobResponse {
         if !self.state.is_terminal() && self.outcome.is_some() {
             return Err(DurableJobError::InvalidOutcome);
         }
+        self.validate_applicability_history()?;
         if self.disposition == Some(MutationDisposition::Committed) && self.receipt_id.is_none() {
             return Err(DurableJobError::InvalidField {
                 field: "receipt_id",
@@ -1335,6 +1701,27 @@ impl DurableJobResponse {
         validate_text_list(&self.selection_coverage, "selection_coverage")?;
         if let Some(frontier) = &self.selection_frontier {
             bounded_text(frontier, "selection_frontier")?;
+        }
+        Ok(())
+    }
+
+    fn validate_applicability_history(&self) -> Result<(), DurableJobError> {
+        if self.applicability_history.len() > DURABLE_JOB_MAX_REFERENCES {
+            return Err(DurableJobError::LimitExceeded("applicability.history"));
+        }
+        for (index, applicability) in self.applicability_history.iter().enumerate() {
+            applicability.validate()?;
+            let outcome = self
+                .outcome
+                .as_ref()
+                .ok_or(DurableJobError::InvalidOutcome)?;
+            if applicability.job_id != self.job_id
+                || applicability.attempt_id != self.attempt_id
+                || applicability.revision != index as u64 + 1
+            {
+                return Err(DurableJobError::OperationMismatch);
+            }
+            applicability.validate_against_outcome(outcome, &self.scope.state_fence)?;
         }
         Ok(())
     }
@@ -1349,7 +1736,16 @@ impl DurableJobResponse {
         if self.request_identity != request.request_identity {
             return Err(DurableJobError::OperationMismatch);
         }
-        if self.scope.state_fence != request.request_identity.operation.state_fence {
+        let records_applicability =
+            matches!(request.operation, JobOperation::RecordApplicability { .. });
+        if !records_applicability
+            && self.scope.state_fence != request.request_identity.operation.state_fence
+        {
+            return Err(DurableJobError::FenceMismatch);
+        }
+        if let JobOperation::RecordApplicability { update } = &request.operation
+            && update.current_state_fence != request.request_identity.operation.state_fence
+        {
             return Err(DurableJobError::FenceMismatch);
         }
         let is_status = matches!(request.operation, JobOperation::Status { .. });
@@ -1461,7 +1857,33 @@ impl DurableJobResponse {
                 }
                 Ok(())
             }
+            JobOperation::RecordApplicability { update } => {
+                self.validate_response_applicability(update)
+            }
         }
+    }
+
+    fn validate_response_applicability(
+        &self,
+        update: &JobOutputApplicabilityUpdate,
+    ) -> Result<(), DurableJobError> {
+        if self.job_id != update.job_id || self.attempt_id != update.attempt_id {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        let latest = self
+            .applicability_history
+            .last()
+            .ok_or(DurableJobError::OperationMismatch)?;
+        if latest.revision != update.expected_applicability_revision.saturating_add(1)
+            || latest.current_state_fence != update.current_state_fence
+            || latest.disposition != update.disposition
+            || latest.changed_axes != update.changed_axes
+            || latest.evidence != update.evidence
+            || latest.next_action != update.next_action
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        Ok(())
     }
 
     /// Requires `LeaseNext` coverage to name the bound job.
@@ -1601,6 +2023,7 @@ fn validate_operation_fence(
         }
         JobOperation::Status { expected_fence, .. }
         | JobOperation::RequestCancel { expected_fence, .. } => Some(expected_fence),
+        JobOperation::RecordApplicability { update } => Some(&update.current_state_fence),
         JobOperation::Reconcile { mutation } => Some(&mutation.operation.state_fence),
     };
     if target_fence.is_some_and(|target| target != fence) {
@@ -1630,7 +2053,7 @@ pub fn durable_job_contract_identity() -> Result<ContractIdentity, DurableJobErr
         "version": DURABLE_JOB_CONTRACT_VERSION,
         "encoding": DURABLE_JOB_CANONICAL_ENCODING,
         "states": ["NOT_STARTED", "QUEUED", "LEASED", "RUNNING", "CHECKPOINTED", "VERIFYING", "COMPLETED", "PARTIAL", "FAILED", "CANCELLED", "UNKNOWN_OUTCOME"],
-        "operations": ["SUBMIT_JOB", "LEASE_NEXT", "LEASE_EXACT", "RENEW_LEASE", "START_JOB", "CHECKPOINT_JOB", "RESUME_JOB", "BEGIN_VERIFICATION", "PUBLISH_OUTCOME", "STATUS", "REQUEST_CANCEL", "RECONCILE_MUTATION"],
+        "operations": ["SUBMIT_JOB", "LEASE_NEXT", "LEASE_EXACT", "RENEW_LEASE", "START_JOB", "CHECKPOINT_JOB", "RESUME_JOB", "BEGIN_VERIFICATION", "PUBLISH_OUTCOME", "STATUS", "REQUEST_CANCEL", "RECONCILE_MUTATION", "RECORD_APPLICABILITY"],
     });
     eliot_contracts::contract_identity(
         DURABLE_JOB_CONTRACT_NAME,
