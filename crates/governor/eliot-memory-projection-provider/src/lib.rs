@@ -1,15 +1,17 @@
 //! Governor-owned bounded memory projection (CC-008, store-deferred).
 //!
-//! [`project_batch`] maps admitted memory observations supplied by the
-//! Governor read side into one bounded [`MemoryProjectionBatch`] under a
-//! shared [`MemoryScopeBinding`]. The provider retrieves and projects; the
-//! Smart evaluator decides applicability over the supplied set.
+//! [`project_batch`] maps caller-supplied admitted memory observations into
+//! one bounded [`MemoryProjectionBatch`] under a shared
+//! [`MemoryScopeBinding`]. The provider retrieves and projects; the Smart
+//! evaluator decides applicability over the supplied set.
 //!
 //! Store read-through is deliberately absent: the observations arrive as
-//! function arguments (fixtures now, the Governor read path after the MGR04
-//! handoff), so this crate imports no storage, journal, credential, or
-//! vendor type. There is no second graph here either: records are projected
-//! field-for-field in deterministic intake order, never re-linked.
+//! function arguments, so this crate imports no storage, journal,
+//! credential, or vendor type. The Governor read path that will supply
+//! those arguments arrives with the MGR04 (#19) handoff; until it does, this
+//! crate's own test target is the only caller. There is no second graph here
+//! either: records are projected field-for-field in deterministic intake
+//! order, never re-linked.
 //!
 //! Every observed item is accounted: projected, named in `omissions` with
 //! its exact rule (scope mismatch, fence mismatch, admitted continuity the
@@ -19,12 +21,23 @@
 //! supplied continuity observation count: this is the single-read contract,
 //! and multi-page reads stay MGR04 scope.
 //!
-//! Continuity is enforced here, not merely offered: [`project_batch`] refuses
-//! the whole read when a continuity observation breaks the I12.35 ingestion
-//! rules, or when an attached workflow view does not belong to the batch
-//! binding, before a single record is built. Admitted continuity then reaches
-//! the denominator exactly once, so a continuity-gated read can never report a
-//! denominator that quietly dropped the continuity material it was gated on.
+//! Continuity is enforced at this boundary whenever a read reaches it:
+//! [`project_batch`] refuses the whole read when a continuity observation
+//! breaks the I12.35 ingestion rules, or when an attached workflow view does
+//! not belong to the batch binding, before a single record is built. Admitted
+//! continuity then reaches the denominator exactly once, so a
+//! continuity-gated read can never report a denominator that quietly dropped
+//! the continuity material it was gated on.
+//!
+//! That boundary is not reached at runtime today, and this prose does not
+//! claim it is. No package in this repository depends on this one, so no
+//! binary links [`project_batch`] or either continuity gate; the crate
+//! manifest, not this comment, is the authority — it declares
+//! `prototype = true` with
+//! `workspace_admission = "workspace_member_prototype_proof_pending"` and
+//! `proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"`. The gates are
+//! product code on this crate's only entry point, so the runtime support
+//! claim stays with the MGR04 (#19) read-side handoff.
 
 #![forbid(unsafe_code)]
 

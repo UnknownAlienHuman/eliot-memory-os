@@ -6,18 +6,28 @@
 //! every continuity observation is validated fail-closed, so type-relative
 //! identity, competing hypotheses without filename or similarity merge,
 //! unknown-or-degraded status without a modality-competent evaluator, and
-//! the prose-proof ban hold on the production projection path, not only in
+//! the prose-proof ban hold wherever a read reaches this gate, not only in
 //! the contract crate. [`admit_workflow_view_for_projection`] binds a
 //! [`WorkflowStateView`] to the shared [`MemoryScopeBinding`] the batch is
 //! projected under.
 //!
-//! [`project_batch`](crate::project_batch) is the production caller of both
-//! gates: it invokes them immediately after the request validates and before
-//! the first record is built, and maps a refusal into
+//! [`project_batch`](crate::project_batch) is the only caller of both gates:
+//! it invokes them immediately after the request validates and before the
+//! first record is built, and maps a refusal into
 //! [`ProjectionError`](crate::ProjectionError) so the read fails closed. A
 //! refused continuity observation therefore cannot contribute to a batch,
 //! and an admitted one is accounted in the denominator as one named coverage
 //! omission rather than dropped.
+//!
+//! "Only caller" is not "production caller", and this module does not claim
+//! the stronger one. No package in this repository depends on this crate, so
+//! no binary links [`project_batch`](crate::project_batch) or either gate, and
+//! until the MGR04 (#19) read-side handoff supplies the admitted observations
+//! this crate's own test target is the only thing that reaches them. The
+//! crate manifest is the authority on that ceiling: `prototype = true` with
+//! `workspace_admission = "workspace_member_prototype_proof_pending"` and
+//! `proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"`, per
+//! `crates/AGENTS.md` — prototype presence does not grant runtime authority.
 
 use eliot_memory_projection_contracts::{
     MemoryProjectionError, MemoryScopeBinding, WorkflowStateView,
@@ -50,6 +60,8 @@ pub fn admit_continuity_for_projection(
 /// batch it claims to describe. A present view is never tolerated as
 /// unchecked: [`project_batch`](crate::project_batch) calls this gate, so a
 /// view outside the binding fails the read instead of travelling unverified.
+/// That caller is the crate's only one and is not yet on a binary path — see
+/// the module documentation.
 pub fn admit_workflow_view_for_projection(
     view: &WorkflowStateView,
     binding: &MemoryScopeBinding,
