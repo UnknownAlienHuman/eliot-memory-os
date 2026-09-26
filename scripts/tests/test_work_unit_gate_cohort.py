@@ -31,7 +31,7 @@ GUARD = c.WorkUnitIdentity("source-shape")
 # once — never computed from live files at test runtime.
 FROZEN_LEAF_ROUTER_SHA256 = {
     "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
-    "scripts/docs_router_core.py": "752834cad7e5d759eeb522badaba653d6587cb6f8b56393d4a5816c99ccb3c89",
+    "scripts/docs_router_core.py": "455aec470ab6f3f8bf7e64578d264ca0877a06cfec411d9aa415ffa62ae4a06a",
     "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
     "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
 }
