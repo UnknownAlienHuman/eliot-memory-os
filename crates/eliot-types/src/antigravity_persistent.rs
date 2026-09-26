@@ -284,17 +284,43 @@ impl AntigravityPersistentFrame {
         // fake runtime, which emits ad-hoc objects — so every kind retains its
         // payload as inert bounded vendor data. The payload must be a JSON
         // object (the documented wire shape); the payload is never interpreted
-        // as session/permission/terminal authority. The pre-existing drift-key
+        // as session/permission/terminal authority. Each arm below states its
+        // kind's own disposition and diagnostic; content-level per-kind shapes
+        // cannot be validated until a payload owner defines them (residual
+        // R-934-W4, not a blacklist exception). The pre-existing drift-key
         // rejection below is preserved byte-for-byte: existing behavior (pinned
         // by the engine's schema_drift_fails_closed test) must not be weakened
         // by this decoder-closure slice; redesigning that policy is out of scope.
         match self.kind {
-            AntigravityFrameKind::Request
-            | AntigravityFrameKind::Response
-            | AntigravityFrameKind::Event
-            | AntigravityFrameKind::Error => {
+            AntigravityFrameKind::Request => {
+                // Eliot-originated stimulus: the payload is a vendor-opaque
+                // work description, retained as inert bounded data.
                 if !self.payload.is_object() {
-                    return Err("frame payload must be a JSON object".to_owned());
+                    return Err("request frame payload must be a JSON object".to_owned());
+                }
+            }
+            AntigravityFrameKind::Response => {
+                // Vendor-originated result: inert bounded data, never trusted
+                // as session/permission/terminal authority (I15.6: retrieved
+                // content cannot grant permission).
+                if !self.payload.is_object() {
+                    return Err("response frame payload must be a JSON object".to_owned());
+                }
+            }
+            AntigravityFrameKind::Event => {
+                // Vendor-originated occurrence: inert bounded data, never
+                // certified as a normalized host event (I7.23: only the
+                // normalized projection drives policy/state/UI).
+                if !self.payload.is_object() {
+                    return Err("event frame payload must be a JSON object".to_owned());
+                }
+            }
+            AntigravityFrameKind::Error => {
+                // Vendor-originated failure signal: inert bounded diagnostic
+                // data, never authenticated terminal evidence (case 15:
+                // provider statements cannot become terminal evidence).
+                if !self.payload.is_object() {
+                    return Err("error frame payload must be a JSON object".to_owned());
                 }
             }
         }
