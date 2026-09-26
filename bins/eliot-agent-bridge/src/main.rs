@@ -18,16 +18,16 @@ use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
     HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
-    KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ResourceHandle, ToolRequest,
-    WIRE_INTERNAL_ERROR, WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND,
-    WIRE_REQUEST_CANCELLED, build_host_cancellation, build_host_invocation,
-    decode_cancel_notification, decode_initialize_version, decode_resource_uri, decode_tools_call,
-    decode_wire_request, gateway_error_to_wire, initialize_result, negotiate_wire_version,
-    render_accepted_result, render_error, render_rejected_result, render_rejection,
-    render_responded_result, render_result, tools_list_result,
+    KernelHostRequestPort, NegotiatedWireVersion, ToolRequest, WIRE_INTERNAL_ERROR,
+    WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
+    build_host_cancellation, build_host_invocation, decode_cancel_notification,
+    decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
+    gateway_error_to_wire, initialize_result, negotiate_wire_version, render_accepted_result,
+    render_error, render_rejected_result, render_rejection, render_responded_result, render_result,
+    tools_list_result,
 };
 #[cfg(test)]
-use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
+use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
 use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
@@ -42,6 +42,22 @@ use std::time::Duration;
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
+
+/// Explicit checked MCP entrypoint token (issue #2562): a leading `mcp`
+/// argv token selects the MCP JSON-RPC front door on stdio. It is coherent
+/// with the approved invocation built by the Governor delegation
+/// (`eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL --transport
+/// stdio --client-declaration <absolute-path>`) and the release
+/// materialization of that argv; the tokenless argv keeps serving the
+/// existing private `op` clients byte-for-byte.
+const MCP_MODE_TOKEN: &str = "mcp";
+
+/// Media type of retained hot-resource snapshots: `record_tool_result_delivery`
+/// publishes the JSON-serialized response content (`serde_json::to_vec`), so
+/// expansion yields `application/json` bytes. This matches the surface's
+/// canonical bound-resource check, which only admits `application/json`
+/// bindings.
+const HOT_RESOURCE_MEDIA_TYPE: &str = "application/json";
 
 /// Stable identity of the binary-private stdio output profile.
 const STDIO_OUTPUT_PROFILE_ID: &str = "eliot.agent-bridge.stdio-output.v1";
@@ -2117,7 +2133,7 @@ struct McpFrontDoor {
     initialized: bool,
     handles: Vec<(String, HostOperationHandle)>,
     cancelled: Vec<String>,
-    resources: Vec<(String, ResourceHandle)>,
+    resources: Vec<(String, eliot_agent_bridge::ResourceHandle)>,
 }
 
 impl McpFrontDoor {
@@ -2175,7 +2191,7 @@ impl McpFrontDoor {
 
     /// Retains one exact hot-resource handle under its exact URI, retiring
     /// the oldest entry past the bound.
-    fn retain_resource(&mut self, uri: &str, handle: ResourceHandle) {
+    fn retain_resource(&mut self, uri: &str, handle: eliot_agent_bridge::ResourceHandle) {
         if let Some(slot) = self.resources.iter_mut().find(|(known, _)| known == uri) {
             slot.1 = handle;
             return;
@@ -2187,7 +2203,7 @@ impl McpFrontDoor {
     }
 
     /// Returns the exact retained handle for one resource URI.
-    fn find_resource(&self, uri: &str) -> Option<&ResourceHandle> {
+    fn find_resource(&self, uri: &str) -> Option<&eliot_agent_bridge::ResourceHandle> {
         self.resources
             .iter()
             .find(|(known, _)| known == uri)
@@ -2198,11 +2214,11 @@ impl McpFrontDoor {
     fn list_resources(&self) -> Vec<Value> {
         self.resources
             .iter()
-            .map(|(uri, handle)| {
+            .map(|(uri, _)| {
                 serde_json::json!({
                     "uri": uri,
                     "name": uri,
-                    "mimeType": handle.media_type,
+                    "mimeType": HOT_RESOURCE_MEDIA_TYPE,
                 })
             })
             .collect()
@@ -2681,11 +2697,11 @@ fn record_mcp_delivery(
     outcome: &HostInvocationOutcome,
 ) -> Option<Value> {
     let view = runner.record_tool_result_delivery(outcome)?;
-    state.retain_resource(view.handle().uri.as_str(), view.handle().clone());
+    state.retain_resource(view.handle().uri().as_str(), view.handle().clone());
     let preview = std::str::from_utf8(view.preview()).ok()?;
     Some(serde_json::json!({
-        "uri": view.handle().uri,
-        "media_type": view.handle().media_type,
+        "uri": view.handle().uri().as_str(),
+        "digest": view.handle().digest(),
         "preview": preview,
         "total_bytes": view.total_bytes(),
         "truncated": view.is_truncated(),
@@ -2756,8 +2772,8 @@ fn handle_mcp_resources_read(
         id,
         serde_json::json!({
             "contents": [{
-                "uri": handle.uri,
-                "mimeType": handle.media_type,
+                "uri": handle.uri().as_str(),
+                "mimeType": HOT_RESOURCE_MEDIA_TYPE,
                 "text": text,
             }],
         }),
