@@ -21,7 +21,7 @@ mod security_scan;
 mod ul_cross_agent_runner;
 mod windows_service;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use disposition::run_facade_disposition_guards;
 use std::io::Write as _;
@@ -2058,6 +2058,102 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("eliot-governor main thread panicked"))?
 }
 
+/// Flagged Claude MCP front-door delegation (issue #2562; flag owned by
+/// #1719, refusal gate owned by #1858).
+///
+/// Once `ELIOT_CLAUDE_FRONT_DOOR=agent-bridge` retires the `claude` host
+/// edge, this process never serves MCP itself: it launches exactly one owned
+/// `eliot-agent-bridge.exe` child with the documented MCP argv and transfers
+/// the stdio session to it, then reports the child's exit status. The
+/// delegation is mechanical and runs before any legacy semantic
+/// initialization: no Governor, Store, WAL, or writer object is constructed
+/// on this path, and the shared `daemon run` runtime is never touched.
+///
+/// Resolution is anchored at the actual running executable, never at PATH or
+/// the working directory: the approved Bridge artifact must sit beside the
+/// launched Governor, and the installation-owned
+/// `agent-bridge/client-declaration-v2.json` must sit beside it. A missing
+/// or mismatched artifact or declaration fails here with an explicit
+/// diagnostic and no legacy fallback; the Bridge itself re-validates the
+/// declaration digest plus the live Kernel challenge before serving.
+/// Exactly one child is spawned through the argument vector (no shell, so
+/// Windows paths with spaces need no interpolation), with the protocol
+/// handles inherited so the child's stdout stays the MCP session. The wait
+/// is synchronous because this process has no other work once delegated:
+/// the delegation lifetime is exactly the child lifetime, nothing detaches,
+/// and the MCP session ends when the child ends.
+fn delegate_claude_mcp_to_agent_bridge() -> Result<std::process::ExitStatus> {
+    use std::process::{Command, Stdio};
+
+    const GOVERNOR_BINARY: &str = "eliot-governor.exe";
+    const BRIDGE_BINARY: &str = "eliot-agent-bridge.exe";
+    const DECLARATION_DIR: &str = "agent-bridge";
+    const DECLARATION_FILE: &str = "client-declaration-v2.json";
+
+    let governor = std::env::current_exe()
+        .context("resolve running Governor executable")?
+        .canonicalize()
+        .context("canonicalize running Governor executable")?;
+    if governor.file_name().and_then(|name| name.to_str()) != Some(GOVERNOR_BINARY) {
+        anyhow::bail!(
+            "refuse front-door delegation from unexpected binary {}: expected {GOVERNOR_BINARY}",
+            governor.display()
+        );
+    }
+    let exe_dir = governor
+        .parent()
+        .context("running Governor executable has no parent directory")?;
+    let bridge = exe_dir.join(BRIDGE_BINARY);
+    if !bridge.is_file() {
+        anyhow::bail!(
+            "flagged Claude MCP front door is selected but the approved Bridge artifact is missing: {} (Bridge exe ships beside the installed Governor; refusing without legacy fallback)",
+            bridge.display()
+        );
+    }
+    // Canonicalize before comparing so a symlinked or aliased layout cannot
+    // disguise a recursive delegation back into this binary.
+    let bridge_canonical = bridge
+        .canonicalize()
+        .context("canonicalize Bridge artifact")?;
+    if bridge_canonical == governor {
+        anyhow::bail!(
+            "refuse recursive front-door delegation: Bridge artifact resolves to the running Governor {}",
+            governor.display()
+        );
+    }
+    let declaration = exe_dir.join(DECLARATION_DIR).join(DECLARATION_FILE);
+    if !declaration.is_file() {
+        anyhow::bail!(
+            "flagged Claude MCP front door is selected but the installation-owned client declaration is missing: {} (refusing without legacy fallback; the bundle never invents it)",
+            declaration.display()
+        );
+    }
+    let mut child = Command::new(&bridge_canonical)
+        .arg("mcp")
+        .arg("--profile")
+        .arg("SPINE_FUNCTIONAL")
+        .arg("--transport")
+        .arg("stdio")
+        .arg("--client-declaration")
+        .arg(&declaration)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "launch flagged Claude MCP front door {}",
+                bridge_canonical.display()
+            )
+        })?;
+    child.wait().with_context(|| {
+        format!(
+            "wait for flagged Claude MCP front door {}",
+            bridge_canonical.display()
+        )
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_command(
     config: &Path,
@@ -2500,16 +2596,29 @@ async fn dispatch_command(
             // The refusal precedes ensure_daemon_ready, so a cut-over
             // invocation never auto-launches the daemon, starts a store, or
             // constructs a ControlWal/WriterActor. Absent flag preserves
-            // today's behavior on every host edge.
+            // today's behavior on every host edge. Remaining hosts proceed on
+            // the retained legacy path while their cutover is pending.
+            //
+            // #2562: on the selected path this process additionally delegates
+            // to the approved Bridge instead of stopping at the refusal. A
+            // successful delegation never returns: the single owned child
+            // owns the stdio session from here. Resolution or launch failures
+            // keep the refusal receipt and return fail-closed with no legacy
+            // fallback.
             if let Err(detail) = front_door_cutover::gate_legacy_entrypoint(
                 "eliot-governor mcp stdio",
                 host.as_deref(),
             ) {
-                front_door_cutover::write_cutover_rejection(
-                    front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
-                    &detail,
-                );
-                return Err(anyhow::anyhow!(detail));
+                match delegate_claude_mcp_to_agent_bridge() {
+                    Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                    Err(error) => {
+                        front_door_cutover::write_cutover_rejection(
+                            front_door_cutover::LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER,
+                            &detail,
+                        );
+                        return Err(error);
+                    }
+                }
             }
             mcp_stdio::run(
                 config,
