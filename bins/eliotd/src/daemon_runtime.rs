@@ -10,6 +10,40 @@
 //! readiness/degraded/fatal protocol evidence. It has no Kernel/store semantic
 //! authority, lifecycle policy ownership, SCM, Host, Watchdog, or canonical
 //! mutation authority.
+//!
+//! # This driver calls no `commit_canonical_and_refresh` (issue #1929)
+//!
+//! Recorded because the #1929 work list names this module as the intended
+//! production caller of `DaemonComposition::commit_canonical_and_refresh`, and
+//! the absence of any such call is the measured reason that entry — and with it
+//! the typed task-binding evidence leg — is unreachable. Measured on this tree,
+//! not inferred: no production code in this module calls
+//! `commit_canonical_and_refresh` or `admit_canonical_write`.
+//!
+//! It must not be read as "this driver commits no canonical write". It does:
+//! the `TestD` owner finish driver runs `commit_testd_terminal_owner_fact`,
+//! which exchanges up to three Governor-owned canonical legs over the neutral
+//! `KernelTransitionPort`. Those legs therefore pass through
+//! `DaemonKernelClient::apply_prepared` and its `check_identity_binding`, so the
+//! **live** #1929 admission edge is the transport one
+//! (`task_binding_admission::admit_named_mutation_capture`), not the
+//! composition-root one. What is unreachable is only the leg that needs a typed
+//! `TaskSelectionEvidence`.
+//!
+//! That leg cannot be given a call here honestly today. Committing through
+//! `commit_canonical_and_refresh` requires a caller-presented
+//! `MaterialReadinessInputs`, whose `OnboardingReadinessReceipt` is the only
+//! carrier of a real `TaskSelectionEvidence`, and this driver has no source for
+//! one: the repository's sole production constructor of that receipt,
+//! `eliot_workscope::ColdStartController::compile`, is reached only through
+//! `eliot_workscope::OnboardingSingleFlight::compile_and_publish` and therefore
+//! only through the uncalled
+//! `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`.
+//! Manufacturing a receipt here — a task revision, an acceptance digest, a
+//! governance profile, a lease — would fabricate exactly the authority the
+//! admission gate exists to verify, so it was not done. The owner of that
+//! receipt is the attach/onboarding ingress, not this driver. See
+//! `eliotd::task_binding_admission`'s "Measured reachability" section.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
