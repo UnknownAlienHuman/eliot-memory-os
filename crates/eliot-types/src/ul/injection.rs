@@ -10,37 +10,78 @@ pub struct ObservedCue {
     pub value: String,
 }
 
-// The direct legacy cue decoder preserves two inert metadata keys; injection
-// records use a stricter adapter for cues nested inside protected records.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObservedCueLegacyInput {
-    kind: LegacyCueKindV1,
-    value: String,
-    #[serde(default)]
-    #[serde(rename = "version")]
-    _version: Option<IgnoredAny>,
-    #[serde(default)]
-    #[serde(rename = "schema_version")]
-    _schema_version: Option<IgnoredAny>,
-}
-
 impl<'de> Deserialize<'de> for ObservedCue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let ObservedCueLegacyInput {
-            kind,
-            value,
-            _version: _,
-            _schema_version: _,
-        } = ObservedCueLegacyInput::deserialize(deserializer)?;
-
-        Ok(Self { kind, value })
+        deserializer.deserialize_map(ObservedCueVisitor)
     }
 }
 
+/// Single-pass decoder for the direct legacy cue boundary.
+///
+/// The accepted key set is enumerated rather than derived, and it is the
+/// historical record plus exactly two inert metadata keys pinned by the #831/8
+/// compatibility oracle. Those two are read and dropped: they are never stored
+/// and never re-serialized, so a versioned trial decode cannot be absorbed by
+/// them, and the re-serialized cue keeps the exact two-key record. Every other
+/// key is refused, and a repeated key is refused before its value is stored, so
+/// a lexical duplicate cannot overwrite an accepted one.
+struct ObservedCueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ObservedCueVisitor {
+    type Value = ObservedCue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a legacy observed cue")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut kind: Option<LegacyCueKindV1> = None;
+        let mut value: Option<String> = None;
+        // The two inert metadata keys are decoded and dropped, never stored.
+        let mut version: Option<IgnoredAny> = None;
+        let mut schema_version: Option<IgnoredAny> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "kind" => set_once(&mut kind, map.next_value()?, "kind")?,
+                "value" => set_once(&mut value, map.next_value()?, "value")?,
+                "version" => {
+                    set_once(&mut version, map.next_value::<IgnoredAny>()?, "version")?;
+                }
+                "schema_version" => {
+                    set_once(
+                        &mut schema_version,
+                        map.next_value::<IgnoredAny>()?,
+                        "schema_version",
+                    )?;
+                }
+                _ => {
+                    return Err(serde::de::Error::unknown_field(
+                        key.as_str(),
+                        &["kind", "value", "version", "schema_version"],
+                    ));
+                }
+            }
+        }
+
+        Ok(ObservedCue {
+            kind: required(kind, "kind")?,
+            value: required(value, "value")?,
+        })
+    }
+}
+
+/// Cue adapter for cues nested inside a protected injection record.
+///
+/// A nested cue carries no legacy compatibility: the exact historical key set
+/// is the whole key set, so the inert metadata pair the direct legacy decode
+/// tolerates is refused here.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictObservedCueInput {
@@ -60,6 +101,25 @@ where
             value: cue.value,
         })
         .collect())
+}
+
+/// Store a decoded field exactly once, refusing a repeated key first.
+fn set_once<T, E>(slot: &mut Option<T>, value: T, key: &'static str) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    if slot.is_some() {
+        return Err(E::duplicate_field(key));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn required<T, E>(value: Option<T>, field: &'static str) -> Result<T, E>
+where
+    E: serde::de::Error,
+{
+    value.ok_or_else(|| E::missing_field(field))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
