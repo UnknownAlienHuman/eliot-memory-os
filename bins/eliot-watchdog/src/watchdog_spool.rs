@@ -1052,7 +1052,7 @@ impl WatchdogSpool {
             )?);
         }
         state.record_observation(intent::GovernorIntentObservationRecord {
-            observation_digest: observation_digest.clone(),
+            observation_digest: observation_digest.to_owned(),
             reason,
             observed_at_ms,
             producer_generation,
