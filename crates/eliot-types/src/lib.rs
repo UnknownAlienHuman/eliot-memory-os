@@ -33,6 +33,7 @@ pub mod secret_boundary;
 pub mod semantic_memory;
 pub mod service;
 pub mod skill;
+pub mod strict_json;
 pub mod task_execution;
 pub mod ul;
 pub mod verification;
@@ -413,6 +414,9 @@ pub use skill::{
     SkillMergeProposal, SkillNeedEstimate, SkillNeedVerdict, SkillOrderingRule, SkillOutputSpec,
     SkillPatchProposal, SkillQuarantineProposal, SkillReplayRequirement, SkillScopeRule,
     SkillSplitProposal, SkillStep, SkillToolRequirement,
+};
+pub use strict_json::{
+    StrictJsonError, StrictJsonErrorKind, strict_json_has_no_duplicate_members, strict_json_value,
 };
 pub use task_execution::{
     TaskExecutionAction, TaskExecutionArtifact, TaskExecutionClass, TaskExecutionClassSource,
