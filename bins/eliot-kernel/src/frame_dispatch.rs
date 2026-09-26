@@ -1172,6 +1172,13 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "agent_activation_reconcile"
             | "publish_owner_bundle"
             | "query_owner_bundle"
+            // Issue #2100 R6: the canonical second-phase read route. The
+            // marker is the one string the admitted dispatch arm already
+            // serves (`QUERY_GRANT_CLOSURE_LINKS_OPERATION`); it was absent
+            // here, so the frame fell through every predicate, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session
+            // before the arm was ever entered.
+            | super::daemon_request_dispatch::QUERY_GRANT_CLOSURE_LINKS_OPERATION
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"
