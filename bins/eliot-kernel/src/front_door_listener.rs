@@ -136,21 +136,21 @@ impl KernelComposition {
             NamedPipeServer::create_with_peer_set(self.ipc.name(), peers)
                 .map_err(|error| KernelBuildError::Principal(error.to_string()))
         })();
-        match &result {
-            Ok(_) => {
-                observe_listener("kernel.front_door_listener_create", "success");
-                observe_listener("kernel.front_door_listener_bind", "success");
-                observe_listener("kernel.front_door_listener_accept_ready", "success");
-            }
-            Err(_) => {
-                // F-LOG-KERNEL-0 (#895 W6/T17): keep only the correlated
-                // lower-phase observation here. The designated terminal
-                // emitter for this startup bind failure is `exit_error`
-                // (`COMPOSITION_FAILURE`); correlation is single-funnel
-                // adjacency, not a threaded op identity.
-                observe_listener("kernel.front_door_listener_create", "fenced");
-                observe_listener("kernel.front_door_listener_bind", "fenced");
-            }
+        // F-LOG-KERNEL-1 (#897 T2): `if/else` rather than the `match` the
+        // sibling bind entries use — the two-statement fenced arm trips
+        // `single_match_else`. The bind itself is unchanged.
+        if result.is_ok() {
+            observe_listener("kernel.front_door_listener_create", "success");
+            observe_listener("kernel.front_door_listener_bind", "success");
+            observe_listener("kernel.front_door_listener_accept_ready", "success");
+        } else {
+            // F-LOG-KERNEL-0 (#895 W6/T17): keep only the correlated
+            // lower-phase observation here. The designated terminal
+            // emitter for this startup bind failure is `exit_error`
+            // (`COMPOSITION_FAILURE`); correlation is single-funnel
+            // adjacency, not a threaded op identity.
+            observe_listener("kernel.front_door_listener_create", "fenced");
+            observe_listener("kernel.front_door_listener_bind", "fenced");
         }
         result
     }
