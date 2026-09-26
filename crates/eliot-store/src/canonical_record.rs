@@ -8,6 +8,11 @@
 //! The two supported wire forms are preserved: `receipt_body_json_b64`
 //! (`STANDARD_NO_PAD`) preferred when present, else legacy `receipt_body`.
 //! Invalid base64 or invalid selected JSON never falls back to legacy.
+//! #2985: the recursive strict lexical decoder that rejects duplicate object
+//! members in a base64-decoded protected body now lives in the single shared
+//! `eliot_types::strict_json` owner, consumed here through
+//! `strict_json_has_no_duplicate_members`; the established external
+//! `canonical record: …` error strings are unchanged.
 //! Duplicate evidence inside the legacy body is preserved through a
 //! duplicate-sensitive capture until selection has run; base64-decoded bodies
 //! receive the same duplicate/trailing-data treatment plus actual generic-`T`
@@ -23,7 +28,10 @@ use std::marker::PhantomData;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use eliot_types::{MemoryRevision, ProjectId, ProjectSequence, TaskId, WriteReceiptRef};
+use eliot_types::{
+    MemoryRevision, ProjectId, ProjectSequence, TaskId, WriteReceiptRef,
+    strict_json_has_no_duplicate_members,
+};
 use serde::de::{DeserializeOwned, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -197,105 +205,16 @@ impl<'de> Deserialize<'de> for LegacyBodyCapture {
     }
 }
 
-/// Strict JSON value used to validate base64-decoded bodies.
+/// Rejects a base64-decoded protected body that carries a duplicate object
+/// member at any depth, before generic `T` decoding can admit it.
 ///
-/// Unlike `serde_json::Value`, object duplicates at any depth are a hard
-/// error here, so a `Value`-shaped protected body cannot smuggle a duplicate
-/// past the decoder. Errors are redacted and never echo input.
-struct StrictValue(Value);
-
-struct StrictVisitor;
-
-impl<'de> Visitor<'de> for StrictVisitor {
-    type Value = StrictValue;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("strict JSON body value without duplicate keys")
-    }
-
-    fn visit_unit<E: DeError>(self) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Null))
-    }
-
-    fn visit_none<E: DeError>(self) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Null))
-    }
-
-    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        StrictValue::deserialize(deserializer)
-    }
-
-    fn visit_bool<E: DeError>(self, v: bool) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Bool(v)))
-    }
-
-    fn visit_i64<E: DeError>(self, v: i64) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Number(v.into())))
-    }
-
-    fn visit_u64<E: DeError>(self, v: u64) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Number(v.into())))
-    }
-
-    fn visit_f64<E: DeError>(self, v: f64) -> Result<Self::Value, E> {
-        let number = serde_json::Number::from_f64(v)
-            .ok_or_else(|| E::custom("canonical record: invalid number"))?;
-        Ok(StrictValue(Value::Number(number)))
-    }
-
-    fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::String(v.to_owned())))
-    }
-
-    fn visit_borrowed_str<E: DeError>(self, v: &'de str) -> Result<Self::Value, E> {
-        self.visit_str(v)
-    }
-
-    fn visit_string<E: DeError>(self, v: String) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::String(v)))
-    }
-
-    fn visit_borrowed_bytes<E: DeError>(self, v: &'de [u8]) -> Result<Self::Value, E> {
-        self.visit_bytes(v)
-    }
-
-    fn visit_bytes<E: DeError>(self, v: &[u8]) -> Result<Self::Value, E> {
-        let text = std::str::from_utf8(v)
-            .map_err(|_| E::custom("canonical record: invalid body bytes"))?;
-        self.visit_str(text)
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut items = Vec::new();
-        while let Some(elem) = seq.next_element::<StrictValue>()? {
-            items.push(elem.0);
-        }
-        Ok(StrictValue(Value::Array(items)))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut object = serde_json::Map::new();
-        let mut seen = HashSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if !seen.insert(key.clone()) {
-                return Err(A::Error::custom("canonical record: duplicate body field"));
-            }
-            let nested: StrictValue = map.next_value()?;
-            object.insert(key, nested.0);
-        }
-        Ok(StrictValue(Value::Object(object)))
-    }
-}
-
-impl<'de> Deserialize<'de> for StrictValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(StrictVisitor)
-    }
-}
-
+/// #2985 moved the single shared lexical decoder to `eliot_types::strict_json`,
+/// so the canonical-record body path and the cognitive reader ingress share one
+/// implementation. This wrapper keeps only the established external error
+/// vocabulary: the duplicate reason stays internal and is redacted to
+/// `canonical record: invalid protected body`.
 fn strict_body_has_no_duplicates<E: DeError>(bytes: &[u8]) -> Result<(), E> {
-    serde_json::from_slice::<StrictValue>(bytes)
-        .map(|_| ())
+    strict_json_has_no_duplicate_members(bytes)
         .map_err(|_| E::custom("canonical record: invalid protected body"))?;
     Ok(())
 }

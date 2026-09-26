@@ -23,11 +23,11 @@ use eliot_types::{
     CognitiveHardGateEvidence, CognitiveHardGateKind, CognitiveJudgeResult,
     CognitiveMemoryCondition, CognitiveUnderstandingAnswer, CognitiveWorkerResult,
     ExternalAgentExecutionRequest, ExternalAgentPurpose, HostLaunchContract, HostMode,
-    OperationJob, OperationJobState, OperationPhase, ProjectId, ProviderExecutionEvidence,
-    ProviderRuntimeContract, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION, SealStagingCheckpoint,
-    SealStagingState, TaskId, TaskIntentOracle, WorkItem, WorkItemId, WorkItemStatus, WorkScope,
-    cognitive_judge_result_schema, cognitive_understanding_answer_schema,
-    cognitive_worker_result_schema,
+    MAX_SECRET_BOUNDARY_BYTES, OperationJob, OperationJobState, OperationPhase, ProjectId,
+    ProviderExecutionEvidence, ProviderRuntimeContract, SEAL_STAGING_CHECKPOINT_SCHEMA_VERSION,
+    SealStagingCheckpoint, SealStagingState, TaskId, TaskIntentOracle, WorkItem, WorkItemId,
+    WorkItemStatus, WorkScope, cognitive_judge_result_schema,
+    cognitive_understanding_answer_schema, cognitive_worker_result_schema, strict_json_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -95,6 +95,19 @@ const SEAL_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str = "eliot-seal-artifact-manifes
 const ABANDONED_SEAL_ATTEMPT_SCHEMA_VERSION: &str = "eliot-abandoned-seal-attempt-v1";
 const PUBLISHED_SEAL_SUPERSESSION_SCHEMA_VERSION: &str = "eliot-published-seal-supersession-v1";
 const ROLE_REUSE_BINDING_SCHEMA_VERSION: &str = "eliot-role-reuse-binding-v1";
+
+/// Upper bound on one provider structured-output document, applied to the
+/// retained reader bytes before any JSON parsing.
+///
+/// #2985: `fs::read` of the sealed output is bounded only by
+/// `enforce_provider_secret_boundary` (a secret scan) and by the receipt's
+/// SHA-256, so without this ceiling an oversized output would be read and
+/// parsed before rejection. The value matches the pre-existing
+/// `MAX_SECRET_BOUNDARY_BYTES` bound the same bytes already pass through, so
+/// every document that could reach the decoder before #2985 is still admitted
+/// and no accepted output changes. It is a pure resource ceiling, not a
+/// semantic contract: a Reader answer that large is already a failed output.
+const READER_PROVIDER_OUTPUT_MAX_BYTES: usize = MAX_SECRET_BOUNDARY_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5508,7 +5521,15 @@ pub fn record_provider(report_root: &Path, private_root: &Path, receipt_path: &P
                 ("worker.json", None)
             }
             CognitiveFieldRole::UnderstandingReader => {
-                let value: Value = serde_json::from_slice(&bytes)?;
+                // #2985: decode the retained bytes once through the shared
+                // strict lexical decoder. A duplicate object member is rejected
+                // here, before any `Value` normalization, so both schema checks
+                // and the typed answer consume one duplicate-clean projection of
+                // these exact bytes. Malformed, trailing and oversized documents
+                // fail the same way, with a bounded redacted cause.
+                let value = strict_json_value(&bytes, READER_PROVIDER_OUTPUT_MAX_BYTES).map_err(
+                    |error| anyhow::anyhow!("Reader output failed strict JSON decode: {error}"),
+                )?;
                 let canonical_schema = cognitive_understanding_answer_schema();
                 let provider_schema = provider_compatible_reader_schema(&canonical_schema)?;
                 validate_json_schema_instance(
