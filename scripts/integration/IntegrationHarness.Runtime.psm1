@@ -9,7 +9,13 @@
 # eliot.integration.runtime-provider.v1 + lock (eliot-host.exe 1.0.0 windows-x64
 # pe 8664 isolated-foreground sha 6356df03...a0fc); mutation-free Plan deriving the
 # component graph (kernel <- host <- governor <- watchdog; bridge <- host,governor)
-# plus Store/Git receipt requirements; unique run-owned installation/session/config/
+# plus Store/Git receipt requirements plus the exact planned target closure
+# (plannedComponents, dependency-closed, launch-ordered); Allocate consumes the
+# required Store/Git receipts via explicit -ProviderReceipts (validated, lane-matched,
+# run-bound, propagated Allocate -> Start -> readiness) and always echoes the
+# requirement; Start launches only the Plan scope when a Plan is supplied and the
+# full topology otherwise (recorded default, never silent); unique run-owned
+# installation/session/config/
 # data/log/temp/artifact identities + canonical F-PIPE namespace + user-scoped
 # isolated-foreground principal; per-executable digest + PE target/profile before
 # launch; Job Object (or accepted equivalent) containment before descendants escape;
@@ -102,6 +108,24 @@ function Test-RuntimeTerminalDisposition {
     if ([string]::IsNullOrWhiteSpace($Disposition)) { throw [System.ArgumentException]::new('RUNTIME-INVALID-DISPOSITION: disposition is empty.') }
     foreach ($allowed in $Script:RuntimeTerminalDispositions) { if ($Disposition -ceq $allowed) { return $true } }
     throw [System.ArgumentException]::new("RUNTIME-INVALID-DISPOSITION: '$Disposition' is not an accepted terminal disposition.")
+}
+function Get-RuntimeTargetClosure {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Target)
+    if ([string]$Target -cnotin $Script:RuntimeComponents) { throw [System.InvalidOperationException]::new("RUNTIME-UNKNOWN-TARGET: closure target '$Target' is not a topology component.") }
+    $closed = @{}
+    $stack = New-Object Collections.Generic.List[string]
+    [void]$stack.Add($Target)
+    while ($stack.Count -gt 0) {
+        $next = $stack[$stack.Count - 1]
+        [void]$stack.RemoveAt($stack.Count - 1)
+        if ($closed.ContainsKey($next)) { continue }
+        $closed[$next] = $true
+        foreach ($dep in @($Script:RuntimeComponentDependencies[$next])) {
+            if (-not $closed.ContainsKey([string]$dep)) { [void]$stack.Add([string]$dep) }
+        }
+    }
+    return @($Script:RuntimeLaunchOrder | Where-Object { $closed.ContainsKey($_) })
 }
 function Resolve-RuntimeDeadline {
     [CmdletBinding()]
@@ -218,7 +242,9 @@ function Invoke-RuntimePlan {
             }
         }
     }
-    return @{ runId = $runId; testClass = $Script:RuntimeTestClass; target = [string]$Requirement['target']; providerName = $Script:RuntimeProviderName; providerRevision = $Script:RuntimeProviderRevision; owner = $owner; generation = $gen; resources = $resources; requiredReceipts = $requiredReceipts; mutationFree = $true }
+    $plannedTarget = [string]$Requirement['target']
+    $plannedComponents = @(Get-RuntimeTargetClosure -Target $plannedTarget)
+    return @{ runId = $runId; testClass = $Script:RuntimeTestClass; target = $plannedTarget; plannedTarget = $plannedTarget; plannedComponents = $plannedComponents; providerName = $Script:RuntimeProviderName; providerRevision = $Script:RuntimeProviderRevision; owner = $owner; generation = $gen; resources = $resources; requiredReceipts = $requiredReceipts; mutationFree = $true }
 }
 function Resolve-RuntimeOwnedPath {
     [CmdletBinding()]
@@ -279,6 +305,9 @@ function Get-RuntimeChildEnv {
     }
     return $filtered
 }
+# Caller-side minter for the Allocate -PeerCredential explicit input: the caller mints
+# and keeps the secret, and only the handle crosses into the provider (Allocate
+# validates and binds it, Start forwards it to the launcher/peer channel).
 function New-RuntimeEphemeralCredential {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$CredentialId, [Parameter()][AllowNull()][scriptblock]$Entropy)
@@ -295,6 +324,20 @@ function New-RuntimeEphemeralCredential {
     }
     if ($nonce -cnotmatch '^[0-9a-f]{16,128}$') { throw [System.ArgumentException]::new('RUNTIME-INVALID-ENTROPY: entropy nonce must be lowercase hex.') }
     return @{ credentialId = $CredentialId; credentialHandle = ('handle:' + $CredentialId + ':' + $nonce.Substring(0, 8)); secret = ('runtime-ephemeral-' + $nonce); ephemeral = $true }
+}
+function Resolve-RuntimePeerCredential {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Credential)
+    if ($Credential.ContainsKey('secret')) { throw [System.InvalidOperationException]::new('RUNTIME-PEER-CREDENTIAL-VALUE: peer credential must report names/handles, never values.') }
+    foreach ($field in @('credentialId', 'credentialHandle')) {
+        if (-not $Credential.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Credential[$field])) { throw [System.ArgumentException]::new("RUNTIME-INVALID-PEER-CREDENTIAL: peer credential is missing '$field'.") }
+    }
+    $peerId = [string]$Credential['credentialId']
+    if ($peerId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw [System.ArgumentException]::new('RUNTIME-INVALID-PEER-CREDENTIAL: credential id has an invalid shape.') }
+    if ([string]$Credential['credentialHandle'] -cnotmatch '^handle:[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[0-9a-f]{8}$') { throw [System.InvalidOperationException]::new('RUNTIME-PEER-CREDENTIAL-SHAPE: peer credentialHandle is not an ephemeral-handle shape.') }
+    $expectedPrefix = ('handle:' + $peerId + ':')
+    if (-not ([string]$Credential['credentialHandle']).StartsWith($expectedPrefix, [System.StringComparison]::Ordinal)) { throw [System.InvalidOperationException]::new('RUNTIME-PEER-CREDENTIAL-SHAPE: peer credentialHandle does not belong to the declared credential id.') }
+    return @{ credentialId = $peerId; credentialHandle = [string]$Credential['credentialHandle'] }
 }
 function Test-RuntimePrincipalShape {
     [CmdletBinding()]
@@ -338,6 +381,8 @@ function Get-RuntimeRedactedText {
         $redacted = [regex]::Replace($redacted, '(?i)ELIOT_GOVERNOR_CONFIG\s*=\s*\S+', 'ELIOT_GOVERNOR_CONFIG=[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)runtime_[a-z_]*(pass|secret|token|key)[a-z_]*\s*=\s*\S+', '[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ)\s*\{[^}]{0,4096}\}', '$1 [redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environ|protocol|source|model|user|trace|commit|branch|tag|repo|repository)\s*[:=]\s*\S+', '$1=[redacted-runtime-secret]')
+        $redacted = [regex]::Replace($redacted, '(?i)([A-Za-z]:\\(?:[^\\/:*?"<>|\s]+\\)*private(?:\\[^\\/:*?"<>|\s]*)*|/(?:[^\\/:*?"<>|\s]+/)*private(?:/[^\\/:*?"<>|\s]*)*)', '[redacted-private-path]')
         $redacted = [regex]::Replace($redacted, '(?i)[A-Za-z]:\\Users\\[^\\/:*?"<>|]+', '[redacted-user-path]')
     } catch {
         return [pscustomobject]@{ text = ''; bytes = 0; truncated = $false; failed = $true }
@@ -356,7 +401,7 @@ function Get-RuntimeRedactedText {
 }
 function Invoke-RuntimeAllocate {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Plan, [Parameter(Mandatory)][string]$BaseTemp, [Parameter()][AllowNull()][scriptblock]$Entropy, [Parameter()][AllowNull()][scriptblock]$NamespaceReservation, [Parameter()][AllowNull()][hashtable]$GovernorConfigReceipt)
+    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Plan, [Parameter(Mandatory)][string]$BaseTemp, [Parameter()][AllowNull()][scriptblock]$Entropy, [Parameter()][AllowNull()][scriptblock]$NamespaceReservation, [Parameter()][AllowNull()][hashtable]$GovernorConfigReceipt, [Parameter()][AllowNull()][AllowEmptyCollection()][hashtable[]]$ProviderReceipts, [Parameter()][AllowNull()][hashtable]$PeerCredential)
     [void](Test-RuntimeBindingShape -Binding $Binding)
     if ([string]$Plan['runId'] -cne [string]$Binding['runId']) { throw [System.InvalidOperationException]::new('RUNTIME-ALLOCATION-MISMATCH: plan run identity does not match binding.') }
     if ([string]::IsNullOrWhiteSpace($BaseTemp)) { throw [System.ArgumentException]::new('RUNTIME-INVALID-PATH: BaseTemp is empty.') }
@@ -393,14 +438,46 @@ function Invoke-RuntimeAllocate {
     else { throw [System.InvalidOperationException]::new('RUNTIME-NAMESPACE-CONFLICT: reservation must return a pipe-namespace mapping.') }
     if ($reserved -cne $pipeNamespace) { throw [System.InvalidOperationException]::new('RUNTIME-NAMESPACE-CONFLICT: reserved namespace does not match the derived canonical namespace.') }
     $allocation = @{ runId = $runId; runRoot = $runRoot; installationRoot = $roots['installation']; sessionRoot = $roots['session']; configRoot = $roots['config']; dataRoot = $roots['data']; logRoot = $roots['logs']; tempRoot = $roots['temp']; artifactRoot = $roots['artifacts']; ownerMarker = $Script:RuntimeOwnedRootMarker; pipeNamespace = $pipeNamespace; sessionId = $sessionId; principal = $principal; owner = [string]$Binding['owner']; generation = [int]$Binding['generation']; allocationSeed = $nonce }
+    $requiredLanes = @()
+    if ($Plan.ContainsKey('requiredReceipts') -and $null -ne $Plan['requiredReceipts']) { $requiredLanes = @($Plan['requiredReceipts']) }
+    $allocation['requiredReceipts'] = $requiredLanes
+    $acceptedReceipts = @()
+    $storeReceiptForConfig = $null
+    $suppliedReceipts = @()
+    if ($null -ne $ProviderReceipts) { $suppliedReceipts = @($ProviderReceipts) }
+    if ($suppliedReceipts.Count -gt 0) {
+        $coveredLanes = @{}
+        foreach ($receipt in $suppliedReceipts) {
+            if ($receipt -isnot [hashtable]) { throw [System.ArgumentException]::new('RUNTIME-INVALID-RECEIPT: provider receipt must be a hashtable.') }
+            [void](Test-RuntimeProviderReceipt -Receipt $receipt)
+            if ([string]$receipt['runId'] -cne $runId) { throw [System.InvalidOperationException]::new('RUNTIME-RECEIPT-FOREIGN: provider receipt run identity is foreign to this binding.') }
+            $laneKind = 'store-receipt'
+            if ([string]$receipt['testClass'] -ceq 'GIT') { $laneKind = 'git-receipt' }
+            $matched = $false
+            foreach ($lane in $requiredLanes) {
+                if (($lane -is [hashtable]) -and ([string]$lane['kind'] -ceq $laneKind) -and ([string]$lane['providerRevision'] -ceq [string]$receipt['providerRevision'])) { $matched = $true }
+            }
+            if (-not $matched) { throw [System.InvalidOperationException]::new("RUNTIME-RECEIPT-LANE: provider receipt lane '$laneKind' is not required by this plan.") }
+            $coveredLanes[$laneKind] = $true
+            $acceptedReceipts += @{ testClass = [string]$receipt['testClass']; providerRevision = [string]$receipt['providerRevision']; digest = [string]$receipt['digest']; issuer = [string]$receipt['issuer']; runId = $runId }
+        }
+        foreach ($lane in $requiredLanes) {
+            if (($lane -is [hashtable]) -and (-not $coveredLanes.ContainsKey([string]$lane['kind']))) { throw [System.InvalidOperationException]::new("RUNTIME-RECEIPT-MISSING: required lane '$($lane['kind'])' has no accepted provider receipt.") }
+        }
+        foreach ($accepted in $acceptedReceipts) { if ([string]$accepted['testClass'] -ceq 'STORE') { $storeReceiptForConfig = $accepted } }
+    }
+    $allocation['providerReceipts'] = $acceptedReceipts
+    if ($null -ne $PeerCredential) {
+        $allocation['peerCredential'] = (Resolve-RuntimePeerCredential -Credential $PeerCredential)
+    }
     if ($null -ne $GovernorConfigReceipt) {
-        $allocation['governorConfig'] = (Resolve-RuntimeGovernorConfig -Binding $Binding -ConfigReceipt $GovernorConfigReceipt -RunRoot $runRoot)
+        $allocation['governorConfig'] = (Resolve-RuntimeGovernorConfig -Binding $Binding -ConfigReceipt $GovernorConfigReceipt -RunRoot $runRoot -AcceptedStoreReceipt $storeReceiptForConfig)
     }
     return $allocation
 }
 function Invoke-RuntimeStart {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Allocation, [Parameter(Mandatory)][AllowNull()][scriptblock]$Acquisition, [Parameter(Mandatory)][AllowNull()][scriptblock]$Launcher, [Parameter(Mandatory)][AllowNull()][scriptblock]$OwnerIssuance, [Parameter()][AllowNull()][scriptblock]$Entropy)
+    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$Allocation, [Parameter(Mandatory)][AllowNull()][scriptblock]$Acquisition, [Parameter(Mandatory)][AllowNull()][scriptblock]$Launcher, [Parameter(Mandatory)][AllowNull()][scriptblock]$OwnerIssuance, [Parameter()][AllowNull()][scriptblock]$Entropy, [Parameter()][AllowNull()][hashtable]$Plan)
     [void](Test-RuntimeBindingShape -Binding $Binding)
     $runId = [string]$Binding['runId']
     if ([string]$Allocation['runId'] -cne $runId) { throw [System.InvalidOperationException]::new('RUNTIME-START-MISMATCH: allocation run identity does not match binding.') }
@@ -416,6 +493,30 @@ function Invoke-RuntimeStart {
         }
         if ($candidate.ContainsKey('runId') -and ([string]$candidate['runId'] -cne $runId)) { throw [System.InvalidOperationException]::new('RUNTIME-START-MISMATCH: allocation governorConfig run identity does not match binding.') }
         $governorBinding = $candidate
+    }
+    $launchScope = @($Script:RuntimeLaunchOrder)
+    $launchScopeSource = 'full-topology-default'
+    if ($null -ne $Plan) {
+        if (-not $Plan.ContainsKey('runId') -or ([string]$Plan['runId'] -cne $runId)) { throw [System.InvalidOperationException]::new('RUNTIME-START-MISMATCH: plan run identity does not match binding.') }
+        if (-not $Plan.ContainsKey('plannedComponents') -or $null -eq $Plan['plannedComponents']) { throw [System.ArgumentException]::new('RUNTIME-INVALID-PLAN: plan carries no derived target closure.') }
+        $claimedScope = @($Plan['plannedComponents'])
+        if ($claimedScope.Count -eq 0) { throw [System.ArgumentException]::new('RUNTIME-INVALID-PLAN: planned target closure is empty.') }
+        foreach ($scoped in $claimedScope) {
+            if ([string]$scoped -cnotin $Script:RuntimeComponents) { throw [System.InvalidOperationException]::new("RUNTIME-UNKNOWN-TARGET: planned scope '$scoped' is not a topology component.") }
+        }
+        foreach ($scoped in $claimedScope) {
+            foreach ($dep in @($Script:RuntimeComponentDependencies[[string]$scoped])) {
+                if ([string]$dep -cnotin $claimedScope) { throw [System.InvalidOperationException]::new("RUNTIME-PLAN-SCOPE-UNCLOSED: planned scope omits dependency '$dep' of '$scoped'.") }
+            }
+        }
+        $launchScope = @($Script:RuntimeLaunchOrder | Where-Object { $claimedScope -ccontains $_ })
+        $launchScopeSource = 'plan'
+    }
+    $peerCredentialBinding = $null
+    if ($Allocation.ContainsKey('peerCredential') -and $null -ne $Allocation['peerCredential']) {
+        $peerCandidate = $Allocation['peerCredential']
+        if ($peerCandidate -isnot [hashtable]) { throw [System.InvalidOperationException]::new('RUNTIME-INVALID-ALLOCATION: allocation peerCredential must be a hashtable receipt.') }
+        $peerCredentialBinding = (Resolve-RuntimePeerCredential -Credential $peerCandidate)
     }
     if ($null -eq $Acquisition) { throw [System.ArgumentException]::new('RUNTIME-MISSING-ACQUISITION: an acquisition seam is required; no download is performed here.') }
     if ($null -eq $Launcher) { throw [System.ArgumentException]::new('RUNTIME-MISSING-LAUNCHER: a process-launcher seam is required; no live spawn is performed here.') }
@@ -463,14 +564,26 @@ function Invoke-RuntimeStart {
     $pipeNamespace = [string]$Allocation['pipeNamespace']
     $sessionId = [string]$Allocation['sessionId']
     $childEnv = Get-RuntimeChildEnv -Ambient @{ PATH = $runtimePath; TEMP = ([string]$Allocation['runRoot']) }
+    $governorConfigFullPath = $null
+    if ($null -ne $governorBinding) {
+        $governorConfigFullPath = [System.IO.Path]::GetFullPath((Join-Path ([string]$Allocation['runRoot']) ([string]$governorBinding['relativePath'])))
+        [void](Resolve-RuntimeOwnedPath -RunRoot ([string]$Allocation['runRoot']) -Path $governorConfigFullPath -ExpectedRunId $runId)
+        # Core-owned protected channel: the only ELIOT_GOVERNOR_CONFIG the child can see
+        # is this explicit owned-root assignment after ambient filtering (ambient values
+        # never survive Get-RuntimeChildEnv, and the path never enters argv).
+        $childEnv['ELIOT_GOVERNOR_CONFIG'] = $governorConfigFullPath
+    }
     $observed = @{}
     $requestKeys = @{}
     foreach ($component in $Script:RuntimeLaunchOrder) {
+        if ($launchScope -cnotcontains $component) { continue }
         $requestKey = ('req-' + $component + '-' + $nonce)
         $pipe = ($Script:RuntimePipeDevicePrefix + $pipeNamespace + '-' + $component)
         $fixedArgv = @($runtimePath, 'run', '--component', $component, '--pipe', $pipe, '--session', $sessionId)
         $single = $null
-        try { $single = (& $Launcher @{ runId = $runId; component = $component; argv = $fixedArgv; pipe = $pipe; sessionId = $sessionId; childEnv = $childEnv; requestKey = $requestKey }) }
+        $launchInput = @{ runId = $runId; component = $component; argv = $fixedArgv; pipe = $pipe; sessionId = $sessionId; childEnv = $childEnv; requestKey = $requestKey }
+        if ($null -ne $peerCredentialBinding) { $launchInput['peerCredentialHandle'] = [string]$peerCredentialBinding['credentialHandle'] }
+        try { $single = (& $Launcher $launchInput) }
         catch {
             $message = $_.Exception.Message
             if ($message -match '(?i)lost-response|timeout|unknown') {
@@ -490,6 +603,12 @@ function Invoke-RuntimeStart {
     }
     $startResult = @{ runId = $runId; launchState = 'launch-registered'; containedObserved = $true; requested = @{ requestKeys = $requestKeys; pipeNamespace = $pipeNamespace; sessionId = $sessionId }; observed = $observed; invocation = @{ argvCount = 8; artifact = $Script:RuntimeArtifact }; binary = @{ version = $Script:RuntimeVersion; architecture = $Script:RuntimeArchitecture; peMachine = $Script:RuntimePeMachine; peProfile = $Script:RuntimePeProfile; digest = [string]$receipt['digest']; provenance = $provenance }; ownerIssuance = @{ generation = $issuedGen; fence = [string]$issuance['fence']; epoch = $issuedEpoch; owner = [string]$issuance['owner'] }; pipeNamespace = $pipeNamespace; sessionId = $sessionId }
     if ($null -ne $governorBinding) { $startResult['governorConfig'] = $governorBinding }
+    if ($null -ne $governorConfigFullPath) { $startResult['governorConfigPath'] = $governorConfigFullPath }
+    $startResult['launchScope'] = @($launchScope)
+    $startResult['launchScopeSource'] = $launchScopeSource
+    if ($null -ne $peerCredentialBinding) { $startResult['peerCredential'] = $peerCredentialBinding }
+    if ($Allocation.ContainsKey('providerReceipts') -and $null -ne $Allocation['providerReceipts'] -and @($Allocation['providerReceipts']).Count -gt 0) { $startResult['providerReceipts'] = @($Allocation['providerReceipts']) }
+    if ($Allocation.ContainsKey('requiredReceipts') -and $null -ne $Allocation['requiredReceipts']) { $startResult['requiredReceipts'] = @($Allocation['requiredReceipts']) }
     return $startResult
 }
 function Invoke-RuntimeObserveReadiness {
@@ -585,6 +704,14 @@ function Invoke-RuntimeObserveReadiness {
     }
     $readinessResult = @{ runId = $runId; readinessState = $state; ready = $whole; wholeTopologyReady = $whole; peerState = $peerState; peerAuthenticated = [bool]$client['peerAuthenticated']; generationFenceState = $genFenceState; generationAccepted = $genFenceOk; staleGeneration = (-not $genFenceOk); components = $components; blockedDependents = @($blockedDependents); pipeNamespace = $ownedNamespace }
     if ($null -ne $governorBinding) { $readinessResult['governorConfig'] = $governorBinding }
+    if ($StartReceipt.ContainsKey('providerReceipts') -and $null -ne $StartReceipt['providerReceipts'] -and @($StartReceipt['providerReceipts']).Count -gt 0) {
+        foreach ($accepted in @($StartReceipt['providerReceipts'])) {
+            if (($accepted -isnot [hashtable]) -or (-not $accepted.ContainsKey('testClass')) -or (-not $accepted.ContainsKey('providerRevision')) -or (-not $accepted.ContainsKey('digest'))) { throw [System.InvalidOperationException]::new('RUNTIME-RECEIPT-STALE: start receipt provider receipt is not an accepted lane binding.') }
+            [void](Test-RuntimeDigestFormat -Digest ([string]$accepted['digest']))
+            if ($accepted.ContainsKey('runId') -and ([string]$accepted['runId'] -cne $runId)) { throw [System.InvalidOperationException]::new('RUNTIME-RECEIPT-FOREIGN: start receipt provider receipt run identity is foreign.') }
+        }
+        $readinessResult['providerReceipts'] = @($StartReceipt['providerReceipts'])
+    }
     return $readinessResult
 }
 function Invoke-RuntimeResetForTest {
@@ -615,11 +742,13 @@ function Invoke-RuntimeCollectEvidence {
     param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][AllowEmptyString()][string]$TerminalState, [Parameter(Mandatory)][AllowEmptyString()][string]$LogText, [Parameter()][AllowNull()][AllowEmptyCollection()][string[]]$Secrets, [ValidateRange(1, 16777216)][int]$MaxBytes = 65536)
     [void](Test-RuntimeBindingShape -Binding $Binding)
     [void](Test-RuntimeTerminalDisposition -Disposition $TerminalState)
+    $secretCount = 0
+    if ($null -ne $Secrets) { $secretCount = @($Secrets).Count }
     $redacted = Get-RuntimeRedactedText -Text $LogText -Secrets $Secrets -MaxBytes $MaxBytes
     if ([bool]$redacted.failed) {
-        return @{ runId = [string]$Binding['runId']; terminalState = $TerminalState; evidenceState = 'EvidenceCollectionFailed'; bytes = 0; truncated = $false; redactionFailed = $true; owner = [string]$Binding['owner'] }
+        return @{ runId = [string]$Binding['runId']; terminalState = $TerminalState; evidenceState = 'EvidenceCollectionFailed'; bytes = 0; truncated = $false; redactionFailed = $true; owner = [string]$Binding['owner']; secretCount = $secretCount; maxBytes = $MaxBytes }
     }
-    return @{ runId = [string]$Binding['runId']; testClass = $Script:RuntimeTestClass; providerRevision = $Script:RuntimeProviderRevision; generation = [int]$Binding['generation']; owner = [string]$Binding['owner']; evidenceId = ('ev-' + ([string]$Binding['runId']).Substring(0, 8)); terminalState = $TerminalState; evidenceState = 'TerminalTestEvidence'; bytes = [int]$redacted.bytes; truncated = [bool]$redacted.truncated; text = [string]$redacted.text }
+    return @{ runId = [string]$Binding['runId']; testClass = $Script:RuntimeTestClass; providerRevision = $Script:RuntimeProviderRevision; generation = [int]$Binding['generation']; owner = [string]$Binding['owner']; evidenceId = ('ev-' + ([string]$Binding['runId']).Substring(0, 8)); terminalState = $TerminalState; evidenceState = 'TerminalTestEvidence'; bytes = [int]$redacted.bytes; truncated = [bool]$redacted.truncated; text = [string]$redacted.text; secretCount = $secretCount; maxBytes = $MaxBytes }
 }
 function Invoke-RuntimeStop {
     [CmdletBinding()]
@@ -745,6 +874,11 @@ function Invoke-RuntimeVerifyCleanup {
 function Test-RuntimeStoreHandleReference {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$StoreHandles)
+    # Scope: shape + run-consistency only (forms mirrored from
+    # IntegrationHarness.Store.psm1: namespace derivation :801, loopback :832,
+    # ephemeral port bound :825, handle shape :664). This check never proves #909
+    # issuance by itself; issuance is proven by the consumed STORE provider receipt
+    # (Allocate -ProviderReceipts, threaded as Resolve -AcceptedStoreReceipt).
     # Validates a reference to the #909 Store provisioner handle triple as issued by
     # Invoke-StoreAllocate (namespace/endpoint) and New-StoreEphemeralCredential
     # (credentialHandle). This module only references Store-issued handles; it never
@@ -771,7 +905,7 @@ function Test-RuntimeStoreHandleReference {
 }
 function Resolve-RuntimeGovernorConfig {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$ConfigReceipt, [Parameter()][AllowNull()][AllowEmptyString()][string]$RunRoot)
+    param([Parameter(Mandatory)][hashtable]$Binding, [Parameter(Mandatory)][hashtable]$ConfigReceipt, [Parameter()][AllowNull()][AllowEmptyString()][string]$RunRoot, [Parameter()][AllowNull()][hashtable]$AcceptedStoreReceipt)
     [void](Test-RuntimeBindingShape -Binding $Binding)
     foreach ($field in @('configName', 'version', 'runId', 'channel', 'digest')) {
         if (-not $ConfigReceipt.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$ConfigReceipt[$field])) { throw [System.ArgumentException]::new("RUNTIME-INVALID-CONFIG: governor config receipt is missing '$field'.") }
@@ -792,8 +926,13 @@ function Resolve-RuntimeGovernorConfig {
     $declaredStoreKeys = @($storeKeys | Where-Object { $ConfigReceipt.ContainsKey($_) })
     if ($declaredStoreKeys.Count -gt 0) {
         if ($declaredStoreKeys.Count -ne $storeKeys.Count) { throw [System.ArgumentException]::new('RUNTIME-INVALID-CONFIG: partial #909 store-handle reference; namespace, endpoint, and credentialHandle are required together.') }
+        if ($null -eq $AcceptedStoreReceipt) { throw [System.InvalidOperationException]::new('RUNTIME-STORE-HANDLE-UNPROVEN: store handle reference requires the accepted STORE provider receipt; shape alone never proves #909 issuance.') }
+        [void](Test-RuntimeProviderReceipt -Receipt $AcceptedStoreReceipt)
+        if ([string]$AcceptedStoreReceipt['testClass'] -cne 'STORE') { throw [System.InvalidOperationException]::new('RUNTIME-STORE-HANDLE-UNPROVEN: accepted receipt is not the STORE lane.') }
+        if ([string]$AcceptedStoreReceipt['runId'] -cne [string]$Binding['runId']) { throw [System.InvalidOperationException]::new('RUNTIME-STORE-HANDLE-UNPROVEN: accepted STORE receipt run identity is foreign.') }
         $candidate = @{ namespace = [string]$ConfigReceipt['storeNamespace']; endpoint = [string]$ConfigReceipt['storeEndpoint']; credentialHandle = [string]$ConfigReceipt['storeCredentialHandle'] }
         [void](Test-RuntimeStoreHandleReference -Binding $Binding -StoreHandles $candidate)
+        $candidate['receiptDigest'] = [string]$AcceptedStoreReceipt['digest']
         $storeHandles = $candidate
     }
     $resolved = @{ runId = [string]$Binding['runId']; configName = $Script:RuntimeGovernorConfigName; version = $Script:RuntimeGovernorConfigVersion; channel = $Script:RuntimeGovernorConfigChannel; relativePath = $relativePath; digest = [string]$ConfigReceipt['digest']; provenance = 'run-local-config-receipt'; accepted = $true }
