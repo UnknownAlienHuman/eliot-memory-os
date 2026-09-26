@@ -13,7 +13,9 @@
 //!   state class and migration contract, the full limit envelope
 //!   (memory/table/instance/stack, wall deadline, epoch/fuel policy and
 //!   cancellation, host-call/input/output/artifact ceilings), privacy/source
-//!   policy, and the shadow/canary comparator plus rollback generation.
+//!   policy, the shadow/canary comparator plus rollback generation, and the
+//!   authority-issued State Fence / Authority Epoch binding (bound at
+//!   admission, never minted).
 //! - Host calls are [`HostCallProposal`]s. A proposal for a capability the
 //!   manifest did not grant is uncallable; a granted capability additionally
 //!   requires a [`GovernorGrant`] held from actual Governor authority. This
@@ -60,6 +62,18 @@ pub const FS_CAPABILITY: &str = "fs.read";
 /// Network capability grant name. Absence of this grant means the guest
 /// cannot request network effects through the supported host surface.
 pub const NET_CAPABILITY: &str = "net.connect";
+
+/// Canonical I6.15 code for a missing exact resource facet: unintroduced
+/// resources are absent even when an adapter is installed, and a missing
+/// exact facet returns this code (never a generic failure or a silently
+/// widened introduction).
+pub const CAPABILITY_INTRODUCTION_REQUIRED: &str = "CAPABILITY_INTRODUCTION_REQUIRED";
+
+/// Canonical I6.15 code for a revoked or stale supporting grant. The host
+/// never emits this: revocation verdicts are owned by Governor grant
+/// semantics (#18) and Kernel activation/revocation enforcement (#15); see
+/// [`ContourGateError::GovernorAuthorizationRequired`].
+pub const CAPABILITY_GRANT_REVOKED: &str = "CAPABILITY_GRANT_REVOKED";
 
 /// Maximum import/export/grant string length echoed in an error code.
 const MAX_NAME_BYTES: usize = 96;
@@ -179,6 +193,18 @@ pub struct GenerationManifest {
     /// Prior compatible generation receiving new requests on rollback.
     /// Old epochs are never reactivated; rollback is a forward route switch.
     pub rollback_generation: Option<String>,
+    /// Authority-issued State Fence generation carried from admission (I6.15
+    /// `state_fence`): bound from the dispatch grant fence, never minted.
+    /// Zero with an empty nonce means no fence is bound (describe layer).
+    pub state_fence_generation: u64,
+    /// Authority-issued State Fence nonce carried from admission: bound from
+    /// the dispatch grant fence, never minted.
+    pub state_fence_nonce: String,
+    /// Authority-issued Authority Epoch binding carried from admission (I6.15
+    /// `authority_epoch`): the canonical live-authority-epoch JSON carried
+    /// verbatim from the envelope, never interpreted here. Empty means no
+    /// epoch is bound (describe layer).
+    pub authority_epoch: String,
 }
 
 impl GenerationManifest {
@@ -205,6 +231,13 @@ impl GenerationManifest {
         if self.migration_contract.trim().is_empty() {
             return Err(ContourGateError::IncompleteManifest(
                 "migration-contract".to_owned(),
+            ));
+        }
+        // A half-bound fence is a manifest defect: generation and nonce
+        // arrive together from the grant or not at all (describe layer).
+        if (self.state_fence_generation == 0) != self.state_fence_nonce.is_empty() {
+            return Err(ContourGateError::IncompleteManifest(
+                "state-fence".to_owned(),
             ));
         }
         Ok(())
@@ -311,6 +344,12 @@ pub enum ContourGateError {
     /// Capability-gated import or host call without a manifest grant.
     CapabilityNotGranted(String),
     /// Granted capability without Governor authorization.
+    ///
+    /// Revoked or stale supporting grants ([`CAPABILITY_GRANT_REVOKED`]) are
+    /// a Governor/Kernel-owned residual at this exact seam: Governor owns
+    /// grant semantics (#18) and Kernel owns activation/revocation
+    /// enforcement (#15). This host distinguishes only never-authorized
+    /// from authorized and never invents a revocation verdict.
     GovernorAuthorizationRequired(String),
     /// Proposal exceeds the generation limit envelope.
     HostCallLimitExceeded(String),
@@ -342,9 +381,11 @@ impl fmt::Display for ContourGateError {
             Self::IncompleteManifest(field) => {
                 write!(formatter, "INCOMPLETE_MANIFEST:{field}")
             }
-            Self::UndeclaredImport(name) => write!(formatter, "UNDECLARED_IMPORT:{name}"),
+            Self::UndeclaredImport(name) => {
+                write!(formatter, "{CAPABILITY_INTRODUCTION_REQUIRED}:{name}")
+            }
             Self::CapabilityNotGranted(capability) => {
-                write!(formatter, "CAPABILITY_NOT_GRANTED:{capability}")
+                write!(formatter, "{CAPABILITY_INTRODUCTION_REQUIRED}:{capability}")
             }
             Self::GovernorAuthorizationRequired(capability) => {
                 write!(formatter, "GOVERNOR_AUTHORIZATION_REQUIRED:{capability}")
@@ -386,8 +427,10 @@ impl std::error::Error for ContourGateError {}
 /// `stateless` with a `none` migration contract and no prior generation;
 /// privacy policy and shadow/canary comparator are left empty because no
 /// privacy context is established and no comparator runs at describe time.
-/// Anything unstated here must be bound by the Governor-owned promotion
-/// path before activation; this manifest never grants it.
+/// No State Fence or Authority Epoch is bound: the describe layer holds no
+/// authority (bound only by the governed admit path from the envelope and
+/// grant). Anything unstated here must be bound by the Governor-owned
+/// promotion path before activation; this manifest never grants it.
 #[must_use]
 pub fn experimental_manifest(
     artifact_digest: Sha256Digest,
@@ -410,6 +453,9 @@ pub fn experimental_manifest(
         privacy_policy: String::new(),
         comparator: String::new(),
         rollback_generation: None,
+        state_fence_generation: 0,
+        state_fence_nonce: String::new(),
+        authority_epoch: String::new(),
     }
 }
 
@@ -480,7 +526,8 @@ fn bounded(value: &str) -> String {
 /// Pre-activation import check: every actual component import observed before
 /// instantiation must be declared in the manifest, and every
 /// capability-gated import (filesystem/network) must additionally hold a
-/// manifest grant. Runs before any instantiation or invocation.
+/// manifest grant. Runs before any instantiation or invocation. Denials
+/// render the canonical [`CAPABILITY_INTRODUCTION_REQUIRED`] code.
 pub fn check_activation_imports(
     manifest: &GenerationManifest,
     actual_imports: &[String],
@@ -521,6 +568,9 @@ pub struct AdmittedGeneration {
     wit_digest: Sha256Digest,
     component_id: String,
     limits: InvocationLimits,
+    state_fence_generation: u64,
+    state_fence_nonce: String,
+    authority_epoch: String,
 }
 
 impl AdmittedGeneration {
@@ -569,6 +619,25 @@ impl AdmittedGeneration {
     pub const fn limits(&self) -> &InvocationLimits {
         &self.limits
     }
+
+    /// State Fence generation bound from the authority-issued grant fence.
+    /// Zero means no fence is bound (describe layer, never authority).
+    #[must_use]
+    pub const fn state_fence_generation(&self) -> u64 {
+        self.state_fence_generation
+    }
+
+    /// State Fence nonce bound from the authority-issued grant fence.
+    #[must_use]
+    pub fn state_fence_nonce(&self) -> &str {
+        &self.state_fence_nonce
+    }
+
+    /// Authority Epoch binding carried verbatim from the envelope.
+    #[must_use]
+    pub fn authority_epoch(&self) -> &str {
+        &self.authority_epoch
+    }
 }
 
 /// Actual contour admission: the full pre-activation sequence in one entry
@@ -600,6 +669,9 @@ pub fn admit_generation(
         wit_digest: manifest.wit_digest.clone(),
         component_id: manifest.component_id.clone(),
         limits: manifest.limits.clone(),
+        state_fence_generation: manifest.state_fence_generation,
+        state_fence_nonce: manifest.state_fence_nonce.clone(),
+        authority_epoch: manifest.authority_epoch.clone(),
     })
 }
 
@@ -664,9 +736,10 @@ pub fn check_admitted_request(
 }
 
 /// Authorizes one host-call proposal under the manifest grant and Governor
-/// authorization. An ungranted filesystem/network capability is uncallable;
-/// a granted capability without Governor authorization stays denied; the
-/// proposal must fit the generation input-byte envelope.
+/// authorization. An ungranted filesystem/network capability is uncallable
+/// (canonical [`CAPABILITY_INTRODUCTION_REQUIRED`]); a granted capability
+/// without Governor authorization stays denied; the proposal must fit the
+/// generation input-byte envelope.
 pub fn authorize_host_call(
     manifest: &GenerationManifest,
     grant: &GovernorGrant,
@@ -741,6 +814,9 @@ mod tests {
             privacy_policy: "project_code".to_owned(),
             comparator: "shadow-exact".to_owned(),
             rollback_generation: Some("gen-41".to_owned()),
+            state_fence_generation: 0,
+            state_fence_nonce: String::new(),
+            authority_epoch: String::new(),
         }
     }
 

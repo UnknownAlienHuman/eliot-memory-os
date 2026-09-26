@@ -384,6 +384,9 @@ fn contour_admission(
         privacy_policy: material.manifest.privacy_policy.clone(),
         comparator: material.manifest.comparator.clone(),
         rollback_generation: material.manifest.rollback_generation.clone(),
+        state_fence_generation: material.grant.fence_generation,
+        state_fence_nonce: material.grant.fence_nonce.clone(),
+        authority_epoch: material.authority_epoch_json.clone(),
     };
     if manifest.artifact_digest != material.ceilings.artifact_digest
         || manifest.component_id != material.ceilings.component_id

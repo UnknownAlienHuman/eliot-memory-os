@@ -22,6 +22,7 @@ use eliot_wasm_runtime::{
 };
 
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
+use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
 use crate::typed_bindings::{TypedWorld, export_matches_interface, typed_wit_digest};
 
 const ENGINE_VERSION: &str = "47.0.4";
@@ -127,9 +128,11 @@ pub enum TypedExecutionError {
         /// Stable reason code.
         reason: String,
     },
-    /// Missing or wrongly typed descriptor/domain export.
+    /// Missing or wrongly typed descriptor/domain export: the admitted
+    /// method is absent (canonical introduction-required denial).
     MissingExport(String),
-    /// Actual forbidden import observed before instantiation.
+    /// Actual forbidden import observed before instantiation: the empty
+    /// linker introduces nothing (canonical introduction-required denial).
     ForbiddenImport(String),
     /// Legacy component presented for a typed world (or reverse).
     LegacyMismatch,
@@ -151,8 +154,9 @@ impl fmt::Display for TypedExecutionError {
             Self::GovernedAdmissionRequired => formatter.write_str("KERNEL_ADMISSION_REQUIRED"),
             Self::WorldUnknown(world) => write!(formatter, "WORLD_UNKNOWN:{world}"),
             Self::WorldSelection { reason } => write!(formatter, "WORLD_SELECTION:{reason}"),
-            Self::MissingExport(name) => write!(formatter, "MISSING_EXPORT:{name}"),
-            Self::ForbiddenImport(name) => write!(formatter, "FORBIDDEN_IMPORT:{name}"),
+            Self::MissingExport(name) | Self::ForbiddenImport(name) => {
+                write!(formatter, "{CAPABILITY_INTRODUCTION_REQUIRED}:{name}")
+            }
             Self::LegacyMismatch => formatter.write_str("LEGACY_MISMATCH"),
             Self::Artifact(error) => write!(formatter, "{error}"),
             Self::LimitDenied(reason) => write!(formatter, "LIMIT_DENIED:{reason}"),
@@ -356,13 +360,19 @@ pub fn execute_describe_experimental(
         .exports(&engine)
         .map(|(name, _)| name.to_owned())
         .collect();
+    // Absent-by-default (issue #21, A2): no export, or an export naming
+    // anything but the admitted interface, means the admitted method was
+    // never introduced — a canonical introduction-required denial naming
+    // the missing interface. Only genuinely ambiguous exports keep the
+    // world-selection code.
+    if exports.is_empty() {
+        return Err(TypedExecutionError::MissingExport(
+            world.interface_name().to_owned(),
+        ));
+    }
     if exports.len() != 1 {
         return Err(TypedExecutionError::WorldSelection {
-            reason: if exports.is_empty() {
-                "missing-export".to_owned()
-            } else {
-                "ambiguous-exports".to_owned()
-            },
+            reason: "ambiguous-exports".to_owned(),
         });
     }
     let export_name = exports[0].clone();
@@ -370,9 +380,9 @@ pub fn execute_describe_experimental(
         return Err(TypedExecutionError::LegacyMismatch);
     }
     if !export_matches_interface(&export_name, world.interface_name()) {
-        return Err(TypedExecutionError::WorldSelection {
-            reason: "incompatible-world".to_owned(),
-        });
+        return Err(TypedExecutionError::MissingExport(
+            world.interface_name().to_owned(),
+        ));
     }
 
     let (descriptor, usage) = dispatch_describe(world, &engine, &component, limits)?;

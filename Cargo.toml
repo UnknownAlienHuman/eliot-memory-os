@@ -326,7 +326,7 @@ eliot-experience-projection = { path = "crates/smart/eliot-experience-projection
 eliot-dreamer-self-query = { path = "crates/smart/eliot-dreamer-self-query", version = "0.1.0" }
 eliot-epistemic-context-provider = { path = "crates/smart/eliot-epistemic-context-provider", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
-wasmtime = { version = "=47.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "=47.0.4", default-features = false, features = ["component-model", "cranelift", "pooling-allocator", "runtime", "std"] }
 wat = "=1.256.0"
 jsonc-parser = { version = "0.33.0", features = ["cst", "serde_json"] }
 redb = "4.1.0"
