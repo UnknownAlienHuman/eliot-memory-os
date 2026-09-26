@@ -859,10 +859,10 @@ impl EvalRunnerService {
                 Vec::new()
             };
         // Only observed failure fails a run (issue #1922 reachability):
-        // `NotYetImplemented` (and `Skipped`/`Blocked`) is non-evidence,
-        // not failure. A run whose cases all executed without an observed
-        // failure is `Completed`; measured validity stays with the verdict
-        // and the integrity receipt, which still gate every promotion.
+        // absence of evidence is not failure. A run whose cases all
+        // executed without an observed failure is `Completed`; measured
+        // validity stays with the verdict and the integrity receipt,
+        // which still gate every promotion.
         let failed_required = case_results
             .iter()
             .any(|result| result.status == EvalCaseStatus::Failed);
