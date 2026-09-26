@@ -374,32 +374,43 @@ impl KernelComposition {
     /// currently verify. The conjunction is:
     ///
     /// 1. the revocable I1.11 supervision step, whose only producer is one
-    ///    Host-observed live SCM Watchdog incarnation bound to the presented
+    ///    independent Host-observed Watchdog observation bound to the presented
     ///    candidate contour, and which a new activation contour revokes;
-    /// 2. a non-zero Watchdog epoch on this candidate's supervision
-    ///    incarnation;
-    /// 3. a signature-verified `Active` supervision lease inside its validity
+    /// 2. that observation is still bound to the presented candidate contour and
+    ///    to the exact target fence being admitted, and is still inside its own
+    ///    finite validity interval;
+    /// 3. a non-zero Watchdog epoch on this candidate's supervision
+    ///    incarnation, which is also the epoch the retained observation was
+    ///    taken under;
+    /// 4. a signature-verified `Active` supervision lease inside its validity
     ///    window under the Kernel trust anchor; and
-    /// 4. a two-sided exact join of that lease to this candidate and to the
-    ///    exact target fence being admitted.
+    /// 5. a two-sided exact join of that lease to this candidate, to the exact
+    ///    target fence being admitted, and to the observed Watchdog epoch — so
+    ///    the retained observation is consumed by the comparison rather than
+    ///    sitting beside it, and a renewed lease cannot stand in for a fresh
+    ///    physical observation.
     ///
-    /// Any missing or mismatched fact refuses. An unexpired signed lease
-    /// alone, a health string, or `eliotd`'s self-reported `watchdog_covered`
-    /// boolean is never coverage.
+    /// Any missing, mismatched, foreign or expired fact refuses. An unexpired
+    /// signed lease alone, a health string, or `eliotd`'s self-reported
+    /// `watchdog_covered` boolean is never coverage.
     #[cfg(windows)]
     pub(crate) fn verify_watchdog_supervision_branch(
         &self,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         target: &StateFence,
     ) -> Result<(), &'static str> {
-        let supervision_verified = self
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|_| "the presented candidate contour has no computable digest")?;
+        // I1.5 (#1750): freshness and binding come from the retained observation
+        // itself. The observation must be current, bound to this exact contour
+        // and this exact fence, and the Watchdog epoch it was taken under is
+        // joined to the signed lease below.
+        let observed_watchdog_epoch = self
             .startup_coordinator
             .lock()
             .map_err(|_| "startup gate lock is poisoned")?
-            .supervision_evidence_is_complete();
-        if !supervision_verified {
-            return Err("no Host-observed Watchdog branch for the current contour");
-        }
+            .admit_supervision_observation(candidate_digest.as_str(), target, unix_ms())?;
         let incarnation = &candidate.supervision_incarnation;
         if incarnation.watchdog_epoch.sequence == 0 {
             return Err("supervision incarnation has no non-zero Watchdog epoch");
@@ -445,6 +456,11 @@ impl KernelComposition {
                 .kernel_epoch
                 .is_same_authority(&target.authority_epoch)
             || binding.watchdog_epoch.value() != incarnation.watchdog_epoch.sequence
+            // The retained observation is consumed here, not merely stored
+            // beside the decision: the signed lease's Watchdog epoch is joined
+            // to the epoch the observation was actually taken under, as a full
+            // (lineage, sequence) tuple rather than a bare number.
+            || incarnation.watchdog_epoch != observed_watchdog_epoch
             || binding.state_fence != *target
             || binding.generation_binding.target_id != candidate.artifact_hash.as_str()
             || binding.generation_binding.target_generation != target.resource_generation

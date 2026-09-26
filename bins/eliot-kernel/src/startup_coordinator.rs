@@ -11,12 +11,22 @@
 //!   incomplete.
 //! - `A07-07-governance-profile.md` :: A7.7 owns the only ceiling scale; the
 //!   startup coordinator reports a ceiling but never invents authority.
+//! - `I01-05-demand-start-observable-use-supervision-and-idle-shutdown.md` ::
+//!   I1.5 step "verify the current Watchdog supervision epoch and responsiveness"
+//!   and "if renewal cannot be proved, coverage ends at expiry and is reported
+//!   honestly" — the supervision step is an owner observation with a finite
+//!   validity interval, not retained text.
+//! - `I08-02-independent-observation-routes.md` :: I8.2 — an observation proves
+//!   event existence, and its coverage is explicit; an absent or expired
+//!   observation leaves coverage unestablished rather than presumed.
 //!
 //! Ordinary module: pure ordered gating only. No I/O, no ORS/store/daemon
 //! mechanics, no credentials. `KernelComposition` owns the single instance
 //! and consults it from normal-write and Material/Critical admission paths.
 
+use eliot_contracts::StateFence;
 use eliot_platform::PlatformHandle;
+use eliot_runtime_contracts::SupervisionJournalEpoch;
 use serde::Serialize;
 
 /// Ordered I1.11 startup step (1-11). Step 0 means nothing completed.
@@ -295,6 +305,52 @@ pub struct StartupStatus {
     pub authority_ceiling: &'static str,
     /// True once step 10 (front-door readiness published) is reached.
     pub front_door_ready: bool,
+    /// Retained independent Watchdog supervision observations, current first.
+    ///
+    /// I1.5 (#1750): a superseded or contradicted observation is a fact that is
+    /// kept, not overwritten, so the window in which the branch changed is
+    /// inspectable after it happened. Inspection only: this projection never
+    /// gates, and no decision reads it.
+    pub supervision_observations: Vec<WatchdogSupervisionObservation>,
+}
+
+/// One independent Watchdog supervision observation, bound to the exact
+/// incarnation the observation owner saw, to the exact candidate contour and
+/// consumer State Fence it was observed under, and to the moment it was taken.
+///
+/// I1.5 (#1750): a supervision claim is not a retained string. It is an
+/// owner-produced observation that carries its own observation time, its own
+/// progress position and a finite validity interval. The closed shape of the
+/// carrier is proven once, where the record is created; currency, contour
+/// binding and fence binding are proven at every consumer, on the Kernel
+/// supervision clock. A renewed signed lease advances no field here, so a lease
+/// renewal can never be counted as a physical observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WatchdogSupervisionObservation {
+    /// The exact live SCM Watchdog incarnation digest the owner observed:
+    /// `host-scm-watchdog:{pid}:{start}:{image_sha256}`.
+    pub incarnation: PlatformHandle,
+    /// Digest of the exact candidate contour this observation was taken under.
+    pub candidate_digest: PlatformHandle,
+    /// The exact consumer State Fence this observation is bound to.
+    pub state_fence: StateFence,
+    /// The Watchdog epoch of the contour this observation was taken under. The
+    /// signed supervision lease is joined to this epoch, not to a number copied
+    /// out of a lease, so the observation is consumed by the coverage
+    /// comparison rather than sitting beside it.
+    pub watchdog_epoch: SupervisionJournalEpoch,
+    /// Observation time on the Kernel supervision clock, in milliseconds. This
+    /// is the causal moment the owner observation was accepted, not a value the
+    /// observation carried about itself.
+    pub observed_at_ms: u64,
+    /// Monotonic count of independent owner observations accepted by this
+    /// coordinator. Only [`StartupCoordinator::record_live_supervision_evidence`]
+    /// advances it, so re-reading retained text or renewing a lease cannot
+    /// move the frontier.
+    pub progress_frontier: u64,
+    /// Finite validity interval in milliseconds, supplied by the single
+    /// supervision timing owner rather than invented here.
+    pub valid_for_ms: u64,
 }
 
 /// Explicit startup coordinator whose transitions correspond to I1.11 steps
@@ -311,11 +367,21 @@ pub struct StartupCoordinator {
     store_schema_probed: bool,
     epoch_recovered: bool,
     supervision_evidence_complete: bool,
-    /// The exact live SCM Watchdog incarnation digest that produced the
-    /// current supervision step. It is stored with the step and withdrawn with
-    /// it, so a supervision claim can never outlive the observation that
-    /// established it and can never be asserted from lease bookkeeping alone.
-    live_watchdog_incarnation: Option<PlatformHandle>,
+    /// The current independent Watchdog supervision observation: exact
+    /// incarnation, contour, consumer fence, observed Watchdog epoch,
+    /// observation time, progress position and finite validity interval. It is
+    /// withdrawn with the revocable step, so a supervision claim can never
+    /// outlive the observation that established it and can never be asserted
+    /// from lease bookkeeping alone.
+    current_supervision_observation: Option<WatchdogSupervisionObservation>,
+    /// The observation the current one superseded or contradicted. It is kept
+    /// as a fact and never overwritten, and it never gates anything.
+    superseded_supervision_observation: Option<WatchdogSupervisionObservation>,
+    /// Monotonic count of independent owner observations accepted. Only
+    /// [`Self::record_live_supervision_evidence`] advances it, and contour
+    /// revocation leaves it alone: the number of physical observations is a
+    /// property of this Kernel, not of one activation contour.
+    supervision_progress_frontier: u64,
     blob_degraded: bool,
     capability_degraded: bool,
 }
@@ -337,7 +403,9 @@ impl StartupCoordinator {
             store_schema_probed: false,
             epoch_recovered: false,
             supervision_evidence_complete: false,
-            live_watchdog_incarnation: None,
+            current_supervision_observation: None,
+            superseded_supervision_observation: None,
+            supervision_progress_frontier: 0,
             blob_degraded: false,
             capability_degraded: false,
         }
@@ -419,7 +487,18 @@ impl StartupCoordinator {
             degraded_capabilities: self.degraded_capabilities(),
             authority_ceiling: self.authority_ceiling(profile).as_str(),
             front_door_ready: self.is_front_door_ready(),
+            supervision_observations: self.retained_supervision_observations(),
         }
+    }
+
+    /// The retained independent Watchdog supervision observations, current
+    /// first. A superseded or contradicted observation is a fact that is kept,
+    /// never overwritten. Inspection only: no decision reads this.
+    fn retained_supervision_observations(&self) -> Vec<WatchdogSupervisionObservation> {
+        let mut retained = Vec::with_capacity(2);
+        retained.extend(self.current_supervision_observation.clone());
+        retained.extend(self.superseded_supervision_observation.clone());
+        retained
     }
 
     /// Inspection is admitted only after I1.11 step 10 publishes front-door
@@ -580,64 +659,151 @@ impl StartupCoordinator {
     /// activation contour.
     ///
     /// I1.5 (#1750): this is the revocable, owner-correct record of one
-    /// Host-observed live Watchdog branch. It is deliberately not a latched
+    /// Host-observed Watchdog branch. It is deliberately not a latched
     /// success: [`Self::revoke_supervision_evidence`] clears it whenever a new
-    /// activation contour is admitted, so a new generation must be observed
-    /// again before Material/Critical work is admitted as independently
-    /// supervised.
+    /// activation contour is admitted, and a contradicted observation clears it
+    /// too, so a generation must be observed again before Material/Critical
+    /// work is admitted as independently supervised. Currency of the retained
+    /// observation is a separate fact, decided by
+    /// [`Self::admit_supervision_observation`].
     #[must_use]
     pub const fn supervision_evidence_is_complete(&self) -> bool {
         self.completed_step >= STARTUP_FINAL_STEP && self.supervision_evidence_complete
     }
 
-    /// The live SCM Watchdog incarnation digest that produced the current I1.11
-    /// supervision step, or `None` when no such step is recorded.
+    /// Requires the recorded independent Watchdog observation to still describe
+    /// exactly this candidate contour and exactly this consumer State Fence, and
+    /// to still be inside the finite validity interval its own observation time
+    /// opens. Returns the Watchdog epoch the observation was taken under, so a
+    /// caller joins the lease it is verifying to the observation itself instead
+    /// of to a retained string.
     ///
-    /// I1.11 step 1 requires Host to validate the independent Watchdog service
-    /// state *through SCM*, and step 11 requires Watchdog to confirm coverage
-    /// independently. This is that observation: a live process identity plus
-    /// the digest of the live Watchdog image bytes. It is stored with the
-    /// revocable step and cleared by [`Self::revoke_supervision_evidence`], so
-    /// a readiness or Material admission can never be justified by a lease
-    /// equality alone — the observation itself has to be present and current.
-    #[must_use]
-    pub fn live_watchdog_incarnation(&self) -> Option<&PlatformHandle> {
-        self.live_watchdog_incarnation.as_ref()
+    /// I1.5 (#1750): this is the one freshness and binding gate behind both
+    /// dependent decisions — supervised readiness and Material/Critical
+    /// admission. A missing, contradicted, contour-foreign, fence-foreign or
+    /// expired observation refuses those two and nothing else: normal-write,
+    /// inspection and low-impact admission never consult it, and a refusal is
+    /// never reported as success. A renewed signed lease advances neither the
+    /// observation time nor the progress frontier, so it cannot make an absent
+    /// observation current.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed-shape reason naming the exact observation fact that no
+    /// longer holds.
+    pub fn admit_supervision_observation(
+        &self,
+        candidate_digest: &str,
+        target: &StateFence,
+        now_ms: u64,
+    ) -> Result<SupervisionJournalEpoch, &'static str> {
+        if !self.supervision_evidence_is_complete() {
+            return Err("no Host-observed Watchdog branch for the current contour");
+        }
+        let current = self
+            .current_supervision_observation
+            .as_ref()
+            .ok_or("no independent Watchdog observation is recorded for the current contour")?;
+        if current.candidate_digest.as_str() != candidate_digest {
+            return Err(
+                "the recorded Watchdog observation belongs to a different candidate contour",
+            );
+        }
+        if !eliot_contracts::fences_match_exact(&current.state_fence, target) {
+            return Err(
+                "the recorded Watchdog observation belongs to a different consumer State Fence",
+            );
+        }
+        if now_ms.saturating_sub(current.observed_at_ms) > current.valid_for_ms {
+            return Err(
+                "the recorded Watchdog observation is outside its finite validity interval",
+            );
+        }
+        Ok(current.watchdog_epoch.clone())
     }
 
-    /// Records the I1.11 supervision step together with the live SCM Watchdog
-    /// incarnation that produced it.
+    /// Records the I1.11 supervision step together with the independent
+    /// Watchdog observation that produced it, bound to the exact contour and
+    /// consumer fence it was observed under.
     ///
-    /// This is the sole production producer of the supervision claim. The
-    /// caller must have just accepted that incarnation for the presented
-    /// candidate contour; the digest is retained so later admissions can prove
-    /// the claim came from a live observation rather than from lease
-    /// bookkeeping.
+    /// This is the sole production producer of the supervision claim and the
+    /// only writer of the progress frontier. The caller must have just accepted
+    /// an owner observation for the presented contour; the carrier's closed
+    /// shape is proven here, once, where the record is created, so no consumer
+    /// ever decides supervision from re-parsed retained text.
+    ///
+    /// Re-observing the same incarnation is progress: the record is replaced in
+    /// place, its observation time and frontier advance, and the retained
+    /// superseded fact is left untouched. Observing a different incarnation
+    /// under the same contour and fence contradicts the standing claim: both
+    /// facts are retained, the claim is withdrawn, and the caller is told, so
+    /// dependent supervision and Material admission narrow until the owner
+    /// observes again. The contiguous I1.11 cursor is never rolled back, so no
+    /// earlier step is un-observed.
     ///
     /// # Errors
     ///
     /// Returns the fixed-shape range error when the supervision step lies
-    /// outside I1.11.
+    /// outside I1.11, when the validity interval is zero, when the carrier is
+    /// not in the closed observation shape, or when the observation contradicts
+    /// the recorded one.
     pub(crate) fn record_live_supervision_evidence(
         &mut self,
         incarnation: PlatformHandle,
+        candidate_digest: PlatformHandle,
+        state_fence: StateFence,
+        watchdog_epoch: SupervisionJournalEpoch,
+        observed_at_ms: u64,
+        valid_for_ms: u64,
     ) -> Result<(), String> {
+        if valid_for_ms == 0 {
+            return Err(
+                "a Watchdog supervision observation needs a non-zero validity interval".to_owned(),
+            );
+        }
+        crate::verify_scm_watchdog_observation_shape(&incarnation).map_err(str::to_owned)?;
+        let contradicts_recorded = self
+            .current_supervision_observation
+            .as_ref()
+            .is_some_and(|current| current.incarnation != incarnation);
+        if contradicts_recorded {
+            self.superseded_supervision_observation = self.current_supervision_observation.take();
+            self.supervision_evidence_complete = false;
+            return Err(
+                "a different Watchdog incarnation was observed for the same contour and fence; the contradicted observation is retained and the supervision claim is withdrawn until the owner observes again"
+                    .to_owned(),
+            );
+        }
         self.record_step_evidence(STARTUP_FINAL_STEP)?;
         self.supervision_evidence_complete = true;
-        self.live_watchdog_incarnation = Some(incarnation);
+        self.supervision_progress_frontier = self.supervision_progress_frontier.saturating_add(1);
+        self.current_supervision_observation = Some(WatchdogSupervisionObservation {
+            incarnation,
+            candidate_digest,
+            state_fence,
+            watchdog_epoch,
+            observed_at_ms,
+            progress_frontier: self.supervision_progress_frontier,
+            valid_for_ms,
+        });
         Ok(())
     }
 
     /// Revokes the recorded independent-supervision evidence.
     ///
     /// The contiguous cursor is left untouched so no earlier I1.11 step is
-    /// un-observed; only the supervision claim itself is withdrawn, together
-    /// with the live SCM incarnation that produced it. Callers use this at the
-    /// one owner-correct moment a new candidate contour is admitted (I1.5),
-    /// because the previous observation belonged to the previous activation.
+    /// un-observed; only the supervision claim itself is withdrawn, and the
+    /// observation that produced it is retained as history rather than dropped.
+    /// The progress frontier is deliberately not reset: it counts independent
+    /// physical observations accepted by this Kernel, not observations of one
+    /// contour. Callers use this at the one owner-correct moment a new
+    /// candidate contour is admitted (I1.5), because the previous observation
+    /// belonged to the previous activation.
     pub fn revoke_supervision_evidence(&mut self) {
         self.supervision_evidence_complete = false;
-        self.live_watchdog_incarnation = None;
+        if let Some(previous) = self.current_supervision_observation.take() {
+            self.superseded_supervision_observation = Some(previous);
+        }
     }
 
     /// Completes every mandatory gate in I1.11 order (1-11). Test and
