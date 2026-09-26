@@ -480,28 +480,17 @@ def _render_json(result: dict) -> str:
 
 
 def _discover_descriptor_files(root: Path) -> list[tuple[int, Path]]:
-    """Closed lookup: only .github/work-units/<number>.toml, numeric names."""
+    """Closed lookup: only .github/work-units/<number>.toml, numeric names.
+
+    Thin projection over the single #852 numeric-class rule
+    (cohort.discover_numeric_descriptor_files); this layer keeps its
+    (number, path) shape but owns no second discovery rule.
+    """
     base = root / ".github" / "work-units"
-    found: list[tuple[int, Path]] = []
     try:
-        if not base.is_dir():
-            return []
-        for child in sorted(base.iterdir(), key=lambda p: p.name):
-            if not child.is_file() or child.suffix != ".toml":
-                continue
-            stem = child.stem
-            if not re.fullmatch(r"[0-9]+", stem):
-                continue
-            try:
-                num = int(stem)
-            except Exception:
-                continue
-            if num <= 0:
-                continue
-            found.append((num, child))
+        return [(num, base / name) for num, name in cohort.discover_numeric_descriptor_files(base)]
     except Exception:
         return []
-    return found
 
 
 def _typed_from_decoded(data: dict):  # type: ignore[no-untyped-def]
@@ -672,7 +661,12 @@ def main(argv: list[str] | None = None) -> int:
         # Catalogue-only: no runner, no assignment, catalogue integrity only.
         if proof == "catalogue-only":
             discovered = _discover_descriptor_files(root)
-            if not discovered:
+            lock_path = root / ".github" / "work-unit-cohort.toml"
+            try:
+                use_lock = lock_path.is_file()
+            except Exception:
+                use_lock = False
+            if not discovered and not use_lock:
                 return finish(fail_result("catalogue missing: no descriptors under .github/work-units",
                                           1, ceiling="catalogue-integrity-only", scope="selected"))
             seen_issues: list = []
@@ -715,6 +709,44 @@ def main(argv: list[str] | None = None) -> int:
                                               ceiling="catalogue-integrity-only", scope="selected"))
                 typed_descs.append(typed)
                 seen_issues.append(typed.issue)
+            # Committed aggregate lock (#852): re-discover the numeric class,
+            # rebuild every row and compare the recomputed digest against the
+            # lock's [aggregate] sha256. Fails closed on any mismatch.
+            if use_lock:
+                try:
+                    typed_by_issue = {t.issue.number: t for t in typed_descs}
+                    catalogue = cohort.verify_cohort_lock(
+                        lock_path, root / ".github" / "work-units", typed_by_issue)
+                except cohort.CohortError as exc:
+                    return finish(fail_result(f"catalogue aggregate lock invalid: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
+                                              ceiling="catalogue-integrity-only", scope="selected",
+                                              failed=["catalogue-lock"]))
+                except c.ContractViolation:
+                    return finish(fail_result("catalogue contract failure", 1,
+                                              ceiling="catalogue-integrity-only", scope="selected",
+                                              failed=["catalogue-lock"]))
+                except Exception:
+                    return finish(fail_result("catalogue internal failure", 2,
+                                              ceiling="catalogue-integrity-only", scope="selected"))
+                if type(catalogue) is not c.CatalogueIntegrityReceipt:
+                    return finish(fail_result("catalogue internal failure: malformed receipt", 2,
+                                              ceiling="catalogue-integrity-only", scope="selected"))
+                blocked_rows = [r for r in catalogue.rows if r.disposition is c.CatalogueDisposition.BLOCKED]
+                counts = {"matrix_cases": int(catalogue.matrix_cases), "missing": 0,
+                          "blocked": len(blocked_rows), "failed": 0, "passed": len(catalogue.rows)}
+                result = {
+                    "proof": proof, "selection": [], "selection_label": "all",
+                    "scope": "selected",
+                    "counts": counts, "missing_evidence": [],
+                    "blocked_evidence": [f"issue-{r.issue.number}" for r in sorted(blocked_rows, key=lambda r: r.issue.number)],
+                    "failed_evidence": [],
+                    "identities": [f"catalogue:{catalogue.sha256[:12]}"],
+                    "identities_label": f"catalogue:{catalogue.sha256[:12]}",
+                    "proof_ceiling": "catalogue-integrity-only", "digest": catalogue.sha256,
+                    "terminal": "PASS", "terminal_detail": "catalogue integrity valid (aggregate lock verified; no execution claimed)",
+                    "exit": 0,
+                }
+                return finish(result)
             # Build full frozen catalogue (all assigned; blocked/planned stay
             # visible when supplied via mocked catalogue in tests).
             try:
