@@ -1803,7 +1803,7 @@ operation = "generation cutover helpers (explicitly dead_code-approved)"
 phase = "cutover"
 scope = "structural"
 status = "proven"
-detail = "Both carry #[allow(dead_code)]; 3308 name-pinned by the bound in-src test (tests.rs:664 string pin). The 6955 match is the HostJobBranches method call inside dead 6911. Zero live callers."
+detail = "Both carry a dead-code allowance attribute; 3308 name-pinned by the bound in-src test (tests.rs:664 string pin). The 6955 match is the HostJobBranches method call inside dead 6911. Zero live callers."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
