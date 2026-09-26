@@ -235,9 +235,12 @@ impl PinnedDirectory {
 pub struct DirectoryOplockGuard {
     directory: Option<File>,
     event: OwnedHandle,
-    overlapped: Box<OVERLAPPED>,
-    _input: Box<REQUEST_OPLOCK_INPUT_BUFFER>,
-    _output: Box<REQUEST_OPLOCK_OUTPUT_BUFFER>,
+    // `Option` so `Drop` takes the kernel-visible allocations and, when the
+    // cancel drain never signals, intentionally leaks them instead of freeing
+    // request storage a late kernel completion may still write.
+    overlapped: Option<Box<OVERLAPPED>>,
+    input: Option<Box<REQUEST_OPLOCK_INPUT_BUFFER>>,
+    output: Option<Box<REQUEST_OPLOCK_OUTPUT_BUFFER>>,
 }
 
 // SAFETY: transfer across threads moves unique ownership of the directory
@@ -245,7 +248,7 @@ pub struct DirectoryOplockGuard {
 // boxed `OVERLAPPED`/op-lock buffers whose heap addresses never change, so
 // the pending kernel request stays bound to the same allocations. The guard
 // is only moved, never shared (`Sync` is deliberately not implemented), and
-// `Drop` cancels and drains the request before the boxes drop.
+// `Drop` cancels, then frees the boxes only when drained, else leaks them.
 unsafe impl Send for DirectoryOplockGuard {}
 
 impl DirectoryOplockGuard {
@@ -329,9 +332,9 @@ impl DirectoryOplockGuard {
         Ok(Self {
             directory: Some(directory),
             event,
-            overlapped,
-            _input: input,
-            _output: output,
+            overlapped: Some(overlapped),
+            input: Some(input),
+            output: Some(output),
         })
     }
 
@@ -353,16 +356,42 @@ impl DirectoryOplockGuard {
 
 impl Drop for DirectoryOplockGuard {
     fn drop(&mut self) {
+        // Taken up front so the drain verdict below owns the kernel-visible
+        // allocations: a signaled (drained) request drops them normally,
+        // while any other outcome leaks them instead of freeing storage a
+        // late completion may still write.
+        let mut overlapped = self.overlapped.take();
+        let mut input = self.input.take();
+        let mut output = self.output.take();
         if let Some(directory) = self.directory.take() {
-            // SAFETY: the pending request belongs to this exact file handle and
-            // OVERLAPPED allocation. Closing the handle completes cancellation.
-            unsafe {
-                CancelIoEx(directory.as_raw_handle().cast(), self.overlapped.as_ref());
+            if let Some(request) = overlapped.as_ref() {
+                // SAFETY: the pending request belongs to this exact file handle and
+                // OVERLAPPED allocation. Closing the handle completes cancellation.
+                unsafe {
+                    CancelIoEx(directory.as_raw_handle().cast(), request.as_ref());
+                }
             }
             drop(directory);
-            // SAFETY: wait only drains the cancellation before boxed buffers drop.
-            unsafe {
-                WaitForSingleObject(self.event.0, 5_000);
+            // SAFETY: the event outlives this body (it is a later struct
+            // field, so it drops after `Drop` returns) and the wait only
+            // drains the cancellation before the boxed buffers release below.
+            let drained = unsafe { WaitForSingleObject(self.event.0, 5_000) };
+            if drained != WAIT_OBJECT_0 {
+                // Fail-closed: without the terminal event signal the kernel
+                // may still complete the canceled request late and write the
+                // OVERLAPPED/output after this guard is gone, so buffer
+                // ownership is unknown and must not be freed. Leaking three
+                // small allocations once per guard is bounded; a kernel
+                // write-after-free is not.
+                if let Some(request) = overlapped.take() {
+                    Box::leak(request);
+                }
+                if let Some(buffer) = input.take() {
+                    Box::leak(buffer);
+                }
+                if let Some(buffer) = output.take() {
+                    Box::leak(buffer);
+                }
             }
         }
     }
