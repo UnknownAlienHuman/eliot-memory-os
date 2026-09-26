@@ -19,7 +19,7 @@ use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
     HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
-    KernelHostRequestPort, NegotiatedWireVersion, ToolRequest, WIRE_INTERNAL_ERROR,
+    KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest, WIRE_INTERNAL_ERROR,
     WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
     build_host_cancellation, build_host_invocation, decode_cancel_notification,
     decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
@@ -28,7 +28,7 @@ use eliot_mcp::{
     tools_list_result,
 };
 #[cfg(test)]
-use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
+use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
 use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
@@ -259,6 +259,8 @@ enum Response {
         reconciliation_required: bool,
         activation_port: &'static str,
         host_request_port: &'static str,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel_binding_failure: Option<PortFailure>,
         observation_forwarding_port: &'static str,
         recovery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -952,7 +954,9 @@ fn main() {
                 authority_epoch,
                 &fence_nonce,
             ),
-            Ok(Request::Status) => status_response(config.profile, &runner),
+            Ok(Request::Status) => {
+                status_response(config.profile, &runner, Some(&mut host_request_client))
+            }
             Ok(Request::Stop) => handle_stop(&runner),
             Err(detail) => Response::Error {
                 code: "REQUEST_INVALID",
@@ -1594,15 +1598,13 @@ struct ReconnectClaim<'a> {
 /// Local authority match alone does not move the binding: after the claims
 /// shape up, the live Kernel binding is proven current through
 /// [`KernelHostRequestClient::check_kernel_binding`] — one observation-only
-/// reconcile probe over the shared admitted transport — before
-/// `Runner::reconnect` runs. When no operation has been admitted yet the
-/// probe passes vacuously on the attach-time handshake, so a fence or epoch
-/// rotation inside that pre-first-exchange window is not detected here;
-/// owner-issued reconnect currency for that window stays open under
-/// issue #77. A failed probe fails closed with
+/// Heartbeat/Health exchange over the shared admitted transport — before
+/// `Runner::reconnect` runs. The probe runs before the first host invocation
+/// too; it creates no request identity, durable operation, or replay entry.
+/// A failed probe fails closed with
 /// `RECONNECT_STALE_AUTHORITY` without mutating the runner, so a fenced,
-/// rotated, or dead Kernel binding proven stale by an admitted operation
-/// can never be papered over with a fresh local label. Cursors and replay inheritance survive only through that
+/// rotated, or dead Kernel binding can never be papered over with a fresh
+/// local label. Cursors and replay inheritance survive only through that
 /// exact owner-authorized match; the kernel transport itself is untouched, so
 /// kernel envelopes keep riding the admitted receipt connection until a new
 /// process admission replaces it (the activation one-shot guard is preserved:
@@ -1674,12 +1676,11 @@ fn handle_reconnect(
     };
     // The bearer claims shaped up against the live local binding; the
     // binding itself is proven current against the Kernel before anything
-    // mutates whenever an admitted operation exists to parent the probe to.
-    // With an empty replay cache the check passes vacuously on the
-    // attach-time handshake, so this comment claims currency only for the
-    // probed case. A failed probe leaves the runner untouched: the replacement
-    // inherits only a Kernel-current binding, never a fresh label over a
-    // fenced, rotated, or dead one.
+    // mutates. Health is a live exchange even with an empty replay cache, so
+    // the attach-time handshake cannot stand in for current owner evidence.
+    // A failed probe leaves the runner untouched: the replacement inherits
+    // only a Kernel-current binding, never a fresh label over a fenced,
+    // rotated, or dead one.
     if let Err(error) = client.check_kernel_binding() {
         return Response::Error {
             code: "RECONNECT_STALE_AUTHORITY",
@@ -1846,20 +1847,24 @@ fn handle_stop(runner: &BridgeRunner) -> Response {
     build_stop_response(pending)
 }
 
-/// Projects owner-derived bridge liveness without probing the Kernel.
+/// Projects bridge liveness and probes the attached Kernel binding before
+/// reporting it as current.
 ///
 /// Every fact comes from the composition or activation owners: the profile
 /// from CLI decoding, capacity from the runtime, and attach/session/fence
 /// facts from the activation-sealed binding (the kernel-issued
 /// `activated_session` captured by the one-shot activation exchange).
-/// Pre-activation reports `not-attached` with no liveness text; post-activation
-/// reports the admitted-session facts but never a probe-backed readiness claim —
-/// dispatch still traverses the live admitted transport per operation, and
-/// staleness surfaces as typed `RECONNECT_*`/`DETACH_*` failures pointing back
-/// at this status, the reconnect/detach operations, and the kernel-owned
-/// `AGENT_HOST_REQUEST_REHYDRATE_OPERATION` exact (envelope, admission-receipt)
-/// pair path. A replacement connection always requires a new admission.
-fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
+/// Pre-activation reports `not-attached`. An attached row marks the retained
+/// binding current only after the live Heartbeat/Health exchange succeeds;
+/// failure remains an explicit unknown Kernel status while preserving the
+/// local attach facts for recovery. Exact-pair rehydration remains a separate
+/// open port-composition contour; a replacement connection always requires a
+/// new admission.
+fn status_response(
+    profile: Profile,
+    runner: &BridgeRunner,
+    client: Option<&mut KernelHostRequestClient>,
+) -> Response {
     match runner.attach_view() {
         None => Response::Status {
             profile: Profile::as_str(profile),
@@ -1872,39 +1877,51 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             reconciliation_required: false,
             activation_port: "not-attached",
             host_request_port: "no-session: attach and activate before host-request dispatch",
+            kernel_binding_failure: None,
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: format!(
-                "attach and activate before host requests; reconnect requires a live attach; \
-                one exact operation recovers only through the kernel-owned \
-                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
-                and a replacement connection requires a new admission"
-            ),
+            recovery: "attach and activate before host requests; attached Status and reconnect probe the live Kernel binding; a replacement connection requires a new admission".to_owned(),
             reactive: None,
             bootstrap: None,
             resources: None,
         },
-        Some(view) => Response::Status {
-            profile: Profile::as_str(profile),
-            control_capacity: runner.control_capacity(),
-            attached: true,
-            connection_id: Some(view.binding().connection_id().as_str().to_owned()),
-            session_id: Some(view.binding().session_id().as_str().to_owned()),
-            activation_generation: Some(view.binding().activation_generation().get()),
-            authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
-            reconciliation_required: view.reconciliation_required(),
-            activation_port: "attached",
-            host_request_port: "session-bound: dispatch joins the admitted Kernel session",
-            observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-            recovery: format!(
-                "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; \
-                stale targets fail closed; one exact operation recovers only through the kernel-owned \
-                `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` exact (envelope, admission-receipt) pair, \
-                and a replacement connection requires a new admission"
-            ),
-            reactive: Some(reactive_status_view(runner)),
-            bootstrap: None,
-            resources: Some(resource_status_view(runner)),
-        },
+        Some(view) => {
+            let probe = match client {
+                Some(client) => client.check_kernel_binding(),
+                None => Err(PortFailure::TransportBindingRejected {
+                    reason: "Kernel status client is unavailable".to_owned(),
+                }),
+            };
+            let (host_request_port, kernel_binding_failure, recovery) = match probe {
+                Ok(()) => (
+                    "kernel-binding-current: live Kernel Health probe succeeded; session-bound dispatch joins the admitted Kernel session",
+                    None,
+                    "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned(),
+                ),
+                Err(error) => (
+                    "kernel-binding-unknown: live Kernel Health probe failed; local attach facts are not currentness proof",
+                    Some(error),
+                    "Kernel binding is unknown; re-attach and activate to establish a new admission before relying on these local attach facts".to_owned(),
+                ),
+            };
+            Response::Status {
+                profile: Profile::as_str(profile),
+                control_capacity: runner.control_capacity(),
+                attached: true,
+                connection_id: Some(view.binding().connection_id().as_str().to_owned()),
+                session_id: Some(view.binding().session_id().as_str().to_owned()),
+                activation_generation: Some(view.binding().activation_generation().get()),
+                authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
+                reconciliation_required: view.reconciliation_required(),
+                activation_port: "attached",
+                host_request_port,
+                kernel_binding_failure,
+                observation_forwarding_port: "unavailable: Kernel observation route not admitted",
+                recovery,
+                reactive: Some(reactive_status_view(runner)),
+                bootstrap: None,
+                resources: Some(resource_status_view(runner)),
+            }
+        }
     }
 }
 
@@ -3716,7 +3733,7 @@ mod tests {
         assert!(!view.attention_truncated);
         let resources = resource_status_view(&runner);
         assert_eq!(resources.entries, 0);
-        let response = status_response(Profile::SpineFunctional, &runner);
+        let response = status_response(Profile::SpineFunctional, &runner, None);
         let value = serde_json::to_value(&response).expect("status must serialize");
         assert_eq!(value["attached"], Value::Bool(false));
         assert!(
@@ -4293,7 +4310,7 @@ mod tests {
                 .expect("expand resolves the issued handle");
             assert_eq!(expanded, stored);
             // Status projects the populated registry.
-            let status = status_response(Profile::SpineFunctional, &runner);
+            let status = status_response(Profile::SpineFunctional, &runner, None);
             let status_value = serde_json::to_value(&status).expect("status must serialize");
             assert_eq!(
                 status_value["resources"]["entries"],
