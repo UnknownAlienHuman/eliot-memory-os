@@ -285,8 +285,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// Accepts one query, or resumes the interrupted exchange already bound
     /// to its idempotency key with partial progress preserved.
     pub fn submit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeJob, ExchangeError> {
-        self.admit(request)
-            .map(|admission| admission.job().clone())
+        self.admit(request).map(|admission| admission.job().clone())
     }
 
     /// Accepts one query, or resumes the interrupted exchange already bound to
@@ -296,7 +295,10 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// exists per identity. A resumed job is served only from a durable record
     /// that still validates, so a restored snapshot can never decode a drifted
     /// record as a live job.
-    pub fn admit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeAdmission, ExchangeError> {
+    pub fn admit(
+        &mut self,
+        request: ResearchQueryRequest,
+    ) -> Result<ExchangeAdmission, ExchangeError> {
         request.validate()?;
         if let Some(job_id) = self.snapshot.idempotency.get(&request.idempotency_key) {
             let existing = self
@@ -708,11 +710,11 @@ impl<B: ResearchBridge, L: ExchangeJobLedger> DurableExchange<B, L> {
                 self.exchange.adopt_resumed(job)?,
             ));
         }
-        let job = self.exchange.submit(request)?;
+        let job = self.exchange.admit(request)?;
         self.ledger
-            .store(job.lifecycle.clone())
+            .store(job.job().lifecycle.clone())
             .map_err(DurableExchangeError::Ledger)?;
-        Ok(ExchangeAdmission::Started(job))
+        Ok(job)
     }
 
     /// Spends progress against the admitted budget and stores the record.
