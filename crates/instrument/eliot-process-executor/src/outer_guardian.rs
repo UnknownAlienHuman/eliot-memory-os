@@ -2,8 +2,10 @@
 //!
 //! I18.31 special case: a `ProcessExecutor` change needs an outer guardian
 //! scenario verifying tree cleanup and evidence. The pure check mechanics
-//! live in this owner crate; the Kernel composition root only wires the
-//! strict launch path (`ProcessExecutionGateway::start_with_guardian`).
+//! live in this owner crate; the Kernel dispatch composition wires the
+//! strict launch path around [`verify_outer_guardian`] when the next
+//! executor-surface generation ships (issue #2385: code first, behavior
+//! acceptance follows).
 //!
 //! The guardian re-verifies from the machine, never from executor
 //! internals: the scenario evidence digest is recomputed over the exact
