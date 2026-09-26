@@ -229,7 +229,7 @@ fn revocation_preserves_only_a_real_alternate_path() -> TestResult {
         &session,
         LogicalTime::new(2),
     )?;
-    assert_eq!(before.paths.len(), 2);
+    assert_eq!(before.path_count(), 2);
     graph.revoke(&GrantId::new("grant:first")?)?;
     let after = graph.snapshot(
         SnapshotId::new("snapshot:after")?,
@@ -238,7 +238,7 @@ fn revocation_preserves_only_a_real_alternate_path() -> TestResult {
         &session,
         LogicalTime::new(3),
     )?;
-    assert_eq!(after.paths.len(), 1);
+    assert_eq!(after.path_count(), 1);
     assert!(after.allows("read", "repo", EffectClass::Read));
     Ok(())
 }

@@ -707,6 +707,11 @@ impl EffectiveCapabilitySnapshot {
             .any(|path| path.grant_path.contains(grant_id))
     }
 
+    /// Number of independently supporting effective paths in this snapshot.
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
+    }
+
     pub fn validate_context(
         &self,
         work_scope: &WorkScopeBinding,
