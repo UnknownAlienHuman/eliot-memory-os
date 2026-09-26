@@ -1323,8 +1323,8 @@ impl KernelComposition {
     /// The parent must be a known current-generation operation. Cancellation
     /// is attempted first; when the parent already passed the cancellable
     /// window the parent is fenced to `Unknown` instead so its outcome is
-    /// reconciled rather than assumed. Parent advancement is best-effort: an
-    /// illegal transition only means the parent lifecycle already moved on.
+    /// reconciled rather than assumed. Store failures are returned so a failed
+    /// durable transition never looks like cancellation succeeded.
     fn advance_host_request_parent(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1346,6 +1346,7 @@ impl KernelComposition {
             .ok_or(TransportError::UnknownRequest)?;
         require_current_generation_parent(&parent, descriptor)?;
         if parent.state.is_terminal() {
+            self.retire_observe_pair_under_transition(parent_operation.as_str(), &parent_digest);
             return Ok(());
         }
         match self.generation_gateway.ors.advance_host_request(
@@ -1354,16 +1355,33 @@ impl KernelComposition {
             HostRequestState::Cancelled,
             None,
         ) {
+            Ok(Some(_)) => {
+                self.retire_observe_pair_under_transition(
+                    parent_operation.as_str(),
+                    &parent_digest,
+                );
+                Ok(())
+            }
+            Ok(None) => Err(TransportError::UnknownRequest),
             Err(OrsError::InvalidTransition) => {
-                let _ = self.generation_gateway.ors.advance_host_request(
+                match self.generation_gateway.ors.advance_host_request(
                     &parent_operation,
                     &parent_digest,
                     HostRequestState::Unknown,
                     None,
-                );
-                Ok(())
+                ) {
+                    Ok(Some(_)) => {
+                        self.retire_observe_pair_under_transition(
+                            parent_operation.as_str(),
+                            &parent_digest,
+                        );
+                        Ok(())
+                    }
+                    Ok(None) => Err(TransportError::UnknownRequest),
+                    Err(_) => Err(TransportError::SessionFenced),
+                }
             }
-            Ok(_) | Err(_) => Ok(()),
+            Err(_) => Err(TransportError::SessionFenced),
         }
     }
 
@@ -2519,9 +2537,12 @@ impl KernelComposition {
     /// capability (lost-answer retry without a new identity); a claim by a
     /// different owner reassigns the attempt (generation bump, fresh identity,
     /// new owner), so the superseded capability can never complete. `None` is
-    /// a null poll, not an error. Pure queue memory: no store IO, so
-    /// already-resulted pairs are retired by the submit/defer legs rather
-    /// than re-checked here. Local-read pairs are never served here.
+    /// a null poll, not an error. The exact ORS row must still be Admitted or
+    /// Routed with no result before an attempt is minted or returned. Closed
+    /// queue entries are pruned from this bounded volatile index while their
+    /// durable rows stay untouched. Store read errors fail closed without
+    /// discarding the pair or its possible-effect evidence. Local-read pairs
+    /// are never served here.
     pub(crate) fn claim_observe_pair(
         &self,
         session: &Session,
@@ -2546,19 +2567,52 @@ impl KernelComposition {
         // Deterministic order: `BTreeMap` iterates connections sorted, pairs
         // stay in enqueue (fifo) order within one connection.
         for refs in index.values_mut() {
-            for candidate in refs.iter_mut() {
+            let mut position = 0;
+            while position < refs.len() {
                 let (Some(envelope), Some(tool)) = (
-                    candidate.observe_envelope.as_ref(),
-                    candidate.observe_tool.as_ref(),
+                    refs[position].observe_envelope.as_ref(),
+                    refs[position].observe_tool.as_ref(),
                 ) else {
+                    position += 1;
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    position += 1;
                     continue;
                 }
                 if envelope.identity.capability != OBSERVE_CAPABILITY {
+                    return Err(TransportError::SessionFenced);
+                }
+                let operation_id = OperationIdentity::new(refs[position].operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let request_digest = refs[position].request_digest.clone();
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, &request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(stored) = stored else {
+                    return Err(TransportError::UnknownRequest);
+                };
+                let expected = requested_host_request_record(envelope)?;
+                if stored.operation_id != operation_id
+                    || stored.request_digest != request_digest
+                    || !stored.same_binding(&expected)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let executable = matches!(
+                    stored.state,
+                    HostRequestState::Admitted | HostRequestState::Routed
+                ) && stored.result_digest.is_none()
+                    && stored.result_response.is_none();
+                if !executable {
+                    refs.remove(position);
                     continue;
                 }
+                let envelope = envelope.clone();
+                let tool = tool.clone();
+                let candidate = &mut refs[position];
                 if !candidate.observe_attempt.is_owned_by(session) {
                     let generation = candidate
                         .observe_attempt
@@ -2579,11 +2633,11 @@ impl KernelComposition {
                     };
                 }
                 let attempt = self.local_read_attempt_capability(
-                    envelope,
+                    &envelope,
                     &candidate.operation_id,
                     &candidate.observe_attempt,
                 )?;
-                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+                return Ok(Some((envelope, tool, attempt)));
             }
         }
         Ok(None)
