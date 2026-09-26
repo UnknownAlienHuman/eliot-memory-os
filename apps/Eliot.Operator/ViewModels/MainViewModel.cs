@@ -860,6 +860,27 @@ public sealed class MainViewModel : INotifyPropertyChanged
         NotifyCounts();
         try
         {
+            if (IsUserAutomationPage)
+            {
+                // UserAutomation has a typed command route, but no canonical
+                // listing projection. Clear any prior page before showing that
+                // limitation; the command panel keeps its separate inputs.
+                Records.Clear();
+                SelectedRecord = null;
+                SelectedAction = null;
+                _nextCursor = null;
+                _graphSelectedRef = null;
+                _projectionBinding = null;
+                _taskContext = null;
+                ResultPayloadText = string.Empty;
+                ResultSummary = "UserAutomation listing unavailable; no total is available.";
+                SetBanner(
+                    "UserAutomation listing unavailable",
+                    "The listing is unavailable until its owner issues a canonical listing projection. The UserAutomation command panel remains available.",
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
+
             ValidateScope();
             var projectId = NullIfBlank(ProjectId);
             var taskId = NullIfBlank(TaskId);
@@ -882,6 +903,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 IsQueryPage ? ResultMode : "human",
                 IsGraphPage ? _graphSelectedRef : null,
                 GraphDepth), cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             // Rows, selection, cursor, graph focus, result payload and the task
             // context are rebuildable views of one owner binding. Any change to
             // runtime, auth generation, owner task revision, projection or
@@ -916,11 +938,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (OperationCanceledException)
         {
-            SetBanner("Request cancelled", "The nonblocking Governor request was cancelled.", OperatorBannerSeverity.Informational);
+            if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
+            {
+                SetBanner("Request cancelled", "The nonblocking Governor request was cancelled.", OperatorBannerSeverity.Informational);
+            }
         }
         catch (Exception error)
         {
-            SetBanner("Degraded / reconnect required", error.Message, OperatorBannerSeverity.Error);
+            if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
+            {
+                SetBanner("Degraded / reconnect required", error.Message, OperatorBannerSeverity.Error);
+            }
         }
         finally
         {
