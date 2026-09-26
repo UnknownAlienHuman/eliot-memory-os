@@ -120,8 +120,9 @@ use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     JobState as TestdJobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy, TESTD_PRODUCTIVE_PROFILE,
-    TargetRoots, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
+    KernelProcessAdmissionRequest, ProcessAdmission, RetryPolicy, TESTD_OWNER_SUBMIT_OPERATION,
+    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetRoots,
+    TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
     TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
     testd_profile_binding, verification_receipt_sha256,
 };
@@ -1242,30 +1243,27 @@ pub(crate) async fn submit_testd_owner_job(
     if now_unix_ms == 0
         || identity.request.metadata != request.submission.invocation.request
         || identity.request.state_fence != request.submission.invocation.request.state_fence
-        || identity.request.metadata.task_id.is_none()
-        || identity
-            .request
-            .state_fence
-            .task_revision
-            .as_ref()
-            .is_none_or(|revision| revision.value() == 0)
     {
         return Err(DispatchLaunchError::Gate(
-            "TestD owner submission does not match the authenticated task identity".to_owned(),
+            "TestD owner submission does not match the authenticated request identity".to_owned(),
+        ));
+    }
+    let task_id_present = identity.request.metadata.task_id.is_some();
+    let task_revision = identity.request.state_fence.task_revision.as_ref();
+    if task_id_present != task_revision.is_some()
+        || task_revision.is_some_and(|revision| revision.value() == 0)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "TestD owner submission has an incomplete or invalid task identity".to_owned(),
         ));
     }
 
-    let (authenticated, process_gateway) = {
+    let authenticated = {
         let service = kernel
             .service
             .lock()
             .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
-        let authenticated = bind_testd_owner_session(&service)?;
-        let process_gateway = kernel
-            .process_gateway
-            .clone()
-            .ok_or(DispatchLaunchError::ExecutorUnavailable)?;
-        (authenticated, process_gateway)
+        bind_testd_owner_session(&service)?
     };
     let generation = Generation::new(authenticated.generation())
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
@@ -1278,6 +1276,36 @@ pub(crate) async fn submit_testd_owner_job(
             "authenticated TestD identity is outside the live Kernel fence".to_owned(),
         ));
     }
+
+    // An authenticated workspace without either task identifier or task
+    // revision is a valid exploratory scope, but cannot admit a productive
+    // TestD job. Return the typed directive only after binding that scope to
+    // the live Kernel fence, and before touching the filesystem, store, or
+    // process gateway.
+    if !task_id_present {
+        let response = TestdOwnerSubmitResponse::Denied {
+            wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+            wire_version: TESTD_OWNER_SUBMIT_WIRE_VERSION,
+            request_digest: request.request_digest.clone(),
+            operation_id: request
+                .submission
+                .invocation
+                .request
+                .request_id
+                .as_str()
+                .to_owned(),
+            directive: TestdOwnerSubmitDirective::TaskSelectionRequired,
+        };
+        response
+            .validate()
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+        return Ok(response);
+    }
+
+    let process_gateway = kernel
+        .process_gateway
+        .clone()
+        .ok_or(DispatchLaunchError::ExecutorUnavailable)?;
 
     let source_input = Path::new(&request.submission.source_root);
     if !source_input.is_absolute() {
@@ -1434,13 +1462,20 @@ pub(crate) async fn submit_testd_owner_job(
     let job = store
         .submit_productive_verifier(submission, identity.clone(), permit, now_unix_ms)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    Ok(TestdOwnerSubmitResponse {
+    let response = TestdOwnerSubmitResponse::Admitted {
+        wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
+        wire_version: TESTD_OWNER_SUBMIT_WIRE_VERSION,
+        request_digest: request.request_digest.clone(),
         job_id: job.job_id,
         operation_id: job.process.operation_id,
         authority_epoch: job.process.authority_epoch,
         generation: job.process.generation,
         payload_digest: job.payload_digest,
-    })
+    };
+    response
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    Ok(response)
 }
 
 struct KernelIssuedProcessProvider {
