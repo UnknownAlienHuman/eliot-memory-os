@@ -22,18 +22,33 @@
 //! typed ref lists plus the stored history handle, which the frozen
 //! service accepts. Wake cancellation on remove likewise returns empty
 //! until the scheduler owner supplies the cancelled identities.
+//!
+//! Issue #2808 owns the occurrence denominator those projections are
+//! derived from. `reconciliation_obligations` is the only producer of the
+//! retained obligation set: it reads the owner-declared occurrence
+//! denominator, requires the owner-issued `completeness` block (read
+//! revision plus `COMPLETE`/`TRUNCATED` coverage), and re-proves that read
+//! revision against the exact revision-head set the owner returned. A row
+//! with no usable invocation document, no owner-issued provenance, or an
+//! unreadable canonical receipt becomes a typed obligation tied to that
+//! exact row, and a denominator the owner did not prove complete becomes an
+//! obligation carrying the durable owner query handle. Absence of evidence
+//! is therefore `unknown`, never "no reconciliation obligation" (I5.16), so
+//! Status, History, deterministic preflight and Remove all answer from one
+//! denominator read revision and an incomplete denominator blocks.
 
 use std::collections::BTreeMap;
 
 use eliot_kernel_core::user_automation::{
-    AutomationReconciliationReference, UserAutomationExecutionProjection, UserAutomationInvocation,
-    UserAutomationOperation, UserAutomationRevision,
+    AutomationReconciliationCause, AutomationReconciliationReference,
+    UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationOperation,
+    UserAutomationRevision,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OrderingScopeId, PreparedTransition, RevisionHead, ScopeId, SecurityContext,
     StateFence, StoreError, TransitionClass, USER_AUTOMATION_SCOPE, WriteReceipt,
-    WriteReceiptStatus, automation_create_params, automation_edit_params,
+    WriteReceiptStatus, audit_heads_digest, automation_create_params, automation_edit_params,
     automation_invocation_read_request, automation_mutation_request, automation_read_request,
     automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, canonical_json_bytes, canonical_request_hash,
@@ -529,31 +544,240 @@ const QUERY_INVOCATIONS: &str = "invocations";
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_FAILURE: &str = "failure";
 
-/// Decodes one stored invocation row from the bounded invocation page.
+/// Closed owner-issued coverage vocabulary carried by one paged automation
+/// read under the store contract's `completeness` payload field.
+const AUTOMATION_PAGE_COMPLETENESS_FIELD: &str = "completeness";
+/// Owner-issued read-revision field of the completeness metadata.
+const AUTOMATION_PAGE_READ_REVISION_FIELD: &str = "read_revision";
+/// Rows-returned field of the completeness metadata.
+const AUTOMATION_PAGE_RETURNED_FIELD: &str = "returned";
+/// Closed coverage disposition field of the completeness metadata.
+const AUTOMATION_PAGE_COVERAGE_FIELD: &str = "coverage";
+/// Closed coverage value: the owner proved the page exhausts the denominator.
+const AUTOMATION_COVERAGE_COMPLETE: &str = "COMPLETE";
+/// Closed coverage value: the owner returned a bounded prefix only.
+const AUTOMATION_COVERAGE_TRUNCATED: &str = "TRUNCATED";
+
+/// Versioned prefix of the durable owner query handle naming one automation
+/// occurrence denominator. The handle is the closed named read plus the exact
+/// owner-issued read revision, so the unrepresented remainder of a
+/// non-proven denominator stays addressable after retirement instead of
+/// disappearing with the bounded page.
+const AUTOMATION_DENOMINATOR_QUERY_PREFIX: &str = "GetUserAutomationState:invocations:v1:";
+
+/// Maximum accumulated invocation-document bytes one denominator read may
+/// inspect before it reports partial/recovery-required instead of a bounded
+/// but silent set. The bound is a cumulative work limit over the declared
+/// denominator, not a per-page one.
+const MAX_AUTOMATION_DENOMINATOR_BYTES: usize = 4 * 1024 * 1024;
+
+/// One stored row's effect disposition inside the occurrence denominator.
+enum OccurrenceEvidence {
+    /// The row's admitting canonical operation is proven committed with no
+    /// outstanding reconciliation envelope, so the row carries no obligation.
+    Resolved,
+    /// The row still carries exactly one typed obligation.
+    Unresolved(AutomationReconciliationReference),
+}
+
+/// Owner-issued denominator coverage decoded from one paged read.
+struct AutomationDenominatorCoverage {
+    /// Owner-issued read revision this page was produced at.
+    read_revision: String,
+    /// Whether the owner proved the page exhausts the declared denominator.
+    complete: bool,
+}
+
+/// One occurrence-denominator read: the retained obligations plus the
+/// owner-issued coverage they were derived from.
+struct AutomationObligationSet {
+    /// Typed obligations in deterministic occurrence order.
+    references: Vec<AutomationReconciliationReference>,
+    /// Owner-issued read revision the denominator was read at.
+    read_revision: String,
+}
+
+/// One complete owner-issued execution projection bound to the denominator
+/// revision it was read at.
+struct AutomationExecutionProjectionPage {
+    /// Typed projection consumed by Status, History and preflight.
+    projection: UserAutomationExecutionProjection,
+    /// Owner-issued read revision the occurrence denominator was read at.
+    read_revision: String,
+}
+
+/// Decodes the owner-issued denominator coverage of one paged read.
 ///
-/// A row that does not carry an invocation document is not an owner-issued
-/// invocation and is skipped by the caller; a row that carries a malformed or
-/// foreign document fails closed instead of being ignored.
+/// The `completeness` block is mandatory: a page that omits it cannot be read
+/// as a complete denominator, because absence of a coverage record is
+/// `unknown`, not unrestricted/complete (I5.16). The declared read revision is
+/// re-proved against the exact revision-head set the owner returned with the
+/// response, so a page cannot claim a denominator revision the owner did not
+/// serve, and the declared row count is re-proved against the page actually
+/// carried.
+fn denominator_coverage(
+    payload: &Value,
+    rows: usize,
+    heads: &[RevisionHead],
+) -> Result<AutomationDenominatorCoverage, StoreError> {
+    let malformed =
+        |field: &'static str, reason: &'static str| StoreError::InvalidField { field, reason };
+    let block = payload
+        .get(AUTOMATION_PAGE_COMPLETENESS_FIELD)
+        .ok_or_else(|| {
+            malformed(
+                "automation.completeness",
+                "paged automation read omitted owner-issued completeness",
+            )
+        })?;
+    let read_revision = block
+        .get(AUTOMATION_PAGE_READ_REVISION_FIELD)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            malformed(
+                "automation.read_revision",
+                "owner-issued read revision is malformed",
+            )
+        })?
+        .to_owned();
+    let declared_rows = block
+        .get(AUTOMATION_PAGE_RETURNED_FIELD)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            malformed(
+                "automation.returned",
+                "owner-issued returned row count is malformed",
+            )
+        })?;
+    let observed_rows = u64::try_from(rows).map_err(|_| {
+        malformed(
+            "automation.returned",
+            "projected automation page length is not representable",
+        )
+    })?;
+    if observed_rows != declared_rows {
+        return Err(malformed(
+            "automation.returned",
+            "owner-issued returned row count does not match the projected page",
+        ));
+    }
+    let coverage = block
+        .get(AUTOMATION_PAGE_COVERAGE_FIELD)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            malformed(
+                "automation.coverage",
+                "owner-issued coverage disposition is malformed",
+            )
+        })?;
+    let complete = match coverage {
+        AUTOMATION_COVERAGE_COMPLETE => true,
+        AUTOMATION_COVERAGE_TRUNCATED => false,
+        _ => {
+            return Err(malformed(
+                "automation.coverage",
+                "owner-issued coverage disposition is not a closed value",
+            ));
+        }
+    };
+    let observed_heads: Vec<(String, u64)> = heads
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    if read_revision != audit_heads_digest(&observed_heads)? {
+        return Err(StoreError::RevisionConflict);
+    }
+    Ok(AutomationDenominatorCoverage {
+        read_revision,
+        complete,
+    })
+}
+
+/// Returns the exact occurrence identity one stored invocation row carries.
+///
+/// A row that names another automation is an identity conflict, and a row
+/// without a usable occurrence identity cannot be tied to any obligation, so
+/// both fail closed instead of being skipped.
+fn occurrence_row_identity(entry: &Value, automation_id: &str) -> Result<String, StoreError> {
+    if entry.get("automation_id").and_then(Value::as_str) != Some(automation_id) {
+        return Err(StoreError::IdentityConflict);
+    }
+    entry
+        .get("occurrence_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(StoreError::InvalidField {
+            field: "automation.occurrence_id",
+            reason: "invocation row omitted its occurrence identity",
+        })
+}
+
+/// Builds one per-occurrence obligation for evidence the owner could not
+/// supply.
+///
+/// `operation_ref` is an actionable migration/reconciliation reference bound
+/// to the exact row. It never states a committed or failed outcome that was
+/// not observed.
+fn evidence_obligation(
+    occurrence_id: &str,
+    cause: AutomationReconciliationCause,
+    read_revision: &str,
+) -> AutomationReconciliationReference {
+    AutomationReconciliationReference {
+        occurrence_id: occurrence_id.to_owned(),
+        operation_ref: format!("automation-occurrence-reconciliation:{occurrence_id}"),
+        cause,
+        read_revision: read_revision.to_owned(),
+        denominator_query_ref: None,
+    }
+}
+
+/// Builds the fail-closed obligation raised when the declared occurrence
+/// denominator is not owner-proven complete.
+///
+/// The obligation is tied to the exact automation denominator and carries the
+/// durable owner query handle that enumerates the rest of the set, so a later
+/// read finishes it instead of restating an empty successful set.
+fn incomplete_denominator_reference(
+    automation_id: &str,
+    read_revision: &str,
+) -> AutomationReconciliationReference {
+    AutomationReconciliationReference {
+        occurrence_id: format!("automation-occurrence-denominator:{automation_id}"),
+        operation_ref: format!(
+            "automation-denominator-reconciliation:{automation_id}:{read_revision}"
+        ),
+        cause: AutomationReconciliationCause::IncompleteDenominator,
+        read_revision: read_revision.to_owned(),
+        denominator_query_ref: Some(format!(
+            "{AUTOMATION_DENOMINATOR_QUERY_PREFIX}{automation_id}@{read_revision}"
+        )),
+    }
+}
+
+/// Decodes one stored invocation row from the occurrence denominator.
+///
+/// `Ok(None)` means the row carries no usable owner-issued invocation
+/// evidence: the document is absent, legacy, or malformed. I5.16 makes that
+/// `unknown`, so the caller raises a typed obligation tied to the exact row
+/// instead of skipping it. A row whose document is present, valid, and bound to
+/// a different automation or occurrence is an identity conflict and still fails
+/// closed.
 fn projected_invocation(entry: &Value) -> Result<Option<UserAutomationInvocation>, StoreError> {
     let Some(document) = entry.get("invocation_json").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let invocation: UserAutomationInvocation = serde_json::from_str(document)
-        .map_err(|error| StoreError::Serialization(error.to_string()))?;
-    invocation
-        .validate()
-        .map_err(|_| StoreError::InvalidField {
-            field: "automation.invocation",
-            reason: "stored invocation failed domain validation",
-        })?;
+    let Ok(invocation) = serde_json::from_str::<UserAutomationInvocation>(document) else {
+        return Ok(None);
+    };
+    if invocation.validate().is_err() {
+        return Ok(None);
+    }
+    let occurrence_id = invocation
+        .occurrence_identity()
+        .map_err(|_| StoreError::IdentityConflict)?;
     if entry.get("automation_id").and_then(Value::as_str) != Some(invocation.automation_id.as_str())
-        || entry.get("occurrence_id").and_then(Value::as_str)
-            != Some(
-                invocation
-                    .occurrence_identity()
-                    .map_err(|_| StoreError::IdentityConflict)?
-                    .as_str(),
-            )
+        || entry.get("occurrence_id").and_then(Value::as_str) != Some(occurrence_id.as_str())
     {
         return Err(StoreError::IdentityConflict);
     }
@@ -710,12 +934,19 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::Status {
                 revision,
-                execution,
+                execution: execution.projection,
             },
         })
     }
 
     /// Projects the history read from the revision-row set.
+    ///
+    /// The history page must be owner-proven complete: a bounded first page is
+    /// not evidence that no later immutable revision exists, so answering from
+    /// an arbitrary first row would present a partial history as the whole one.
+    /// The page and the occurrence denominator must also agree on one
+    /// owner-issued read revision, so a read that raced a successor commit
+    /// fails closed instead of answering from two snapshots.
     async fn read_history_outcome(
         &self,
         request: &UserAutomationStoreRequest,
@@ -729,8 +960,13 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
             fence,
         )?;
-        let payload = self.client.execute_named(query).await?.payload;
-        let entries = payload
+        // The request is validated against its own response, and
+        // `NamedReadRequest` is not `Copy`, so the send takes a clone. This is
+        // the same shape the other validating reads in this file already use.
+        let response = self.client.execute_named(query.clone()).await?;
+        validate_named_response(&query, &response)?;
+        let entries = response
+            .payload
             .get(eliot_store_api::AUTOMATION_PAGE_REVISIONS)
             .and_then(Value::as_array)
             .ok_or(StoreError::InvalidField {
@@ -741,6 +977,14 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             return Err(StoreError::InvalidField {
                 field: "automation.automation_id",
                 reason: "unknown automation",
+            });
+        }
+        let history_coverage =
+            denominator_coverage(&response.payload, entries.len(), &response.revision_heads)?;
+        if !history_coverage.complete {
+            return Err(StoreError::InvalidField {
+                field: "automation.revisions",
+                reason: "history page is not owner-proven complete",
             });
         }
         let revision_id = entries
@@ -757,10 +1001,13 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         let execution = self
             .execution_projection(&request.context.state_fence, automation_id, &revision)
             .await?;
+        if execution.read_revision != history_coverage.read_revision {
+            return Err(StoreError::RevisionConflict);
+        }
         Ok(UserAutomationStoreOutcome::Read {
             result: UserAutomationReadResult::History {
                 automation_id: automation_id.to_owned(),
-                execution,
+                execution: execution.projection,
             },
         })
     }
@@ -889,22 +1136,25 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
     /// `current_execution_refs` stays the stored Durable Job reference
     /// projection: the canonical Durable Job owner, not this Store adapter,
     /// resolves those references to a job state. The unresolved
-    /// reconciliation set is derived from the persisted invocation rows: an
-    /// occurrence whose admitting canonical operation has no committed
-    /// receipt, or a receipt that still requires a reconciliation envelope, is
-    /// an outstanding I14.21 obligation and is preserved verbatim through
-    /// status, history, and retirement.
+    /// reconciliation set is derived from the complete declared occurrence
+    /// denominator: an occurrence whose admitting canonical operation has no
+    /// committed receipt, or a receipt that still requires a reconciliation
+    /// envelope, is an outstanding I14.21 obligation and is preserved verbatim
+    /// through status, history, and retirement. This is the single production
+    /// constructor of the projection, so Status, History, preflight and Remove
+    /// answer from one denominator read revision.
     async fn execution_projection(
         &self,
         fence: &StateFence,
         automation_id: &str,
         revision: &UserAutomationRevision,
-    ) -> Result<UserAutomationExecutionProjection, StoreError> {
+    ) -> Result<AutomationExecutionProjectionPage, StoreError> {
+        let obligations = self
+            .reconciliation_obligations(fence, automation_id)
+            .await?;
         let projection = UserAutomationExecutionProjection {
             current_execution_refs: Vec::new(),
-            unresolved_reconciliation_refs: self
-                .unresolved_reconciliation_refs(fence, automation_id)
-                .await?,
+            unresolved_reconciliation_refs: obligations.references,
             history_query_ref: revision.execution_history_query_ref.clone(),
         };
         projection
@@ -913,16 +1163,40 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 field: "automation.execution",
                 reason: "execution projection invalid",
             })?;
-        Ok(projection)
+        Ok(AutomationExecutionProjectionPage {
+            projection,
+            read_revision: obligations.read_revision,
+        })
     }
 
-    /// Reads the bounded invocation page and returns every occurrence whose
-    /// admitting canonical operation is still unresolved.
-    async fn unresolved_reconciliation_refs(
+    /// Reads the declared occurrence denominator and returns every obligation
+    /// it still carries, with the owner-issued coverage they came from.
+    ///
+    /// Every same-fence invocation row the owner declared is inspected. A row
+    /// whose admitting canonical operation is proven committed with no
+    /// outstanding reconciliation envelope contributes nothing; every other row
+    /// contributes exactly one typed obligation:
+    ///
+    /// - a missing, legacy, or malformed invocation document, a row without
+    ///   owner-issued provenance, and an unreadable canonical receipt are
+    ///   `unknown` evidence, not "no effect" (I5.16), and each becomes an
+    ///   obligation tied to that exact row with an actionable migration
+    ///   reference;
+    /// - a denominator the owner did not prove complete, or one whose
+    ///   cumulative document budget this read exhausted, is itself an
+    ///   obligation carrying the durable owner query handle, so the
+    ///   unrepresented remainder stays visible and addressable after
+    ///   retirement instead of reading as an empty successful set.
+    ///
+    /// The set is deduplicated only on exact occurrence/operation identity
+    /// after its binding is validated; two rows claiming one occurrence with a
+    /// different operation, cause, or read revision are an identity conflict
+    /// rather than one arbitrarily retained representative.
+    async fn reconciliation_obligations(
         &self,
         fence: &StateFence,
         automation_id: &str,
-    ) -> Result<Vec<AutomationReconciliationReference>, StoreError> {
+    ) -> Result<AutomationObligationSet, StoreError> {
         let query = automation_read_request(
             QUERY_INVOCATIONS.to_owned(),
             Some(automation_id.to_owned()),
@@ -930,64 +1204,154 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
             fence.clone(),
         )?;
-        let payload = self.client.execute_named(query).await?.payload;
-        let entries = payload
+        // Validated against its own response; `NamedReadRequest` is not `Copy`.
+        let response = self.client.execute_named(query.clone()).await?;
+        validate_named_response(&query, &response)?;
+        let entries = response
+            .payload
             .get(eliot_store_api::AUTOMATION_PAGE_INVOCATIONS)
             .and_then(Value::as_array)
             .ok_or(StoreError::InvalidField {
                 field: "automation.invocations",
                 reason: "store invocation projection malformed",
             })?;
+        let coverage =
+            denominator_coverage(&response.payload, entries.len(), &response.revision_heads)?;
         let mut references: Vec<AutomationReconciliationReference> = Vec::new();
+        let mut inspected_bytes: usize = 0;
+        let mut budget_exhausted = false;
         for entry in entries {
-            if entry.get("automation_id").and_then(Value::as_str) != Some(automation_id) {
-                return Err(StoreError::IdentityConflict);
+            let occurrence_id = occurrence_row_identity(entry, automation_id)?;
+            inspected_bytes = inspected_bytes.saturating_add(
+                entry
+                    .get("invocation_json")
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len),
+            );
+            if inspected_bytes > MAX_AUTOMATION_DENOMINATOR_BYTES {
+                budget_exhausted = true;
+                break;
             }
-            let Some(invocation) = projected_invocation(entry)? else {
-                continue;
-            };
-            let Some(provenance) = invocation.provenance.as_ref() else {
-                continue;
-            };
-            let operation_ref = provenance.operation_id.to_string();
-            let occurrence_id = invocation
-                .occurrence_identity()
-                .map_err(|_| StoreError::IdentityConflict)?;
-            let unresolved = match self.client.receipt(provenance.operation_id.clone()).await? {
-                None => true,
-                Some(receipt) => {
-                    receipt.validate()?;
-                    if receipt.idempotency_key != provenance.idempotency_key
-                        || receipt.canonical_request_hash != provenance.canonical_request_hash
-                        || receipt.state_fence != provenance.request_metadata.state_fence
-                    {
-                        return Err(StoreError::IdentityConflict);
-                    }
-                    receipt.status != eliot_store_api::WriteReceiptStatus::Committed
-                        || receipt.require_reconciliation_envelope().is_err()
-                }
-            };
-            if unresolved {
-                let reference = AutomationReconciliationReference {
-                    occurrence_id,
-                    operation_ref,
-                };
-                reference.validate().map_err(|_| StoreError::InvalidField {
-                    field: "automation.reconciliation",
-                    reason: "reconciliation reference invalid",
-                })?;
+            if let OccurrenceEvidence::Unresolved(reference) = self
+                .occurrence_evidence(entry, &occurrence_id, &coverage.read_revision)
+                .await?
+            {
                 references.push(reference);
             }
         }
-        references.sort_by(|left, right| {
-            left.occurrence_id
-                .cmp(&right.occurrence_id)
-                .then_with(|| left.operation_ref.cmp(&right.operation_ref))
-        });
-        references.dedup_by(|left, right| {
-            left.occurrence_id == right.occurrence_id && left.operation_ref == right.operation_ref
-        });
-        Ok(references)
+        if budget_exhausted || !coverage.complete {
+            let reference =
+                incomplete_denominator_reference(automation_id, &coverage.read_revision);
+            reference.validate().map_err(|_| StoreError::InvalidField {
+                field: "automation.reconciliation",
+                reason: "incomplete denominator reference invalid",
+            })?;
+            references.push(reference);
+        }
+        let mut by_occurrence: BTreeMap<String, AutomationReconciliationReference> =
+            BTreeMap::new();
+        for reference in references {
+            match by_occurrence.get(&reference.occurrence_id) {
+                Some(existing) if *existing == reference => {}
+                Some(_) => return Err(StoreError::IdentityConflict),
+                None => {
+                    by_occurrence.insert(reference.occurrence_id.clone(), reference);
+                }
+            }
+        }
+        Ok(AutomationObligationSet {
+            references: by_occurrence.into_values().collect(),
+            read_revision: coverage.read_revision,
+        })
+    }
+
+    /// Classifies one stored invocation row into a resolved effect or one
+    /// typed reconciliation obligation.
+    async fn occurrence_evidence(
+        &self,
+        entry: &Value,
+        occurrence_id: &str,
+        read_revision: &str,
+    ) -> Result<OccurrenceEvidence, StoreError> {
+        let Some(invocation) = projected_invocation(entry)? else {
+            return Ok(OccurrenceEvidence::Unresolved(evidence_obligation(
+                occurrence_id,
+                AutomationReconciliationCause::MissingInvocationEvidence,
+                read_revision,
+            )));
+        };
+        let Some(provenance) = invocation.provenance.as_ref() else {
+            return Ok(OccurrenceEvidence::Unresolved(evidence_obligation(
+                occurrence_id,
+                AutomationReconciliationCause::MissingInvocationProvenance,
+                read_revision,
+            )));
+        };
+        // An unavailable receipt lookup is unknown evidence, not an absent
+        // effect: the row keeps its obligation instead of being dropped from
+        // the denominator.
+        let Ok(receipt) = self.client.receipt(provenance.operation_id.clone()).await else {
+            return Ok(OccurrenceEvidence::Unresolved(evidence_obligation(
+                occurrence_id,
+                AutomationReconciliationCause::ReceiptEvidenceUnavailable,
+                read_revision,
+            )));
+        };
+        let Some(receipt) = receipt else {
+            return Ok(OccurrenceEvidence::Unresolved(evidence_obligation(
+                occurrence_id,
+                AutomationReconciliationCause::UnresolvedOperation,
+                read_revision,
+            )));
+        };
+        receipt.validate()?;
+        if receipt.idempotency_key != provenance.idempotency_key
+            || receipt.canonical_request_hash != provenance.canonical_request_hash
+            || receipt.state_fence != provenance.request_metadata.state_fence
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        // An exact committed receipt removes only its own obligation.
+        if receipt.status == eliot_store_api::WriteReceiptStatus::Committed
+            && receipt.require_reconciliation_envelope().is_ok()
+        {
+            Ok(OccurrenceEvidence::Resolved)
+        } else {
+            Ok(OccurrenceEvidence::Unresolved(evidence_obligation(
+                occurrence_id,
+                AutomationReconciliationCause::UnresolvedOperation,
+                read_revision,
+            )))
+        }
+    }
+
+    /// Fails closed when the declared occurrence denominator is not
+    /// owner-proven complete for one automation.
+    ///
+    /// The retirement leg only moves the current pointer, so the immutable
+    /// invocation rows and their outstanding obligations survive it. What it
+    /// must never do is retire on a bounded first page and let a later Status
+    /// or History read of the retired automation report "no reconciliation
+    /// obligation" from the same bounded page. Retirement itself is never
+    /// refused because an effect is unresolved: the obligations are preserved
+    /// verbatim, only an unrepresentable denominator is rejected.
+    async fn require_complete_occurrence_denominator(
+        &self,
+        fence: &StateFence,
+        automation_id: &str,
+    ) -> Result<(), StoreError> {
+        let obligations = self
+            .reconciliation_obligations(fence, automation_id)
+            .await?;
+        if obligations.references.iter().any(|obligation| {
+            obligation.cause == AutomationReconciliationCause::IncompleteDenominator
+        }) {
+            return Err(StoreError::InvalidField {
+                field: "automation.reconciliation",
+                reason: "retirement requires an owner-proven complete occurrence denominator",
+            });
+        }
+        Ok(())
     }
 
     /// Executes one authenticated mutation through one admitted
@@ -1161,12 +1525,25 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             UserAutomationOperation::Remove {
                 automation_id,
                 automation_revision,
-            } => Ok(automation_state_transition_params(
-                "remove".to_owned(),
-                automation_id.clone(),
-                automation_revision.clone(),
-                eliot_store_api::AUTOMATION_STATE_RETIRED.to_owned(),
-            )),
+            } => {
+                // Retirement may not narrow the occurrence denominator: the
+                // retired automation still answers Status and History from the
+                // same immutable invocation rows, so the leg first proves that
+                // the complete obligation set is enumerable at one owner-issued
+                // read revision. The proof runs before the transition is
+                // admitted, so an unrepresentable denominator never retires.
+                self.require_complete_occurrence_denominator(
+                    &request.context.state_fence,
+                    automation_id,
+                )
+                .await?;
+                Ok(automation_state_transition_params(
+                    "remove".to_owned(),
+                    automation_id.clone(),
+                    automation_revision.clone(),
+                    eliot_store_api::AUTOMATION_STATE_RETIRED.to_owned(),
+                ))
+            }
             UserAutomationOperation::RunNow {
                 automation_id,
                 automation_revision,
