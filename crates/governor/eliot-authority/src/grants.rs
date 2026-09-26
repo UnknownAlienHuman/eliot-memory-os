@@ -242,9 +242,9 @@ pub(crate) fn check_narrowing(
     Ok(())
 }
 
-/// Deterministic relation receipt for one quarantined cross-root edge, so
-/// legacy migration replays exactly: the same snapshot always restores the
-/// same relation identity.
+/// Deterministic structural relation ID for one quarantined cross-root edge,
+/// so legacy migration replays exactly: the same snapshot always restores the
+/// same relation identity. This ID is not owner-issued quarantine evidence.
 fn quarantine_relation_id(parent: &GrantId, child: &GrantId) -> String {
     format!(
         "cross_root_quarantine:{}:{}",
@@ -694,13 +694,13 @@ pub enum CrossRootRelationDisposition {
 /// inheritance: exact source and dependent identities, both roots, owner
 /// principals, the dependent's StateFence/Authority Epoch binding, the
 /// revision the relation was quarantined at, and the deterministic relation
-/// receipt. Quarantine is not deletion — the full dependent lineage is
+/// ID. Quarantine is not deletion — the full dependent lineage is
 /// retained — but retaining a record never admits it for authority: this
 /// type is never placed in an [`EffectiveCapabilityPath`], a supporting
 /// introduction ref, or the admitted grant map.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuarantinedCrossRootRelation {
-    /// Deterministic relation receipt for this exact edge.
+    /// Deterministic structural relation ID for this exact edge; not a receipt.
     pub relation_id: String,
     /// Crossing source: the delegating parent grant.
     pub parent_grant_id: GrantId,
@@ -855,35 +855,34 @@ pub struct AuthorizedCrossRootMember {
 /// One quarantined cross-root dependent encountered by a closure.
 ///
 /// The dependent authorizes nothing, but the traversal refused to follow
-/// it, so the verdict binds the exact separate-quarantine receipt: #2100
-/// consumes the receipt instead of fencing an inert identity.
+/// it. The relation ID is structural forensic detail; it does not authorize
+/// omitting the dependent from a complete #2100 fencing denominator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuarantinedFrontierMember {
     /// Quarantined dependent identity.
     pub grant_id: GrantId,
     /// Crossing source identity.
     pub parent_grant_id: GrantId,
-    /// Exact separate-quarantine receipt for this edge.
+    /// Structural relation ID for this edge, retained for forensic reference only.
     pub relation_id: String,
 }
 
 /// Honest revocation-closure state (#2875 item 6).
 ///
-/// A traversal that encounters an active/unresolved cross-root dependent
-/// never reports a clear complete closure merely because it emitted an
-/// omission: completeness requires every encountered dependent in the
-/// affected set or bound to a verified separate-quarantine receipt, and
-/// anything less is an explicit partial/unknown state with the exact
-/// frontier and omissions.
+/// A traversal that encounters a cross-scope omission keeps the exact
+/// omission and dependent in the frontier and reports partial/unknown. A
+/// structural quarantine relation ID may accompany that state for forensics,
+/// but it cannot establish complete closure without owner-qualified evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevocationClosureState {
-    /// Every encountered dependent is in the affected denominator, and
-    /// every omitted cross-root dependent is bound to a verified
-    /// separate-quarantine receipt.
+    /// Every encountered dependent is in the affected denominator; there are
+    /// no unqualified cross-scope omissions in this state. This graph leaves
+    /// the field empty until qualified quarantine proof is available.
     Complete { separately_quarantined: Vec<String> },
     /// Recovery-required: the exact unresolved frontier plus the exact
-    /// engine omissions in engine order. Bound separate-quarantine
-    /// receipts travel alongside so partial progress stays auditable.
+    /// engine omissions in engine order. Structurally matching quarantine
+    /// relation IDs may travel alongside as forensic details; they are not
+    /// separate-quarantine receipts.
     PartialOrUnknown {
         frontier: Vec<String>,
         omissions: Vec<RevocationOmission>,
@@ -896,8 +895,8 @@ pub enum RevocationClosureState {
 ///
 /// The exact verdict the durable descendant-closure fencing owner (#2100)
 /// consumes: the same-root denominator, the receipt-authorized cross-root
-/// descendants with their authorizing receipts, the quarantined frontier
-/// with its separate-quarantine receipts, every traversed transition
+/// descendants with their authorizing receipts, the structural quarantine
+/// frontier with relation IDs for forensics, every traversed transition
 /// receipt, and the honest completeness state reconciling the bounded
 /// engine outcome against the live graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -914,7 +913,8 @@ pub struct RevocationClosureVerdict {
     /// Receipt-authorized cross-root descendants in parent-before-child
     /// order; every member's authority derives through a crossing.
     pub authorized_cross_root: Vec<AuthorizedCrossRootMember>,
-    /// Quarantined dependents encountered with bound receipts.
+    /// Structurally quarantined dependents encountered by the walk. Their
+    /// relation IDs are forensic labels, not proof that omission is complete.
     pub quarantined_frontier: Vec<QuarantinedFrontierMember>,
     /// Every transition receipt authorizing a followed crossing, sorted.
     pub traversed_transitions: Vec<String>,
@@ -1233,11 +1233,11 @@ impl GrantGraph {
         // of an affected in-graph grant must already be suppressed. The
         // verdict reconciles the bounded engine outcome against the live
         // graph: it follows same-root and receipt-authorized parent links,
-        // binds every omitted cross-root dependent to its verified
-        // separate-quarantine receipt, and reports anything less as
+        // preserves omitted cross-scope dependents as unresolved frontier
+        // entries, and reports anything less as
         // partial/unknown — so a partial verdict, or a closure that
         // under-claims its transitive descendants, still refuses. An
-        // omitted dependent without a bound receipt is never silently
+        // omitted dependent without owner-qualified quarantine evidence is never silently
         // cleared. Affected references naming no grant in this graph belong
         // to another graph's denominator and refuse nothing.
         let suppressed_ids: BTreeSet<&str> = suppressed
@@ -1285,11 +1285,11 @@ impl GrantGraph {
     /// The recheck reads the verdict owner, not the bounded engine directly:
     /// [`GrantGraph::revocation_closure_verdict`] reconciles the engine outcome
     /// against the live graph, follows same-root and receipt-authorized parent
-    /// links, binds every omitted cross-root dependent to its verified
-    /// separate-quarantine receipt, and reports anything less as
+    /// links, preserves omitted cross-scope dependents as unresolved frontier
+    /// entries, and reports anything less as
     /// [`RevocationClosureState::PartialOrUnknown`] - so a partial verdict, or a
     /// closure that under-claims its descendants, still refuses, and an omitted
-    /// dependent without a bound receipt is never silently cleared.
+    /// dependent without owner-qualified quarantine evidence is never silently cleared.
     ///
     /// An affected reference naming no grant in this graph belongs to another
     /// graph's denominator and refuses nothing.
@@ -1330,8 +1330,8 @@ impl GrantGraph {
                 .map_err(map_bounded_history_error)?;
             // The verdict has exactly two states, so a non-`Complete` verdict IS
             // the incomplete-coverage cause: the closure could not be proven
-            // whole inside the declared bounds, or an omitted cross-root
-            // dependent carried no verified separate-quarantine receipt.
+            // whole inside the declared bounds, or an omitted cross-scope
+            // dependent lacked owner-qualified quarantine evidence.
             if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
                 return Err(RevocationHistoryError::BoundedRevocation(
                     eliot_influence::InfluenceError::IncompleteCoverage("recovery.closure_verdict"),
@@ -1389,11 +1389,12 @@ impl GrantGraph {
     /// declaration belongs to the hydration layer that serves the full
     /// closure evidence.
     ///
-    /// Receipt-authorized cross-root descendants and quarantined dependents
-    /// are enumerated separately by
+    /// Receipt-authorized cross-root descendants and structural quarantine
+    /// relations are enumerated separately by
     /// [`revocation_closure_verdict`](Self::revocation_closure_verdict),
-    /// which carries the exact authorizing and separate-quarantine receipts
-    /// the durable fencing owner (#2100) consumes.
+    /// which carries authorizing receipts and forensic relation IDs. A
+    /// structural quarantine label cannot authorize omission for the durable
+    /// fencing owner (#2100).
     pub fn delegated_closure(
         &self,
         grant_id: &GrantId,
@@ -1691,8 +1692,8 @@ impl GrantGraph {
         // authority: each is declared with the dedicated cross-scope
         // relation so the omission names the exact refused edge while the
         // full lineage stays visible in the snapshot. Quarantine is not
-        // erasure, and the verdict binds every such omission to its
-        // separate-quarantine receipt.
+        // erasure, and the verdict preserves every such omission and dependent
+        // frontier; relation IDs are forensic details, not closure receipts.
         for relation in self.quarantined.values() {
             edges.push(QualifiedInfluenceEdge::cross_scope(
                 relation.parent_grant_id.as_str().to_owned(),
@@ -1762,9 +1763,9 @@ impl GrantGraph {
         Ok(outcome)
     }
 
-    /// Collects the quarantined dependents whose edge source the walk
-    /// reached: the separate-quarantine frontier the fencing owner (#2100)
-    /// consumes with the verdict.
+    /// Collects the structurally quarantined dependents whose edge source the
+    /// walk reached. Relation IDs remain forensic details in the verdict;
+    /// they do not establish a complete omission for the fencing owner (#2100).
     fn collect_quarantined_frontier(
         &self,
         reached: &BTreeSet<String>,
@@ -1784,10 +1785,10 @@ impl GrantGraph {
 
     /// Reconciles one bounded engine outcome against the structural walk
     /// (#2875 item 6): the engine's affected set must match the reached set
-    /// exactly, and every omitted cross-root dependent must bind to its
-    /// verified separate-quarantine receipt. Returns the frontier refs, the
-    /// bound separate-quarantine receipts, and whether the verdict is
-    /// partial/unknown.
+    /// exactly. Every cross-scope omission remains in the frontier and makes
+    /// the verdict partial/unknown because this graph has no owner-qualified
+    /// quarantine binding. A matching structural relation ID is returned only
+    /// as forensic detail.
     fn reconcile_engine_outcome(
         &self,
         outcome: &eliot_influence::BoundedRevocationOutcome,
@@ -1825,12 +1826,17 @@ impl GrantGraph {
                     partial = true;
                 }
                 OmissionCause::CrossScope => {
-                    if let Some(relation_id) = self.bind_quarantine_omission(omission) {
-                        separately_quarantined.insert(relation_id);
-                    } else {
-                        frontier_refs.insert(omission.edge_dependent.clone());
-                        partial = true;
+                    if let (Ok(source), Ok(dependent)) = (
+                        GrantId::new(omission.edge_source.as_str()),
+                        GrantId::new(omission.edge_dependent.as_str()),
+                    ) && let Some(relation) = self.quarantine_for_edge(&source, &dependent)
+                    {
+                        separately_quarantined.insert(relation.relation_id.clone());
                     }
+                    frontier_refs.insert(omission.edge_dependent.clone());
+                    // A structural relation ID is not owner-issued evidence,
+                    // so no cross-scope omission can close this denominator.
+                    partial = true;
                 }
                 _ => {
                     frontier_refs.insert(omission.edge_dependent.clone());
@@ -1841,15 +1847,6 @@ impl GrantGraph {
         (frontier_refs, separately_quarantined, partial)
     }
 
-    /// Binds one cross-scope omission to its separate-quarantine receipt:
-    /// the exact relation retained for the omitted source/dependent edge.
-    fn bind_quarantine_omission(&self, omission: &RevocationOmission) -> Option<String> {
-        let source = GrantId::new(omission.edge_source.as_str()).ok()?;
-        let dependent = GrantId::new(omission.edge_dependent.as_str()).ok()?;
-        self.quarantine_for_edge(&source, &dependent)
-            .map(|relation| relation.relation_id.clone())
-    }
-
     /// Computes the honest revocation-closure verdict for one grant (#2875
     /// items 6, 7): the exact denominator the durable fencing owner (#2100)
     /// consumes.
@@ -1858,11 +1855,10 @@ impl GrantGraph {
     /// receipt-covered edges — from the origin, recording the same-root
     /// denominator, the receipt-authorized cross-root descendants with
     /// their authorizing receipts, every traversed transition, and the
-    /// quarantined dependents encountered with their separate-quarantine
-    /// receipts. The bounded engine outcome is then reconciled against
-    /// that walk: completeness requires the engine's affected set to match
-    /// the reached set exactly and every omitted cross-root dependent to
-    /// bind to its verified separate-quarantine receipt. Anything less —
+    /// structurally quarantined dependents encountered with their forensic
+    /// relation IDs. The bounded engine outcome is reconciled against that
+    /// walk: completeness requires the engine's affected set to match the
+    /// reached set exactly and contain no cross-scope omissions. Anything less —
     /// an unfinished traversal, a nonempty frontier, an unbound omission,
     /// or a denominator mismatch — is an explicit partial/unknown state
     /// with the exact frontier and omissions, never an omission-labelled
@@ -2119,10 +2115,10 @@ impl GrantGraph {
     /// declared with the dedicated cross-scope influence relation by
     /// [`transitive_revocation_closure`](Self::transitive_revocation_closure),
     /// so the bounded evaluator records a typed `OmissionCause::CrossScope`
-    /// omission naming the exact edge position, and
-    /// [`revocation_closure_verdict`](Self::revocation_closure_verdict)
-    /// binds that omission to the separate-quarantine receipt. Revocation
-    /// cannot widen scope or effect.
+    /// omission naming the exact edge position. The verdict retains the
+    /// dependent in its frontier and remains partial; a matching structural
+    /// relation ID is forensic detail only. Revocation cannot widen scope or
+    /// effect.
     fn validate_edges(&self) -> Result<(), AuthorityError> {
         for child in self.grants.values() {
             let Some(parent_id) = &child.parent_grant_id else {
