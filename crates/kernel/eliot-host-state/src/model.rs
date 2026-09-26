@@ -2029,6 +2029,24 @@ pub struct HostState {
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
     pub applied_operations: Vec<AppliedOperation>,
+    /// Retirement records this Host log durably applied, retained so a reader
+    /// can resolve one retirement by its exact operation identity.
+    ///
+    /// `retired_epochs` keeps only the retired Host epoch, so a caller cannot
+    /// tell which cutover operation produced a retirement, nor when it was
+    /// recorded, nor which evidence it carried; this projection keeps the
+    /// resolved record itself.
+    ///
+    /// The list is bounded: the reducer admits a retirement only for a
+    /// retained epoch that is not already retired, so one epoch contributes at
+    /// most one entry. A later authorized activation-generation change does not
+    /// erase it.
+    ///
+    /// This field grants no authority. `HostState` is a rebuildable read model
+    /// replayed from the durable journal bytes; an entry here is a resolution
+    /// aid, never proof that an effect occurred.
+    #[serde(default)]
+    pub epoch_retirements: Vec<EpochRetirementRecord>,
 }
 
 impl HostState {
@@ -2055,6 +2073,7 @@ impl HostState {
             retained_epochs,
             retired_epochs: Vec::new(),
             applied_operations: Vec::new(),
+            epoch_retirements: Vec::new(),
         }
     }
 }

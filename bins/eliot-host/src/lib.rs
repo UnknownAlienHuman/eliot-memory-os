@@ -4456,10 +4456,12 @@ impl HostComposition {
             &activation_generation,
         )?;
         // Bounded reconciliation closed by a real owner readback under the
-        // same operation identity. The journal retirement receipt is
-        // genuinely absent here: retirement is a separate explicitly
-        // authorized step, so the registry flip alone is the observed proof
-        // and the honest disposition is `RetirementPending`.
+        // same operation identity. The retirement is resolved through the same
+        // journal-owner lookup the disposition port uses, so this projection
+        // never asserts an absent retirement it did not look up, and it never
+        // attaches a presented receipt as if it proved one. The registry flip
+        // alone is therefore the observed proof and the honest disposition is
+        // `RetirementPending`.
         //
         // The projection runs only for a PROVEN commit. An unresolved outcome
         // is returned exactly as its owner observation produced it, so this
@@ -4471,20 +4473,18 @@ impl HostComposition {
             .open_registry_store()?
             .load()
             .map_err(|error| CutoverError::Registry(error.to_string()))?;
+        let durable = self.journal.snapshot().map_err(|error| {
+            CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
+        })?;
+        let retirement =
+            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         let reconciled = reconcile_cutover_outcome(
-            &committed.operation,
+            request,
             true,
-            self.journal
-                .snapshot()
-                .map_err(|error| {
-                    CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
-                })?
-                .pending_cutover
-                .as_ref(),
+            durable.pending_cutover.as_ref(),
             readback.committed_cutover_activation(),
             readback.active_generation(),
-            &validated.request().target_generation,
-            None,
+            &retirement,
         );
         if reconciled.disposition != CutoverDisposition::RetirementPending {
             return Ok((reconciled, barrier));
@@ -4498,14 +4498,21 @@ impl HostComposition {
     ///
     /// [#962](crate::backup_cutover) or the public command surface. It owns no
     /// algorithm. It re-reads the Host journal's own durable cutover
-    /// projection and the installation registry's active generation and
-    /// projects them through
+    /// projection, the installation registry's active generation and its
+    /// operation-bound cutover receipt, and the retirement record the journal
+    /// owner actually applied for this exact cutover operation, then projects
+    /// them through
     /// [`crate::backup_cutover::reconcile_cutover_outcome`], so the returned
     /// disposition is the exact requested/validated/prepared/committed/
     /// reconciled/retirement-pending/failed/unknown state of the operation
-    /// rather than a local assumption. The optional `retirement_receipt` is the
-    /// actual journal `AppendReceipt` read back for this operation identity.
-    /// No cutover effect is performed here and nothing is retried.
+    /// rather than a local assumption, and
+    /// [`crate::backup_cutover::CutoverOutcome::residual`] names whatever
+    /// uncertainty the owners left behind. The optional `retirement_receipt`
+    /// is a lookup HINT, never the proof: it is believed only when it names the
+    /// transaction identity the journal owner computed for the record it
+    /// resolved, so an unrelated genuine `AppendReceipt` cannot produce
+    /// `Reconciled`. No cutover effect is performed here, nothing is appended
+    /// or mutated, and nothing is retried.
     ///
     /// # Errors
     ///
