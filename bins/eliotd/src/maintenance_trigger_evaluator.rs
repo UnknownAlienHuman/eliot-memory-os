@@ -33,8 +33,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_maintenance::{
-    AutomationTriggerDecision, MaintenanceAutomationMode, MaintenanceFamily, MaintenanceTrigger,
-    MaintenanceTriggerInput,
+    AutomationTriggerDecision, MaintenanceFamily, MaintenanceTrigger, MaintenanceTriggerInput,
 };
 
 use super::DaemonComposition;
@@ -47,7 +46,7 @@ use super::DaemonError;
 ///
 /// | Held field | Value | Why it is not `true` | Owning issue |
 /// |---|---|---|---|
-/// | `mode` | [`MaintenanceAutomationMode::Off`] | No Human maintenance-policy owner exists in `eliotd`; `eliot-config` owns only a one-shot *first-run* decision that the daemon runtime never reads. `Off` is I14.22's own "no automatic job or proactive recommendation" value, so an unresolved policy denies automation instead of defaulting to permissive. | #1692, #1693 |
+/// | `mode` | [`Off`](eliot_maintenance::MaintenanceAutomationMode::Off) | No Human maintenance-policy owner exists in `eliotd`; `eliot-config` owns only a one-shot *first-run* decision that the daemon runtime never reads. `Off` is I14.22's own "no automatic job or proactive recommendation" value, so an unresolved policy denies automation instead of defaulting to permissive. Since #1693 the catalog in [`maintenance_family_catalog`] is the single place that states the selected mode per registered family, and this seam reads it from there rather than repeating the literal. | #1692, #1693 |
 /// | `scheduled_window` | `false` | `eliotd` holds no Host wake / Task Scheduler occurrence. Inventing a window is exactly the "locally invented occurrence" #1692 forbids. | #1692 |
 /// | `route_available` | `false` | No maintenance route/credential owner publishes a service-safe route to this daemon. | #1692 |
 /// | `budget_available` | `false` | No maintenance budget/quota owner publishes one. | #1692 |
@@ -120,10 +119,12 @@ pub struct MaintenanceObservation {
     pub origin: MaintenanceTriggerOrigin,
     /// The registered family this trigger concerns.
     ///
-    /// #1693 owns the per-family catalog that maps an observation to its
-    /// family. Until it lands, callers name the self-review family the
-    /// observation actually concerns rather than inventing a maintenance
-    /// route for a family whose execution owner is unverified.
+    /// #1693 owns the per-family catalog in [`maintenance_family_catalog`], and
+    /// this seam resolves every family through it. The family still arrives
+    /// from the caller because it is the caller's real observation: the
+    /// catalog decides the mode, the conditions, the deduplication scope and
+    /// the route for a family, but it cannot invent which family an observed
+    /// signal concerns.
     pub family: MaintenanceFamily,
     /// Real evidence identities observed at the call site.
     ///
@@ -144,11 +145,19 @@ impl DaemonComposition {
     /// built from live observations and the composed owner's
     /// [`MaintenanceController`] does the deciding; this method adds no policy.
     ///
+    /// Since #1693 the per-family facts are read from the registered
+    /// maintenance-family catalog instead of being restated here: the selected
+    /// automation mode and the idempotency/deduplication scope both come from
+    /// the family's own entry, and the entry records the resolved route
+    /// alongside the decision. The catalog does not loosen any gate below and
+    /// does not choose the family; it only supplies what the family owns.
+    ///
     /// The decision is emitted through the existing minimal operational
     /// diagnostics by
     /// [`emit_maintenance_trigger_decision`](crate::diagnostics::emit_maintenance_trigger_decision)
-    /// on every successful evaluation, so the decision is inspectable whether
-    /// or not the caller keeps the returned value.
+    /// on every successful evaluation, and the catalog's route and its one
+    /// actionable recommendation are emitted next to it, so the decision is
+    /// inspectable whether or not the caller keeps the returned value.
     ///
     /// # Errors
     ///
@@ -164,12 +173,20 @@ impl DaemonComposition {
                 eliot_governor::CompositionError::NotReady,
             ));
         }
+        // The registered entry for the observed family. The lookup is total
+        // over `MaintenanceFamily`, so no family can be unregistered here and
+        // no caller-supplied family is ever treated as unrecognised.
+        let entry = crate::maintenance_family_catalog::entry_for(observation.family);
         // The live admitted fence is read here, never taken from the caller:
         // a transported fence claim is not a current observation.
         let state_fence = self.governor.kernel_snapshot().state_fence().clone();
         let scope_ref = scope_ref_for(&state_fence);
+        // The trigger identity carries the catalog's deduplication scope, so
+        // the identity that duplicate suppression compares states which scope
+        // it is, and `MaintenanceController::admit`'s job identity inherits it.
         let trigger_id = format!(
-            "{}:{}:{scope_ref}",
+            "{}:{}:{}:{scope_ref}",
+            entry.dedup.scope_name(),
             observation.origin.as_str(),
             observation.family
         );
@@ -178,9 +195,11 @@ impl DaemonComposition {
             evidence_refs: observation.evidence_refs,
             family: observation.family,
             scope_ref,
-            // Fail-closed: no Human maintenance-policy owner exists here yet
-            // (`UNRESOLVED_AUTHORITIES`). See the module-level table.
-            mode: MaintenanceAutomationMode::Off,
+            // Fail-closed, and now sourced from the registered catalog rather
+            // than repeated here: no Human maintenance-policy owner exists yet
+            // (`UNRESOLVED_AUTHORITIES`, and the table above). See the
+            // module-level table.
+            mode: entry.mode,
             trigger: observation.origin.maintenance_trigger(),
             explicit_request: false,
             // The one gate read from a real observation.
@@ -203,6 +222,12 @@ impl DaemonComposition {
             .maintenance
             .evaluate_trigger(&input)?;
         let _ = crate::diagnostics::emit_maintenance_trigger_decision(&input, &decision);
+        // The catalog's half of the record: which registered family this was,
+        // where its start would have to go, and the exact unavailable
+        // dependency or absent Durable Job route that stops it today. A
+        // triggered family is therefore never silently ignored, and no family
+        // is ever reported as having run.
+        entry.record_start_route(&decision);
         Ok(decision)
     }
 
@@ -238,13 +263,18 @@ fn scope_ref_for(state_fence: &eliot_contracts::StateFence) -> String {
     )
 }
 
-/// The family this daemon's triggers select today.
+/// The family this daemon's wired trigger sites name.
 ///
 /// Every trigger origin currently concerns the daemon's own admitted health
-/// and maintenance debt, which is exactly what I14.22's
-/// `SelfQualityDebt` family ("self-quality, feedback and maintenance-debt
-/// review") covers. #1693 replaces this with the real per-observation family
-/// catalog; naming one family here keeps every decision inspectable and stops
-/// the evaluator from silently claiming maintenance work whose execution owner
-/// has not been proven.
+/// and maintenance debt, which is exactly what I14.22's `SelfQualityDebt`
+/// family ("self-quality, feedback and maintenance-debt review") covers.
+///
+/// #1693 supplied the registered per-family catalog, so this is no longer a
+/// catalog limit: `MaintenanceFamily` carries all fifteen families and
+/// [`maintenance_family_catalog::entry_for`] resolves any of them, and
+/// [`DaemonComposition::evaluate_maintenance_trigger`] routes whichever one the
+/// caller observes. This constant remains the family the daemon's own
+/// observable trigger sites name, because the family is the caller's real
+/// observation and the catalog must not invent which family an observed signal
+/// concerns.
 pub const SELF_OBSERVED_FAMILY: MaintenanceFamily = MaintenanceFamily::SelfQualityDebt;
