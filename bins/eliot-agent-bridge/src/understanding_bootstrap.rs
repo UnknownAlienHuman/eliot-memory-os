@@ -23,6 +23,7 @@
 //! the Governor-owned `TaskSelectionEvidence` where they overlap so the
 //! projection stays comparable without duplicating that contract.
 
+use eliot_governor::ColdStartSurfaceView;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -318,6 +319,93 @@ impl BootstrapContext {
         };
         validate_context(&context)?;
         Ok(context)
+    }
+
+    /// Ref-bound projection constructor over the Governor-compiled readiness
+    /// surface (I4.4.1).
+    ///
+    /// Production intake for a surface the Governor compiler delivered: the
+    /// caller supplies the [`ColdStartSurfaceView`] projected by
+    /// `GovernorComposition::cold_start_surface_for_lease` from the retained
+    /// terminal `OnboardingReadinessReceipt`, plus the owner-produced
+    /// non-readiness context, and this builds the context through
+    /// [`BootstrapContext::from_receipt`] so the same fail-closed validation
+    /// applies. The readiness half (`onboarding_readiness_ref`,
+    /// `onboarding_disposition`, `smallest_missing_question`,
+    /// `lease_deadline`, `receipt_revision`, `workspace_instance_ref`,
+    /// `projection_source_ref`, `projection_generation`) always comes from
+    /// the compiled view; the bridge never invents it. An unknown readiness
+    /// token fails closed with `READINESS_TOKEN_UNKNOWN` instead of guessing
+    /// a disposition.
+    /// Live status: owning intake for the bridge delivery path; the live
+    /// bridge note path supplies no governor surface yet (BLOCKED-BY
+    /// bridge-transport: `BridgeRunner::note_owner_snapshot` intake in
+    /// `bins/eliot-agent-bridge/src/lib.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_compiled_surface(
+        surface: &ColdStartSurfaceView,
+        principal_ref: String,
+        profile_ref: String,
+        workscope_ref: String,
+        revision_refs: Vec<String>,
+        orientation_handles: Vec<String>,
+        attention_handles: Vec<String>,
+        problem_handles: Vec<String>,
+        role_lease_ref: String,
+        state_fence_ref: String,
+        governance: GovernanceEvidence,
+        route_profile_ref: String,
+        decision_safety_floor_refs: Vec<String>,
+        supported_count: u32,
+        verified_count: u32,
+        candidate_count: u32,
+        conflicts_unknowns: Vec<String>,
+        next_safe_expansion: String,
+    ) -> Result<Self, BootstrapError> {
+        let onboarding_disposition = match surface.readiness.as_str() {
+            "UNSEEN" => ReadinessDisposition::Unseen,
+            "SCANNING" => ReadinessDisposition::Scanning,
+            "NEEDS_SCOPE" => ReadinessDisposition::NeedsScope,
+            "NEEDS_TASK" => ReadinessDisposition::NeedsTask,
+            "NEEDS_SOURCES" => ReadinessDisposition::NeedsSources,
+            "READY_READ_ONLY" => ReadinessDisposition::ReadyReadOnly,
+            "READY_MATERIAL" => ReadinessDisposition::ReadyMaterial,
+            "DEGRADED" => ReadinessDisposition::Degraded,
+            "CONFLICTED" => ReadinessDisposition::Conflicted,
+            _ => {
+                return Err(BootstrapError::new(
+                    "READINESS_TOKEN_UNKNOWN",
+                    "compiled readiness token is not a known lifecycle",
+                ));
+            }
+        };
+        Self::from_receipt(
+            surface.receipt_ref.clone(),
+            principal_ref,
+            profile_ref,
+            workscope_ref,
+            onboarding_disposition,
+            surface.smallest_missing_question.clone(),
+            surface.lease_deadline,
+            surface.receipt_revision,
+            revision_refs,
+            orientation_handles,
+            attention_handles,
+            problem_handles,
+            role_lease_ref,
+            state_fence_ref,
+            governance,
+            route_profile_ref,
+            decision_safety_floor_refs,
+            surface.workspace_instance_ref.clone(),
+            surface.projection_source_ref.clone(),
+            surface.projection_generation,
+            supported_count,
+            verified_count,
+            candidate_count,
+            conflicts_unknowns,
+            next_safe_expansion,
+        )
     }
 }
 

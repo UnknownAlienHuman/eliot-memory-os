@@ -57,6 +57,7 @@ mod user_automation_execution_client;
 mod user_automation_failure_history;
 #[cfg(test)]
 mod user_automation_failure_history_tests;
+mod user_automation_runtime_handoff;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
@@ -207,14 +208,18 @@ pub use user_automation::{
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
 pub use user_automation_execution::{
-    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
-    UserAutomationExecutionRequest, UserAutomationFailureHistory, UserAutomationFailureHistoryPort,
-    UserAutomationFailurePublication, UserAutomationFailureRecord,
-    UserAutomationNotificationDelivery, UserAutomationNotificationPort,
-    UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition,
-    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
-    UserAutomationWakeCancellationTarget, UserAutomationWakePort, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback,
+    UserAutomationDueWakeRejection, UserAutomationDueWakeRejectionCause,
+    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationExecutionError,
+    UserAutomationExecutionOutcome, UserAutomationExecutionRequest, UserAutomationFailureHistory,
+    UserAutomationFailureHistoryPort, UserAutomationFailurePublication,
+    UserAutomationFailureRecord, UserAutomationHorizonTrigger, UserAutomationNotificationDelivery,
+    UserAutomationNotificationPort, UserAutomationRemovalResult, UserAutomationRuntimeAdmission,
+    UserAutomationRuntimeComposition, UserAutomationRuntimeError, UserAutomationRuntimePort,
+    UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
+    UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication, UserAutomationWakePort,
+    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    advance_wake_horizon, compile_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
+    resolve_due_wake,
 };
 #[cfg(windows)]
 pub use user_automation_execution_client::AuthenticatedUserAutomationHostExecutionTransport;
@@ -236,6 +241,13 @@ pub use user_automation_execution_client::{
 };
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
+};
+pub use user_automation_runtime_handoff::{
+    USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
+    UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
+    UserAutomationHorizonPhase, UserAutomationOperatorRuntime, UserAutomationOperatorTransition,
+    UserAutomationRecoveryPhase, UserAutomationWakePhase, committed_configuration_state,
+    run_now_wake_read_request,
 };
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,

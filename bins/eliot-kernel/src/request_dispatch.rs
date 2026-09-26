@@ -17,23 +17,48 @@
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
 //!   and reachable through [`KernelComposition::backup_capture`]). The
-//!   manifest, every member disposition, the evidenced class and the
-//!   archive/kernel fence join are the owner's answers: a hex shape and a
-//!   self-reported checksum are never verification. What this proves is
-//!   STRUCTURAL validity plus a join to the live generation - recomputed
-//!   checksums, the class's own requirements and `export_fence.state_fence`
-//!   equality. It is NOT provenance: nothing in the path is signed, `StateFence`
-//!   is publicly observable through `ServerHello`, and no member denominator is
-//!   checked on the verify path. The `eliot-backup` edge this route needs is
-//!   already declared in `bins/eliot-kernel/Cargo.toml`, so no dependency is
-//!   added here. Verification publishes nothing and mutates nothing.
+//!   manifest, every member disposition, the evidenced class, the exact class
+//!   ceiling and the archived-fence relation are the owner's answers: a hex
+//!   shape and a self-reported checksum are never verification. What this
+//!   proves is STRUCTURAL validity plus the archived fence's own validation -
+//!   recomputed checksums, the class's own requirements, and a `StateFence`
+//!   that is either the live session fence or this installation's own earlier
+//!   authority epoch. Exact equality with the live generation is deliberately
+//!   not required: it made a genuine earlier-generation archive unverifiable
+//!   after the restart or epoch rotation at which verification matters most,
+//!   and current-target compatibility plus epoch monotonicity belong to the
+//!   isolated restore/cutover owners (A13.7 "Cutover requires separate
+//!   authority"). It is NOT provenance: nothing in the path is signed,
+//!   `StateFence` is publicly observable through `ServerHello`, and no member
+//!   denominator is checked on the verify path, so the owner answers at the
+//!   structurally-valid-candidate level with no capture receipt. A valid
+//!   degraded or scope class is a real archive with a lower ceiling (I5.13:
+//!   `canonical_only_degraded` "preserves semantic data only and is never
+//!   advertised as operational recovery"; `scope_export` is "not an
+//!   installation backup"), never `invalid`. The `eliot-backup` edge this route
+//!   needs is already declared in `bins/eliot-kernel/Cargo.toml`, so no
+//!   dependency is added here. The archive itself is published nowhere and no
+//!   installation state is mutated, but the decided answer is recorded as one
+//!   durable readback row in the Kernel's existing ORS (issue #2802): keyed by
+//!   the request's own idempotency identity, committed before the reply, and
+//!   read back so an exact replay after a Kernel restart or an Authority Epoch
+//!   rotation returns the same owner-proved answer with its historical fence,
+//!   while a changed archive under the same identity is an `IDENTITY_CONFLICT`
+//!   that performs no transition (I5.27, I14.21). A store outage fails closed
+//!   instead of downgrading to a non-persisted answer, because that would be a
+//!   false proof claim under A0.3.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
 //!   admissibility, provisioning shape, store-level isolation inequality),
-//!   then returns `blocked` naming the Governor-built transitions
-//!   (`governor-restore-transitions`: `CoordinationCommit` plus restore-class
-//!   imports; owning lane Governor/eliotd). Owner-backed gates are marked
-//!   `-deferred` in `gates_passed` and never claimed as proven.
+//!   then returns `blocked` naming the three real owners rather than a
+//!   Governor transition type: the Kernel restore coordinator and the
+//!   production call to it (#960), the owner-issued restore evidence - a
+//!   `RestoreJournalAdmission` plus a `DestinationManifestEvidence` - (#962),
+//!   and the front-door connection (#2569), all open. Measured on this tree,
+//!   none of those three exists yet: there is no `restore_transitions` symbol
+//!   and no `CoordinationCommit` type anywhere, and the composition's
+//!   isolated-restore entry has no production caller. Owner-backed gates are
+//!   marked `-deferred` in `gates_passed` and never claimed as proven.
 //!
 //! The dispatch-matrix arm is [`crate::frame_dispatch`]'s closed `backup`
 //! operation gate; this file holds only the route. The arm fences the frame
@@ -48,8 +73,14 @@
 
 use std::num::NonZeroU64;
 
-use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+use eliot_contracts::{
+    EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
+};
 use eliot_ipc::{PeerIdentity, Session, TransportError};
+use eliot_ors::{
+    BACKUP_VERIFICATION_RESULT_RECORD_TYPE, BackupVerificationDisposition,
+    BackupVerificationResultRecord, CONTRACT_VERSION as ORS_CONTRACT_VERSION, OrsError,
+};
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use serde_json::{Map, Value};
@@ -92,6 +123,20 @@ pub(crate) const BACKUP_TEXT_MAX: usize = 256;
 /// restore-test payload, byte-exact with the CLI surface: a larger presented
 /// set refuses early instead of reaching owner-held verification.
 pub(crate) const BACKUP_INTRODUCTIONS_MAX: usize = 256;
+
+/// Domain separator of the `backup.verify` canonical request digest (I5.27).
+///
+/// I5.27 binds idempotency to canonical bytes rather than to caller spelling, so
+/// the digest needs a named domain that cannot collide with another operation's
+/// digest over the same archive bytes.
+const BACKUP_VERIFY_REQUEST_DOMAIN: &str = "eliot.kernel.backup-verify.request";
+/// Canonical encoding version of the `backup.verify` request digest.
+///
+/// This is I5.27's `canonical_encoding_version`: a move of the number is a new
+/// digest contract, never a silent reinterpretation of a retained one, and no
+/// field that affects authority, scope, ordering, privacy or effect is omitted
+/// or defaulted around it.
+const BACKUP_VERIFY_REQUEST_ENCODING_VERSION: u16 = 1;
 
 /// Gates reported by the restore-test rehearsal, in pass order.
 ///
@@ -485,25 +530,70 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
     )
 }
 
-/// Projects a complete capture-owner verification report into the route's `ok`
-/// envelope.
+/// Every owner-proved value one successful `backup.verify` answer projects.
 ///
-/// Every field is the owner's own answer: the archive identity (bounded to the
-/// same operator text limit the surface applies, so a structurally valid
-/// archive with an over-long identity cannot make the surface return a result
-/// mismatch), the evidenced class under the owner's single class-name spelling,
-/// the archive digest, the verify-only operation identity, the verification
-/// level the owner performed, and the per-domain member counts read from the
-/// owner's own dispositions through the owner's own count helper.
-fn verified_reply(report: &CaptureReport, idempotency_key: &str) -> Value {
-    let event_count = member_domain_count(report, MEMBER_DOMAIN_CANONICAL);
-    let receipt_count = member_domain_count(report, MEMBER_DOMAIN_RECEIPT);
-    let blob_count = member_domain_count(report, MEMBER_DOMAIN_BLOB);
+/// The live owner report and the durable ORS record are both projected into
+/// this one shape, so [`verified_reply`] stays the single wire projection and a
+/// replayed answer cannot drift from a freshly computed one. Every field is an
+/// owner answer: none is derived from the caller's `bundle_hex` spelling, none
+/// is defaulted, and none is inferred from a sibling field.
+struct VerifiedProjection {
+    /// Archive identity the owner proved.
+    backup_id: String,
+    /// Evidenced archive class in the owner's own class-name spelling.
+    class: String,
+    /// The owner's digest of the complete encoded archive.
+    archive_sha256: String,
+    /// The owner's own class-ceiling spelling.
+    class_ceiling: String,
+    /// The evidence level the owner proved.
+    verification_level: String,
+    /// The archived fence's current/historical relation to this target.
+    target_compatibility: String,
+    /// Canonical-member denominator in the owner's own dispositions.
+    event_count: u64,
+    /// Receipt-obligation member denominator in the owner's own dispositions.
+    receipt_count: u64,
+    /// Sealed-blob obligation member denominator in the owner's own
+    /// dispositions. Equal bytes under different obligations stay distinct
+    /// counts instead of being coalesced into one.
+    blob_count: u64,
+    /// Owner-issued publication receipt, explicitly absent when the owner
+    /// issued none.
+    capture_receipt: Option<String>,
+    /// Digest of the canonical request bytes this operation was admitted with.
+    request_digest: String,
+}
+
+/// Projects one verification result into the route's `ok` envelope.
+///
+/// Every field is an owner answer read from `projection`: the archive identity
+/// (bounded to the same operator text limit the surface applies, so a
+/// structurally valid archive with an over-long identity cannot make the surface
+/// return a result mismatch), the evidenced class under the owner's single
+/// class-name spelling, the archive digest, the request's stable operation
+/// identity, the evidence level the owner proved, the exact class ceiling and
+/// archived-fence relation in the owner's own spellings, the capture receipt
+/// (explicitly null when the owner has none), the per-domain member counts read
+/// from the owner's own dispositions, and the canonical request digest this
+/// operation was admitted under.
+///
+/// `operation_id` is the request's stable operation identity the route already
+/// bound (`idempotency_key`), never a minted `verify-only-{backup_id}`: I5.27
+/// defines idempotency over canonical bytes, "not over caller spelling or an
+/// unversioned hash", and the owner only ever reports back the identity its
+/// caller bound.
+///
+/// `request_digest` is additive. It binds this exact answer to the canonical
+/// request bytes that produced it, so a later replay under the same operation
+/// identity can return this same body and can tell a changed archive apart from
+/// it; no existing field is removed, renamed or re-spelled.
+fn verified_reply(projection: &VerifiedProjection, idempotency_key: &str) -> Value {
     // The operator surface applies its own bounded-text check to `bundle_id`
     // and would answer a result mismatch for an over-long identity, so the
     // route refuses with the owner's own class reason instead of emitting an
     // `ok` the surface cannot project.
-    if report.backup_id.len() > BACKUP_TEXT_MAX {
+    if projection.backup_id.len() > BACKUP_TEXT_MAX {
         return invalid_reply(
             BACKUP_VERIFY_OPERATION,
             idempotency_key,
@@ -511,128 +601,506 @@ fn verified_reply(report: &CaptureReport, idempotency_key: &str) -> Value {
             "archive identity exceeds the bounded operator text length",
         );
     }
+    // Explicitly null, never omitted: no retained-artifact owner issues a
+    // capture receipt on this path. The missing symbol is a production
+    // `impl PublicationPort`; the only implementation is `MemPublisher` inside
+    // `bins/eliot-kernel/tests/backup_capture.rs`.
+    let capture_receipt = projection
+        .capture_receipt
+        .clone()
+        .map_or(Value::Null, Value::String);
     backup_reply(
         BACKUP_VERIFY_OPERATION,
         "ok",
         idempotency_key,
         vec![
-            ("bundle_id", Value::String(report.backup_id.clone())),
-            ("class", Value::String(class_name(report.class).to_owned())),
+            ("bundle_id", Value::String(projection.backup_id.clone())),
+            ("class", Value::String(projection.class.clone())),
             (
                 "integrity_sha256",
-                Value::String(report.archive_sha256.clone()),
+                Value::String(projection.archive_sha256.clone()),
             ),
-            ("operation_id", Value::String(report.operation_id.clone())),
+            ("operation_id", Value::String(idempotency_key.to_owned())),
             (
                 "verification_level",
-                Value::String(report.verification_level.to_owned()),
+                Value::String(projection.verification_level.clone()),
             ),
-            ("event_count", Value::from(event_count)),
-            ("receipt_count", Value::from(receipt_count)),
-            ("blob_count", Value::from(blob_count)),
+            (
+                "class_ceiling",
+                Value::String(projection.class_ceiling.clone()),
+            ),
+            (
+                "target_compatibility",
+                Value::String(projection.target_compatibility.clone()),
+            ),
+            ("capture_receipt", capture_receipt),
+            ("event_count", Value::from(projection.event_count)),
+            ("receipt_count", Value::from(projection.receipt_count)),
+            ("blob_count", Value::from(projection.blob_count)),
+            (
+                "request_digest",
+                Value::String(projection.request_digest.clone()),
+            ),
         ],
     )
 }
 
+/// Projects the live owner report into the shared successful-answer shape.
+///
+/// The class ceiling is the owner's own class-evidence value, so its exact
+/// spelling is read through that closed type's serialization instead of a second
+/// hand-written vocabulary here; a ceiling that does not serialize to a JSON
+/// string is a change in that type, and the route refuses rather than projecting
+/// a value the operator surface cannot bound.
+fn projection_from_report(
+    report: &CaptureReport,
+    request_digest: String,
+) -> Result<VerifiedProjection, String> {
+    let Ok(Value::String(class_ceiling)) = serde_json::to_value(report.class_ceiling) else {
+        return Err("class evidence ceiling is not serializable".to_owned());
+    };
+    Ok(VerifiedProjection {
+        backup_id: report.backup_id.clone(),
+        class: class_name(report.class).to_owned(),
+        archive_sha256: report.archive_sha256.clone(),
+        class_ceiling,
+        verification_level: report.evidence_level.as_wire_name().to_owned(),
+        target_compatibility: report.archived_fence_relation.as_wire_name().to_owned(),
+        event_count: member_domain_count(report, MEMBER_DOMAIN_CANONICAL),
+        receipt_count: member_domain_count(report, MEMBER_DOMAIN_RECEIPT),
+        blob_count: member_domain_count(report, MEMBER_DOMAIN_BLOB),
+        capture_receipt: report.receipt_identity.clone(),
+        request_digest,
+    })
+}
+
+/// Projects the durable ORS record into the shared successful-answer shape.
+///
+/// The stored owner answers win over anything recomputed on this call: the
+/// persisted archived-fence relation is the historical one, and re-deriving it
+/// against whatever generation happens to be live now is exactly the drift this
+/// durable row exists to prevent.
+fn projection_from_record(record: &BackupVerificationResultRecord) -> VerifiedProjection {
+    VerifiedProjection {
+        backup_id: record.backup_id.clone(),
+        class: record.class.clone(),
+        archive_sha256: record.archive_sha256.clone(),
+        class_ceiling: record.class_ceiling.clone(),
+        verification_level: record.verification_level.clone(),
+        target_compatibility: record.target_compatibility.clone(),
+        event_count: record.event_count,
+        receipt_count: record.receipt_count,
+        blob_count: record.blob_count,
+        capture_receipt: record.capture_receipt.clone(),
+        request_digest: record.request_digest.clone(),
+    }
+}
+
+/// Binds one fresh owner-proved answer to its operation identity and to the
+/// digest of the exact reply body it projects.
+///
+/// `contract_version` is ORS's own wire/storage version, so a row written under
+/// a different record contract fails its read closed instead of being read back
+/// as the same answer.
+fn record_from_projection(
+    idempotency_key: &str,
+    projection: &VerifiedProjection,
+    reply_digest: String,
+) -> BackupVerificationResultRecord {
+    BackupVerificationResultRecord {
+        contract_version: ORS_CONTRACT_VERSION,
+        idempotency_key: idempotency_key.to_owned(),
+        request_digest: projection.request_digest.clone(),
+        archive_sha256: projection.archive_sha256.clone(),
+        backup_id: projection.backup_id.clone(),
+        class: projection.class.clone(),
+        class_ceiling: projection.class_ceiling.clone(),
+        verification_level: projection.verification_level.clone(),
+        target_compatibility: projection.target_compatibility.clone(),
+        event_count: projection.event_count,
+        receipt_count: projection.receipt_count,
+        blob_count: projection.blob_count,
+        capture_receipt: projection.capture_receipt.clone(),
+        reply_digest,
+    }
+}
+
+/// Computes the canonical request digest of one `backup.verify` operation.
+///
+/// Only owner-proved values enter the preimage: the fixed operation kind, its
+/// canonical encoding version, this operation's domain, and the verification
+/// owner's own digest of the complete encoded archive. The caller's `bundle_hex`
+/// spelling is deliberately excluded - the same bytes re-spelled in another case
+/// must resolve to the same operation, and a caller-authored checksum is not the
+/// owner's answer (see the module docs). I5.27 forbids omitting or defaulting a
+/// field that affects authority, scope, ordering, privacy or effect, so the
+/// preimage names the operation kind and its version instead of a bare archive
+/// digest.
+fn backup_verify_request_digest(archive_sha256: &str) -> Result<String, String> {
+    let preimage = serde_json::json!({
+        "archive_sha256": archive_sha256,
+        "canonical_encoding_version": BACKUP_VERIFY_REQUEST_ENCODING_VERSION,
+        "domain_separator": BACKUP_VERIFY_REQUEST_DOMAIN,
+        "semantic_command_kind": BACKUP_VERIFY_OPERATION,
+    });
+    let bytes = canonical_json_bytes(&preimage).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Digest over the exact reply body one verification projects.
+///
+/// A replay recomputes this against the stored value, so a row that cannot
+/// rebuild the body it claims to hold fails closed instead of projecting a body
+/// it never produced.
+fn reply_body_digest(body: &Value) -> Result<String, String> {
+    let bytes = canonical_json_bytes(body).map_err(|error| error.to_string())?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Projects the I5.27 identity conflict for a reused operation identity.
+///
+/// Reusing an idempotency key with a different canonical request hash returns
+/// `IDENTITY_CONFLICT` and performs no transition, so the refusal names the two
+/// bounded digests and nothing else: no archive bytes, no caller text, and no
+/// stored answer is projected into a refusal. `bound_request_digest` is
+/// optional because a conflict observed at stage time can be answered before the
+/// bound row could be read back.
+fn identity_conflict_reply(
+    idempotency_key: &str,
+    bound_request_digest: Option<&str>,
+    presented_request_digest: &str,
+) -> Value {
+    let reason = bound_request_digest.map_or_else(
+        || {
+            format!(
+                "IDENTITY_CONFLICT: idempotency key is already bound to a different canonical request than {presented_request_digest}; no transition"
+            )
+        },
+        |bound| {
+            format!(
+                "IDENTITY_CONFLICT: idempotency key already bound to request digest {bound}; presented request digest {presented_request_digest}; no transition"
+            )
+        },
+    );
+    backup_reply(
+        BACKUP_VERIFY_OPERATION,
+        "invalid",
+        idempotency_key,
+        vec![
+            ("code", Value::String("identity_conflict".to_owned())),
+            ("field", Value::String("backup.verify".to_owned())),
+            ("reason", Value::String(bounded_reason(&reason))),
+        ],
+    )
+}
+
+/// Fail-closed reply used when no durable row backs this operation identity.
+///
+/// A store outage must never silently downgrade to a non-persisted answer: a
+/// verification that claims `ok` with nothing recorded behind it is a false
+/// proof claim under A0.3. The route refuses instead of answering from a
+/// recompute it could not bind to an operation identity. The store's own error
+/// text is deliberately not relayed here, because the operator surface prints
+/// `reason` verbatim and a durable-store error can name local paths.
+fn verification_not_recorded_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        "the durable verification result store did not record this operation, so no verification result is answered; this is not a verification answer",
+    )
+}
+
+/// Returns whether one durable-store failure is the I5.27 identity conflict
+/// rather than an outage.
+///
+/// The store reports a binding conflict through the same typed integrity error
+/// it uses for every record family, distinguished by the record type, so the
+/// route reads the published record-type constant instead of matching error
+/// prose or inventing a second error type.
+fn is_backup_verification_conflict(error: &OrsError) -> bool {
+    matches!(
+        error,
+        OrsError::IntegrityProblem { record_type, .. }
+            if *record_type == BACKUP_VERIFICATION_RESULT_RECORD_TYPE
+    )
+}
+
+/// Returns the refusal for an owner state that is not a decided verification.
+///
+/// `Complete` and `Incomplete` both answer `ok`: a structurally valid archive
+/// of a degraded class is a real archive with a lower ceiling, not a corrupt
+/// one. I5.13 gives each class its own explicit wording -
+/// `canonical_only_degraded` "preserves semantic data only and is never
+/// advertised as operational recovery" and `scope_export` is "not an
+/// installation backup" - and the owner's `class_ceiling` and `evidence_level`
+/// carry that lower bound explicitly, so reporting it as `invalid` would
+/// misstate a good archive. Only an undecided or refused owner state (`Unknown`,
+/// `Cancelled`, `Unsupported`) keeps the stable-prose refusal, and no other
+/// check is weakened.
+fn undecided_report_reply(report: &CaptureReport, idempotency_key: &str) -> Option<Value> {
+    if matches!(
+        report.state,
+        CaptureState::Complete | CaptureState::Incomplete { .. }
+    ) {
+        return None;
+    }
+    let reason = match &report.state {
+        CaptureState::Unknown { reason } | CaptureState::Unsupported { reason } => reason.clone(),
+        // Every remaining terminal state is reported with stable prose rather
+        // than a Rust `Debug` name, so no owner state leaks an internal enum
+        // spelling onto the operator wire.
+        CaptureState::Cancelled => "capture owner cancelled the verification".to_owned(),
+        CaptureState::Complete | CaptureState::Incomplete { .. } => {
+            "capture owner reported a decided state after a decided-state refusal".to_owned()
+        }
+    };
+    Some(invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.class",
+        &bounded_reason(&reason),
+    ))
+}
+
+/// What the durable store already holds for one verification operation.
+///
+/// `Absent` is a positive fact about the store, not an unknown answer: it means
+/// this operation identity was never recorded, so the caller may verify and
+/// stage exactly once. It is never produced from a store failure, because a
+/// failure that degraded to `Absent` would answer `ok` for a result nothing
+/// recorded. The bound record is boxed so this two-variant shape stays small
+/// next to `Absent`.
+enum PriorVerification {
+    /// No durable row owns this operation identity yet.
+    Absent,
+    /// A durable owner-backed result already owns this operation identity.
+    Bound(Box<BackupVerificationResultRecord>),
+}
+
+/// Admits the bounded inline bundle bytes one verify frame presents.
+///
+/// Every refusal here is a shape failure decided before any owner is named: a
+/// non-object payload, an unexpected or missing key, a non-string or non-hex
+/// `bundle_hex`, and empty bytes. The returned field and reason are the route's
+/// own shape vocabulary; the owner's refusal vocabulary is never used for a
+/// shape the owner never saw.
+fn admit_verify_bundle(payload: &Value) -> Result<Vec<u8>, (&'static str, String)> {
+    let Some(object) = payload.as_object() else {
+        return Err(("backup.verify", "payload must be a JSON object".to_owned()));
+    };
+    if let Err(reason) = require_exact_keys(object, &["bundle_hex"]) {
+        return Err(("backup.verify", reason));
+    }
+    let bundle_hex = match get_str(object, "bundle_hex") {
+        Ok(bundle_hex) => bundle_hex,
+        Err(reason) => return Err(("backup.bundle_hex", reason)),
+    };
+    let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
+        Ok(bundle_raw) => bundle_raw,
+        Err(reason) => return Err(("backup.bundle_hex", reason)),
+    };
+    if bundle_raw.is_empty() {
+        return Err((
+            "backup.bundle_hex",
+            "bundle bytes must be non-empty".to_owned(),
+        ));
+    }
+    Ok(bundle_raw)
+}
+
+/// Answers from the durable owner-backed result that owns this operation.
+///
+/// A different canonical request hash under the same key is the I5.27 identity
+/// conflict: the request performs no transition, and the stored answers are not
+/// projected into a refusal. An equal hash replays the persisted result, whose
+/// stored answers win over anything recomputed on this call, so an exact replay
+/// after a Kernel restart or an Authority Epoch rotation reports the historical
+/// archived-fence relation and the exact receipt proved then. The stored reply
+/// digest is recomputed and must match; a row that cannot rebuild the body it
+/// claims to hold fails closed instead of projecting one it never produced.
+fn answer_bound_verification(
+    record: &BackupVerificationResultRecord,
+    fresh: &VerifiedProjection,
+    idempotency_key: &str,
+) -> Value {
+    if record.request_digest != fresh.request_digest {
+        return identity_conflict_reply(
+            idempotency_key,
+            Some(record.request_digest.as_str()),
+            fresh.request_digest.as_str(),
+        );
+    }
+    let body = verified_reply(&projection_from_record(record), idempotency_key);
+    match reply_body_digest(&body) {
+        Ok(digest) if digest == record.reply_digest => body,
+        _ => verification_not_recorded_reply(idempotency_key),
+    }
+}
+
 impl KernelComposition {
     /// Handles one backup verify frame: admits the bounded inline bundle bytes,
-    /// then decodes and validates them through the real capture owner.
+    /// then decodes and validates them through the real capture owner and binds
+    /// the decided answer to this operation's durable identity.
     ///
     /// The owner is [`super::backup_capture::KernelBackupCapture`], already bound
     /// on the composition by #959; this route supplies only what a front door
     /// legitimately holds: the presented bytes, the session's own admission
-    /// projection, and the Kernel's live state fence. Manifest, member integrity,
-    /// the closed class rules and the archive/kernel fence join are the owner's
-    /// answers, so a corrupted archive refuses as a typed `invalid` carrying the
-    /// owner's own reason instead of a shape check passing. Shape failures refuse
-    /// as `invalid` before the owner is called at all.
+    /// projection, the Kernel's live state fence, and the request's stable
+    /// operation identity. Manifest, member integrity, the closed class rules
+    /// and the archived-fence relation are the owner's answers, so a corrupted
+    /// archive refuses as a typed `invalid` carrying the owner's own reason
+    /// instead of a shape check passing. Shape failures refuse as `invalid`
+    /// before the owner is called at all.
+    ///
+    /// The durable readback is consulted before the expensive recompute, and a
+    /// store outage fails closed there: an answer must never be returned for a
+    /// result that could not be bound to this operation's identity. A decided
+    /// answer is recorded under the request's own idempotency key before it is
+    /// returned, so an exact replay after a Kernel restart or an Authority Epoch
+    /// rotation reads the same owner-backed result back - retaining its
+    /// historical fence and its exact member denominators - while a changed
+    /// archive under the same identity is an `IDENTITY_CONFLICT` that performs
+    /// no transition (I5.27, I14.21).
+    ///
+    /// The command stays read-only in every other respect: no restore, no
+    /// activation, no cutover, no key availability, no Product readiness and no
+    /// installation mutation. The added effect is one durable readback row.
     fn handle_backup_verify(
         &self,
         session: &Session,
         payload: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TransportError> {
-        let Some(object) = payload.as_object() else {
-            return Ok(invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                "backup.verify",
-                "payload must be a JSON object",
-            ));
-        };
-        if let Err(reason) = require_exact_keys(object, &["bundle_hex"]) {
-            return Ok(invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                "backup.verify",
-                &reason,
-            ));
-        }
-        let bundle_hex = match get_str(object, "bundle_hex") {
-            Ok(bundle_hex) => bundle_hex,
-            Err(reason) => {
-                return Ok(invalid_reply(
-                    BACKUP_VERIFY_OPERATION,
-                    idempotency_key,
-                    "backup.bundle_hex",
-                    &reason,
-                ));
-            }
-        };
-        let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
+        let bundle_raw = match admit_verify_bundle(payload) {
             Ok(bundle_raw) => bundle_raw,
-            Err(reason) => {
+            Err((field, reason)) => {
                 return Ok(invalid_reply(
                     BACKUP_VERIFY_OPERATION,
                     idempotency_key,
-                    "backup.bundle_hex",
+                    field,
                     &reason,
                 ));
             }
         };
-        if bundle_raw.is_empty() {
-            return Ok(invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                "backup.bundle_hex",
-                "bundle bytes must be non-empty",
-            ));
-        }
         let caller = admit_backup_caller(session)?;
+        let Ok(prior) = self.load_prior_verification(idempotency_key) else {
+            return Ok(verification_not_recorded_reply(idempotency_key));
+        };
         let report = match self.backup_capture().verify_only(
             &bundle_raw,
             &caller,
             &session.module_generation.state_fence,
+            idempotency_key,
         ) {
             Ok(report) => report,
             Err(error) => return Ok(capture_error_reply(idempotency_key, &error)),
         };
-        // The owner reports class completeness, and the operator surface promotes
-        // an `ok` envelope to a verified archive. A degraded or scope class is
-        // structurally valid but cannot claim completeness, so it refuses with the
-        // owner's own reason instead of being promoted.
-        if !matches!(report.state, CaptureState::Complete) {
-            let reason = match &report.state {
-                CaptureState::Incomplete { reason } | CaptureState::Unknown { reason } => {
-                    reason.clone()
-                }
-                // Every remaining terminal state is reported with stable prose
-                // rather than a Rust `Debug` name, so no owner state leaks an
-                // internal enum spelling onto the operator wire.
-                CaptureState::Cancelled => "capture owner cancelled the verification".to_owned(),
-                CaptureState::Unsupported { reason } => reason.clone(),
-                CaptureState::Complete => {
-                    "capture owner reported completeness after a completeness refusal".to_owned()
-                }
-            };
-            return Ok(invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                "backup.class",
-                &bounded_reason(&reason),
-            ));
+        if let Some(refusal) = undecided_report_reply(&report, idempotency_key) {
+            return Ok(refusal);
         }
-        Ok(verified_reply(&report, idempotency_key))
+        let Ok(request_digest) = backup_verify_request_digest(&report.archive_sha256) else {
+            return Ok(verification_not_recorded_reply(idempotency_key));
+        };
+        let fresh = match projection_from_report(&report, request_digest) {
+            Ok(fresh) => fresh,
+            Err(reason) => {
+                return Ok(invalid_reply(
+                    BACKUP_VERIFY_OPERATION,
+                    idempotency_key,
+                    "backup.class_ceiling",
+                    &bounded_reason(&reason),
+                ));
+            }
+        };
+        Ok(self.answer_backup_verify(prior, &fresh, idempotency_key))
+    }
+
+    /// Reads the durable verification result already bound to this operation.
+    ///
+    /// A store failure is returned, never flattened into "absent": a store
+    /// outage that silently downgraded to a non-persisted answer would let this
+    /// route answer `ok` for a verification with no durable result behind it,
+    /// which A0.3 classifies as a false proof claim. The caller fails closed.
+    fn load_prior_verification(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<PriorVerification, OrsError> {
+        match self
+            .p07_ors
+            .load_backup_verification_result(idempotency_key)?
+        {
+            Some(record) => Ok(PriorVerification::Bound(Box::new(record))),
+            None => Ok(PriorVerification::Absent),
+        }
+    }
+
+    /// Answers one decided verification from the owner report and the store.
+    ///
+    /// Every branch either replays the persisted owner-backed result or records
+    /// the fresh one first, so an `ok` reply never precedes its durable row.
+    fn answer_backup_verify(
+        &self,
+        prior: PriorVerification,
+        fresh: &VerifiedProjection,
+        idempotency_key: &str,
+    ) -> Value {
+        match prior {
+            PriorVerification::Bound(record) => {
+                answer_bound_verification(&record, fresh, idempotency_key)
+            }
+            PriorVerification::Absent => self.stage_backup_verification(fresh, idempotency_key),
+        }
+    }
+
+    /// Records the fresh owner-proved answer and returns the body to send.
+    ///
+    /// Persist-before-answer: the durable row is committed before the body is
+    /// returned, so a lost response reconciles to this same persisted result
+    /// (I14.21) rather than re-deriving a differently-fenced one. A concurrent
+    /// stage that already bound this key is answered from the durable winner.
+    fn stage_backup_verification(
+        &self,
+        fresh: &VerifiedProjection,
+        idempotency_key: &str,
+    ) -> Value {
+        let body = verified_reply(fresh, idempotency_key);
+        let Ok(reply_digest) = reply_body_digest(&body) else {
+            return verification_not_recorded_reply(idempotency_key);
+        };
+        let record = record_from_projection(idempotency_key, fresh, reply_digest);
+        match self.p07_ors.stage_backup_verification_result(&record) {
+            Ok(BackupVerificationDisposition::Stored) => body,
+            Ok(BackupVerificationDisposition::AlreadyBound(bound)) => {
+                answer_bound_verification(&bound, fresh, idempotency_key)
+            }
+            Err(error) => self.answer_failed_stage(&fresh.request_digest, idempotency_key, &error),
+        }
+    }
+
+    /// Answers after the durable stage did not succeed.
+    ///
+    /// The I5.27 identity conflict is the one stage failure that is an answer
+    /// rather than an outage, so the bound digest is read back to make the
+    /// refusal concrete. Every other failure is an outage: the effect was not
+    /// recorded, and this route must not answer `ok` for it.
+    fn answer_failed_stage(
+        &self,
+        presented_request_digest: &str,
+        idempotency_key: &str,
+        error: &OrsError,
+    ) -> Value {
+        if !is_backup_verification_conflict(error) {
+            return verification_not_recorded_reply(idempotency_key);
+        }
+        let bound = match self
+            .p07_ors
+            .load_backup_verification_result(idempotency_key)
+        {
+            Ok(Some(record)) => Some(record.request_digest),
+            Ok(None) | Err(_) => None,
+        };
+        identity_conflict_reply(idempotency_key, bound.as_deref(), presented_request_digest)
     }
 }
 
@@ -784,11 +1252,14 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
 /// waits for the owner edge; each entry must already be a JSON object so
 /// malformed rows refuse before any owner readback.
 ///
-/// Execution itself refuses with `plan_gap` naming the Governor-built
-/// coordination commit plus restore-class imports (owning lane
-/// Governor/eliotd, open): committing or importing without them would
-/// fabricate Governor authority, and rehearsal never activates, retires, or
-/// cuts over.
+/// Execution itself refuses with `plan_gap` naming the real owners rather
+/// than a Governor transition type: the Kernel restore coordinator and the
+/// production call to it (#960), the owner-issued `RestoreJournalAdmission`
+/// and `DestinationManifestEvidence` (#962), and the front-door connection
+/// (#2569), all open. Provisioning the isolated destination, admitting the
+/// durable ORS restore journal and importing restore-class bytes without that
+/// owner evidence would fabricate owner authority, and rehearsal never
+/// activates, retires, or cuts over.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear shape-validation sequence per rehearsal gate; splitting it would hide the exact admission order the blocked reply reports"
@@ -975,14 +1446,14 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
             (
                 "missing_owner",
                 Value::String(
-                    "governor-restore-transitions (CoordinationCommit plus restore-class imports; owning lane Governor/eliotd)"
+                    "backup-restore-owners (#960 Kernel restore coordinator and its production call; #962 owner-issued RestoreJournalAdmission and DestinationManifestEvidence; #2569 front-door connection)"
                         .to_owned(),
                 ),
             ),
             (
                 "reason",
                 Value::String(
-                    "gates proven through the rehearsal shape path; execution needs the Governor-built coordination commit plus restore-class imports, which no owner supplies yet"
+                    "the six rehearsal shape gates ran for real; the isolated destination, the durable ORS journal admission and the restore-class import are owner evidence no production owner supplies, and the composition's isolated-restore entry has no production caller"
                         .to_owned(),
                 ),
             ),

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use eliot_contracts::{EpochContractError, EpochId as EpochIdentity, EpochTransition};
+use eliot_contracts::{EpochContractError, EpochId as EpochIdentity, EpochTransition, StateFence};
 use eliot_observation_contracts::ObservationRecordEnvelope;
 use eliot_platform::{HostProcessNonce, KernelActivationNonce, PlatformHandle, PortOutcome};
 use eliot_runtime_contracts::{
@@ -1201,7 +1201,17 @@ pub struct DrainRecord {
     /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
     /// so a required field would make every installed v3 frame fail
     /// `decode_record_for_replay` and render the whole epoch unloadable.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` is equally mandatory, for the same reason
+    /// `EpochRetirementRecord::predecessor_relation` carries it (#2868):
+    /// `record_checksum` hashes the RE-SERIALIZED record, so emitting
+    /// `"expected_predecessor":null` for a frame written without the key would
+    /// change that frame's checksum and therefore its recomputed transaction
+    /// identity. The field was added to the frozen v3 schema without it, so
+    /// every drain frame persisted before that change re-serializes
+    /// differently; omitting the member keeps those frames byte-identical to the
+    /// shape they were written with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_predecessor: Option<String>,
 }
 
@@ -1596,6 +1606,176 @@ impl CleanMarker {
     }
 }
 
+/// Domain separator and contract revision of [`PredecessorRetirementRelation`].
+///
+/// The relation is a closed, versioned record. The version is part of the
+/// canonical bytes hashed into `relation_digest`, so a future revision of this
+/// contract cannot be replayed as this one.
+pub const PREDECESSOR_RETIREMENT_RELATION_CONTRACT: &str =
+    "eliot.host.predecessor-retirement-relation.v1";
+
+/// Owner-issued proof that one exact installation generation was carried by one
+/// exact Host epoch, issued for one cutover operation (#2868).
+///
+/// # Why this record exists
+///
+/// A cutover names its predecessor as a GENERATION (`PlatformHandle`, compared
+/// against the installation registry's `active_generation()`), while the Host
+/// journal owns EPOCHS. Before this record the retirement effect accepted the
+/// epoch to retire as an independent parameter and proved only that it was
+/// *some* unretired prior epoch of the same installation. With two outstanding
+/// prior epochs that proof is satisfied by the wrong one, so the effect and the
+/// `Reconciled` disposition it reported were not bound to the predecessor the
+/// cutover actually consumed.
+///
+/// Nothing else in the durable state preserves the mapping for a PREDECESSOR.
+/// The installation registry does construct the join - `ActivationCommitFence`
+/// pairs an approved `generation: PlatformHandle` with a mandatory
+/// `phase_b_live_binding` naming the Host epoch - but for the activation being
+/// COMMITTED, and staging a new approved generation clears the registry's single
+/// such fence, which the cutover's own target staging does before its CAS. The
+/// Host journal's `CutoverIntentRecord` names installation generations, but its
+/// `RecordFence` binds them to the epoch that PERFORMED the cutover, never to the
+/// epoch that carried the predecessor generation. This record is therefore the
+/// only place the predecessor's mapping can be preserved, and it is preserved by
+/// whoever can prove it, not by the retirement effect.
+///
+/// # Effect identity
+///
+/// Every field that affects authority, scope, ordering, privacy or effect is
+/// inside `relation_digest`, and [`PredecessorRetirementRelation::validate`]
+/// RE-DERIVES that digest from the field values instead of shape-checking it. A
+/// changed mapping under one `cutover_operation` identity therefore cannot keep
+/// the original digest and cannot pass validation with it (I5.27).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredecessorRetirementRelation {
+    /// [`PREDECESSOR_RETIREMENT_RELATION_CONTRACT`], exactly.
+    pub contract: PlatformHandle,
+    /// Installation whose registry owns the predecessor generation.
+    pub installation: PlatformHandle,
+    /// Exact expected predecessor generation this cutover consumed.
+    pub predecessor_generation: PlatformHandle,
+    /// Exact Host epoch that carried `predecessor_generation`.
+    pub retired_host: HostInstallationEpoch,
+    /// Canonical `(installation, epoch)` digest of `retired_host`, recomputed by
+    /// [`host_owner_epoch_digest`]. Present so a reader can match the epoch
+    /// without re-deriving it, and checked so the two cannot disagree.
+    pub retired_host_epoch_digest: PlatformHandle,
+    /// Activation the issuer recorded for the predecessor it retires.
+    pub activation_id: PlatformHandle,
+    /// Host activation lineage the issuer recorded for `retired_host`.
+    pub activation_generation: EpochTransition,
+    /// Authority fence under which the issuer observed the mapping.
+    pub state_fence: StateFence,
+    /// The cutover operation identity this relation is issued for. A relation
+    /// is operation-specific: a different operation does not inherit it.
+    pub cutover_operation: IdempotencyIdentity,
+    /// Owner that issued the relation.
+    pub relation_issuer: PlatformHandle,
+    /// Owner-recorded issuance instant.
+    pub issued_at: PlatformHandle,
+    /// Canonical digest over the contract separator and every field above.
+    pub relation_digest: PlatformHandle,
+}
+
+impl PredecessorRetirementRelation {
+    /// The canonical digest this relation's own field values produce.
+    ///
+    /// Deterministic and versioned: the contract separator is the first tuple
+    /// element, so a later revision of this contract cannot produce this
+    /// revision's digest. `relation_digest` is excluded because it is the value
+    /// being checked; including it would be circular.
+    fn canonical_digest(&self) -> Result<PlatformHandle, JournalError> {
+        let bytes = serde_json::to_vec(&(
+            PREDECESSOR_RETIREMENT_RELATION_CONTRACT,
+            &self.installation,
+            &self.predecessor_generation,
+            &self.retired_host,
+            &self.retired_host_epoch_digest,
+            &self.activation_id,
+            &self.activation_generation,
+            &self.state_fence,
+            &self.cutover_operation,
+            &self.relation_issuer,
+            &self.issued_at,
+        ))
+        .map_err(|error| {
+            JournalError::Invalid(format!("predecessor_relation is not encodable: {error}"))
+        })?;
+        PlatformHandle::new(format!("{:x}", Sha256::digest(bytes)))
+            .map_err(|error| JournalError::Invalid(format!("predecessor_relation digest: {error}")))
+    }
+
+    fn validate(&self) -> Result<(), JournalError> {
+        if self.contract.as_str() != PREDECESSOR_RETIREMENT_RELATION_CONTRACT {
+            return Err(JournalError::Invalid(
+                "predecessor_relation.contract is not the accepted relation contract".to_owned(),
+            ));
+        }
+        handle(&self.installation, "predecessor_relation.installation")?;
+        handle(
+            &self.predecessor_generation,
+            "predecessor_relation.predecessor_generation",
+        )?;
+        self.retired_host.validate()?;
+        if self.retired_host.installation != self.installation {
+            return Err(JournalError::Invalid(
+                "predecessor_relation.retired_host belongs to another installation".to_owned(),
+            ));
+        }
+        // The epoch digest is not decorative: it is re-derived from the epoch it
+        // claims, so the two can never name different Host epochs.
+        let expected = host_owner_epoch_digest(&self.retired_host)?;
+        if self.retired_host_epoch_digest != expected {
+            return Err(JournalError::Invalid(
+                "predecessor_relation.retired_host_epoch_digest does not match retired_host"
+                    .to_owned(),
+            ));
+        }
+        handle(&self.activation_id, "predecessor_relation.activation_id")?;
+        validate_epoch_transition(&self.activation_generation)?;
+        self.state_fence.validate().map_err(|error| {
+            JournalError::Invalid(format!("predecessor_relation.state_fence: {error}"))
+        })?;
+        self.cutover_operation.validate()?;
+        handle(
+            &self.relation_issuer,
+            "predecessor_relation.relation_issuer",
+        )?;
+        handle(&self.issued_at, "predecessor_relation.issued_at")?;
+        // Re-derived, not shape-checked: the digest is a real commitment over the
+        // mapping. A changed generation or epoch under one operation identity
+        // cannot pass with the previous digest.
+        if self.relation_digest != self.canonical_digest()? {
+            return Err(JournalError::Invalid(
+                "predecessor_relation.relation_digest does not match the relation contents"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this relation's GENERATION half names the request's exact
+    /// expected predecessor generation of this exact installation.
+    ///
+    /// The generation side only. Whether the relation's `retired_host` is the
+    /// epoch the record actually retired is a SEPARATE comparison, deliberately
+    /// not folded in here: the record owner enforces that pairing
+    /// ([`EpochRetirementRecord::validate`]), and a caller that satisfied a
+    /// one-sided join would be recreating the defect this relation exists to
+    /// remove.
+    pub fn maps_generation(
+        &self,
+        installation: &PlatformHandle,
+        predecessor: &PlatformHandle,
+    ) -> bool {
+        self.installation == *installation
+            && self.predecessor_generation == *predecessor
+            && self.retired_host.installation == *installation
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpochRetirementRecord {
@@ -1604,6 +1784,32 @@ pub struct EpochRetirementRecord {
     pub retired_host: HostInstallationEpoch,
     pub retirement_evidence_refs: Vec<PlatformHandle>,
     pub retired_at: PlatformHandle,
+    /// Owner-issued predecessor-generation-to-Host-epoch relation for this
+    /// retirement (#2868).
+    ///
+    /// `default` is mandatory, not stylistic: `EpochRetirementRecord` and
+    /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
+    /// so a required field would make every already-installed v3 frame fail
+    /// `decode_record_for_replay` and render the whole epoch unloadable.
+    ///
+    /// `None` is a legacy record written before the relation existed. It stays
+    /// historical evidence with a LOWER proof ceiling: the status binder
+    /// requires a relation for exact completion, so a legacy record can never
+    /// close predecessor retirement and can never produce `Reconciled`.
+    ///
+    /// `skip_serializing_if` is a correctness requirement here, not an
+    /// optimization. `record_checksum` is a SHA-256 over the RE-SERIALIZED
+    /// record, and `query_epoch_retirement` recomputes the transaction identity
+    /// from that checksum. Emitting `"predecessor_relation":null` for a record
+    /// that was persisted without the key would change the checksum of every
+    /// already-installed v3 frame, so its recomputed transaction identity would
+    /// stop matching the durably recorded one - which would turn a genuine
+    /// historical retirement into an absent one and a byte-identical re-append
+    /// into an idempotency conflict. Omitting the member when it is absent is
+    /// what keeps a legacy record serializing byte-identically to the shape it
+    /// was written with. `default` remains required for the decode direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_relation: Option<PredecessorRetirementRelation>,
 }
 
 impl EpochRetirementRecord {
@@ -1616,7 +1822,23 @@ impl EpochRetirementRecord {
             "retirement_evidence_refs",
             true,
         )?;
-        handle(&self.retired_at, "retired_at")
+        handle(&self.retired_at, "retired_at")?;
+        if let Some(relation) = &self.predecessor_relation {
+            relation.validate()?;
+            // The relation and the record name one retirement. A record whose
+            // relation maps a DIFFERENT epoch than the record retires is
+            // internally contradictory, and the journal owner refuses it here
+            // rather than letting a reader pick the side it prefers.
+            if relation.retired_host != self.retired_host
+                || relation.installation != self.retired_host.installation
+            {
+                return Err(JournalError::Invalid(
+                    "predecessor_relation names a different retired epoch than the record"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

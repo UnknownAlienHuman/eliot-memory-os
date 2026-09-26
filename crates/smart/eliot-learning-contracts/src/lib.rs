@@ -48,7 +48,13 @@ pub use promotion::{
     HistoryRetention, PromotionBoundaryCandidate, PromotionMutationTarget, RolloutBoundary,
 };
 pub use state_view::{
-    CampaignLearningStateView, Completeness, LearningStateViewRecipe, MemberProjection,
-    OmissionPolicy, OwnerDisagreement, SlotDisposition, SlotProjection, SlotRequirement, SlotSpec,
-    SourceDenominator,
+    CampaignActiveOverlayPolicy, CampaignHistoryPlanReference, CampaignLearningStateProvenance,
+    CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
+    CampaignPositionRef, CampaignSlotProjectionDigest, CampaignSourceBinding,
+    CampaignSourceRequirement, CampaignSourceResolution, CampaignSourceResolutionStatus,
+    CampaignSourceRevisionRef, CampaignSourceRole, CampaignViewRebuildReason, Completeness,
+    LearningStateViewRecipe, MemberProjection, OmissionPolicy, OwnerDisagreement, SlotDisposition,
+    SlotProjection, SlotRequirement, SlotSpec, SourceDenominator,
 };
+
+pub use state_view::TASK_CONTROLLER_CAMPAIGN_OWNER_ID;

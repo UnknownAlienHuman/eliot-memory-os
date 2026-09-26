@@ -37,6 +37,13 @@ pub const WASM_HOST_MATERIAL_FILE_NAME: &str = "eliot-wasm-host.admitted-dispatc
 pub const WASM_HOST_GUEST_ARTIFACT_FILE_NAME: &str = "eliot-wasm-host.guest-artifact.bin";
 /// Colocated guest input file name staged with the material.
 pub const WASM_HOST_GUEST_INPUT_FILE_NAME: &str = "eliot-wasm-host.guest-input.bin";
+/// Kernel control-request file name staged beside the delivery set while the
+/// loop runs. One `WasmHostRequestFrame` JSON document naming the running
+/// operation; the loop's installed control reader polls it for external
+/// Cancel/Reconcile/Shutdown. Same loader-derived directory rule as the
+/// delivery set; the owner publisher stays the authority for the staged
+/// value.
+pub const WASM_HOST_CONTROL_FILE_NAME: &str = "eliot-wasm-host.control-request.json";
 /// Material envelope wire identity, matched exactly with the publisher.
 pub const WASM_DISPATCH_MATERIAL_WIRE_ID: &str = "eliot.wasm.dispatch-material";
 /// Material envelope wire version, matched exactly with the publisher.

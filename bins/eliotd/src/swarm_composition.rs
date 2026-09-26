@@ -9,8 +9,9 @@
 //! [`CanonicalSwarmPlanAttachmentStore`]) -> swarm consumer (vend port, pinned
 //! handle, attach through the port) -> `AdapterRegistry` surface (route
 //! adjudication: admitted, revoked, stale; first launch per class pins the
-//! admitted generation and later drift is blocked with no silent
-//! substitution) -> native-worker dispatch
+//! admitted generation, adapter-entry digest, and generation fingerprint,
+//! and later drift is blocked with no silent substitution) -> native-worker
+//! dispatch
 //! (persist intent before executor call) -> reconciliation (rehydrate after
 //! restart, reconcile nonterminal children before any relaunch, bounded
 //! cancel drain to `terminal_ready`).
@@ -211,6 +212,16 @@ pub struct AttachedPlan {
 /// sealed attachment. The cancel path resolves the slot to this identity
 /// from the ledger-persisted intent; rehydration refuses a persisted intent
 /// whose cancellation identity does not match the derivation.
+///
+/// The registry half of the lineage travels as opaque caller-projected
+/// material mirroring `eliot-swarm` `RegistryRouteAdjudication`: the
+/// adapter-entry digest and the generation fingerprint pin per route class
+/// exactly like `generation`, so a replaced backing adapter under an
+/// admitted class cannot silently substitute a new result for the same
+/// logical attempt. The Kernel `#22` one-shot permit itself never travels
+/// here (opaque, non-`Clone`, consumed at the executor boundary); the
+/// process receipt arrives after launch through runner observation, and the
+/// result identity through the exact terminal kind, never as intent fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildLaunchIntent {
     /// Stable operation identity `job_handle:plan_revision:slot`.
@@ -233,6 +244,16 @@ pub struct ChildLaunchIntent {
     pub route_class: String,
     /// Generation pinned to this launch by the generation-permit owner.
     pub generation: u64,
+    /// Registry adapter-entry digest the launch was sealed against.
+    ///
+    /// Opaque caller-projected material: this module never touches the
+    /// registry itself. Pinned per route class on first launch; later drift
+    /// is refused with no silent substitution.
+    pub adapter_entry_digest: [u8; 32],
+    /// Opaque generation fingerprint bound to `generation` by the
+    /// generation-permit owner. Pinned per route class like `generation`;
+    /// drift is refused.
+    pub generation_fingerprint: [u8; 32],
 }
 
 /// Bounded drain decision for one attached swarm plan denominator.
@@ -437,15 +458,13 @@ fn expected_cancellation_id(operation_id: &str) -> String {
     format!("{operation_id}-cancel")
 }
 
-/// Reads the admitted generation pin for one route class, if any.
+/// Reads the admitted route pin for one route class, if any.
 ///
 /// Returns `None` for a class with no launch yet under the attached plan;
-/// the first launch pins it (see [`SwarmComposition::launch_child`]).
-fn pinned_generation(bindings: &[(String, u64)], route_class: &str) -> Option<u64> {
-    bindings
-        .iter()
-        .find(|(class, _)| class == route_class)
-        .map(|(_, generation)| *generation)
+/// the first launch pins generation, adapter digest, and generation
+/// fingerprint together (see [`SwarmComposition::launch_child`]).
+fn find_pin<'b>(bindings: &'b [RouteBindingPin], route_class: &str) -> Option<&'b RouteBindingPin> {
+    bindings.iter().find(|pin| pin.class == route_class)
 }
 
 /// Verifies one launch intent's lineage against the sealed attachment.
@@ -516,35 +535,63 @@ fn check_intent_lineage(
     Ok(())
 }
 
+/// Admitted route pin for one route class under the attached plan.
+///
+/// The first launch per class pins the generation, the registry
+/// adapter-entry digest, and the opaque generation fingerprint together: a
+/// replaced backing route or adapter under an admitted class carries
+/// different material, and launching it under the attached plan would
+/// silently substitute a new result for the same logical scope. Pins rebuild
+/// from the ledger on rehydration, so a restart cannot revive stale route
+/// authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RouteBindingPin {
+    /// Registry-admitted route class this pin seals.
+    class: String,
+    /// Generation admitted for the class at pin time.
+    generation: u64,
+    /// Adapter-entry digest admitted for the class at pin time.
+    adapter_digest: [u8; 32],
+    /// Generation fingerprint admitted for the class at pin time.
+    generation_fingerprint: [u8; 32],
+}
+
 /// Verifies one ledger-persisted intent against the sealed attachment and
 /// folds its route binding into the rebuilt pins.
 ///
 /// Runs [`check_intent_lineage`] first, then folds the route binding:
-/// intents disagreeing on one class generation under the sealed attachment
-/// are `InternalContract` (the ledger cannot have drifted through
+/// intents disagreeing on one class generation, adapter digest, or
+/// generation fingerprint under the sealed attachment are `InternalContract`
+/// (the ledger cannot have drifted through
 /// [`SwarmComposition::launch_child`], so disagreement is refused rather
 /// than narrowed).
 fn reconcile_persisted_intent(
     intent: &ChildLaunchIntent,
     sealed: &AttachedPlan,
-    bindings: &mut Vec<(String, u64)>,
+    bindings: &mut Vec<RouteBindingPin>,
 ) -> Result<(), SwarmCompositionError> {
     check_intent_lineage(intent, sealed)?;
-    match bindings
-        .iter()
-        .find(|(class, _)| *class == intent.route_class)
-    {
-        Some((_, pinned)) if *pinned != intent.generation => {
+    match bindings.iter().find(|pin| pin.class == intent.route_class) {
+        Some(pinned)
+            if pinned.generation != intent.generation
+                || pinned.adapter_digest != intent.adapter_entry_digest
+                || pinned.generation_fingerprint != intent.generation_fingerprint =>
+        {
             Err(SwarmCompositionError::InternalContract {
                 detail: format!(
-                    "persisted intents disagree on route {:?} generation under the sealed attachment",
+                    "persisted intents disagree on route {:?} generation, adapter digest, or generation fingerprint under the sealed attachment",
                     intent.route_class
                 ),
             })
         }
         Some(_) => Ok(()),
         None => {
-            bindings.push((intent.route_class.clone(), intent.generation));
+            bindings.push(RouteBindingPin {
+                class: intent.route_class.clone(),
+                generation: intent.generation,
+                adapter_digest: intent.adapter_entry_digest,
+                generation_fingerprint: intent.generation_fingerprint,
+            });
             Ok(())
         }
     }
@@ -722,17 +769,18 @@ pub struct SwarmComposition<'a, L: LaunchIntentLedger, R: ChildRunner> {
     plan: Option<AttachedPlan>,
     launched: Vec<ChildLaunchIntent>,
     reconciled: bool,
-    /// Route-class → generation pins admitted by the first launch per class
-    /// under the attached plan (stale-route gate, item A8).
+    /// Route-class pins admitted by the first launch per class under the
+    /// attached plan (stale-route gate, item A8).
     ///
     /// A replaced backing route under an admitted class carries a different
-    /// generation; launching it under the attached plan would silently
-    /// substitute a new result for the same logical scope, so drift from the
-    /// pin is [`SwarmCompositionError::RouteBlocked`]. Pins rebuild from the
+    /// generation, adapter digest, or generation fingerprint; launching it
+    /// under the attached plan would silently substitute a new result for
+    /// the same logical scope, so drift from the pin is
+    /// [`SwarmCompositionError::RouteBlocked`]. Pins rebuild from the
     /// ledger on [`SwarmComposition::rehydrate_after_restart`], so a restart
     /// cannot revive stale route authority (A0.3 hard boundary: restoration
     /// of revoked influence after recovery fails closed).
-    route_bindings: Vec<(String, u64)>,
+    route_bindings: Vec<RouteBindingPin>,
 }
 
 impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
@@ -861,16 +909,17 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// [`RegistryRouteStatus::Admitted`] with a non-blank route class
     /// (revoked, stale, or blank is [`SwarmCompositionError::RouteBlocked`]
     /// with no fallback); a route class launched before under this attached
-    /// plan keeps its admitted generation — drift is
+    /// plan keeps its admitted generation, adapter-entry digest, and
+    /// generation fingerprint — drift in any of the three is
     /// [`SwarmCompositionError::RouteBlocked`] with no silent substitution
     /// (stale-route gate, item A8: provider/route replacement cannot revive
     /// stale child authority under the same plan); the launch intent,
     /// carrying the deterministic attempt and cancellation identities plus
-    /// the Governor-validated fence digest, passes the shared lineage check
-    /// (the same check rehydration applies to persisted intents) and is then
-    /// appended to the durable ledger BEFORE the runner is called; the runner
-    /// call happens exactly once per appended intent. A runner failure after
-    /// a persisted
+    /// the Governor-validated fence digest and the pinned registry material,
+    /// passes the shared lineage check (the same check rehydration applies
+    /// to persisted intents) and is then appended to the durable ledger
+    /// BEFORE the runner is called; the runner call happens exactly once per
+    /// appended intent. A runner failure after a persisted
     /// append propagates as [`SwarmCompositionError::OwnerFailure`] while
     /// the intent stays persisted with unknown outcome — it reconciles
     /// through [`SwarmComposition::rehydrate_after_restart`], never by
@@ -893,6 +942,8 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         route: RegistryRouteStatus,
         route_class: &str,
         generation: u64,
+        adapter_entry_digest: [u8; 32],
+        generation_fingerprint: [u8; 32],
     ) -> Result<ChildLaunchIntent, SwarmCompositionError> {
         let plan = self
             .plan
@@ -911,12 +962,15 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             }
         }
         require_text(route_class, "route_class")?;
-        if let Some(pinned) = pinned_generation(&self.route_bindings, route_class)
-            && pinned != generation
+        if let Some(pinned) = find_pin(&self.route_bindings, route_class)
+            && (pinned.generation != generation
+                || pinned.adapter_digest != adapter_entry_digest
+                || pinned.generation_fingerprint != generation_fingerprint)
         {
             return Err(SwarmCompositionError::RouteBlocked {
                 detail: format!(
-                    "route {route_class:?} generation drift under the attached plan: admitted {pinned}, requested {generation}"
+                    "route {route_class:?} generation, adapter digest, or generation fingerprint drift under the attached plan: admitted generation {pinned_generation}, requested {generation}",
+                    pinned_generation = pinned.generation,
                 ),
             });
         }
@@ -937,6 +991,8 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
             fence_digest: plan.fence_digest.clone(),
             route_class: route_class.to_owned(),
             generation,
+            adapter_entry_digest,
+            generation_fingerprint,
         };
         // Lineage self-check before anything persists: the fresh intent runs
         // the same [`check_intent_lineage`] rehydration applies to persisted
@@ -948,11 +1004,16 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // No runner call happens before this append returns.
         let _sequence = self.ledger.append_intent(&intent)?;
         // Pin the admitted route binding once the intent is durable: later
-        // launches under this plan must present the same generation for the
-        // class, and rehydration rebuilds the pins from the ledger.
-        if pinned_generation(&self.route_bindings, route_class).is_none() {
-            self.route_bindings
-                .push((route_class.to_owned(), generation));
+        // launches under this plan must present the same generation, adapter
+        // digest, and generation fingerprint for the class, and rehydration
+        // rebuilds the pins from the ledger.
+        if find_pin(&self.route_bindings, route_class).is_none() {
+            self.route_bindings.push(RouteBindingPin {
+                class: route_class.to_owned(),
+                generation,
+                adapter_digest: adapter_entry_digest,
+                generation_fingerprint,
+            });
         }
         self.launched.push(intent.clone());
         self.runner.launch(&intent).map_err(|error| match error {
@@ -1065,7 +1126,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // lineage.
         let persisted = self.ledger.intents();
         let mut children = Vec::with_capacity(persisted.len());
-        let mut bindings: Vec<(String, u64)> = Vec::new();
+        let mut bindings: Vec<RouteBindingPin> = Vec::new();
         for intent in &persisted {
             reconcile_persisted_intent(intent, sealed, &mut bindings)?;
             let state = self.runner.observe(&intent.slot)?;

@@ -70,7 +70,9 @@ pub const LEGACY_CANDIDATE_SCHEMA_V5: &str = "eliot-agent-api/v5:CapabilityRoute
 /// Case-insensitive secret/credential markers that must never enter a public
 /// receipt field. The list is intentionally narrow: each marker names a
 /// credential or secret transport (`bearer` tokens, private keys, API keys,
-/// passwords, cookies, authorization headers) rather than ordinary
+/// passwords, cookies, authorization headers, bare `sk-` provider key
+/// material, the `auth.json` credential filename, Windows absolute-path
+/// `:\` and Unix home-directory `/home/` locators) rather than ordinary
 /// operational vocabulary, so redaction never fires on plain provider
 /// status text such as `provider rejected request`.
 const FORBIDDEN_PUBLIC_ERROR_MARKERS: &[&str] = &[
@@ -80,18 +82,88 @@ const FORBIDDEN_PUBLIC_ERROR_MARKERS: &[&str] = &[
     "privatekey",
     "api_key",
     "apikey",
+    "api-key",
     "client_secret",
     "passwd",
     "password",
     "secret",
+    "cookie",
     "set-cookie",
     "authorization:",
     "token=",
+    "sk-",
+    "auth.json",
+    ":\\",
+    "/home/",
 ];
 
 /// Placeholder recorded when an adapter error message carries nothing
 /// publishable after sanitization.
 const REDACTED_PUBLIC_ERROR: &str = "redacted-provider-error";
+
+/// Fixed diagnostic issued by the ACP production terminal assembly for a
+/// non-terminal envelope
+/// (`AcpResultEnvelope::assemble_candidate_result`): the only caller-owned
+/// fixed reason flowing through the adapter-error boundary. The wire message
+/// of a provider error is untrusted input and never an entry.
+const ACP_TERMINAL_ASSEMBLY_DIAGNOSTIC: &str =
+    "acp result envelope is not terminal; outcome unreconciled";
+
+/// Closed adapter-boundary registry of permitted public diagnostics (issue
+/// #2641): exact fixed strings authored by ELIOT trusted caller code, never
+/// provider prose. An arbitrary marker-free provider string is not certified
+/// safe and never qualifies, so [`sanitize_adapter_error`] admits a message
+/// verbatim only on exact equality with one of these entries and discards
+/// everything else to [`REDACTED_PUBLIC_ERROR`]. Entries are added only
+/// together with the real production caller that issues them.
+pub const PERMITTED_PUBLIC_ERROR_DIAGNOSTICS: &[&str] = &[ACP_TERMINAL_ASSEMBLY_DIAGNOSTIC];
+
+/// Explicit code identity of the ELIOT caller authorized to issue one fixed
+/// public diagnostic through the adapter-error boundary (issue #2641). Each
+/// variant names one concrete production code site, never a broad trust
+/// class: a new admitted diagnostic requires a new variant together with the
+/// real caller that issues its fixed text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustedAdapterDiagnosticCaller {
+    /// `AcpResultEnvelope::assemble_candidate_result`: non-terminal envelope
+    /// terminal assembly issuing the fixed unreconciled-outcome reason.
+    AcpTerminalAssembly,
+}
+
+/// Narrow caller-side trusted-code mapping (issue #2641): admits a
+/// caller-supplied reason verbatim only when the explicit caller identity
+/// and the candidate text exactly equal one registered pair, returning the
+/// canonical registry entry. The match is exact equality on the trimmed
+/// input (no slicing, no case folding, no prefix or code-shape pattern), so
+/// unknown free-form provider prose never qualifies and no JSON-RPC/ACP
+/// numeric code is assigned public meaning here. A miss returns `None` so
+/// the caller falls through to [`sanitize_adapter_error`], which yields the
+/// explicit `redacted-provider-error` fallback for unestablished content.
+/// Designated production caller: `AcpResultEnvelope::into_agent_result`
+/// (fed by `assemble_candidate_result` and `drain_wire_result`).
+#[must_use]
+pub fn resolve_trusted_adapter_diagnostic(
+    caller: TrustedAdapterDiagnosticCaller,
+    candidate: &str,
+) -> Option<&'static str> {
+    let trimmed = candidate.trim();
+    match caller {
+        TrustedAdapterDiagnosticCaller::AcpTerminalAssembly
+            if trimmed == ACP_TERMINAL_ASSEMBLY_DIAGNOSTIC =>
+        {
+            Some(ACP_TERMINAL_ASSEMBLY_DIAGNOSTIC)
+        }
+        TrustedAdapterDiagnosticCaller::AcpTerminalAssembly => None,
+    }
+}
+
+/// Reports whether a trimmed adapter-error message is an admitted public
+/// diagnostic: exact equality with one entry of
+/// [`PERMITTED_PUBLIC_ERROR_DIAGNOSTICS`]. Exact comparison performs no
+/// slicing, so it is UTF-8 safe by construction for any non-ASCII input.
+fn is_permitted_public_diagnostic(trimmed: &str) -> bool {
+    PERMITTED_PUBLIC_ERROR_DIAGNOSTICS.contains(&trimmed)
+}
 
 /// Byte-preserving ASCII case-insensitive credential-marker screen (issue
 /// #2641). Markers are ASCII, so stepping over the original string's char
@@ -117,7 +189,12 @@ fn contains_forbidden_marker(text: &str) -> bool {
 /// boundary (issue #369 W20/A21, hardened by issue #2641). The whole
 /// untrusted message is discarded to the existing `redacted-provider-error`
 /// fallback whenever it is credential-bearing, oversized, control-bearing,
-/// or otherwise not an establishable permitted public diagnostic: label-only
+/// or unestablished: only an exact [`PERMITTED_PUBLIC_ERROR_DIAGNOSTICS`]
+/// entry passes verbatim, because an arbitrary marker-free string is not
+/// certified safe and every other unestablished content takes the explicit
+/// fallback. Caller-owned fixed reasons keep their meaning through the
+/// narrow [`resolve_trusted_adapter_diagnostic`] caller-identity mapping,
+/// not a permissive pattern. Label-only
 /// redaction would retain values such as `password=DEMO_VALUE_123` while
 /// defeating the validator's keyword check, and parsing a credential grammar
 /// to keep surrounding prose is rejected in favor of discarding. Control
@@ -147,6 +224,13 @@ pub fn sanitize_adapter_error(raw: &str) -> String {
         return REDACTED_PUBLIC_ERROR.to_owned();
     }
     if contains_forbidden_marker(trimmed) {
+        return REDACTED_PUBLIC_ERROR.to_owned();
+    }
+    // Unestablished content is never certified safe: only an exact
+    // caller-owned permitted diagnostic passes verbatim (exact equality, no
+    // slicing, so non-ASCII input stays panic-free); unknown free-form prose
+    // takes the explicit fallback.
+    if !is_permitted_public_diagnostic(trimmed) {
         return REDACTED_PUBLIC_ERROR.to_owned();
     }
     // Truncation only removes a suffix, so it cannot introduce markers or
@@ -192,6 +276,27 @@ fn validate_bounded_text(
     }
     if value.chars().count() > max_chars {
         return Err(ContractError::OversizeField { field });
+    }
+    Ok(())
+}
+
+/// Validates a bounded public handle/reason reference: bounded text plus the
+/// same credential-marker screen as [`validate_safe_public_error`]. Sibling
+/// public receipt fields (`unobserved_reason`, `recovery_ref`,
+/// `restricted_raw_error_ref`, `raw_evidence_ref`) must never smuggle the
+/// secret/credential/path content that the safe-error field rejects (issue
+/// #369 A21): only `safe_public_error` was marker-screened, so an absolute
+/// credential path or a bare provider key survived into the public receipt
+/// through these fields. A marker-bearing handle fails closed with
+/// [`ContractError::ForbiddenContent`] instead of entering the receipt.
+fn validate_public_handle(value: &str, field: &'static str) -> Result<(), ContractError> {
+    validate_bounded_text(value, field, MAX_TEXT_REF_CHARS)?;
+    let value_lower = value.to_lowercase();
+    if FORBIDDEN_PUBLIC_ERROR_MARKERS
+        .iter()
+        .any(|marker| value_lower.contains(marker))
+    {
+        return Err(ContractError::ForbiddenContent { field });
     }
     Ok(())
 }
@@ -807,19 +912,19 @@ impl PhysicalRouteObservationReceipt {
             return Err(ContractError::InvalidRouteDisposition);
         }
         if let Some(reference) = &self.recovery_ref {
-            validate_bounded_text(reference, "recovery_ref", MAX_TEXT_REF_CHARS)?;
+            validate_public_handle(reference, "recovery_ref")?;
         }
         if self.raw_evidence_ref.is_some() != self.raw_evidence_digest.is_some() {
             return Err(ContractError::InvalidRouteDisposition);
         }
         if let Some(reference) = &self.raw_evidence_ref {
-            validate_bounded_text(reference, "raw_evidence_ref", MAX_TEXT_REF_CHARS)?;
+            validate_public_handle(reference, "raw_evidence_ref")?;
         }
         if let Some(message) = &self.safe_public_error {
             validate_safe_public_error(message)?;
         }
         if let Some(reference) = &self.restricted_raw_error_ref {
-            validate_bounded_text(reference, "restricted_raw_error_ref", MAX_TEXT_REF_CHARS)?;
+            validate_public_handle(reference, "restricted_raw_error_ref")?;
         }
         self.state_fence
             .validate()
@@ -869,9 +974,7 @@ impl PhysicalRouteObservationReceipt {
                     return Err(ContractError::InvalidRouteDisposition);
                 }
                 match &self.unobserved_reason {
-                    Some(reason) => {
-                        validate_bounded_text(reason, "unobserved_reason", MAX_TEXT_REF_CHARS)
-                    }
+                    Some(reason) => validate_public_handle(reason, "unobserved_reason"),
                     None => Err(ContractError::MissingObservationReason),
                 }
             }

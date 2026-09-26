@@ -38,6 +38,25 @@
 //! process exit. Verification-only decodes and validates with zero restore
 //! calls and zero installation mutation.
 //!
+//! Proof levels this coordinator reports (issue #2802):
+//!
+//! - Every result names its own evidence level ([`CaptureEvidenceLevel`]) and
+//!   its exact class ceiling (`BackupClass::evidence_level`): I5.13 keeps
+//!   `canonical_only_degraded` "preserves semantic data only and is never
+//!   advertised as operational recovery" and `scope_export` "not an
+//!   installation backup", and states "Backup existence is not recovery
+//!   proof", so a degraded class reports its own lower ceiling instead of
+//!   being promoted to recovery or collapsed into corruption.
+//! - The archived fence is validated internally and related to the live session
+//!   fence as current or historical ([`ArchivedFenceRelation`]): a restart,
+//!   generation change, or epoch rotation must not make a genuine earlier
+//!   archive unverifiable, and current-target compatibility plus epoch
+//!   monotonicity stay with the isolated restore/cutover owners (A13.7
+//!   "Cutover requires separate authority").
+//! - The reported operation identity is only ever the identity the admitted
+//!   caller bound: I5.27 defines idempotency over canonical bytes, "not over
+//!   caller spelling or an unversioned hash", so this owner never mints one.
+//!
 //! Capability cell: Kernel capture ownership (cross-owner capture execution).
 //! Forbidden authority: no ORS row reinterpretation, no epoch minting, no
 //! cutover, no activation/retirement of any installation, no second archive
@@ -48,9 +67,9 @@ use std::path::{Path, PathBuf};
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupInput, CanonicalRecord,
-    ExportFence, HostStateAuditFence, OrsSnapshotFence, WatchdogSpoolFence,
+    ExportFence, HostStateAuditFence, OrsSnapshotFence, RestoreEvidenceLevel, WatchdogSpoolFence,
 };
-use eliot_contracts::StateFence;
+use eliot_contracts::{EpochRelation, StateFence};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -144,9 +163,99 @@ pub enum CaptureState {
     Unknown { reason: String },
 }
 
+/// The closed evidence level this owner actually proved for one result
+/// (issue #2802 instruction 1).
+///
+/// The level is the owner's own answer about what it did, never a value a
+/// caller infers from the reply shape: `verification_level` on the wire is
+/// exactly the spelling `as_wire_name` returns here. I5.13 keeps "Backup
+/// existence is not recovery proof", so the three levels below are separated
+/// rather than collapsed into one Boolean-like "verified" claim.
+///
+/// The fourth level of #2802 instruction 1 — restore rehearsal / readiness —
+/// is deliberately NOT represented here and remains outside this command: it
+/// needs the isolated restore and cutover owners, and this owner performs no
+/// restore call and mutates nothing.
+///
+/// A [`StructurallyValidCandidate`] is never promoted to
+/// [`ProvenanceBoundCapture`] by this owner, because no retained-artifact owner
+/// exists in the repository today: there is no production
+/// `impl PublicationPort` (the only implementation is `MemPublisher` inside
+/// `bins/eliot-kernel/tests/backup_capture.rs`), and
+/// `KernelBackupCapture::capture` / `request_from_ports` have zero production
+/// callers. Nothing here may invent a capture receipt to cross that gap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureEvidenceLevel {
+    /// Bytes that decode and validate internally; carries no retained capture
+    /// receipt, so it is an untrusted candidate.
+    StructurallyValidCandidate,
+    /// Bound to a retained capture artifact handle plus its owner-issued
+    /// publication receipt.
+    ProvenanceBoundCapture,
+    /// Provenance-bound AND class/compatibility qualified.
+    ClassQualified,
+}
+
+impl CaptureEvidenceLevel {
+    /// Stable operator/wire spelling of this owner's evidence level.
+    ///
+    /// The front-door projection reads this one value instead of restating a
+    /// level literal, so renaming a level changes exactly one place.
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::StructurallyValidCandidate => "structurally-valid-candidate",
+            Self::ProvenanceBoundCapture => "provenance-bound-capture",
+            Self::ClassQualified => "class-qualified",
+        }
+    }
+}
+
+/// The closed relation between an archive's own fence and the live session
+/// fence (issue #2802 instruction 4).
+///
+/// The archived fence is validated internally — `BackupBundle::validate`
+/// already calls `ExportFence::validate` (which validates
+/// `state_fence.validate()` and `consistent`) and already binds the fence to
+/// the archive's own manifest through `export_fence_sha256` — and this relation
+/// adds no weakening of either check. It records only whether the archive is
+/// the current fence or this installation's own earlier authority.
+///
+/// Current-target compatibility and epoch monotonicity are separate decisions
+/// owned by the isolated restore/cutover owners, because A13.7 states "Cutover
+/// requires separate authority" and old sessions, leases, approvals, and epochs
+/// do not revive. A stale or foreign archive may therefore be incompatible for
+/// this target without being structurally corrupt, and this command reports
+/// that honestly instead of refusing the archive or promoting it to recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchivedFenceRelation {
+    /// The archived fence is the live fence of the operation: either it equals
+    /// the session fence the route supplied, or this owner is the producer and
+    /// published it from its own frozen export fence in the same operation.
+    CurrentSession,
+    /// The archived fence is an older epoch on this installation's own
+    /// authority lineage: this installation's history, accepted rather than
+    /// refused.
+    HistoricalAuthority,
+}
+
+impl ArchivedFenceRelation {
+    /// Stable operator/wire spelling of the archived-fence relation.
+    ///
+    /// Bound in one place beside the classification so the front door never
+    /// restates the relation as its own literal.
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::CurrentSession => "current-session",
+            Self::HistoricalAuthority => "historical-authority",
+        }
+    }
+}
+
 /// Outcome of one capture or verification: the requested class, exact
-/// source and archive identities, verification level, member dispositions,
-/// and terminal state.
+/// source and archive identities, evidence level, class ceiling, archived-fence
+/// relation, member dispositions, and terminal state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureReport {
     /// Archive backup identity bound at build.
@@ -155,17 +264,31 @@ pub struct CaptureReport {
     pub class: BackupClass,
     /// Deterministic digest of the complete encoded archive.
     pub archive_sha256: String,
-    /// Publication operation identity (or the verify-only identity).
+    /// Operation identity of this result. Capture mints it once at the single
+    /// publication; verification only reports back the identity its admitted
+    /// caller bound, because I5.27 defines idempotency over canonical bytes and
+    /// not over caller spelling, so this owner never invents one.
     pub operation_id: String,
     /// Terminal capture state (never recovered, activated, cut-over, or
     /// finished).
     pub state: CaptureState,
-    /// Verification level performed (`build-validate-publish` for capture,
-    /// `decode-validate-relation` for verification-only).
-    pub verification_level: &'static str,
+    /// Evidence level this owner proved, from
+    /// [`CaptureEvidenceLevel`]: the owner's own answer, never a value a
+    /// caller infers.
+    pub evidence_level: CaptureEvidenceLevel,
+    /// Exact class-specific restore proof ceiling for this archive's class,
+    /// read from [`BackupClass::evidence_level`]. I5.13 keeps a degraded class
+    /// from ever being advertised as operational recovery, so the ceiling is
+    /// reported beside the state rather than encoded into it.
+    pub class_ceiling: RestoreEvidenceLevel,
+    /// Whether the archive's fence is the current session fence or this
+    /// installation's own earlier authority; see [`ArchivedFenceRelation`].
+    pub archived_fence_relation: ArchivedFenceRelation,
     /// Exactly one disposition per expected source member.
     pub member_dispositions: Vec<(String, String)>,
-    /// Publication receipt identity, or the suspended-operations marker.
+    /// Publication receipt identity, or the suspended-operations marker. It is
+    /// absent on the verification-only path because no retained-artifact owner
+    /// issues a receipt there, and absence stays explicit rather than inferred.
     pub receipt_identity: Option<String>,
 }
 
@@ -271,7 +394,16 @@ impl KernelBackupCapture {
             archive_sha256,
             operation_id,
             state,
-            verification_level: "build-validate-publish",
+            // The capture really did build, validate and publish once through
+            // the admitted port, so it is the class/compatibility qualified
+            // level; the class ceiling still bounds what the archive may claim.
+            evidence_level: CaptureEvidenceLevel::ClassQualified,
+            class_ceiling: bundle.manifest.class.evidence_level(),
+            // The producing operation is this owner: the published fence is the
+            // frozen export fence of the operation in flight, so no historical
+            // relation applies. The verify path is where a carried archive
+            // carries an earlier generation's fence.
+            archived_fence_relation: ArchivedFenceRelation::CurrentSession,
             member_dispositions,
             receipt_identity,
         })
@@ -279,9 +411,15 @@ impl KernelBackupCapture {
 
     /// Verifies one archive without restoration effects or installation
     /// mutation: admitted gate, `BackupBundle::decode` plus repeated
-    /// validation, and an exact kernel-fence compatibility check. No
-    /// publication happens here and nothing is mutated (`&self` only); the
-    /// report state follows class completeness.
+    /// validation, and a historical relation between the archived fence and the
+    /// live session fence. No publication happens here and nothing is mutated
+    /// (`&self` only); the report state follows class completeness.
+    ///
+    /// `operation_id` is the identity the admitted caller already bound. This
+    /// owner reports it back and never mints one: I5.27 defines idempotency
+    /// over canonical bytes, "not over caller spelling or an unversioned hash",
+    /// so a fabricated `verify-only-{backup_id}` would be a spelling, not an
+    /// operation identity.
     #[allow(
         clippy::unused_self,
         reason = "governed owner seam keeps &self receivers; the work root binds composition"
@@ -291,6 +429,7 @@ impl KernelBackupCapture {
         bytes: &[u8],
         caller: &CaptureCallerAuth,
         kernel_fence: &StateFence,
+        operation_id: &str,
     ) -> Result<CaptureReport, KernelCaptureError> {
         require_capture_admitted(caller)?;
         let bundle = BackupBundle::decode(bytes)
@@ -298,11 +437,8 @@ impl KernelBackupCapture {
         bundle
             .validate()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
-        if bundle.export_fence.state_fence != *kernel_fence {
-            return Err(KernelCaptureError::RelationIncoherent(
-                "kernel fence does not admit archive".to_owned(),
-            ));
-        }
+        let archived_fence_relation =
+            classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence)?;
         let archive_sha256 = bundle
             .bundle_sha256()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
@@ -324,12 +460,22 @@ impl KernelBackupCapture {
             }
         };
         Ok(CaptureReport {
-            operation_id: format!("verify-only-{backup_id}"),
+            operation_id: operation_id.to_owned(),
             backup_id,
             class,
             archive_sha256,
             state,
-            verification_level: "decode-validate-relation",
+            // Decoding, validating and relating bytes is the whole of this
+            // path: no retained capture artifact is looked up, so the result
+            // is a structurally valid candidate and never a provenance-bound
+            // or class-qualified archive.
+            evidence_level: CaptureEvidenceLevel::StructurallyValidCandidate,
+            // A valid `canonical_only_degraded` or `scope_export` reports its
+            // exact lower ceiling from the archive's own class instead of
+            // inheriting the collapsed degraded-class reason as its only
+            // answer.
+            class_ceiling: class.evidence_level(),
+            archived_fence_relation,
             member_dispositions,
             receipt_identity: None,
         })
@@ -342,6 +488,48 @@ impl KernelBackupCapture {
         relation: &SnapshotRelation,
     ) -> Result<(), KernelCaptureError> {
         relation.validate_relation()
+    }
+}
+
+/// Classifies one archived `StateFence` against the live session fence.
+///
+/// The archived fence is already validated internally by the bundle; this
+/// decides only the relation, and it replaces the exact-equality gate that made
+/// a genuine earlier-generation archive unverifiable after a restart, a
+/// generation change, or an epoch rotation.
+///
+/// The decision uses `EpochId::relation_to` on the authority epoch only.
+/// `StateFence::is_compatible_with` is deliberately not the gate: it also
+/// requires `resource_generation` equality, so it refuses every archive after
+/// any generation change — the defect this replaces — and A13.7's
+/// schema/format compatibility and Authority Epoch monotonicity checks belong
+/// to the isolated restore, not to a read-only verify.
+///
+/// An older epoch on the same lineage is this installation's own history and is
+/// accepted as [`ArchivedFenceRelation::HistoricalAuthority`]. A foreign
+/// lineage is not this installation's history and refuses; so does an epoch
+/// ahead of the live session, which is not a historical archive and whose
+/// monotonicity this command does not judge.
+fn classify_archived_fence(
+    archived: &StateFence,
+    current: &StateFence,
+) -> Result<ArchivedFenceRelation, KernelCaptureError> {
+    match archived
+        .authority_epoch
+        .relation_to(&current.authority_epoch)
+    {
+        EpochRelation::Same => Ok(ArchivedFenceRelation::CurrentSession),
+        EpochRelation::DirectParent | EpochRelation::SameLineageOlder => {
+            Ok(ArchivedFenceRelation::HistoricalAuthority)
+        }
+        EpochRelation::DirectChild | EpochRelation::SameLineageNewer => {
+            Err(KernelCaptureError::RelationIncoherent(
+                "archive authority epoch is ahead of the current session epoch".to_owned(),
+            ))
+        }
+        EpochRelation::UnrelatedLineage => Err(KernelCaptureError::RelationIncoherent(
+            "archive authority lineage is not this installation's lineage".to_owned(),
+        )),
     }
 }
 

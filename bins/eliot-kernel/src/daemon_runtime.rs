@@ -388,23 +388,22 @@ impl KernelComposition {
             .generations
             .lock()
             .map_err(|_| KernelBuildError::Service("generation lock poisoned".to_owned()))?;
-        let route = generations
-            .route(&scope)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-        // Exact tuple equality is the authorization rule (Implements #64): the
-        // route carries the canonical `EpochId`, so a supervised launch from a
-        // different lineage at the same sequence is not the active daemon
-        // route. The identical rule is already applied to the process receipt
-        // above; this closes the same self-inconsistency on the route side.
-        if route.active_generation().value() != launch.generation.value()
-            || !route
-                .authority_epoch()
-                .is_same_authority(&launch.authority_epoch)
-        {
-            return Err(KernelBuildError::Service(
-                "eliotd supervised generation is not the active daemon route".to_owned(),
-            ));
-        }
+        // The canonical router owns this admission rule (Implements #64), so the
+        // route is not compared inline here any more. The launch descriptor
+        // carries no physical process generation and no fence nonce, so it is
+        // presented to the router's supervised-generation entry point, which
+        // applies the same exact-tuple epoch guard and the same exact
+        // generation comparison as the `RouteFence` path: a supervised launch
+        // from a different lineage at the same sequence is not the active
+        // daemon route, and a fenced or unactivated epoch cannot match the
+        // route either.
+        generations
+            .route_for_supervised_generation(&scope, launch.generation, &launch.authority_epoch)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd supervised generation is not the active daemon route: {error}"
+                ))
+            })?;
         Ok(())
     }
 

@@ -39,6 +39,7 @@ pub mod grant_activation_port;
 pub mod introduction_lifecycle;
 pub mod module;
 pub mod user_automation;
+mod user_automation_zones;
 
 pub use authority::{
     AuthorityGrant, AuthorityGrantRequest, AuthorityReceipt, KernelAuthority, KernelAuthorityKey,

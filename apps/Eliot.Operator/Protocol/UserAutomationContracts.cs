@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Eliot.Operator.Protocol.Generated;
 
 namespace Eliot.Operator.Protocol;
 
@@ -110,6 +111,16 @@ public sealed record UserAutomationEditOperation(
         {
             throw new InvalidOperationException("UserAutomation edit must supersede one distinct revision of the same automation.");
         }
+        // An edit is a NEW immutable revision, so an effect-relevant schedule
+        // change has to be backed by a NEW owner normalization result. This
+        // refuses the two provable stale-owner-evidence cases: reusing the
+        // previous revision's occurrence source digest after changing the source,
+        // and carrying a digest foreign to an unchanged source. Neither revision
+        // is ever rewritten here; the Operator derives no normalization of its
+        // own, so a genuine re-normalization must come from the owner.
+        UserAutomationScheduleMirror.RequireFreshOwnerEvidenceForEdit(
+            PreviousRevision.Schedule,
+            Revision.Schedule);
     }
 
     public override bool IsEffect() => true;
@@ -500,6 +511,42 @@ public sealed record UserAutomationNormalizedSchedule(
     [property: JsonPropertyName("end_at")] string? EndAt,
     [property: JsonPropertyName("next_occurrences")] IReadOnlyList<string> NextOccurrences)
 {
+    /// <summary>
+    /// Validates the bounded wire shape and the exact supported contract version
+    /// of the owner-issued occurrence set.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every field of the versioned occurrence record is checked against the
+    /// grammar in <c>UserAutomationScheduleMirror</c>, which is a generated port
+    /// of the Kernel owner contract, so this method can no longer accept a
+    /// revision the Kernel refuses. Three things changed decisively here:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>
+    /// The exact contract version and the pinned zone database release are
+    /// READ OFF the owner's own occurrence bytes. They are not a second copy
+    /// carried on this record: the owner side is <c>deny_unknown_fields</c>, so
+    /// a member the owner does not know would make every request undecodable.
+    /// </item>
+    /// <item>
+    /// A legacy shape-only occurrence is refused by name, with the
+    /// re-normalization action attached. The revision is never rewritten here;
+    /// an immutable revision is only ever superseded by a new one.
+    /// </item>
+    /// <item>
+    /// Ordering is decided by the resolved canonical instant, NEVER by a lexical
+    /// comparison of the raw records. Mixed offsets are exactly the case where
+    /// the two disagree, and the Kernel orders by the instant.
+    /// </item>
+    /// </list>
+    /// <para>
+    /// This is a shape and evidence check only. It is not admission, and it does
+    /// not make the schedule normalized: normalization is the owner's act, and
+    /// a successful pass here is reported as "admitted for submission", never as
+    /// "normalized".
+    /// </para>
+    /// </remarks>
     public void Validate()
     {
         UserAutomationContract.RequireOneOf(Kind, "schedule.kind", "ONE_SHOT", "RECURRING");
@@ -511,14 +558,39 @@ public sealed record UserAutomationNormalizedSchedule(
         UserAutomationContract.RequireText(StartAt, "schedule.start_at");
         if (EndAt is not null) UserAutomationContract.RequireText(EndAt, "schedule.end_at");
         UserAutomationContract.RequireTextList(NextOccurrences, "schedule.next_occurrences");
-        if (NextOccurrences.Count == 0 || NextOccurrences.Zip(NextOccurrences.Skip(1)).Any(pair => string.CompareOrdinal(pair.First, pair.Second) >= 0))
+        if (NextOccurrences.Count == 0)
         {
-            throw new InvalidOperationException("schedule.next_occurrences must be non-empty and strictly ordered.");
+            throw new InvalidOperationException("schedule.next_occurrences must be non-empty.");
         }
         if (Kind == "ONE_SHOT" && NextOccurrences.Count != 1)
         {
             throw new InvalidOperationException("ONE_SHOT schedules require one next occurrence.");
         }
+        UserAutomationScheduleMirror.ReadOwnerSchedule(
+            Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
+    }
+
+    /// <summary>
+    /// The typed normalization receipt this Operator preserves for a schedule it
+    /// has admitted for submission.
+    /// </summary>
+    /// <remarks>
+    /// This is a METHOD, not a property, for the same reason
+    /// <c>UserAutomationOperation.IsEffect</c> is: the owner-side request records
+    /// are <c>deny_unknown_fields</c>, so a serialized member the owner does not
+    /// know would make every request undecodable. A method has no serialized
+    /// surface at all, which keeps the exclusion exact.
+    /// <para>
+    /// The receipt carries only what the owner-issued bytes decide. It is NOT an
+    /// owner receipt, and it does not certify that the owner admitted or
+    /// normalized the revision.
+    /// </para>
+    /// </remarks>
+    public UserAutomationScheduleReceipt NormalizationReceipt()
+    {
+        Validate();
+        return UserAutomationScheduleMirror.ReadOwnerSchedule(
+            Timezone, DstFold, DstGap, StartAt, EndAt, NextOccurrences);
     }
 }
 
@@ -650,7 +722,14 @@ public sealed record UserAutomationRecursionPolicy(
 public static class UserAutomationContract
 {
     public const string Route = "eliot_user_automation";
-    public const string PreflightContractRevision = "eliot.user-automation.preflight.v1";
+
+    /// <summary>
+    /// The admitted preflight contract revision, read from the GENERATED mirror
+    /// of the owner contract rather than hand-copied, so a Kernel change to the
+    /// revision cannot be absorbed silently by this one consumer.
+    /// </summary>
+    public const string PreflightContractRevision =
+        Generated.OperatorScheduleContract.USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION;
 
     public static readonly IReadOnlyList<string> OperationKinds =
     [

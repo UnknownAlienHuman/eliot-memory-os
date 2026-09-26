@@ -47,11 +47,15 @@ use eliot_contracts::{
     OperationId, RequestMetadata, StateFence, TaskId, TaskRevision, canonical_json_bytes,
     sha256_hex,
 };
+use eliot_learning_contracts::{
+    CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
+    TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+};
 use eliot_store_api::{
-    CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, ScopeId, SecurityContext, StoreEvidenceHandles, StoreFailure,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
+    CONTRACT_VERSION, CampaignSourcePublication, EffectClass, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, OperationManifestDigest,
+    OrderingHeadExpectation, OrderingScopeId, ScopeId, SecurityContext, StoreEvidenceHandles,
+    StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
 };
@@ -61,7 +65,13 @@ use eliot_task::{
 };
 use thiserror::Error;
 
-use crate::{CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort};
+use crate::{
+    CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort,
+    campaign_source_publishers::assemble_task_owner_matrix,
+    campaign_task_sources::{
+        TaskControllerCampaignSources, build_task_controller_campaign_sources,
+    },
+};
 
 /// Production adapter manifest name from the Surreal adapter.
 const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
@@ -91,8 +101,13 @@ pub enum TaskLifecycleError {
     Kernel(#[from] KernelPortError),
     /// The transition was not committed; the payload carries the typed
     /// disposition, retry directive, and recovery action.
+    ///
+    /// The payload is boxed so the enum stays pointer-sized on the success
+    /// path. The variant name, the carried [`StoreFailure`] value, and the
+    /// `Display` text are unchanged: the box is an allocation, never a
+    /// narrower or flattened payload.
     #[error("task transition was not committed (see store failure payload)")]
-    Store(StoreFailure),
+    Store(Box<StoreFailure>),
     /// Canonical bytes, digests, or envelope projection failed fail-closed.
     #[error("task transition serialization: {0}")]
     Serialization(String),
@@ -101,14 +116,35 @@ pub enum TaskLifecycleError {
 impl TaskLifecycleError {
     /// Returns the typed store failure when this error carries one.
     #[must_use]
-    pub const fn store_failure(&self) -> Option<&StoreFailure> {
+    pub fn store_failure(&self) -> Option<&StoreFailure> {
         match self {
-            Self::Store(failure) => Some(failure),
+            Self::Store(failure) => Some(failure.as_ref()),
             Self::Owner(_) | Self::Composition(_) | Self::Kernel(_) | Self::Serialization(_) => {
                 None
             }
         }
     }
+}
+
+/// The exact guarded task command one admitted task transition carries.
+///
+/// A guarded command is not three independent arguments: the subject
+/// [`TaskId`], the [`TaskCommandContext`] that binds the admitted State Fence
+/// and request context, and the closed [`TaskCommand`] are one owner-native
+/// value. Binding them here keeps every `apply_task*` entry point from being
+/// able to name a command without its task or its context, and it is what lets
+/// the campaign-learning-state entries carry their declared recipe and owner
+/// publication matrix without exceeding a readable argument list. Nothing is
+/// added, defaulted, or reordered: the group is a source shape, not a new
+/// admission step.
+#[derive(Clone, Debug)]
+pub struct GuardedTaskCommand {
+    /// Subject task of the transition.
+    pub task_id: TaskId,
+    /// Exact admitted command context, including its State Fence.
+    pub context: TaskCommandContext,
+    /// Closed owner-defined command.
+    pub command: TaskCommand,
 }
 
 /// Governor-owned task lifecycle adapter over one serialized owner.
@@ -220,7 +256,7 @@ fn map_store_error(
     ctx: &StoreFailureIdentityContext,
 ) -> TaskLifecycleError {
     match StoreFailure::from_store_error(error, ctx.clone()) {
-        Ok(failure) => TaskLifecycleError::Store(failure),
+        Ok(failure) => TaskLifecycleError::Store(Box::new(failure)),
         Err(contract) => TaskLifecycleError::Serialization(contract.to_string()),
     }
 }
@@ -240,6 +276,7 @@ fn state_wire(state: TaskState) -> Result<String, TaskLifecycleError> {
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the envelope binds every admitted identity field explicitly; grouping them would hide a binding"
 )]
 fn task_envelope(
@@ -249,6 +286,9 @@ fn task_envelope(
     record: &TaskRecord,
     expected_revision: u64,
     manifest_digest: OperationManifestDigest,
+    campaign_recipe: Option<&LearningStateViewRecipe>,
+    campaign_sources: Option<&TaskControllerCampaignSources>,
+    campaign_publications: Option<&[CampaignSourcePublication]>,
 ) -> Result<CanonicalWriteEnvelope, TaskLifecycleError> {
     identity
         .validate()
@@ -300,6 +340,42 @@ fn task_envelope(
         "actor_ref".to_owned(),
         serde_json::Value::String(event.actor_ref.clone()),
     );
+    if let Some(recipe) = campaign_recipe {
+        validate_campaign_recipe_anchor(recipe, identity, &operation_id, &record.task_id, fence)?;
+        parameters.insert(
+            "campaign_learning_state_recipe_json".to_owned(),
+            serde_json::Value::String(
+                serde_json::to_string(recipe)
+                    .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+            ),
+        );
+    }
+    if let Some(publications) = campaign_publications {
+        parameters.insert(
+            "campaign_source_publications_json".to_owned(),
+            serde_json::to_value(publications)
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        );
+        parameters.insert(
+            "campaign_source_matrix_complete".to_owned(),
+            serde_json::Value::String("true".to_owned()),
+        );
+    } else if let Some(sources) = campaign_sources {
+        parameters.insert(
+            "campaign_source_publications_json".to_owned(),
+            serde_json::to_value(&[
+                sources.objective.clone(),
+                sources.plan.clone(),
+                sources.acceptance.clone(),
+                sources.open_items.clone(),
+            ])
+            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        );
+        parameters.insert(
+            "campaign_source_matrix_complete".to_owned(),
+            serde_json::Value::String("false".to_owned()),
+        );
+    }
     let envelope = CanonicalWriteEnvelope {
         operation_id,
         request: identity.request.metadata.clone(),
@@ -337,6 +413,70 @@ fn task_envelope(
         .validate()
         .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
     Ok(envelope)
+}
+
+fn validate_campaign_recipe_anchor(
+    recipe: &LearningStateViewRecipe,
+    identity: &eliot_protocol::RequestIdentity,
+    operation_id: &OperationId,
+    task_id: &TaskId,
+    state_fence: &StateFence,
+) -> Result<(), TaskLifecycleError> {
+    recipe
+        .validate()
+        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    if recipe.binding.task_id != *task_id
+        || recipe.binding.request_id != identity.request.metadata.request_id
+        || recipe.binding.operation_id != *operation_id
+        || recipe.binding.product_id != identity.request.metadata.product_id
+        || recipe.binding.source.owner != identity.request.metadata.source_id
+        || recipe.binding.state_fence != *state_fence
+        || identity.request.metadata.task_id.as_ref() != Some(task_id)
+    {
+        return Err(TaskLifecycleError::Serialization(
+            "campaign recipe does not bind the admitted task request, operation, and fence"
+                .to_owned(),
+        ));
+    }
+    let task_plan = recipe
+        .source_requirements
+        .iter()
+        .find(|requirement| requirement.role == CampaignSourceRole::TaskPlan)
+        .ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "campaign recipe lacks its TaskPlan owner anchor".to_owned(),
+            )
+        })?;
+    if task_plan.owner.as_str() != TASK_CONTROLLER_CAMPAIGN_OWNER_ID
+        || task_plan.source_binding != CampaignSourceBinding::AuthenticatedTaskAnchor
+        || task_plan.expected_reference.is_some()
+        || !task_plan.load_bearing
+    {
+        return Err(TaskLifecycleError::Serialization(
+            "campaign recipe TaskPlan must use the admitted Task Controller anchor".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn complete_campaign_publications(
+    task_sources: &TaskControllerCampaignSources,
+    owner_publications: Vec<CampaignSourcePublication>,
+) -> Result<Vec<CampaignSourcePublication>, TaskLifecycleError> {
+    assemble_task_owner_matrix(task_sources, owner_publications)
+        .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))
+}
+
+fn complete_campaign_publications_from_builder<F>(
+    task_sources: &TaskControllerCampaignSources,
+    owner_builder: F,
+) -> Result<Vec<CampaignSourcePublication>, TaskLifecycleError>
+where
+    F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
+{
+    let owner_publications =
+        owner_builder(task_sources).map_err(TaskLifecycleError::Serialization)?;
+    complete_campaign_publications(task_sources, owner_publications)
 }
 
 impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
@@ -399,12 +539,116 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             &record,
             1,
             manifest_digest.clone(),
+            None,
+            None,
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
     }
 
-    /// Applies one guarded task command and commits it through the canonical path.
+    /// Proposes a task while the Task Controller owner atomically declares
+    /// the exact campaign learning-state recipe in the same `UpdateTaskState`
+    /// transition. The recipe is validated against the admitted task,
+    /// request, operation, and fence before canonical commit.
+    pub async fn propose_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&proposal.context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            None,
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
+    /// Proposes a task and atomically retains the complete closed owner-role
+    /// publication matrix on the same authenticated `UpdateTaskState` write.
+    /// The owner rows are supplied by their real owner transitions; this
+    /// method only validates their exact bindings and CAS expectations.
+    pub async fn propose_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        owner_publications: Vec<CampaignSourcePublication>,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&proposal.context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications(&sources, owner_publications)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
     ///
     /// The command is validated against a scratch clone of the single task
     /// owner, including the task-revision compare-and-swap base carried by
@@ -416,10 +660,13 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: OperationId,
-        task_id: TaskId,
-        context: TaskCommandContext,
-        command: TaskCommand,
+        guarded: GuardedTaskCommand,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
         identity
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
@@ -460,12 +707,260 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             &record,
             expected_revision,
             manifest_digest.clone(),
+            None,
+            None,
+            None,
         )?;
         self.commit_envelope(identity, operation_id, envelope, manifest_digest)
             .await
     }
 
-    /// Commits one admitted envelope and validates the returned receipt.
+    /// Proposes a task and lets an owner-bound adapter assemble the complete
+    /// non-Task-Controller publication matrix after the Task Controller rows
+    /// have been built from the admitted transition.
+    pub async fn propose_task_with_complete_campaign_owner_materials<F>(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        proposal: TaskProposal,
+        recipe: LearningStateViewRecipe,
+        owner_builder: F,
+    ) -> Result<WriteReceipt, TaskLifecycleError>
+    where
+        F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
+    {
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&proposal.context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let mut scratch = self.task.clone();
+        let event = scratch.propose(proposal.clone())?;
+        let record = scratch.task(&proposal.task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted proposal".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            1,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
+    /// Applies a guarded task command while the Task Controller owner
+    /// atomically declares the exact campaign learning-state recipe in the
+    /// same `UpdateTaskState` transition.
+    pub async fn apply_task_with_learning_state_recipe(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let current = self
+            .task
+            .task(&task_id)
+            .ok_or_else(|| TaskLifecycleError::Owner(TaskError::TaskNotFound(task_id.clone())))?;
+        let expected_revision = context
+            .state_fence
+            .task_revision
+            .map_or(current.revision, TaskRevision::value);
+        let mut scratch = self.task.clone();
+        let event = scratch.apply(task_id.clone(), context, command)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted transition".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            None,
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
+    /// Applies a guarded task command while atomically retaining the complete
+    /// owner-role publication matrix on the same canonical task transition.
+    pub async fn apply_task_with_complete_campaign_sources(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        owner_publications: Vec<CampaignSourcePublication>,
+    ) -> Result<WriteReceipt, TaskLifecycleError> {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let current = self
+            .task
+            .task(&task_id)
+            .ok_or_else(|| TaskLifecycleError::Owner(TaskError::TaskNotFound(task_id.clone())))?;
+        let expected_revision = context
+            .state_fence
+            .task_revision
+            .map_or(current.revision, TaskRevision::value);
+        let mut scratch = self.task.clone();
+        let event = scratch.apply(task_id.clone(), context, command)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted transition".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications(&sources, owner_publications)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
+    /// Applies a guarded task command and lets an owner-bound adapter assemble
+    /// the complete non-Task-Controller publication matrix after the Task
+    /// Controller rows have been built from the admitted transition.
+    pub async fn apply_task_with_complete_campaign_owner_materials<F>(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        owner_builder: F,
+    ) -> Result<WriteReceipt, TaskLifecycleError>
+    where
+        F: FnOnce(&TaskControllerCampaignSources) -> Result<Vec<CampaignSourcePublication>, String>,
+    {
+        let GuardedTaskCommand {
+            task_id,
+            context,
+            command,
+        } = guarded;
+        identity
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("request_identity")))?;
+        let fence = &identity.request.metadata.state_fence;
+        if &identity.request.state_fence != fence
+            || self.canonical.state_fence() != fence
+            || !fence.is_compatible_with(&context.state_fence)
+        {
+            return Err(TaskLifecycleError::Owner(TaskError::FenceMismatch));
+        }
+        let current = self
+            .task
+            .task(&task_id)
+            .ok_or_else(|| TaskLifecycleError::Owner(TaskError::TaskNotFound(task_id.clone())))?;
+        let expected_revision = context
+            .state_fence
+            .task_revision
+            .map_or(current.revision, TaskRevision::value);
+        let mut scratch = self.task.clone();
+        let event = scratch.apply(task_id.clone(), context, command)?;
+        let record = scratch.task(&task_id).cloned().ok_or_else(|| {
+            TaskLifecycleError::Serialization(
+                "task record is missing after the admitted transition".to_owned(),
+            )
+        })?;
+        let manifest_digest = production_manifest_digest()?;
+        let source_heads = self
+            .kernel
+            .campaign_source_heads(&record.task_id, recipe.binding.scope.as_str(), fence)
+            .await?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
+        let envelope = task_envelope(
+            identity,
+            operation_id.clone(),
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            Some(&publications),
+        )?;
+        self.commit_envelope(identity, operation_id, envelope, manifest_digest)
+            .await
+    }
+
     ///
     /// Only [`WriteReceiptStatus::Committed`] succeeds; every other status
     /// stays pending as a typed [`StoreFailure`]. A lost acknowledgement
@@ -490,14 +985,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
                             StoreFailure::from_provider_unknown_outcome(&ctx).map_err(|error| {
                                 TaskLifecycleError::Serialization(error.to_string())
                             })?;
-                        return Err(TaskLifecycleError::Store(failure));
+                        return Err(TaskLifecycleError::Store(Box::new(failure)));
                     }
                     Err(KernelPortError::Unknown(_)) => {
                         let failure =
                             StoreFailure::from_provider_unknown_outcome(&ctx).map_err(|error| {
                                 TaskLifecycleError::Serialization(error.to_string())
                             })?;
-                        return Err(TaskLifecycleError::Store(failure));
+                        return Err(TaskLifecycleError::Store(Box::new(failure)));
                     }
                     Err(other) => return Err(TaskLifecycleError::Kernel(other)),
                 }
@@ -545,7 +1040,7 @@ fn check_committed_receipt(
             StoreRecoveryAction::None,
             ctx,
         )?;
-        return Err(TaskLifecycleError::Store(failure));
+        return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
     if receipt.transition_class != TransitionClass::TaskControl
         || receipt.operation_manifest_digest != *manifest_digest
@@ -558,7 +1053,7 @@ fn check_committed_receipt(
             StoreRecoveryAction::None,
             ctx,
         )?;
-        return Err(TaskLifecycleError::Store(failure));
+        return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
     if receipt.status != WriteReceiptStatus::Committed {
         let (reason, disposition, retry, recovery) = match receipt.status {
@@ -571,7 +1066,7 @@ fn check_committed_receipt(
                     StoreRecoveryAction::EscalateInternalDefect,
                     ctx,
                 )?;
-                return Err(TaskLifecycleError::Store(failure));
+                return Err(TaskLifecycleError::Store(Box::new(failure)));
             }
             WriteReceiptStatus::Rejected => (
                 "TASK_NOT_COMMITTED_REJECTED",
@@ -600,7 +1095,7 @@ fn check_committed_receipt(
             recovery,
             ctx,
         )?;
-        return Err(TaskLifecycleError::Store(failure));
+        return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
     Ok(())
 }
@@ -961,9 +1456,11 @@ mod tests {
         let applied = block_on(refreshed_adapter.apply_task(
             &identity(&fence, "req-task-open", "idem-task-open"),
             apply_id.clone(),
-            TaskId::new("task-1").expect("task id"),
-            command_context("task-request-2", "task-event-2", &fence),
-            TaskCommand::Open,
+            GuardedTaskCommand {
+                task_id: TaskId::new("task-1").expect("task id"),
+                context: command_context("task-request-2", "task-event-2", &fence),
+                command: TaskCommand::Open,
+            },
         ))
         .expect("admitted transition");
         assert_eq!(applied.operation_id, apply_id);
@@ -1027,9 +1524,11 @@ mod tests {
         let rejected = block_on(refreshed_adapter.apply_task(
             &identity(&fence, "req-task-stale", "idem-task-stale"),
             eliot_contracts::OperationId::new("op-task-stale").expect("operation id"),
-            TaskId::new("task-1").expect("task id"),
-            command_context("task-request-stale", "task-event-stale", &stale_fence),
-            TaskCommand::Open,
+            GuardedTaskCommand {
+                task_id: TaskId::new("task-1").expect("task id"),
+                context: command_context("task-request-stale", "task-event-stale", &stale_fence),
+                command: TaskCommand::Open,
+            },
         ));
         assert!(
             matches!(

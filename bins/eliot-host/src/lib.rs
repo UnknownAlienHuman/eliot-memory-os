@@ -60,9 +60,11 @@ pub mod windows_event_log;
 // F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
 //
 // Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
-// `observe_entrypoint_with_detail`, `observe_terminal_error`); the Event Log
-// seam stays typed-Unavailable (`windows_event_log::event_log_sink_status`),
-// never implemented here (#984 still open).
+// `observe_entrypoint_with_detail`, `observe_terminal_error`); sink status is
+// the live `windows_event_log::event_log_sink_status` answer: `Ok` where
+// #984's accepted safe port is live (Windows), typed `EventLogUnavailable`
+// elsewhere. Delivery goes through `report_local_event` (landed `bf37d3e1` /
+// #1706; synchronous, per-call handle, receipt proves OS acceptance only).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals or borrows of
@@ -72,12 +74,10 @@ pub mod windows_event_log;
 // mutable global dedup cache: one terminal emission per failed public
 // operation is enforced by the single outermost guard per operation, while
 // inner phase observations share correlation by stage order only.
-fn host_lifecycle_note_event_log_unavailable() {
-    let _ = windows_event_log::event_log_sink_status();
-}
+pub use host_diagnostics::note_event_log_sink_status;
 
 fn host_lifecycle_observe_requested(detail: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::Startup,
         host_lifecycle_frozen_event(detail),
@@ -85,7 +85,7 @@ fn host_lifecycle_observe_requested(detail: &str) {
 }
 
 fn host_lifecycle_observe_scm(detail: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ScmDispatch,
         host_lifecycle_frozen_event(detail),
@@ -93,7 +93,7 @@ fn host_lifecycle_observe_scm(detail: &str) {
 }
 
 fn host_lifecycle_observe_drain(detail: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
         host_diagnostics::EntrypointStage::ShutdownDrain,
         host_lifecycle_frozen_event(detail),
@@ -101,7 +101,7 @@ fn host_lifecycle_observe_drain(detail: &str) {
 }
 
 fn host_lifecycle_observe_terminal(code: &str) {
-    host_lifecycle_note_event_log_unavailable();
+    note_event_log_sink_status();
     host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(code));
 }
 
@@ -1062,12 +1062,12 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
-    HostStoreBootstrapRequirement, KernelActivationPermit, KernelActivationQuery,
-    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
-    KernelReadyReceipt, KernelServiceState, ProcessAuthorityHandoffDescriptor, RestartBudget,
-    StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
-    StoreRebindReceipt, control_request_frame, decode_control_response_frame,
-    semantic_store_config_hash_from_json,
+    HostStartupEvidence, HostStoreBootstrapRequirement, KernelActivationPermit,
+    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
+    KernelControlResponse, KernelReadyReceipt, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
+    StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
+    decode_control_response_frame, semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -2146,10 +2146,41 @@ impl HostJobBranches {
             host_state_root,
             store_data_root,
         )?;
+        Self::send_bound_host_startup_evidence(
+            transport,
+            &evidence,
+            candidate,
+            generation_handle,
+            sequence,
+        )
+        .await
+    }
+
+    /// Sends one already-built startup-evidence carrier on this connection and
+    /// requires the exact response binding.
+    ///
+    /// I1.5 (#1750): this is the single wire seam for the carrier, shared by
+    /// the activation sequence and by the bounded readiness cadence that
+    /// republishes a CURRENT independent Watchdog observation before its repeat
+    /// probe. One send, one binding check, no second protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the frame cannot be delivered with a known
+    /// outcome, or when the Kernel response is not exactly bound to this
+    /// request.
+    #[cfg(windows)]
+    async fn send_bound_host_startup_evidence(
+        transport: &mut NamedPipeTransport,
+        evidence: &HostStartupEvidence,
+        candidate: &HostKernelCandidateBinding,
+        generation_handle: &PlatformHandle,
+        sequence: u64,
+    ) -> Result<(), HostError> {
         let request = kernel_control_request(
             candidate,
-            authority_generation,
-            KernelControlCommand::ReportHostStartupEvidence(evidence),
+            evidence.state_fence.resource_generation,
+            KernelControlCommand::ReportHostStartupEvidence(evidence.clone()),
             sequence,
         )?;
         let frame = control_request_frame(
@@ -3516,6 +3547,7 @@ impl HostJobBranches {
         approved_kernel_artifact: &PlatformHandle,
         approved_store_artifact: &PlatformHandle,
         approved_config: &PlatformHandle,
+        supervision_evidence: &HostStartupEvidence,
     ) -> Result<AuthenticatedKernelReadiness, HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -3600,11 +3632,25 @@ impl HostJobBranches {
             ))?;
             let peer_evidence = PlatformHandle::new(format!("kernel-peer:{peer_digest}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?;
+            // I1.5 (#1750): the independent Watchdog observation is republished
+            // on this connection before the probe, so Kernel binds a CURRENT
+            // owner observation to this contour and this consumer fence rather
+            // than answering the probe from retained text. It occupies the first
+            // command on the strict per-connection sequence and the probe
+            // follows as the second.
+            HostJobBranches::send_bound_host_startup_evidence(
+                &mut transport,
+                supervision_evidence,
+                candidate,
+                approved_generation,
+                1,
+            )
+            .await?;
             let request = KernelControlRequest {
                 wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
                 wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
                 message_id: fresh_identity("kernel-probe")?,
-                sequence: 1,
+                sequence: 2,
                 peer_process_id: std::process::id(),
                 generation: launch.authority_generation,
                 candidate: candidate.clone(),
@@ -5208,7 +5254,7 @@ impl HostComposition {
     ///
     /// Prior-generation process/SCM retirement remains a separate explicitly
     /// authorized
-    /// [`crate::backup_cutover::retire_prior_generation`] step holding the
+    /// [`Self::backup_dispatch_cutover_retire`] step holding the
     /// returned barrier; source retention and erasure are never automatic
     /// cleanup here.
     ///
@@ -5332,12 +5378,31 @@ impl HostComposition {
         let durable = self.journal.snapshot().map_err(|error| {
             CutoverError::HostTransition(HostError::OwnerLeaseRecovery(error.to_string()))
         })?;
+        // The retirement is resolved by the SAME journal owner through a further
+        // read, so it must be bracketed on its far side exactly as
+        // `read_cutover_disposition` brackets it: resolve it FROM `durable` and
+        // take one more sample afterwards to prove `durable` is still current.
+        // Resolving it after the coherence decision - which is what this path did
+        // - left the retirement observation strictly outside the compared
+        // interval while the `Reconciled` arm gates on that interval. Two
+        // consequences, both fail-closed but both false: a record landing between
+        // the last sample and the lookup is reported as `UnboundRetirement`
+        // ("a substituted record") when the status port would have reported
+        // `ConcurrentOwnerMovement` ("the owners moved"), and a positive
+        // history claim is gated by a coherence proof that does not cover the
+        // observation it gates. This is the same stale-currency defect
+        // `read_cutover_disposition` already closed on the status side.
+        let retirement =
+            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         // A failed READ is a failure, never a concurrency fact: it is propagated
         // with the same error the surrounding reads use, so it can never be
         // reported as owner movement.
         let coherence = match self.journal.snapshot() {
             Ok(resampled)
-                if crate::backup_cutover::cutover_observation_unchanged(&before, &resampled) =>
+                if crate::backup_cutover::cutover_observation_unchanged(&before, &durable)
+                    && crate::backup_cutover::cutover_observation_unchanged(
+                        &durable, &resampled,
+                    ) =>
             {
                 OwnerObservationCoherence::Coherent
             }
@@ -5348,8 +5413,6 @@ impl HostComposition {
                 )));
             }
         };
-        let retirement =
-            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
         let reconciled = reconcile_cutover_outcome(
             request,
             durable.pending_cutover.as_ref(),
@@ -5411,24 +5474,38 @@ impl HostComposition {
     /// Executes the separately authorized prior-generation retirement that
     /// completes one committed cutover.
     ///
-    /// This is the second admitted cutover port, and it is the only caller of
-    /// [`crate::backup_cutover::retire_prior_generation`]. Retirement is never
+    /// This is the second admitted cutover port, and it is the only entry to the
+    /// prior-generation retirement effect. Retirement is never
     /// automatic cleanup: the caller must present the
     /// [`GenerationRetirementBarrier`] returned by
-    /// [`Self::backup_dispatch_cutover`] for the same operation, the exact
-    /// prior [`eliot_host_state::HostInstallationEpoch`] still retained by the
-    /// journal, and an explicit non-empty retirement authorization. Only then
-    /// is the durable `EpochRetirement` record appended. The source
-    /// installation is retained until this record commits, and source data
-    /// destruction stays a separate explicitly authorized action.
+    /// [`Self::backup_dispatch_cutover`] for the same operation and an explicit
+    /// non-empty retirement authorization. Only then is the durable
+    /// `EpochRetirement` record appended. The source installation is retained
+    /// until this record commits, and source data destruction stays a separate
+    /// explicitly authorized action.
+    ///
+    /// The epoch to retire is **not** a parameter. It is derived from the
+    /// durable owners by
+    /// [`crate::backup_cutover::resolve_predecessor_retirement_relation`], which
+    /// requires an owner-issued
+    /// [`eliot_host_state::PredecessorRetirementRelation`] mapping this
+    /// cutover's exact `expected_predecessor` generation onto one exact
+    /// outstanding Host epoch (#2868). A caller-selected epoch was previously
+    /// accepted and proved only that it was *some* unretired prior epoch of this
+    /// installation, so with two outstanding prior epochs the cutover could
+    /// retire the wrong one and later report the other as the consumed
+    /// predecessor's completion. When the owners do not establish the relation
+    /// this port returns a typed `Unknown` +
+    /// [`CutoverResidual::PredecessorEpochUnknown`](crate::backup_cutover::CutoverResidual::PredecessorEpochUnknown)
+    /// outcome and appends nothing.
     ///
     /// # Errors
     ///
     /// Returns [`CutoverError`](crate::backup_cutover::CutoverError) when the
     /// separately supplied operation does not match the operation the admitted
-    /// cutover payload authorizes, the authorization is empty, the prior epoch
-    /// is not a retained epoch of this installation, or the journal owner
-    /// refuses the retirement record.
+    /// cutover payload authorizes, the authorization is empty, the owner-issued
+    /// relation does not bind this operation's predecessor generation to the
+    /// epoch being retired, or the journal owner refuses the retirement record.
     #[cfg(windows)]
     pub fn backup_dispatch_cutover_retire(
         &self,
@@ -5436,7 +5513,6 @@ impl HostComposition {
         request: &crate::backup_cutover::CutoverRequest,
         evidence: &crate::backup_cutover::IsolatedRecoveryEvidence,
         barrier: &GenerationRetirementBarrier,
-        prior_host: &eliot_host_state::HostInstallationEpoch,
         retirement_authorization: &PlatformHandle,
     ) -> Result<crate::backup_cutover::CutoverOutcome, crate::backup_cutover::CutoverError> {
         use crate::backup_cutover::{
@@ -5454,14 +5530,7 @@ impl HostComposition {
             )));
         }
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        retire_authorized_generation(
-            self,
-            request,
-            evidence,
-            barrier,
-            prior_host,
-            retirement_authorization,
-        )
+        retire_authorized_generation(self, request, evidence, barrier, retirement_authorization)
     }
 
     /// Opens the durable Host contour for one installation identity and
@@ -8514,6 +8583,63 @@ impl HostComposition {
         outcome
     }
 
+    /// Re-observes the independent Watchdog branch for one readiness contour
+    /// and returns the closed carrier that publishes it.
+    ///
+    /// I1.5 (#1750): a repeated readiness probe is an ordinary request and must
+    /// not be answered from the observation retained since activation. This
+    /// re-runs the SAME single producer the startup path uses, so the live SCM
+    /// Watchdog incarnation is re-read from the OS right now (bound PID/start
+    /// pair, process liveness, and image bytes equal to the approved Watchdog
+    /// artifact) and the whole carrier is rebuilt from fresh probes. It runs on
+    /// the Host's own bounded readiness cadence, never synchronously on an
+    /// ordinary request, and it introduces no second supervisor, no second
+    /// observation protocol and no new wire field.
+    ///
+    /// # Errors
+    ///
+    /// Returns the producer's own typed reason: an unreadable journal, no
+    /// usable active manifest, an unbound or dead Watchdog incarnation, a
+    /// substituted Watchdog image, a tampered Blob manifest, or a contour that
+    /// is not the approved active generation.
+    #[cfg(windows)]
+    fn reobserve_watchdog_supervision_evidence(
+        &self,
+        generation: &PlatformHandle,
+    ) -> Result<HostStartupEvidence, HostError> {
+        let launch = self.jobs.launch.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+        })?;
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+        })?;
+        if self.jobs.approved_generation.as_ref() != Some(generation) {
+            return Err(HostError::ProcessContour(
+                "readiness re-observation is not for the approved active generation".to_owned(),
+            ));
+        }
+        let active = self
+            .registry
+            .generations()
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .ok_or_else(|| {
+                HostError::ProcessContour(
+                    "readiness re-observation generation is not present in the approved registry"
+                        .to_owned(),
+                )
+            })?;
+        host_startup_evidence::build_host_startup_evidence(
+            &self.journal,
+            &active.manifest,
+            candidate,
+            launch.authority_generation,
+            candidate.kernel_epoch.clone(),
+            self.launch_options.host_state_root(),
+            Path::new(launch.runtime_state_roots.store_data_root.as_str()),
+        )
+    }
+
     /// Persists the durable evidence for one failed authenticated readiness
     /// proof, with a cause-specific reason.
     ///
@@ -8910,6 +9036,12 @@ impl HostComposition {
                 "readiness probe has no materialized Store config digest".to_owned(),
             )
         })?;
+        // I1.5 (#1750): republish a CURRENT independent Watchdog observation
+        // before the repeat probe, on this bounded readiness cadence, so the
+        // probe is answered from a fresh owner observation instead of from the
+        // one retained since activation. The carrier rides the same connection
+        // and the same strict per-connection command sequence as the probe.
+        let supervision_evidence = self.reobserve_watchdog_supervision_evidence(generation)?;
         let contour = self.current_readiness_contour(
             generation,
             kernel_artifact,
@@ -8921,6 +9053,7 @@ impl HostComposition {
             kernel_artifact,
             store_artifact,
             materialized_config_digest,
+            &supervision_evidence,
         )?;
         let registry_authority = self
             .registry

@@ -31,6 +31,20 @@
 //!   consult the same cell before resolving anything, so a successful start
 //!   never authorizes later work forever.
 //!
+//! Two more disciplines close the loop's edges:
+//!
+//! - **External control is real intake, not self-talk.** An installed
+//!   [`KernelControlReader`] polls the owner-staged control-request file on
+//!   every tick — including while guest work is pending — and admits what
+//!   it yields through the same frame shape, parse, and binding validation
+//!   the delivery-set path uses, so one admission path serves both sources.
+//!   Only an identity-matching Cancel/Reconcile/Shutdown is consumed;
+//!   anything else is left for its own delivery.
+//! - **Emission and cleanup are bounded.** One result frame gets a bounded
+//!   stdout wait and then fails closed, never reusing the contended stream,
+//!   and the staged set is consumed only while it still names the served
+//!   generation, so a replacement staged mid-run is never deleted.
+//!
 //! The experimental describe path and the one-shot guest-child protocol are
 //! separate modes reachable only through their own CLI branches; the
 //! governed loop never falls back to either, and neither falls back here.
@@ -39,9 +53,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
 use std::time::Duration;
 
 use eliot_wasm_runtime::{
@@ -54,7 +68,10 @@ use crate::dispatch_drive::{
     DriveError, LifecycleVerdicts, SeatedVerdicts, evaluate_lifecycle_verdicts,
     evaluate_seated_verdicts,
 };
-use crate::dispatch_material::{MaterialError, ValidatedDispatchMaterial, read_dispatch_material};
+use crate::dispatch_material::{
+    MaterialError, ValidatedDispatchMaterial, WASM_HOST_CONTROL_FILE_NAME, admitted_material_path,
+    consume_staged, read_dispatch_material, read_staged_bytes,
+};
 use crate::parent_authority::edge_now_ms;
 use crate::parent_runtime::{AdmittedRuntime, build_admitted_runtime};
 
@@ -82,6 +99,15 @@ pub const MAX_RESULT_FRAME_BYTES: usize = 64 * 1024;
 /// long the loop can go without re-checking the authority window; it starts
 /// no worker and decides no timeout policy of its own.
 const CONTROL_POLL: Duration = Duration::from_millis(25);
+
+/// Output deadline for one result-frame emission. A size budget is not a
+/// time budget: when the reader stops consuming, the synchronous stdout
+/// write plus flush would wedge the control thread forever, so one frame
+/// gets this bounded wait and then fails closed. Same value and discipline
+/// as the agent-bridge `STDOUT_WRITE_TIMEOUT` precedent: at most one
+/// outstanding frame, a bounded wait on the slow consumer, and no reuse of
+/// the contended stream after a timeout.
+const OUTPUT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Fail-closed loop errors. Stable codes plus one stable field name; no
 /// digests, paths, or payloads are echoed.
@@ -615,6 +641,20 @@ pub trait WasmHostRequestChannel {
     /// read.
     fn next_frame(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError>;
 
+    /// Non-blocking poll for one externally staged Kernel control frame
+    /// naming this operation. `None` means nothing is pending right now —
+    /// never exhaustion: the loop keeps serving the delivery set and polls
+    /// again on its next tick, including while guest work is pending. The
+    /// default has no external source and always reports nothing pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::ChannelUnavailable`] when the control source
+    /// fails in a way the loop must not ignore.
+    fn poll_control(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
+        Ok(None)
+    }
+
     /// Publishes one correlated result frame.
     ///
     /// # Errors
@@ -624,14 +664,129 @@ pub trait WasmHostRequestChannel {
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError>;
 }
 
+/// Installed Kernel control reader: the external control intake of the
+/// ordinary loop.
+///
+/// The owner stages the delivery set as files beside the installation; a
+/// Kernel Cancel/Reconcile/Shutdown for the running operation stages the
+/// same way, as one [`WasmHostRequestFrame`] JSON document at the
+/// loader-derived control path. The loop polls this reader on every tick —
+/// including while guest work is pending — and admits what it yields
+/// through the same frame shape, parse, and binding validation the
+/// delivery-set path uses, so one admission path serves both sources.
+///
+/// Fail-closed per frame: an absent, unreadable, oversize, malformed, or
+/// foreign control file yields nothing and is left in place — ownership of
+/// an unidentifiable file can never be established, and unauthenticated
+/// input must neither act nor abort the admitted operation. Only a
+/// well-formed frame naming this exact operation is consumed and returned.
+/// `Invoke` is never admitted externally: the one admitted invoke comes
+/// from the delivery set only, so a second execution path cannot open
+/// through the control file.
+pub struct KernelControlReader {
+    path: PathBuf,
+    identity: WasmHostControl,
+}
+
+impl KernelControlReader {
+    /// Pins the reader to the loader-derived control path and the exact
+    /// admitted operation identity it may consume control for.
+    #[must_use]
+    pub fn new(binding: &AdmittedBinding, path: PathBuf) -> Self {
+        Self {
+            path,
+            identity: WasmHostControl {
+                operation_id: binding.operation_id.clone(),
+                invocation_id: binding.invocation_id.clone(),
+                request_digest: binding.request_digest.clone(),
+            },
+        }
+    }
+
+    /// Returns one staged control frame naming this operation, consuming
+    /// it, or `None` when nothing admittable is staged. Never fails the
+    /// loop: every control-file fault degrades to nothing pending.
+    fn poll(&self) -> Option<WasmHostRequestFrame> {
+        let Ok(bytes) = read_staged_bytes(&self.path) else {
+            return None;
+        };
+        let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
+            return None;
+        };
+        match WasmHostRequestFrame::parse(&frame) {
+            Ok(WasmHostRequest::Cancel(control) | WasmHostRequest::Reconcile(control))
+                if control == self.identity =>
+            {
+                consume_staged(&self.path);
+                Some(frame)
+            }
+            Ok(WasmHostRequest::Shutdown) if self.controls_this_operation(&frame) => {
+                consume_staged(&self.path);
+                Some(frame)
+            }
+            Ok(WasmHostRequest::Invoke(_)) if self.controls_this_operation(&frame) => {
+                // Names this operation but is never externally admittable:
+                // consume so it cannot spin the poll, and yield nothing.
+                consume_staged(&self.path);
+                None
+            }
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    /// Pins a Shutdown or Invoke frame to this operation. Those parses
+    /// carry their identity as plain fields, so the external path checks
+    /// them here: parse alone authenticates nothing.
+    fn controls_this_operation(&self, frame: &WasmHostRequestFrame) -> bool {
+        frame.operation_id == self.identity.operation_id
+            && frame.invocation_id == self.identity.invocation_id
+            && frame.request_digest == self.identity.request_digest
+    }
+}
+
+/// Emits one serialized frame on stdout with the bounded output wait.
+///
+/// The write plus flush runs on a single named helper thread so a stalled
+/// reader cannot wedge the control thread past [`OUTPUT_DEADLINE`]. At most
+/// one frame is ever outstanding — the synchronous loop never pipelines a
+/// second — and a missed deadline fails closed: the helper still holds the
+/// stdout lock, so the caller must never touch the stream again.
+fn emit_frame_bounded(framed: Vec<u8>) -> Result<(), LoopError> {
+    let (done_tx, done_rx) = channel::<bool>();
+    let spawn = std::thread::Builder::new()
+        .name("eliot-wasm-host-stdout-write".to_owned())
+        .spawn(move || {
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            let ok = output
+                .write_all(&framed)
+                .and_then(|()| output.write_all(b"\n"))
+                .and_then(|()| output.flush())
+                .is_ok();
+            let _ = done_tx.send(ok);
+        });
+    if spawn.is_err() {
+        return Err(LoopError::ChannelUnavailable);
+    }
+    match done_rx.recv_timeout(OUTPUT_DEADLINE) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(LoopError::ChannelUnavailable),
+    }
+}
+
 /// Production channel over the owner delivery set and the canonical receipt
 /// stream. One delivery set carries exactly one admitted operation, so the
 /// channel issues that request once and then reports exhaustion, which is
 /// what closes admission and starts the drain.
+///
+/// An installed [`KernelControlReader`] additionally feeds externally staged
+/// Kernel control while the loop runs; without one the channel behaves
+/// exactly as before.
 pub struct DeliverySetChannel {
     admitted: Option<WasmHostRequestFrame>,
     delivered: bool,
-    stdout: std::io::Stdout,
+    control: Option<KernelControlReader>,
+    emission_broken: bool,
 }
 
 impl DeliverySetChannel {
@@ -642,8 +797,17 @@ impl DeliverySetChannel {
         Self {
             admitted: Some(admitted),
             delivered: false,
-            stdout: std::io::stdout(),
+            control: None,
+            emission_broken: false,
         }
+    }
+
+    /// Installs the Kernel control reader feeding external
+    /// Cancel/Reconcile/Shutdown for this operation.
+    #[must_use]
+    pub fn with_kernel_control(mut self, reader: KernelControlReader) -> Self {
+        self.control = Some(reader);
+        self
     }
 }
 
@@ -656,17 +820,31 @@ impl WasmHostRequestChannel for DeliverySetChannel {
         Ok(self.admitted.take())
     }
 
+    fn poll_control(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
+        match self.control.as_ref() {
+            Some(reader) => Ok(reader.poll()),
+            None => Ok(None),
+        }
+    }
+
     fn publish(&mut self, frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+        if self.emission_broken {
+            // A previous emission missed its output deadline; the helper
+            // thread still holds the stdout lock, so the contended stream
+            // is never reused — every later frame fails closed here.
+            return Err(LoopError::ChannelUnavailable);
+        }
         let bytes = serde_json::to_vec(frame).map_err(|_| LoopError::ResultTooLarge)?;
         if bytes.len() > MAX_RESULT_FRAME_BYTES {
             return Err(LoopError::ResultTooLarge);
         }
-        let mut stdout = self.stdout.lock();
-        stdout
-            .write_all(&bytes)
-            .and_then(|()| stdout.write_all(b"\n"))
-            .and_then(|()| stdout.flush())
-            .map_err(|_| LoopError::ChannelUnavailable)
+        match emit_frame_bounded(bytes) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.emission_broken = true;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -996,22 +1174,25 @@ impl BoundedRequestLoop {
 /// Runs the bounded ordinary request loop over one granted execution.
 ///
 /// The control phase always runs (authority refresh, drain, revocation,
-/// containment), the request phase admits at most `max_in_flight` queued
-/// commands, and each reply is projected onto a correlated owner-backed
-/// frame. The worker is always joined before the loop returns, so no guest
-/// work outlives the process.
+/// containment, external control intake), the request phase admits at most
+/// `max_in_flight` queued commands, and each reply is projected onto a
+/// correlated owner-backed frame. The worker is always joined before the
+/// loop returns, so no guest work outlives the process.
 pub fn run_request_loop(
     runtime: AdmittedRuntime,
     material: &ValidatedDispatchMaterial,
 ) -> Result<WasmHostResultFrame, LoopError> {
     let binding = AdmittedBinding::from_material(material, &runtime.invocation);
     let request_frame = WasmHostRequestFrame::admitted_invoke(&binding);
+    let mut channel = DeliverySetChannel::new(request_frame);
+    if let Some(path) = kernel_control_path() {
+        channel = channel.with_kernel_control(KernelControlReader::new(&binding, path));
+    }
     let mut state = BoundedRequestLoop::new(
         binding,
         runtime.engine_binding.clone(),
         Arc::clone(&runtime.live),
     );
-    let mut channel = DeliverySetChannel::new(request_frame);
     let worker = spawn_worker(runtime, state.max_in_flight);
     let outcome = drive_loop(&mut state, &mut channel, &worker.commands, &worker.outcomes);
     // Typed shutdown: close admission, ask the worker to stop, and join it so
@@ -1029,11 +1210,40 @@ pub fn run_request_loop(
     state.published().cloned().ok_or(denied("no-request"))
 }
 
+/// Derives the Kernel control-request path from the loader path only —
+/// never from argv, stdin, or environment. `None` when the loader path is
+/// unavailable, in which case the loop serves the delivery set with no
+/// external control source.
+fn kernel_control_path() -> Option<PathBuf> {
+    admitted_material_path().and_then(|path| {
+        path.parent()
+            .map(|directory| directory.join(WASM_HOST_CONTROL_FILE_NAME))
+    })
+}
+
+/// Admits one externally staged Kernel control frame through the same
+/// admission path internal control uses. Returns whether a frame was
+/// admitted; the caller then applies the loop's normal send/close handling
+/// and continues its tick without pulling a new delivery request.
+fn admit_external_control(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+) -> Result<bool, LoopError> {
+    let Some(frame) = channel.poll_control()? else {
+        return Ok(false);
+    };
+    if let Err(error) = state.admit(&frame) {
+        state.denial = Some(error);
+        return Err(error);
+    }
+    Ok(true)
+}
+
 /// The control / request / completion cycle. Split out so each phase stays a
 /// single bounded step.
 fn drive_loop(
     state: &mut BoundedRequestLoop,
-    channel: &mut DeliverySetChannel,
+    channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
 ) -> Result<(), LoopError> {
@@ -1041,6 +1251,15 @@ fn drive_loop(
         state.tick();
         if state.lifecycle.in_flight {
             poll_pending(state, channel, commands, outcomes)?;
+            continue;
+        }
+        // External control stays processable while the loop is idle too: a
+        // Kernel Cancel racing the delivery set is admitted before the
+        // invoke is pulled, never after it executed.
+        if admit_external_control(state, channel)? {
+            if let Some(command) = state.queued {
+                state.send(command, commands)?;
+            }
             continue;
         }
         let Some(frame) = channel.next_frame()? else {
@@ -1071,7 +1290,7 @@ fn drive_loop(
 /// was pending.
 fn poll_pending(
     state: &mut BoundedRequestLoop,
-    channel: &mut DeliverySetChannel,
+    channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
 ) -> Result<(), LoopError> {
@@ -1088,6 +1307,13 @@ fn poll_pending(
         }
         Err(RecvTimeoutError::Timeout) => {
             state.containment_step()?;
+            // External control intake while guest work is pending: the
+            // control poll never blocks, so the outstanding command keeps
+            // its outcome wait while a Kernel Cancel/Reconcile/Shutdown
+            // staged beside the delivery set is admitted through the same
+            // path. Owner intent wins the single command slot over the
+            // clock-derived containment above.
+            admit_external_control(state, channel)?;
             if let Some(command) = state.queued {
                 state.send(command, commands)?;
             }
@@ -1166,7 +1392,7 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // leftover is a fresh-drive signal rather than a silent reuse. The
         // in-memory retention of the terminal frame above is the readback
         // path, not a second execution.
-        consume_delivery_set();
+        consume_delivery_set(&material);
         let frame = frame.map_err(OrdinaryDriveError::Loop)?;
         served_grant = Some(material.grant.grant_digest.as_str().to_owned());
         outcome = Some(frame);
@@ -1174,10 +1400,18 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
     outcome.ok_or(OrdinaryDriveError::NoDeliverySet)
 }
 
-/// Consumes the staged delivery set beside this installation. Best effort by
-/// contract, and derived from the loader path only — never from argv, stdin,
-/// or environment.
-fn consume_delivery_set() {
+/// Consumes the staged delivery set beside this installation — but only
+/// while it still names the generation this loop served.
+///
+/// The publisher stages replacements under the same fixed filenames, so a
+/// replacement published while this loop ran now owns those paths: the
+/// staged envelope is re-read and the set is consumed only when its grant
+/// and guest digests still match the served material. Anything else — a
+/// replacement, an unreadable envelope, or an already-consumed set — is
+/// left untouched; a leftover is a fresh-drive signal, never silent reuse.
+/// Derived from the loader path only — never from argv, stdin, or
+/// environment. Best effort by contract.
+fn consume_delivery_set(material: &ValidatedDispatchMaterial) {
     use crate::dispatch_material::{
         WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
         WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, consume_staged,
@@ -1187,9 +1421,40 @@ fn consume_delivery_set() {
     else {
         return;
     };
-    consume_staged(&directory.join(WASM_HOST_MATERIAL_FILE_NAME));
-    consume_staged(&directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME));
-    consume_staged(&directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME));
+    let still_ours = match read_dispatch_material() {
+        Ok(Some(current)) => {
+            current.grant.grant_digest == material.grant.grant_digest
+                && current.ceilings.artifact_digest == material.ceilings.artifact_digest
+                && current.ceilings.input_digest == material.ceilings.input_digest
+        }
+        Ok(None) | Err(_) => false,
+    };
+    if still_ours {
+        consume_staged(&directory.join(WASM_HOST_MATERIAL_FILE_NAME));
+        consume_staged(&directory.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME));
+        consume_staged(&directory.join(WASM_HOST_GUEST_INPUT_FILE_NAME));
+    }
+    // A control leftover naming this operation is ours to retire under the
+    // same ownership rule; a foreign or malformed one is left for its own
+    // delivery (and self-heals when the next control overwrites the file).
+    let control_path = directory.join(WASM_HOST_CONTROL_FILE_NAME);
+    if control_names_operation(&control_path, material) {
+        consume_staged(&control_path);
+    }
+}
+
+/// Returns whether the staged control file names the served operation. Any
+/// read, shape, or identity mismatch answers no: ownership of an
+/// unidentifiable file can never be established.
+fn control_names_operation(path: &Path, material: &ValidatedDispatchMaterial) -> bool {
+    let Ok(bytes) = read_staged_bytes(path) else {
+        return false;
+    };
+    let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
+        return false;
+    };
+    frame.operation_id == material.operation_id
+        && frame.grant_digest == material.grant.grant_digest.as_str()
 }
 
 /// Reads the owner-staged delivery set beside this installation.

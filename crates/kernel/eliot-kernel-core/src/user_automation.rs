@@ -10,6 +10,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::user_automation_zones;
+
 pub use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     ContractIdentity, ContractVersion, OperationId, PolicyRevision, RequestMetadata, StateFence,
@@ -37,7 +39,31 @@ pub const USER_AUTOMATION_PREFLIGHT_EFFECT_CEILING: &str = "READ";
 pub const USER_AUTOMATION_SCOPE: &str = "user-automation";
 /// Revision required by the deterministic preflight contract.
 pub const USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION: &str = "eliot.user-automation.preflight.v1";
+/// Canonical encoding of one owner-normalized calendar occurrence.
+///
+/// One occurrence key is the `|`-separated, fixed-arity record
+///
+/// ```text
+/// <encoding>|<zone>|<zone database revision>|<local wall clock>|<offset>
+///   |<resolved UTC instant>|<transition window>|<disposition>|<source digest>
+/// ```
+///
+/// of exactly the owner evidence a replay needs. Every field has a closed
+/// grammar, so a rejected value names a missing or malformed piece of evidence
+/// instead of a string that merely resembles a timestamp. A local wall clock is
+/// always accompanied by the instant the pinned zone revision resolved it to,
+/// the offset that instant carries, the transition evidence that makes a fold or
+/// gap reproducible, and the fold or gap disposition the owner applied. A
+/// database revision therefore cannot silently re-resolve a stored occurrence:
+/// it is part of the record, and of the occurrence identity derived from it.
+///
+/// The predecessor of this encoding was a local wall clock plus an offset with
+/// none of that evidence. Such a record is a legacy, unverified input and is
+/// refused with [`UserAutomationError::LegacyScheduleEncoding`], so it is never
+/// silently certified under this stronger contract.
+pub const NORMALIZED_OCCURRENCE_ENCODING: &str = "ELIOT/I11.12/OCCURRENCE/V2";
 const OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
+const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V1";
 const FAILURE_FINGERPRINT_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-FAILURE/V1";
 const WAKE_REASON_PREFIX: &str = "user-automation";
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -79,6 +105,62 @@ pub enum UserAutomationError {
     /// Canonical serialization failed while deriving an identity.
     #[error("UserAutomation canonical serialization failed: {0}")]
     Serialization(String),
+    /// A normalized occurrence still carries the retired shape-only encoding.
+    ///
+    /// That encoding is a legacy, unverified input: it carries no zone
+    /// identity, no pinned database revision, no resolved instant and no
+    /// applied fold or gap disposition, so it is never certified under the
+    /// versioned calendar contract. The owning calendar adapter must
+    /// re-normalize it into a new revision.
+    #[error("normalized occurrence is legacy shape-only and requires re-normalization: {0}")]
+    LegacyScheduleEncoding(&'static str),
+    /// The named zone is not a member of the pinned zone table.
+    ///
+    /// Zone admission is table membership, so a zone the pinned release does not
+    /// define, a zone whose expansion could not be proven against an independent
+    /// implementation, and a spelled pair that merely resembles a real one are
+    /// all refused here. No zone is ever resolved from its spelling.
+    ///
+    /// A zone the pinned release does define, but whose pinned offsets cannot be
+    /// stated exactly in this contract's canonical offset unit, is refused here as
+    /// well rather than answered from a truncated offset. `Africa/Monrovia` is
+    /// the one such zone in this release: it applied `-0:44:30` until 1972, and
+    /// minutes cannot hold that value. The zone is reported here because from this
+    /// boundary the two cases are the same answer: this contract has no
+    /// minute-valued zone evidence to offer for it.
+    #[error("normalized occurrence names a zone the pinned zone table does not carry: {0}")]
+    UnknownZone(&'static str),
+    /// The pinned zone database revision is not the one this build carries.
+    ///
+    /// A revision is refused rather than read from an ambient database, so a
+    /// timezone database update cannot silently rewrite an existing revision.
+    #[error("pinned zone database revision is not the revision this build carries: {0}")]
+    ZoneDatabaseRevision(&'static str),
+    /// The occurrence instant lies outside the pinned table's closed window.
+    ///
+    /// The window is never extrapolated: an occurrence beyond it is refused with
+    /// the window in the payload rather than resolved from a guess.
+    #[error("occurrence instant is outside the pinned zone table window {window}: {field}")]
+    ZoneTableWindow {
+        /// The field that carried the out-of-window instant.
+        field: &'static str,
+        /// The closed window this build admits, as an ISO-8601 interval.
+        window: &'static str,
+    },
+    /// The embedded zone table failed its pinned digest or structure check.
+    ///
+    /// Every zone lookup fails closed rather than answer from bytes that are not
+    /// the pinned release.
+    #[error("the pinned zone table failed its integrity check and every zone lookup is refused")]
+    ZoneTableIntegrity,
+    /// The recorded zone evidence is not what the pinned table applies.
+    ///
+    /// The offset, the local wall clock, the transition evidence and the applied
+    /// disposition of an occurrence must all be what the named zone actually
+    /// applies at the recorded instant. This is what proves that a recorded
+    /// offset is one the named zone applies at that local wall clock.
+    #[error("occurrence evidence is not what the pinned zone table applies: {0}")]
+    ZoneEvidence(&'static str),
 }
 
 /// Execution mode admitted by an immutable revision.
@@ -159,17 +241,21 @@ pub struct NormalizedSchedule {
     pub start_at: String,
     /// Optional inclusive owner-normalized end instant.
     pub end_at: Option<String>,
-    /// Bounded, sorted, owner-normalized next occurrence keys.
+    /// Bounded, chronologically ordered owner-normalized occurrences in the
+    /// [`NORMALIZED_OCCURRENCE_ENCODING`] encoding.
     pub next_occurrences: Vec<String>,
 }
 
 impl NormalizedSchedule {
-    /// Validates schedule shape without interpreting calendar semantics.
+    /// Validates the schedule shape without interpreting calendar semantics.
     ///
-    /// Shape validation deliberately does not read the calendar: the
-    /// owner-normalized occurrence set is the trigger contract, and
+    /// Shape validation stays calendar-blind on purpose: the owner-normalized
+    /// occurrence set is the trigger contract, and
     /// [`Self::validate_normalized_occurrences`] performs the deterministic
-    /// calendar/timezone/DST interpretation over exactly that set.
+    /// calendar, timezone, DST, interval and chronological interpretation over
+    /// exactly that set. No two instants are compared as text here, because `+`
+    /// sorts before `Z` and a lexical order of mixed offsets is not a
+    /// chronological one.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
         text(&self.expression, "schedule.expression")?;
         text(&self.calendar, "schedule.calendar")?;
@@ -177,23 +263,11 @@ impl NormalizedSchedule {
         text(&self.start_at, "schedule.start_at")?;
         if let Some(end_at) = &self.end_at {
             text(end_at, "schedule.end_at")?;
-            if end_at < &self.start_at {
-                return Err(UserAutomationError::Invalid("schedule.end_at"));
-            }
         }
         if self.next_occurrences.is_empty() {
             return Err(UserAutomationError::Invalid("schedule.next_occurrences"));
         }
         list_text(&self.next_occurrences, "schedule.next_occurrences")?;
-        if self
-            .next_occurrences
-            .windows(2)
-            .any(|window| window[0] >= window[1])
-        {
-            return Err(UserAutomationError::Invalid(
-                "schedule.next_occurrences.order",
-            ));
-        }
         if self.kind == ScheduleKind::OneShot && self.next_occurrences.len() != 1 {
             return Err(UserAutomationError::Invalid(
                 "schedule.one_shot_occurrences",
@@ -204,65 +278,130 @@ impl NormalizedSchedule {
 
     /// Validates the declared timezone identifier without guessing one.
     ///
-    /// Only the closed canonical forms are admitted: `UTC`, an `Etc/GMT`
-    /// fixed-offset zone, or a canonical `Area/Location` IANA identifier. A
-    /// blank, offset-suffixed, or otherwise shaped zone is refused instead of
-    /// being resolved to a nearest match, because an ambiguous calendar
-    /// phrase is never silently guessed.
+    /// Only identities that are members of the pinned zone table are admitted.
+    /// A zone that release does not define, a zone whose expansion could not be
+    /// proven against an independent implementation, and a spelled pair that
+    /// merely resembles a real one are all refused identically, and none is
+    /// resolved to a nearest match. The occurrence set must additionally pin the
+    /// database revision the owner normalized against, so an ambiguous calendar
+    /// phrase is never guessed and an ambient machine locale is never used.
     pub fn validate_timezone(&self) -> Result<(), UserAutomationError> {
-        let zone = self.timezone.trim();
-        if zone != self.timezone || zone.is_empty() {
-            return Err(UserAutomationError::Invalid("schedule.timezone"));
-        }
-        let canonical = zone == "UTC"
-            || zone
-                .strip_prefix("Etc/GMT")
-                .is_some_and(offset_is_canonical)
-            || (zone.split('/').count() == 2
-                && zone.split('/').all(|segment| {
-                    !segment.is_empty()
-                        && segment
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                }));
-        if !canonical {
+        if self.timezone.trim() != self.timezone || !is_canonical_zone_identity(&self.timezone) {
             return Err(UserAutomationError::Invalid("schedule.timezone.canonical"));
         }
         Ok(())
     }
 
-    /// Interprets the owner-normalized occurrence set deterministically.
+    /// Returns the immutable compiled digest binding this occurrence projection
+    /// to its declared expression and calendar.
     ///
-    /// Each occurrence key is a canonical local wall clock
-    /// (`YYYY-MM-DDTHH:MM:SS`) followed by the exact UTC offset selected by the
-    /// declared timezone, so no time-zone database is required and no offset
-    /// is inferred. The check enforces the property the declared
-    /// [`DstFoldPolicy`]/[`DstGapPolicy`] must leave behind: the normalized set
-    /// is unambiguous, that is, at most one member per local wall clock. A set
-    /// that still carries an unresolved fold (or gap) member fails closed
-    /// instead of being admitted.
-    pub fn validate_normalized_occurrences(&self) -> Result<(), UserAutomationError> {
+    /// The expression language is owned elsewhere, so Kernel never reparses it.
+    /// The owner compiles the expression once and every occurrence of the
+    /// projection carries this digest, so an occurrence that is not the next
+    /// result of the declared expression and calendar fails closed instead of
+    /// being presented as their projection.
+    pub fn source_digest(&self) -> Result<String, UserAutomationError> {
+        let bytes = canonical_json_bytes(&(
+            SCHEDULE_SOURCE_DIGEST_DOMAIN,
+            &self.expression,
+            &self.calendar,
+        ))
+        .map_err(|error| UserAutomationError::Serialization(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Returns the decoded owner-issued occurrence set in validated
+    /// chronological order.
+    ///
+    /// The set is the single normalized occurrence contract. Each member
+    /// carries the canonical zone identity, the pinned zone database revision,
+    /// the range-checked local civil datetime, the resolved UTC instant and
+    /// applied offset, the applied fold or gap disposition, and the compiled
+    /// source digest. Every member must resolve to exactly the instant its
+    /// disposition and applied offset select, lie inside the declared start and
+    /// end interval, and be strictly later than its predecessor: a duplicate
+    /// instant cannot occupy two positions, and the two distinct instants of a
+    /// fold remain two distinct occurrences instead of colliding.
+    pub fn normalized_occurrences(&self) -> Result<Vec<NormalizedOccurrence>, UserAutomationError> {
         self.validate()?;
         self.validate_timezone()?;
-        let mut wall_clocks = BTreeSet::new();
+        let source_digest = self.source_digest()?;
+        let start = parse_civil_instant(&self.start_at, "schedule.start_at")?;
+        let end = self
+            .end_at
+            .as_deref()
+            .map(|end_at| parse_civil_instant(end_at, "schedule.end_at"))
+            .transpose()?;
+        if end.is_some_and(|end| end < start) {
+            return Err(UserAutomationError::Invalid("schedule.end_at"));
+        }
+        let mut pinned_database_revision: Option<String> = None;
+        let mut previous_instant: Option<i64> = None;
+        let mut occurrences = Vec::with_capacity(self.next_occurrences.len());
         for occurrence_key in &self.next_occurrences {
-            let wall_clock = occurrence_wall_clock(occurrence_key)?;
-            if !wall_clocks.insert(wall_clock) {
+            let occurrence = self.parse_occurrence(occurrence_key, &source_digest)?;
+            match &pinned_database_revision {
+                Some(revision) if *revision != occurrence.zone_database_revision => {
+                    return Err(UserAutomationError::Invalid(
+                        "schedule.next_occurrences.zone_database_revision",
+                    ));
+                }
+                Some(_) => {}
+                None => pinned_database_revision = Some(occurrence.zone_database_revision.clone()),
+            }
+            if occurrence.instant_seconds < start
+                || end.is_some_and(|end| occurrence.instant_seconds > end)
+            {
                 return Err(UserAutomationError::Invalid(
-                    "schedule.next_occurrences.dst_ambiguity",
+                    "schedule.next_occurrences.interval",
                 ));
             }
+            match previous_instant {
+                Some(previous) if occurrence.instant_seconds == previous => {
+                    return Err(UserAutomationError::Invalid(
+                        "schedule.next_occurrences.duplicate_instant",
+                    ));
+                }
+                Some(previous) if occurrence.instant_seconds < previous => {
+                    return Err(UserAutomationError::Invalid(
+                        "schedule.next_occurrences.order",
+                    ));
+                }
+                _ => {}
+            }
+            previous_instant = Some(occurrence.instant_seconds);
+            occurrences.push(occurrence);
         }
+        Ok(occurrences)
+    }
+
+    /// Interprets the owner-normalized occurrence set deterministically.
+    ///
+    /// This is the deterministic calendar interpretation of exactly that set:
+    /// the declared zone identity, the pinned zone database revision, the civil
+    /// local datetimes, the UTC offsets, the resolved instants, the applied
+    /// fold and gap dispositions, the compiled source digest, the start and end
+    /// interval, and the chronological order. It admits no occurrence it cannot
+    /// derive from the owner-issued evidence and it never resolves a zone, reads
+    /// a time zone database, or consults an ambient clock or locale.
+    ///
+    /// This is a schedule check only. Principal, `WorkScope`, State Fence,
+    /// preflight, overlap and reconciliation remain separate admission checks
+    /// over a valid occurrence, so a valid occurrence is still not a wake.
+    pub fn validate_normalized_occurrences(&self) -> Result<(), UserAutomationError> {
+        self.normalized_occurrences()?;
         Ok(())
     }
 
     /// Returns whether one calendar occurrence belongs to this revision's
     /// owner-normalized occurrence set.
     ///
-    /// An occurrence outside the set is not resolved, shifted, or folded into a
-    /// neighbour: the caller fails closed.
+    /// The supplied key is validated under the same versioned contract as the
+    /// stored set, so an occurrence outside it is neither resolved, shifted, nor
+    /// folded into a neighbour: the caller fails closed.
     pub fn contains_occurrence(&self, occurrence_key: &str) -> Result<bool, UserAutomationError> {
-        occurrence_wall_clock(occurrence_key)?;
+        self.validate_timezone()?;
+        self.parse_occurrence(occurrence_key, &self.source_digest()?)?;
         Ok(self
             .next_occurrences
             .iter()
@@ -271,13 +410,16 @@ impl NormalizedSchedule {
 
     /// Returns the deterministic successor of one normalized occurrence.
     ///
+    /// The successor is the next member of the validated chronological
+    /// projection, so re-spelling a member's text cannot move it in the chain.
     /// `None` means the occurrence is the last retained member of this
     /// revision's projection; a caller never invents a later occurrence.
     pub fn next_occurrence_after(
         &self,
         occurrence_key: &str,
     ) -> Result<Option<String>, UserAutomationError> {
-        occurrence_wall_clock(occurrence_key)?;
+        self.parse_occurrence(occurrence_key, &self.source_digest()?)?;
+        self.validate_normalized_occurrences()?;
         Ok(self
             .next_occurrences
             .iter()
@@ -285,60 +427,725 @@ impl NormalizedSchedule {
             .nth(1)
             .cloned())
     }
+
+    /// Parses and validates one occurrence key against this schedule's declared
+    /// zone, fold and gap policies, and compiled source digest.
+    fn parse_occurrence(
+        &self,
+        occurrence_key: &str,
+        source_digest: &str,
+    ) -> Result<NormalizedOccurrence, UserAutomationError> {
+        if occurrence_key.len() > MAX_OCCURRENCE_KEY_BYTES {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.shape",
+            ));
+        }
+        let fields: Vec<&str> = occurrence_key
+            .split(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR)
+            .collect();
+        if fields.len() != NORMALIZED_OCCURRENCE_FIELD_COUNT {
+            return Err(if is_legacy_occurrence_key(occurrence_key) {
+                UserAutomationError::LegacyScheduleEncoding("schedule.next_occurrences")
+            } else {
+                UserAutomationError::Invalid("schedule.occurrence_key.shape")
+            });
+        }
+        if fields[0] != NORMALIZED_OCCURRENCE_ENCODING {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.encoding",
+            ));
+        }
+        if fields[1] != self.timezone {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.timezone",
+            ));
+        }
+        if !is_canonical_zone_database_revision(fields[2]) {
+            return Err(UserAutomationError::ZoneDatabaseRevision(
+                "schedule.occurrence_key.zone_database_revision",
+            ));
+        }
+        if fields[8] != source_digest {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.source_digest",
+            ));
+        }
+        let disposition =
+            parse_occurrence_disposition(fields[7], "schedule.occurrence_key.disposition")?;
+        require_declared_disposition(disposition, self.dst_fold, self.dst_gap)?;
+        let local = parse_civil_wall_clock(fields[3], "schedule.occurrence_key.local")?;
+        let offset_minutes = parse_utc_offset(fields[4], "schedule.occurrence_key.offset")?;
+        let instant_seconds = parse_utc_instant(fields[5], "schedule.occurrence_key.instant")?;
+        let transition =
+            parse_transition_window(fields[6], disposition, "schedule.occurrence_key.transition")?;
+        require_resolved_instant(
+            local,
+            offset_minutes,
+            disposition,
+            transition,
+            instant_seconds,
+        )?;
+        require_pinned_zone_evidence(
+            &self.timezone,
+            local.unix_seconds(),
+            offset_minutes,
+            instant_seconds,
+            disposition,
+            transition,
+        )?;
+        Ok(NormalizedOccurrence {
+            timezone: self.timezone.clone(),
+            zone_database_revision: fields[2].to_owned(),
+            local: fields[3].to_owned(),
+            offset_minutes,
+            instant_seconds,
+            disposition,
+            source_digest: fields[8].to_owned(),
+        })
+    }
 }
 
-/// Length of the canonical local wall clock prefix `YYYY-MM-DDTHH:MM:SS`.
-const OCCURRENCE_WALL_CLOCK_BYTES: usize = 19;
+/// Fold or gap disposition the calendar owner applied to one normalized
+/// occurrence.
+///
+/// The disposition is owner-issued evidence recorded with the occurrence, not
+/// a value Kernel re-derives: inspection and replay therefore never read a time
+/// zone database again. A `DstFoldPolicy::Reject` or `DstGapPolicy::Reject`
+/// schedule produces no disposition here, because the owner must refuse the
+/// ambiguous or nonexistent local time instead of normalizing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OccurrenceDisposition {
+    /// The local wall clock exists exactly once in the pinned zone revision.
+    Unique,
+    /// The local wall clock occurs twice and the earlier instant was applied.
+    FoldFirst,
+    /// The local wall clock occurs twice and the later instant was applied.
+    FoldSecond,
+    /// The local wall clock does not exist and was shifted forward to the first
+    /// existing instant.
+    GapShiftForward,
+}
 
-/// Splits one canonical occurrence key into its local wall clock and exact
-/// UTC offset, refusing any spelling that is not canonical.
-fn occurrence_wall_clock(occurrence_key: &str) -> Result<&str, UserAutomationError> {
-    let bytes = occurrence_key.as_bytes();
-    if bytes.len() != OCCURRENCE_WALL_CLOCK_BYTES + 1
-        && bytes.len() != OCCURRENCE_WALL_CLOCK_BYTES + 6
-    {
-        return Err(UserAutomationError::Invalid(
-            "schedule.occurrence_key.shape",
-        ));
+/// One decoded owner-issued normalized calendar occurrence.
+///
+/// This is the whole normalized occurrence contract of one bounded projection
+/// member: the canonical zone identity and the pinned zone database revision
+/// the owner normalized against, the valid local civil datetime, the resolved
+/// UTC instant and the applied offset, the applied fold or gap disposition, and
+/// the immutable compiled digest of the source expression and calendar. Kernel
+/// validates this evidence; it never resolves a zone, reads a time zone
+/// database, or reads the ambient machine locale.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedOccurrence {
+    /// Canonical owner-normalized zone identity.
+    pub timezone: String,
+    /// Pinned versioned zone database or platform-owner revision token.
+    pub zone_database_revision: String,
+    /// Valid local civil wall clock in `timezone`.
+    pub local: String,
+    /// Applied UTC offset in signed minutes east of UTC.
+    pub offset_minutes: i32,
+    /// Resolved UTC instant in seconds since the Unix epoch.
+    pub instant_seconds: i64,
+    /// Applied fold or gap disposition.
+    pub disposition: OccurrenceDisposition,
+    /// Immutable compiled digest of the source expression and calendar.
+    pub source_digest: String,
+}
+
+/// Separator between the fields of one normalized occurrence key. No field may
+/// contain it, so the record is unambiguously position-addressable.
+const NORMALIZED_OCCURRENCE_FIELD_SEPARATOR: char = '|';
+/// Fixed number of fields in one normalized occurrence key.
+const NORMALIZED_OCCURRENCE_FIELD_COUNT: usize = 9;
+/// Longest accepted normalized occurrence key. The encoding is a fixed record
+/// of short tokens, so a longer value is refused before it is split.
+const MAX_OCCURRENCE_KEY_BYTES: usize = 1024;
+/// Byte length of the canonical local wall clock `YYYY-MM-DDTHH:MM:SS`.
+const CIVIL_WALL_CLOCK_BYTES: usize = 19;
+/// Byte length of a canonical resolved UTC instant `YYYY-MM-DDTHH:MM:SSZ`.
+const UTC_INSTANT_BYTES: usize = CIVIL_WALL_CLOCK_BYTES + 1;
+/// Byte length of a canonical UTC offset `+HH:MM` or `-HH:MM`.
+const UTC_OFFSET_BYTES: usize = 6;
+/// Seconds in one civil day.
+const SECONDS_PER_DAY: i64 = 86_400;
+/// Seconds in one civil hour.
+const SECONDS_PER_HOUR: i64 = 3_600;
+/// Seconds in one civil minute.
+const SECONDS_PER_MINUTE: i64 = 60;
+/// Earliest civil year this contract normalizes. Year one keeps the absolute
+/// instant arithmetic below exact, and no automation occurrence is normalized
+/// before the Unix epoch.
+const MIN_CIVIL_YEAR: u32 = 1;
+/// Latest civil year this contract normalizes: the four digit range.
+const MAX_CIVIL_YEAR: u32 = 9999;
+/// Days from 0000-03-01 to 1970-01-01 in the proleptic Gregorian calendar.
+const CIVIL_EPOCH_DAY_OFFSET: i64 = 719_468;
+/// Days in one 400 year era of the proleptic Gregorian calendar.
+const DAYS_PER_CIVIL_ERA: i64 = 146_097;
+/// Largest civil UTC offset east of UTC in the time zone database, fourteen
+/// hours, so a larger spelled offset names no instant.
+const MAX_CIVIL_UTC_OFFSET_MINUTES: u32 = 14 * 60;
+/// Largest civil offset step one zone transition may apply. The database
+/// contains a whole skipped civil day, so the bound is one full day rather than
+/// one hour.
+const MAX_TRANSITION_STEP_MINUTES: u32 = 24 * 60;
+/// Longest accepted zone identity.
+const MAX_ZONE_IDENTITY_BYTES: usize = 64;
+/// Longest accepted pinned zone database revision token.
+const MAX_ZONE_DATABASE_REVISION_BYTES: usize = 64;
+/// The closed window the pinned zone table admits, as an ISO-8601 interval.
+///
+/// An occurrence instant outside it is refused with this window in the payload
+/// rather than resolved by extrapolating the table's stored timeline.
+const ZONE_TABLE_WINDOW_ISO: &str = "[1970-01-01T00:00:00Z, 2100-01-01T00:00:00Z)";
+
+/// One range-checked proleptic Gregorian civil date and time of day.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CivilDateTime {
+    /// Proleptic Gregorian year.
+    year: u32,
+    /// Month of the year, `1..=12`.
+    month: u32,
+    /// Day of the month, nonzero and within the month.
+    day: u32,
+    /// Hour of the day, `0..=23`.
+    hour: u32,
+    /// Minute of the hour, `0..=59`.
+    minute: u32,
+    /// Second of the minute, `0..=59`.
+    second: u32,
+}
+
+impl CivilDateTime {
+    /// Absolute seconds since the Unix epoch for this civil wall clock read as
+    /// UTC.
+    ///
+    /// A zone offset is applied by the caller, so the same civil value in two
+    /// zones yields two instants by arithmetic alone and no ambient clock is
+    /// ever read.
+    fn unix_seconds(&self) -> i64 {
+        days_from_civil(self.year, self.month, self.day) * SECONDS_PER_DAY
+            + i64::from(self.hour) * SECONDS_PER_HOUR
+            + i64::from(self.minute) * SECONDS_PER_MINUTE
+            + i64::from(self.second)
     }
-    if !bytes[..OCCURRENCE_WALL_CLOCK_BYTES]
-        .iter()
-        .enumerate()
-        .all(|(index, byte)| match index {
+}
+
+/// Days from 1970-01-01 to one proleptic Gregorian civil date.
+///
+/// This is the closed domain `days_from_civil` decomposition of the civil
+/// calendar. It reads no clock, locale, or calendar database, so two processes
+/// always agree on the chronological order of a normalized occurrence. The
+/// caller range-checks the date to [`MIN_CIVIL_YEAR`]..=[`MAX_CIVIL_YEAR`], the
+/// domain in which the era decomposition below is exact.
+fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year);
+    let (shifted_year, shifted_month) = if month <= 2 {
+        (year - 1, month + 12)
+    } else {
+        (year, month)
+    };
+    let era = shifted_year / 400;
+    let year_of_era = shifted_year - era * 400;
+    let month_position = i64::from(shifted_month) - 3;
+    let day_of_year = (153 * month_position + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * DAYS_PER_CIVIL_ERA + day_of_era - CIVIL_EPOCH_DAY_OFFSET
+}
+
+/// Returns whether one proleptic Gregorian year is a leap year.
+fn is_civil_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+/// Returns the number of days in one proleptic Gregorian month, honouring the
+/// leap day.
+fn days_in_civil_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_civil_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Returns whether a canonical numeric field spells a decimal digit at `index`.
+fn is_decimal_digit(value: &str, index: usize) -> bool {
+    value.as_bytes()[index].is_ascii_digit()
+}
+
+/// Reads the two decimal digits at `start` of a validated canonical field.
+fn decimal_pair(value: &str, start: usize) -> u32 {
+    u32::from(value.as_bytes()[start] - b'0') * 10 + u32::from(value.as_bytes()[start + 1] - b'0')
+}
+
+/// Reads the four decimal digits at the start of a validated canonical field.
+fn decimal_quad(value: &str) -> u32 {
+    decimal_pair(value, 0) * 100 + decimal_pair(value, 2)
+}
+
+/// Parses one canonical local wall clock `YYYY-MM-DDTHH:MM:SS`.
+///
+/// The value is range-checked against the proleptic Gregorian calendar,
+/// including leap days and the closed year range, instead of being accepted
+/// because its bytes look like a date. Fractional seconds, a lower case `t`,
+/// and a leap second are refused: only the canonical spelling of an exact civil
+/// second is an owner-normalized value.
+fn parse_civil_wall_clock(
+    value: &str,
+    field: &'static str,
+) -> Result<CivilDateTime, UserAutomationError> {
+    let bytes = value.as_bytes();
+    let canonical = bytes.len() == CIVIL_WALL_CLOCK_BYTES
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
             4 | 7 => *byte == b'-',
             10 => *byte == b'T',
             13 | 16 => *byte == b':',
             _ => byte.is_ascii_digit(),
-        })
+        });
+    if !canonical {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    let year = decimal_quad(value);
+    let month = decimal_pair(value, 5);
+    let day = decimal_pair(value, 8);
+    let hour = decimal_pair(value, 11);
+    let minute = decimal_pair(value, 14);
+    let second = decimal_pair(value, 17);
+    if !(MIN_CIVIL_YEAR..=MAX_CIVIL_YEAR).contains(&year)
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_civil_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
     {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    Ok(CivilDateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
+}
+
+/// Parses one canonical UTC offset `+HH:MM` or `-HH:MM` as signed minutes east
+/// of UTC.
+///
+/// The offset is range-checked against the largest civil offset the time zone
+/// database contains, so `+99`, a minute field above `59`, and a negative zero
+/// offset are refused instead of being admitted as a spelled offset that names
+/// no instant.
+fn parse_utc_offset(value: &str, field: &'static str) -> Result<i32, UserAutomationError> {
+    let bytes = value.as_bytes();
+    let canonical = bytes.len() == UTC_OFFSET_BYTES
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[3] == b':'
+        && is_decimal_digit(value, 1)
+        && is_decimal_digit(value, 2)
+        && is_decimal_digit(value, 4)
+        && is_decimal_digit(value, 5);
+    if !canonical {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    let hours = decimal_pair(value, 1);
+    let minutes = decimal_pair(value, 4);
+    if hours > 23 || minutes > 59 {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    let total_minutes = hours * 60 + minutes;
+    if (total_minutes == 0 && bytes[0] == b'-') || total_minutes > MAX_CIVIL_UTC_OFFSET_MINUTES {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    let total_minutes =
+        i32::try_from(total_minutes).map_err(|_| UserAutomationError::Invalid(field))?;
+    Ok(if bytes[0] == b'+' {
+        total_minutes
+    } else {
+        -total_minutes
+    })
+}
+
+/// Parses the resolved UTC instant field of one occurrence record.
+///
+/// The canonical spelling is the civil UTC value with a `Z` suffix, so one
+/// instant always has exactly one byte representation.
+fn parse_utc_instant(value: &str, field: &'static str) -> Result<i64, UserAutomationError> {
+    if value.len() != UTC_INSTANT_BYTES || !value.ends_with('Z') {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    Ok(parse_civil_wall_clock(&value[..CIVIL_WALL_CLOCK_BYTES], field)?.unix_seconds())
+}
+
+/// Parses one owner-normalized RFC 3339 instant as absolute seconds.
+///
+/// `start_at` and `end_at` are instants rather than wall clocks, so the offset
+/// is applied here: `2026-01-01T00:00:00+14:00` is correctly later than
+/// `2026-01-01T00:00:00Z` even though it sorts before it as text.
+fn parse_civil_instant(value: &str, field: &'static str) -> Result<i64, UserAutomationError> {
+    if value.len() < CIVIL_WALL_CLOCK_BYTES + 1 {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    let civil = parse_civil_wall_clock(&value[..CIVIL_WALL_CLOCK_BYTES], field)?;
+    let offset = &value[CIVIL_WALL_CLOCK_BYTES..];
+    let offset_minutes = if offset == "Z" {
+        0
+    } else {
+        parse_utc_offset(offset, field)?
+    };
+    Ok(civil.unix_seconds() - i64::from(offset_minutes) * SECONDS_PER_MINUTE)
+}
+
+/// Parses the applied fold or gap disposition field of one occurrence record.
+fn parse_occurrence_disposition(
+    value: &str,
+    field: &'static str,
+) -> Result<OccurrenceDisposition, UserAutomationError> {
+    match value {
+        "UNIQUE" => Ok(OccurrenceDisposition::Unique),
+        "FOLD_FIRST" => Ok(OccurrenceDisposition::FoldFirst),
+        "FOLD_SECOND" => Ok(OccurrenceDisposition::FoldSecond),
+        "GAP_SHIFT_FORWARD" => Ok(OccurrenceDisposition::GapShiftForward),
+        _ => Err(UserAutomationError::Invalid(field)),
+    }
+}
+
+/// Parses the owner-carried transition evidence of one fold or gap occurrence.
+///
+/// A unique occurrence carries `-`: its local wall clock exists once, so there
+/// is no transition to reproduce. A fold or a gap carries the offsets the pinned
+/// zone revision applies immediately before and after the transition, joined by
+/// `~`. That pair is the exact evidence a replay needs to re-derive the applied
+/// offset without reading a time zone database again, and
+/// [`require_pinned_zone_evidence`] is what turns it into proof: it checks both
+/// boundaries against the transitions the pinned table actually holds between
+/// the two instants, so a recorded offset that the named zone does not apply at
+/// that local wall clock is refused.
+fn parse_transition_window(
+    value: &str,
+    disposition: OccurrenceDisposition,
+    field: &'static str,
+) -> Result<Option<(i32, i32)>, UserAutomationError> {
+    if disposition == OccurrenceDisposition::Unique {
+        return if value == "-" {
+            Ok(None)
+        } else {
+            Err(UserAutomationError::Invalid(field))
+        };
+    }
+    let Some((before, after)) = value.split_once('~') else {
+        return Err(UserAutomationError::Invalid(field));
+    };
+    let pre = parse_utc_offset(before, field)?;
+    let post = parse_utc_offset(after, field)?;
+    let step = pre.abs_diff(post);
+    if step == 0 || step > MAX_TRANSITION_STEP_MINUTES {
+        return Err(UserAutomationError::Invalid(field));
+    }
+    Ok(Some((pre, post)))
+}
+
+/// Requires the recorded disposition to be the one the declared fold and gap
+/// policies admit.
+///
+/// A `Reject` policy produces no normalized occurrence: the owner must refuse the
+/// ambiguous or nonexistent local time instead of selecting a disposition for
+/// it. A `Reject` schedule therefore never carries a fold or gap member, and a
+/// `First` or `Second` schedule never silently carries the other side of a fold.
+fn require_declared_disposition(
+    disposition: OccurrenceDisposition,
+    dst_fold: DstFoldPolicy,
+    dst_gap: DstGapPolicy,
+) -> Result<(), UserAutomationError> {
+    let admitted = match disposition {
+        OccurrenceDisposition::Unique => true,
+        OccurrenceDisposition::FoldFirst => dst_fold == DstFoldPolicy::First,
+        OccurrenceDisposition::FoldSecond => dst_fold == DstFoldPolicy::Second,
+        OccurrenceDisposition::GapShiftForward => dst_gap == DstGapPolicy::ShiftForward,
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(UserAutomationError::Invalid(
+            "schedule.occurrence_key.disposition",
+        ))
+    }
+}
+
+/// Requires the recorded instant to be exactly the one the applied disposition
+/// selects for the recorded local wall clock and applied offset.
+///
+/// For a unique local wall clock the recorded offset is the only offset the
+/// pinned zone revision applies, so the instant must be `local - offset`. For a
+/// fold the zone applies the pre transition offset to the earlier instant and
+/// the post transition offset to the later one, so `FIRST` must carry the pre
+/// transition offset and resolve to `local - pre`, and `SECOND` must carry the
+/// post transition offset and resolve to `local - post`. For a gap the local
+/// wall clock does not exist, so the owner shifts it forward by the transition
+/// step: the applied offset is the post transition offset and the instant is
+/// `local + step - post`, which is the same value as `local - pre`.
+///
+/// An occurrence whose recorded offset is neither side of the recorded
+/// transition, or whose instant does not round-trip through its own offset, is
+/// refused. Kernel resolves nothing: it refuses evidence that is not
+/// self-consistent.
+fn require_resolved_instant(
+    local: CivilDateTime,
+    offset_minutes: i32,
+    disposition: OccurrenceDisposition,
+    transition: Option<(i32, i32)>,
+    instant_seconds: i64,
+) -> Result<(), UserAutomationError> {
+    let applied = match (disposition, transition) {
+        (OccurrenceDisposition::Unique, None) => offset_minutes,
+        (OccurrenceDisposition::FoldFirst, Some((pre, post)))
+            if pre > post && offset_minutes == pre =>
+        {
+            pre
+        }
+        (OccurrenceDisposition::FoldSecond, Some((pre, post)))
+            if pre > post && offset_minutes == post =>
+        {
+            post
+        }
+        (OccurrenceDisposition::GapShiftForward, Some((pre, post)))
+            if pre < post && offset_minutes == post =>
+        {
+            pre
+        }
+        _ => {
+            return Err(UserAutomationError::Invalid(
+                "schedule.occurrence_key.transition",
+            ));
+        }
+    };
+    if local.unix_seconds() - i64::from(applied) * SECONDS_PER_MINUTE != instant_seconds {
         return Err(UserAutomationError::Invalid(
-            "schedule.occurrence_key.wall_clock",
+            "schedule.occurrence_key.instant",
         ));
     }
-    let offset = &occurrence_key[OCCURRENCE_WALL_CLOCK_BYTES..];
-    if offset != "Z"
-        && !(bytes.len() == OCCURRENCE_WALL_CLOCK_BYTES + 6
-            && (offset.starts_with('+') || offset.starts_with('-'))
-            && offset.as_bytes()[3] == b':'
-            && offset[1..3].bytes().all(|byte| byte.is_ascii_digit())
-            && offset[4..].bytes().all(|byte| byte.is_ascii_digit()))
+    Ok(())
+}
+
+/// Requires the recorded zone evidence to be what the pinned table applies.
+///
+/// The owner asserts a zone, a local wall clock, an offset, an instant, a
+/// transition pair and a disposition. This is where Kernel decides whether that
+/// assertion is true, by reading the offsets and transitions of the named zone
+/// out of the pinned table. Nothing is taken on the owner's spelling and nothing
+/// is read from an ambient database, so the recorded disposition stays
+/// inspectable and replayable while the decision that admitted it is Kernel's.
+///
+/// Given the recorded `(zone, local, offset, instant, transition, disposition)`:
+///
+/// 1. the zone must be a member of the pinned table and the revision must be the
+///    pinned one, which the caller has already established;
+/// 2. the offset the zone applies at the recorded instant must equal the recorded
+///    offset, which alone refuses an in-range offset that merely round-trips
+///    through its own instant;
+/// 3. the recorded local wall clock must equal the recorded instant rendered in
+///    the offset the zone applies at that instant;
+/// 4. what the local wall clock actually is decides the disposition: a unique
+///    clock admits only `UNIQUE` and needs no transition, a fold admits only
+///    `FOLD_FIRST` or `FOLD_SECOND` and must select the earlier or later of
+///    exactly the two instants the table resolves it to, and a gap admits only
+///    `GAP_SHIFT_FORWARD` and must land on the table's real post-transition
+///    instant;
+/// 5. when a transition pair is recorded, both of its boundaries must equal the
+///    offsets the table actually applies on either side of the transition it
+///    names.
+fn require_pinned_zone_evidence(
+    zone: &str,
+    claimed_local_unix_seconds: i64,
+    claimed_offset_minutes: i32,
+    claimed_instant_seconds: i64,
+    disposition: OccurrenceDisposition,
+    transition: Option<(i32, i32)>,
+) -> Result<(), UserAutomationError> {
+    if !(user_automation_zones::ZONE_TABLE_WINDOW_START_SECONDS
+        ..user_automation_zones::ZONE_TABLE_WINDOW_END_EXCLUSIVE_SECONDS)
+        .contains(&claimed_instant_seconds)
     {
-        return Err(UserAutomationError::Invalid(
+        return Err(UserAutomationError::ZoneTableWindow {
+            field: "schedule.occurrence_key.instant",
+            window: ZONE_TABLE_WINDOW_ISO,
+        });
+    }
+    let applied = user_automation_zones::offset_minutes_at(zone, claimed_instant_seconds)
+        .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+    if applied != claimed_offset_minutes {
+        return Err(UserAutomationError::ZoneEvidence(
             "schedule.occurrence_key.offset",
         ));
     }
-    Ok(&occurrence_key[..OCCURRENCE_WALL_CLOCK_BYTES])
+    if claimed_local_unix_seconds
+        != claimed_instant_seconds + i64::from(applied) * SECONDS_PER_MINUTE
+    {
+        return Err(UserAutomationError::ZoneEvidence(
+            "schedule.occurrence_key.local",
+        ));
+    }
+    let reality = user_automation_zones::classify_local_clock(zone, claimed_local_unix_seconds)
+        .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+    let disagree = || UserAutomationError::ZoneEvidence("schedule.occurrence_key.disposition");
+    let real_transition = match (disposition, reality) {
+        (
+            OccurrenceDisposition::Unique,
+            user_automation_zones::LocalClockReality::Unique {
+                instant_seconds,
+                offset_minutes,
+            },
+        ) => {
+            if instant_seconds != claimed_instant_seconds || offset_minutes != applied {
+                return Err(disagree());
+            }
+            return require_absent_transition(transition);
+        }
+        (
+            OccurrenceDisposition::FoldFirst,
+            user_automation_zones::LocalClockReality::Fold {
+                first_instant_seconds,
+                first_offset_minutes,
+                transition: real,
+                ..
+            },
+        ) => {
+            if first_instant_seconds != claimed_instant_seconds || first_offset_minutes != applied {
+                return Err(disagree());
+            }
+            real
+        }
+        (
+            OccurrenceDisposition::FoldSecond,
+            user_automation_zones::LocalClockReality::Fold {
+                second_instant_seconds,
+                second_offset_minutes,
+                transition: real,
+                ..
+            },
+        ) => {
+            if second_instant_seconds != claimed_instant_seconds || second_offset_minutes != applied
+            {
+                return Err(disagree());
+            }
+            real
+        }
+        (
+            OccurrenceDisposition::GapShiftForward,
+            user_automation_zones::LocalClockReality::Gap {
+                transition: real,
+                resolved_instant_seconds,
+                post_offset_minutes,
+                ..
+            },
+        ) => {
+            if resolved_instant_seconds != claimed_instant_seconds || post_offset_minutes != applied
+            {
+                return Err(disagree());
+            }
+            real
+        }
+        _ => return Err(disagree()),
+    };
+    let Some((pre, post)) = transition else {
+        return Err(UserAutomationError::ZoneEvidence(
+            "schedule.occurrence_key.transition",
+        ));
+    };
+    if pre != real_transition.pre_offset_minutes || post != real_transition.post_offset_minutes {
+        return Err(UserAutomationError::ZoneEvidence(
+            "schedule.occurrence_key.transition",
+        ));
+    }
+    Ok(())
 }
 
-/// Returns whether a canonical `Etc/GMT` offset suffix is well formed.
-fn offset_is_canonical(offset: &str) -> bool {
-    offset.is_empty()
-        || offset
-            .strip_prefix('+')
-            .or_else(|| offset.strip_prefix('-'))
-            .is_some_and(|hours| {
-                hours.len() == 1
-                    || (hours.len() == 2 && hours.bytes().all(|byte| byte.is_ascii_digit()))
+/// Requires that a unique occurrence records no transition pair.
+fn require_absent_transition(transition: Option<(i32, i32)>) -> Result<(), UserAutomationError> {
+    if transition.is_some() {
+        return Err(UserAutomationError::ZoneEvidence(
+            "schedule.occurrence_key.transition",
+        ));
+    }
+    Ok(())
+}
+
+/// Maps one zone-table failure onto its typed contract refusal.
+fn map_zone_error(
+    error: user_automation_zones::ZoneTableError,
+    field: &'static str,
+) -> UserAutomationError {
+    match error {
+        user_automation_zones::ZoneTableError::Integrity => UserAutomationError::ZoneTableIntegrity,
+        user_automation_zones::ZoneTableError::UnknownZone
+        | user_automation_zones::ZoneTableError::SubMinuteOffset(_) => {
+            UserAutomationError::UnknownZone(field)
+        }
+        user_automation_zones::ZoneTableError::OutsideCoverage => {
+            UserAutomationError::ZoneTableWindow {
+                field: "schedule.occurrence_key.instant",
+                window: ZONE_TABLE_WINDOW_ISO,
+            }
+        }
+    }
+}
+
+/// Returns whether one zone identity is a member of the pinned zone table.
+///
+/// Zone admission is table membership and nothing else. The table is generated
+/// from one pinned release of the IANA database and carries every name that
+/// release defines, plus every backward-compatible alias, and it carries only
+/// the names an independent implementation of the same data confirmed. So a
+/// spelled pair that names no database zone is refused, and so is a name that
+/// merely resembles one: `America/Nowhere_City` and `Foo/Bar` are absent for
+/// exactly the same reason as each other. A zone the release does define, but
+/// whose pinned offsets this contract's canonical offset unit cannot state
+/// exactly, is absent too, and is refused rather than answered from a truncated
+/// offset.
+fn is_canonical_zone_identity(zone: &str) -> bool {
+    !zone.is_empty()
+        && zone.len() <= MAX_ZONE_IDENTITY_BYTES
+        && user_automation_zones::is_pinned_zone(zone)
+}
+
+/// Returns whether one pinned zone database revision token names the revision
+/// this build carries.
+///
+/// The token must be exactly the pinned release, compared case-sensitively. No
+/// other revision is read, and none is resolved from an ambient database, so a
+/// timezone database update cannot silently rewrite an existing revision.
+fn is_canonical_zone_database_revision(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ZONE_DATABASE_REVISION_BYTES
+        && value == user_automation_zones::PINNED_ZONE_DATABASE_RELEASE
+}
+
+/// Returns whether one occurrence key still carries the retired shape-only
+/// encoding.
+///
+/// The retired encoding was a local wall clock plus an offset, with no zone
+/// identity, no pinned database revision, no resolved instant, and no applied
+/// disposition. It is recognized only so the contract can name the required
+/// re-normalization instead of silently certifying an unverified input under
+/// the versioned calendar contract.
+fn is_legacy_occurrence_key(occurrence_key: &str) -> bool {
+    let bytes = occurrence_key.as_bytes();
+    let retired_length = bytes.len() == UTC_INSTANT_BYTES
+        || bytes.len() == CIVIL_WALL_CLOCK_BYTES + UTC_OFFSET_BYTES;
+    retired_length
+        && bytes[..CIVIL_WALL_CLOCK_BYTES]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => *byte == b'-',
+                10 => *byte == b'T',
+                13 | 16 => *byte == b':',
+                _ => byte.is_ascii_digit(),
             })
 }
 
@@ -2085,6 +2892,29 @@ mod tests {
     }
 
     fn revision(state: UserAutomationConfigurationState) -> UserAutomationRevision {
+        // The occurrence is the owner-issued versioned record of the normalized
+        // result: the declared `America/New_York` wall clock, the offset the
+        // pinned database revision applies to it, the instant that resolves to,
+        // no transition, the unique disposition, and the compiled source digest
+        // of the declared expression and calendar.
+        let schedule = NormalizedSchedule {
+            kind: ScheduleKind::Recurring,
+            expression: "at 12:00".to_owned(),
+            calendar: "gregorian".to_owned(),
+            timezone: "America/New_York".to_owned(),
+            dst_fold: DstFoldPolicy::First,
+            dst_gap: DstGapPolicy::ShiftForward,
+            start_at: "2026-09-21T00:00:00Z".to_owned(),
+            end_at: None,
+            next_occurrences: Vec::new(),
+        };
+        let source_digest = schedule.source_digest().expect("source digest");
+        let mut schedule = schedule;
+        schedule.next_occurrences = vec![format!(
+            "{NORMALIZED_OCCURRENCE_ENCODING}|America/New_York|{}\
+             |2026-09-21T12:00:00|-04:00|2026-09-21T16:00:00Z|-|UNIQUE|{source_digest}",
+            user_automation_zones::PINNED_ZONE_DATABASE_RELEASE
+        )];
         UserAutomationRevision {
             automation_id: "automation-1".to_owned(),
             revision: "revision-7".to_owned(),
@@ -2096,17 +2926,7 @@ mod tests {
                 workdir_ref: "workdir-1".to_owned(),
             },
             natural_language_intent: "run the qualified deterministic check".to_owned(),
-            schedule: NormalizedSchedule {
-                kind: ScheduleKind::Recurring,
-                expression: "at 12:00".to_owned(),
-                calendar: "gregorian".to_owned(),
-                timezone: "America/New_York".to_owned(),
-                dst_fold: DstFoldPolicy::First,
-                dst_gap: DstGapPolicy::ShiftForward,
-                start_at: "2026-09-21T00:00:00Z".to_owned(),
-                end_at: None,
-                next_occurrences: vec!["2026-09-21T12:00:00-04:00".to_owned()],
-            },
+            schedule,
             mode: UserAutomationExecutionMode::DeterministicProcess,
             task: AutomationTaskBinding {
                 qualified_ref: "script:checks/v1".to_owned(),

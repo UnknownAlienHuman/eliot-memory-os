@@ -24,6 +24,8 @@
 //! [`NamedReadOperation::GetAttentionAndProblems`],
 //! [`NamedReadOperation::GetUnderstandingProjectionInputs`],
 //! [`NamedReadOperation::GetCapabilityEvidenceState`],
+//! [`NamedReadOperation::GetExperienceBankRange`],
+//! [`NamedReadOperation::GetAgentFeedbackRange`],
 //! [`NamedReadOperation::GetNotificationState`], the `#2100` owner-feed
 //! [`NamedReadOperation::GetAuthorityRevocationHistory`], and — since #1780 —
 //! [`NamedReadOperation::GetOrderingHeads`], pass
@@ -33,9 +35,11 @@
 //! The local-read serving arm ([`KernelContextReadClient::execute_local_read`])
 //! twins that gate shape for an admitted envelope+tool pair: the closed
 //! `eliot.query` selectors serve exactly one bounded
-//! [`LocalReadPort::evidence_query`](eliot_read::LocalReadPort::evidence_query),
-//! while `eliot.packet` stays admission-only (`Unavailable`, MGR04 #19) and a
-//! wrong fence fails closed before any read. The port and the admitted fence
+//! [`LocalReadPort::evidence_query`](eliot_read::LocalReadPort::evidence_query).
+//! `eliot.packet` is dispatched by the production campaign-packet poller after
+//! its own owner reads and Context compilation; this query-only port refuses
+//! to reinterpret a packet as evidence. A wrong fence fails closed before any
+//! read. The port and the admitted fence
 //! stay per-call parameters, so the composition retains no client and no
 //! thread; the `local_read` forwarding transport
 //! (`DaemonKernelClient::local_read_async`) is called through the
@@ -74,9 +78,10 @@ use eliot_protocol::{
 };
 use eliot_read::{LocalReadPort, QueryResult, ReadError};
 use eliot_store_api::{
-    CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
+    CampaignLearningStateViewLookup, CampaignSourceRevisionLookup, CanonicalReadClient,
+    EVIDENCE_PACK_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, REVOCATION_HISTORY_MAX_RECORDS, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, StoreError,
+    ScopeId, StoreError, validate_experience_read_params,
 };
 use serde_json::Value;
 
@@ -165,6 +170,14 @@ impl KernelContextReadClient {
             | NamedReadOperation::GetUnderstandingProjectionInputs
             | NamedReadOperation::GetCapabilityEvidenceState => {
                 Self::check_reconstruction_capability(request)
+            }
+            NamedReadOperation::GetExperienceBankRange
+            | NamedReadOperation::GetAgentFeedbackRange => {
+                Self::check_experience_range_capability(request)
+            }
+            NamedReadOperation::GetCampaignSourceRevision
+            | NamedReadOperation::GetCampaignLearningStateView => {
+                Self::check_campaign_learning_read_capability(request)
             }
             NamedReadOperation::GetNotificationState => Self::check_notification_selectors(request),
             NamedReadOperation::GetAuthorityRevocationHistory => {
@@ -264,6 +277,93 @@ impl KernelContextReadClient {
         }
         request.validate()?;
         Ok(())
+    }
+
+    /// Checks exact task-scoped campaign owner/view selectors before the
+    /// named read reaches Kernel. The typed store request performs the same
+    /// validation at its catalogue edge.
+    fn check_campaign_learning_read_capability(
+        request: &NamedReadRequest,
+    ) -> Result<(), StoreError> {
+        if request.scope_id.is_none() {
+            return Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "campaign learning reads require an exact task scope",
+            });
+        }
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "campaign learning reads require ExactFence",
+            });
+        }
+        request.validate()?;
+        let lookup = request
+            .parameters
+            .get("lookup")
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "campaign learning lookup is required",
+            })?;
+        if request.parameters.len() != 1 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameters",
+                reason: "campaign learning reads accept only lookup",
+            });
+        }
+        match request.operation {
+            NamedReadOperation::GetCampaignSourceRevision => {
+                let lookup: CampaignSourceRevisionLookup =
+                    serde_json::from_value(lookup.clone())
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                if lookup.named_parameters()? != request.parameters {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "campaign source lookup is not canonical",
+                    });
+                }
+            }
+            NamedReadOperation::GetCampaignLearningStateView => {
+                let lookup: CampaignLearningStateViewLookup =
+                    serde_json::from_value(lookup.clone())
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                if lookup.named_parameters()? != request.parameters {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "campaign view lookup is not canonical",
+                    });
+                }
+            }
+            _ => return Err(StoreError::UnknownOperation),
+        }
+        Ok(())
+    }
+
+    /// Executes one exact campaign owner or prior-view lookup through the
+    /// already-authenticated Kernel client. The request must carry the
+    /// admitted task fence and a closed store-owned selector.
+    pub(crate) async fn execute_campaign_read(
+        kernel: &DaemonKernelClient,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
+        if !matches!(
+            request.operation,
+            NamedReadOperation::GetCampaignSourceRevision
+                | NamedReadOperation::GetCampaignLearningStateView
+        ) {
+            return Err(StoreError::UnknownOperation);
+        }
+        Self::check_campaign_learning_read_capability(&request)?;
+        let admitted = kernel.snapshot().state_fence();
+        if request.state_fence != admitted {
+            return Err(StoreError::FenceMismatch);
+        }
+        let response = kernel
+            .store_named_async(request.clone())
+            .await
+            .map_err(Self::map_kernel_error)?;
+        Self::check_execute_response(&request, &response)?;
+        Ok(response)
     }
 
     /// Checks the closed notification-read selectors before any transport:
@@ -408,9 +508,10 @@ impl KernelContextReadClient {
     /// Checks the local-read execute capability before any read is served:
     /// the pair must prove its closed linkage, name the admitted
     /// `eliot.query` capability, and carry the closed evidence selectors.
-    /// `eliot.packet` is admission-only and fails closed as
-    /// [`StoreError::Unavailable`] (MGR04 #19 owns storage activation); any
-    /// other tool fails closed as [`StoreError::UnknownOperation`], mirroring
+    /// `eliot.packet` is outside this query-only twin and fails closed as
+    /// [`StoreError::Unavailable`]; the authenticated campaign poller owns
+    /// packet dispatch. Any other tool fails closed as
+    /// [`StoreError::UnknownOperation`], mirroring
     /// [`check_execute_capability`](Self::check_execute_capability).
     fn check_local_read_capability(
         envelope: &HostRequestEnvelope,
@@ -509,8 +610,10 @@ impl KernelContextReadClient {
     /// envelope fence must equal the caller-observed admitted fence, and the
     /// closed selectors serve exactly one bounded `evidence_query` whose
     /// answer must echo the evidence operation and the admitted fence.
-    /// `eliot.packet` stays admission-only (`Unavailable`); a wrong fence or
-    /// a substituted answer fails closed, never `Ok`-empty.
+    /// `eliot.packet` is intentionally not served by this query-only port;
+    /// the authenticated daemon poller dispatches it through the production
+    /// campaign compiler. A wrong fence or a substituted answer fails closed,
+    /// never `Ok`-empty.
     ///
     /// The port and the fence stay per-call parameters (rather than retained
     /// state) so the composition retains no client and no thread: callers
@@ -624,6 +727,31 @@ impl KernelContextReadClient {
     /// `cue|negative_memory` enum.
     fn check_projection_input_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
         check_declared_read_selectors(request.operation, &request.parameters)
+    }
+
+    /// Checks one closed exact-fence experience history read before
+    /// transport. Range size is bounded by the canonical owner contract;
+    /// the packet compiler supplies the authenticated envelope's scope and
+    /// fence, never a scope or revision claimed by tool arguments.
+    fn check_experience_range_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
+        if request.scope_id.is_none() {
+            return Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "experience range read requires an exact scope",
+            });
+        }
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "experience range read requires ExactFence",
+            });
+        }
+        request.validate()?;
+        let decoded = validate_experience_read_params(&request.parameters)?;
+        if decoded.max_records > MAX_EXPERIENCE_PAGE_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        Ok(())
     }
 
     /// Checks the closed `GetCapabilityEvidenceState` selectors before any

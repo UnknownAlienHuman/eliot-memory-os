@@ -198,9 +198,11 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         &tool_digest(&tool),
     );
     assert!(
-        host_request_route::check_local_read_admission(&envelope, &tool)
-            .expect("admitted query must validate")
-            .is_some(),
+        matches!(
+            host_request_route::check_local_read_admission(&envelope, &tool)
+                .expect("admitted query must validate"),
+            host_request_route::LocalReadAdmission::Query(_)
+        ),
         "the admitted query carries selectors and is queue-eligible"
     );
     stage_admitted(&kernel, &envelope);

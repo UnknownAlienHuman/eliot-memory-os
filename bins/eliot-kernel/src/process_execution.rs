@@ -1,11 +1,12 @@
 //! Kernel process-execution admission and execution closure.
 //!
 //! Traceability: Architecture A2.3, A13.2, ARCH-AUTH-01, ARCH-RES-01;
-//! Implementation I1.2, I2.15, I14.6, I14.24, I15.3. This ordinary module owns
-//! only authenticated process admission, authority/replay/evidence linearization,
-//! path proofs, and the bounded executor handoff. It does not own task completion,
-//! semantic authority, ambient command execution, or path widening. The module
-//! remains below the <10k LOC split invariant.
+//! Implementation I1.2, I2.15, I14.6, I14.24, I14.26, I15.3. This ordinary
+//! module owns only authenticated process admission,
+//! authority/replay/evidence linearization, path proofs, and the bounded
+//! executor handoff. It does not own task completion, semantic authority,
+//! ambient command execution, or path widening. The module remains below the
+//! <10k LOC split invariant.
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::path::{Path, PathBuf};
@@ -25,8 +26,10 @@ use eliot_kernel_service::{
     ProcessExecutionResponse,
 };
 use eliot_ors::{
-    ProcessEvidenceRecord, ProcessStartReplayRecord as OrsReplayRecord,
-    ProcessStartReplayState as OrsReplayState, RedbRecoveryStore,
+    EpochIdentity, EpochLineage, OpaqueLabel, ProcessEvidenceRecord,
+    ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
+    ProcessStreamRecoveryBinding, ProcessStreamRecoveryProjection, RecoveryOwner,
+    RedbRecoveryStore,
 };
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::{
@@ -39,8 +42,8 @@ use eliot_process::{
     OriginControlPresentation, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
     ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
-    ProcessSessionBinding, ProcessStartReceipt, SuspendedLaunchEvidence, SuspendedProcessIdentity,
-    ValidatedDispatch,
+    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SuspendedLaunchEvidence,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_store_api::{
@@ -109,6 +112,89 @@ impl ProcessEvidenceSink for OrsProcessEvidenceSink {
             .map_err(|error| eliot_process::EvidenceSinkError {
                 message: error.to_string(),
             })
+    }
+}
+
+/// Production sink that retains immutable process-stream recovery evidence
+/// (issue #269) on the same live executor handoff as
+/// [`OrsProcessEvidenceSink`].
+///
+/// For every observed physical stream it derives one ORS recovery projection
+/// from the evidence and writes it through the existing ORS owner and codec
+/// (`RedbRecoveryStore::put_process_stream_recovery`). It adds no second table
+/// owner, no second codec and no second write path, and it carries no stream
+/// bytes: only the immutable locator identity, the exact durable coverage, the
+/// typed transport/persistence state, the exact gap set and the reconciliation
+/// owner cross into ORS. The untouched evidence is then handed to the sibling
+/// sink, so the process-evidence record remains the one canonical observation of
+/// the same physical result.
+struct OrsProcessStreamRecoverySink {
+    store: Arc<RedbRecoveryStore>,
+    owner: ProcessOwnerBinding,
+    evidence: Arc<OrsProcessEvidenceSink>,
+}
+
+impl ProcessEvidenceSink for OrsProcessStreamRecoverySink {
+    fn record(&self, evidence: ProcessEvidence) -> Result<(), eliot_process::EvidenceSinkError> {
+        let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
+        for stream in [evidence.stdout(), evidence.stderr()].into_iter().flatten() {
+            let binding =
+                process_stream_recovery_binding(&evidence, &self.owner, stream, observed_at_ms)
+                    .map_err(|error| stream_recovery_sink_error(&error))?;
+            let projection = ProcessStreamRecoveryProjection::from_stream_evidence(stream, binding)
+                .map_err(|error| stream_recovery_sink_error(&error))?;
+            self.store
+                .put_process_stream_recovery(&projection)
+                .map_err(|error| stream_recovery_sink_error(&error))?;
+        }
+        self.evidence.record(evidence)
+    }
+}
+
+/// Binds one observed physical stream to its ORS recovery-projection identity.
+///
+/// Every field is derived from the observation the executor just produced and
+/// from the admitted owner; nothing is synthesized. The provider state-fence
+/// digest and the writer-epoch exact tuple come from the admitted execution
+/// binding, so the ORS projection's own cross-field lineage check holds without
+/// a scalar-to-authority coercion. The governing policy revision is the digest
+/// over the exact policy/privacy/visibility/retention/redaction identity set
+/// that the retained projection itself carries, and the reconciliation owner is
+/// the authenticated module that owns the operation. A stream that cannot be
+/// bound fails the sink instead of writing a weakened projection.
+fn process_stream_recovery_binding(
+    evidence: &ProcessEvidence,
+    owner: &ProcessOwnerBinding,
+    stream: &ProcessStreamEvidence,
+    observed_at_ms: i64,
+) -> Result<ProcessStreamRecoveryBinding, eliot_ors::OrsError> {
+    let binding = evidence.binding();
+    let state_fence_bytes = serde_json::to_vec(binding.state_fence())
+        .map_err(|error| eliot_ors::OrsError::Encoding(error.to_string()))?;
+    let policy_bytes = serde_json::to_vec(stream.policy())
+        .map_err(|error| eliot_ors::OrsError::Encoding(error.to_string()))?;
+    let authority_epoch = binding.authority_epoch();
+    Ok(ProcessStreamRecoveryBinding {
+        state_fence_digest: super::sha256_hex(&state_fence_bytes),
+        writer_epoch: EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new(authority_epoch.lineage_id.as_str())?,
+                epoch: authority_epoch.sequence.get(),
+            },
+            predecessor: None,
+        },
+        policy_revision: super::sha256_hex(&policy_bytes),
+        reconciliation_owner: RecoveryOwner::new(owner.module_id())?,
+        observed_at_ms,
+    })
+}
+
+/// Maps one ORS failure onto the bounded sink error the executor already
+/// surfaces. Only the ORS error text crosses; it becomes a failed start, never
+/// a success claim.
+fn stream_recovery_sink_error(error: &eliot_ors::OrsError) -> eliot_process::EvidenceSinkError {
+    eliot_process::EvidenceSinkError {
+        message: error.to_string(),
     }
 }
 
@@ -1556,9 +1642,16 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         self.executor
             .start(
                 request,
-                Arc::new(OrsProcessEvidenceSink {
+                // Issue #269: the recovery sink wraps the evidence sink, so one
+                // executor handoff retains both the process-evidence record and
+                // the per-stream recovery projection for the same observation.
+                Arc::new(OrsProcessStreamRecoverySink {
                     store: Arc::clone(&self.evidence_store),
                     owner: owner.clone(),
+                    evidence: Arc::new(OrsProcessEvidenceSink {
+                        store: Arc::clone(&self.evidence_store),
+                        owner: owner.clone(),
+                    }),
                 }),
             )
             .await

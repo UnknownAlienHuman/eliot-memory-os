@@ -50,6 +50,38 @@
 //! all belong to a successor read and a page can never be presented as
 //! current under a stale denominator. Absence of the object is `unknown`,
 //! never unrestricted/complete (I5.16).
+//!
+//! Paged continuation (issue #2808). A `TRUNCATED` completeness block also
+//! carries one owner-minted `next_cursor`, and the read accepts it back as the
+//! optional `cursor` selector of the two page-bearing denominator reads
+//! (`history`, `invocations`). The cursor is a versioned, canonically encoded
+//! object bound to every property a stable continuation needs:
+//!
+//! ```text
+//! automation-page:v1:{"after_row_id":…,"automation_id":…,"max_records":…,
+//!                     "order":"ASC","query":…,"read_revision":…,
+//!                     "state_fence":…}
+//! ```
+//!
+//! - `query` and `automation_id` bind the cursor to one declared denominator,
+//!   so a cursor minted for `invocations` cannot page `history` or another
+//!   automation;
+//! - `read_revision` and `state_fence` bind it to one head snapshot, so a page
+//!   requested after a commit that advanced any revision head fails closed
+//!   instead of skipping or repeating a row under a moving set;
+//! - `order` names the ordering direction, so a consumer and an owner cannot
+//!   silently disagree about which key the `after_row_id` compares against;
+//! - `after_row_id` is the **exclusive last row identity** of the page just
+//!   served — never an offset, so reordering, deletion and retirement cannot
+//!   lose or repeat a logical identity;
+//! - `max_records` binds the page bound in force, so a repage under different
+//!   bounds invalidates outstanding cursors instead of re-reading a window.
+//!
+//! Both backends order the `history` denominator by `revision` and the
+//! `invocations` denominator by `occurrence_id`, ascending, so the exclusive
+//! comparison is a total, stable key on either contour. Callers echo cursors;
+//! only the store owner mints them and [`automation_page_cursor_parse`]
+//! re-verifies every binding before a page is served.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +91,7 @@ use thiserror::Error;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, StateFence, StoreError,
+    ReadConsistency, StateFence, StoreError, canonical_json_bytes,
 };
 
 /// Versioned wire/schema identity for canonical user-automation state.
@@ -84,6 +116,13 @@ pub const MAX_AUTOMATION_REVISION_ID_BYTES: usize = 128;
 pub const MAX_AUTOMATION_DOC_BYTES: usize = 262_144;
 /// Maximum records one automation read may return.
 pub const MAX_AUTOMATION_PAGE_RECORDS: u16 = 64;
+/// Maximum accepted owner-minted page-continuation cursor length in bytes.
+///
+/// The cursor is a canonically encoded object over two bounded identities, two
+/// digests, the ordering direction and the page bound, so 1 KiB leaves
+/// headroom for the longest admissible identities while keeping the read input
+/// far below the activated read input bound.
+pub const MAX_AUTOMATION_CURSOR_BYTES: usize = 1_024;
 
 /// Mutation discriminator parameter (closed mutation leg).
 pub const AUTOMATION_PARAM_OPERATION: &str = "operation";
@@ -111,6 +150,14 @@ pub const AUTOMATION_PARAM_QUERY: &str = "query";
 pub const AUTOMATION_PARAM_INCLUDE_RETIRED: &str = "include_retired";
 /// Decimal page-size bound (list/history/invocations, required).
 pub const AUTOMATION_PARAM_MAX_RECORDS: &str = "max_records";
+/// Owner-minted page-continuation selector (history/invocations, optional).
+///
+/// An absent selector reads the first page of the declared denominator. A
+/// present selector resumes strictly after the exclusive last row identity the
+/// owner served, under the read revision, fence, ordering direction and page
+/// bound the owner minted it with. It is never an offset, so a moving set can
+/// neither lose nor repeat a row.
+pub const AUTOMATION_PARAM_CURSOR: &str = "cursor";
 
 /// Mutation leg discriminator values (mirror the domain operation
 /// `snake_case` kinds).
@@ -165,6 +212,21 @@ pub const AUTOMATION_PAGE_FAILURE: &str = "failure";
 pub const AUTOMATION_PAGE_REVISION: &str = "revision";
 /// Read payload field: projection fence.
 pub const AUTOMATION_PAGE_STATE_FENCE: &str = "state_fence";
+/// Completeness field: owner-minted continuation for the next page.
+///
+/// Present exactly on a `TRUNCATED` page, and absent on a `COMPLETE` one: a
+/// complete denominator has no successor page, so absence here is a proven end
+/// of the set, not missing evidence (I5.16).
+pub const AUTOMATION_PAGE_NEXT_CURSOR: &str = "next_cursor";
+/// Version tag of the canonical automation page-continuation cursor encoding.
+pub const AUTOMATION_CURSOR_VERSION: &str = "automation-page:v1";
+/// The one ordering direction the automation page denominators serve.
+///
+/// Both backends order the `history` denominator by `revision` and the
+/// `invocations` denominator by `occurrence_id`, ascending. The direction is
+/// part of the cursor so a consumer can never compare `after_row_id` against a
+/// different key than the owner paged on.
+pub const AUTOMATION_CURSOR_ORDER_ASCENDING: &str = "ASC";
 
 /// Fail-closed automation wire errors before [`StoreError`] projection.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -281,6 +343,191 @@ pub struct DecodedAutomationRead {
     pub include_retired: bool,
     /// Page-size bound (list/history/invocations only).
     pub max_records: u16,
+    /// Verified owner-minted continuation for a paged denominator read.
+    pub cursor: Option<AutomationPageCursor>,
+}
+
+/// One owner-minted continuation over one paged automation denominator.
+///
+/// Every field is a binding the owner re-verifies before serving the next page,
+/// and every field is required: a continuation that could omit its denominator,
+/// its head snapshot, its direction or its exclusive last row identity would be
+/// an offset over a changing set. The exclusive last row identity is the
+/// `revision` of the last history row served, or the `occurrence_id` of the
+/// last invocation row served, matching the query's total ordering key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationPageCursor {
+    /// Closed query discriminator whose denominator this cursor pages.
+    pub query: String,
+    /// Stable automation identity owning the declared denominator.
+    pub automation_id: String,
+    /// Owner-issued read revision this cursor was minted at.
+    pub read_revision: String,
+    /// Admission fence the page was served under.
+    pub state_fence: StateFence,
+    /// Ordering direction of the denominator (`ASC`).
+    pub order: String,
+    /// Exclusive last row identity served; the next page starts strictly after.
+    pub after_row_id: String,
+    /// Page bound in force when the cursor was minted.
+    pub max_records: u16,
+}
+
+impl AutomationPageCursor {
+    /// Validates every binding before a page is served from the cursor.
+    ///
+    /// Rejects a non-closed query, a direction this contract does not serve, a
+    /// blank or unbounded row identity, a page bound outside the closed range,
+    /// and a read revision that is not the SHA-256 hex the owner issues. I5.27:
+    /// the encoding is versioned and every field affecting scope and ordering is
+    /// explicit, never defaulted or omitted.
+    fn validate(&self) -> Result<(), AutomationContractError> {
+        if !matches!(
+            self.query.as_str(),
+            AUTOMATION_QUERY_HISTORY | AUTOMATION_QUERY_INVOCATIONS
+        ) {
+            return Err(AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation is only valid for paged denominator reads",
+            });
+        }
+        if self.order != AUTOMATION_CURSOR_ORDER_ASCENDING {
+            return Err(AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation direction is not a closed value",
+            });
+        }
+        validate_automation_id(&self.automation_id).map_err(|_| {
+            AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation automation identity is invalid",
+            }
+        })?;
+        if self.after_row_id.trim().is_empty() || self.after_row_id.chars().any(char::is_control) {
+            return Err(AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation last row identity must be non-blank text",
+            });
+        }
+        if self.after_row_id.len() > MAX_AUTOMATION_ID_BYTES {
+            return Err(AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation last row identity exceeds the length bound",
+            });
+        }
+        if self.read_revision.len() != 64
+            || !self
+                .read_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation read revision must be lowercase SHA-256 hex",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation fence is invalid",
+            })?;
+        if self.max_records == 0 || self.max_records > MAX_AUTOMATION_PAGE_RECORDS {
+            return Err(AutomationContractError::InvalidField {
+                field: AUTOMATION_PARAM_CURSOR,
+                reason: "continuation page bound is out of range",
+            });
+        }
+        Ok(())
+    }
+
+    /// Renders the canonical wire encoding of one continuation.
+    ///
+    /// The canonical encoding is deterministic and versioned: the same bindings
+    /// always produce the same bytes on every contour, so a cursor survives a
+    /// round trip through a request, a response and the next request unchanged.
+    ///
+    /// An encoding failure is a typed mint failure, never an empty body: a
+    /// versioned prefix carrying no bindings would be a well-formed-looking
+    /// wire that no echoed continuation can ever verify, so the owner would
+    /// publish a `TRUNCATED` page whose successor has no address. The mint
+    /// fails closed instead, and the read that needed the continuation fails
+    /// rather than reporting a page whose remainder cannot be resumed.
+    fn to_wire(&self) -> Result<String, StoreError> {
+        let body = canonical_json_bytes(self).map_err(|error| {
+            StoreError::Serialization(format!(
+                "automation page cursor canonical encoding failed: {error}"
+            ))
+        })?;
+        let body = String::from_utf8(body).map_err(|error| {
+            StoreError::Serialization(format!(
+                "automation page cursor canonical encoding is not UTF-8: {error}"
+            ))
+        })?;
+        Ok(format!("{AUTOMATION_CURSOR_VERSION}:{body}"))
+    }
+}
+
+/// Mints one continuation for the page just served.
+///
+/// The owner calls this only for a `TRUNCATED` page, binding the exclusive last
+/// row identity it actually served, the read revision and fence it served it
+/// under, and the page bound in force. Callers echo the returned text; they
+/// never construct or edit it.
+pub fn automation_cursor_mint(
+    query: &str,
+    automation_id: &str,
+    read_revision: &str,
+    state_fence: &StateFence,
+    after_row_id: &str,
+    max_records: u16,
+) -> Result<String, StoreError> {
+    let cursor = AutomationPageCursor {
+        query: query.to_owned(),
+        automation_id: automation_id.to_owned(),
+        read_revision: read_revision.to_owned(),
+        state_fence: state_fence.clone(),
+        order: AUTOMATION_CURSOR_ORDER_ASCENDING.to_owned(),
+        after_row_id: after_row_id.to_owned(),
+        max_records,
+    };
+    cursor
+        .validate()
+        .map_err(AutomationContractError::into_store_error)?;
+    let wire = cursor.to_wire()?;
+    if wire.len() > MAX_AUTOMATION_CURSOR_BYTES {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    Ok(wire)
+}
+
+/// Verifies one echoed continuation against the page about to be served.
+///
+/// Only the canonical [`AUTOMATION_CURSOR_VERSION`] encoding verifies; no
+/// scaffold, foreign or hand-written shape is accepted, because a cursor whose
+/// denominator, head snapshot, direction, fence, page bound or exclusive last
+/// row identity is not exactly the one the owner minted is an offset over a
+/// moving set. `read_revision` is re-proved against the digest the owner is
+/// serving right now, so a commit that advanced any revision head invalidates
+/// outstanding cursors and restarts enumeration instead of drifting.
+pub fn automation_cursor_verify(
+    wire: &str,
+    query: &str,
+    automation_id: &str,
+    read_revision: &str,
+    state_fence: &StateFence,
+    max_records: u16,
+) -> Result<AutomationPageCursor, StoreError> {
+    let malformed = || StoreError::InvalidField {
+        field: AUTOMATION_PARAM_CURSOR,
+        reason: "continuation is malformed, foreign, or stale",
+    };
+    let cursor = automation_cursor_shape(wire, query, automation_id, max_records)?;
+    if cursor.read_revision != read_revision || cursor.state_fence != *state_fence {
+        return Err(malformed());
+    }
+    Ok(cursor)
 }
 
 /// Builds the closed `ApplyUserAutomationState` mutation request.
@@ -717,6 +964,16 @@ pub fn validate_automation_read_params(
             reason: "page bound is out of range",
         });
     }
+    // A present-but-non-string continuation fails closed instead of reading as
+    // an absent cursor, which would silently restart the denominator at page
+    // one and re-serve rows the consumer already folded in.
+    let cursor_text = match parameters.get(AUTOMATION_PARAM_CURSOR) {
+        None => None,
+        Some(value) => Some(value.as_str().ok_or(StoreError::InvalidField {
+            field: AUTOMATION_PARAM_CURSOR,
+            reason: "continuation must be a string",
+        })?),
+    };
     match query {
         AUTOMATION_QUERY_LIST => {
             if requested_revision.is_some() || requested_occurrence_id.is_some() {
@@ -729,6 +986,12 @@ pub fn validate_automation_read_params(
                     reason: "selector is not valid for list reads",
                 });
             }
+            if cursor_text.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_CURSOR,
+                    reason: "continuation is not valid for list reads",
+                });
+            }
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: None,
@@ -736,6 +999,7 @@ pub fn validate_automation_read_params(
                 requested_occurrence_id: None,
                 include_retired,
                 max_records,
+                cursor: None,
             })
         }
         AUTOMATION_QUERY_CURRENT | AUTOMATION_QUERY_HISTORY => {
@@ -749,6 +1013,20 @@ pub fn validate_automation_read_params(
                 field: "automation.automation_id",
                 reason: "exact automation selector is required",
             })?;
+            // An exact immutable-revision read addresses one immutable row and
+            // must never widen into a bounded page, so it cannot also page.
+            let cursor = match (query, cursor_text) {
+                (AUTOMATION_QUERY_HISTORY, Some(text)) if requested_revision.is_none() => Some(
+                    automation_cursor_shape(text, query, &automation_id, max_records)?,
+                ),
+                (_, Some(_)) => {
+                    return Err(StoreError::InvalidField {
+                        field: AUTOMATION_PARAM_CURSOR,
+                        reason: "continuation is only valid for paged denominator reads",
+                    });
+                }
+                _ => None,
+            };
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: Some(automation_id),
@@ -756,6 +1034,7 @@ pub fn validate_automation_read_params(
                 requested_occurrence_id: None,
                 include_retired,
                 max_records,
+                cursor,
             })
         }
         AUTOMATION_QUERY_INVOCATIONS => {
@@ -769,6 +1048,21 @@ pub fn validate_automation_read_params(
                 field: "automation.automation_id",
                 reason: "exact automation selector is required",
             })?;
+            // An exact occurrence read addresses one retained row and must never
+            // widen into a bounded page, so it cannot also page.
+            let cursor =
+                match cursor_text {
+                    Some(text) if requested_occurrence_id.is_none() => Some(
+                        automation_cursor_shape(text, query, &automation_id, max_records)?,
+                    ),
+                    Some(_) => {
+                        return Err(StoreError::InvalidField {
+                            field: AUTOMATION_PARAM_CURSOR,
+                            reason: "continuation is not valid with an exact occurrence selector",
+                        });
+                    }
+                    None => None,
+                };
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: Some(automation_id),
@@ -776,6 +1070,7 @@ pub fn validate_automation_read_params(
                 requested_occurrence_id,
                 include_retired,
                 max_records,
+                cursor,
             })
         }
         AUTOMATION_QUERY_FAILURE => {
@@ -789,6 +1084,12 @@ pub fn validate_automation_read_params(
                     reason: "selector is not valid for failure reads",
                 });
             }
+            if cursor_text.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_CURSOR,
+                    reason: "continuation is not valid for failure reads",
+                });
+            }
             let automation_id = automation_id.ok_or(StoreError::InvalidField {
                 field: "automation.automation_id",
                 reason: "exact automation selector is required",
@@ -800,10 +1101,45 @@ pub fn validate_automation_read_params(
                 requested_occurrence_id: None,
                 include_retired,
                 max_records,
+                cursor: None,
             })
         }
         _ => Err(StoreError::UnknownOperation),
     }
+}
+
+/// Decodes one echoed continuation into its verified shape bindings.
+///
+/// This is the pre-dispatch half of [`automation_cursor_verify`]: it proves the
+/// encoding, the closed query, the closed direction, the bounded row identity
+/// and that the cursor names this automation under this page bound. The
+/// read-revision binding against the live head set is re-proved by the owner
+/// that serves the page, because only the owner observes those heads.
+fn automation_cursor_shape(
+    wire: &str,
+    query: &str,
+    automation_id: &str,
+    max_records: u16,
+) -> Result<AutomationPageCursor, StoreError> {
+    let malformed = || StoreError::InvalidField {
+        field: AUTOMATION_PARAM_CURSOR,
+        reason: "continuation is malformed or foreign",
+    };
+    if wire.len() > MAX_AUTOMATION_CURSOR_BYTES {
+        return Err(malformed());
+    }
+    let Some(body) = wire.strip_prefix(&format!("{AUTOMATION_CURSOR_VERSION}:")) else {
+        return Err(malformed());
+    };
+    let cursor: AutomationPageCursor = serde_json::from_str(body).map_err(|_| malformed())?;
+    cursor.validate().map_err(|_| malformed())?;
+    if cursor.query != query
+        || cursor.automation_id != automation_id
+        || cursor.max_records != max_records
+    {
+        return Err(malformed());
+    }
+    Ok(cursor)
 }
 
 fn text_param<'a>(

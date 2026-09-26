@@ -9,13 +9,16 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    AutomationCapabilityProfile, AutomationExecutionReference, AutomationWorkClass,
-    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
-    UserAutomationExecutionMode, UserAutomationFailureProjection, UserAutomationInvocation,
+    AutomationCapabilityProfile, AutomationExecutionReference, AutomationReconciliationCause,
+    AutomationReconciliationReference, AutomationWorkClass, ProviderFingerprintPolicy,
+    UserAutomationConfigurationState, UserAutomationError, UserAutomationExecutionMode,
+    UserAutomationExecutionProjection, UserAutomationFailureProjection, UserAutomationInvocation,
     UserAutomationPreflightContext, UserAutomationPreflightDecision,
     UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
+    UserAutomationTrigger, UserAutomationTriggerOrigin,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
@@ -25,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    UserAutomationMutationResult, UserAutomationService, UserAutomationServiceError,
-    UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStorePort,
+    UserAutomationMutationResult, UserAutomationOwnerSnapshot, UserAutomationReadResult,
+    UserAutomationService, UserAutomationServiceError, UserAutomationServiceRequest,
+    UserAutomationStoreOutcome, UserAutomationStorePort,
 };
 
 /// Errors returned by an existing Durable Job, WakeIntent, or notification
@@ -69,6 +73,22 @@ pub enum UserAutomationExecutionError {
     /// A runtime response did not bind to the occurrence/fence that was sent.
     #[error("UserAutomation runtime response mismatch: {0}")]
     RuntimeResponseMismatch(&'static str),
+    /// The declared occurrence denominator was not owner-proven complete, so a
+    /// runtime boundary refused rather than acting on a bounded subset of it.
+    ///
+    /// The whole obligation travels with the refusal, not just its cause. The
+    /// durable owner query handle is the only route by which a caller can finish
+    /// enumerating the denominator, so a refusal that dropped it would be
+    /// strictly worse than the deferral it replaces: the caller would know the
+    /// work is blocked and have no way to unblock it.
+    #[error(
+        "UserAutomation occurrence denominator is not owner-proven complete: \
+         cause={:?} read_revision={} denominator_query_ref={}",
+        .0.cause,
+        .0.read_revision,
+        .0.denominator_query_ref.as_deref().unwrap_or("<none>")
+    )]
+    OccurrenceDenominatorIncomplete(AutomationReconciliationReference),
 }
 
 /// Owner-issued Durable Job material for one admitted UserAutomation
@@ -565,15 +585,39 @@ impl UserAutomationWakeReadRequest {
             "wake_read.authenticated_principal",
         )?;
         self.invocation.validate()?;
-        if self.invocation.trigger_origin
-            != eliot_kernel_core::user_automation::UserAutomationTriggerOrigin::Human
-            || self.invocation.principal_ref != self.authenticated_principal
-        {
+        if self.invocation.principal_ref != self.authenticated_principal {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
-                "wake read Human source",
+                "wake read principal",
             ));
         }
-        validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
+        // The authenticated wake owner retains both owner-issued occurrence
+        // kinds, so the readback contract names the source kind instead of
+        // accepting only the Human run-now one. Each kind keeps its own
+        // provenance proof: a `Human` run-now occurrence must still match the
+        // exact committed parent operation identity, and a `ScheduledWake`
+        // occurrence must name a calendar occurrence of the normalized set
+        // rather than a manual nonce. An admitted child is neither a published
+        // wake nor a trigger this contour reads back.
+        match self.invocation.trigger_origin {
+            UserAutomationTriggerOrigin::Human => {
+                validate_human_invocation_source(&self.context, &self.identity, &self.invocation)?;
+            }
+            UserAutomationTriggerOrigin::ScheduledWake => {
+                if !matches!(
+                    self.invocation.trigger,
+                    UserAutomationTrigger::Scheduled { .. }
+                ) {
+                    return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                        "scheduled wake must name a calendar occurrence",
+                    ));
+                }
+            }
+            UserAutomationTriggerOrigin::AutomationChild => {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "an admitted child is not an owner wake",
+                ));
+            }
+        }
         self.invocation
             .occurrence_identity()
             .map_err(UserAutomationExecutionError::Contract)
@@ -628,6 +672,987 @@ fn is_sha256_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Closed reason one bounded recurring horizon is published or advanced.
+///
+/// The reason selects which slice of the immutable normalized denominator the
+/// wake owner is asked to retain. It is closed so a caller cannot name an
+/// ad-hoc slice: every member of every slice is an occurrence of the accepted
+/// revision's own normalized contract, and the reason only selects where that
+/// bounded slice starts.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UserAutomationHorizonTrigger {
+    /// First publication for an accepted active revision (`Create`).
+    AcceptedRevision,
+    /// Publication for a new active revision committed by a superseding `Edit`.
+    SupersedingEdit,
+    /// Publication for the same immutable revision after `Resume`.
+    ResumedRevision,
+    /// The next bounded slice after one occurrence reached an owner-acknowledged
+    /// disposition.
+    DispositionAdvance,
+}
+
+impl UserAutomationHorizonTrigger {
+    /// Reports whether this trigger names a whole-denominator first publication
+    /// rather than a post-disposition slice.
+    #[must_use]
+    pub const fn publishes_whole_denominator(self) -> bool {
+        !matches!(self, Self::DispositionAdvance)
+    }
+}
+
+/// One occurrence of the accepted normalized denominator that the existing
+/// `WakeIntent` owner must retain.
+///
+/// Every member is compiled from the immutable revision: the occurrence key is
+/// the owner-normalized calendar encoding produced by the pinned zone
+/// contract, and `source_digest` is the compiled digest binding that key to the
+/// declared expression and calendar. Nothing here is a time Kernel derived,
+/// shifted, folded, or extrapolated.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeHorizonEntry {
+    /// Stable revision-bound occurrence identity.
+    pub occurrence_id: String,
+    /// Exact owner-normalized calendar occurrence key, carrying the resolved
+    /// instant, the applied offset, and the applied fold or gap disposition.
+    pub occurrence_key: String,
+    /// Compiled digest binding this occurrence to the declared expression and
+    /// calendar of the accepted revision.
+    pub source_digest: String,
+    /// Inert owner-contract wake intent compiled by the revision for exactly
+    /// this occurrence under the publishing State Fence.
+    pub wake_intent: WakeIntent,
+}
+
+/// Bounded wake horizon requested from the existing WakeIntent/Task Scheduler
+/// owner for one immutable revision.
+///
+/// The request carries three separate things so none of them can be inferred
+/// from another: the complete normalized `denominator` the revision owns, the
+/// bounded `entries` slice being published now, and the `identity` of the one
+/// operation that publishes it. A `WakeIntent` grants no execution authority by
+/// itself, so this request is a publication obligation and never permission to
+/// pre-admit a Durable Job.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeHorizonPublication {
+    /// Live authenticated request metadata and State Fence.
+    pub context: RequestMetadata,
+    /// Principal authenticated by Kernel/Host.
+    pub authenticated_principal: String,
+    /// Exact operation identity that owns this publication. A replay of the
+    /// same identity re-requests the same slice and mints no second wake.
+    pub identity: OperationIdentity,
+    /// Stable automation identity.
+    pub automation_id: String,
+    /// Immutable revision identity whose normalized contract is published.
+    pub automation_revision: String,
+    /// Immutable digest of that revision. An advance that observes a different
+    /// digest is a different revision, not a continuation of this cursor.
+    pub revision_digest: String,
+    /// Fence under which the publication is issued.
+    pub state_fence: StateFence,
+    /// Closed reason selecting this bounded slice.
+    pub trigger: UserAutomationHorizonTrigger,
+    /// Complete occurrence denominator of the accepted revision, in the
+    /// revision's own normalized order.
+    pub denominator_occurrence_ids: Vec<String>,
+    /// The bounded slice published now, a contiguous run of the denominator in
+    /// the same order.
+    pub entries: Vec<UserAutomationWakeHorizonEntry>,
+    /// Fixed safety pin: only not-yet-admitted future wakes are published.
+    pub only_unadmitted_future: bool,
+    /// Occurrence already consumed by the slice, present exactly for
+    /// [`UserAutomationHorizonTrigger::DispositionAdvance`].
+    pub consumed_occurrence_id: Option<String>,
+}
+
+impl UserAutomationWakeHorizonPublication {
+    /// Validates the request shape.
+    ///
+    /// The checks that need the immutable revision live in
+    /// [`Self::validate_against_revision`], which every production caller
+    /// reaches through [`compile_wake_horizon`] and [`advance_wake_horizon`].
+    pub fn validate(&self) -> Result<(), UserAutomationExecutionError> {
+        self.context
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        self.identity
+            .validate()
+            .map_err(UserAutomationServiceError::Store)
+            .map_err(UserAutomationExecutionError::Service)?;
+        validate_text(
+            &self.authenticated_principal,
+            "horizon.authenticated_principal",
+        )?;
+        validate_text(&self.automation_id, "horizon.automation_id")?;
+        validate_text(&self.automation_revision, "horizon.automation_revision")?;
+        validate_digest(&self.revision_digest, "horizon.revision_digest")?;
+        if !self.only_unadmitted_future || self.state_fence != self.context.state_fence {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "horizon must be same-fence and unadmitted-only",
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        validate_unique_horizon_list(
+            &self.denominator_occurrence_ids,
+            "horizon.denominator_occurrence_ids",
+        )?;
+        if self.entries.is_empty() {
+            return Err(UserAutomationExecutionError::Contract(
+                UserAutomationError::Invalid("horizon.entries"),
+            ));
+        }
+        for entry in &self.entries {
+            validate_text(&entry.occurrence_id, "horizon.entry.occurrence_id")?;
+            validate_text(&entry.occurrence_key, "horizon.entry.occurrence_key")?;
+            validate_digest(&entry.source_digest, "horizon.entry.source_digest")?;
+            entry
+                .wake_intent
+                .validate()
+                .map_err(|_| UserAutomationError::Invalid("horizon.entry.wake_intent"))?;
+            if entry.wake_intent.wake_id != entry.occurrence_id
+                || entry.wake_intent.state != WakeIntentState::Pending
+                || entry.wake_intent.state_fence != self.state_fence
+            {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "horizon entry occurrence/fence/state",
+                ));
+            }
+        }
+        if self.trigger.publishes_whole_denominator() {
+            if self.consumed_occurrence_id.is_some() {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "whole-denominator publication cannot name a consumed occurrence",
+                ));
+            }
+        } else {
+            let Some(consumed) = self.consumed_occurrence_id.as_deref() else {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "a disposition advance must name the consumed occurrence",
+                ));
+            };
+            validate_text(consumed, "horizon.consumed_occurrence_id")?;
+        }
+        Ok(())
+    }
+
+    /// Cross-checks the request against the exact immutable revision.
+    ///
+    /// The retained denominator must equal what this revision's normalized
+    /// contract compiles, every entry must be one of those occurrences with the
+    /// revision's own compiled source digest, and the published slice must be a
+    /// contiguous run of the denominator in the revision's own order. A
+    /// disposition advance must additionally start immediately after its
+    /// consumed occurrence, so no future time is ever invented past the
+    /// revision's normalized contract.
+    pub fn validate_against_revision(
+        &self,
+        revision: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationExecutionError> {
+        self.validate()?;
+        revision
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        if revision.automation_id != self.automation_id
+            || revision.revision != self.automation_revision
+            || revision.owner_principal != self.authenticated_principal
+            || revision
+                .digest()
+                .map_err(UserAutomationExecutionError::Contract)?
+                != self.revision_digest
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "horizon revision binding",
+            ));
+        }
+        let source_digest = revision
+            .schedule
+            .source_digest()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        let identities = revision
+            .compile_occurrence_identities()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        let denominator = identities
+            .iter()
+            .map(|identity| identity.occurrence_id.clone())
+            .collect::<Vec<_>>();
+        if denominator != self.denominator_occurrence_ids {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "horizon denominator is not the revision normalized set",
+            ));
+        }
+        let start = horizon_slice_start(
+            &denominator,
+            self.trigger,
+            self.consumed_occurrence_id.as_deref(),
+        )?;
+        if start + self.entries.len() > denominator.len() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "horizon slice is not a bounded run of the revision denominator",
+            ));
+        }
+        for (entry, occurrence_id) in self
+            .entries
+            .iter()
+            .zip(&denominator[start..start + self.entries.len()])
+        {
+            if &entry.occurrence_id != occurrence_id || entry.source_digest != source_digest {
+                return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "horizon entry occurrence/source digest",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the exact occurrence identities this request publishes now.
+    #[must_use]
+    pub fn requested_occurrence_ids(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.occurrence_id.clone())
+            .collect()
+    }
+
+    /// Returns the stable replay handle a caller re-presents to finish an
+    /// unacknowledged remainder.
+    ///
+    /// It grants nothing: it names work, it does not authorize it.
+    pub fn retry_handle(
+        &self,
+        remaining_occurrence_ids: &[String],
+    ) -> Result<String, UserAutomationExecutionError> {
+        horizon_retry_handle(
+            &self.identity,
+            &self.revision_digest,
+            remaining_occurrence_ids,
+        )
+    }
+}
+
+/// Domain separator for the deterministic horizon retry handle.
+const HORIZON_RETRY_HANDLE_DOMAIN: &str = "eliot.user_automation.horizon-retry.v1";
+
+/// Returns the index at which a bounded horizon slice starts inside the
+/// immutable revision's normalized denominator.
+fn horizon_slice_start(
+    denominator: &[String],
+    trigger: UserAutomationHorizonTrigger,
+    consumed_occurrence_id: Option<&str>,
+) -> Result<usize, UserAutomationExecutionError> {
+    if trigger.publishes_whole_denominator() {
+        if consumed_occurrence_id.is_some() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "whole-denominator publication cannot name a consumed occurrence",
+            ));
+        }
+        return Ok(0);
+    }
+    let consumed =
+        consumed_occurrence_id.ok_or(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "a disposition advance must name the consumed occurrence",
+        ))?;
+    let position = denominator
+        .iter()
+        .position(|candidate| candidate == consumed)
+        .ok_or(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "the consumed occurrence is not a member of this revision denominator",
+        ))?;
+    Ok(position + 1)
+}
+
+/// Derives the stable replay handle for one unacknowledged horizon remainder.
+///
+/// The handle is a pure function of the operation identity that owns the
+/// publication, the immutable revision digest it publishes for, and the exact
+/// remaining occurrence set. A retry of the same remainder under the same
+/// identity is therefore recognisable as the same operation, while any change
+/// to the remainder or the revision produces a different handle. It is derived
+/// by this boundary rather than requested from an owner, because an absent owner
+/// is precisely the case a caller must still be able to name; it grants nothing
+/// and authorizes nothing.
+pub fn horizon_retry_handle(
+    identity: &OperationIdentity,
+    revision_digest: &str,
+    remaining_occurrence_ids: &[String],
+) -> Result<String, UserAutomationExecutionError> {
+    validate_unique_horizon_list(remaining_occurrence_ids, "horizon.retry_handle.remaining")?;
+    validate_digest(revision_digest, "horizon.retry_handle.revision_digest")?;
+    let bytes = canonical_json_bytes(&(
+        HORIZON_RETRY_HANDLE_DOMAIN,
+        identity.operation_id.as_str(),
+        identity.idempotency_key.as_str(),
+        revision_digest,
+        remaining_occurrence_ids,
+    ))
+    .map_err(|error| {
+        UserAutomationExecutionError::Contract(UserAutomationError::Serialization(
+            error.to_string(),
+        ))
+    })?;
+    Ok(format!("ua-horizon-retry:{}", sha256_hex(&bytes)))
+}
+
+/// Owner's answer to one bounded horizon publication request.
+///
+/// The owner must echo the exact publication identity and account for every
+/// requested occurrence. An occurrence it did not acknowledge is retained here
+/// as the exact remaining set together with the replay handle; it is never
+/// dropped, because a dropped occurrence is indistinguishable from an
+/// occurrence that was never requested.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakePublication {
+    /// Stable automation identity the owner published for.
+    pub automation_id: String,
+    /// Immutable revision identity the owner published for.
+    pub automation_revision: String,
+    /// Immutable revision digest the owner observed.
+    pub revision_digest: String,
+    /// Fence the owner acknowledged under.
+    pub state_fence: StateFence,
+    /// Owner-issued identity of the publication operation itself.
+    pub publication_operation_id: OperationId,
+    /// Owner-issued idempotency identity of that publication.
+    pub publication_idempotency_key: String,
+    /// Exact occurrences the owner acknowledged as retained.
+    pub acknowledged_occurrence_ids: Vec<String>,
+    /// Exact occurrences of the request the owner did not acknowledge.
+    pub remaining_occurrence_ids: Vec<String>,
+    /// Stable handle a caller re-presents for the remaining set.
+    pub retry_handle: String,
+}
+
+impl UserAutomationWakePublication {
+    /// Validates the owner answer against the exact request sent.
+    ///
+    /// The acknowledged and remaining sets must together be exactly the
+    /// requested set, disjoint, and free of duplicates, and the owner must
+    /// echo the immutable revision identity and publication identity. A
+    /// remaining set that does not match the request is an owner answer this
+    /// boundary refuses rather than reports as a partial success.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request.validate()?;
+        validate_text(
+            &self.publication_idempotency_key,
+            "publication.publication_idempotency_key",
+        )?;
+        validate_digest(&self.revision_digest, "publication.revision_digest")?;
+        validate_text(&self.retry_handle, "publication.retry_handle")?;
+        self.state_fence
+            .validate()
+            .map_err(|error| UserAutomationExecutionError::Metadata(error.to_string()))?;
+        if self.automation_id != request.automation_id
+            || self.automation_revision != request.automation_revision
+            || self.revision_digest != request.revision_digest
+            || self.state_fence != request.state_fence
+            || self.publication_operation_id != request.identity.operation_id
+            || self.publication_idempotency_key != request.identity.idempotency_key
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "publication identity binding",
+            ));
+        }
+        let mut accounted: BTreeSet<&str> = BTreeSet::new();
+        for (values, field) in [
+            (
+                &self.acknowledged_occurrence_ids,
+                "publication.acknowledged_occurrence_ids",
+            ),
+            (
+                &self.remaining_occurrence_ids,
+                "publication.remaining_occurrence_ids",
+            ),
+        ] {
+            validate_unique_horizon_list(values, field)?;
+            for value in values {
+                if !accounted.insert(value.as_str()) {
+                    return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                        "publication accounts for one occurrence twice",
+                    ));
+                }
+            }
+        }
+        let requested = request.requested_occurrence_ids();
+        if accounted.len() != requested.len()
+            || !requested
+                .iter()
+                .all(|occurrence_id| accounted.contains(occurrence_id.as_str()))
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "publication does not account for the requested horizon",
+            ));
+        }
+        if self.retry_handle != request.retry_handle(&self.remaining_occurrence_ids)? {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "publication retry handle",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reports whether the owner acknowledged the complete requested horizon.
+    #[must_use]
+    pub fn acknowledged_all(&self) -> bool {
+        self.remaining_occurrence_ids.is_empty()
+    }
+}
+
+/// Compiles the bounded wake horizon of one accepted immutable revision.
+///
+/// The whole compiler is derived from the revision: its normalized occurrence
+/// denominator and stable occurrence identities, the compiled schedule trigger
+/// basis, and the inert owner-contract wake intent it produces for each
+/// occurrence. The slice is the whole denominator for a first publication, and
+/// the run strictly after `consumed_occurrence_id` for a disposition advance.
+/// No time is derived, shifted, or extrapolated here, so this function cannot
+/// widen a schedule.
+pub fn compile_wake_horizon(
+    revision: &UserAutomationRevision,
+    context: RequestMetadata,
+    authenticated_principal: String,
+    identity: OperationIdentity,
+    state_fence: StateFence,
+    trigger: UserAutomationHorizonTrigger,
+    consumed_occurrence_id: Option<&str>,
+) -> Result<UserAutomationWakeHorizonPublication, UserAutomationExecutionError> {
+    revision
+        .validate()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    if revision.owner_principal != authenticated_principal {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "horizon principal is not the revision owner",
+        ));
+    }
+    let digest = revision
+        .digest()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    let source_digest = revision
+        .schedule
+        .source_digest()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    let identities = revision
+        .compile_occurrence_identities()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    let denominator_occurrence_ids = identities
+        .iter()
+        .map(|identity| identity.occurrence_id.clone())
+        .collect::<Vec<_>>();
+    let start = horizon_slice_start(&denominator_occurrence_ids, trigger, consumed_occurrence_id)?;
+    if start >= identities.len() {
+        return Err(UserAutomationExecutionError::Contract(
+            UserAutomationError::Invalid("horizon.entries"),
+        ));
+    }
+    let mut entries = Vec::with_capacity(identities.len() - start);
+    for identity in &identities[start..] {
+        let UserAutomationTrigger::Scheduled { occurrence_key } = &identity.trigger else {
+            return Err(UserAutomationExecutionError::Contract(
+                UserAutomationError::Invalid("horizon.entry.occurrence_key"),
+            ));
+        };
+        entries.push(UserAutomationWakeHorizonEntry {
+            occurrence_id: identity.occurrence_id.clone(),
+            occurrence_key: occurrence_key.clone(),
+            source_digest: source_digest.clone(),
+            wake_intent: revision
+                .compile_wake_intent(&identity.occurrence_id, state_fence.clone())
+                .map_err(UserAutomationExecutionError::Contract)?,
+        });
+    }
+    let publication = UserAutomationWakeHorizonPublication {
+        context,
+        authenticated_principal,
+        identity,
+        automation_id: revision.automation_id.clone(),
+        automation_revision: revision.revision.clone(),
+        revision_digest: digest,
+        state_fence,
+        trigger,
+        denominator_occurrence_ids,
+        entries,
+        only_unadmitted_future: true,
+        consumed_occurrence_id: consumed_occurrence_id.map(str::to_owned),
+    };
+    publication.validate_against_revision(revision)?;
+    Ok(publication)
+}
+
+/// Advances the recurring horizon from owner state after one occurrence reached
+/// an owner-acknowledged disposition.
+///
+/// The cursor is revision-bound: the denominator is recompiled from the exact
+/// immutable revision the due wake resolved against, and the cursor position is
+/// the consumed occurrence's own place in that denominator. Because the revision
+/// is immutable and its digest is carried by the resolution, the recompiled
+/// denominator is provably the one any earlier publication of that revision
+/// carried, so no prior publication record is needed to continue it and none is
+/// invented here. The advance therefore never mutates the revision, never mints a
+/// second occurrence identity, and never produces a time outside the revision's
+/// normalized contract.
+pub fn advance_wake_horizon(
+    resolution: &UserAutomationDueWakeResolution,
+    consumed_occurrence_id: &str,
+    context: RequestMetadata,
+    authenticated_principal: String,
+    identity: OperationIdentity,
+    state_fence: StateFence,
+) -> Result<UserAutomationWakeHorizonPublication, UserAutomationExecutionError> {
+    resolution
+        .revision
+        .validate()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    if resolution
+        .revision
+        .digest()
+        .map_err(UserAutomationExecutionError::Contract)?
+        != resolution.revision_digest
+    {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "horizon advance revision digest is not the resolved immutable revision",
+        ));
+    }
+    if resolution.revision.owner_principal != authenticated_principal {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "horizon advance principal is not the resolved revision owner",
+        ));
+    }
+    compile_wake_horizon(
+        &resolution.revision,
+        context,
+        authenticated_principal,
+        identity,
+        state_fence,
+        UserAutomationHorizonTrigger::DispositionAdvance,
+        Some(consumed_occurrence_id),
+    )
+}
+
+/// Closed cause by which one authenticated owner wake is refused before any
+/// execution effect is requested.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UserAutomationDueWakeRejectionCause {
+    /// The carrier did not arrive as an existing scheduler wake.
+    NotScheduledWakeOrigin,
+    /// A scheduler wake named something other than a calendar occurrence.
+    NotCalendarOccurrence,
+    /// An admitted child requested a trigger this contour does not consume.
+    NestedChildOccurrence,
+    /// The authenticated principal, owner, or work scope does not match.
+    ForeignPrincipal,
+    /// The occurrence belongs to a revision that has been superseded.
+    SupersededRevision,
+    /// The occurrence belongs to a revision that is no longer the current one.
+    StaleRevision,
+    /// The current configuration state admits no occurrence.
+    OwnerNotActive,
+    /// The occurrence is not a member of the current normalized set.
+    UnnormalizedOccurrence,
+    /// The carried occurrence identity is not the one the current revision
+    /// compiles.
+    OccurrenceIdentityMismatch,
+    /// The wake owner retains no such published wake.
+    WakeNotRetained,
+    /// The retained wake is no longer a pending, unadmitted intent.
+    WakeAlreadyConsumed,
+    /// The retained wake belongs to another occurrence, revision, or fence.
+    ForeignWake,
+    /// The occurrence already has an admitted Durable Job reference.
+    OccurrenceAlreadyAdmitted,
+}
+
+/// One refused due wake, with its closed cause and the exact evidence it was
+/// refused against.
+///
+/// A refusal is a typed decision, not prose: `cause` is what the boundary
+/// rejected, `owner_configuration_state` is the live admission state when that
+/// is the cause, and `occurrence_id` is the exact stable occurrence the wake
+/// named. Nothing here is inferred from the absence of a damage signature.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationDueWakeRejection {
+    /// Closed cause of the refusal.
+    pub cause: UserAutomationDueWakeRejectionCause,
+    /// Stable occurrence the refused wake named.
+    pub occurrence_id: String,
+    /// Live owner configuration state, present exactly when the cause is
+    /// [`UserAutomationDueWakeRejectionCause::OwnerNotActive`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_configuration_state: Option<UserAutomationConfigurationState>,
+    /// Already-admitted Durable Job reference this duplicate delivery resolves
+    /// to, present exactly when the cause is
+    /// [`UserAutomationDueWakeRejectionCause::OccurrenceAlreadyAdmitted`].
+    ///
+    /// A duplicate delivery therefore returns the existing operation instead of
+    /// prose: the caller reconciles that reference rather than admitting a
+    /// second one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_execution: Option<AutomationExecutionReference>,
+    /// Closed reason the boundary refused this wake before any effect.
+    pub reason: String,
+}
+
+impl UserAutomationDueWakeRejection {
+    /// Builds one typed refusal with its named reason.
+    #[must_use]
+    pub fn new(
+        cause: UserAutomationDueWakeRejectionCause,
+        occurrence_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            cause,
+            occurrence_id: occurrence_id.into(),
+            owner_configuration_state: None,
+            existing_execution: None,
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds the closed refusal for a current owner state that admits nothing.
+    #[must_use]
+    pub fn owner_not_active(
+        occurrence_id: impl Into<String>,
+        state: UserAutomationConfigurationState,
+    ) -> Self {
+        let occurrence_id = occurrence_id.into();
+        let reason = format!(
+            "occurrence {occurrence_id} is refused because the current owner configuration state \
+             is {state:?}, which admits no occurrence; the wake is cancelled or expired by the \
+             schedule owner rather than executed"
+        );
+        Self {
+            cause: UserAutomationDueWakeRejectionCause::OwnerNotActive,
+            occurrence_id,
+            owner_configuration_state: Some(state),
+            existing_execution: None,
+            reason,
+        }
+    }
+
+    /// Builds the closed refusal for a duplicate delivery of an occurrence that
+    /// already has an admitted Durable Job reference.
+    #[must_use]
+    pub fn occurrence_already_admitted(
+        occurrence_id: impl Into<String>,
+        existing: AutomationExecutionReference,
+    ) -> Self {
+        let occurrence_id = occurrence_id.into();
+        let reason = format!(
+            "occurrence {occurrence_id} already has Durable Job reference {} in state {:?} in the \
+             complete owner execution projection, so this delivery is a duplicate of that \
+             operation and returns it instead of admitting a second one",
+            existing.durable_job_ref, existing.state
+        );
+        Self {
+            cause: UserAutomationDueWakeRejectionCause::OccurrenceAlreadyAdmitted,
+            occurrence_id,
+            owner_configuration_state: None,
+            existing_execution: Some(existing),
+            reason,
+        }
+    }
+}
+
+/// Resolved, owner-proven identity of one due authenticated wake.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationDueWakeResolution {
+    /// Exact current immutable revision the wake resolved to.
+    pub revision: UserAutomationRevision,
+    /// Occurrence re-derived by that current revision from its own normalized
+    /// set, with the `ScheduledWake` origin.
+    pub invocation: UserAutomationInvocation,
+    /// Immutable revision digest the resolution was made against.
+    pub revision_digest: String,
+}
+
+impl UserAutomationDueWakeResolution {
+    /// Validates that the resolution still binds the carrier it resolved.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationRuntimeAdmission,
+    ) -> Result<(), UserAutomationExecutionError> {
+        self.revision
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        self.invocation
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        validate_digest(&self.revision_digest, "due_wake.revision_digest")?;
+        let digest = self
+            .revision
+            .digest()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        let occurrence_id = self
+            .invocation
+            .occurrence_identity()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        if digest != self.revision_digest
+            || self.revision != request.revision
+            || self.invocation != request.invocation
+            || occurrence_id != request.preflight.occurrence_id
+            || occurrence_id != request.wake_intent.wake_id
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "due wake resolution binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Resolves the exact current automation, revision, and occurrence of one
+/// authenticated owner wake, refusing every wake the current owner no longer
+/// admits before any execution effect is requested.
+///
+/// This is the pre-execution gate of issue #2806 item 5. It performs no IO, no
+/// model or provider call, and no scheduler call: it compares the carrier
+/// against the canonical owner snapshot and the complete owner execution
+/// projection, so a stale, paused, removed, superseded, already-admitted,
+/// duplicate, or foreign wake is refused on evidence rather than admitted and
+/// discovered later. A `WakeIntent` grants no execution authority by itself;
+/// every one of these refusals exists because of that.
+pub fn resolve_due_wake(
+    owner: &UserAutomationOwnerSnapshot,
+    request: &UserAutomationRuntimeAdmission,
+    expected_principal: &str,
+    execution: &UserAutomationExecutionProjection,
+) -> Result<UserAutomationDueWakeResolution, UserAutomationDueWakeRejection> {
+    let carried_occurrence = request
+        .invocation
+        .occurrence_identity()
+        .unwrap_or_else(|_| String::from("<unresolvable>"));
+    refuse_foreign_due_wake_shape(request, &carried_occurrence)?;
+    refuse_foreign_due_wake_principal(owner, request, expected_principal, &carried_occurrence)?;
+    refuse_stale_due_wake_revision(owner, request, &carried_occurrence)?;
+    refuse_unadmitted_due_wake_owner(owner, &carried_occurrence)?;
+    refuse_already_admitted_due_wake(execution, &carried_occurrence)?;
+    compile_due_wake_occurrence(owner, request, expected_principal, &carried_occurrence)
+}
+
+/// Refuses a carrier that is not a due scheduler wake for a top-level calendar
+/// occurrence of this automation.
+fn refuse_foreign_due_wake_shape(
+    request: &UserAutomationRuntimeAdmission,
+    carried_occurrence: &str,
+) -> Result<(), UserAutomationDueWakeRejection> {
+    if request.invocation.trigger_origin != UserAutomationTriggerOrigin::ScheduledWake {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::NotScheduledWakeOrigin,
+            carried_occurrence,
+            "an owner wake must arrive as a ScheduledWake occurrence; a Human run-now occurrence \
+             and an admitted child are not consumed by this ingress",
+        ));
+    }
+    if !matches!(
+        request.invocation.trigger,
+        UserAutomationTrigger::Scheduled { .. }
+    ) {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::NotCalendarOccurrence,
+            carried_occurrence,
+            "a scheduled wake must name an owner-normalized calendar occurrence, never a manual \
+             run-now nonce",
+        ));
+    }
+    if request.invocation.child_depth != 0 {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::NestedChildOccurrence,
+            carried_occurrence,
+            "an admitted child occurrence cannot be re-entered as a schedule wake; scheduling \
+             authority requires a separate exact Human-approved operation",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a wake issued for another principal or another automation.
+fn refuse_foreign_due_wake_principal(
+    owner: &UserAutomationOwnerSnapshot,
+    request: &UserAutomationRuntimeAdmission,
+    expected_principal: &str,
+    carried_occurrence: &str,
+) -> Result<(), UserAutomationDueWakeRejection> {
+    if request.authenticated_principal != expected_principal
+        || request.invocation.principal_ref != expected_principal
+        || owner.authenticated_principal != expected_principal
+        || owner.revision.owner_principal != expected_principal
+    {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::ForeignPrincipal,
+            carried_occurrence,
+            "the wake principal, the authenticated session principal, and the canonical owner \
+             principal are not the same principal, so this wake is not issued for this owner",
+        ));
+    }
+    if owner.automation_id != request.invocation.automation_id
+        || request.revision.automation_id != owner.automation_id
+    {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::ForeignPrincipal,
+            carried_occurrence,
+            "the wake names a different automation than the canonical owner it was resolved \
+             against",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a wake of a superseded revision or of a revision the canonical owner
+/// no longer serves.
+fn refuse_stale_due_wake_revision(
+    owner: &UserAutomationOwnerSnapshot,
+    request: &UserAutomationRuntimeAdmission,
+    carried_occurrence: &str,
+) -> Result<(), UserAutomationDueWakeRejection> {
+    if owner.revision.revision != request.invocation.automation_revision {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::SupersededRevision,
+            carried_occurrence,
+            format!(
+                "the wake names revision {} of {}, but the canonical current revision is {}; the \
+                 named revision is superseded and its not-yet-admitted wakes are cancelled rather \
+                 than executed",
+                request.invocation.automation_revision,
+                owner.automation_id,
+                owner.revision.revision
+            ),
+        ));
+    }
+    if owner.revision != request.revision {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::StaleRevision,
+            carried_occurrence,
+            "the immutable revision carried by the wake is not the current canonical revision, so \
+             the occurrence cannot be preflighted against the live owner state",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a wake of a revision whose current configuration state admits no
+/// occurrence.
+fn refuse_unadmitted_due_wake_owner(
+    owner: &UserAutomationOwnerSnapshot,
+    carried_occurrence: &str,
+) -> Result<(), UserAutomationDueWakeRejection> {
+    if owner.current_configuration_state != UserAutomationConfigurationState::Active {
+        return Err(UserAutomationDueWakeRejection::owner_not_active(
+            carried_occurrence,
+            owner.current_configuration_state,
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a duplicate delivery of an occurrence that already has an admitted
+/// Durable Job reference, returning that operation instead of admitting a second
+/// one.
+fn refuse_already_admitted_due_wake(
+    execution: &UserAutomationExecutionProjection,
+    carried_occurrence: &str,
+) -> Result<(), UserAutomationDueWakeRejection> {
+    if let Some(existing) = execution
+        .current_execution_refs
+        .iter()
+        .find(|reference| reference.occurrence_id == carried_occurrence)
+        .cloned()
+    {
+        return Err(UserAutomationDueWakeRejection::occurrence_already_admitted(
+            carried_occurrence,
+            existing,
+        ));
+    }
+    Ok(())
+}
+
+/// Re-derives the wake occurrence from the current revision's own normalized set
+/// and returns the resolved occurrence with that revision's immutable digest.
+fn compile_due_wake_occurrence(
+    owner: &UserAutomationOwnerSnapshot,
+    request: &UserAutomationRuntimeAdmission,
+    expected_principal: &str,
+    carried_occurrence: &str,
+) -> Result<UserAutomationDueWakeResolution, UserAutomationDueWakeRejection> {
+    let unnormalized = |error: UserAutomationError| {
+        UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::UnnormalizedOccurrence,
+            carried_occurrence,
+            format!("the current revision normalized set does not compile this wake: {error}"),
+        )
+    };
+    let UserAutomationTrigger::Scheduled { occurrence_key } = &request.invocation.trigger else {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::NotCalendarOccurrence,
+            carried_occurrence,
+            "a scheduled wake must name an owner-normalized calendar occurrence",
+        ));
+    };
+    let invocation = owner
+        .revision
+        .scheduled_invocation(
+            occurrence_key,
+            expected_principal,
+            UserAutomationTriggerOrigin::ScheduledWake,
+            0,
+        )
+        .map_err(unnormalized)?;
+    let occurrence_id = invocation.occurrence_identity().map_err(unnormalized)?;
+    if occurrence_id != carried_occurrence {
+        return Err(UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::OccurrenceIdentityMismatch,
+            carried_occurrence,
+            format!(
+                "the carried occurrence identity does not match the identity the current revision \
+                 compiles for the same calendar occurrence ({occurrence_id})"
+            ),
+        ));
+    }
+    let revision_digest = owner.revision.digest().map_err(|error| {
+        UserAutomationDueWakeRejection::new(
+            UserAutomationDueWakeRejectionCause::UnnormalizedOccurrence,
+            carried_occurrence,
+            format!("the current revision digest could not be derived: {error}"),
+        )
+    })?;
+    Ok(UserAutomationDueWakeResolution {
+        revision: owner.revision.clone(),
+        invocation,
+        revision_digest,
+    })
+}
+
+/// Refuses a retained wake that the schedule owner no longer offers as a
+/// pending, unadmitted intent for the resolved occurrence.
+pub fn refuse_consumed_wake(
+    occurrence_id: &str,
+    intent: &WakeIntent,
+) -> Option<UserAutomationDueWakeRejection> {
+    if intent.state == WakeIntentState::Pending {
+        return None;
+    }
+    Some(UserAutomationDueWakeRejection::new(
+        UserAutomationDueWakeRejectionCause::WakeAlreadyConsumed,
+        occurrence_id.to_owned(),
+        format!(
+            "the schedule owner retains occurrence {occurrence_id} in lifecycle state {:?}, which \
+             is not a pending unadmitted intent, so this delivery is a duplicate or a superseded \
+             delivery and returns the existing operation instead of admitting a second one",
+            intent.state
+        ),
+    ))
 }
 
 /// Failure record sent to the existing canonical failure-history and notify
@@ -951,6 +1976,32 @@ pub trait UserAutomationDurableJobPort: Send + Sync {
 /// [`UserAutomationDurableJobPort::admit_occurrence`].
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationWakePort: Send + Sync {
+    /// Publishes one bounded recurring horizon to the existing WakeIntent/Task
+    /// Scheduler owner.
+    ///
+    /// The owner is the sole writer of its wake journal, so the request is
+    /// already bound to one immutable revision, one State Fence, and the
+    /// revision's own normalized occurrence denominator: an implementation
+    /// cannot widen, reorder, or extend that denominator. The answer must
+    /// account for every requested occurrence, and only an owner acknowledgement
+    /// makes a horizon published.
+    ///
+    /// The default refuses with a named unavailability instead of inferring a
+    /// publication. That is the correct answer for a contour with no schedule
+    /// owner: a `WakeIntent` publication is an owner effect, and a caller must
+    /// never be able to make an absent owner look like a retained wake.
+    async fn publish_wake_horizon(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "UserAutomation wake horizon publication is unavailable at this boundary: the existing \
+             WakeIntent/Task Scheduler owner publishes no horizon operation over the admitted \
+             channel, so nothing was sent and no wake was retained"
+                .to_owned(),
+        ))
+    }
+
     /// Reads one exact persisted Pending wake from the existing owner.
     /// Implementations without a readback path fail closed.
     async fn read_pending_wake(
@@ -1133,6 +2184,15 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         runtime: &R,
     ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
         request.validate()?;
+        // Execution admission consumes the complete, fail-closed owner view, not
+        // a bounded subset of it (issue #2808). An occurrence denominator the
+        // owner could not prove complete is missing coverage evidence, which is
+        // `unknown` rather than "no unresolved effect" (I5.16), so it is refused
+        // here instead of being reported as an ordinary preflight deferral that a
+        // caller could retry as if it were transient capacity. Preflight still
+        // owns the genuinely unresolved-effect case, where the correct outcome is
+        // `Deferred { ReconciliationRequired }`.
+        require_complete_occurrence_view(&request.projection.execution)?;
         let context = UserAutomationPreflightContext {
             request_metadata: request.context.clone(),
         };
@@ -1274,6 +2334,65 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             .await
     }
 
+    /// Reads the complete owner execution view for one automation through the
+    /// same `Status` read every other consumer uses, and refuses when the
+    /// declared occurrence denominator is not owner-proven complete.
+    ///
+    /// The Store adapter builds `unresolved_reconciliation_refs` over the
+    /// complete declared denominator by paging it under one owner-issued read
+    /// revision, and records a denominator it could not prove complete as an
+    /// [`AutomationReconciliationCause::IncompleteDenominator`] obligation
+    /// carrying the durable owner query handle rather than as an empty set
+    /// (issue #2808, I5.16). Reading it here is what makes the runtime
+    /// boundaries — execution admission and wake cancellation — consume that
+    /// complete view instead of a bounded subset of it.
+    ///
+    /// The read is deliberately bounded: the projection carries typed
+    /// references plus one durable query handle, never unbounded history rows,
+    /// and `current_execution_refs` stays the stored Durable Job projection, so
+    /// Durable Job history is not duplicated. The `Status` leg is the canonical
+    /// read for exactly this reason; `History` carries the same projection but
+    /// additionally walks the immutable revision denominator, which the runtime
+    /// boundary does not need.
+    ///
+    /// The read reuses the caller's admitted operation identity rather than
+    /// minting one: this service never creates a canonical operation identity,
+    /// it only carries the identity the authenticated route admitted. The read
+    /// issues no transition and no receipt, so the retirement or execution the
+    /// caller came for is unaffected by it.
+    pub async fn owner_execution_view(
+        &self,
+        request: &UserAutomationServiceRequest,
+        automation_id: &str,
+    ) -> Result<UserAutomationExecutionProjection, UserAutomationExecutionError> {
+        let response = self
+            .dispatch(UserAutomationServiceRequest {
+                context: request.context.clone(),
+                authenticated_principal: request.authenticated_principal.clone(),
+                identity: request.identity.clone(),
+                intent: UserAutomationOperatorIntent {
+                    intent_id: format!("{}:owner-execution-view", request.intent.intent_id),
+                    principal_ref: request.authenticated_principal.clone(),
+                    state_fence: request.context.state_fence.clone(),
+                    operation: eliot_kernel_core::UserAutomationOperation::Status {
+                        automation_id: automation_id.to_owned(),
+                    },
+                },
+            })
+            .await?;
+        match response.outcome {
+            UserAutomationStoreOutcome::Read {
+                result: UserAutomationReadResult::Status { execution, .. },
+            } => {
+                require_complete_occurrence_view(&execution)?;
+                Ok(execution)
+            }
+            _ => Err(UserAutomationExecutionError::OperationMismatch(
+                "owner execution view did not return a status projection",
+            )),
+        }
+    }
+
     /// Retires one revision and cancels the exact owner-issued pending wake
     /// targets observed for that revision.
     pub async fn remove_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
@@ -1293,6 +2412,19 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 ));
             }
         };
+        // Wake cancellation acts on the same complete, fail-closed owner view as
+        // execution admission (issue #2808). `remove_and_cancel_with_targets`
+        // is one of the four consumer legs of the single `execution_projection`
+        // constructor, and the Store's retirement gate refuses to commit the
+        // transition unless the declared occurrence denominator is owner-proven
+        // complete at one read revision. Asserting the same gate on the
+        // cancellation that follows the commit means the scheduler owner is
+        // never asked to cancel from a bounded subset, and a Store adapter that
+        // did not gate the retirement is caught here rather than silently
+        // proceeding. Retirement itself is never refused because an effect is
+        // unresolved: those obligations are preserved verbatim.
+        let owner_view = self.owner_execution_view(&request, &automation_id).await?;
+        require_complete_occurrence_view(&owner_view)?;
         let response = self.dispatch(request.clone()).await?;
         let (receipt, result, replayed) = match response.outcome {
             UserAutomationStoreOutcome::Committed { receipt, result } => (receipt, result, false),
@@ -1338,6 +2470,44 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
     }
 }
 
+/// Refuses a runtime boundary whose owner view is not a complete, fail-closed
+/// occurrence denominator.
+///
+/// The canonical Store adapter builds `unresolved_reconciliation_refs` over the
+/// complete declared denominator, paging it under one owner-issued read
+/// revision, and encodes a denominator it could not prove complete as an
+/// [`AutomationReconciliationCause::IncompleteDenominator`] obligation carrying
+/// the durable owner query handle — never as an empty set (issue #2808, I5.16).
+///
+/// This is the shared fail-closed gate for the two runtime boundaries that act
+/// on automation state: execution admission (`execute_occurrence_with_material`)
+/// and wake cancellation (`remove_and_cancel_with_targets`). An unresolved
+/// effect on any page therefore blocks identically to one on the first page, and
+/// an incomplete denominator blocks as recovery-required instead of letting the
+/// boundary act on a bounded subset. The gate reads only the caller's typed
+/// projection: it loads no extra history, and Durable Job history is not
+/// duplicated because `current_execution_refs` stays the stored Durable Job
+/// projection.
+fn require_complete_occurrence_view(
+    execution: &UserAutomationExecutionProjection,
+) -> Result<(), UserAutomationExecutionError> {
+    // The obligation itself is the error payload, not just its cause: the
+    // durable `denominator_query_ref` inside it is the caller's only route to
+    // finish enumerating the denominator, and `IncompleteDenominator` is defined
+    // to carry one. Reducing this to a field name would leave the caller knowing
+    // the work is blocked with no way to unblock it.
+    if let Some(obligation) = execution
+        .unresolved_reconciliation_refs
+        .iter()
+        .find(|obligation| obligation.cause == AutomationReconciliationCause::IncompleteDenominator)
+    {
+        return Err(
+            UserAutomationExecutionError::OccurrenceDenominatorIncomplete(obligation.clone()),
+        );
+    }
+    Ok(())
+}
+
 fn validate_text(value: &str, field: &'static str) -> Result<(), UserAutomationExecutionError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(UserAutomationExecutionError::Contract(
@@ -1371,6 +2541,27 @@ fn validate_unique_text_list(
         if !unique.insert(value) {
             return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
                 "duplicate cancellation identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Unique non-blank occurrence identity list for a compiled horizon.
+///
+/// Same shape gate as [`validate_unique_text_list`] with the horizon-specific
+/// refusal, because one stable occurrence identity appearing twice in a horizon
+/// is a schedule defect, not a cancellation defect.
+fn validate_unique_horizon_list(
+    values: &[String],
+    field: &'static str,
+) -> Result<(), UserAutomationExecutionError> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        validate_text(value, field)?;
+        if !unique.insert(value) {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "duplicate UserAutomation occurrence identity in the horizon",
             ));
         }
     }

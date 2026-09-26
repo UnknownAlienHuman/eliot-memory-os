@@ -40,6 +40,11 @@ const ADMISSION: &str = "admission-digest-1126";
 const PLAN: &str = "plan-rev-7";
 const FENCE: &str = "fence-digest-1126";
 const JOB: &str = "job-1126-1";
+/// Registry adapter-entry digest sealing every fixture launch (pinned per
+/// route class on first launch; identical across fixtures so pins agree).
+const ADAPTER_DIGEST: [u8; 32] = [0xA1; 32];
+/// Opaque generation fingerprint sealing every fixture launch.
+const GENERATION_FINGERPRINT: [u8; 32] = [0xF1; 32];
 
 /// Shared ordered event log proving persist-before-launch across the two
 /// owners: the ledger logs `persist:<operation_id>`, the runner logs
@@ -226,14 +231,28 @@ fn attach_launches_two_children_with_persist_before_launch_order() {
 
     // Two children launch over the admitted route surface.
     let first = composition
-        .launch_child("slot-a", RegistryRouteStatus::Admitted, "native-worker", 3)
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
         .expect("first child launches");
     assert_eq!(first.operation_id, format!("{JOB}:{PLAN}:slot-a"));
     assert_eq!(first.attempt_id, format!("{JOB}:{PLAN}:slot-a-attempt"));
     assert_persist_before_launch(&log, &first.operation_id);
 
     let second = composition
-        .launch_child("slot-b", RegistryRouteStatus::Admitted, "native-worker", 3)
+        .launch_child(
+            "slot-b",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
         .expect("second child launches");
     assert_persist_before_launch(&log, &second.operation_id);
     assert_eq!(composition.launched().len(), 2);
@@ -255,11 +274,25 @@ fn attach_launches_two_children_with_persist_before_launch_order() {
     // all, no ledger append: the intent never persists.
     let intents_before = ledger.intents().len();
     assert!(matches!(
-        composition.launch_child("slot-c", RegistryRouteStatus::Revoked, "native-worker", 3),
+        composition.launch_child(
+            "slot-c",
+            RegistryRouteStatus::Revoked,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT
+        ),
         Err(SwarmCompositionError::RouteBlocked { .. })
     ));
     assert!(matches!(
-        composition.launch_child("slot-c", RegistryRouteStatus::Stale, "native-worker", 3),
+        composition.launch_child(
+            "slot-c",
+            RegistryRouteStatus::Stale,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT
+        ),
         Err(SwarmCompositionError::RouteBlocked { .. })
     ));
     assert_eq!(ledger.intents().len(), intents_before);
@@ -267,7 +300,14 @@ fn attach_launches_two_children_with_persist_before_launch_order() {
     // Reusing a slot that already carries a persisted intent is refused:
     // changed input needs a new identity, never a silent relaunch.
     assert!(matches!(
-        composition.launch_child("slot-a", RegistryRouteStatus::Admitted, "native-worker", 3),
+        composition.launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT
+        ),
         Err(SwarmCompositionError::DuplicateSlot { .. })
     ));
 }
@@ -288,10 +328,24 @@ fn restart_rehydrates_and_reconciles_before_any_relaunch() {
             .attach_admitted_plan(ADMISSION, PLAN, FENCE, JOB)
             .expect("replay binds before restart");
         before
-            .launch_child("slot-a", RegistryRouteStatus::Admitted, "native-worker", 3)
+            .launch_child(
+                "slot-a",
+                RegistryRouteStatus::Admitted,
+                "native-worker",
+                3,
+                ADAPTER_DIGEST,
+                GENERATION_FINGERPRINT,
+            )
             .expect("slot-a launches");
         before
-            .launch_child("slot-b", RegistryRouteStatus::Admitted, "native-worker", 3)
+            .launch_child(
+                "slot-b",
+                RegistryRouteStatus::Admitted,
+                "native-worker",
+                3,
+                ADAPTER_DIGEST,
+                GENERATION_FINGERPRINT,
+            )
             .expect("slot-b launches");
     }
     runner.set_state("slot-a", ChildState::Running);
@@ -304,7 +358,14 @@ fn restart_rehydrates_and_reconciles_before_any_relaunch() {
     let mut restarted = composition(&attachment, &ledger, &runner);
     assert!(!restarted.launch_allowed());
     assert!(matches!(
-        restarted.launch_child("slot-c", RegistryRouteStatus::Admitted, "native-worker", 3),
+        restarted.launch_child(
+            "slot-c",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT
+        ),
         Err(SwarmCompositionError::PlanNotAttached)
     ));
 
@@ -364,7 +425,14 @@ fn restart_rehydrates_and_reconciles_before_any_relaunch() {
         Err(SwarmCompositionError::StaleLineage { .. })
     ));
     assert!(matches!(
-        restarted.launch_child("slot-c", RegistryRouteStatus::Admitted, "native-worker", 3),
+        restarted.launch_child(
+            "slot-c",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT
+        ),
         Err(SwarmCompositionError::ReconcileRequired)
     ));
     let recovered = restarted
@@ -373,10 +441,24 @@ fn restart_rehydrates_and_reconciles_before_any_relaunch() {
     assert_eq!(recovered.plan, sealed);
     // slot-c is a new identity, so it may launch; reusing slot-a is refused.
     restarted
-        .launch_child("slot-c", RegistryRouteStatus::Admitted, "native-worker", 3)
+        .launch_child(
+            "slot-c",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
         .expect("new slot launches after reconcile");
     assert!(matches!(
-        restarted.launch_child("slot-a", RegistryRouteStatus::Admitted, "native-worker", 3),
+        restarted.launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT
+        ),
         Err(SwarmCompositionError::DuplicateSlot { .. })
     ));
 }
@@ -390,10 +472,24 @@ fn cancel_drain_reaches_terminal_ready_then_unknown_blocks_false_terminal() {
     let mut composition = composition(&attachment, &ledger, &runner);
     attach(&mut composition);
     composition
-        .launch_child("slot-a", RegistryRouteStatus::Admitted, "native-worker", 3)
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
         .expect("slot-a launches");
     composition
-        .launch_child("slot-b", RegistryRouteStatus::Admitted, "native-worker", 3)
+        .launch_child(
+            "slot-b",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
         .expect("slot-b launches");
     runner.set_state("slot-a", ChildState::Running);
     runner.set_state("slot-b", ChildState::Running);

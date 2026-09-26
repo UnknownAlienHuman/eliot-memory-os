@@ -20,11 +20,14 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
 #[cfg(windows)]
 use eliot_kernel_service::{
-    AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDurableJobPort,
-    UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
-    UserAutomationHostExecutionTransport, UserAutomationOwnerLookup,
-    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakePort, UserAutomationWakeReadRequest,
+    AuthenticatedUserAutomationHostExecutionTransport, UserAutomationDueWakeRejection,
+    UserAutomationDueWakeResolution, UserAutomationDurableJobPort, UserAutomationHorizonOutcome,
+    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationHostExecutionClient,
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
+    UserAutomationOwnerLookup, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
+    UserAutomationWakeCancellation, UserAutomationWakeHorizonPublication, UserAutomationWakePort,
+    UserAutomationWakePublication, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
@@ -32,7 +35,7 @@ use eliot_process::{
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    RequestIdentity, host_request_operation_id,
+    RequestIdentity, TaskControllerResultBody, host_request_operation_id,
 };
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -40,11 +43,13 @@ use eliot_runtime_contracts::{
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
 use eliot_store_api::{
-    CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
-    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
-    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
+    CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
+    CampaignSourceRevisionRef, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationIdentity, OrderingHeadExpectation, PreparedTransition,
+    ReadConsistency, RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation,
+    StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -441,6 +446,10 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
+        "campaign_packet_claim" => "campaign_packet_claim",
+        "campaign_packet_result" => "campaign_packet_result",
+        "task_controller_claim" => "task_controller_claim",
+        "task_controller_result" => "task_controller_result",
         "agent_host_request_submit" => "agent_host_request_submit",
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
@@ -599,6 +608,13 @@ struct IntroductionRevocationOperation {
 /// `wasm_host_artifact_binding()`: any divergence fails closed here, the
 /// same way `bind_notify_launch_grant` pins its own canonical image name.
 const WASM_HOST_IMAGE_FILE_NAME: &str = "eliot-wasm-host.exe";
+
+/// Stable module identity the demanded `eliot-wasm-host.exe` parent runs
+/// under. Mirrors the `front_door_session` worker spellings
+/// (`eliot-doctor`, `eliot-testd`, `eliot-native-worker`): the binary's own
+/// name, bound by the Kernel at spawn through the admitted process owner,
+/// never self-asserted by the child.
+const WASM_HOST_MODULE_ID: &str = "eliot-wasm-host";
 
 /// Closed owner-side WASM dispatch publication (`#1780` D4a, `#1955`).
 ///
@@ -908,6 +924,347 @@ impl NotificationPageQuery {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed campaign publication admission path keeps the source transition, owner matrix, and recipe binding together"
+)]
+fn campaign_source_publications_for_transition(
+    transition: &PreparedTransition,
+    request_id: &eliot_contracts::RequestId,
+) -> Result<Vec<CampaignSourcePublication>, String> {
+    let mut task_operation = None;
+    let mut task_recipe: Option<eliot_store_api::LearningStateViewRecipe> = None;
+    let mut campaign_matrix_complete = false;
+    let mut publications = Vec::new();
+    for operation in &transition.named_operations {
+        if operation.operation != eliot_store_api::NamedMutationOperation::UpdateTaskState {
+            if operation
+                .parameters
+                .contains_key("campaign_source_publications_json")
+            {
+                return Err(
+                    "campaign source publication must be carried by the owner transition".into(),
+                );
+            }
+            continue;
+        }
+        if task_operation.is_some() {
+            return Err("campaign publication transition must contain one task update".into());
+        }
+        let task_id = operation
+            .parameters
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "task update lacks its exact task identity".to_owned())?;
+        task_operation = Some(task_id.to_owned());
+        if let Some(value) = operation
+            .parameters
+            .get("campaign_source_publications_json")
+        {
+            publications = serde_json::from_value(value.clone()).map_err(|_| {
+                "campaign source publications are not the closed typed list".to_owned()
+            })?;
+        }
+        if let Some(value) = operation.parameters.get("campaign_source_matrix_complete") {
+            campaign_matrix_complete = match value.as_str() {
+                Some("true") => true,
+                Some("false") => false,
+                _ => {
+                    return Err(
+                        "campaign source matrix completeness marker is not a boolean wire value"
+                            .into(),
+                    );
+                }
+            };
+        }
+        if let Some(value) = operation
+            .parameters
+            .get("campaign_learning_state_recipe_json")
+        {
+            let text = value.as_str().ok_or_else(|| {
+                "campaign learning-state recipe parameter is not a JSON string".to_owned()
+            })?;
+            task_recipe = Some(serde_json::from_str(text).map_err(|_| {
+                "campaign learning-state recipe parameter is not the closed typed recipe".to_owned()
+            })?);
+        }
+    }
+    if campaign_matrix_complete && task_recipe.is_none() {
+        return Err("complete campaign source matrix requires its bound recipe".into());
+    }
+    if publications.is_empty() {
+        if task_recipe.is_some() {
+            return Err(
+                "campaign learning-state recipe requires its atomic source publications".into(),
+            );
+        }
+        return Ok(publications);
+    }
+    let task_id = task_operation
+        .ok_or_else(|| "campaign source publication has no task update".to_owned())?;
+    if transition.transition_class != eliot_store_api::TransitionClass::TaskControl
+        || transition.task_id.as_deref() != Some(task_id.as_str())
+        || transition.state_fence.task_revision.is_none()
+    {
+        return Err("campaign sources require the exact TaskControl task/fence binding".into());
+    }
+    let task_revision = transition
+        .state_fence
+        .task_revision
+        .as_ref()
+        .ok_or_else(|| "campaign sources require an exact task revision fence".to_owned())?;
+    let task_record_id = eliot_store_api::CampaignOwnerRecordId::Task(
+        eliot_contracts::TaskId::new(task_id.clone()).map_err(|error| error.to_string())?,
+    );
+    let mut by_role = BTreeMap::new();
+    for publication in &publications {
+        publication.validate().map_err(|error| error.to_string())?;
+        if publication.read_receipt.read_state_fence != transition.state_fence {
+            return Err(
+                "campaign source publication is not bound to the admitted read fence".into(),
+            );
+        }
+        let record = &publication.record;
+        match &publication.state {
+            eliot_store_api::CampaignSourcePublicationState::NewRevision { .. }
+                if record.recorded_state_fence != transition.state_fence =>
+            {
+                return Err(
+                    "new campaign source must carry the exact admitted transition fence".into(),
+                );
+            }
+            eliot_store_api::CampaignSourcePublicationState::CurrentReference { .. }
+                if publication.read_receipt.read_state_fence != transition.state_fence =>
+            {
+                return Err(
+                    "current campaign source reference must carry the exact admitted read fence"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        if !campaign_matrix_complete
+            && !matches!(
+                record.role,
+                eliot_store_api::CampaignSourceRole::TaskObjective
+                    | eliot_store_api::CampaignSourceRole::TaskAcceptance
+                    | eliot_store_api::CampaignSourceRole::TaskPlan
+                    | eliot_store_api::CampaignSourceRole::TaskOpenItems
+            )
+        {
+            return Err(
+                "partial campaign source publication may carry only Task Controller rows".into(),
+            );
+        }
+        if by_role.insert(record.role, publication).is_some() {
+            return Err("campaign source publication matrix contains a duplicate role".into());
+        }
+        if matches!(
+            record.role,
+            eliot_store_api::CampaignSourceRole::TaskObjective
+                | eliot_store_api::CampaignSourceRole::TaskPlan
+        ) && (record.record_id != task_record_id
+            || record.revision != eliot_store_api::CampaignOwnerRevision::Task(*task_revision))
+        {
+            return Err(
+                "Task Controller source identity must match the admitted task revision".into(),
+            );
+        }
+    }
+
+    let task_roles = [
+        eliot_store_api::CampaignSourceRole::TaskObjective,
+        eliot_store_api::CampaignSourceRole::TaskAcceptance,
+        eliot_store_api::CampaignSourceRole::TaskPlan,
+        eliot_store_api::CampaignSourceRole::TaskOpenItems,
+    ];
+    if campaign_matrix_complete {
+        let Some(recipe) = task_recipe.as_ref() else {
+            return Err("complete campaign source matrix requires its bound recipe".into());
+        };
+        let expected_publications = recipe
+            .source_requirements
+            .iter()
+            .filter(|requirement| {
+                requirement.source_binding
+                    != eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent
+            })
+            .count();
+        if by_role.len() != expected_publications {
+            return Err(format!(
+                "complete campaign source matrix requires {expected_publications} publications after explicit absences, observed {}",
+                by_role.len()
+            ));
+        }
+        for requirement in &recipe.source_requirements {
+            match requirement.source_binding {
+                eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent => {
+                    if by_role.contains_key(&requirement.role) {
+                        return Err(format!(
+                            "explicitly absent campaign role {:?} must not have a publication",
+                            requirement.role
+                        ));
+                    }
+                }
+                _ => {
+                    if !by_role.contains_key(&requirement.role) {
+                        return Err(format!(
+                            "complete campaign source matrix omits declared role {:?}",
+                            requirement.role
+                        ));
+                    }
+                }
+            }
+        }
+    } else if by_role.len() != task_roles.len()
+        || task_roles.iter().any(|role| !by_role.contains_key(role))
+    {
+        return Err(
+            "partial campaign source publication must contain the four Task Controller rows".into(),
+        );
+    }
+
+    if let Some(recipe) = task_recipe {
+        recipe.validate().map_err(|error| error.to_string())?;
+        for role in by_role.keys() {
+            if !recipe
+                .source_requirements
+                .iter()
+                .any(|requirement| requirement.role == *role)
+            {
+                return Err("campaign source publication contains an undeclared role".into());
+            }
+        }
+        let mut history_count = 0usize;
+        for publication in &publications {
+            history_count = history_count.saturating_add(publication.record.history_plans.len());
+            for history in &publication.record.history_plans {
+                history
+                    .validate_for_source_at_fence(
+                        recipe.campaign_id.as_str(),
+                        &publication.record.owner_id,
+                        &transition.state_fence,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if campaign_matrix_complete && history_count == 0 {
+            return Err("complete campaign source matrix requires owner-produced history".into());
+        }
+        if recipe.binding.task_id.as_str() != task_id
+            || recipe.binding.request_id != *request_id
+            || recipe.binding.operation_id != transition.identity.operation_id
+            || recipe.binding.state_fence != transition.state_fence
+        {
+            return Err("TaskPlan recipe does not bind the admitted task operation".into());
+        }
+        let task_plan = by_role
+            .get(&eliot_store_api::CampaignSourceRole::TaskPlan)
+            .ok_or_else(|| "TaskPlan source publication is missing".to_owned())?;
+        let task_plan_recipe: eliot_store_api::LearningStateViewRecipe =
+            serde_json::from_value(task_plan.record.document.body.clone())
+                .map_err(|_| "TaskPlan is not the typed learning-state recipe".to_owned())?;
+        if task_plan_recipe != recipe {
+            return Err("TaskPlan publication and recipe parameter are not byte-equivalent".into());
+        }
+        if task_plan.record.record_id
+            != eliot_store_api::CampaignOwnerRecordId::Task(
+                eliot_contracts::TaskId::new(task_id.clone()).map_err(|error| error.to_string())?,
+            )
+            || task_plan.record.revision
+                != eliot_store_api::CampaignOwnerRevision::Task(*task_revision)
+            || task_plan.record.recorded_state_fence != recipe.binding.state_fence
+        {
+            return Err("TaskPlan publication does not bind the admitted task identity".into());
+        }
+        let anchor = recipe
+            .source_requirements
+            .iter()
+            .find(|requirement| requirement.role == eliot_store_api::CampaignSourceRole::TaskPlan)
+            .ok_or_else(|| "TaskPlan recipe lacks its authenticated anchor".to_owned())?;
+        if anchor.owner.as_str() != eliot_store_api::TASK_CONTROLLER_CAMPAIGN_OWNER_ID
+            || anchor.source_binding
+                != eliot_store_api::CampaignSourceBinding::AuthenticatedTaskAnchor
+            || anchor.expected_reference.is_some()
+        {
+            return Err("TaskPlan recipe has an invalid authenticated owner anchor".into());
+        }
+        let objective_requirement = recipe
+            .source_requirements
+            .iter()
+            .find(|requirement| {
+                requirement.role == eliot_store_api::CampaignSourceRole::TaskObjective
+            })
+            .ok_or_else(|| "TaskPlan recipe lacks its TaskObjective source".to_owned())?;
+        let objective_publication = by_role
+            .get(&eliot_store_api::CampaignSourceRole::TaskObjective)
+            .ok_or_else(|| "TaskObjective source publication is missing".to_owned())?;
+        let expected_objective = objective_requirement
+            .expected_reference
+            .as_ref()
+            .ok_or_else(|| "TaskObjective recipe reference is missing".to_owned())?;
+        let observed_objective = CampaignSourceRevisionRef {
+            role: objective_publication.record.role,
+            owner: objective_publication.record.owner_id.clone(),
+            record_id: objective_publication.record.record_id.clone(),
+            revision: objective_publication.record.revision.clone(),
+            content_digest: objective_publication.record.content_digest.clone(),
+            slot_projection_digests: objective_publication.record.slot_projection_digests.clone(),
+            recorded_state_fence: objective_publication.record.recorded_state_fence.clone(),
+        };
+        if &observed_objective != expected_objective {
+            return Err(
+                "TaskPlan reference does not bind the owner-issued TaskObjective row".into(),
+            );
+        }
+        for requirement in &recipe.source_requirements {
+            let Some(publication) = by_role.get(&requirement.role) else {
+                if requirement.source_binding
+                    == eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent
+                    || (!campaign_matrix_complete
+                        && !matches!(
+                            requirement.role,
+                            eliot_store_api::CampaignSourceRole::TaskObjective
+                                | eliot_store_api::CampaignSourceRole::TaskPlan
+                        ))
+                {
+                    continue;
+                }
+                return Err("campaign source publication matrix omits a declared owner".into());
+            };
+            if requirement.source_binding
+                == eliot_store_api::CampaignSourceBinding::ExplicitlyAbsent
+            {
+                return Err("an explicitly absent source cannot be published".into());
+            }
+            if requirement.source_binding == eliot_store_api::CampaignSourceBinding::ExactReference
+            {
+                let expected = requirement.expected_reference.as_ref().ok_or_else(|| {
+                    "exact source requirement lacks its owner reference".to_owned()
+                })?;
+                let observed = CampaignSourceRevisionRef {
+                    role: publication.record.role,
+                    owner: publication.record.owner_id.clone(),
+                    record_id: publication.record.record_id.clone(),
+                    revision: publication.record.revision.clone(),
+                    content_digest: publication.record.content_digest.clone(),
+                    slot_projection_digests: publication.record.slot_projection_digests.clone(),
+                    recorded_state_fence: publication.record.recorded_state_fence.clone(),
+                };
+                if &observed != expected {
+                    return Err("published source does not match the recipe owner reference".into());
+                }
+            }
+        }
+    } else if by_role
+        .keys()
+        .any(|role| !matches!(role, eliot_store_api::CampaignSourceRole::TaskObjective))
+    {
+        return Err("owner-specific campaign sources require the bound recipe".into());
+    }
+    Ok(publications)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OriginChallengeIssueOperation {
@@ -1074,13 +1431,17 @@ impl KernelComposition {
                 observe_daemon_request("kernel.daemon_request_admitted", "success");
                 observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
                 observe_daemon_request("kernel.daemon_response_prepared", "success");
-                // F-LOG-KERNEL-1 (#897 W3): the reply value is prepared here
-                // and handed to the front-door driver transport boundary. The
-                // only delivery witness is the driver-owned `send_checked`
-                // write (`front_door_driver.rs`, outside #897 scope), so
-                // delivery stays `unknown` at this boundary: a prepared
-                // response is not a delivered response.
-                observe_daemon_request("kernel.daemon_response_delivered", "unknown");
+                // F-LOG-KERNEL-1 (#897 W3): prepared, delivered and unknown
+                // are three independent records. `delivered` marks the reply
+                // value delivered to the immediate caller at this dispatch
+                // boundary (the transport handoff), never the wire write: the
+                // only wire-delivery witness is the driver-owned
+                // `send_checked` write (`front_door_driver.rs`, outside #897
+                // scope), so the post-handoff transport outcome stays
+                // `unknown` at this boundary.
+                observe_daemon_request("kernel.daemon_response_delivered", "success");
+                observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                observe_daemon_request("kernel.daemon_request_cleanup", "complete");
             }
             Err(error) => {
                 observe_daemon_request("kernel.daemon_request_validated", "fenced");
@@ -1093,6 +1454,7 @@ impl KernelComposition {
                     observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
                 }
                 super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                observe_daemon_request("kernel.daemon_request_cleanup", "fenced");
             }
         }
         result
@@ -1458,6 +1820,11 @@ impl KernelComposition {
                         // A retained terminal result never takes this path:
                         // exact replay stays idempotent across the deadline.
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -1567,6 +1934,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -1642,6 +2014,11 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -1692,6 +2069,149 @@ impl KernelComposition {
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "campaign_packet_claim" => {
+                // Campaign packets have their own closed queue and attempt
+                // ledger. This route never scans the `eliot.query` queue and
+                // never derives evidence-pack selectors from packet material.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_campaign_packet_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, tool, attempt)) => serde_json::json!({
+                                "status": "known",
+                                "value": {
+                                    "pair": {
+                                        "envelope": envelope,
+                                        "tool": tool,
+                                        "attempt": attempt,
+                                    }
+                                },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "campaign_packet_result" => {
+                // A packet result is submitted through the packet queue only;
+                // the shared result gate still proves the exact attempt,
+                // envelope fence, owner publication binding, and digest.
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_campaign_packet_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "task_controller_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_task_controller_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                                "status": "known",
+                                "value": {
+                                    "pair": {
+                                        "invocation": invocation,
+                                        "envelope": envelope,
+                                        "tool": tool,
+                                        "operation_id": attempt.operation_id,
+                                        "attempt": attempt,
+                                    }
+                                },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "task_controller_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: TaskControllerResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_task_controller_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
                         Err(error) => Err(error),
@@ -1739,7 +2259,17 @@ impl KernelComposition {
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let cancel = self.cancel_host_request(&envelope);
                 match &cancel {
-                    Ok(_) => observe_daemon_request("kernel.daemon_cancel_requested", "success"),
+                    Ok(_) => {
+                        observe_daemon_request("kernel.daemon_cancel_requested", "success");
+                        // F-LOG-KERNEL-1 (#897 T18): the typed cancellation
+                        // owner admitted the cancellation, so the requested
+                        // cancellation is observed as effected here. This is
+                        // the production-reachable observation half of the
+                        // request/observed pair; the `Cancelled` terminal
+                        // disposition below stays for the error path. Info
+                        // only; the observed wrapper owns the terminal.
+                        observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
+                    }
                     Err(_) => observe_daemon_request("kernel.daemon_cancel_requested", "fenced"),
                 }
                 let (receipt, record) = cancel?;
@@ -2009,6 +2539,7 @@ impl KernelComposition {
             }
             "publish_wasm_dispatch_bundle" => {
                 self.wasm_dispatch_bundle_operation(session, payload.clone())
+                    .await
             }
             "bind_notify_launch_grant" => {
                 self.notify_launch_grant_operation(session, payload.clone())
@@ -2431,21 +2962,35 @@ impl KernelComposition {
         }
 
         let owner_check = match &request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request }
+                if is_due_scheduler_wake(request) =>
+            {
+                Self::user_automation_due_wake_owner_check(
+                    self.revalidate_user_automation_due_wake(session, request)
+                        .await,
+                )
+            }
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
-                self.revalidate_user_automation_admission(session, request)
-                    .await
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_admission(session, request)
+                        .await,
+                )
             }
             UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
-                self.revalidate_user_automation_cancellation(session, request)
-                    .await
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_cancellation(session, request)
+                        .await,
+                )
             }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
-                self.revalidate_user_automation_wake_read(session, request)
-                    .await
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_wake_read(session, request)
+                        .await,
+                )
             }
         };
-        if let Err(error) = owner_check {
-            return Ok(Self::user_automation_runtime_error_response(error));
+        if let Some(answer) = owner_check {
+            return Ok(answer);
         }
 
         let transport =
@@ -2470,21 +3015,35 @@ impl KernelComposition {
         // immediately before crossing into the effect owner; the earlier
         // shape/fence check is not an effect-time admission proof.
         let owner_check = match &request {
+            UserAutomationHostExecutionOperation::AdmitOccurrence { request }
+                if is_due_scheduler_wake(request) =>
+            {
+                Self::user_automation_due_wake_owner_check(
+                    self.revalidate_user_automation_due_wake(session, request)
+                        .await,
+                )
+            }
             UserAutomationHostExecutionOperation::AdmitOccurrence { request } => {
-                self.revalidate_user_automation_admission(session, request)
-                    .await
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_admission(session, request)
+                        .await,
+                )
             }
             UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
-                self.revalidate_user_automation_cancellation(session, request)
-                    .await
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_cancellation(session, request)
+                        .await,
+                )
             }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
-                self.revalidate_user_automation_wake_read(session, request)
-                    .await
+                Self::user_automation_owner_check(
+                    self.revalidate_user_automation_wake_read(session, request)
+                        .await,
+                )
             }
         };
-        if let Err(error) = owner_check {
-            return Ok(Self::user_automation_runtime_error_response(error));
+        if let Some(answer) = owner_check {
+            return Ok(answer);
         }
 
         match request {
@@ -2494,16 +3053,21 @@ impl KernelComposition {
                     &session.module_generation.state_fence,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
-                match Box::pin(client.admit_occurrence(request)).await {
-                    Ok(execution) => Ok(serde_json::json!({
-                        "status": "known",
-                        "value": {
-                            "outcome": "admitted",
-                            "execution": execution,
-                        },
-                        "recovery": null,
-                    })),
-                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                if is_due_scheduler_wake(&request) {
+                    Box::pin(self.user_automation_due_wake_operation(session, *request, &client))
+                        .await
+                } else {
+                    match Box::pin(client.admit_occurrence(request)).await {
+                        Ok(execution) => Ok(serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "outcome": "admitted",
+                                "execution": execution,
+                            },
+                            "recovery": null,
+                        })),
+                        Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                    }
                 }
             }
             UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
@@ -2547,6 +3111,14 @@ impl KernelComposition {
     /// canonical request hash are sealed by the canonical Store owner over the
     /// exact prepared transition. The route therefore creates no authority, no
     /// principal, and no second canonical writer.
+    ///
+    /// The answer is one post-commit orchestration transition. The canonical
+    /// Store commit, the wake publication/cancellation handoff over the
+    /// authenticated `USER_AUTOMATION_RUNTIME_OPERATION` channel, and the
+    /// execution disposition are reported as three separate typed phases, and
+    /// the top-level `status`/`recovery` pair is computed from those phases: a
+    /// required handoff that is absent or unknown can never answer `known` with
+    /// `recovery: null` (issue #2806, I11.12).
     pub(crate) async fn user_automation_operator_operation(
         &self,
         session: &Session,
@@ -2591,42 +3163,129 @@ impl KernelComposition {
             },
             intent,
         };
-        let gateway = self.retained_store_gateway()?;
-        let response = Box::pin(gateway.execute_user_automation_operation(request))
+        // The existing authenticated Host execution channel is composed for
+        // exactly the operations that own a wake or execution handoff, so a
+        // read-only answer never depends on the Host contour. The composed
+        // `UserAutomationOperatorRuntime` is the concrete runtime port the
+        // post-commit transition calls; no second transport or route is created.
+        let runtime_channel = match self
+            .user_automation_operator_runtime_channel(
+                &request.intent.operation,
+                &session.module_generation.state_fence,
+            )
             .await
-            .map_err(|_error| {
-                super::kernel_diagnostics::observe_terminal_error(
-                    "daemon_user_automation_operator_store",
-                );
-                TransportError::SessionFenced
-            })?;
-        let outcome = match &response.outcome {
-            eliot_kernel_service::UserAutomationStoreOutcome::Read { .. } => "read",
-            eliot_kernel_service::UserAutomationStoreOutcome::Committed { .. } => "committed",
-            eliot_kernel_service::UserAutomationStoreOutcome::Replayed { .. } => "replayed",
+        {
+            Ok(channel) => channel,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
         };
+        let runtime = runtime_channel
+            .as_ref()
+            .map(eliot_kernel_service::UserAutomationOperatorRuntime::new);
+        let gateway = self.retained_store_gateway()?;
+        let transition =
+            Box::pin(gateway.execute_user_automation_operation(request.clone(), runtime.as_ref()))
+                .await
+                .map_err(|_error| {
+                    // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+                    // observation only. The single designated terminal for
+                    // this failed operation is emitted by
+                    // `execute_daemon_request_observed`; a second terminal
+                    // here would inflate one store failure into two.
+                    observe_daemon_request(
+                        "kernel.daemon_user_automation_operator_store",
+                        "fenced",
+                    );
+                    TransportError::SessionFenced
+                })?;
         // The Human inspect surface shows the deterministic schedule
         // projection before activation: the same normalized occurrence set the
         // trigger contract uses, compiled here into the immutable
         // revision-bound occurrence identities. A schedule the compiler cannot
         // compile fails closed instead of projecting a guessed occurrence.
         let occurrences =
-            Self::user_automation_inspection_occurrences(&response.outcome).map_err(|_error| {
-                super::kernel_diagnostics::observe_terminal_error(
-                    "daemon_user_automation_occurrence_projection",
+            Self::user_automation_inspection_occurrences(&transition).map_err(|_error| {
+                // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+                // observation only; `execute_daemon_request_observed` owns
+                // the single designated terminal for this failed operation.
+                observe_daemon_request(
+                    "kernel.daemon_user_automation_occurrence_projection",
+                    "fenced",
                 );
                 TransportError::SessionFenced
             })?;
+        let recovery = transition.recovery();
+        let known = transition.is_known();
+        if !known {
+            // F-LOG-KERNEL-1 (#897 T19): the store transition reports an
+            // unknown wake/execution outcome after possible work. The
+            // response body carries `"status": "unknown"` below; this record
+            // keeps the diagnostic stream honest alongside it. Observation
+            // only; the response value is unchanged.
+            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+        }
         Ok(serde_json::json!({
-            "status": "known",
+            "status": if known { "known" } else { "unknown" },
             "value": {
-                "outcome": outcome,
-                "state_fence": response.state_fence,
-                "result": response.outcome,
+                "identity": transition.identity,
+                "state_fence": transition.state_fence,
+                "configuration": transition.configuration,
+                "wake": transition.wake,
+                "horizon": transition.horizon,
+                "execution": transition.execution,
                 "occurrences": occurrences,
             },
-            "recovery": null,
+            "recovery": recovery,
         }))
+    }
+
+    /// Composes the existing authenticated Host execution channel for the
+    /// operations that own a wake or execution handoff.
+    ///
+    /// The channel is the same server-authored `user_automation_runtime`
+    /// transport the runtime route already serves, so this adds no authority and
+    /// no new operation name. A read-only answer composes nothing, so it never
+    /// depends on the Host contour.
+    ///
+    /// An operation that only publishes a bounded recurring horizon may reach its
+    /// owner later: an unreachable Host contour composes nothing and the
+    /// publication is reported as unavailable with the exact remaining occurrence
+    /// set and replay handle, so the canonical commit still happens and the
+    /// obligation stays visible. An operation that owns an execution or
+    /// cancellation effect is refused outright, because answering that path
+    /// without its owner would be a Store-only success.
+    #[cfg(windows)]
+    async fn user_automation_operator_runtime_channel(
+        &self,
+        operation: &eliot_kernel_core::UserAutomationOperation,
+        state_fence: &StateFence,
+    ) -> Result<
+        Option<
+            UserAutomationHostExecutionClient<AuthenticatedUserAutomationHostExecutionTransport>,
+        >,
+        UserAutomationRuntimeError,
+    > {
+        let need = user_automation_runtime_handoff_need(operation);
+        if need == UserAutomationRuntimeHandoffNeed::None {
+            return Ok(None);
+        }
+        let transport =
+            match AuthenticatedUserAutomationHostExecutionTransport::connect_server_authored(
+                self.ipc_limits().operation_timeout,
+            )
+            .await
+            {
+                Ok(transport) => transport,
+                Err(_) if need == UserAutomationRuntimeHandoffNeed::PublicationOnly => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        if transport.channel_binding().state_fence != *state_fence {
+            return Err(UserAutomationRuntimeError::IdentityConflict);
+        }
+        Ok(Some(UserAutomationHostExecutionClient::new(transport)?))
     }
 
     /// Compiles the deterministic next-occurrence projection of every revision
@@ -2636,13 +3295,15 @@ impl KernelComposition {
     /// list rather than re-deriving a revision the caller did not ask for.
     #[cfg(windows)]
     fn user_automation_inspection_occurrences(
-        outcome: &eliot_kernel_service::UserAutomationStoreOutcome,
+        transition: &eliot_kernel_service::UserAutomationOperatorTransition,
     ) -> Result<Vec<serde_json::Value>, UserAutomationRuntimeError> {
         use eliot_kernel_service::UserAutomationReadResult;
-        let eliot_kernel_service::UserAutomationStoreOutcome::Read { result } = outcome else {
+        let eliot_kernel_service::UserAutomationConfigurationPhase::Read { result } =
+            &transition.configuration
+        else {
             return Ok(Vec::new());
         };
-        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result {
+        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result.as_ref() {
             UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
             UserAutomationReadResult::Status { revision, .. }
             | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
@@ -3255,6 +3916,577 @@ impl KernelComposition {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Revalidates one due scheduler wake against the canonical owner before any
+    /// execution effect is requested.
+    ///
+    /// A scheduled occurrence has no committed `RunNow` receipt, so this leg
+    /// proves the occurrence against the current owner projection and the live
+    /// policy owner instead of against a Store receipt the owner never issued.
+    /// The revalidation is deterministic: it reads the canonical current
+    /// revision, its complete execution projection, and the same config/policy
+    /// snapshot the owner-issued preflight receipt carries, and it reaches no
+    /// model, provider, or scheduler call. A wake that is stale, paused,
+    /// removed, superseded, already admitted, duplicate, or foreign is refused
+    /// here with its closed cause, before any effect owner is contacted.
+    async fn revalidate_user_automation_due_wake(
+        &self,
+        session: &Session,
+        request: &UserAutomationRuntimeAdmission,
+    ) -> Result<UserAutomationDueWakeResolution, UserAutomationDueWakeOutcome> {
+        let runtime = |error| UserAutomationDueWakeOutcome::Runtime(error);
+        let authenticated_principal =
+            authenticated_user_automation_principal(session).map_err(|_| {
+                runtime(UserAutomationRuntimeError::Rejected(
+                    "UserAutomation session principal is unavailable".to_owned(),
+                ))
+            })?;
+        request
+            .validate()
+            .map_err(|error| runtime(UserAutomationRuntimeError::Rejected(error.to_string())))?;
+        if request.context.state_fence != session.module_generation.state_fence
+            || request.authenticated_principal != authenticated_principal
+        {
+            return Err(runtime(UserAutomationRuntimeError::IdentityConflict));
+        }
+        let gateway = self.retained_store_gateway().map_err(|_| {
+            runtime(UserAutomationRuntimeError::Unavailable(
+                "canonical UserAutomation Store owner is unavailable".to_owned(),
+            ))
+        })?;
+        let lookup = UserAutomationOwnerLookup {
+            automation_id: request.invocation.automation_id.clone(),
+            requested_revision: request.invocation.automation_revision.clone(),
+            authenticated_principal: authenticated_principal.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+        };
+        let owner = gateway
+            .read_user_automation_owner(&lookup)
+            .await
+            .map_err(|error| runtime(UserAutomationRuntimeError::Unavailable(error)))?;
+        let execution =
+            Self::user_automation_owner_execution_projection(&gateway, &lookup, request)
+                .await
+                .map_err(runtime)?;
+        let resolution = resolve_due_wake(&owner, request, &authenticated_principal, &execution)
+            .map_err(UserAutomationDueWakeOutcome::Refused)?;
+        resolution
+            .validate_for(request)
+            .map_err(|error| runtime(UserAutomationRuntimeError::Rejected(error.to_string())))?;
+        // The owner-issued preflight receipt is deterministic evidence, not a
+        // claim: it is re-compared here against the live policy owner and the
+        // live admission state, so a receipt produced against a superseded
+        // snapshot cannot carry a due wake into the effect owner.
+        let policy_snapshot = self
+            .read_user_automation_policy_snapshot(&lookup.state_fence)
+            .await
+            .map_err(runtime)?;
+        let occurrence_id = resolution
+            .invocation
+            .occurrence_identity()
+            .map_err(|error| runtime(UserAutomationRuntimeError::Rejected(error.to_string())))?;
+        if request.preflight.automation_id != owner.automation_id
+            || request.preflight.automation_revision != owner.revision.revision
+            || request.preflight.occurrence_id != occurrence_id
+            || request.preflight.work_class != owner.revision.work_class
+            || request.preflight.config_snapshot_id != policy_snapshot.snapshot_id
+            || request.preflight.config_snapshot != policy_snapshot
+            || request.preflight.config_snapshot_id != request.preflight.config_snapshot.snapshot_id
+            || request.preflight.configuration_state
+                != eliot_kernel_core::user_automation::UserAutomationConfigurationState::Active
+            || request.preflight.source_receipt.core.request.state_fence != lookup.state_fence
+            || request.preflight.source_receipt.core.request.metadata != request.context
+            || policy_snapshot.state_fence != lookup.state_fence
+        {
+            return Err(runtime(UserAutomationRuntimeError::IdentityConflict));
+        }
+        Ok(resolution)
+    }
+
+    /// Projects a decided owner revalidation into the answer to return, or
+    /// `None` when the revalidation proved the operation.
+    #[cfg(windows)]
+    fn user_automation_owner_check(
+        check: Result<(), UserAutomationRuntimeError>,
+    ) -> Option<serde_json::Value> {
+        match check {
+            Ok(()) => None,
+            Err(error) => Some(Self::user_automation_runtime_error_response(error)),
+        }
+    }
+
+    /// Projects one due-wake revalidation into the answer to return, or `None`
+    /// when the wake is still admissible.
+    #[cfg(windows)]
+    fn user_automation_due_wake_owner_check(
+        check: Result<UserAutomationDueWakeResolution, UserAutomationDueWakeOutcome>,
+    ) -> Option<serde_json::Value> {
+        match check {
+            Ok(_) => None,
+            Err(UserAutomationDueWakeOutcome::Refused(rejection)) => {
+                Some(Self::user_automation_due_wake_refused_response(&rejection))
+            }
+            Err(UserAutomationDueWakeOutcome::Runtime(error)) => {
+                Some(Self::user_automation_runtime_error_response(error))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    /// Reads the complete owner execution projection for one due wake.
+    ///
+    /// The read goes through the same `Status` projection the Durable Job owner
+    /// maintains, and it inherits the complete-denominator gate, so the
+    /// duplicate guard can never answer "no admitted job" from a bounded
+    /// denominator. It reuses the carrier's admitted operation identity and
+    /// issues no transition, so it mints no canonical identity.
+    async fn user_automation_owner_execution_projection(
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        lookup: &UserAutomationOwnerLookup,
+        request: &UserAutomationRuntimeAdmission,
+    ) -> Result<
+        eliot_kernel_core::user_automation::UserAutomationExecutionProjection,
+        UserAutomationRuntimeError,
+    > {
+        gateway
+            .read_user_automation_owner_execution_view(
+                &eliot_kernel_service::UserAutomationServiceRequest {
+                    context: request.context.clone(),
+                    authenticated_principal: request.authenticated_principal.clone(),
+                    identity: request.identity.clone(),
+                    intent: eliot_kernel_core::UserAutomationOperatorIntent {
+                        intent_id: format!(
+                            "{}:due-wake-owner-execution-view",
+                            request.identity.operation_id.as_str()
+                        ),
+                        principal_ref: request.authenticated_principal.clone(),
+                        state_fence: lookup.state_fence.clone(),
+                        operation: eliot_kernel_core::UserAutomationOperation::Status {
+                            automation_id: lookup.automation_id.clone(),
+                        },
+                    },
+                },
+                &lookup.automation_id,
+            )
+            .await
+            .map_err(UserAutomationRuntimeError::Unavailable)
+    }
+
+    /// Consumes one authenticated owner wake (issue #2806 items 5 and 6).
+    ///
+    /// The order is fixed: resolve the exact current automation, revision, and
+    /// occurrence; prove the retained wake is the owner's own pending record for
+    /// that occurrence; then cross into the same execution join `run-now` uses.
+    /// Every refusal happens before the effect owner is contacted, and a refusal
+    /// returns the closed cause and the existing operation rather than prose.
+    ///
+    /// After the Durable Job owner acknowledges the admission, the next bounded
+    /// recurring horizon slice is requested through the same schedule owner
+    /// (item 6). The advance recompiles the denominator from the immutable
+    /// revision the wake resolved against, so it never mutates that revision and
+    /// never produces a time outside its normalized contract.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_operation(
+        &self,
+        session: &Session,
+        request: UserAutomationRuntimeAdmission,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+    ) -> Result<serde_json::Value, TransportError> {
+        let resolution = match self
+            .revalidate_user_automation_due_wake(session, &request)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(UserAutomationDueWakeOutcome::Refused(rejection)) => {
+                return Ok(Self::user_automation_due_wake_refused_response(&rejection));
+            }
+            Err(UserAutomationDueWakeOutcome::Runtime(error)) => {
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
+        };
+        let occurrence_id = match request.invocation.occurrence_identity() {
+            Ok(occurrence_id) => occurrence_id,
+            Err(error) => {
+                return Ok(Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::Rejected(error.to_string()),
+                ));
+            }
+        };
+        let read_request = UserAutomationWakeReadRequest {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            invocation: request.invocation.clone(),
+        };
+        let readback = match Self::user_automation_due_wake_readback(
+            session,
+            &occurrence_id,
+            &read_request,
+            client,
+        )
+        .await
+        {
+            UserAutomationDueWakeRead::Proven(readback) => readback,
+            UserAutomationDueWakeRead::Answer(answer) => return Ok(answer),
+        };
+        // One stable occurrence may produce at most one admitted job/effect. The
+        // carrier is the same owner-issued admission `run-now` uses, so the
+        // Durable Job owner's own operation identity is the at-most-once
+        // boundary; the revalidation above already refused any occurrence that
+        // the complete owner projection shows as already admitted.
+        let execution = match client.admit_occurrence(request.clone()).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                // No owner acknowledged a disposition, so the recurring horizon
+                // does not advance: this wake is still unconsumed and a later
+                // owner-issued submission can admit it.
+                return Ok(Self::user_automation_runtime_error_response(error));
+            }
+        };
+        if let Err(error) = execution.validate() {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::Rejected(error.to_string()),
+            ));
+        }
+        if execution.occurrence_id != occurrence_id {
+            return Ok(Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::IdentityConflict,
+            ));
+        }
+        let horizon = Self::user_automation_due_wake_horizon(
+            session,
+            &resolution,
+            &occurrence_id,
+            &request,
+            client,
+        )
+        .await;
+        let recovery = Self::user_automation_horizon_recovery(&horizon);
+        Ok(serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": "admitted",
+                "execution": execution,
+                "resolution": resolution,
+                "wake_readback": readback,
+                "horizon": horizon,
+            },
+            "recovery": recovery,
+        }))
+    }
+
+    /// Proves the retained wake is the schedule owner's own pending record for
+    /// the resolved occurrence.
+    ///
+    /// The wake owner is the sole writer of its journal, so the only proof that
+    /// this occurrence was published as a pending wake is the owner's own
+    /// retained record read back over the authenticated channel. A `WakeIntent`
+    /// that merely exists grants nothing; a record the owner no longer offers as
+    /// pending is a duplicate or a superseded delivery and is refused here,
+    /// before any effect owner is contacted.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_readback(
+        session: &Session,
+        occurrence_id: &str,
+        read_request: &UserAutomationWakeReadRequest,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+    ) -> UserAutomationDueWakeRead {
+        let readback: UserAutomationWakeReadback = match client
+            .read_pending_wake(read_request.clone())
+            .await
+        {
+            Ok(readback) => readback,
+            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
+                return UserAutomationDueWakeRead::Answer(
+                        Self::user_automation_due_wake_refused_response(
+                            &UserAutomationDueWakeRejection::new(
+                                eliot_kernel_service::UserAutomationDueWakeRejectionCause::WakeNotRetained,
+                                occurrence_id.to_owned(),
+                                format!(
+                                    "the schedule owner retains no pending wake for this \
+                                     occurrence: {reason}"
+                                ),
+                            ),
+                        ),
+                    );
+            }
+            Err(error) => {
+                return UserAutomationDueWakeRead::Answer(
+                    Self::user_automation_runtime_error_response(error),
+                );
+            }
+        };
+        if let Some(rejection) = refuse_consumed_wake(occurrence_id, &readback.intent) {
+            return UserAutomationDueWakeRead::Answer(
+                Self::user_automation_due_wake_refused_response(&rejection),
+            );
+        }
+        if readback.intent.wake_id != occurrence_id
+            || readback.intent.state_fence != session.module_generation.state_fence
+        {
+            return UserAutomationDueWakeRead::Answer(
+                Self::user_automation_due_wake_refused_response(
+                    &UserAutomationDueWakeRejection::new(
+                        eliot_kernel_service::UserAutomationDueWakeRejectionCause::ForeignWake,
+                        occurrence_id.to_owned(),
+                        "the retained wake belongs to another occurrence or State Fence than the \
+                         occurrence the canonical owner resolved",
+                    ),
+                ),
+            );
+        }
+        if let Err(error) = readback.validate_for(read_request) {
+            return UserAutomationDueWakeRead::Answer(
+                Self::user_automation_runtime_error_response(UserAutomationRuntimeError::Rejected(
+                    error.to_string(),
+                )),
+            );
+        }
+        UserAutomationDueWakeRead::Proven(readback)
+    }
+
+    /// Requests the next bounded recurring horizon slice after an
+    /// owner-acknowledged admission (issue #2806 item 6).
+    ///
+    /// The advance happens only after the Durable Job owner acknowledged the
+    /// occurrence, and its cursor is the consumed occurrence's place in the
+    /// immutable revision's own normalized denominator. A request that was never
+    /// sent, or whose answer was lost, keeps the exact remaining occurrence set
+    /// and the replay handle instead of reporting a published horizon.
+    #[cfg(windows)]
+    async fn user_automation_due_wake_horizon(
+        session: &Session,
+        resolution: &UserAutomationDueWakeResolution,
+        occurrence_id: &str,
+        request: &UserAutomationRuntimeAdmission,
+        client: &UserAutomationHostExecutionClient<
+            AuthenticatedUserAutomationHostExecutionTransport,
+        >,
+    ) -> UserAutomationHorizonPhase {
+        let denominator_occurrence_ids = resolution
+            .revision
+            .compile_occurrence_identities()
+            .map(|identities| {
+                identities
+                    .iter()
+                    .map(|identity| identity.occurrence_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let publication = match advance_wake_horizon(
+            resolution,
+            occurrence_id,
+            request.context.clone(),
+            request.authenticated_principal.clone(),
+            request.identity.clone(),
+            session.module_generation.state_fence.clone(),
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                return Self::user_automation_unacknowledged_horizon(
+                    resolution,
+                    &denominator_occurrence_ids,
+                    &request.identity,
+                    &format!(
+                        "the next bounded horizon slice for the resolved revision could not be \
+                         compiled from its own normalized contract: {error}"
+                    ),
+                    false,
+                );
+            }
+        };
+        let requested_occurrence_ids = publication.requested_occurrence_ids();
+        if requested_occurrence_ids.is_empty() {
+            return Self::user_automation_unacknowledged_horizon(
+                resolution,
+                &denominator_occurrence_ids,
+                &request.identity,
+                "the resolved revision has no remaining occurrence after the admitted one, so there \
+                 is no next horizon slice to request",
+                false,
+            );
+        }
+        match UserAutomationWakePort::publish_wake_horizon(client, publication.clone()).await {
+            Ok(acknowledgement) => Self::user_automation_acknowledged_horizon(
+                resolution,
+                &publication,
+                &requested_occurrence_ids,
+                acknowledgement,
+            ),
+            Err(error) => {
+                let reason = error.to_string();
+                let unknown = !matches!(error, UserAutomationRuntimeError::Unavailable(_));
+                Self::user_automation_unacknowledged_horizon(
+                    resolution,
+                    &denominator_occurrence_ids,
+                    &request.identity,
+                    &reason,
+                    unknown,
+                )
+            }
+        }
+    }
+
+    /// Projects one horizon the schedule owner did not acknowledge.
+    ///
+    /// The remainder retained here is the resolved revision's own complete
+    /// normalized denominator: it is the exact set an owner still has to be asked
+    /// about, and it is derived from the immutable revision rather than from the
+    /// failed call. An empty set would claim that nothing is outstanding, which is
+    /// exactly what this contour cannot prove, and the replay handle is derived
+    /// from that same immutable digest and the parent operation identity, so it
+    /// names the retry without authorizing it.
+    #[cfg(windows)]
+    fn user_automation_unacknowledged_horizon(
+        resolution: &UserAutomationDueWakeResolution,
+        denominator_occurrence_ids: &[String],
+        identity: &OperationIdentity,
+        reason: &str,
+        unknown: bool,
+    ) -> UserAutomationHorizonPhase {
+        let requested = denominator_occurrence_ids.to_vec();
+        let outcome = if unknown {
+            UserAutomationHorizonOutcome::UnknownOutcome {
+                reason: reason.to_owned(),
+            }
+        } else {
+            UserAutomationHorizonOutcome::Unavailable {
+                reason: reason.to_owned(),
+            }
+        };
+        let retry_handle = horizon_retry_handle(
+            identity,
+            &resolution.revision_digest,
+            denominator_occurrence_ids,
+        )
+        .unwrap_or_else(|_| {
+            format!(
+                "ua-horizon-retry:unresolved:{}:{}",
+                identity.operation_id.as_str(),
+                resolution.revision_digest
+            )
+        });
+        UserAutomationHorizonPhase {
+            trigger: UserAutomationHorizonTrigger::DispositionAdvance,
+            automation_id: resolution.revision.automation_id.clone(),
+            automation_revision: resolution.revision.revision.clone(),
+            revision_digest: resolution.revision_digest.clone(),
+            remaining_occurrence_ids: requested.clone(),
+            requested_occurrence_ids: requested,
+            retry_handle,
+            outcome,
+        }
+    }
+
+    /// Projects one owner-acknowledged horizon answer.
+    ///
+    /// A published horizon is an owner acknowledgement of every requested
+    /// occurrence. A partial answer keeps the exact remaining set and the owner's
+    /// own replay handle beside the reason, so it can never be read as a
+    /// published wake set. An answer that does not account for the request is
+    /// treated as unknown rather than as a partial success, because a
+    /// mismatched remainder is not evidence about any occurrence.
+    #[cfg(windows)]
+    fn user_automation_acknowledged_horizon(
+        resolution: &UserAutomationDueWakeResolution,
+        publication: &UserAutomationWakeHorizonPublication,
+        requested_occurrence_ids: &[String],
+        acknowledgement: UserAutomationWakePublication,
+    ) -> UserAutomationHorizonPhase {
+        if let Err(error) = acknowledgement.validate_for(publication) {
+            return Self::user_automation_unacknowledged_horizon(
+                resolution,
+                requested_occurrence_ids,
+                &publication.identity,
+                &format!(
+                    "the schedule owner answer does not account for the requested horizon: {error}"
+                ),
+                true,
+            );
+        }
+        let publication_operation_id = Box::new(acknowledgement.publication_operation_id.clone());
+        let outcome = if acknowledgement.acknowledged_all() {
+            UserAutomationHorizonOutcome::Published {
+                publication_operation_id,
+            }
+        } else {
+            UserAutomationHorizonOutcome::Partial {
+                publication_operation_id,
+                reason: format!(
+                    "the schedule owner acknowledged {} of the {} occurrences that follow the \
+                     admitted one; the exact remaining set is retained and must be replayed under \
+                     its handle",
+                    acknowledgement.acknowledged_occurrence_ids.len(),
+                    requested_occurrence_ids.len()
+                ),
+            }
+        };
+        UserAutomationHorizonPhase {
+            trigger: publication.trigger,
+            automation_id: publication.automation_id.clone(),
+            automation_revision: publication.automation_revision.clone(),
+            revision_digest: publication.revision_digest.clone(),
+            remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids,
+            requested_occurrence_ids: requested_occurrence_ids.to_vec(),
+            retry_handle: acknowledgement.retry_handle,
+            outcome,
+        }
+    }
+
+    /// Projects the recovery directive of one bounded horizon, including the
+    /// exact remaining occurrence set and the replay handle the caller must use.
+    #[cfg(windows)]
+    fn user_automation_horizon_recovery(
+        horizon: &UserAutomationHorizonPhase,
+    ) -> Option<serde_json::Value> {
+        let (kind, reason) = match &horizon.outcome {
+            UserAutomationHorizonOutcome::Published { .. } => return None,
+            UserAutomationHorizonOutcome::Partial { reason, .. }
+            | UserAutomationHorizonOutcome::UnknownOutcome { reason } => {
+                ("unknown_outcome", reason)
+            }
+            UserAutomationHorizonOutcome::Unavailable { reason } => ("unavailable", reason),
+        };
+        Some(serde_json::json!({
+            "kind": kind,
+            "reason": reason,
+            "automation_id": horizon.automation_id,
+            "automation_revision": horizon.automation_revision,
+            "remaining_occurrence_ids": horizon.remaining_occurrence_ids,
+            "retry_handle": horizon.retry_handle,
+        }))
+    }
+
+    /// Projects one refused due wake.
+    ///
+    /// A refusal is a decided answer, not an unknown one: the wake was refused
+    /// before any effect, nothing is pending, and nothing was admitted. The
+    /// closed cause and, for a duplicate delivery, the already-admitted Durable
+    /// Job reference are returned so the caller reconciles that same operation
+    /// instead of issuing a new one.
+    #[cfg(windows)]
+    fn user_automation_due_wake_refused_response(
+        rejection: &UserAutomationDueWakeRejection,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": false,
+                "outcome": "due_wake_refused",
+                "cause": rejection.cause,
+                "occurrence_id": rejection.occurrence_id,
+                "owner_configuration_state": rejection.owner_configuration_state,
+                "existing_execution": rejection.existing_execution,
+                "reason": rejection.reason,
+            },
+            "recovery": null,
+        })
     }
 
     #[cfg(windows)]
@@ -3875,6 +5107,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the authenticated store admission path retains the complete prepared-transition and source-publication checks"
+    )]
     async fn store_apply_operation(
         &self,
         session: &Session,
@@ -3970,6 +5206,31 @@ impl KernelComposition {
         {
             return Ok(rejection);
         }
+        let campaign_source_publications = match campaign_source_publications_for_transition(
+            &operation.transition,
+            &operation.context.request_id,
+        ) {
+            Ok(publications) => publications,
+            Err(error) => {
+                return Ok(Self::store_error_response_text("write_receipt", &error));
+            }
+        };
+        let campaign_source_operation_id = operation.transition.identity.operation_id.clone();
+        let campaign_source_request_digest =
+            operation.transition.identity.canonical_request_hash.clone();
+        if !campaign_source_publications.is_empty()
+            && let Err(error) = self.p07_ors.reserve_campaign_source_publications(
+                &campaign_source_operation_id,
+                &campaign_source_request_digest,
+                &campaign_source_publications,
+            )
+        {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                &error.to_string(),
+            ));
+        }
+        let gateway = self.retained_store_gateway()?;
         match gateway
             .apply(
                 &operation.context,
@@ -3979,7 +5240,36 @@ impl KernelComposition {
             )
             .await
         {
-            Ok(receipt) => Ok(store_apply_response(&receipt)),
+            Ok(receipt) => {
+                if !campaign_source_publications.is_empty() {
+                    if receipt.status == WriteReceiptStatus::Committed {
+                        if let Err(error) = self.p07_ors.commit_campaign_source_publications(
+                            &campaign_source_operation_id,
+                            &campaign_source_request_digest,
+                            &campaign_source_publications,
+                            &receipt,
+                        ) {
+                            // Keep the source reservation. An exact replay of
+                            // this same canonical operation obtains the
+                            // durable receipt and completes ORS reconciliation.
+                            return Ok(Self::store_error_response_text(
+                                "write_receipt",
+                                &error.to_string(),
+                            ));
+                        }
+                    } else if let Err(error) = self.p07_ors.abort_campaign_source_publications(
+                        &campaign_source_operation_id,
+                        &campaign_source_request_digest,
+                        &campaign_source_publications,
+                    ) {
+                        return Ok(Self::store_error_response_text(
+                            "write_receipt",
+                            &error.to_string(),
+                        ));
+                    }
+                }
+                Ok(store_apply_response(&receipt))
+            }
             Err(error) => Ok(Self::store_error_response_text("write_receipt", &error)),
         }
     }
@@ -4308,6 +5598,10 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed named-read route keeps fence, catalogue, and owner-source admission together"
+    )]
     async fn store_named_operation(
         &self,
         session: &Session,
@@ -4327,6 +5621,107 @@ impl KernelComposition {
             ));
         }
         validate_store_session_fence(session, &operation.request.state_fence)?;
+        if operation.request.operation == NamedReadOperation::GetCampaignLearningStateView {
+            let lookup: CampaignLearningStateViewLookup = operation
+                .request
+                .parameters
+                .get("lookup")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(TransportError::SessionFenced)?;
+            lookup
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if operation
+                .request
+                .scope_id
+                .as_ref()
+                .map(eliot_store_api::ScopeId::as_str)
+                != Some(lookup.scope_id.as_str())
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let read = match self
+                .p07_ors
+                .load_campaign_learning_state_view(&lookup.view_id)
+            {
+                Ok(Some(publication))
+                    if publication.task_id == lookup.task_id
+                        && publication.scope_id == lookup.scope_id =>
+                {
+                    CampaignLearningStateViewRead {
+                        status: CampaignLearningStateViewReadStatus::Current,
+                        publication: Some(publication),
+                        read_state_fence: operation.request.state_fence.clone(),
+                    }
+                }
+                Ok(Some(_) | None) => CampaignLearningStateViewRead {
+                    status: CampaignLearningStateViewReadStatus::Missing,
+                    publication: None,
+                    read_state_fence: operation.request.state_fence.clone(),
+                },
+                Err(error) => {
+                    return Ok(Self::store_error_response_text(
+                        "store_named",
+                        &error.to_string(),
+                    ));
+                }
+            };
+            read.validate().map_err(|_| TransportError::SessionFenced)?;
+            let response = NamedReadResponse {
+                operation: NamedReadOperation::GetCampaignLearningStateView,
+                state_fence: operation.request.state_fence,
+                revision_heads: Vec::new(),
+                payload: serde_json::json!({"campaign_learning_state_view": read}),
+            };
+            return Ok(store_named_response(&response));
+        }
+        if operation.request.operation == NamedReadOperation::GetCampaignSourceRevision {
+            if operation.request.scope_id.is_none() {
+                return Err(TransportError::SessionFenced);
+            }
+            let lookup: CampaignSourceRevisionLookup = operation
+                .request
+                .parameters
+                .get("lookup")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(TransportError::SessionFenced)?;
+            lookup
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let read = self
+                .p07_ors
+                .load_campaign_source_revision(&lookup, &operation.request.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if let Some(source) = &read.source
+                && source.document.schema
+                    == eliot_store_api::CampaignSourceDocumentSchema::LearningStateViewRecipe
+            {
+                let recipe_scope = source
+                    .document
+                    .body
+                    .pointer("/binding/scope_id")
+                    .and_then(serde_json::Value::as_str);
+                if recipe_scope
+                    != operation
+                        .request
+                        .scope_id
+                        .as_ref()
+                        .map(eliot_store_api::ScopeId::as_str)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+            }
+            read.validate().map_err(|_| TransportError::SessionFenced)?;
+            let response = NamedReadResponse {
+                operation: NamedReadOperation::GetCampaignSourceRevision,
+                state_fence: operation.request.state_fence,
+                revision_heads: Vec::new(),
+                payload: serde_json::json!({"campaign_source_revision": read}),
+            };
+            return Ok(store_named_response(&response));
+        }
         // Authority-history reads are Kernel-owned fence state (`#2100`):
         // serve durable closure-fence history from the retained ORS instead
         // of forwarding to the store bridge. The store catalogue truthfully
@@ -4366,9 +5761,9 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
-    /// Executes one closed local read for an admitted `eliot.query`.
+    /// Executes one closed local read for an admitted query or campaign packet.
     ///
-    /// The `local_read` kind is the GetEvidencePack-only sibling of
+    /// The `local_read` kind is the authenticated dispatch sibling of
     /// `store_named` on the same authenticated daemon session: no new
     /// transport, pipe, or listener. Rejection happens before reading —
     /// linkage plus closed selectors are proven (pure, no IO), then the full
@@ -4384,8 +5779,10 @@ impl KernelComposition {
     /// never bypass attempt ownership: persistence, exact-replay, conflict,
     /// expiry, fence, and staleness joins are identical to the async submit
     /// leg. A stale attempt fails closed here (never a bound result);
-    /// `eliot.packet` pairs are admitted and returned honestly, never read on
-    /// this leg.
+    /// `eliot.packet` pairs are admitted, queued, and claimed through the
+    /// same attempt-bound lifecycle; the daemon campaign compiler performs
+    /// their owner reads and result construction before the shared submit
+    /// leg.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -4409,18 +5806,23 @@ impl KernelComposition {
         // Rejection-before-reading: linkage plus closed selectors next. This
         // validation is pure, so a changed payload digest, a forged
         // descriptor, or a malformed selector never reaches Gateway IO.
-        let selectors = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let admission = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let selectors = match admission {
+            host_request_route::LocalReadAdmission::Query(selectors) => selectors,
+            host_request_route::LocalReadAdmission::CampaignPacket { .. } => {
+                // `local_read` is the query-only Gateway leg. A campaign
+                // packet is served only by the dedicated packet claim/compile/
+                // result flight; admitting it here would risk reinterpreting
+                // packet material as `GetEvidencePack` selectors.
+                return Err(TransportError::SessionFenced);
+            }
+        };
         let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
         if let Some(replayed) =
             host_request_route::local_read_replay_response(&receipt, &record, &envelope)?
         {
             return Ok(replayed);
         }
-        let Some(selectors) = selectors else {
-            return Ok(host_request_route::host_request_admitted_response(
-                &receipt, &record,
-            ));
-        };
         // No bypass: the presented attempt must be the live claim-record
         // attempt owned by the presenting session before any Gateway IO. A
         // replaced, retired, or revoked attempt fails closed here. Full
@@ -4524,8 +5926,10 @@ impl KernelComposition {
     }
 
     /// Publishes one owner-side WASM dispatch bundle on the admitted path
-    /// (`#1780` D4a, `#1955`): the production caller of
-    /// `eliot_kernel_service::publish_wasm_dispatch_bundle`.
+    /// (`#1780` D4a, `#1955`) and demand-starts its installation-approved
+    /// host parent (`#2568` A1): the production caller of
+    /// `eliot_kernel_service::publish_wasm_dispatch_bundle` and of
+    /// [`Self::start_wasm_host_parent`].
     ///
     /// The `WasmOwnerClaim` is built from admitted owner material carried in
     /// the closed payload; guest/input digests re-hash against those exact
@@ -4540,14 +5944,19 @@ impl KernelComposition {
     /// the host path's parent, never a caller string. Publication requires
     /// a fence-bound session on a Ready, unfenced Kernel; the claim and its
     /// snapshot must speak for this session's authority at this generation.
-    /// The computed one-shot join gate is projected into the receipt so the
-    /// live join table can close over it; no second registry is retained
-    /// here.
+    /// After staging, the re-hashed host image is started through the
+    /// admitted process gateway with argv from the validated material, so a
+    /// real ordinary request reaches the host request loop; a refused start
+    /// fails the operation closed (the staged set stays for the delivery
+    /// owner — cleanup is `#2786` territory, never an invented delete
+    /// here). The computed one-shot join gate is projected into the receipt
+    /// so the live join table can close over it; no second registry is
+    /// retained here.
     #[allow(
         clippy::too_many_lines,
-        reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, and receipt projection in one audited order"
+        reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, demand-start, and receipt projection in one audited order"
     )]
-    fn wasm_dispatch_bundle_operation(
+    async fn wasm_dispatch_bundle_operation(
         &self,
         session: &Session,
         payload: serde_json::Value,
@@ -4656,6 +6065,14 @@ impl KernelComposition {
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,
         );
+        let launch = self
+            .start_wasm_host_parent(
+                &bundle,
+                host_executable_path.as_str(),
+                host_artifact_digest.as_str(),
+                install_dir,
+            )
+            .await?;
         Ok(serde_json::json!({
             "kind": "wasm_dispatch_bundle_receipt",
             "value": {
@@ -4668,8 +6085,131 @@ impl KernelComposition {
                 "material_path": bundle.material_path.to_string_lossy(),
                 "artifact_path": bundle.artifact_path.to_string_lossy(),
                 "input_path": bundle.input_path.to_string_lossy(),
+                "launch": "started",
+                "launch_request_digest": launch.request_digest(),
+                "launch_permit_digest": launch.permit_digest(),
             },
         }))
+    }
+
+    /// Demand-starts the installation-approved `eliot-wasm-host.exe` parent
+    /// for one published dispatch bundle through the admitted process
+    /// gateway (`#2568` A1): the governed demand-start half of bundle
+    /// publication (I1.5 startup: start only the remaining capabilities
+    /// required by the admitted request).
+    ///
+    /// The P-03 intent carries the re-hashed host image, the install
+    /// directory as its working directory, and argv assembled from the
+    /// validated material only (`--profile <profile>` — the closed
+    /// publisher-checked spelling the host CLI requires before it reaches
+    /// `run_ordinary_request_loop`; no nonce, handle, or path travels on
+    /// the command line). The intent operation is the admitted claim
+    /// operation, so the receipt's `operation_id` is exactly the supervised
+    /// process's operation; tree/job/image/session, fence, and lease derive
+    /// from it under the `wasm-host-launch` prefix, mirroring the
+    /// Doctor/testd/native-worker dispatch contour (`spawn_ready_child`).
+    /// Environment is secret-free, limits are the same bounded contour, and
+    /// supervision stays with the gateway owner (replay begin for exact
+    /// resubmits, path-lease re-proof at launch, inspect/cancel by
+    /// operation). Every refusal — no gateway, stale snapshot, an image
+    /// outside the retained root, or an unknown spawn outcome — fails
+    /// closed; the staged set is left for the delivery owner (`#2786`), and
+    /// no launch table or reconciler is kept here.
+    #[cfg(windows)]
+    async fn start_wasm_host_parent(
+        &self,
+        bundle: &eliot_kernel_service::WasmPublishedBundle,
+        host_executable_path: &str,
+        host_artifact_digest: &str,
+        install_dir: &std::path::Path,
+    ) -> Result<ProcessStartReceipt, TransportError> {
+        let material = &bundle.material;
+        let operation_id = OperationId::new(material.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let short: String = operation_id.as_str().chars().take(16).collect();
+        let generation =
+            Generation::new(material.generation).map_err(|_| TransportError::SessionFenced)?;
+        let working_directory = install_dir.to_str().ok_or(TransportError::SessionFenced)?;
+        let intent = ProcessIntent::new(
+            operation_id,
+            ProcessTreeId::new(format!("wasm-host-launch-tree-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            JobId::new(format!("wasm-host-launch-job-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            ImageId::new(format!("wasm-host-launch-image-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            SessionId::new(format!("wasm-host-launch-session-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            generation,
+            host_executable_path.to_owned(),
+            host_artifact_digest.to_owned(),
+            vec!["--profile".to_owned(), material.profile.clone()],
+            working_directory.to_owned(),
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .map_err(|_| TransportError::SessionFenced)?,
+            ResourceLimits::new(86_400_000, None, None, 64 * 1024, 64 * 1024, 4)
+                .map_err(|_| TransportError::SessionFenced)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let fence = FencingToken::new(
+            material.authority_epoch.clone(),
+            generation,
+            format!("wasm-host-launch-fence-{short}"),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let admission = ProcessExecutionAdmissionRequest::new(
+            WASM_HOST_MODULE_ID,
+            intent,
+            ActionLeaseRef::new(format!("wasm-host-launch-kernel-launch-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            fence,
+            unix_ms().saturating_add(60_000),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        admission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let expectation = super::current_process_named_pipe_expectation()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let owner = ProcessOwnerBinding::new(
+            WASM_HOST_MODULE_ID,
+            super::runtime_identity::stable_owner_principal_digest(
+                expectation.expected_sid(),
+                WASM_HOST_MODULE_ID,
+                &material.authority_epoch,
+                generation,
+            ),
+            material.authority_epoch.clone(),
+            generation,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        self.admit_material_process_start(&admission)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let proof = self
+            .retain_process_path_proof(&admission)
+            .map_err(|_| TransportError::SessionFenced)?;
+        gateway
+            .start(&owner, admission, proof)
+            .await
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Demand-start fails closed off the Windows process contour: the
+    /// installer-pinned `.exe` image cannot run there, so no silent
+    /// publish-only success is reported.
+    #[cfg(not(windows))]
+    async fn start_wasm_host_parent(
+        &self,
+        _bundle: &eliot_kernel_service::WasmPublishedBundle,
+        _host_executable_path: &str,
+        _host_artifact_digest: &str,
+        _install_dir: &std::path::Path,
+    ) -> Result<ProcessStartReceipt, TransportError> {
+        Err(TransportError::SessionFenced)
     }
 
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
@@ -5028,6 +6568,96 @@ fn validate_user_automation_trigger_text(
     }
     let _ = field;
     Ok(())
+}
+
+/// What kind of runtime handoff one closed operator operation owns.
+///
+/// The distinction is load-bearing for the schedule owner. An operation that
+/// owns a wake publication may answer `Unknown`/`Unavailable` with the exact
+/// remaining occurrence set when the Host contour cannot be reached, so its
+/// canonical commit still happens and the publication obligation stays visible.
+/// An operation that owns an effect or a cancellation is refused outright when
+/// its owner is unreachable, because answering that path without the owner
+/// would be a Store-only success.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserAutomationRuntimeHandoffNeed {
+    /// The operation owns no runtime handoff.
+    None,
+    /// The operation only publishes a bounded recurring wake horizon.
+    PublicationOnly,
+    /// The operation crosses into an execution or cancellation owner.
+    Effect,
+}
+
+/// Reports whether one admitted occurrence carrier arrived as a due scheduler
+/// wake rather than as a Human `run-now` occurrence.
+///
+/// The two are different owner ingresses over the same authenticated channel: a
+/// `run-now` occurrence is proved against its committed Store receipt, and a
+/// `ScheduledWake` occurrence is proved against the current owner projection and
+/// the retained wake record. Neither is inferred from the carrier shape, and
+/// neither is granted authority by the selector.
+#[cfg(windows)]
+fn is_due_scheduler_wake(request: &UserAutomationRuntimeAdmission) -> bool {
+    request.invocation.trigger_origin
+        == eliot_kernel_core::user_automation::UserAutomationTriggerOrigin::ScheduledWake
+}
+
+/// Closed outcome of one due-wake pre-execution revalidation.
+///
+/// A refusal and an unavailable owner are different answers: a refusal is a
+/// decided rejection with a closed cause and no recovery work, while a runtime
+/// failure leaves an obligation the caller must retry or reconcile. Collapsing
+/// them would make a stale wake look like an outage.
+#[cfg(windows)]
+enum UserAutomationDueWakeOutcome {
+    /// The wake was refused before any effect owner was contacted.
+    Refused(UserAutomationDueWakeRejection),
+    /// The canonical owner or its policy projection could not be read.
+    Runtime(UserAutomationRuntimeError),
+}
+
+/// Closed outcome of one due-wake retained-wake proof.
+#[cfg(windows)]
+enum UserAutomationDueWakeRead {
+    /// The schedule owner retains exactly this occurrence as a pending,
+    /// unadmitted wake under the current State Fence.
+    Proven(UserAutomationWakeReadback),
+    /// The wake is refused or the owner could not be read; this is the answer
+    /// to return instead of admitting the occurrence.
+    Answer(serde_json::Value),
+}
+
+/// Classifies the runtime handoff one closed operator operation owns.
+///
+/// `Create`, `Resume`, and `Edit` own a bounded recurring horizon publication;
+/// `run-now`, `remove`, and `pause` cross into an execution or cancellation
+/// owner. A read or a configuration query owns none, so it composes no runtime
+/// channel and reports both handoff phases as not applicable instead of implying
+/// an absent owner.
+#[cfg(windows)]
+fn user_automation_runtime_handoff_need(
+    operation: &eliot_kernel_core::UserAutomationOperation,
+) -> UserAutomationRuntimeHandoffNeed {
+    match operation {
+        eliot_kernel_core::UserAutomationOperation::Create { .. }
+        | eliot_kernel_core::UserAutomationOperation::Resume { .. } => {
+            UserAutomationRuntimeHandoffNeed::PublicationOnly
+        }
+        eliot_kernel_core::UserAutomationOperation::RunNow { .. }
+        | eliot_kernel_core::UserAutomationOperation::Remove { .. }
+        | eliot_kernel_core::UserAutomationOperation::Pause { .. }
+        | eliot_kernel_core::UserAutomationOperation::Edit { .. } => {
+            UserAutomationRuntimeHandoffNeed::Effect
+        }
+        eliot_kernel_core::UserAutomationOperation::List { .. }
+        | eliot_kernel_core::UserAutomationOperation::Status { .. }
+        | eliot_kernel_core::UserAutomationOperation::History { .. }
+        | eliot_kernel_core::UserAutomationOperation::InspectLastFailure { .. } => {
+            UserAutomationRuntimeHandoffNeed::None
+        }
+    }
 }
 
 #[cfg(test)]

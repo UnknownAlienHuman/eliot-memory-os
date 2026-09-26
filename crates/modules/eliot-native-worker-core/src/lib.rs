@@ -25,6 +25,7 @@ pub use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
 };
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
+use eliot_contracts::RequestId;
 use eliot_process::{
     CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
     PROCESS_CONTRACT_SCHEMA_VERSION, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
@@ -33,6 +34,7 @@ use eliot_process::{
 use eliot_receipts::{ProofCeiling, ReceiptDisposition};
 use thiserror::Error;
 
+pub use eliot_protocol::AckPhase;
 use ports::{AdmissionLiveness, CapabilityGrant, EffectAdmissionGrant, ProcessBindingSnapshot};
 pub use ports::{
     AdmissionLivenessFacts, AdmissionLivenessOutcome, CapabilityAdmissionFacts,
@@ -43,7 +45,7 @@ pub use ports::{
     ProviderFailure, ReadinessSubmission,
 };
 pub use protocol::{
-    AckPhase, CancelRequest, CheckpointRequest, ClaimBindingDecision, ClaimConflict, DeliveryClass,
+    CancelRequest, CheckpointRequest, ClaimBindingDecision, ClaimConflict, DeliveryClass,
     EXECUTION_UNIT_SCHEMA_VERSION, EventAckReceipt, JSON_ENCODING_PROFILE, MAX_CLAIM_TEXT_LEN,
     MAX_CREDENTIAL_REFERENCES, MAX_INVALIDATION_ENTRIES, MAX_OPERATION_IDENTITY_LEN,
     NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_CLAIM_WIRE_VERSION_V1,
@@ -1329,7 +1331,7 @@ where
     #[allow(clippy::too_many_arguments)]
     fn append_event(
         &mut self,
-        request_id: &str,
+        request_id: &RequestId,
         trace_context: &BTreeMap<String, String>,
         payload_type: &'static str,
         payload: WorkerEventPayload,
@@ -1347,7 +1349,7 @@ where
             grant.producer_id().to_owned(),
             grant.worker_generation(),
             grant.authority().epoch.clone(),
-            request_id.to_owned(),
+            request_id.clone(),
             causal_predecessor_refs,
             delivery_class,
             ack_required,
@@ -1802,7 +1804,7 @@ fn validate_ack(receipt: &EventAckReceipt, grant: &CapabilityGrant) -> Result<()
 fn validate_event(
     event: &WorkerEventEnvelope,
     grant: &CapabilityGrant,
-    request_id: &str,
+    request_id: &RequestId,
     payload_type: &str,
     payload: &WorkerEventPayload,
     disposition: &ReceiptDisposition,
@@ -1818,7 +1820,7 @@ fn validate_event(
         || event.state_fence != grant.authority().state_fence
         || event.event_id.trim().is_empty()
         || event.sequence == 0
-        || event.request_id != request_id
+        || event.request_id != *request_id
         || event.payload_type != payload_type
         || event.payload != *payload
         || event.disposition != *disposition
@@ -1848,7 +1850,9 @@ fn validate_replayed_events(
             || event.state_fence != grant.authority().state_fence
             || event.event_id.trim().is_empty()
             || event.sequence == 0
-            || event.request_id.trim().is_empty()
+            // request_id is the shared RequestId contract: blank and
+            // control-bearing values cannot be constructed (RequestId::new)
+            // or deserialized, so no local shape check remains here.
             || event.payload_type.trim().is_empty()
             || event.sequence <= prior_sequence
             || (after_sequence.is_some() && event.sequence != prior_sequence.saturating_add(1))
@@ -1876,9 +1880,9 @@ fn validate_replayed_events(
 
 fn validate_request_replay(
     events: &[WorkerEventEnvelope],
-    request_id: &str,
+    request_id: &RequestId,
 ) -> Result<(), WorkerError> {
-    if events.iter().any(|event| event.request_id != request_id) {
+    if events.iter().any(|event| event.request_id != *request_id) {
         return Err(WorkerError::ReplayContract("request_replay_binding"));
     }
     Ok(())

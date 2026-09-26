@@ -608,11 +608,15 @@ impl GrantGraph {
         let suppressed = derive_suppressions(&graph, &closures);
         // Fail-closed recheck: every engine-reachable in-graph descendant of
         // an affected in-graph grant must already be suppressed. The engine
-        // traverses exactly the same-root parent links as
-        // `derive_suppressions`, so this holds by construction on complete
-        // evidence and refuses when a closure under-claims its transitive
-        // descendants. Affected references naming no grant in this graph
-        // belong to another graph's denominator and refuse nothing.
+        // follows only same-root parent links and declares a cross-root
+        // delegation edge with `CrossScope`, so its affected set is contained
+        // in the parent-chain closure `derive_suppressions` resolves and this
+        // holds by construction on complete evidence; a closure that
+        // under-claims its transitive same-root descendants still refuses. A
+        // cross-root dependent is never engine-reachable, so only the
+        // committed closure evidence can name it. Affected references naming
+        // no grant in this graph belong to another graph's denominator and
+        // refuse nothing.
         let suppressed_ids: BTreeSet<&str> = suppressed
             .iter()
             .map(|entry| entry.grant_id.as_str())
@@ -754,9 +758,15 @@ impl GrantGraph {
     /// Every delegation link on the origin's authority root becomes one
     /// qualified influence edge with
     /// [`PermittedCurrent`](InfluenceEdgeDisposition::PermittedCurrent)
-    /// disposition: live-graph edges are current by construction. Lineage
-    /// that crosses authority roots is never followed, mirroring
-    /// [`delegated_closure`](Self::delegated_closure).
+    /// disposition: live-graph edges are current by construction. A link that
+    /// leaves the origin's authority root is still declared, with
+    /// [`CrossScope`](InfluenceEdgeDisposition::CrossScope) disposition, so the
+    /// evaluator records a typed cross-scope omission for it instead of the
+    /// link vanishing from the denominator. Such a dependent is quarantined
+    /// from this traversal: it is never followed, never revoked, and never part
+    /// of the affected set, mirroring
+    /// [`delegated_closure`](Self::delegated_closure) and the rule that
+    /// revocation cannot widen scope.
     ///
     /// The production recheck runs the evaluator in bounded pages and resumes
     /// only from the exact returned continuation. Per-page limits may end a
@@ -785,15 +795,31 @@ impl GrantGraph {
         let mut edges = Vec::new();
         for grant in self.grants.values() {
             let Some(parent_id) = grant.parent_grant_id.as_ref() else {
+                // A grant with no parent grant id is a delegation root, not an
+                // edge: it has no source position to qualify, so there is no
+                // edge to declare and no disposition to record for it here.
                 continue;
             };
-            if grant.authority_root_ref != authority_root_ref {
-                continue;
-            }
+            // Delegation that leaves the origin's authority root is never
+            // followed, and it is never dropped without a trace either. The
+            // edge is declared with the `CrossScope` disposition so the
+            // evaluator records a typed `CrossScope` omission naming the exact
+            // source-bound edge position instead of an absent edge the reader
+            // cannot distinguish from an unexamined one. Revocation cannot
+            // widen scope or effect, so a cross-root dependent is quarantined
+            // from this traversal: it is not propagated, is not revoked, and
+            // never enters the affected set. Quarantine is not erasure — the
+            // grant keeps its full lineage in the snapshot and the omission is
+            // the only evidence that this traversal refused to follow it.
+            let disposition = if grant.authority_root_ref == authority_root_ref {
+                InfluenceEdgeDisposition::PermittedCurrent
+            } else {
+                InfluenceEdgeDisposition::CrossScope
+            };
             edges.push(QualifiedInfluenceEdge {
                 source_ref: parent_id.as_str().to_owned(),
                 dependent_ref: grant.grant_id.as_str().to_owned(),
-                disposition: InfluenceEdgeDisposition::PermittedCurrent,
+                disposition,
             });
         }
         let request = BoundedRevocationRequest {
@@ -965,6 +991,41 @@ impl GrantGraph {
         Ok(())
     }
 
+    /// Validates every delegation edge as a narrowing edge, and classifies
+    /// lineage that leaves the parent's authority root instead of refusing it.
+    ///
+    /// Refused with [`AuthorityError::GrantNotNarrower`] naming the child when
+    /// the child is not narrower than its parent on any of the four narrowing
+    /// axes: issuer is not the parent's holder, authority is not a strict
+    /// subset of the parent's authority, `expires_at` is later than the
+    /// parent's, or `max_uses` exceeds the parent's. A parent naming no grant
+    /// in this graph is still [`AuthorityError::MissingParent`]. These four
+    /// clauses are the fail-closed narrowing boundary of A0.3 "hidden creation
+    /// or expansion of authority", and the classification below does not relax
+    /// one of them: a cross-root dependent must still be narrower than its own
+    /// parent, so a crossing can never expand authority, effect, or lifetime.
+    ///
+    /// Accepted and classified: a child whose `authority_root_ref` differs from
+    /// its parent's. A cross-root delegation is a real lineage crossing, and
+    /// refusing it here made every graph containing one unconstructable, so the
+    /// typed cross-scope cause could never be produced by the production path.
+    /// The child keeps its own authority root and is never adopted into the
+    /// parent's. Its edge is declared with
+    /// [`CrossScope`](InfluenceEdgeDisposition::CrossScope) by
+    /// [`transitive_revocation_closure`](Self::transitive_revocation_closure),
+    /// so the bounded evaluator records a typed `OmissionCause::CrossScope`
+    /// omission naming the exact edge position and the dependent is never
+    /// followed, never revoked by that traversal, and never enters its
+    /// affected set. Revocation cannot widen scope or effect.
+    ///
+    /// This is incomplete lineage handled as bounded influence rather than as
+    /// memory deletion, which is A12.5 "Incomplete lineage creates scoped
+    /// quarantine or an unknown, not global memory deletion", I12.20
+    /// "quarantine the bounded affected scope and open Problem State", and
+    /// I15.7 "may be quarantined from agents but retained for forensics"
+    /// (#686: "quarantine is not erasure"). Quarantine is not erasure here
+    /// either: the grant keeps its full lineage in the snapshot, and the
+    /// omission is the evidence that this traversal refused to follow it.
     fn validate_edges(&self) -> Result<(), AuthorityError> {
         for child in self.grants.values() {
             let Some(parent_id) = &child.parent_grant_id else {
@@ -974,8 +1035,13 @@ impl GrantGraph {
                 .grants
                 .get(parent_id)
                 .ok_or_else(|| AuthorityError::MissingParent(parent_id.clone()))?;
-            if child.authority_root_ref != parent.authority_root_ref
-                || child.issuer != parent.holder
+            // A delegation that leaves the parent's authority root is a
+            // representable lineage shape, not a narrowing failure. It is
+            // classified where the bounded closure declares each edge, and the
+            // four narrowing clauses below still apply to it, so crossing a
+            // root is quarantined rather than adopted and never widens
+            // authority. See this function's documentation.
+            if child.issuer != parent.holder
                 || !child.authority.is_strict_subset_of(&parent.authority)
                 || child.expires_at > parent.expires_at
                 || child.max_uses > parent.max_uses

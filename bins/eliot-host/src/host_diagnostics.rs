@@ -321,6 +321,26 @@ pub fn observe_terminal_error(code: &str) {
     );
 }
 
+/// Notes Event Log sink unavailability where the sink cannot carry a record.
+///
+/// Consumes the live [`crate::windows_event_log::event_log_sink_status`]
+/// answer: where #984's landed safe port is live (Windows) there is nothing
+/// to note and the call stays silent; elsewhere the unavailability is
+/// recorded as one `INFO` subordinate record on the shared `tracing` sink so
+/// the standing seam state stays observable. Observation only: the record is
+/// never a terminal emission and never changes results, order, retry, or
+/// receipts.
+pub fn note_event_log_sink_status() {
+    if crate::windows_event_log::event_log_sink_status().is_ok() {
+        return;
+    }
+    tracing::info!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.event_log_sink_unavailable",
+        "event log sink unavailable; record stays on tracing"
+    );
+}
+
 /// Typed evidence basis for one projected Host request record.
 ///
 /// This is a diagnostic evidence classification, never a lifecycle: each

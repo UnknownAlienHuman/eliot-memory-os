@@ -50,14 +50,24 @@ fn fence() -> StateFence {
 fn manifest() -> AllowedReferenceManifest {
     AllowedReferenceManifest {
         run_id: "run-700".to_owned(),
+        root_context_revision: "root-700".to_owned(),
         state_fence: fence(),
         source_handles: vec!["src-a".to_owned(), "src-b".to_owned()],
         evidence_handles: Vec::new(),
         artifact_handles: Vec::new(),
+        url_handles: Vec::new(),
+        tool_refs: Vec::new(),
+        verifier_refs: Vec::new(),
         allowed_anchor_precision: AnchorPrecision::Section,
+        scope_class: "propulsion thermal envelope".to_owned(),
+        disclosure: DisclosureClass::ProjectBound,
+        retention_class: "governed-by-caller".to_owned(),
         stale_or_revoked_handles: Vec::new(),
-        digest: DIGEST_A.to_owned(),
+        expansion_routes: Vec::new(),
+        digest: String::new(),
     }
+    .seal()
+    .expect("fixture manifest must seal")
 }
 
 fn request() -> ResearchQueryRequest {
@@ -246,7 +256,12 @@ fn reference_outside_frozen_manifest_fails() {
         Err(HandoffError::Contract(_))
     ));
     let mut revoked_req = request();
-    revoked_req.allowed_references.stale_or_revoked_handles = vec!["src-b".to_owned()];
+    let mut revoked_manifest = revoked_req.allowed_references.clone();
+    revoked_manifest.stale_or_revoked_handles = vec!["src-b".to_owned()];
+    // Revocation has to be sealed in, because the digest covers the stale set.
+    revoked_req.allowed_references = revoked_manifest
+        .seal()
+        .expect("revoked fixture manifest must seal");
     let revoked_bundle = bundle(&job_id);
     let mut revoked_claim = claim("src-b", "a revoked claim");
     revoked_claim.claim_id = "claim-revoked".to_owned();

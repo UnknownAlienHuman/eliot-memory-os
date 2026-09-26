@@ -38,6 +38,16 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod campaign_context_owner;
+pub mod campaign_evaluation_owner;
+pub mod campaign_owner_matrix;
+pub mod campaign_packet;
+pub mod campaign_task_controller;
+
+pub use campaign_context_owner::build_context_owner_publications;
+pub use campaign_evaluation_owner::build_product_evaluation_publications;
+pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
+pub use campaign_task_controller::serve_task_controller_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -101,6 +111,7 @@ pub use agent_fabric::{
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
     daemon_coordinator_config, plan_candidate, prereq_ports,
 };
+use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
 use controlboard_adapters::SharedOperatorReplay;
 
@@ -131,7 +142,7 @@ pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome, ObserveSubmitOutcome,
-    OwnerSessionFacts,
+    OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -539,6 +550,210 @@ pub struct DaemonComposition {
     /// performs no transport, and is never read on the readiness path: closure
     /// must not block or fail the finish ceremony.
     learning_closure: eliot_governor::LearningClosureService,
+}
+
+/// Production B-MOD model registry port (issue #1108 W4/A2).
+///
+/// Closed over the retained composition: the registry owner (B-MOD #694) has
+/// no accepted interface revision on this base, so the port honestly reports
+/// [`PortBindingState::Missing`] and every resolution attempt raises the
+/// typed [`FabricOperation::ResolveModelRoute`] residual instead of inventing
+/// a route. Route ranking stays with the owner; owner delegation lands with
+/// #694.
+struct ProductionModelRegistryPort;
+
+impl ModelRegistryPort for ProductionModelRegistryPort {
+    fn resolve_route(
+        &self,
+        requirements: &RouteRequirements,
+    ) -> Result<Option<eliot_agent_api::RouteFingerprint>, FabricError> {
+        Err(blocked_port(
+            FabricPortId::ModelRegistry,
+            FabricOperation::ResolveModelRoute,
+            requirements.role.clone(),
+            None,
+            None,
+        ))
+    }
+
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Missing
+    }
+}
+
+/// Production B-PEER coordination channel port (issue #1108 W4/A2).
+///
+/// Closed over the retained composition: the channel owner (B-PEER #696) has
+/// no accepted interface revision on this base, so the port honestly reports
+/// [`PortBindingState::Missing`] and every delivery attempt raises the typed
+/// [`FabricOperation::DeliverPeer`] residual instead of emitting an
+/// unverified delivery. Delivery stays with the owner; owner delegation
+/// lands with #696.
+struct ProductionPeerChannelPort;
+
+impl PeerChannelPort for ProductionPeerChannelPort {
+    fn deliver(&self, message: &PeerMessage) -> Result<PeerReceipt, FabricError> {
+        Err(blocked_port(
+            FabricPortId::PeerChannel,
+            FabricOperation::DeliverPeer,
+            message.message_id.clone(),
+            None,
+            None,
+        ))
+    }
+
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Missing
+    }
+}
+
+/// Production B-SWARM durable swarm control port (issue #1108 W4/A2).
+///
+/// Closed over the retained composition: the swarm control owner (B-SWARM
+/// #698) has no accepted interface revision on this base, so the port
+/// honestly reports [`PortBindingState::Missing`] and every plan entry
+/// raises the typed [`FabricOperation::EnterSwarm`] residual instead of
+/// entering an unadmitted plan. Plan ownership stays with the Task
+/// Controller/Governor; owner delegation lands with #698.
+struct ProductionSwarmControlPort;
+
+impl SwarmControlPort for ProductionSwarmControlPort {
+    fn enter_plan(
+        &self,
+        candidate: &eliot_agent_coordinator::StaffingPlanCandidate,
+    ) -> Result<SwarmEntryReceipt, FabricError> {
+        Err(blocked_port(
+            FabricPortId::SwarmControl,
+            FabricOperation::EnterSwarm,
+            candidate.candidate_id.as_str().to_owned(),
+            Some(candidate.state_fence.clone()),
+            None,
+        ))
+    }
+
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Missing
+    }
+}
+
+/// Production Governor admission authority port (issue #1108 W4/A2).
+///
+/// Closed over the retained composition: no accepted swarm
+/// reservation/admission interface revision exists on the retained Governor
+/// composition on this base, so the port honestly reports
+/// [`PortBindingState::Missing`] and every staging/commit attempt raises the
+/// typed [`FabricOperation::StageReservation`]/[`FabricOperation::CommitAdmission`]
+/// residual instead of minting a reservation or admission. Kernel staging
+/// and Governor admission stay with their owners; owner delegation lands
+/// with the Governor swarm-admission owner.
+struct ProductionAdmissionAuthorityPort;
+
+impl AdmissionAuthorityPort for ProductionAdmissionAuthorityPort {
+    fn stage_reservation(&self, definition: &SwarmDefinition) -> Result<Reservation, FabricError> {
+        Err(blocked_port(
+            FabricPortId::AdmissionAuthority,
+            FabricOperation::StageReservation,
+            definition.definition_id.as_str().to_owned(),
+            Some(definition.fence.clone()),
+            None,
+        ))
+    }
+
+    fn commit_admission(&self, reservation: &Reservation) -> Result<FabricAdmission, FabricError> {
+        Err(blocked_port(
+            FabricPortId::AdmissionAuthority,
+            FabricOperation::CommitAdmission,
+            reservation.reservation_id.clone(),
+            Some(reservation.fence.clone()),
+            None,
+        ))
+    }
+
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Missing
+    }
+}
+
+/// Production Kernel activation authority port (issue #1108 W4/A2).
+///
+/// Closed over the retained composition: the activation projection owner
+/// (B-ACTIVATION-PROJECTION #839) has no accepted interface revision on this
+/// base, so the port honestly reports [`PortBindingState::Missing`] and
+/// every activation attempt raises the typed [`FabricOperation::Activate`]
+/// residual instead of fabricating launch authority. Activation stays with
+/// the Kernel owner; owner delegation lands with #839.
+struct ProductionActivationAuthorityPort;
+
+impl ActivationAuthorityPort for ProductionActivationAuthorityPort {
+    fn activate(
+        &self,
+        admission: &FabricAdmission,
+        attempt_id: &eliot_agent_api::AttemptId,
+    ) -> Result<ActivationEvidence, FabricError> {
+        Err(blocked_port(
+            FabricPortId::ActivationAuthority,
+            FabricOperation::Activate,
+            attempt_id.as_str().to_owned(),
+            Some(admission.fence.clone()),
+            Some(admission.epoch.clone()),
+        ))
+    }
+
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Missing
+    }
+}
+
+/// Production dispatch egress port (issue #1108 W4/A2).
+///
+/// Closed over the retained composition: concrete execution remains #874 in
+/// a separate binary with no compile-time symbol consumable here, so the
+/// port honestly reports [`PortBindingState::Missing`] and every emission
+/// raises the typed [`FabricOperation::Emit`] residual instead of launching
+/// an unretained dispatch. Execution stays with the executor owner; owner
+/// delegation lands with the executor-daemon bind.
+struct ProductionDispatchEgressPort;
+
+impl DispatchEgressPort for ProductionDispatchEgressPort {
+    fn emit(&self, intent: &DispatchIntent) -> Result<DispatchAck, FabricError> {
+        Err(blocked_port(
+            FabricPortId::DispatchEgress,
+            FabricOperation::Emit,
+            intent.dispatch_id.clone(),
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        ))
+    }
+
+    fn interface_binding(&self) -> PortBindingState {
+        PortBindingState::Missing
+    }
+}
+
+/// Builds the typed missing-prerequisite residual for a production port whose
+/// owner has no accepted interface revision (issue #1700).
+///
+/// A blank or control-bearing `work` identity fails closed as
+/// [`FabricError::Contract`] inside the residual builder, so input shape is
+/// enforced here even though the fabric pre-validates before the owner call.
+fn blocked_port(
+    port: FabricPortId,
+    operation: FabricOperation,
+    work: String,
+    fence: Option<StateFence>,
+    epoch: Option<EpochId>,
+) -> FabricError {
+    match MissingPortResidual::new(
+        port,
+        PortBindingState::Missing,
+        operation,
+        work,
+        fence,
+        epoch,
+    ) {
+        Ok(residual) => FabricError::MissingPrerequisite(Box::new(residual)),
+        Err(error) => error,
+    }
 }
 
 impl DaemonComposition {
@@ -1637,9 +1852,11 @@ impl DaemonComposition {
     ///
     /// The adapter forwards the exact admitted identity, operation identity,
     /// proposal, context, and command to the Governor canonical task path
-    /// and returns only typed results. No policy, admission, or semantic
-    /// rules live here; a duplicate, stale revision, stale fence, or illegal
-    /// transition fails closed in the Governor owner. Publication happens
+    /// and returns only typed results. Its recipe-bearing proposal/command
+    /// methods publish the learning-state recipe atomically in that same
+    /// Task Controller transition. No policy, admission, or semantic rules
+    /// live here; duplicate, stale revision, stale fence, and illegal
+    /// transitions fail closed in the Governor owner. Publication happens
     /// only via the Governor `refresh_from_kernel` at the returned receipt
     /// revision. Callers take a fresh adapter per operation so a Governor
     /// refresh surfaces as an exact-view mismatch instead of silent
@@ -2034,6 +2251,69 @@ impl DaemonComposition {
         Ok(AgentFabric::restore_verified(
             snapshot, config, ports, material,
         )?)
+    }
+
+    /// Builds the production fabric ports from retained composition state
+    /// (issue #1108 W4/A2).
+    ///
+    /// Non-test construction of [`FabricPorts`]: every seam is bound to the
+    /// closed production port above, so the verified fabric path is
+    /// reachable without the test-only fakes in
+    /// `bins/eliotd/tests/agent_fabric_wiring.rs`. Each port reports
+    /// [`PortBindingState::Missing`] until its prerequisite owner (B-MOD
+    /// #694, B-PEER #696, B-SWARM #698, governor-admission,
+    /// B-ACTIVATION-PROJECTION #839, dispatch-egress) binds an accepted
+    /// interface revision; dependent operations block with the typed
+    /// missing-prerequisite residual instead of inventing authority.
+    /// Readiness gates the construction exactly like
+    /// [`Self::agent_fabric_descriptor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Composition`] when the Governor is not ready.
+    pub fn production_fabric_ports(&self) -> Result<FabricPorts, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(FabricPorts {
+            model_registry: Arc::new(ProductionModelRegistryPort),
+            peer_channel: Arc::new(ProductionPeerChannelPort),
+            swarm_control: Arc::new(ProductionSwarmControlPort),
+            admission_authority: Arc::new(ProductionAdmissionAuthorityPort),
+            activation_authority: Arc::new(ProductionActivationAuthorityPort),
+            dispatch_egress: Arc::new(ProductionDispatchEgressPort),
+        })
+    }
+
+    /// Drives one verified provider operation through the production fabric
+    /// (issue #1108 W4/A2 production driver).
+    ///
+    /// Per-operation entry into the verified path: builds the production
+    /// ports through [`Self::production_fabric_ports`], then constructs the
+    /// fabric through [`Self::agent_fabric_new_verified`], which resolves
+    /// the capability over the live authenticated session (caller-supplied
+    /// session halves overwritten, expectation epoch-bound to the live
+    /// fence) and constructs the coordinator through
+    /// `AgentFabric::new_with_admitted_provider`. The per-operation driver
+    /// (executor) binds this seam per admitted operation without changing
+    /// executor semantics here; without a validated handshake the
+    /// resolution fails closed and the daemon stays plan-only. This is the
+    /// non-test production caller the verified seam requires: the
+    /// composition invents no port implementation beyond the closed ports
+    /// above and reimplements no owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::production_fabric_ports`] readiness rejection or
+    /// the [`Self::agent_fabric_new_verified`] rejection unchanged.
+    pub fn drive_verified_agent_fabric(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        material: VerifiedProviderMaterial,
+    ) -> Result<AgentFabric, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_drive_verified").entered();
+        let ports = self.production_fabric_ports()?;
+        self.agent_fabric_new_verified(kernel, ports, material)
     }
 
     /// Resolves the session-observed owner half of one verified provider

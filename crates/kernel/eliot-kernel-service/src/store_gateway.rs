@@ -16,7 +16,10 @@ use std::time::Duration;
 use eliot_contracts::{OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
-use eliot_kernel_core::user_automation::UserAutomationInvocation;
+use eliot_kernel_core::UserAutomationOperation;
+use eliot_kernel_core::user_automation::{
+    UserAutomationConfigurationState, UserAutomationInvocation, UserAutomationRevision,
+};
 use eliot_ors::{
     RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
@@ -46,10 +49,16 @@ use crate::store_write_reservation::{
 };
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
-    StoreClientFault, StoreClientFaultHarness, UserAutomationOwnerLookup,
-    UserAutomationOwnerSnapshot, UserAutomationService, UserAutomationServiceRequest,
-    UserAutomationStoreRequest, UserAutomationStoreResponse,
+    StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
+    UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
+    UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
+    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationService, UserAutomationServiceRequest,
+    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
+    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
+    run_now_wake_read_request,
 };
+use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
@@ -1177,8 +1186,8 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string())
     }
 
-    /// Executes one authenticated `UserAutomation` operator operation through
-    /// the existing canonical Store owner.
+    /// Executes one authenticated `UserAutomation` operator operation as one
+    /// post-commit orchestration transition.
     ///
     /// The caller contributes only the authenticated request metadata, the
     /// authenticated principal, the operation identity triple, and the closed
@@ -1188,13 +1197,97 @@ impl KernelStoreGateway {
     /// Store adapter rebuilds byte-identical bytes deterministically. This is
     /// the one production path from a Kernel front-door route into
     /// [`CanonicalUserAutomationStore`]; it adds no second writer.
-    pub async fn execute_user_automation_operation(
+    ///
+    /// The canonical Store commit is only the first phase. The transition then
+    /// hands the committed operation to the existing runtime owners over the
+    /// already-authenticated `UserAutomationRuntimePort` and returns the Store
+    /// commit, the wake publication/cancellation handoff and the execution
+    /// disposition as three distinct phases of one parent operation. A Store
+    /// receipt is never reported as an execution result, and an unresolved
+    /// handoff is returned as a typed phase that
+    /// [`UserAutomationOperatorTransition::recovery`] turns into the caller's
+    /// recovery directive.
+    ///
+    /// `runtime` is `Some` for every operation that owns a wake or execution
+    /// handoff. A read-only answer passes `None` and reports both handoff
+    /// phases as not applicable; a handoff operation answered without a
+    /// composed runtime fails closed as unavailable rather than as a Store-only
+    /// success.
+    pub async fn execute_user_automation_operation<R>(
         &self,
         request: UserAutomationServiceRequest,
-    ) -> Result<UserAutomationStoreResponse, String> {
+        runtime: Option<&R>,
+    ) -> Result<UserAutomationOperatorTransition, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
             self.store.as_ref(),
         ));
+        let sealed = self.seal_user_automation_operation(&store, request).await?;
+        let response = Box::pin(UserAutomationService::new(&store).dispatch(sealed.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.identity != sealed.identity
+            || response.state_fence != sealed.context.state_fence
+        {
+            return Err(
+                "canonical UserAutomation response does not bind to the sealed operation"
+                    .to_owned(),
+            );
+        }
+        let configuration = UserAutomationConfigurationPhase::from_store_outcome(response.outcome);
+        let (wake, execution) = self
+            .user_automation_runtime_handoff(&sealed, &configuration, runtime)
+            .await?;
+        let horizon = self
+            .publish_schedule_horizon(&sealed, &configuration, runtime)
+            .await?;
+        let transition = UserAutomationOperatorTransition::with_horizon(
+            sealed.identity.clone(),
+            sealed.context.state_fence.clone(),
+            configuration,
+            wake,
+            execution,
+            horizon,
+        );
+        transition.validate()?;
+        Ok(transition)
+    }
+
+    /// Reads the complete owner execution projection for one automation through
+    /// the same `Status` read every other consumer uses.
+    ///
+    /// This is the gateway-level entry for runtime boundaries that must inspect
+    /// the canonical Durable Job projection before crossing into an effect owner
+    /// — the due-wake consumer's duplicate guard, for example. It delegates to
+    /// [`UserAutomationService::owner_execution_view`], so it inherits the
+    /// complete-denominator gate: a denominator the owner could not prove
+    /// complete is refused instead of answered as "no admitted job". It reuses
+    /// the caller's admitted operation identity and issues no transition, so it
+    /// mints no canonical identity and needs no runtime port.
+    pub async fn read_user_automation_owner_execution_view(
+        &self,
+        request: &UserAutomationServiceRequest,
+        automation_id: &str,
+    ) -> Result<UserAutomationExecutionProjection, String> {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        // The `Status` join carries the whole read projection and its response
+        // across the await, so it is pinned rather than held inline; the pinned
+        // form is the same production Store path the operator route uses.
+        Box::pin(UserAutomationService::new(&store).owner_execution_view(request, automation_id))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Seals the canonical request hash over the exact prepared transition.
+    async fn seal_user_automation_operation<C: CanonicalStoreClient>(
+        &self,
+        store: &CanonicalUserAutomationStore<C>,
+        request: UserAutomationServiceRequest,
+    ) -> Result<UserAutomationServiceRequest, String> {
         let mut unsealed = request.clone();
         unsealed.identity.canonical_request_hash = String::new();
         let unsealed_store_request = UserAutomationStoreRequest {
@@ -1216,9 +1309,293 @@ impl KernelStoreGateway {
         let mut sealed = request;
         sealed.identity.canonical_request_hash =
             canonical_request_hash(&view).map_err(|error| error.to_string())?;
-        Box::pin(UserAutomationService::new(&store).dispatch(sealed))
-            .await
-            .map_err(|error| error.to_string())
+        Ok(sealed)
+    }
+
+    /// Routes one committed operator operation to its runtime handoff phases.
+    async fn user_automation_runtime_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        if configuration.read_result().is_some() {
+            return Ok((not_applicable_wake(), not_applicable_execution()));
+        }
+        match &sealed.intent.operation {
+            UserAutomationOperation::RunNow {
+                automation_id,
+                automation_revision,
+                ..
+            } => {
+                self.run_now_handoff(
+                    sealed,
+                    configuration,
+                    runtime,
+                    automation_id,
+                    automation_revision,
+                )
+                .await
+            }
+            UserAutomationOperation::Remove {
+                automation_id,
+                automation_revision,
+            } => retirement_handoff(
+                configuration,
+                Some(automation_id),
+                automation_revision,
+                UserAutomationConfigurationState::Retired,
+            ),
+            UserAutomationOperation::Pause {
+                automation_id,
+                automation_revision,
+            } => retirement_handoff(
+                configuration,
+                Some(automation_id),
+                automation_revision,
+                UserAutomationConfigurationState::Paused,
+            ),
+            UserAutomationOperation::Edit {
+                previous_revision, ..
+            } => Ok((
+                superseded_wake_phase(&previous_revision.revision)?,
+                not_applicable_execution(),
+            )),
+            _ => Ok((not_applicable_wake(), not_applicable_execution())),
+        }
+    }
+
+    /// Compiles and publishes the bounded recurring wake horizon this committed
+    /// operation owns, if any.
+    ///
+    /// `Create`, a `Resume` of the same immutable revision, and an `Edit` that
+    /// committed a new `Active` revision each own exactly one publication
+    /// obligation. It is reported as its own phase beside the wake publication or
+    /// cancellation phase, because a superseding `Edit` also owns the
+    /// predecessor's unresolved cancellation obligation: collapsing the two
+    /// would either hide the new horizon or silently answer for a cancellation
+    /// this contour does not perform.
+    ///
+    /// The horizon is compiled from the committed revision and nothing else: its
+    /// own immutable normalized occurrence denominator, the compiled trigger
+    /// basis, and the publishing State Fence. An inactive committed revision
+    /// owns no wake at all and publishes nothing. A revision that owns a horizon
+    /// with no reachable schedule owner reports the exact requested and
+    /// remaining sets with a replay handle, which is the failure cut of issue
+    /// #2806: a committed configuration plus an explicit publication obligation,
+    /// never a silent success.
+    async fn publish_schedule_horizon<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+    ) -> Result<Option<UserAutomationHorizonPhase>, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let Some(trigger) = schedule_horizon_trigger(&sealed.intent.operation) else {
+            return Ok(None);
+        };
+        let Some(revision) = committed_revision(configuration) else {
+            return Err(
+                "a configuration mutation that owns a wake horizon did not return a canonical \
+                 revision"
+                    .to_owned(),
+            );
+        };
+        if revision.configuration_state != UserAutomationConfigurationState::Active {
+            // A committed non-active revision admits no future occurrence, so it
+            // owns no horizon. That is a complete answer about an obligation
+            // that never existed, not a partial publication.
+            return Ok(None);
+        }
+        let publication = compile_wake_horizon(
+            revision,
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            sealed.context.state_fence.clone(),
+            trigger,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let requested_occurrence_ids = publication.requested_occurrence_ids();
+        let retry_handle = publication
+            .retry_handle(&requested_occurrence_ids)
+            .map_err(|error| error.to_string())?;
+        let Some(runtime) = runtime else {
+            return Ok(Some(unreached_horizon_phase(
+                &publication,
+                &requested_occurrence_ids,
+                retry_handle,
+                UnreachedHorizonKind::Unavailable,
+                UNREACHED_WAKE_OWNER_REASON,
+            )));
+        };
+        match UserAutomationWakePort::publish_wake_horizon(runtime, publication.clone()).await {
+            Ok(acknowledgement) => {
+                acknowledgement
+                    .validate_for(&publication)
+                    .map_err(|error| error.to_string())?;
+                let publication_operation_id =
+                    Box::new(acknowledgement.publication_operation_id.clone());
+                let outcome = if acknowledgement.acknowledged_all() {
+                    UserAutomationHorizonOutcome::Published {
+                        publication_operation_id,
+                    }
+                } else {
+                    UserAutomationHorizonOutcome::Partial {
+                        publication_operation_id,
+                        reason: format!(
+                            "the schedule owner acknowledged {} of the {} requested occurrences of \
+                             revision {}; the exact remaining set is retained and must be \
+                             replayed under its handle before the horizon counts as published",
+                            acknowledgement.acknowledged_occurrence_ids.len(),
+                            requested_occurrence_ids.len(),
+                            publication.automation_revision
+                        ),
+                    }
+                };
+                Ok(Some(UserAutomationHorizonPhase {
+                    trigger: publication.trigger,
+                    automation_id: publication.automation_id.clone(),
+                    automation_revision: publication.automation_revision.clone(),
+                    revision_digest: publication.revision_digest.clone(),
+                    requested_occurrence_ids,
+                    remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids,
+                    retry_handle: acknowledgement.retry_handle,
+                    outcome,
+                }))
+            }
+            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
+                Ok(Some(unreached_horizon_phase(
+                    &publication,
+                    &requested_occurrence_ids,
+                    retry_handle,
+                    UnreachedHorizonKind::Unavailable,
+                    &reason,
+                )))
+            }
+            Err(UserAutomationRuntimeError::UnknownOutcome(reason)) => {
+                Ok(Some(unreached_horizon_phase(
+                    &publication,
+                    &requested_occurrence_ids,
+                    retry_handle,
+                    UnreachedHorizonKind::UnknownOutcome,
+                    &reason,
+                )))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Completes the `RunNow` handoff: exact committed/replayed invocation
+    /// readback, current owner projection, and the owner readback of the wake
+    /// for that exact occurrence over the authenticated runtime channel.
+    async fn run_now_handoff<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+        automation_id: &str,
+        automation_revision: &str,
+    ) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let Some(UserAutomationMutationResult::RunNow { invocation, .. }) =
+            configuration.mutation_result()
+        else {
+            return Err("run-now did not return a run-now projection".to_owned());
+        };
+        let occurrence_id = invocation
+            .occurrence_identity()
+            .map_err(|error| error.to_string())?;
+        // Exact committed/replayed invocation readback. The persisted document
+        // is compared with the answer of this very identity, so a replayed Store
+        // mutation resumes the same occurrence and can never mint a second
+        // manual nonce or a second occurrence.
+        let persisted = self
+            .read_user_automation_invocation(
+                &sealed.context.state_fence,
+                automation_id,
+                &occurrence_id,
+            )
+            .await?;
+        if persisted != *invocation {
+            return Err(
+                "committed UserAutomation occurrence does not match the canonical invocation readback"
+                    .to_owned(),
+            );
+        }
+        let owner = self
+            .read_user_automation_owner(&UserAutomationOwnerLookup {
+                automation_id: automation_id.to_owned(),
+                requested_revision: automation_revision.to_owned(),
+                authenticated_principal: sealed.authenticated_principal.clone(),
+                state_fence: sealed.context.state_fence.clone(),
+            })
+            .await?;
+        if owner.automation_id != automation_id
+            || owner.revision.revision != automation_revision
+            || owner.revision.owner_principal != sealed.authenticated_principal
+        {
+            return Err(
+                "committed UserAutomation occurrence does not bind to the current owner revision"
+                    .to_owned(),
+            );
+        }
+        // The current configuration state is the owner's admission fact. A
+        // paused, retired or blocked owner admits no occurrence, so no wake or
+        // Durable Job owner is asked. The committed configuration phase stays
+        // visible: an unadmitted occurrence is reported as such, never as a
+        // failed commit.
+        if owner.current_configuration_state != UserAutomationConfigurationState::Active {
+            return Ok((
+                UserAutomationWakePhase::NotApplicable {
+                    reason: unadmitted_wake_reason(
+                        automation_id,
+                        automation_revision,
+                        owner.current_configuration_state,
+                    ),
+                },
+                UserAutomationExecutionPhase::Unavailable {
+                    reason: unadmitted_execution_reason(
+                        &occurrence_id,
+                        owner.current_configuration_state,
+                    ),
+                },
+            ));
+        }
+        let Some(runtime) = runtime else {
+            return Ok((
+                UserAutomationWakePhase::Unavailable {
+                    reason: unproven_wake_channel_reason(),
+                },
+                UserAutomationExecutionPhase::Unavailable {
+                    reason: unproven_execution_channel_reason(),
+                },
+            ));
+        };
+        let wake_request = run_now_wake_read_request(
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            invocation.clone(),
+        );
+        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
+            Ok(readback) => UserAutomationWakePhase::Published { readback },
+            Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                reason: error.to_string(),
+            },
+        };
+        let execution = UserAutomationExecutionPhase::Unavailable {
+            reason: unproven_durable_job_material_reason(&occurrence_id, automation_revision),
+        };
+        Ok((wake, execution))
     }
 
     /// Seeds the Store's all-absent genesis state under the active Kernel
@@ -2077,6 +2454,237 @@ impl KernelStoreGateway {
         health.validate().map_err(|error| error.to_string())?;
         Ok(health)
     }
+}
+
+/// Returns the canonical revision a committed configuration mutation produced.
+fn committed_revision(
+    configuration: &UserAutomationConfigurationPhase,
+) -> Option<&UserAutomationRevision> {
+    match configuration.mutation_result()? {
+        UserAutomationMutationResult::Revision { revision, .. } => Some(revision),
+        UserAutomationMutationResult::RunNow { .. } => None,
+    }
+}
+
+/// Whether a committed configuration operation owns one bounded recurring wake
+/// horizon publication, and which closed reason names that slice.
+fn schedule_horizon_trigger(
+    operation: &UserAutomationOperation,
+) -> Option<UserAutomationHorizonTrigger> {
+    match operation {
+        UserAutomationOperation::Create { .. } => {
+            Some(UserAutomationHorizonTrigger::AcceptedRevision)
+        }
+        UserAutomationOperation::Resume { .. } => {
+            Some(UserAutomationHorizonTrigger::ResumedRevision)
+        }
+        UserAutomationOperation::Edit { .. } => Some(UserAutomationHorizonTrigger::SupersedingEdit),
+        UserAutomationOperation::List { .. }
+        | UserAutomationOperation::Status { .. }
+        | UserAutomationOperation::History { .. }
+        | UserAutomationOperation::Pause { .. }
+        | UserAutomationOperation::RunNow { .. }
+        | UserAutomationOperation::Remove { .. }
+        | UserAutomationOperation::InspectLastFailure { .. } => None,
+    }
+}
+
+/// Whether an unacknowledged horizon is a request that was never sent or a
+/// request whose answer was lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnreachedHorizonKind {
+    Unavailable,
+    UnknownOutcome,
+}
+
+/// Reason used when this transition composes no schedule owner at all.
+const UNREACHED_WAKE_OWNER_REASON: &str = "no authenticated UserAutomation runtime channel was composed for this transition, so the \
+     compiled wake horizon was never handed to the schedule owner and no wake is retained";
+
+/// Projects a horizon that the schedule owner did not fully acknowledge.
+///
+/// The exact requested and remaining occurrence sets and the replay handle are
+/// always retained. A failure answer never reports an empty remainder: an empty
+/// set would claim that nothing is outstanding, which is exactly the answer this
+/// boundary cannot prove without an owner.
+fn unreached_horizon_phase(
+    publication: &UserAutomationWakeHorizonPublication,
+    requested_occurrence_ids: &[String],
+    retry_handle: String,
+    kind: UnreachedHorizonKind,
+    reason: &str,
+) -> UserAutomationHorizonPhase {
+    let outcome = match kind {
+        UnreachedHorizonKind::Unavailable => UserAutomationHorizonOutcome::Unavailable {
+            reason: reason.to_owned(),
+        },
+        UnreachedHorizonKind::UnknownOutcome => UserAutomationHorizonOutcome::UnknownOutcome {
+            reason: reason.to_owned(),
+        },
+    };
+    UserAutomationHorizonPhase {
+        trigger: publication.trigger,
+        automation_id: publication.automation_id.clone(),
+        automation_revision: publication.automation_revision.clone(),
+        revision_digest: publication.revision_digest.clone(),
+        requested_occurrence_ids: requested_occurrence_ids.to_vec(),
+        remaining_occurrence_ids: requested_occurrence_ids.to_vec(),
+        retry_handle,
+        outcome,
+    }
+}
+
+/// Completes the retirement handoff for `Remove` and `Pause`.
+///
+/// The committed document is checked against the requested automation,
+/// revision, and the exact configuration state that operation must produce, so
+/// the phase is only derived from the exact revision this identity committed.
+fn retirement_handoff(
+    configuration: &UserAutomationConfigurationPhase,
+    automation_id: Option<&str>,
+    automation_revision: &str,
+    expected_state: UserAutomationConfigurationState,
+) -> Result<(UserAutomationWakePhase, UserAutomationExecutionPhase), String> {
+    let Some(revision) = committed_revision(configuration) else {
+        return Err("retirement did not return a canonical revision".to_owned());
+    };
+    if revision.revision != automation_revision
+        || automation_id.is_some_and(|id| revision.automation_id != id)
+        || committed_configuration_state(configuration) != Some(expected_state)
+    {
+        return Err(
+            "committed UserAutomation revision does not match the retirement request".to_owned(),
+        );
+    }
+    let committed_occurrences = revision
+        .compile_occurrence_identities()
+        .map_err(|error| error.to_string())?
+        .len();
+    Ok((
+        unproven_wake_target_phase(
+            &revision.automation_id,
+            &revision.revision,
+            committed_occurrences,
+        ),
+        not_applicable_execution(),
+    ))
+}
+
+/// Wake phase for an operation that owns no wake publication or cancellation.
+fn not_applicable_wake() -> UserAutomationWakePhase {
+    UserAutomationWakePhase::NotApplicable {
+        reason: "this operator operation owns no wake publication or cancellation".to_owned(),
+    }
+}
+
+/// Execution phase for an operation that owns no execution disposition.
+fn not_applicable_execution() -> UserAutomationExecutionPhase {
+    UserAutomationExecutionPhase::NotApplicable {
+        reason:
+            "this operator operation commits configuration only and owns no occurrence to execute"
+                .to_owned(),
+    }
+}
+
+/// Wake phase for a superseding `Edit`, whose affected revision is the retired
+/// predecessor rather than the committed document.
+///
+/// The superseded document is not the answer of this identity, so its committed
+/// occurrence denominator cannot be counted here. The phase is therefore
+/// unresolved by construction instead of asserting that no wake exists.
+fn superseded_wake_phase(previous_revision: &str) -> Result<UserAutomationWakePhase, String> {
+    if previous_revision.trim().is_empty() {
+        return Err("superseding edit did not name the affected revision".to_owned());
+    }
+    Ok(UserAutomationWakePhase::UnknownOutcome {
+        reason: format!(
+            "superseded revision {previous_revision} is not the committed document of this identity, \
+             so its committed occurrence denominator is unknown; its not-yet-admitted wakes cannot \
+             be cancelled from a bounded subset and stay unknown until the owner enumerates them"
+        ),
+    })
+}
+
+/// Wake phase for a retirement whose exact owner-issued target list could not be
+/// proven complete.
+///
+/// The canonical revision exposes its committed calendar occurrence identities,
+/// but the authenticated wake owner publishes an exact per-occurrence readback
+/// only for a Human `RunNow` occurrence. A retirement therefore cannot present
+/// a non-empty, complete, exact cancellation target list here, and an empty list
+/// is not proof that no unadmitted wake exists: the phase stays unknown.
+fn unproven_wake_target_phase(
+    automation_id: &str,
+    automation_revision: &str,
+    committed_occurrences: usize,
+) -> UserAutomationWakePhase {
+    UserAutomationWakePhase::UnknownOutcome {
+        reason: format!(
+            "retired revision {automation_revision} of {automation_id} exposes {committed_occurrences} \
+             committed calendar occurrence identities, but the authenticated wake owner publishes an \
+             exact per-occurrence target only for a Human run-now occurrence, so no complete exact \
+             unadmitted target list is owner-proven; no cancellation is issued and the already \
+             admitted jobs, immutable history and unresolved obligations are preserved"
+        ),
+    }
+}
+
+/// Wake phase reason used when no authenticated runtime channel was composed.
+fn unproven_wake_channel_reason() -> String {
+    "no authenticated UserAutomation runtime channel was composed for this transition, so the \
+     committed occurrence was not handed to the wake owner"
+        .to_owned()
+}
+
+/// Wake phase reason for a committed occurrence the current owner does not admit.
+fn unadmitted_wake_reason(
+    automation_id: &str,
+    automation_revision: &str,
+    state: UserAutomationConfigurationState,
+) -> String {
+    format!(
+        "the current owner configuration state of {automation_id}/{automation_revision} is {state:?}, \
+         which admits no wake, so the committed occurrence was not handed to the wake owner"
+    )
+}
+
+/// Execution phase reason for a committed occurrence the current owner does not
+/// admit.
+fn unadmitted_execution_reason(
+    occurrence_id: &str,
+    state: UserAutomationConfigurationState,
+) -> String {
+    format!(
+        "the current owner configuration state for occurrence {occurrence_id} is {state:?}, which \
+         admits no execution, so the Durable Job owner was never asked and the occurrence stays \
+         unadmitted"
+    )
+}
+
+/// Execution phase reason used when no authenticated runtime channel was composed.
+fn unproven_execution_channel_reason() -> String {
+    "no authenticated UserAutomation runtime channel was composed for this transition, so the \
+     committed occurrence was not handed to the Durable Job owner"
+        .to_owned()
+}
+
+/// Execution phase reason for a committed occurrence with no owner-issued
+/// Durable Job submission material.
+///
+/// The existing Durable Job owner admits a complete submission. That submission
+/// carries the qualified artifact content reference and the job admission
+/// receipt; neither is derivable from the canonical Store receipt, and deriving
+/// either would fabricate content evidence and authority. The Durable Job owner
+/// is therefore never asked, so the phase is `Unavailable` rather than a lost
+/// answer: nothing was sent, no job was minted, and the occurrence stays
+/// unadmitted for a later owner-issued submission to admit.
+fn unproven_durable_job_material_reason(occurrence_id: &str, automation_revision: &str) -> String {
+    format!(
+        "occurrence {occurrence_id} of revision {automation_revision} is committed and its wake is \
+         owner-read, but the Durable Job owner was never asked: no owner-issued submission material \
+         exists for it, because the qualified artifact content reference and the job admission \
+         receipt are issued by that owner and are not derivable from the canonical Store commit"
+    )
 }
 
 /// Canonical route/epoch gate shared by every gateway read/write path.

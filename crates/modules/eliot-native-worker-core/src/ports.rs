@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, AuthorizedEffect, ProposedEffect, WorkLeaseId,
 };
-use eliot_contracts::{EpochId, StateFence};
+use eliot_contracts::{EpochId, RequestId, StateFence};
 use eliot_process::{
     FencingToken, Generation, OperationId, ProcessRequest, ProcessTreeId, ResourceLimits,
 };
@@ -881,11 +881,14 @@ pub trait CapabilityAdmissionPort: Send {
 }
 
 /// Inert checkpoint command derived from the live worker/process binding.
+///
+/// `request_id` is the shared ELIOT-owned [`RequestId`], so checkpoint
+/// persistence is keyed by the exact EBP request correlation identity.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableCheckpointRequest {
     checkpoint_ref: String,
-    request_id: String,
+    request_id: RequestId,
     stream_id: String,
     producer_generation: u64,
     authority_epoch: EpochId,
@@ -899,7 +902,7 @@ impl DurableCheckpointRequest {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         checkpoint_ref: String,
-        request_id: String,
+        request_id: RequestId,
         grant: &CapabilityGrant,
         process: &ProcessBindingSnapshot,
     ) -> Self {
@@ -921,7 +924,7 @@ impl DurableCheckpointRequest {
         &self.checkpoint_ref
     }
     #[must_use]
-    pub fn request_id(&self) -> &str {
+    pub fn request_id(&self) -> &RequestId {
         &self.request_id
     }
     #[must_use]
@@ -955,12 +958,15 @@ impl DurableCheckpointRequest {
 }
 
 /// Provider facts for an already durable checkpoint receipt.
+///
+/// `request_id` is the shared ELIOT-owned [`RequestId`], so the receipt is
+/// compared against the exact EBP request correlation identity.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointReceiptFacts {
     receipt_id: String,
     checkpoint_ref: String,
-    request_id: String,
+    request_id: RequestId,
     stream_id: String,
     producer_generation: u64,
     authority_epoch: EpochId,
@@ -976,7 +982,7 @@ impl CheckpointReceiptFacts {
     pub fn new(
         receipt_id: impl Into<String>,
         checkpoint_ref: impl Into<String>,
-        request_id: impl Into<String>,
+        request_id: RequestId,
         stream_id: impl Into<String>,
         producer_generation: u64,
         authority_epoch: EpochId,
@@ -989,7 +995,7 @@ impl CheckpointReceiptFacts {
         Self {
             receipt_id: receipt_id.into(),
             checkpoint_ref: checkpoint_ref.into(),
-            request_id: request_id.into(),
+            request_id,
             stream_id: stream_id.into(),
             producer_generation,
             authority_epoch,
@@ -1010,7 +1016,7 @@ impl CheckpointReceiptFacts {
         &self.checkpoint_ref
     }
     #[must_use]
-    pub fn request_id(&self) -> &str {
+    pub fn request_id(&self) -> &RequestId {
         &self.request_id
     }
     #[must_use]
@@ -1087,7 +1093,7 @@ pub trait DurableReplayPort: Send {
     fn lookup_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure>;
 
@@ -1095,7 +1101,7 @@ pub trait DurableReplayPort: Send {
     fn begin_request(
         &mut self,
         stream_id: &str,
-        request_id: &str,
+        request_id: &RequestId,
         fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure>;
 

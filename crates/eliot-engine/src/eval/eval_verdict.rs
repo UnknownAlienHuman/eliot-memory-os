@@ -37,7 +37,7 @@ impl EvalVerdictService {
         // pre-retention results carry None (unknown, never a staleness
         // claim). Only genuinely drifted retained sets downgrade, and only
         // to Inconclusive — staleness is not failure evidence.
-        let current = super::current_eval_fingerprints();
+        let current = super::current_eval_fingerprints(&run.project_id);
         let has_stale_case = run.case_results.iter().any(|result| {
             matches!(&result.integrity_fingerprints, Some(recorded) if recorded.is_stale_against(&current))
         });

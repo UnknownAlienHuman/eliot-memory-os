@@ -4,10 +4,9 @@
 //! supplied evidence. The caller (`HostComposition` at delegation; fixtures in
 //! tests) provides the admission, the source root, the explicitly admitted
 //! staging parent, authority values, and a [`PreparationJournal`] sink. This
-//! module mints no authority of its own: fresh destination identities derive
-//! deterministically from the operation identity under a domain separator, so
-//! they are never archive copies or caller-chosen increments — while true
-//! owner epoch assignment stays with the later cutover child.
+//! module mints no authority of its own: the fresh destination identity binds
+//! owner-issued evidence under a domain separator and never any caller-chosen
+//! material, so it is neither an archive copy nor a value a caller can select.
 //!
 //! Effects are exactly: create one destination directory under the admitted
 //! parent, pin its OS identity, and record intent/result through the journal
@@ -15,6 +14,32 @@
 //! source shutdown, no SCM contact, no registry writes, no archive import, no
 //! cutover. Launch/readiness/effect authority have no representation here by
 //! construction (see case 958/10).
+//!
+//! The created directory is **not** an installation allocated through the
+//! installation authority: `ApprovedGenerationRegistry` exposes no public
+//! mutation seam (every mutator is `pub(crate)`), so the created root has no
+//! `ApprovedGeneration` row, no registry CAS and no activation fence of its
+//! own. It is a fenced empty root under a protected staging parent. Allocating
+//! a real new installation is an owner correction in
+//! `crates/kernel/eliot-installation`, outside this module.
+//!
+//! # Destination identity and epoch
+//!
+//! [`derive_destination_id`] and [`derive_destination_epoch`] bind
+//! owner-issued evidence only: the owner-issued authority generation, the
+//! owner-proved configuration projection digest, the **owner-resolved** staging
+//! parent returned by the protected-root owner, and the operation identity.
+//! [`DestinationAdmission::authority_nonce`] is deliberately NOT an input: a
+//! caller that could choose the nonce could choose the identity and the epoch,
+//! and an archive-supplied nonce would make both archive-determined.
+//!
+//! The resulting `destination_epoch` is a preparation-scope lineage marker
+//! bound to that evidence. It is **not** an Authority Epoch and no Authority
+//! Epoch is issued here: I5.13/A13.7 require a new Authority Epoch lineage
+//! strictly above every observed epoch, and the only owner that could allocate
+//! one is the cutover child, which is a separate issue. A preparation receipt
+//! must therefore never be read as epoch authority, and nothing in this module
+//! consumes `destination_epoch` as one.
 //!
 //! # Configuration projection
 //!
@@ -26,11 +51,39 @@
 //! configuration digest and its [`BackupConfigProjection::projection_digest`]
 //! becomes the admitted [`DestinationAdmission::config_projection_digest`], so
 //! the prepared-destination receipt binds the exact configuration evidence that
-//! was proved. The same step renders the optional forensic audit note through
-//! [`describe_audit_fence`] into
-//! [`DestinationAdmission::audit_fence_note`]; the note stays evidence text
-//! with its non-authoritative ceiling and is never a lease, grant, or
-//! current-state assertion.
+//! was proved.
+//!
+//! That projection **refuses** a presented owner lease reference, purge-ledger
+//! revision or forensic audit note, because no owner reachable from Host issues
+//! or corroborates any of them. This module passes those presented values
+//! through so the refusal is real, and it never renders a caller-authored
+//! forensic note into a receipt: [`DestinationAdmission::audit_fence_note`] and
+//! [`PreparedDestination::audit_fence_note`] are therefore always absent here.
+//! I5.13 keeps the HostStateAuditFence optional for exactly this reason.
+//!
+//! # Source and API guard
+//!
+//! The source-identity proof is real and lives at its owner:
+//! `HostComposition::prepare_backup_destination` calls
+//! [`BackupCallerAuth::authenticate_for_owner`] with the held owner lease and
+//! the launch installation handle before any preparation runs, so the presented
+//! source installation identity is compared against owner-issued evidence
+//! there. The delegated port itself is owner-bound too: [`OwnerEvidence`] has
+//! all-private fields and only [`OwnerEvidence::inspect`] can build one, so
+//! [`DelegatedPreparation::prepare`] cannot be entered without a real
+//! protected root and a committed registry behind it.
+//!
+//! What is NOT proved here: [`prepare_isolated_destination`] and
+//! [`DestinationAdmission`] are `pub` with all-public fields, so a caller that
+//! bypasses the delegated port can reach the effect step with a fabricated
+//! source root and staging parent. Narrowing that port means making it
+//! crate-private, which the declared 958 suite calls directly, and the
+//! authenticated-caller control itself is owned by #954
+//! ([`BackupCallerAuth::authenticate`] fails closed against it). The module
+//! holds no registry writer, no archive import, no store-recovery rewrite and
+//! no cutover arm, so the closed [`PreparationClass`] set plus those absences
+//! are what exclude a second installer/registry, same-installation
+//! Store-recovery rewrite, archive restore and cutover today.
 //!
 //! # Staging parent, generation and sweep bounds
 //!
@@ -72,31 +125,25 @@
 //!   drive unbounded reconciles and `remove_dir_all` calls (A13.9: a Durable
 //!   Job carries a budget).
 //!
-//! # Target build and profile are presented scope, not approved names
+//! # Target build and profile are owner-approved identities
 //!
-//! [`DestinationAdmission::target_build`] and
-//! [`DestinationAdmission::target_profile`] stay caller-presented bounded text,
-//! and are hashed into the admission digest as exactly that. The owner records
-//! reachable from this module ([`OwnerEvidence`], [`ApprovedBuildBinding`])
-//! carry approved artifact *digests* plus a generation handle, and have no
-//! build-name or profile-name field, so no owner source exists here against
-//! which a presented name could be approved; no name-level approval list and
-//! no always-passing comparison is invented in its place. The owner-approval
-//! check that genuinely exists is the presented `build_digests` subset check
-//! against the owner artifact set, in
-//! [`DelegatedPreparation::prepare`] and again in
-//! [`OwnerEvidence::project_backup_configuration`]. Nothing here claims more:
-//! the owner-issued facts in the receipt are the manifest digest and the
-//! configuration projection digest, and the build/profile strings are scope
-//! text the owner has not approved by name.
+//! [`DelegatedPreparation::prepare`] refuses a presented
+//! [`DestinationAdmission::target_build`] that is not the owner-issued
+//! approved-generation handle, and a presented
+//! [`DestinationAdmission::target_profile`] that is not the owner-issued
+//! approved profile token of the same validated record. Both come from the
+//! owner record through [`bind_approved_build`], so no approval list, no
+//! synthetic table and no always-passing comparison is invented: a name the
+//! owner has not approved is refused, not accepted. The shape half stays in
+//! [`validate_admission`], which can only check bounded printable text because
+//! the low-level port has no owner evidence.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::backup_config_projection::{
     ApprovedBuildBinding, AuditFenceNote, BackupConfigProjection, BackupConfigRequest,
-    ProjectionError, bind_approved_build, describe_audit_fence, hash_field,
-    project_backup_config_owner_bound,
+    ProjectionError, bind_approved_build, hash_field, project_backup_config_owner_bound,
 };
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry,
@@ -114,17 +161,6 @@ use thiserror::Error;
 pub const PREPARATION_VERSION: u32 = 1;
 /// Maximum length of one bounded identity string.
 pub const MAX_IDENTITY_LEN: usize = 256;
-/// Maximum length of the rendered forensic audit note carried in an admission.
-///
-/// A receipt-size bound, not an authority bound: the note has no authority to
-/// check because it can never be a lease, grant, or current-state assertion.
-///
-/// Sized so it can always hold the largest note the projector admits — 64
-/// dispositions of 256 bytes each, their separators, the 64-character note
-/// digest, and the fixed ceiling wording (16 615 bytes). A smaller bound would
-/// let preparation refuse a note the projector had already accepted, which
-/// would report a receipt-size limit as an evidence failure.
-pub const MAX_AUDIT_NOTE_LEN: usize = 16615;
 /// Maximum number of caller-presented operation ids one cleanup sweep may be
 /// narrowed to.
 ///
@@ -168,7 +204,7 @@ pub const MAX_CLEANUP_SWEEP_OPERATIONS: usize = 256;
 /// [`PreparationError::SweepBudget`], names any roots already removed in the same
 /// call, and preserves everything not yet swept.
 pub const CLEANUP_SWEEP_BUDGET: Duration = Duration::from_secs(30);
-/// Domain separator for owner-minted destination identities.
+/// Domain separator for owner-evidence-bound destination identities.
 pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
 
 /// Errors for isolated destination preparation (issue #958).
@@ -180,6 +216,25 @@ pub enum PreparationError {
     /// Approved generation disagrees with the authority generation input.
     #[error("unapproved generation: approved {approved} != authority {authority}")]
     UnapprovedGeneration { approved: u64, authority: u64 },
+    /// A presented target build/profile is not the owner-approved identity.
+    #[error(
+        "unapproved target {field}: presented {presented} is not the owner-approved {approved}"
+    )]
+    UnapprovedTarget {
+        field: &'static str,
+        presented: String,
+        approved: String,
+    },
+    /// No owner issues the value the request presented for this field.
+    ///
+    /// The fail-closed alternative to copying an uncorroborated caller claim
+    /// into an owner-issued receipt. `obligation` names the exact owner that
+    /// must issue it and is a static sentence; no caller value is echoed.
+    #[error("no owner-issued evidence for field {field}: {obligation}")]
+    OwnerEvidenceUnavailable {
+        field: &'static str,
+        obligation: &'static str,
+    },
     /// Staging parent is the source, nested under it, missing, not a directory,
     /// or outside the ELIOT protected contour (cases 958/5-6, 958/7).
     #[error("staging parent not admitted: {reason}")]
@@ -263,7 +318,8 @@ impl PreparationError {
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static tokens or validated numeric facts
-// (generations, owner-minted destination epochs); never operation/installation
+// (generations, owner-evidence-bound preparation-scope lineage markers); never
+// operation/installation
 // strings, paths, digests, nonces, reasons, `redacted_debug()` text, or
 // arbitrary error `Debug`/`Display` (a canary stays absent even inside an
 // alleged identity string). Truncation bounds size, never sensitivity. Before
@@ -291,6 +347,7 @@ impl PreparationError {
 // `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
+// /`owner_identity_evidence`/`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
 // boundary). No record asserts destination readiness, source retirement, or
 // activation: `destination_epoch` is preparation scope, never authority.
@@ -319,6 +376,10 @@ fn preparation_error_category(error: &PreparationError) -> (&'static str, &'stat
     match *error {
         PreparationError::InvalidRequest { field, .. } => ("invalid_request", field),
         PreparationError::UnapprovedGeneration { .. } => ("unapproved_generation", "generation"),
+        PreparationError::UnapprovedTarget { field, .. } => ("unapproved_target", field),
+        PreparationError::OwnerEvidenceUnavailable { field, .. } => {
+            ("owner_evidence_unavailable", field)
+        }
         PreparationError::ArbitraryPath { .. } => ("arbitrary_path", "path"),
         PreparationError::SourceIsActive => ("source_is_active", "source_root"),
         PreparationError::ForeignContent { .. } => ("foreign_content", "destination_root"),
@@ -414,10 +475,15 @@ impl PreparationClass {
 
 /// Destination admission: explicit, fully-bound request (issue #958, cases 958/5-7, 958/9).
 ///
-/// Every authority input is presented evidence. `staging_parent` is an
-/// explicitly admitted isolated-prep parent directory — never the source, never
-/// an arbitrary client path (verified by the protected-root owner, not
-/// trusted), and never outside the ELIOT protected contour.
+/// Mixed by construction, and the docs name which is which. `staging_parent` is
+/// an explicitly admitted isolated-prep parent directory — never the source,
+/// never an arbitrary client path (verified by the protected-root owner, not
+/// trusted), and never outside the ELIOT protected contour. On the delegated
+/// path `authority_generation`, `manifest_digest` and
+/// `config_projection_digest` are owner-issued or owner-proved, and
+/// `target_build`/`target_profile` are approved against the owner record there;
+/// every remaining text field is presented evidence, and a presented forensic
+/// note is refused.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DestinationAdmission {
     /// Operation identity (bounded text, unique per preparation).
@@ -433,20 +499,26 @@ pub struct DestinationAdmission {
     /// protected contour; verified by the protected-root owner, never
     /// trusted as a name).
     pub staging_parent: PathBuf,
-    /// Target build identity for the destination (bounded caller-presented
-    /// text).
+    /// Target build identity for the destination (bounded text).
     ///
-    /// Not owner-approved by name: the owner records reachable here carry
-    /// approved artifact digests and no build-name field, so this stays the
-    /// presented scope of the operation and is hashed into the admission
-    /// digest as such. What is genuinely owner-approved for the build is the
-    /// presented `build_digests` subset check against the owner artifact set.
+    /// Owner-approved on the delegated path: the value must equal the
+    /// owner-issued approved-generation handle of the validated approved
+    /// record ([`ApprovedBuildBinding::generation_handle`]), otherwise
+    /// [`DelegatedPreparation::prepare`] refuses with
+    /// [`PreparationError::UnapprovedTarget`]. No broader build-name catalogue
+    /// exists on this path, so a name outside the approved generation is refused
+    /// rather than accepted. What is additionally owner-approved for the build is
+    /// the presented `build_digests` subset check against the owner artifact
+    /// set.
     pub target_build: String,
-    /// Target profile for the destination (bounded caller-presented text).
+    /// Target profile for the destination (bounded text).
     ///
-    /// Not owner-approved by name, for the same reason as
-    /// [`DestinationAdmission::target_build`]: no owner source carries a
-    /// profile name, and none is invented here.
+    /// Owner-approved on the delegated path: the value must equal the
+    /// owner-issued approved profile token of the same validated record
+    /// ([`ApprovedBuildBinding::approved_profile`]), otherwise
+    /// [`DelegatedPreparation::prepare`] refuses with
+    /// [`PreparationError::UnapprovedTarget`]. No local spelling or fallback
+    /// list is used for that token.
     pub target_profile: String,
     /// Generation the caller claims as approved for the destination.
     pub approved_generation: u64,
@@ -464,18 +536,34 @@ pub struct DestinationAdmission {
     /// never a caller-presented one.
     pub manifest_digest: String,
     /// Owner-issued configuration projection digest proved for this request
-    /// (hex64). It binds the owner lease reference, approved generation,
-    /// purge-ledger revision, owner authority state fence, owner-issued
-    /// configuration/build digests and the optional forensic note, so the
-    /// prepared-destination receipt names the exact configuration evidence
-    /// that was proved.
+    /// (hex64). It binds the owner-approved generation, the owner authority
+    /// state fence, the owner-issued configuration/build digests and the
+    /// owner-approved profile token, and states the absence of an owner-issued
+    /// lease reference, purge-ledger revision and audit note, so the
+    /// prepared-destination receipt names the exact configuration evidence that
+    /// was proved.
     pub config_projection_digest: String,
-    /// Optional rendered forensic audit note, with its non-authoritative
-    /// ceiling stated by [`describe_audit_fence`]. It is carried as evidence
-    /// text only and can never act as a lease, grant, or current-state
-    /// assertion; no API converts it into one.
+    /// Optional rendered forensic audit note.
+    ///
+    /// Always `None` on every path this module owns: a presented note is
+    /// refused, by the owner-bound configuration projection as
+    /// [`ProjectionError::OwnerEvidenceUnavailable`] and independently by
+    /// [`validate_admission`] as [`PreparationError::OwnerEvidenceUnavailable`],
+    /// because no owner reachable from Host issues or corroborates such a note.
+    /// The field is kept so the receipt shape is unchanged, and so a tampered
+    /// record that carries one is detected rather than silently reinterpreted.
+    /// It can never act as a lease, grant, or current-state assertion; no API
+    /// converts it into one.
     pub audit_fence_note: Option<String>,
-    /// Opaque owner-issued entropy for fresh identity derivation (bounded text).
+    /// Opaque caller-presented entropy text.
+    ///
+    /// Deliberately NOT an input to the destination identity or the preparation
+    /// epoch: [`derive_destination_id`] and [`derive_destination_epoch`] bind
+    /// owner-issued evidence instead, so a caller cannot select either by
+    /// choosing this value and an archive-supplied value cannot determine
+    /// either. It stays part of the presented contract surface and remains
+    /// hashed into the admission digest, so rotating it is still a changed
+    /// idempotency input.
     pub authority_nonce: String,
     /// Caller-observed state fence bound into the receipt.
     pub state_fence_digest: String,
@@ -513,6 +601,12 @@ pub struct RootIdentity {
 }
 
 /// Prepared isolated destination: the only success output.
+///
+/// It is a fenced empty root under a protected staging parent, **not** an
+/// installation allocated through the installation authority: no
+/// `ApprovedGeneration` row, registry CAS or activation fence is created for
+/// it, because the registry exposes no public mutation seam. Nothing here is
+/// restored, launched, activated or retired.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PreparedDestination {
     /// Operation identity that produced it.
@@ -521,9 +615,15 @@ pub struct PreparedDestination {
     pub root: PathBuf,
     /// Pinned OS identity captured at creation.
     pub root_identity: RootIdentity,
-    /// Owner-minted destination identity (deterministic, never archive/caller copy).
+    /// Destination identity bound to owner-issued evidence (never an archive or
+    /// caller copy, and never caller-selectable).
     pub destination_id: String,
-    /// Destination epoch minted for preparation scope (distinct from owner epochs).
+    /// Preparation-scope lineage marker bound to the same owner-issued
+    /// evidence as [`PreparedDestination::destination_id`].
+    ///
+    /// **Not** an Authority Epoch: no Authority Epoch is issued by this module
+    /// (see the module documentation), and nothing here consumes this value as
+    /// one. A preparation receipt must never be read as epoch authority.
     pub destination_epoch: u64,
     /// Admission receipt digest binding the admitted inputs.
     pub admission_digest: String,
@@ -532,9 +632,11 @@ pub struct PreparedDestination {
     /// states the proved configuration evidence directly instead of only
     /// through [`PreparedDestination::admission_digest`].
     pub config_projection_digest: String,
-    /// Optional rendered forensic audit note, with its non-authoritative
-    /// ceiling stated. Evidence text only; never a lease, grant, or
-    /// current-state assertion.
+    /// Optional rendered forensic audit note.
+    ///
+    /// Always `None` on every path this module owns; a presented note is
+    /// refused, never rendered into a receipt. See
+    /// [`DestinationAdmission::audit_fence_note`].
     pub audit_fence_note: Option<String>,
 }
 
@@ -560,9 +662,22 @@ pub struct CleanupReport {
 
 /// Durable intent/result sink port (issue #958).
 ///
-/// Implemented by `HostComposition` over the installation/Host journal at
-/// delegation; tests use an in-memory sink. Synchronous narrow port: record
-/// intent before effects, result after; load-before-act for idempotency.
+/// **This trait has no production implementor.** The only implementation in the
+/// repository is the in-memory `MemJournal` in
+/// `bins/eliot-host/tests/backup_preparation.rs`, and the blanket
+/// `impl<J: PreparationJournal> DelegatedPreparation<J>` is a bound, not an
+/// implementation. `HostComposition` does not implement it, so intent/result
+/// persistence survives neither a process restart nor a Host restart today.
+///
+/// A durable implementation is possible over `HostStateJournal::append` and
+/// `HostStateJournal::snapshot`, but it requires a **new** `HostStateRecord`
+/// variant in `crates/kernel/eliot-host-state`, which is outside issue #958's
+/// declared Exclusive mutable scope; that owner correction is the exact blocker,
+/// and it is why [`reconcile_preparation`] can still report an unknown effect as
+/// [`ReconcileDisposition::Absent`] when the process restarted (I14.21).
+///
+/// Synchronous narrow port: record intent before effects, result after;
+/// load-before-act for idempotency.
 pub trait PreparationJournal {
     /// Records the preparation intent (admission digest + derived root).
     fn record_intent(
@@ -609,18 +724,19 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), PreparationError
     Ok(())
 }
 
-/// Bounds the rendered forensic audit note carried in an admission (case 958/3).
+/// Refuses a rendered forensic audit note carried in an admission (case 958/3).
 ///
-/// The note text is produced by
-/// [`describe_audit_fence`](crate::backup_config_projection::describe_audit_fence)
-/// from already-validated note fields, so this is purely a receipt-size and
-/// printable-text bound. There is deliberately no authority check here because
-/// the note can never be a lease, grant, or current-state assertion.
-fn check_audit_note(note: &str) -> Result<(), PreparationError> {
-    if note.is_empty() || note.len() > MAX_AUDIT_NOTE_LEN || note.chars().any(char::is_control) {
-        return Err(PreparationError::InvalidRequest {
+/// The note would be caller-authored: nothing in this module compares its digest
+/// or its observed dispositions to Host state, so a receipt carrying it would
+/// publish unverified disposition claims under a forensic label. I5.13 keeps the
+/// `HostStateAuditFence` optional, so refusing it is a complete answer rather
+/// than a gap, and no note-size bound is needed because no note is ever carried.
+fn reject_audit_note(note: Option<&String>) -> Result<(), PreparationError> {
+    if note.is_some() {
+        return Err(PreparationError::OwnerEvidenceUnavailable {
             field: "audit_fence_note",
-            reason: "bounded printable forensic note text required".to_owned(),
+            obligation: "a HostStateAuditFence must be issued or corroborated by the owner that observed \
+                 the installation lineage; preparation admits no caller-authored forensic note",
         });
     }
     Ok(())
@@ -634,31 +750,77 @@ fn sha_hex(parts: &[&[u8]]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Owner-minted destination identity (issue #958, case 958/9).
+/// Summarizes the owner-issued evidence a destination identity binds.
 ///
-/// Deterministic domain-separated derivation from the operation identity plus
-/// owner nonce: fresh per operation, stable across repeats, and never equal
-/// to archive-supplied or caller-chosen values (which live outside this domain).
+/// Three owner-issued facts and nothing else: the authority generation carried
+/// by the committed activation fence, the configuration projection digest the
+/// owner-bound projector proved, and the **owner-resolved** staging parent
+/// returned by the protected-root owner (not the caller's path name). Together
+/// with the operation identity and the preparation version they form the input
+/// to [`derive_destination_id`] and [`derive_destination_epoch`].
+///
+/// The caller-presented [`DestinationAdmission::authority_nonce`] is excluded on
+/// purpose. With it in the derivation, a caller could enumerate values until it
+/// liked the produced identity, and an archive-supplied value would make the
+/// identity archive-determined.
+fn owner_identity_evidence(
+    admission: &DestinationAdmission,
+    owner_resolved_parent: &Path,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"eliot.backup.destination.owner-identity-evidence.v1\0");
+    hasher.update(PREPARATION_VERSION.to_le_bytes());
+    hash_field(
+        &mut hasher,
+        b"authority_generation",
+        &admission.authority_generation.to_le_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"config_projection_digest",
+        admission.config_projection_digest.as_bytes(),
+    );
+    hash_path(&mut hasher, b"owner_resolved_parent", owner_resolved_parent);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Destination identity bound to owner-issued evidence (issue #958, case
+/// 958/9).
+///
+/// Deterministic, domain-separated derivation from the operation identity plus
+/// the owner-evidence summary produced by [`owner_identity_evidence`]: fresh per
+/// operation, stable across repeats, and never equal to archive-supplied or
+/// caller-chosen values. The caller cannot select it: no presented field, and in
+/// particular not `authority_nonce`, is an input, and the path component is the
+/// owner-resolved parent rather than a name the caller chose.
 #[must_use]
-pub fn derive_destination_id(operation_id: &str, authority_nonce: &str) -> String {
+pub fn derive_destination_id(operation_id: &str, owner_evidence: &str) -> String {
     sha_hex(&[
         DESTINATION_ID_DOMAIN.as_bytes(),
         b"\0identity\0",
         operation_id.as_bytes(),
         b"\0",
-        authority_nonce.as_bytes(),
+        owner_evidence.as_bytes(),
     ])
 }
 
-/// Owner-minted preparation epoch (same properties as the destination identity).
+/// Preparation-scope lineage marker bound to the same owner-issued evidence
+/// (see [`derive_destination_id`]).
+///
+/// It is **not** an Authority Epoch and no Authority Epoch is issued here: a new
+/// Authority Epoch lineage strictly above every observed epoch is the cutover
+/// child's owner obligation (I5.13, A13.7), and the installation authority
+/// exposes no epoch-allocating seam to this module. Nothing in this module
+/// consumes the returned value as an epoch; it only discriminates one fenced
+/// preparation from another under identical owner evidence.
 #[must_use]
-pub fn derive_destination_epoch(operation_id: &str, authority_nonce: &str) -> u64 {
+pub fn derive_destination_epoch(operation_id: &str, owner_evidence: &str) -> u64 {
     let digest = sha_hex(&[
         DESTINATION_ID_DOMAIN.as_bytes(),
         b"\0epoch\0",
         operation_id.as_bytes(),
         b"\0",
-        authority_nonce.as_bytes(),
+        owner_evidence.as_bytes(),
     ]);
     u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8])).max(1)
 }
@@ -709,7 +871,10 @@ fn hash_path(hasher: &mut Sha256, label: &[u8], path: &Path) {
 /// projection and then carries `config_projection_digest` and
 /// `audit_fence_note`, so an admission digest that hashed neither would let
 /// two different proved configuration projections reuse one idempotency key
-/// and return the same recorded destination.
+/// and return the same recorded destination. The audit-note arm is now
+/// unreachable on every path this module owns — a presented note is refused —
+/// but it stays in the hashed set so the digest remains a faithful encoding of
+/// the whole struct and a record that somehow carries one is detected.
 fn admission_digest(admission: &DestinationAdmission) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"eliot.backup.destination-admission.v3\0");
@@ -938,10 +1103,14 @@ fn reverify_recorded_destination(
 /// real check when the second value came from owner evidence:
 /// [`DelegatedPreparation::prepare`] fills it from
 /// [`OwnerEvidence::authority_generation`], so the production path refuses an
-/// unapproved generation (case 958/7). The shape checks here are unchanged and
-/// stay shape checks: `target_build` and `target_profile` are bounded text with
-/// no name-level owner approval, and the presented `build_digests` subset check
-/// is what approves a build (see the module documentation).
+/// unapproved generation (case 958/7). The shape checks here stay shape checks:
+/// `target_build` and `target_profile` are bounded text here, and the owner
+/// comparison that approves them by name is in
+/// [`DelegatedPreparation::prepare`], where the owner record is in hand.
+///
+/// A presented forensic audit note is refused here, before any effect and
+/// independently of the configuration projection, so no caller-authored
+/// disposition claim can enter a receipt through this port either.
 fn validate_admission(admission: &DestinationAdmission) -> Result<(), PreparationError> {
     check_identity(&admission.operation_id, "operation_id")?;
     check_identity(&admission.source_installation_id, "source_installation_id")?;
@@ -952,9 +1121,7 @@ fn validate_admission(admission: &DestinationAdmission) -> Result<(), Preparatio
         &admission.config_projection_digest,
         "config_projection_digest",
     )?;
-    if let Some(note) = &admission.audit_fence_note {
-        check_audit_note(note)?;
-    }
+    reject_audit_note(admission.audit_fence_note.as_ref())?;
     check_digest(&admission.state_fence_digest, "state_fence_digest")?;
     check_identity(&admission.authority_nonce, "authority_nonce")?;
     if admission.approved_generation == 0 {
@@ -1210,7 +1377,11 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
     }
     let canonical_parent = admit_staging_parent(admission)
         .map_err(|error| note_prepare_error(OP_PREPARE, "admit_parent", error, generation))?;
-    let destination_id = derive_destination_id(&admission.operation_id, &admission.authority_nonce);
+    // Identity and preparation-scope lineage bind owner-issued evidence and the
+    // owner-resolved parent, never a presented field: see
+    // `owner_identity_evidence`.
+    let identity_evidence = owner_identity_evidence(admission, &canonical_parent);
+    let destination_id = derive_destination_id(&admission.operation_id, &identity_evidence);
     let root = canonical_parent.join(format!("dest-{destination_id}"));
     if root.exists() {
         return Err(note_prepare_error(
@@ -1241,10 +1412,7 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
         root: root.clone(),
         root_identity: identity,
         destination_id,
-        destination_epoch: derive_destination_epoch(
-            &admission.operation_id,
-            &admission.authority_nonce,
-        ),
+        destination_epoch: derive_destination_epoch(&admission.operation_id, &identity_evidence),
         admission_digest: digest,
         config_projection_digest: admission.config_projection_digest.clone(),
         audit_fence_note: admission.audit_fence_note.clone(),
@@ -1564,9 +1732,10 @@ fn remove_reverified_destination(
 /// [`PreparationError::InvalidRequest`], a non-directory yields
 /// [`PreparationError::ArbitraryPath`], and an unresolvable root yields
 /// [`PreparationError::FilesystemEffect`]. Owner error internals are never
-/// echoed. Staging admission, generation/lease authority, and journal
-/// binding stay with [`prepare_isolated_destination`] and HostComposition
-/// delegation.
+/// echoed. Staging admission and generation authority stay with
+/// [`prepare_isolated_destination`] and HostComposition delegation, and the
+/// owner lease reference a caller may present is refused by the configuration
+/// projection rather than bound from the request.
 pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, PreparationError> {
     roots
         .validate()
@@ -1601,14 +1770,20 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
 /// always comes from the owner-bound [`ApprovedBuildBinding`] through the
 /// configuration projection, so a caller can never assert a competing
 /// manifest. Presented build digests are subset-checked against the owner
-/// artifact set by that same projection. Numeric generation, lease, purge, and
-/// target build/profile stay caller-presented pending #954 control contracts
-/// and `HostComposition` delegation, which authenticate the caller; the
-/// projection binds them and never invents currency for them. The one
-/// presented generation that is nevertheless decided against owner evidence is
-/// `approved_generation`, compared by
-/// [`DelegatedPreparation::prepare`] against
-/// [`OwnerEvidence::authority_generation`].
+/// artifact set by that same projection.
+///
+/// The remaining fields are presented and are treated as follows. The
+/// presented `approved_generation` is decided against owner evidence
+/// ([`DelegatedPreparation::prepare`] against
+/// [`OwnerEvidence::authority_generation`]); `target_build` and
+/// `target_profile` must equal the owner-approved generation handle and
+/// profile token or the preparation is refused. A presented owner lease
+/// reference, purge-ledger revision or forensic audit note is **refused**,
+/// because no owner reachable from Host issues or corroborates any of them —
+/// lease issuance and purge-ledger authority belong to #954 and to the
+/// purge-ledger owner respectively. The presented `authority_generation` is
+/// read nowhere on this path: this lane grants it nothing, and the admission
+/// carries the owner-issued one instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PresentedPreparationRequest {
     /// Operation identity (bounded text, unique per preparation).
@@ -1620,13 +1795,19 @@ pub struct PresentedPreparationRequest {
     /// Explicitly admitted staging parent (verified through the
     /// protected-root owner, never trusted as a name).
     pub staging_parent: PathBuf,
-    /// Target build identity for the destination (bounded presented text; not
-    /// owner-approved by name, see
-    /// [`DestinationAdmission::target_build`]).
+    /// Target build identity for the destination (bounded text).
+    ///
+    /// Must equal the owner-issued approved-generation handle on the delegated
+    /// path, or [`DelegatedPreparation::prepare`] refuses with
+    /// [`PreparationError::UnapprovedTarget`]; see
+    /// [`DestinationAdmission::target_build`].
     pub target_build: String,
-    /// Target profile for the destination (bounded presented text; not
-    /// owner-approved by name, see
-    /// [`DestinationAdmission::target_profile`]).
+    /// Target profile for the destination (bounded text).
+    ///
+    /// Must equal the owner-issued approved profile token on the delegated path,
+    /// or [`DelegatedPreparation::prepare`] refuses with
+    /// [`PreparationError::UnapprovedTarget`]; see
+    /// [`DestinationAdmission::target_profile`].
     pub target_profile: String,
     /// Generation the caller claims as approved (presented, and checked
     /// against owner-issued authority evidence).
@@ -1643,21 +1824,37 @@ pub struct PresentedPreparationRequest {
     /// because it is part of the presented contract surface, and removing a
     /// contract field from under #954 is not this lane's decision.
     pub authority_generation: u64,
-    /// Owner lease reference the requester presents (bounded text; projected
-    /// and bound into the projection digest, never a secret value).
+    /// Owner lease reference the requester presents (bounded text).
+    ///
+    /// Presenting a value is **refused** by the owner-bound configuration
+    /// projection: no owner reachable from Host issues a lease reference, so
+    /// the claim could not be corroborated and is never copied into the
+    /// projection. The field stays on the presented contract surface because
+    /// removing a #954 contract field is not this lane's decision.
     pub owner_lease_ref: String,
-    /// Purge-ledger revision the requester presents (projected and bound into
-    /// the projection digest; owner issuance belongs to #954).
+    /// Purge-ledger revision the requester presents.
+    ///
+    /// Presenting a nonzero value is **refused** by the owner-bound
+    /// configuration projection, for the same reason: purge-ledger authority is
+    /// owned outside Host backup preparation and no owner observed here issues a
+    /// revision, so the projection records the absence instead.
     pub purge_ledger_revision: u64,
     /// Presented build digests, each verified against owner artifacts by the
     /// configuration projection.
     pub build_digests: Vec<String>,
-    /// Optional forensic Host state audit note. It is validated, bound into
-    /// the projection digest, and rendered with its non-authoritative ceiling
-    /// into the prepared-destination receipt; it is never a lease, grant, or
-    /// current-state assertion.
+    /// Optional forensic Host state audit note.
+    ///
+    /// Presenting one is **refused** by the owner-bound configuration projection:
+    /// nothing here compares its digest or observed dispositions to Host state,
+    /// so it is never bound into a projection digest nor rendered into a
+    /// prepared-destination receipt. I5.13 keeps that fence optional.
     pub audit_fence_note: Option<AuditFenceNote>,
-    /// Opaque owner-issued entropy for fresh identity derivation.
+    /// Opaque caller-presented entropy text.
+    ///
+    /// Not an input to the destination identity or the preparation-scope epoch:
+    /// both bind owner-issued evidence instead, so a caller cannot select either
+    /// and an archive-supplied value cannot determine either. It remains hashed
+    /// into the admission digest, so rotating it is a changed idempotency input.
     pub authority_nonce: String,
     /// Caller-observed state fence bound into the receipt.
     pub state_fence_digest: String,
@@ -1669,10 +1866,15 @@ pub struct PresentedPreparationRequest {
 /// This is the exact sink interface the HostComposition owner binds: it owns
 /// the installation/Host journal sink (`J`), takes inspected owner evidence
 /// ([`OwnerEvidence`]) plus one presented request, and runs the full
-/// owner-bound preparation lifecycle. Caller authentication stays
-/// parameterized pending #954; every owner or presented-evidence failure
-/// maps to a static fail-closed [`PreparationError`] without echoing owner
-/// internals.
+/// owner-bound preparation lifecycle. [`OwnerEvidence`] has all-private fields
+/// and only [`OwnerEvidence::inspect`] can build one, so this port cannot be
+/// entered without a real protected root and a committed registry behind it.
+/// The caller-role half of authentication stays with #954
+/// ([`BackupCallerAuth::authenticate`], a real fail-closed refusal), while the
+/// source-identity half is proved by
+/// [`BackupCallerAuth::authenticate_for_owner`] at the composition port. Every
+/// owner or presented-evidence failure maps to a typed [`PreparationError`]
+/// without echoing owner internals.
 pub struct DelegatedPreparation<J: PreparationJournal> {
     journal: J,
 }
@@ -1687,16 +1889,18 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// presented request.
     ///
     /// Order: bind the active approved generation from the inspected
-    /// evidence, project the bounded owner-issued configuration evidence
+    /// evidence, approve the presented target build and profile against that
+    /// owner record, project the bounded owner-issued configuration evidence
     /// through the owner-bound projector, resolve the manifest-bound owner
     /// source root, then admit and prepare idempotently. The projection is a
-    /// precondition, not an observation: a stale or mixed lease, generation,
-    /// configuration/build digest, purge revision or forensic note is refused
-    /// before any filesystem observation, and the projected owner
-    /// configuration digest plus the projection digest are admitted so the
-    /// prepared-destination receipt binds the exact configuration evidence
-    /// that was proved. The caller never chooses the manifest digest, the
-    /// projection digest, or the owner lease.
+    /// precondition, not an observation: a presented owner lease reference,
+    /// purge-ledger revision or forensic note is refused outright, and a stale
+    /// or mixed generation or configuration/build digest is refused, both
+    /// before any filesystem observation. The projected owner configuration
+    /// digest plus the projection digest are admitted so the
+    /// prepared-destination receipt binds the exact configuration evidence that
+    /// was proved. The caller never chooses the manifest digest, the projection
+    /// digest, or the owner lease.
     ///
     /// The admitted `authority_generation` is the owner-issued one from
     /// [`OwnerEvidence::authority_generation`], so the presented
@@ -1704,9 +1908,11 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     /// evidence, and the presented `request.authority_generation` is not an
     /// input to that decision at all. The presented `staging_parent` is proved
     /// by the protected-root owner inside the preparation, so a
-    /// client-supplied arbitrary path is refused. Target build and profile
-    /// stay presented text with no name-level owner approval: see the module
-    /// documentation.
+    /// client-supplied arbitrary path is refused. The presented target build
+    /// and profile are compared against the owner-issued approved-generation
+    /// handle and approved profile token of the same validated record, so a
+    /// build or profile the owner has not approved is refused rather than
+    /// accepted.
     pub fn prepare(
         &mut self,
         evidence: &OwnerEvidence,
@@ -1715,6 +1921,36 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
         let binding: ApprovedBuildBinding = evidence
             .approved_binding()
             .map_err(|error| note_prepare_error(OP_DELEGATE, "bind_build", error, 0))?;
+        // The presented target build and profile are approved by NAME against
+        // the owner record bound above, not merely shape-checked. The two
+        // owner-issued names are the approved-generation handle and the
+        // approved profile token; no approval list, synthetic table or
+        // always-passing comparison is involved, and a name the owner has not
+        // approved is refused before any effect (case 958/7).
+        if request.target_build != binding.generation_handle {
+            return Err(note_prepare_error(
+                OP_DELEGATE,
+                "check_target",
+                PreparationError::UnapprovedTarget {
+                    field: "target_build",
+                    presented: request.target_build.clone(),
+                    approved: binding.generation_handle.clone(),
+                },
+                0,
+            ));
+        }
+        if request.target_profile != binding.approved_profile {
+            return Err(note_prepare_error(
+                OP_DELEGATE,
+                "check_target",
+                PreparationError::UnapprovedTarget {
+                    field: "target_profile",
+                    presented: request.target_profile.clone(),
+                    approved: binding.approved_profile.clone(),
+                },
+                0,
+            ));
+        }
         let source_root = resolve_owner_source_root(evidence.runtime_roots())
             .map_err(|error| note_prepare_error(OP_DELEGATE, "resolve_source", error, 0))?;
         for digest in &request.build_digests {
@@ -1738,11 +1974,12 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
         }
         // The owner-issued configuration projection runs AFTER the checks above
         // so #983's per-step diagnostics keep their existing precedence, and
-        // BEFORE the admission is built so a stale or mixed lease, generation,
-        // configuration/build digest, purge revision or forensic note is refused
-        // before any effect. The projector re-checks the presented build digests
-        // against the owner-issued artifact set, so the loop above is a first
-        // cheap refusal and this is the authoritative one.
+        // BEFORE the admission is built so a presented lease reference, purge
+        // revision or forensic note, and any stale or mixed generation or
+        // configuration/build digest, is refused before any effect. The
+        // projector re-checks the presented build digests against the
+        // owner-issued artifact set, so the loop above is a first cheap refusal
+        // and this is the authoritative one.
         let projection: BackupConfigProjection = evidence
             .project_backup_configuration(request, &binding)
             .map_err(|error| note_prepare_error(OP_DELEGATE, "project_config", error, 0))?;
@@ -1766,11 +2003,12 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
             authority_generation: evidence.authority_generation(),
             manifest_digest: projection.manifest_digest.clone(),
             config_projection_digest: projection.projection_digest.clone(),
-            // The forensic note reaches the receipt only as rendered evidence
-            // text carrying its own non-authoritative ceiling. There is no
-            // constructor that turns it into a lease, grant, or current-state
-            // assertion, and none is added here.
-            audit_fence_note: request.audit_fence_note.as_ref().map(describe_audit_fence),
+            // No caller-authored forensic note can reach a receipt: a presented
+            // one was refused by the projection above, and `validate_admission`
+            // refuses it independently. `describe_audit_fence` is therefore not
+            // called from this path — an unverified disposition claim must not
+            // be published under a forensic label.
+            audit_fence_note: None,
             authority_nonce: request.authority_nonce.clone(),
             state_fence_digest: request.state_fence_digest.clone(),
         };
@@ -1820,6 +2058,9 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
             field,
             reason: "evidence is not current owner evidence".to_owned(),
         },
+        ProjectionError::OwnerEvidenceUnavailable { field, obligation } => {
+            PreparationError::OwnerEvidenceUnavailable { field, obligation }
+        }
     }
 }
 
@@ -2037,20 +2278,28 @@ impl OwnerEvidence {
     /// - the projection fence is the committed activation fence's authority
     ///   state fence, so a caller cannot choose the fence its evidence is bound
     ///   to;
-    /// - the generation handle is bound inside the projector from the same
-    ///   owner record.
+    /// - the generation handle and profile token are bound inside the projector
+    ///   from the same owner record.
     ///
-    /// Installation identity, owner lease reference, numeric generation,
-    /// purge-ledger revision, presented build digests and the optional
-    /// forensic note are caller-presented and shape-checked here, then bound
-    /// into the returned [`BackupConfigProjection`]. The projector verifies
-    /// presented-vs-owner equality where the owner has evidence and never
-    /// invents currency where it does not: the installation registry, the
-    /// approved generation and the activation commit fence carry no
-    /// owner-issued lease reference and no purge-ledger revision, so those two
-    /// stay presented until #954 control contracts land. No secret-typed field
-    /// exists on this path, and a credential-shaped value fails digest or
-    /// identity shape rather than being projected.
+    /// The presented owner lease reference, purge-ledger revision and optional
+    /// forensic note are passed through unchanged **so the projector refuses
+    /// them**: no installation record, approved generation, activation commit
+    /// fence or host-state record reachable from Host issues or corroborates any
+    /// of the three, so a presented value could only be a self-declaration. The
+    /// returned [`BackupConfigProjection`] therefore carries an empty lease
+    /// reference and a zero purge-ledger revision, and the projection digest
+    /// binds those absences explicitly. No secret-typed field exists on this
+    /// path, and a credential-shaped value fails digest or identity shape
+    /// rather than being projected.
+    ///
+    /// Installation identity, numeric generation and presented build digests
+    /// remain caller-presented and shape-checked here, then bound into the
+    /// returned record. The install identity's only owner corroboration is
+    /// `BackupCallerAuth::authenticate_for_owner` at
+    /// `HostComposition::prepare_backup_destination`, which compares it against
+    /// the owner-issued launch installation handle before this method runs; the
+    /// numeric generation and the build digests are compared against
+    /// owner-issued values inside the projector.
     ///
     /// `manifest_digest` is the one field that is NOT caller-presented on this
     /// path, and it is stated here rather than left to look like a check: the
@@ -2158,6 +2407,13 @@ pub fn verify_staging_parent_lease(
 /// Caller authentication itself is pending #954 role-bound control: until
 /// the #954 owner port lands, [`BackupCallerAuth::authenticate`] fails
 /// closed and no destination effect is reachable through delegation.
+///
+/// The live source-identity proof is
+/// [`BackupCallerAuth::authenticate_for_owner`], which
+/// `HostComposition::prepare_backup_destination` runs before any preparation
+/// and which compares the presented source installation identity against the
+/// owner-issued launch installation handle covered by the held owner lease. See
+/// the module documentation for exactly what is proved there and what is not.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackupCallerAuth {
     /// Owner-issued caller lease digest (hex64; shape-checked only).
@@ -2178,8 +2434,15 @@ impl BackupCallerAuth {
     ///
     /// Fail-closed pending the #954 caller-control port: there is currently
     /// no owner-issued caller token to verify against, so every caller is
-    /// refused here before any destination effect. The #954 implementation
+    /// refused here before any destination effect. This is a real refusal, not
+    /// a placeholder for a passing check: no destination can be prepared
+    /// through the authenticated-caller path until #954 supplies the
+    /// verification, and no code path relaxes it. The #954 implementation
     /// fills this method without changing its signature or callers.
+    ///
+    /// The owner-issued source-identity proof that does exist today is
+    /// [`BackupCallerAuth::authenticate_for_owner`]; this method covers the
+    /// caller-role/credential half that #954 owns.
     pub fn authenticate(&self) -> Result<(), PreparationError> {
         Err(PreparationError::InvalidRequest {
             field: "caller_auth",

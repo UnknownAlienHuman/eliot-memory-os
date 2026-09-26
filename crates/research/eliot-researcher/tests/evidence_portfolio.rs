@@ -131,12 +131,43 @@ fn record(handle: &str) -> SourceRecord {
     SourceRecord::new(source_params(handle)).expect("source record")
 }
 
+// Fixture for the owner-bound absence preconditions: the two former
+// caller-supplied booleans are no longer inputs, so the cases below present the
+// evidence those flags stood in for.
+fn no_match_evaluation(members: &[String], frozen_scope_digest: &str) -> NoMatchEvaluation {
+    NoMatchEvaluation {
+        predicate_id: "predicate-700".to_owned(),
+        frozen_scope_digest: frozen_scope_digest.to_owned(),
+        index_revision: "index-rev-1".to_owned(),
+        no_match_members: members.to_vec(),
+    }
+}
+
+fn preconditions(
+    account: &CoverageAccount,
+    evaluation: Option<NoMatchEvaluation>,
+    frozen_scope_digest: &str,
+) -> AbsencePreconditions {
+    AbsencePreconditions::derive(
+        account,
+        &BTreeMap::new(),
+        1_700_000_300_000,
+        frozen_scope_digest,
+        evaluation,
+    )
+    .expect("preconditions")
+}
+
 fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> AuthorizedManifest {
     let mut sources = BTreeMap::new();
     for (handle, entry) in &portfolio.records {
         sources.insert(
             handle.clone(),
-            (entry.content_digest.clone(), entry.transformed_from.clone()),
+            ManifestSource {
+                record_digest: entry.digest().expect("source record commitment"),
+                content_digest: entry.content_digest.clone(),
+                transformed_from: entry.transformed_from.clone(),
+            },
         );
     }
     let edges: BTreeSet<(String, String)> = portfolio
@@ -273,6 +304,8 @@ fn source_outside_claim_authority_domain() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::Unsupported);
@@ -331,13 +364,23 @@ fn stale_partial_and_contested_sources_limit_grade() {
         statement: "the alloy survives".to_owned(),
         material: true,
         domain: "propulsion".to_owned(),
-        citations: vec!["base-src".to_owned(), "rival-src".to_owned()],
+        citations: vec!["base-src".to_owned()],
         precision: Vec::new(),
         counterclaim_ids: vec!["rival-src".to_owned()],
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
-    assert_eq!(verdict.outcome, ClaimOutcome::Contradicted);
+    // The old fixture listed `rival-src` as a citation AND as a counterclaim and
+    // expected CONTRADICTED. That is the defect #2874 closes: listing a handle
+    // contests nothing. With no opposition relation supplied the honest class is
+    // NOT_VERIFIABLE_IN_SCOPE, and the identity is still preserved.
+    assert_eq!(verdict.outcome, ClaimOutcome::NotVerifiableInScope);
+    assert_eq!(
+        verdict.public_class(),
+        PublicAuditClass::NotVerifiableInScope
+    );
     assert_eq!(verdict.counterevidence, vec!["rival-src".to_owned()]);
 }
 
@@ -442,37 +485,55 @@ fn acquisition_dispositions_stay_distinct() {
 #[test]
 fn absence_requires_complete_authoritative_lookup() {
     let inquiry = FrozenInquiry::freeze(inquiry_params()).expect("inquiry");
-    let mut proven = CoverageAccount::open(inquiry.denominator_members()).expect("account");
-    for member in inquiry.denominator_members() {
+    let members: Vec<String> = inquiry.denominator_members().into_iter().collect();
+    let mut proven = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
         proven
             .record(
-                &member,
+                member,
                 SourceDisposition::Observed,
                 Some(format!("h-{member}")),
             )
             .expect("record");
     }
-    assert_eq!(assess_absence(true, &proven, true), AbsenceVerdict::Proven);
-    let mut gapped = CoverageAccount::open(inquiry.denominator_members()).expect("account");
-    for member in inquiry.denominator_members() {
+    assert_eq!(
+        assess_absence(
+            &proven,
+            &preconditions(
+                &proven,
+                Some(no_match_evaluation(&members, DIGEST_A)),
+                DIGEST_A
+            )
+        ),
+        AbsenceVerdict::Proven
+    );
+    let mut gapped = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
         let disposition = if member == "primary#0" {
             SourceDisposition::Unknown
         } else {
             SourceDisposition::Observed
         };
         gapped
-            .record(&member, disposition, Some(format!("h-{member}")))
+            .record(member, disposition, Some(format!("h-{member}")))
             .expect("record");
     }
     assert!(matches!(
-        assess_absence(true, &gapped, true),
+        assess_absence(
+            &gapped,
+            &preconditions(
+                &gapped,
+                Some(no_match_evaluation(&members, DIGEST_A)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::Unproven { .. }
     ));
-    let mut exhausted = CoverageAccount::open(inquiry.denominator_members()).expect("account");
-    for member in inquiry.denominator_members() {
+    let mut exhausted = CoverageAccount::open(members.iter().cloned().collect()).expect("account");
+    for member in &members {
         exhausted
             .record(
-                &member,
+                member,
                 SourceDisposition::Observed,
                 Some(format!("h-{member}")),
             )
@@ -482,15 +543,29 @@ fn absence_requires_complete_authoritative_lookup() {
         .note_frontier("route budget ended early")
         .expect("frontier");
     assert!(matches!(
-        assess_absence(true, &exhausted, true),
+        assess_absence(
+            &exhausted,
+            &preconditions(
+                &exhausted,
+                Some(no_match_evaluation(&members, DIGEST_A)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::PartialExhaustion { .. }
     ));
     assert!(matches!(
-        assess_absence(false, &proven, true),
+        assess_absence(&proven, &preconditions(&proven, None, DIGEST_A)),
         AbsenceVerdict::Unproven { .. }
     ));
     assert!(matches!(
-        assess_absence(true, &proven, false),
+        assess_absence(
+            &proven,
+            &preconditions(
+                &proven,
+                Some(no_match_evaluation(&members, DIGEST_B)),
+                DIGEST_A
+            )
+        ),
         AbsenceVerdict::Unproven { .. }
     ));
 }
@@ -628,6 +703,8 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: vec!["unread-dossier-9".to_owned()],
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&hidden_unknown, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -642,6 +719,8 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
     let verdict = audit_claim(&bare, &portfolio, &manifest, 1_700_000_300_000);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
@@ -654,9 +733,20 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         precision: Vec::new(),
         counterclaim_ids: Vec::new(),
         unknown_refs: Vec::new(),
+        frozen_identities: Vec::new(),
+        opposition_relations: Vec::new(),
     };
+    // A claim with no frozen identity cannot be released as supported: there is
+    // nothing to check its wording and revision against, so `MethodArtifact-
+    // Alignment` fails by construction. The internal outcome stays
+    // INCOMPLETE_ACCOUNTING rather than acquiring a new terminal class.
     let verdict = audit_claim(&clean, &portfolio, &manifest, 1_700_000_300_000);
-    assert_eq!(verdict.outcome, ClaimOutcome::Supported);
+    assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
+    assert_eq!(
+        verdict.public_class(),
+        PublicAuditClass::NotVerifiableInScope
+    );
+    assert!(!verdict.dimensions_complete());
     assert_eq!(verdict.grade_ceiling, Some(2));
     assert!(GOLDEN.contains("INCOMPLETE_ACCOUNTING"));
     assert!(GOLDEN.contains("SUPPORTED"));

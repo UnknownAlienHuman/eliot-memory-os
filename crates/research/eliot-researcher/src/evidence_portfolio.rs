@@ -23,8 +23,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_research_exchange_api::{CompletionDisposition, DisclosureClass, SourceClass};
+use serde::{Serialize, Serializer};
 
 /// Stable identity of this discipline surface.
 pub const PORTFOLIO_CONTRACT: &str = "eliot.research.evidence-portfolio";
@@ -128,6 +129,27 @@ pub enum PortfolioError {
         /// Failing field path.
         field: &'static str,
     },
+    /// A canonical value could not be encoded into its declared identity domain.
+    ///
+    /// Identity preimages in this module go through the repository's accepted
+    /// canonical serializer ([`eliot_contracts::canonical_json_bytes`]), so an
+    /// unencodable value is a real refusal rather than a silent omission: a
+    /// digest that skipped a field it could not spell would be exactly the
+    /// identity seam this module exists to close.
+    Unencodable {
+        /// Failing field path.
+        field: &'static str,
+    },
+    /// A recomputed canonical digest disagrees with the frozen one.
+    ///
+    /// This is the readback/provenance check: a record, inquiry or manifest
+    /// whose bytes no longer hash to the digest bound to it has been substituted
+    /// or corrupted after the freeze, and constructor-time validation alone
+    /// cannot detect that.
+    InvalidDigest {
+        /// Failing field path.
+        field: &'static str,
+    },
 }
 
 impl std::fmt::Display for PortfolioError {
@@ -163,6 +185,12 @@ impl std::fmt::Display for PortfolioError {
             }
             Self::InvalidTerminal { field } => {
                 write!(f, "{field} cannot decode as complete")
+            }
+            Self::Unencodable { field } => {
+                write!(f, "{field} cannot be encoded into its canonical domain")
+            }
+            Self::InvalidDigest { field } => {
+                write!(f, "{field} does not match its recomputed canonical digest")
             }
         }
     }
@@ -344,6 +372,19 @@ impl SourceDisposition {
     }
 }
 
+impl Serialize for SourceDisposition {
+    /// Serializes as the same stable wire spelling [`Self::wire_name`] returns.
+    ///
+    /// The identity preimages must not depend on a Rust variant name, and this
+    /// enum must not grow a second spelling: `wire_name` is the single owner and
+    /// this impl only projects it. A derived `Serialize` would have emitted the
+    /// variant identifier (`Observed`) instead, which is the same defect as
+    /// encoding `{:?}` into a digest.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
 /// Ranked deception/exfiltration/persistence risk for one source (I15.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RiskState {
@@ -369,8 +410,16 @@ impl RiskState {
     }
 }
 
+impl Serialize for RiskState {
+    /// Serializes as the same stable wire spelling [`Self::wire_name`] returns.
+    /// See the [`SourceDisposition`] impl for the single-owner rationale.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
 /// One exact structured evidence span inside a source payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EvidenceSpan {
     /// Stable span identity within the source.
     pub span_id: String,
@@ -380,12 +429,36 @@ pub struct EvidenceSpan {
     pub excerpt_digest: String,
 }
 
+impl EvidenceSpan {
+    /// Total order used to freeze spans deterministically.
+    ///
+    /// `evidence_spans` arrives as a `Vec`, so a caller's ordering would
+    /// otherwise leak into the record's identity and two records holding the
+    /// same spans in a different order would disagree on their digest while
+    /// meaning exactly the same thing. Ordering is by the whole span, so a
+    /// duplicated `span_id` with different content still sorts deterministically
+    /// and both copies stay bound.
+    fn canonical_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.span_id
+            .cmp(&other.span_id)
+            .then_with(|| self.anchor.cmp(&other.anchor))
+            .then_with(|| self.excerpt_digest.cmp(&other.excerpt_digest))
+    }
+}
+
 /// A vetted source record. Every I15.5 assurance dimension is an explicit
 /// typed field: identity/provenance, integrity, freshness, domain competence,
 /// incentives/track record, independence/common lineage, privacy class,
 /// instruction-injection risk, deception/exfiltration/persistence risk,
 /// allowed epistemic use, allowed effects, and required verifier/quarantine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Every field on this struct participates in [`Self::digest`]. The record is
+/// serialized whole through the repository's canonical serializer, so a field
+/// cannot be added here and left out of the identity: the omission that made a
+/// changed freshness boundary, transform verification, allowed effect, verifier,
+/// quarantine, counterevidence target, citation edge, excerpt span or data role
+/// hash identically is no longer expressible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SourceRecord {
     /// Canonical source handle; the frozen identity of this record.
     pub handle: String,
@@ -518,7 +591,7 @@ impl SourceRecord {
     /// artifacts: a derived record without verified raw lineage keeps its
     /// transform cap downstream instead of failing here.
     #[allow(clippy::too_many_lines)]
-    pub fn new(params: SourceRecordParams) -> Result<Self, PortfolioError> {
+    pub fn new(mut params: SourceRecordParams) -> Result<Self, PortfolioError> {
         text(&params.handle, "source.handle")?;
         text(&params.title, "source.title")?;
         text(&params.locator, "source.locator")?;
@@ -609,6 +682,22 @@ impl SourceRecord {
             digest(&span.excerpt_digest, "source.excerpt_digest")?;
         }
         text(&params.data_role, "source.data_role")?;
+        // The two caller-ordered collections are frozen into canonical order
+        // here rather than only inside the encoder, so a constructor-built record
+        // and its digest agree about what "the same record" means: two records
+        // listing the same citation edges or the same evidence spans in a
+        // different order are now equal *and* hash equally, instead of comparing
+        // unequal while sharing one identity.
+        //
+        // This is an invariant of the constructor, not of the type: every field is
+        // `pub` and the struct is not `#[non_exhaustive]`, so a direct struct
+        // literal can still carry an arbitrary order. Such a record is not
+        // rejected — it simply hashes to its own distinct identity, and
+        // `AuthorizedManifest::binds_source_record` still catches it against the
+        // commitment a manifest froze. The claim being made here is the narrow
+        // one: `new` normalises, and only `new` is claimed to.
+        params.cites.sort();
+        params.evidence_spans.sort_by(EvidenceSpan::canonical_order);
         Ok(Self {
             handle: params.handle,
             class: params.class,
@@ -657,38 +746,93 @@ impl SourceRecord {
         self.authority_domains.iter().any(|d| d == domain)
     }
 
-    /// Canonical digest of this vetted record.
-    pub fn digest(&self) -> String {
-        let mut preimage = String::from("source-record/v1;");
-        self.canonical_into(&mut preimage);
-        freeze(&preimage)
+    /// Whether this record carries `span` among its own admitted evidence spans.
+    ///
+    /// Exact on all three span fields, so a relation cannot quote an excerpt
+    /// digest the record does not hold and call it admitted. A record with no
+    /// spans admits none, which is the fail-closed answer.
+    pub fn binds_span(&self, span: &EvidenceSpan) -> bool {
+        self.evidence_spans.iter().any(|held| {
+            held.span_id == span.span_id
+                && held.anchor == span.anchor
+                && held.excerpt_digest == span.excerpt_digest
+        })
     }
 
-    fn canonical_into(&self, preimage: &mut String) {
-        push_field(preimage, "handle", &self.handle);
-        push_field(preimage, "class", &format!("{:?}", self.class));
-        push_field(preimage, "locator", &self.locator);
-        push_field(preimage, "content_digest", &self.content_digest);
-        push_field(preimage, "operation_id", &self.operation_id);
-        push_field(preimage, "receipt_handle", &self.receipt_handle);
-        push_field(preimage, "acquisition", self.acquisition.wire_name());
-        if let Some(grade) = self.grade {
-            push_field(preimage, "grade", &grade.to_string());
+    /// Deterministic canonical bytes of the whole vetted record.
+    ///
+    /// This is the one encoder for the declared
+    /// [`SOURCE_RECORD_DIGEST_DOMAIN`], and [`Self::digest`] is its only
+    /// caller. Object keys are sorted recursively and the domain string is
+    /// bound into the bytes, so the same record always produces the same bytes
+    /// with no clock, address or map-ordering input.
+    ///
+    /// The previous encoder was a hand-written field list that named ten of the
+    /// record's twenty-nine fields. Anything it did not name was invisible to
+    /// the identity, which is the defect this method replaces: the field set is
+    /// now the struct's field set, so a field cannot be added to the record and
+    /// forgotten here.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&SourceRecordDigestInput {
+            domain: SOURCE_RECORD_DIGEST_DOMAIN,
+            record: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "source.canonical_body",
+        })
+    }
+
+    /// Canonical digest of this vetted record.
+    ///
+    /// Refused rather than defaulted when the record cannot be encoded: a digest
+    /// computed over a silently shortened field set would be worse than no
+    /// digest, because it would look like provenance.
+    pub fn digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with a frozen one.
+    ///
+    /// This is the readback check the constructor cannot perform. A record
+    /// substituted after the freeze still validates as itself — every field it
+    /// carries is well-formed — and only a recomputation over the bytes actually
+    /// present can say that it is no longer the record that was frozen.
+    pub fn verify_identity(&self, frozen_digest: &str) -> Result<(), PortfolioError> {
+        if self.digest()? != frozen_digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "source.record_digest",
+            });
         }
-        push_count(preimage, "domains", self.authority_domains.len());
-        for domain in &self.authority_domains {
-            push_field(preimage, "domain", domain);
-        }
-        if let Some(root) = &self.lineage_root {
-            push_field(preimage, "lineage_root", root);
-        }
-        push_field(preimage, "disclosure", &format!("{:?}", self.disclosure));
-        push_field(preimage, "deception_risk", self.deception_risk.wire_name());
+        Ok(())
     }
 }
 
+/// Declared identity domain of [`SourceRecord`].
+///
+/// Bumped `v1` -> `v2` with the complete field set. The `v1` preimage was a
+/// length-prefixed string over ten named fields, so a record that changed its
+/// freshness boundary, transform verification, allowed use or effects, verifier,
+/// quarantine, counterevidence relation, citation edges, excerpt spans or data
+/// role hashed identically to its predecessor. The bytes and the field set both
+/// changed, so the domain says so instead of letting one name cover two
+/// incompatible field sets.
+pub const SOURCE_RECORD_DIGEST_DOMAIN: &str = "source-record/v2";
+
+/// The single canonical encoder input for [`SourceRecord`].
+///
+/// The record is borrowed whole rather than field-by-field: the omission this
+/// replaces happened because a hand-written list and a struct can drift apart,
+/// and nothing in the compiler objects when they do.
+#[derive(Serialize)]
+struct SourceRecordDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole vetted record.
+    record: &'a SourceRecord,
+}
+
 /// One expected source-role slot of the frozen denominator.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RoleSlot {
     /// Role name admitted by the denominator.
     pub role: String,
@@ -701,7 +845,7 @@ pub struct RoleSlot {
 }
 
 /// Finite budget caps bound into the immutable inquiry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BudgetCaps {
     /// Maximum acquisition attempts.
     pub attempts: u64,
@@ -727,7 +871,10 @@ pub struct BudgetCaps {
 /// independence, freshness and grade requirements, admitted route capability
 /// references, independent budgets, stop and partial policy, and the
 /// operation/replay identity with its frozen digest.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Every field participates in [`Self::digest`], and the digest is the only one
+/// excluded from its own preimage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct FrozenInquiry {
     /// Schema identity the inquiry is bound to.
     pub schema: String,
@@ -770,8 +917,35 @@ pub struct FrozenInquiry {
     /// Replay identity of this inquiry.
     pub replay_id: String,
     /// Frozen digest over the whole inquiry shape.
+    ///
+    /// Excluded from its own preimage by `#[serde(skip)]`, so the digest is the
+    /// only field on this struct that is not part of the identity it certifies.
+    #[serde(skip)]
     pub digest: String,
 }
+
+/// Declared identity domain of [`FrozenInquiry`].
+///
+/// Bumped `v1` -> `v2` when the State Fence was added to the preimage, and
+/// `v2` -> `v3` here for a different reason: the `v2` preimage spelled all five
+/// fence components with `{:?}`. Rust `Debug` is a diagnostic rendering, not a
+/// versioned wire form — it is not covered by any compatibility promise, it can
+/// change with a type wrapper or a derive, and `task_revision`, `policy_revision`
+/// and `integration_revision` are three distinct types that were each rendered
+/// independently. The fence is now serialized as the typed value it is, through
+/// the same canonical serializer as the rest of the inquiry.
+///
+/// # What this does and does not buy
+///
+/// It removes the `Debug` dependency, which was unversioned and undocumented. It
+/// does **not** make these bytes independent of the fence's field set: the
+/// encoder is now bound to `StateFence`'s serde shape in `eliot-contracts`, so a
+/// field added there changes `frozen-inquiry/v3` bytes with no bump on this side
+/// and nothing here would detect it. That residual is real and is why the field
+/// set is a declared contract rather than an implementation detail — but it is a
+/// weaker guarantee than a versioned wire form, and this constant's name should
+/// not be read as claiming otherwise.
+pub const FROZEN_INQUIRY_DIGEST_DOMAIN: &str = "frozen-inquiry/v3";
 
 /// Named constructor arguments for [`FrozenInquiry::freeze`].
 #[derive(Clone, Debug)]
@@ -900,55 +1074,7 @@ impl FrozenInquiry {
         text(&params.replay_id, "inquiry.replay_id")?;
         params.roles.sort_by(|a, b| a.role.cmp(&b.role));
         params.routes.sort();
-        let mut preimage = String::from("frozen-inquiry/v1;");
-        push_field(&mut preimage, "schema", &params.schema);
-        push_field(&mut preimage, "protocol", &params.protocol);
-        push_field(&mut preimage, "policy", &params.policy);
-        push_field(&mut preimage, "question", &params.question);
-        push_field(&mut preimage, "objective", &params.objective);
-        push_field(&mut preimage, "output_contract", &params.output_contract);
-        push_field(&mut preimage, "requester", &params.requester);
-        push_field(&mut preimage, "task", &params.task);
-        push_field(&mut preimage, "attempt", &params.attempt);
-        push_field(&mut preimage, "scope", &params.scope);
-        push_field(&mut preimage, "privacy", &params.privacy);
-        push_field(
-            &mut preimage,
-            "disclosure",
-            &format!("{:?}", params.disclosure),
-        );
-        push_count(&mut preimage, "roles", params.roles.len());
-        for slot in &params.roles {
-            push_field(&mut preimage, "role", &slot.role);
-            push_field(&mut preimage, "class", &format!("{:?}", slot.class));
-            push_field(&mut preimage, "required", &slot.required.to_string());
-            push_field(&mut preimage, "authority_domain", &slot.authority_domain);
-        }
-        push_count(&mut preimage, "routes", params.routes.len());
-        for route in &params.routes {
-            push_field(&mut preimage, "route", route);
-        }
-        for (tag, value) in [
-            ("attempts", params.budgets.attempts),
-            ("sources", params.budgets.sources),
-            ("bytes", params.budgets.bytes),
-            ("stu", params.budgets.stu),
-            ("output", params.budgets.output),
-            ("cost", params.budgets.cost),
-            ("work", params.budgets.work),
-        ] {
-            push_field(&mut preimage, tag, &value.to_string());
-        }
-        push_field(
-            &mut preimage,
-            "deadline_ms",
-            &params.budgets.deadline_ms.to_string(),
-        );
-        push_field(&mut preimage, "stop_rule", &params.stop_rule);
-        push_field(&mut preimage, "partial_policy", &params.partial_policy);
-        push_field(&mut preimage, "operation_id", &params.operation_id);
-        push_field(&mut preimage, "replay_id", &params.replay_id);
-        Ok(Self {
+        let mut inquiry = Self {
             schema: params.schema,
             protocol: params.protocol,
             policy: params.policy,
@@ -969,8 +1095,49 @@ impl FrozenInquiry {
             partial_policy: params.partial_policy,
             operation_id: params.operation_id,
             replay_id: params.replay_id,
-            digest: freeze(&preimage),
+            digest: String::new(),
+        };
+        inquiry.digest = inquiry.canonical_digest()?;
+        Ok(inquiry)
+    }
+
+    /// Deterministic canonical bytes of the whole frozen inquiry, with the
+    /// stored digest excluded.
+    ///
+    /// The State Fence is serialized as the typed value it is, through the same
+    /// canonical serializer as every other field, so its five components are
+    /// bound by their own contract spellings rather than by whatever `Debug`
+    /// happened to print. The digest and the bytes come from this one encoder, so
+    /// a stored inquiry can be re-read and re-hashed without reconstructing a
+    /// preimage by hand.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&FrozenInquiryDigestInput {
+            domain: FROZEN_INQUIRY_DIGEST_DOMAIN,
+            inquiry: self,
         })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "inquiry.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// A reloaded inquiry is only the same inquiry if its bytes still hash to
+    /// the digest recorded beside them. The fence is inside those bytes, so a
+    /// fence rewritten after the freeze is detected here rather than being
+    /// accepted as the fence the inquiry was frozen under.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "inquiry.digest",
+            });
+        }
+        Ok(())
     }
 
     /// Exact denominator members: one `role#index` position per required
@@ -1001,6 +1168,19 @@ impl FrozenInquiry {
         }
         freeze(&preimage)
     }
+}
+
+/// The single canonical encoder input for [`FrozenInquiry`].
+///
+/// The inquiry is borrowed whole; its `digest` field is excluded by
+/// `#[serde(skip)]` on the field itself, so the exclusion is declared next to
+/// the field it excludes rather than reconstructed at each call site.
+#[derive(Serialize)]
+struct FrozenInquiryDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen inquiry, minus its own digest.
+    inquiry: &'a FrozenInquiry,
 }
 
 /// One provider-neutral acquisition request prepared through the existing
@@ -1256,16 +1436,50 @@ pub fn decide_grade(records: &[&SourceRecord], claim_domain: &str, now_ms: i64) 
     GradeDecision { ceiling, limits }
 }
 
+/// One observed candidate the frozen denominator never declared.
+///
+/// I21.1: a provider result that was never admitted stays visibly outside the
+/// frozen scope. The observation keeps its real [`SourceDisposition`], its exact
+/// content digest and the admitted operation that produced it, it closes no
+/// declared member, and it never becomes part of the declared population. The
+/// denominator is never widened to fit an observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedOutsideScope {
+    /// Observed source handle, exactly as the acquisition route reported it.
+    pub handle: String,
+    /// What the acquisition route actually observed.
+    pub disposition: SourceDisposition,
+    /// Exact digest of the observed content bytes.
+    pub content_digest: String,
+    /// Admitted operation identity that produced the observation.
+    pub operation_id: String,
+    /// Digest of the admitted reference manifest the observation fell outside
+    /// of.
+    pub admitted_manifest_digest: String,
+}
+
+impl ObservedOutsideScope {
+    /// Closed reason code an observation in this set carries. It is the only
+    /// reason the set can hold: an observation is retained here exactly because
+    /// the frozen denominator never declared it, and the code is digested so a
+    /// reader never has to infer the reason from the schema.
+    pub const REASON: &'static str = "observed_outside_frozen_scope";
+}
+
 /// Exact coverage accounting over the frozen denominator: every expected
 /// member carries exactly one visible disposition, an explicit exclusion, or
-/// a budget-frontier note. Complete accounting never implies that all
-/// evidence succeeded.
+/// a budget-frontier note, and every candidate the run actually observed is
+/// either bound to one of those members or retained as an observation outside
+/// the frozen scope. Complete accounting never implies that all evidence
+/// succeeded, and the two populations stay separately visible in every digest
+/// so a verified empty scope never reads as an enumeration that never ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageAccount {
     expected: BTreeSet<String>,
     outcomes: BTreeMap<String, (SourceDisposition, Option<String>)>,
     exclusions: BTreeMap<String, String>,
     frontier: Option<String>,
+    observed: BTreeMap<String, ObservedOutsideScope>,
 }
 
 impl CoverageAccount {
@@ -1281,12 +1495,14 @@ impl CoverageAccount {
             outcomes: BTreeMap::new(),
             exclusions: BTreeMap::new(),
             frontier: None,
+            observed: BTreeMap::new(),
         })
     }
 
     /// Records one disposition for one expected member, with the acquiring
-    /// source handle when one exists. Re-recording the same disposition is
-    /// idempotent; a changed disposition for the same member conflicts.
+    /// source handle when one exists. A repeated delivery of the identical
+    /// member/disposition/handle binding is idempotent; any changed binding
+    /// conflicts rather than disappearing behind the same disposition.
     pub fn record(
         &mut self,
         member: &str,
@@ -1298,25 +1514,85 @@ impl CoverageAccount {
                 field: "coverage.member",
             });
         }
+        if let Some(handle) = &handle {
+            text(handle, "coverage.handle")?;
+        }
         if self.exclusions.contains_key(member) {
             return Err(PortfolioError::Conflict {
                 field: "coverage.member",
             });
         }
         match self.outcomes.get(member) {
-            Some((current, _)) if *current == disposition => Ok(()),
+            Some((current, current_handle))
+                if *current == disposition && *current_handle == handle =>
+            {
+                Ok(())
+            }
             Some(_) => Err(PortfolioError::Conflict {
                 field: "coverage.member",
             }),
             None => {
-                if let Some(handle) = &handle {
-                    text(handle, "coverage.handle")?;
-                }
                 self.outcomes
                     .insert(member.to_owned(), (disposition, handle));
                 Ok(())
             }
         }
+    }
+
+    /// Records one observed candidate against the accounting.
+    ///
+    /// A handle the frozen denominator declared is recorded as that member's
+    /// disposition. A handle the denominator never declared is retained as an
+    /// [`ObservedOutsideScope`] observation: it keeps its real disposition,
+    /// content digest and admitted operation, closes no member, and stays
+    /// outside the declared population. A repeated delivery of the identical
+    /// binding is idempotent; a changed disposition, content digest or admitted
+    /// operation under an already-retained handle conflicts instead of
+    /// overwriting the earlier observation.
+    pub fn observe(
+        &mut self,
+        handle: &str,
+        disposition: SourceDisposition,
+        content_digest: &str,
+        operation_id: &str,
+        admitted_manifest_digest: &str,
+    ) -> Result<(), PortfolioError> {
+        text(handle, "coverage.handle")?;
+        digest(content_digest, "coverage.content_digest")?;
+        text(operation_id, "coverage.operation_id")?;
+        digest(
+            admitted_manifest_digest,
+            "coverage.admitted_manifest_digest",
+        )?;
+        if self.expected.contains(handle) {
+            return self.record(handle, disposition, Some(handle.to_owned()));
+        }
+        let observation = ObservedOutsideScope {
+            handle: handle.to_owned(),
+            disposition,
+            content_digest: content_digest.to_owned(),
+            operation_id: operation_id.to_owned(),
+            admitted_manifest_digest: admitted_manifest_digest.to_owned(),
+        };
+        match self.observed.get(handle) {
+            Some(current) if *current == observation => Ok(()),
+            Some(_) => Err(PortfolioError::Conflict {
+                field: "coverage.observed_handle",
+            }),
+            None => {
+                self.observed.insert(handle.to_owned(), observation);
+                Ok(())
+            }
+        }
+    }
+
+    /// Every observed candidate the frozen denominator never declared, in
+    /// canonical handle order. These close no declared member and narrow no
+    /// denominator: they are retained so an empty eligible scope stays
+    /// distinguishable from an enumeration that never ran.
+    #[must_use]
+    pub fn observed_outside_scope(&self) -> Vec<ObservedOutsideScope> {
+        self.observed.values().cloned().collect()
     }
 
     /// Excludes one member under an explicit permitted reason.
@@ -1418,6 +1694,26 @@ impl CoverageAccount {
                 push_field(preimage, "handle", handle);
             }
         }
+        push_count(preimage, "observed", self.observed.len());
+        for observation in self.observed.values() {
+            push_field(preimage, ObservedOutsideScope::REASON, &observation.handle);
+            push_field(
+                preimage,
+                "observed_disposition",
+                observation.disposition.wire_name(),
+            );
+            push_field(
+                preimage,
+                "observed_content_digest",
+                &observation.content_digest,
+            );
+            push_field(preimage, "observed_operation_id", &observation.operation_id);
+            push_field(
+                preimage,
+                "observed_manifest_digest",
+                &observation.admitted_manifest_digest,
+            );
+        }
         push_count(preimage, "exclusions", self.exclusions.len());
         for (member, reason) in &self.exclusions {
             push_field(preimage, "excluded", member);
@@ -1439,9 +1735,10 @@ impl CoverageAccount {
 /// Absence verdict for one scoped negative claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AbsenceVerdict {
-    /// Proven: complete denominator, full accounting, authoritative lookup.
+    /// Proven: complete denominator, full accounting, current sources and a
+    /// bounded predicate evaluation over exactly the closed members.
     Proven,
-    /// Unproven: unknown or unavailable material leaves the negative open.
+    /// Unproven: a named retained fact leaves the negative open.
     Unproven {
         /// Bounded reason the absence cannot be claimed.
         reason: String,
@@ -1453,43 +1750,320 @@ pub enum AbsenceVerdict {
     },
 }
 
-/// Assesses a scoped absence claim. Only a complete denominator with full
-/// accounting and an authoritative lookup proves absence; unknown or
-/// unavailable material is never absence, and bounded exhaustion is partial.
+/// One owner-bound, identity-bearing record of a bounded predicate evaluation
+/// over a named closed population.
+///
+/// This is neither a verdict nor a flag: it is the identity of the per-member
+/// predicate result. It names the predicate that was evaluated, the frozen
+/// scope snapshot and index revision the evaluation was bounded to, and the
+/// exact members it found no match for. [`assess_absence`] proves absence only
+/// when that member set is exactly the set of declared members the accounting
+/// closed intact, so an incomplete evaluation cannot be presented as
+/// exhaustive and a ranked index can neither add a member to the denominator
+/// of a negative nor remove one from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoMatchEvaluation {
+    /// Exact identity of the predicate that was evaluated.
+    pub predicate_id: String,
+    /// Digest of the frozen scope snapshot the evaluation was bounded to.
+    pub frozen_scope_digest: String,
+    /// Revision of the source/index the evaluation ran against.
+    pub index_revision: String,
+    /// Members the predicate found no match for. Normalised into canonical
+    /// order by [`AbsencePreconditions::derive`] so arrival order never
+    /// affects the comparison against the closed denominator.
+    pub no_match_members: Vec<String>,
+}
+
+/// The owner-bound preconditions one exact negative claim is assessed against.
+///
+/// Every field is derived from the exact coverage accounting, the vetted source
+/// records behind it and the frozen scope snapshot the claim is scoped to, and
+/// every field is private: a precondition set can only be produced by
+/// [`AbsencePreconditions::derive`] over a real [`CoverageAccount`], never
+/// written by a caller. [`assess_absence`] then re-proves the digest before it
+/// reads any of the content and re-checks the bound account digest against the
+/// account it is handed, so a set that was not derived over that account is
+/// refused instead of believed. A caller supplies evidence and never a verdict.
+///
+/// The record names which precondition is unmet through the bounded reason
+/// [`AbsenceVerdict::Unproven`] retains, and its digest binds the preconditions
+/// to that exact evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbsencePreconditions {
+    /// Digest of the frozen scope snapshot the claim is scoped to.
+    frozen_scope_digest: String,
+    /// Digest of the exact accounting the preconditions were derived over.
+    account_digest: String,
+    /// Declared members that were never examined at all.
+    unexamined: Vec<String>,
+    /// Declared members examined with a disposition that did not close them,
+    /// paired with that disposition's stable spelling.
+    unclosed: Vec<(String, &'static str)>,
+    /// Declared members carrying an explicit exclusion. An exclusion is not a
+    /// successful search, so an excluded member can never support a negative.
+    excluded: Vec<String>,
+    /// Closed members whose source or index is no longer current.
+    incompatible: Vec<String>,
+    /// Declared members the accounting closed intact.
+    closed: Vec<String>,
+    /// Candidates observed outside the frozen scope. They are counted so an
+    /// empty eligible set stays distinguishable from an enumeration that never
+    /// ran; they close no member and narrow no denominator.
+    observed_outside_scope: usize,
+    /// Frontier where a bounded enumeration stopped, when one applied.
+    frontier: Option<String>,
+    /// The bounded predicate evaluation bound to the requested query, when one
+    /// exists. The research plane records acquisition dispositions, not
+    /// per-member query predicate results, so an inquiry record binds none and
+    /// the negative stays unproven.
+    evaluation: Option<NoMatchEvaluation>,
+    /// Digest over the preconditions.
+    digest: String,
+}
+
+impl AbsencePreconditions {
+    /// Derives the preconditions of one exact negative claim from the exact
+    /// accounting, the vetted records behind it and the frozen snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a digest or field error for a malformed frozen-scope digest or a
+    /// malformed evaluation binding, and
+    /// [`PortfolioError::IncompleteDenominator`] for an evaluation that names
+    /// no member, which no closed population produces.
+    pub fn derive(
+        account: &CoverageAccount,
+        records: &BTreeMap<String, SourceRecord>,
+        now_ms: i64,
+        frozen_scope_digest: &str,
+        evaluation: Option<NoMatchEvaluation>,
+    ) -> Result<Self, PortfolioError> {
+        digest(frozen_scope_digest, "absence.frozen_scope_digest")?;
+        let mut unclosed: Vec<(String, &'static str)> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        let mut incompatible: Vec<String> = Vec::new();
+        for (member, (disposition, handle)) in &account.outcomes {
+            if disposition.closes_member() {
+                closed.push(member.clone());
+                let stale = handle.as_ref().is_some_and(|handle| {
+                    records
+                        .get(handle)
+                        .is_some_and(|record| record.is_stale_at(now_ms))
+                });
+                if stale {
+                    incompatible.push(member.clone());
+                }
+            } else {
+                unclosed.push((member.clone(), disposition.wire_name()));
+            }
+        }
+        let evaluation = match evaluation {
+            Some(mut evaluation) => {
+                text(&evaluation.predicate_id, "absence.predicate_id")?;
+                text(&evaluation.index_revision, "absence.index_revision")?;
+                digest(
+                    &evaluation.frozen_scope_digest,
+                    "absence.evaluation_frozen_scope_digest",
+                )?;
+                if evaluation.no_match_members.is_empty() {
+                    return Err(PortfolioError::IncompleteDenominator {
+                        field: "absence.no_match_members",
+                    });
+                }
+                for member in &evaluation.no_match_members {
+                    text(member, "absence.no_match_member")?;
+                }
+                evaluation.no_match_members.sort();
+                evaluation.no_match_members.dedup();
+                Some(evaluation)
+            }
+            None => None,
+        };
+        let mut preconditions = Self {
+            frozen_scope_digest: frozen_scope_digest.to_owned(),
+            account_digest: account.digest(),
+            unexamined: account.open_members(),
+            unclosed,
+            excluded: account.exclusions.keys().cloned().collect(),
+            incompatible,
+            closed,
+            observed_outside_scope: account.observed.len(),
+            frontier: account.frontier.clone(),
+            evaluation,
+            digest: String::new(),
+        };
+        preconditions.digest = preconditions.compute_digest();
+        Ok(preconditions)
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("absence-preconditions/v1;");
+        push_field(
+            &mut preimage,
+            "frozen_scope_digest",
+            &self.frozen_scope_digest,
+        );
+        push_field(&mut preimage, "account_digest", &self.account_digest);
+        for (tag, members) in [
+            ("unexamined", &self.unexamined),
+            ("excluded", &self.excluded),
+            ("incompatible", &self.incompatible),
+            ("closed", &self.closed),
+        ] {
+            push_count(&mut preimage, tag, members.len());
+            for member in members {
+                push_field(&mut preimage, tag, member);
+            }
+        }
+        push_count(&mut preimage, "unclosed", self.unclosed.len());
+        for (member, disposition) in &self.unclosed {
+            push_field(&mut preimage, "unclosed_member", member);
+            push_field(&mut preimage, "unclosed_disposition", disposition);
+        }
+        push_count(
+            &mut preimage,
+            "observed_outside_scope",
+            self.observed_outside_scope,
+        );
+        if let Some(frontier) = &self.frontier {
+            push_field(&mut preimage, "frontier", frontier);
+        }
+        match &self.evaluation {
+            Some(evaluation) => {
+                push_field(&mut preimage, "predicate_id", &evaluation.predicate_id);
+                push_field(
+                    &mut preimage,
+                    "evaluation_frozen_scope_digest",
+                    &evaluation.frozen_scope_digest,
+                );
+                push_field(&mut preimage, "index_revision", &evaluation.index_revision);
+                push_count(
+                    &mut preimage,
+                    "no_match_members",
+                    evaluation.no_match_members.len(),
+                );
+                for member in &evaluation.no_match_members {
+                    push_field(&mut preimage, "no_match_member", member);
+                }
+            }
+            None => push_field(&mut preimage, "evaluation", "absent"),
+        }
+        freeze(&preimage)
+    }
+}
+
+/// Assesses a scoped absence claim over owner-bound preconditions.
+///
+/// Only a complete denominator, an exact accounting of every declared member,
+/// an intact source/index for each closed member, no exclusion and a bounded
+/// predicate evaluation over exactly the closed members proves absence. A
+/// bounded enumeration that stopped is partial exhaustion. Every rejected claim
+/// names the retained fact that rejected it, so no verdict rests on a
+/// caller-supplied flag.
+///
+/// `account` is the accounting the preconditions are claimed to describe. It is
+/// required so the preconditions cannot be re-bound to a different accounting
+/// than the one they were derived over, and it is the only trusted account the
+/// assessment has. A precondition set that does not re-prove its own digest, or
+/// whose bound account digest is not this account's, is refused as
+/// [`AbsenceVerdict::Unproven`] before any of its content is read: a claim that
+/// cannot be re-proved is not proved.
 pub fn assess_absence(
-    denominator_complete: bool,
     account: &CoverageAccount,
-    authoritative_lookup: bool,
+    preconditions: &AbsencePreconditions,
 ) -> AbsenceVerdict {
-    if account.frontier.is_some() {
+    if preconditions.compute_digest() != preconditions.digest {
+        return AbsenceVerdict::Unproven {
+            reason: "absence: the preconditions do not re-prove their own digest, so this set is \
+                     not owner-bound evidence and proves nothing"
+                .to_owned(),
+        };
+    }
+    let account_digest = account.digest();
+    if preconditions.account_digest != account_digest {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the preconditions are bound to coverage account {account_digest}, not to \
+                 the account presented with them, so the two cannot be swapped"
+            ),
+        };
+    }
+    if let Some(frontier) = &preconditions.frontier {
         return AbsenceVerdict::PartialExhaustion {
-            frontier: account.frontier.clone().unwrap_or_default(),
+            frontier: frontier.clone(),
         };
     }
-    if !denominator_complete {
+    if !preconditions.unexamined.is_empty() {
         return AbsenceVerdict::Unproven {
-            reason: "denominator is not a complete scope".to_owned(),
+            reason: format!(
+                "coverage: {} declared denominator member(s) were never examined: {}",
+                preconditions.unexamined.len(),
+                preconditions.unexamined.join(",")
+            ),
         };
     }
-    if !account.is_accounted() {
+    if !preconditions.excluded.is_empty() {
         return AbsenceVerdict::Unproven {
-            reason: "coverage accounting is incomplete".to_owned(),
+            reason: format!(
+                "coverage: an exclusion is not a successful search; {} member(s) were excluded: {}",
+                preconditions.excluded.len(),
+                preconditions.excluded.join(",")
+            ),
         };
     }
-    if !authoritative_lookup {
+    if !preconditions.unclosed.is_empty() {
+        let unclosed = preconditions
+            .unclosed
+            .iter()
+            .map(|(member, disposition)| format!("{member}={disposition}"))
+            .collect::<Vec<String>>()
+            .join(",");
         return AbsenceVerdict::Unproven {
-            reason: "lookup is not authoritative for this scope".to_owned(),
+            reason: format!(
+                "coverage: {} examined member(s) did not close their denominator slot: {unclosed}",
+                preconditions.unclosed.len()
+            ),
         };
     }
-    let open = account.outcomes.values().any(|(disposition, _)| {
-        matches!(
-            disposition,
-            SourceDisposition::Unknown | SourceDisposition::Unavailable
-        )
-    });
-    if open {
+    if !preconditions.incompatible.is_empty() {
         return AbsenceVerdict::Unproven {
-            reason: "unknown or unavailable material leaves the negative open".to_owned(),
+            reason: format!(
+                "coverage: {} closed member(s) are no longer current for the frozen snapshot: {}",
+                preconditions.incompatible.len(),
+                preconditions.incompatible.join(",")
+            ),
+        };
+    }
+    let Some(evaluation) = &preconditions.evaluation else {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: no bounded predicate evaluation is bound to the requested query over \
+                 frozen scope snapshot {}; accounting {} declared member(s) closed and observing \
+                 {} candidate(s) outside that scope does not prove the query has no match",
+                preconditions.frozen_scope_digest,
+                preconditions.closed.len(),
+                preconditions.observed_outside_scope
+            ),
+        };
+    };
+    if evaluation.frozen_scope_digest != preconditions.frozen_scope_digest {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the predicate evaluation is bounded to frozen scope snapshot {}, not to {}",
+                evaluation.frozen_scope_digest, preconditions.frozen_scope_digest
+            ),
+        };
+    }
+    if evaluation.no_match_members != preconditions.closed {
+        return AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the predicate evaluation covers {} member(s) over index revision {}, \
+                 not the {} closed member(s) of the frozen denominator",
+                evaluation.no_match_members.len(),
+                evaluation.index_revision,
+                preconditions.closed.len()
+            ),
         };
     }
     AbsenceVerdict::Proven
@@ -1498,6 +2072,10 @@ pub fn assess_absence(
 /// Structured precision kinds for already-structured claim/reference records.
 /// No prose is parsed: assertions arrive structured and are checked against
 /// structured support.
+///
+/// The set is closed: an assertion kind that is not one of these is not a
+/// precision this crate can check, and an unchecked kind is never reported as
+/// supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrecisionKind {
     /// Quantified numeric assertion with unit and denominator.
@@ -1508,6 +2086,14 @@ pub enum PrecisionKind {
     Version,
     /// Causal mechanism assertion.
     Causal,
+    /// Coordinate/anchor assertion: the claimed anchor precision of a citation.
+    ///
+    /// I21.7: "A source that supports a file-level or document-level claim does
+    /// not automatically support a symbol, line, causal mechanism or
+    /// population-wide statement." The coordinate form of that rule is this
+    /// kind: a citation may not claim an anchor finer than the support it
+    /// actually carries.
+    Coordinate,
 }
 
 /// One structured precision assertion: what a claim asserts and what the
@@ -1539,6 +2125,26 @@ pub struct UnsupportedPrecisionItem {
     pub risk: String,
     /// Required probe or narrower wording.
     pub required_probe: String,
+}
+
+/// Coordinate/anchor precision rank on the I21.7 ladder, coarsest first.
+///
+/// The wire spellings are the ones the exchange contract's
+/// `AnchorPrecision` uses, and the order is that type's weakest-first order:
+/// `source` is the coarsest anchor and `byte_range` the finest. A spelling this
+/// function does not know has no rank, and an unknown rank is never treated as
+/// coarse enough to admit a fine anchor.
+fn coordinate_rank(name: &str) -> Option<u8> {
+    match name {
+        "source" => Some(0),
+        "document" => Some(1),
+        "page" => Some(2),
+        "section" => Some(3),
+        "paragraph" => Some(4),
+        "line" => Some(5),
+        "byte_range" => Some(6),
+        _ => None,
+    }
 }
 
 fn decimal_scale(value: &str) -> Option<usize> {
@@ -1656,6 +2262,15 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             .supported
             .split('|')
             .any(|mechanism| mechanism.trim() == assertion.asserted.trim()),
+        PrecisionKind::Coordinate => match (
+            coordinate_rank(assertion.asserted.trim()),
+            coordinate_rank(assertion.supported.trim()),
+        ) {
+            // An unrecognised coordinate spelling is never treated as supported:
+            // an unknown rank fails closed rather than falling back to equality.
+            (Some(asserted_rank), Some(supported_rank)) => asserted_rank <= supported_rank,
+            _ => false,
+        },
     };
     if supported {
         Ok(())
@@ -1677,6 +2292,10 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
                 "false causal mechanism without evidenced mechanism",
                 "name only evidenced mechanisms or declare correlation",
             ),
+            PrecisionKind::Coordinate => (
+                "a citation at an anchor finer than the admitted support would be unbacked text",
+                "narrow the anchor to the supported precision or admit a source that supports it",
+            ),
         };
         Err(UnsupportedPrecisionItem {
             asserted: assertion.asserted.clone(),
@@ -1685,6 +2304,96 @@ pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), Unsupported
             risk: risk.to_owned(),
             required_probe: probe.to_owned(),
         })
+    }
+}
+
+/// Whether a claim is material to the inquiry decision.
+///
+/// Typed rather than a bare `bool` so a frozen claim identity cannot carry an
+/// unlabelled truth value into an audit: materiality changes which public audit
+/// class a verdict may take, and an unlabelled `false` reads as "not material"
+/// whether the author meant that or forgot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum ClaimMateriality {
+    /// The claim is material to the inquiry decision and must be audited.
+    Material,
+    /// The claim is supporting colour and is not audited as material.
+    NonMaterial,
+}
+
+impl ClaimMateriality {
+    /// Stable wire spelling of this materiality.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Material => "MATERIAL",
+            Self::NonMaterial => "NON_MATERIAL",
+        }
+    }
+
+    /// Whether a claim of this materiality may be audited as material.
+    pub const fn is_material(self) -> bool {
+        matches!(self, Self::Material)
+    }
+}
+
+/// What a statement asserts, as distinct from how strongly it asserts it.
+///
+/// Modality is part of the frozen claim identity because two claims can share a
+/// subject, a population and a source while differing only in modality, and a
+/// counterevidence relation that refutes a descriptive claim says nothing about
+/// a normative one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum ClaimModality {
+    /// Describes what is the case.
+    Descriptive,
+    /// Asserts what will be the case.
+    Predictive,
+    /// Asserts what ought to be the case.
+    Normative,
+    /// Asserts that one thing causes another.
+    Causal,
+}
+
+impl ClaimModality {
+    /// Stable wire spelling of this modality.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Descriptive => "DESCRIPTIVE",
+            Self::Predictive => "PREDICTIVE",
+            Self::Normative => "NORMATIVE",
+            Self::Causal => "CAUSAL",
+        }
+    }
+}
+
+/// The scope under which one claim or one counterevidence relation is asserted.
+///
+/// I21.8 requires a claim to be judged under the population, time, definition and
+/// denominator it was actually made under. A source about another population is
+/// not a weaker contradiction of a claim about this one; it is a statement about
+/// something else, and this record is what keeps the two apart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClaimConditions {
+    /// Population or scope the statement is about.
+    pub population_scope: String,
+    /// Time window and version the statement is about.
+    pub time_version: String,
+    /// Definition, unit and denominator the statement is measured in.
+    pub definition_unit_denominator: String,
+    /// Modality the statement asserts in.
+    pub modality: ClaimModality,
+}
+
+impl ClaimConditions {
+    /// Stable wire spelling of this condition set.
+    pub fn wire_name(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.population_scope,
+            self.time_version,
+            self.definition_unit_denominator,
+            self.modality.wire_name()
+        )
     }
 }
 
@@ -1706,9 +2415,570 @@ pub struct AuditedClaim {
     /// Structured precision assertions for this claim.
     pub precision: Vec<PrecisionAssertion>,
     /// Counterclaim identities preserved against this claim.
+    ///
+    /// These are **alleged** counterclaims and nothing more. A handle listed here
+    /// is eligible to be examined; it is never a contradiction, and a caller
+    /// cannot promote one by listing it. `Contradicts` is reachable only from a
+    /// [`ClaimOppositionRelation`] that the accepted semantic-evaluation owner
+    /// established, so this list is preserved rather than believed.
     pub counterclaim_ids: Vec<String>,
     /// Unknown evidence references that must stay explicit.
     pub unknown_refs: Vec<String>,
+    /// Frozen claim identities this claim was frozen under.
+    ///
+    /// Empty means the claim carries no frozen identity, and the audit then
+    /// reports every attached counterclaim as unverifiable rather than assuming
+    /// opposition. A claim that cannot state what it is cannot have anything
+    /// contradict it.
+    pub frozen_identities: Vec<FrozenClaimIdentity>,
+    /// Owner-issued claim↔counterevidence relations.
+    ///
+    /// Each is examined on its own evidence. A relation whose evaluator, span or
+    /// source commitment does not verify is reported as unverifiable; it does not
+    /// fall back to the weaker same-domain test that produced the original
+    /// defect.
+    pub opposition_relations: Vec<ClaimOppositionRelation>,
+}
+
+impl AuditedClaim {
+    /// Named constructor for a claim audited without a frozen identity.
+    ///
+    /// A claim that carries no [`FrozenClaimIdentity`] cannot be released as
+    /// supported, because there is nothing to check its wording and revision
+    /// against. This constructor makes that state explicit rather than leaving it
+    /// to a caller to remember: it is the shape a claim arrives in before it has
+    /// been frozen, and the audit says so instead of guessing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every refusal the frozen identity raises. Returns `Ok(None)`
+    /// never — a caller that has no identity uses [`Self::unfrozen`].
+    pub fn freeze_identity(&self) -> Result<FrozenClaimIdentity, PortfolioError> {
+        FrozenClaimIdentity::freeze(FrozenClaimIdentity {
+            claim_id: self.claim_id.clone(),
+            statement: self.statement.clone(),
+            materiality: if self.material {
+                ClaimMateriality::Material
+            } else {
+                ClaimMateriality::NonMaterial
+            },
+            subject: self.domain.clone(),
+            conditions: ClaimConditions {
+                population_scope: self.domain.clone(),
+                time_version: String::new(),
+                definition_unit_denominator: String::new(),
+                modality: ClaimModality::Descriptive,
+            },
+            artifact_digest: self.statement_artifact_digest(),
+            claim_revision: 1,
+            digest: String::new(),
+        })
+    }
+
+    /// The digest of the statement text this claim carries, as its artifact
+    /// identity when no artifact revision was supplied.
+    ///
+    /// The statement is the released wording, so its digest is the honest artifact
+    /// commitment available here. A caller holding a real artifact digest should
+    /// freeze the identity explicitly instead of relying on this.
+    fn statement_artifact_digest(&self) -> String {
+        freeze(&format!("claim-statement/v1;{}", self.statement))
+    }
+}
+
+/// The five public release audit classes that `#1765` requires.
+///
+/// I21.8 names exactly five: `SUPPORTED`, `PARTIALLY_SUPPORTED`, `UNSUPPORTED`,
+/// `CONTRADICTED`, `NOT_VERIFIABLE_IN_SCOPE`. The internal [`ClaimOutcome`] keeps
+/// further values because outside-manifest, stale and incomplete-accounting are
+/// real and distinct findings, and collapsing them into one of the five would
+/// lose the reason. This enum is the lossless public projection, and
+/// [`ClaimVerdict::public_class`] is its only producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicAuditClass {
+    /// Every material dimension the release gate requires is established.
+    Supported,
+    /// Some required dimensions hold and the remainder is preserved as residue.
+    PartiallySupported,
+    /// No sufficient in-manifest support, and nothing contradicts the claim.
+    Unsupported,
+    /// Exact frozen counterevidence refutes the claim under compatible conditions.
+    Contradicted,
+    /// At least one required dimension is unknown, unevaluable or out of scope.
+    ///
+    /// This is the fail-closed class: it is never inferred from the absence of a
+    /// finding. A dimension nobody could evaluate is unknown, and unknown is not
+    /// support.
+    NotVerifiableInScope,
+}
+
+impl PublicAuditClass {
+    /// Every public class, weakest-first, as a frozen ordered list.
+    ///
+    /// Declared so a release consumer can enumerate the whole public vocabulary
+    /// from one owner instead of reconstructing it from the five spellings it
+    /// happens to have seen.
+    pub const ALL: [Self; 5] = [
+        Self::NotVerifiableInScope,
+        Self::Unsupported,
+        Self::PartiallySupported,
+        Self::Supported,
+        Self::Contradicted,
+    ];
+
+    /// Stable wire spelling of this public class.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Supported => "SUPPORTED",
+            Self::PartiallySupported => "PARTIALLY_SUPPORTED",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::Contradicted => "CONTRADICTED",
+            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
+        }
+    }
+}
+
+/// The dimension of a claim a counterevidence relation contests.
+///
+/// A relation names the dimension it opposes so that agreement on every other
+/// dimension is explicit rather than assumed. A source that shares a subject and
+/// a population but asserts the opposite time window has not refuted the claim;
+/// it has made a different claim, and `OppositionDimension` is how the difference
+/// is named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum OppositionDimension {
+    /// The asserted proposition itself.
+    Proposition,
+    /// The polarity of the assertion.
+    Polarity,
+    /// The subject the assertion is about.
+    Subject,
+    /// The population or scope the assertion covers.
+    Population,
+    /// The time window or version the assertion covers.
+    TimeVersion,
+    /// The definition, unit or denominator the assertion is measured in.
+    DefinitionUnit,
+    /// The intervention the assertion attributes the outcome to.
+    Intervention,
+    /// The specific excerpt the assertion rests on.
+    Excerpt,
+}
+
+impl OppositionDimension {
+    /// Stable wire spelling of this dimension.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Proposition => "PROPOSITION",
+            Self::Polarity => "POLARITY",
+            Self::Subject => "SUBJECT",
+            Self::Population => "POPULATION",
+            Self::TimeVersion => "TIME_VERSION",
+            Self::DefinitionUnit => "DEFINITION_UNIT",
+            Self::Intervention => "INTERVENTION",
+            Self::Excerpt => "EXCERPT",
+        }
+    }
+}
+
+/// Whether a relation asserts opposition to the claim or agreement with it.
+///
+/// `Agrees` exists so that "this source supports the claim" is a first-class,
+/// refusable statement rather than the absence of a contradiction. A source that
+/// agrees cannot become counterevidence through any attachment order, and a
+/// relation that claims opposition while evaluating as agreement is a relation
+/// that does not verify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum OppositionPolarity {
+    /// The source contests the claim on the named dimension.
+    Denies,
+    /// The source supports the claim on the named dimension.
+    Agrees,
+}
+
+impl OppositionPolarity {
+    /// Stable wire spelling of this polarity.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Denies => "DENIES",
+            Self::Agrees => "AGREES",
+        }
+    }
+}
+
+/// What the accepted semantic-evaluation owner concluded about one excerpt.
+///
+/// #2874 forbids inferring entailment here. There is no substring match, no
+/// regex test and no trust in a source's own prose label: the only admissible
+/// answer is a receipt from the evaluation owner, and its absence is `Unknown`
+/// rather than a negative result computed locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum SemanticEvaluationOutcome {
+    /// The evaluator established that the excerpt refutes the claim.
+    Refutes,
+    /// The evaluator established that the excerpt does not speak to the claim.
+    Insufficient,
+}
+
+impl SemanticEvaluationOutcome {
+    /// Stable wire spelling of this outcome.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Refutes => "REFUTES",
+            Self::Insufficient => "INSUFFICIENT",
+        }
+    }
+}
+
+/// One owner-issued claim↔counterevidence relation.
+///
+/// This is the only thing that can make a claim `CONTRADICTED`. It binds the exact
+/// claim identity and revision, the exact source record commitment and the exact
+/// span the opposition rests on, the dimension and polarity of the opposition, the
+/// conditions under which the opposition holds, and an evaluator receipt. A
+/// caller that supplies none of this gets `NOT_VERIFIABLE_IN_SCOPE`, which is the
+/// correct answer for "we asserted an opposition and cannot show it".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClaimOppositionRelation {
+    /// Stable relation identity.
+    pub relation_id: String,
+    /// Frozen identity of the claim this relation contests.
+    pub claim: FrozenClaimIdentity,
+    /// Handle of the source alleged to contest the claim.
+    pub source_handle: String,
+    /// Exact commitment of the source record as frozen.
+    ///
+    /// This is [`SourceRecord::digest`] under
+    /// [`SOURCE_RECORD_DIGEST_DOMAIN`], so a source whose interpretation-relevant
+    /// field changed after the relation was issued no longer matches and the
+    /// relation does not verify.
+    pub source_record_digest: String,
+    /// The exact span the opposition rests on.
+    pub span: EvidenceSpan,
+    /// The dimension of the claim this relation contests.
+    pub dimension: OppositionDimension,
+    /// Whether the source contests or agrees with the claim.
+    pub polarity: OppositionPolarity,
+    /// Conditions under which the opposition holds.
+    pub compatible_conditions: ClaimConditions,
+    /// Identity of the evaluator that reached the outcome.
+    pub evaluator_id: String,
+    /// Exact evaluator revision the outcome was produced under.
+    pub evaluator_revision: String,
+    /// What the evaluator concluded.
+    pub evaluation: SemanticEvaluationOutcome,
+    /// Fraction of the claim the evaluation covered, in millionths.
+    ///
+    /// A relation that covers only part of the claim cannot silently close all of
+    /// it; coverage below one millionth leaves the remainder unaccounted.
+    pub coverage_ppm: u32,
+    /// Frozen digest over the whole relation shape.
+    #[serde(skip)]
+    pub digest: String,
+}
+
+/// Declared identity domain of [`FrozenClaimIdentity`].
+///
+/// `v1` is the first declared form. An edited claim's wording, materiality,
+/// subject, conditions, artifact digest or revision all move it, which is what
+/// makes "the wording changed after the opposition was frozen" detectable rather
+/// than a matter of trusting the caller.
+pub const FROZEN_CLAIM_IDENTITY_DOMAIN: &str = "frozen-claim-identity/v1";
+
+/// Declared identity domain of [`ClaimOppositionRelation`].
+///
+/// `v1` is the first declared form. It binds the claim identity, the source record
+/// commitment, the span, the dimension, the polarity, the compatible conditions,
+/// the evaluator identity and revision, the evaluation outcome and the coverage,
+/// so a relation altered in any of those respects stops verifying against itself.
+pub const CLAIM_OPPOSITION_RELATION_DOMAIN: &str = "claim-opposition-relation/v1";
+
+/// One frozen claim identity: exactly what was claimed, under what conditions,
+/// at which artifact revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FrozenClaimIdentity {
+    /// Claim identity.
+    pub claim_id: String,
+    /// Exact final statement wording.
+    pub statement: String,
+    /// Whether the claim is material.
+    pub materiality: ClaimMateriality,
+    /// The subject the claim is about.
+    pub subject: String,
+    /// The exact conditions the claim was made under.
+    pub conditions: ClaimConditions,
+    /// Digest of the artifact the claim was released in.
+    pub artifact_digest: String,
+    /// Revision of the claim within its artifact.
+    pub claim_revision: u64,
+    /// Frozen digest over the whole identity shape.
+    #[serde(skip)]
+    pub digest: String,
+}
+
+/// The single canonical encoder input for [`FrozenClaimIdentity`].
+#[derive(Serialize)]
+struct FrozenClaimIdentityDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen identity, minus its own digest.
+    identity: &'a FrozenClaimIdentity,
+}
+
+/// The single canonical encoder input for [`ClaimOppositionRelation`].
+#[derive(Serialize)]
+struct ClaimOppositionRelationDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole relation, minus its own digest.
+    relation: &'a ClaimOppositionRelation,
+}
+
+impl FrozenClaimIdentity {
+    /// Validates and freezes one claim identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank identity, statement, subject or
+    /// condition, a bad artifact digest, or a value that cannot be encoded.
+    pub fn freeze(mut identity: Self) -> Result<Self, PortfolioError> {
+        text(&identity.claim_id, "claim_identity.claim_id")?;
+        text(&identity.statement, "claim_identity.statement")?;
+        text(&identity.subject, "claim_identity.subject")?;
+        text(
+            &identity.conditions.population_scope,
+            "claim_identity.population_scope",
+        )?;
+        text(
+            &identity.conditions.time_version,
+            "claim_identity.time_version",
+        )?;
+        text(
+            &identity.conditions.definition_unit_denominator,
+            "claim_identity.definition_unit_denominator",
+        )?;
+        digest(&identity.artifact_digest, "claim_identity.artifact_digest")?;
+        if identity.claim_revision == 0 {
+            return Err(PortfolioError::Blank {
+                field: "claim_identity.claim_revision",
+            });
+        }
+        identity.digest = String::new();
+        identity.digest = identity.canonical_digest()?;
+        Ok(identity)
+    }
+
+    /// Deterministic canonical bytes of the frozen identity, digest excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the identity cannot be encoded.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&FrozenClaimIdentityDigestInput {
+            domain: FROZEN_CLAIM_IDENTITY_DOMAIN,
+            identity: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "claim_identity.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the identity cannot be encoded.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::InvalidDigest`] when they disagree.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "claim_identity.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ClaimOppositionRelation {
+    /// Validates and freezes one opposition relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank relation, claim, source or evaluator
+    /// identity, a bad source commitment or artifact digest, a zero revision, or a
+    /// coverage value above one millionth.
+    pub fn freeze(mut relation: Self) -> Result<Self, PortfolioError> {
+        text(&relation.relation_id, "opposition.relation_id")?;
+        text(&relation.source_handle, "opposition.source_handle")?;
+        digest(
+            &relation.source_record_digest,
+            "opposition.source_record_digest",
+        )?;
+        text(&relation.span.span_id, "opposition.span_id")?;
+        text(&relation.span.anchor, "opposition.anchor")?;
+        digest(&relation.span.excerpt_digest, "opposition.excerpt_digest")?;
+        text(
+            &relation.compatible_conditions.population_scope,
+            "opposition.population_scope",
+        )?;
+        text(
+            &relation.compatible_conditions.time_version,
+            "opposition.time_version",
+        )?;
+        text(
+            &relation.compatible_conditions.definition_unit_denominator,
+            "opposition.definition_unit_denominator",
+        )?;
+        text(&relation.evaluator_id, "opposition.evaluator_id")?;
+        text(
+            &relation.evaluator_revision,
+            "opposition.evaluator_revision",
+        )?;
+        if relation.coverage_ppm > 1_000_000 {
+            return Err(PortfolioError::Conflict {
+                field: "opposition.coverage_ppm",
+            });
+        }
+        // The relation is only meaningful against a claim identity that verifies,
+        // so the claim's own commitment is proved here rather than at each use.
+        relation.claim.verify_integrity()?;
+        relation.digest = String::new();
+        relation.digest = relation.canonical_digest()?;
+        Ok(relation)
+    }
+
+    /// Deterministic canonical bytes of the relation, digest excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the relation cannot be encoded.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&ClaimOppositionRelationDigestInput {
+            domain: CLAIM_OPPOSITION_RELATION_DOMAIN,
+            relation: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "opposition.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the relation cannot be encoded.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::InvalidDigest`] when they disagree.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "opposition.digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Named constructor for a relation whose claim identity is already frozen.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every refusal [`Self::freeze`] raises, including the frozen
+    /// claim identity's own. Building a relation and dropping it establishes
+    /// nothing; the audit only ever reads relations attached to
+    /// [`AuditedClaim::opposition_relations`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        relation_id: impl Into<String>,
+        claim: FrozenClaimIdentity,
+        source_handle: impl Into<String>,
+        source_record: &SourceRecord,
+        span: EvidenceSpan,
+        dimension: OppositionDimension,
+        polarity: OppositionPolarity,
+        compatible_conditions: ClaimConditions,
+        evaluator_id: impl Into<String>,
+        evaluator_revision: impl Into<String>,
+        evaluation: SemanticEvaluationOutcome,
+        coverage_ppm: u32,
+    ) -> Result<Self, PortfolioError> {
+        let source_record_digest = source_record.digest()?;
+        Self::freeze(Self {
+            relation_id: relation_id.into(),
+            claim,
+            source_handle: source_handle.into(),
+            source_record_digest,
+            span,
+            dimension,
+            polarity,
+            compatible_conditions,
+            evaluator_id: evaluator_id.into(),
+            evaluator_revision: evaluator_revision.into(),
+            evaluation,
+            coverage_ppm,
+            digest: String::new(),
+        })
+    }
+
+    /// Whether this relation's own conditions are compatible with the claim's.
+    ///
+    /// Compatibility is decided field by field and the mismatching fields are
+    /// returned, never inferred from the broad authority domain. A partial overlap
+    /// is reported as partial: it is not rounded up to agreement, because the
+    /// whole defect this replaces was a broad-domain test standing in for an
+    /// exact one.
+    pub fn condition_compatibility(
+        &self,
+        claim_conditions: &ClaimConditions,
+    ) -> ConditionCompatibility {
+        let mut mismatched: Vec<OppositionDimension> = Vec::new();
+        if self.compatible_conditions.population_scope != claim_conditions.population_scope {
+            mismatched.push(OppositionDimension::Population);
+        }
+        if self.compatible_conditions.time_version != claim_conditions.time_version {
+            mismatched.push(OppositionDimension::TimeVersion);
+        }
+        if self.compatible_conditions.definition_unit_denominator
+            != claim_conditions.definition_unit_denominator
+        {
+            mismatched.push(OppositionDimension::DefinitionUnit);
+        }
+        if self.compatible_conditions.modality != claim_conditions.modality {
+            mismatched.push(OppositionDimension::Proposition);
+        }
+        if mismatched.is_empty() {
+            ConditionCompatibility::Compatible
+        } else if mismatched.len() == 4 {
+            ConditionCompatibility::Incompatible(mismatched)
+        } else {
+            ConditionCompatibility::PartiallyOverlapping(mismatched)
+        }
+    }
+}
+
+/// How one relation's conditions relate to the claim's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConditionCompatibility {
+    /// Every condition matches; the opposition is under the same conditions.
+    Compatible,
+    /// Some conditions match and some do not; both facts are preserved.
+    PartiallyOverlapping(Vec<OppositionDimension>),
+    /// No condition matches; this is a statement about something else.
+    Incompatible(Vec<OppositionDimension>),
 }
 
 /// Claim audit outcome for one structured claim.
@@ -1722,12 +2992,135 @@ pub enum ClaimOutcome {
     Unsupported,
     /// Preserved counterevidence contests the claim.
     Contradicted,
+    /// An attached counterclaim identity is preserved but cannot be verified as
+    /// relevant to this claim's domain under the frozen manifest, so it neither
+    /// contradicts nor supports.
+    NotVerifiableInScope,
     /// A citation falls outside the frozen manifest.
     OutsideManifest,
     /// Stale material limits the claim without closing it.
     StaleLimited,
     /// Material-claim accounting is incomplete.
     IncompleteAccounting,
+}
+
+/// Why one attached counterclaim identity did or did not contradict the claim.
+///
+/// The audit records this per identity rather than only a verdict, so a consumer
+/// never has to recover the reason by matching rendered residue text. Every
+/// variant except [`Self::Contradicts`] leaves the identity preserved but
+/// unverified in scope: absence of contradiction is never read as support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterclaimDisposition {
+    /// Resolved to relevant counterevidence under compatible conditions.
+    ///
+    /// Reachable only from a verified [`ClaimOppositionRelation`]. Every other
+    /// variant below means the opposition was *not* established, and none of them
+    /// is ever read as support.
+    Contradicts,
+    /// The handle is eligible on every axis the manifest, lineage, domain,
+    /// freshness and weight checks cover, but nothing establishes that it actually
+    /// contests this claim. This is the variant the original defect turned into
+    /// `Contradicts`, and it is the honest default for a bare attachment.
+    NotVerifiableInScope,
+    /// The relation is frozen against a different claim or a different claim
+    /// revision, so it says nothing about this claim.
+    RelationClaimMismatch,
+    /// The claim's wording no longer matches the wording the relation was frozen
+    /// against. An edited claim invalidates every verdict reached through it.
+    RelationStatementChanged,
+    /// The claim carries no frozen identity, so no opposition can be established
+    /// against it.
+    NoFrozenClaimIdentity,
+    /// The relation's bytes no longer hash to the digest frozen beside them.
+    RelationDigestMismatch,
+    /// The relation rests on a span the admitted source record does not contain.
+    SpanNotAdmitted,
+    /// The relation is frozen against a source revision that no longer exists.
+    RelationSourceRevisionChanged,
+    /// The evaluator found the excerpt insufficient to speak to the claim.
+    EvaluationInsufficient,
+    /// The relation carries no evaluator identity or revision.
+    NoEvaluationRoute,
+    /// The evaluator established that the source **agrees** with the claim. A
+    /// source that supports a claim cannot become counterevidence through any
+    /// attachment order.
+    AgreesWithClaim,
+    /// The opposition is stated under conditions that do not match the claim's on
+    /// any dimension, so it is a statement about something else.
+    IncompatibleConditions,
+    /// The opposition matches the claim's conditions on some dimensions and not
+    /// others. Preserved as partial; never rounded up to agreement.
+    PartiallyOverlappingConditions,
+    /// The opposition covers only part of the claim, leaving the remainder
+    /// unaccounted.
+    PartialCoverage,
+    /// The handle is allowlisted but explicitly revoked, so it cannot be
+    /// verified as counterevidence and is not merely absent.
+    Revoked,
+    /// The handle is outside the frozen manifest.
+    OutsideManifest,
+    /// No authoritative lineage stands behind the handle.
+    UnresolvedLineage,
+    /// The record does not cover the claim's authority domain.
+    OutsideDomain,
+    /// The record is past its frozen freshness boundary at the audit instant, so
+    /// it cannot contradict under compatible conditions.
+    Stale,
+    /// The record's acquisition disposition carries no evidentiary weight.
+    CarriesNoWeight,
+    /// The same handle is also a material citation of this claim, so it cannot
+    /// contest it. The input asserts the source both supports and contests the
+    /// claim, which this cell does not resolve in either direction.
+    AlsoACitation,
+}
+
+impl CounterclaimDisposition {
+    /// Stable wire spelling of this disposition.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Contradicts => "CONTRADICTS",
+            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
+            Self::Revoked => "REVOKED",
+            Self::OutsideManifest => "OUTSIDE_MANIFEST",
+            Self::UnresolvedLineage => "UNRESOLVED_LINEAGE",
+            Self::OutsideDomain => "OUTSIDE_DOMAIN",
+            Self::Stale => "STALE",
+            Self::CarriesNoWeight => "CARRIES_NO_WEIGHT",
+            Self::AlsoACitation => "ALSO_A_CITATION",
+            Self::RelationClaimMismatch => "RELATION_CLAIM_MISMATCH",
+            Self::RelationStatementChanged => "RELATION_STATEMENT_CHANGED",
+            Self::NoFrozenClaimIdentity => "NO_FROZEN_CLAIM_IDENTITY",
+            Self::RelationDigestMismatch => "RELATION_DIGEST_MISMATCH",
+            Self::SpanNotAdmitted => "SPAN_NOT_ADMITTED",
+            Self::RelationSourceRevisionChanged => "RELATION_SOURCE_REVISION_CHANGED",
+            Self::EvaluationInsufficient => "EVALUATION_INSUFFICIENT",
+            Self::NoEvaluationRoute => "NO_EVALUATION_ROUTE",
+            Self::AgreesWithClaim => "AGREES_WITH_CLAIM",
+            Self::IncompatibleConditions => "INCOMPATIBLE_CONDITIONS",
+            Self::PartiallyOverlappingConditions => "PARTIALLY_OVERLAPPING_CONDITIONS",
+            Self::PartialCoverage => "PARTIAL_COVERAGE",
+        }
+    }
+
+    /// Whether this disposition means the opposition was established.
+    ///
+    /// The only `true` in this table is [`Self::Contradicts`], and it is the only
+    /// one reachable from a verified relation. Everything else — including
+    /// [`Self::AgreesWithClaim`] and every eligibility failure — leaves the
+    /// opposition unestablished, and none of them is ever read as support.
+    pub const fn establishes_opposition(self) -> bool {
+        matches!(self, Self::Contradicts)
+    }
+}
+
+/// One attached counterclaim identity with the disposition the audit gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterclaimResolution {
+    /// The attached counterclaim identity, preserved verbatim.
+    pub counterclaim_id: String,
+    /// Disposition this audit assigned to the identity.
+    pub disposition: CounterclaimDisposition,
 }
 
 impl ClaimOutcome {
@@ -1738,6 +3131,7 @@ impl ClaimOutcome {
             Self::PartiallySupported => "PARTIALLY_SUPPORTED",
             Self::Unsupported => "UNSUPPORTED",
             Self::Contradicted => "CONTRADICTED",
+            Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
             Self::OutsideManifest => "OUTSIDE_MANIFEST",
             Self::StaleLimited => "STALE_LIMITED",
             Self::IncompleteAccounting => "INCOMPLETE_ACCOUNTING",
@@ -1755,14 +3149,203 @@ pub struct ClaimVerdict {
     pub outcome: ClaimOutcome,
     /// Typed residue lines (sorted for stability).
     pub residue: Vec<String>,
+    /// The over-precise assertions of this claim, as typed items.
+    ///
+    /// I21.7 requires the `UnsupportedPrecisionItem` to be *recorded*, not only
+    /// rendered: a verdict that keeps the item's asserted coordinate, highest
+    /// supported precision, basis, false-precision risk and required probe as
+    /// one `String` loses the structure a downstream consumer needs to tell a
+    /// false line anchor from a false causal mechanism. The rendered
+    /// [`Self::residue`] line is still produced, so nothing is lost.
+    pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
     /// Preserved counterevidence identities.
     pub counterevidence: Vec<String>,
+    /// Per-identity disposition of every attached counterclaim, in sorted-id
+    /// order. This is the typed partition the outcome is derived from.
+    pub counterclaim_resolutions: Vec<CounterclaimResolution>,
     /// Preserved unknown references.
     pub unknowns: Vec<String>,
     /// Grade ceiling over the supporting records, when computable.
     pub grade_ceiling: Option<u8>,
     /// Evidence handles behind the verdict, sorted.
     pub evidence_map: Vec<String>,
+    /// Every dimension the audit examined, whether or not it found a failure.
+    ///
+    /// This is the record that makes the public projection lossless in the other
+    /// direction. A verdict that kept only its terminal outcome would force a
+    /// consumer to recover "was this also outside the manifest, and also stale?"
+    /// by matching residue prose — the exact mistake the `#1765` repair already
+    /// had to undo once. The dimensions are named, not rendered.
+    pub dimensions: Vec<AuditDimension>,
+    /// Digests of the relations the audit relied on, sorted.
+    ///
+    /// A verdict is bound to the exact relations that produced it, so a later
+    /// reader can tell whether the opposition still verifies rather than trusting
+    /// a `CONTRADICTED` label whose evidence has since changed.
+    pub relation_digests: Vec<String>,
+    /// Digest of the frozen claim identity this verdict was decided under.
+    ///
+    /// Empty when the claim carried no frozen identity, which is itself a reason
+    /// the verdict cannot be `Supported`.
+    pub claim_identity_digest: String,
+}
+
+/// One named dimension the claim audit examined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditDimension {
+    /// Every material citation resolved inside the frozen manifest.
+    ReferenceVerification,
+    /// Every material citation carries evidentiary weight.
+    ValueVerification,
+    /// The claim is inside the requested specification and scope.
+    SpecificationCompliance,
+    /// The method and artifact the claim rests on are the ones audited.
+    MethodArtifactAlignment,
+    /// The claim's wording and revision still match what was frozen.
+    ClaimIdentityCurrent,
+    /// Every alleged counterclaim was examined.
+    CounterevidenceExamined,
+    /// Material-claim accounting is complete.
+    AccountingComplete,
+    /// Every attached counterclaim resolved to exactly one disposition.
+    ///
+    /// The premise of this dimension is that the partitions agree: a handle cannot
+    /// be simultaneously "outside the manifest" on the citation side and "also a
+    /// citation" on the counterclaim side. `audit_claim` classifies each handle
+    /// once and both partitions read that one answer, so this dimension is the
+    /// record that the two did not diverge.
+    PartitionCoherence,
+}
+
+impl AuditDimension {
+    /// Stable wire spelling of this dimension.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReferenceVerification => "REFERENCE_VERIFICATION",
+            Self::ValueVerification => "VALUE_VERIFICATION",
+            Self::SpecificationCompliance => "SPECIFICATION_COMPLIANCE",
+            Self::MethodArtifactAlignment => "METHOD_ARTIFACT_ALIGNMENT",
+            Self::ClaimIdentityCurrent => "CLAIM_IDENTITY_CURRENT",
+            Self::CounterevidenceExamined => "COUNTEREVIDENCE_EXAMINED",
+            Self::AccountingComplete => "ACCOUNTING_COMPLETE",
+            Self::PartitionCoherence => "PARTITION_COHERENCE",
+        }
+    }
+}
+
+impl ClaimVerdict {
+    /// The wire spellings of the typed over-precision residue, in the item order
+    /// the audit produced them. A binding that hashes this verdict can name the
+    /// typed items without depending on their rendered prose.
+    #[must_use]
+    pub fn unsupported_precision_lines(&self) -> Vec<String> {
+        self.unsupported_precision
+            .iter()
+            .map(|item| {
+                format!(
+                    "unsupported_precision:{}|{}|{}|{}",
+                    item.asserted, item.highest_supported, item.basis, item.required_probe
+                )
+            })
+            .collect()
+    }
+
+    /// The public release class for this verdict.
+    ///
+    /// Lossless by construction: every internal outcome maps to exactly one public
+    /// class, and no dimension is discarded to reach it. `OutsideManifest`,
+    /// `StaleLimited` and `IncompleteAccounting` are not public classes — I21.8
+    /// names five — so they project onto the class that describes what a release
+    /// consumer may do with the claim: an outside-manifest or stale claim is not
+    /// `Supported`, and an incompletely accounted one is not verifiable.
+    #[must_use]
+    pub fn public_class(&self) -> PublicAuditClass {
+        match self.outcome {
+            ClaimOutcome::Contradicted => PublicAuditClass::Contradicted,
+            ClaimOutcome::Supported => PublicAuditClass::Supported,
+            ClaimOutcome::PartiallySupported => PublicAuditClass::PartiallySupported,
+            ClaimOutcome::Unsupported | ClaimOutcome::StaleLimited => PublicAuditClass::Unsupported,
+            ClaimOutcome::OutsideManifest
+            | ClaimOutcome::NotVerifiableInScope
+            | ClaimOutcome::IncompleteAccounting => PublicAuditClass::NotVerifiableInScope,
+        }
+    }
+
+    /// Whether every dimension the release gate requires was established.
+    ///
+    /// This is the "no `SUPPORTED` promotion while a required dimension fails or
+    /// is unknown" rule expressed as a question a consumer can ask, rather than
+    /// as a precedence chain that decides it silently.
+    #[must_use]
+    pub fn dimensions_complete(&self) -> bool {
+        !self.dimensions.is_empty()
+            && self
+                .dimensions
+                .iter()
+                .all(|dimension| self.dimension_passed(*dimension))
+    }
+
+    /// Whether one named dimension passed. An absent dimension did not pass.
+    fn dimension_passed(&self, dimension: AuditDimension) -> bool {
+        let failed = match dimension {
+            AuditDimension::ReferenceVerification => {
+                self.outcome == ClaimOutcome::OutsideManifest || self.evidence_map.is_empty()
+            }
+            AuditDimension::ValueVerification => {
+                self.outcome == ClaimOutcome::Unsupported
+                    || self.outcome == ClaimOutcome::StaleLimited
+                    || self.outcome == ClaimOutcome::PartiallySupported
+            }
+            AuditDimension::SpecificationCompliance => {
+                self.counterclaim_resolutions.iter().any(|entry| {
+                    matches!(
+                        entry.disposition,
+                        CounterclaimDisposition::IncompatibleConditions
+                            | CounterclaimDisposition::PartiallyOverlappingConditions
+                            | CounterclaimDisposition::OutsideDomain
+                    )
+                })
+            }
+            AuditDimension::MethodArtifactAlignment => self.claim_identity_digest.is_empty(),
+            AuditDimension::ClaimIdentityCurrent => {
+                self.counterclaim_resolutions.iter().any(|entry| {
+                    matches!(
+                        entry.disposition,
+                        CounterclaimDisposition::RelationStatementChanged
+                            | CounterclaimDisposition::RelationClaimMismatch
+                            | CounterclaimDisposition::NoFrozenClaimIdentity
+                            | CounterclaimDisposition::RelationDigestMismatch
+                    )
+                })
+            }
+            AuditDimension::CounterevidenceExamined => {
+                self.counterevidence.is_empty()
+                    || self.counterclaim_resolutions.iter().any(|entry| {
+                        !matches!(
+                            entry.disposition,
+                            CounterclaimDisposition::Contradicts
+                                | CounterclaimDisposition::AlsoACitation
+                        )
+                    })
+            }
+            AuditDimension::AccountingComplete => {
+                self.outcome == ClaimOutcome::IncompleteAccounting || !self.unknowns.is_empty()
+            }
+            // Coherence is a property of how this verdict was built rather than of
+            // what it found: every handle in `counterclaim_resolutions` carries
+            // exactly one disposition, and a handle cannot appear twice with
+            // different answers. It fails only if the resolution list contradicts
+            // itself, which no current path can produce — which is the point of
+            // recording it.
+            AuditDimension::PartitionCoherence => {
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                self.counterclaim_resolutions
+                    .iter()
+                    .any(|entry| !seen.insert(entry.counterclaim_id.as_str()))
+            }
+        };
+        !failed
+    }
 }
 
 /// The frozen evidence portfolio under audit: inquiry identity, vetted source
@@ -1832,20 +3415,43 @@ impl EvidencePortfolio {
     }
 }
 
+/// The exact identity one manifest admits for one source.
+///
+/// A manifest used to bind `handle -> (content_digest, transformed_from)`, which
+/// commits the acquired bytes and the raw lineage and nothing else. A source
+/// could keep both of those while its freshness boundary, transform
+/// verification, allowed use or effects, verifier, quarantine, counterevidence
+/// relation, citation edges, excerpt spans or data role all changed, and the
+/// manifest rehashed identically while the record an audit reads had become a
+/// different object. The record commitment below is what closes that; the other
+/// two are kept as explicit subfields because they remain independently
+/// meaningful commitments and a consumer should not have to re-derive them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ManifestSource {
+    /// The complete canonical commitment of the vetted [`SourceRecord`], over
+    /// every identity-relevant field it carries.
+    pub record_digest: String,
+    /// Digest of the acquired content bytes.
+    pub content_digest: String,
+    /// Raw source the admitted record was transformed from, when derived.
+    pub transformed_from: Option<String>,
+}
+
 /// One immutable authorized manifest over the exact inquiry, denominator,
 /// source and evidence identities, raw and transform digests, dependence
 /// graph, coverage, grade limits, counterevidence, conflicts, unknowns, the
-/// reference allowlist, and privacy/expiry bounds. Canonical sets are frozen
-/// sorted, so the manifest bytes are stable under arrival order while
-/// meaningful sequence stays identity-visible.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// reference allowlist, and privacy/expiry bounds. Every collection here is a
+/// set in meaning and is frozen sorted by [`Self::freeze`], so the manifest bytes
+/// are stable under arrival order while meaningful sequence stays
+/// identity-visible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AuthorizedManifest {
     /// Digest of the frozen inquiry.
     pub inquiry_digest: String,
     /// Digest of the exact denominator.
     pub denominator_digest: String,
-    /// Source identities to `(content digest, transform lineage)` pairs.
-    pub sources: BTreeMap<String, (String, Option<String>)>,
+    /// Exact source identity commitments by canonical handle.
+    pub sources: BTreeMap<String, ManifestSource>,
     /// Dependence edges `(from, to)` in frozen order.
     pub dependence_edges: BTreeSet<(String, String)>,
     /// Digest of the frozen coverage accounting.
@@ -1869,8 +3475,18 @@ pub struct AuthorizedManifest {
     /// Manifest revision; a revision invalidates older audits.
     pub revision: u64,
     /// Frozen digest over the whole manifest shape.
+    ///
+    /// Excluded from its own preimage by `#[serde(skip)]`.
+    #[serde(skip)]
     pub digest: String,
 }
+
+/// Declared identity domain of [`AuthorizedManifest`].
+///
+/// Bumped `v1` -> `v2` with the per-source record commitment. The `v1`
+/// preimage named two subfields per source where a manifest now names three, so
+/// the same name would have covered two different field sets.
+pub const AUTHORIZED_MANIFEST_DIGEST_DOMAIN: &str = "authorized-manifest/v2";
 
 /// Named constructor arguments for [`AuthorizedManifest::freeze`].
 #[derive(Clone, Debug)]
@@ -1880,7 +3496,7 @@ pub struct AuthorizedManifestParams {
     /// Denominator digest.
     pub denominator_digest: String,
     /// Source identities.
-    pub sources: BTreeMap<String, (String, Option<String>)>,
+    pub sources: BTreeMap<String, ManifestSource>,
     /// Dependence edges.
     pub dependence_edges: BTreeSet<(String, String)>,
     /// Coverage digest.
@@ -1919,10 +3535,11 @@ impl AuthorizedManifest {
                 field: "manifest.sources",
             });
         }
-        for (handle, (content, raw)) in &params.sources {
+        for (handle, source) in &params.sources {
             text(handle, "manifest.source")?;
-            digest(content, "manifest.content_digest")?;
-            if let Some(raw) = raw {
+            digest(&source.record_digest, "manifest.source.record_digest")?;
+            digest(&source.content_digest, "manifest.content_digest")?;
+            if let Some(raw) = &source.transformed_from {
                 text(raw, "manifest.raw_lineage")?;
             }
         }
@@ -1983,53 +3600,13 @@ impl AuthorizedManifest {
         params.conflicts.sort();
         params.unknowns.sort();
         params.allowlist.sort();
-        let mut preimage = String::from("authorized-manifest/v1;");
-        push_field(&mut preimage, "inquiry_digest", &params.inquiry_digest);
-        push_field(
-            &mut preimage,
-            "denominator_digest",
-            &params.denominator_digest,
-        );
-        push_count(&mut preimage, "sources", params.sources.len());
-        for (handle, (content, raw)) in &params.sources {
-            push_field(&mut preimage, "source", handle);
-            push_field(&mut preimage, "content", content);
-            if let Some(raw) = raw {
-                push_field(&mut preimage, "raw", raw);
-            }
-        }
-        push_count(&mut preimage, "edges", params.dependence_edges.len());
-        for (from, to) in &params.dependence_edges {
-            push_field(&mut preimage, "from", from);
-            push_field(&mut preimage, "to", to);
-        }
-        push_field(&mut preimage, "coverage_digest", &params.coverage_digest);
-        for limit in &params.grade_limits {
-            push_field(&mut preimage, "grade_limit", limit);
-        }
-        for item in &params.counterevidence {
-            push_field(&mut preimage, "counterevidence", item);
-        }
-        for item in &params.conflicts {
-            push_field(&mut preimage, "conflict", item);
-        }
-        for item in &params.unknowns {
-            push_field(&mut preimage, "unknown", item);
-        }
-        for handle in &params.allowlist {
-            push_field(&mut preimage, "allowed", handle);
-        }
-        for handle in &params.revoked {
-            push_field(&mut preimage, "revoked", handle);
-        }
-        push_field(
-            &mut preimage,
-            "disclosure",
-            &format!("{:?}", params.disclosure),
-        );
-        push_field(&mut preimage, "expires_ms", &params.expires_ms.to_string());
-        push_field(&mut preimage, "revision", &params.revision.to_string());
-        Ok(Self {
+        // `revoked` is a set in meaning — it answers membership, never order — so
+        // it is sorted with the rest. It was the one canonical collection the
+        // freeze left in arrival order, which meant two manifests revoking the
+        // same handles in a different order hashed differently under one declared
+        // domain: an identity that moved without any authorization moving.
+        params.revoked.sort();
+        let mut manifest = Self {
             inquiry_digest: params.inquiry_digest,
             denominator_digest: params.denominator_digest,
             sources: params.sources,
@@ -2044,8 +3621,10 @@ impl AuthorizedManifest {
             disclosure: params.disclosure,
             expires_ms: params.expires_ms,
             revision: params.revision,
-            digest: freeze(&preimage),
-        })
+            digest: String::new(),
+        };
+        manifest.digest = manifest.canonical_digest()?;
+        Ok(manifest)
     }
 
     /// Whether `handle` is citable under this manifest: allowlisted and not
@@ -2054,32 +3633,323 @@ impl AuthorizedManifest {
         self.allowlist.iter().any(|h| h == handle) && !self.revoked.iter().any(|h| h == handle)
     }
 
-    /// Canonical bytes of the frozen manifest shape (without the digest
-    /// field), stable under arrival order.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut preimage = String::from("authorized-manifest/v1;");
-        push_field(&mut preimage, "inquiry_digest", &self.inquiry_digest);
-        push_field(
-            &mut preimage,
-            "denominator_digest",
-            &self.denominator_digest,
-        );
-        push_count(&mut preimage, "sources", self.sources.len());
-        for (handle, (content, raw)) in &self.sources {
-            push_field(&mut preimage, "source", handle);
-            push_field(&mut preimage, "content", content);
-            if let Some(raw) = raw {
-                push_field(&mut preimage, "raw", raw);
-            }
-        }
-        push_count(&mut preimage, "edges", self.dependence_edges.len());
-        for (from, to) in &self.dependence_edges {
-            push_field(&mut preimage, "from", from);
-            push_field(&mut preimage, "to", to);
-        }
-        push_field(&mut preimage, "coverage_digest", &self.coverage_digest);
-        preimage.into_bytes()
+    /// The exact identity this manifest froze for `handle`, when it froze one.
+    pub fn source_commitment(&self, handle: &str) -> Option<&ManifestSource> {
+        self.sources.get(handle)
     }
+
+    /// Whether this manifest still commits `record` exactly as it was frozen.
+    ///
+    /// A substituted record that keeps its handle and its content digest still
+    /// changes one of the interpretation-relevant fields, so it changes the
+    /// record commitment and fails here. The answer is false for a handle the
+    /// manifest never froze, which is the same refusal as a record outside it.
+    pub fn binds_source_record(&self, record: &SourceRecord) -> bool {
+        self.source_commitment(&record.handle)
+            .is_some_and(|source| record.verify_identity(&source.record_digest).is_ok())
+    }
+
+    /// Deterministic canonical bytes of the frozen manifest shape, with the
+    /// stored digest excluded.
+    ///
+    /// This is the same encoder [`Self::canonical_digest`] hashes, over the same
+    /// declared domain, so a persisted manifest can be re-read and re-hashed
+    /// without a second field list that could drift from the first.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&AuthorizedManifestDigestInput {
+            domain: AUTHORIZED_MANIFEST_DIGEST_DOMAIN,
+            manifest: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "manifest.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "manifest.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The single canonical encoder input for [`AuthorizedManifest`].
+///
+/// The manifest is borrowed whole; its `digest` field is excluded by
+/// `#[serde(skip)]` on the field itself, so the exclusion is declared next to
+/// the field it excludes.
+#[derive(Serialize)]
+struct AuthorizedManifestDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole frozen manifest, minus its own digest.
+    manifest: &'a AuthorizedManifest,
+}
+
+/// Classifies one attached counterclaim identity against this claim.
+///
+/// The checks run most-specific first, and each records its own typed residue
+/// line, so the reason an identity did not contradict is never lost:
+///
+/// * a handle that is also a material citation of this claim asserts both
+///   support and opposition at once, which this cell does not resolve;
+/// * a revoked handle is stronger than an absent one — the evidence was
+///   authorized and then withdrawn, so it cannot be verified either way;
+/// * a record past its frozen freshness boundary cannot contradict under
+///   compatible conditions, even though a time-stale record may still support.
+fn resolve_counterclaim(
+    counterclaim_id: &str,
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+    manifest: &AuthorizedManifest,
+    now_ms: i64,
+    residue: &mut Vec<String>,
+) -> CounterclaimDisposition {
+    if claim.citations.iter().any(|cited| cited == counterclaim_id) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is also a citation and cannot contest the claim"
+        ));
+        return CounterclaimDisposition::AlsoACitation;
+    }
+    if manifest
+        .revoked
+        .iter()
+        .any(|handle| handle == counterclaim_id)
+    {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is revoked and cannot be verified"
+        ));
+        return CounterclaimDisposition::Revoked;
+    }
+    if !manifest.allows(counterclaim_id) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} outside frozen manifest"
+        ));
+        return CounterclaimDisposition::OutsideManifest;
+    }
+    let Some(record) = portfolio.records.get(counterclaim_id) else {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} has no authoritative lineage"
+        ));
+        return CounterclaimDisposition::UnresolvedLineage;
+    };
+    // The manifest froze this handle's complete record commitment, so a record
+    // that no longer hashes to it was substituted after the freeze. It is
+    // reported as unresolved lineage rather than silently audited as the source
+    // the manifest admitted.
+    if !manifest.binds_source_record(record) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} does not match the frozen source commitment"
+        ));
+        return CounterclaimDisposition::UnresolvedLineage;
+    }
+    if !record.covers_domain(&claim.domain) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} outside claim domain {}",
+            claim.domain
+        ));
+        return CounterclaimDisposition::OutsideDomain;
+    }
+    if record.is_stale_at(now_ms) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is stale and cannot contradict"
+        ));
+        return CounterclaimDisposition::Stale;
+    }
+    if !record.acquisition.may_support() {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} disposition {} carries no weight",
+            record.acquisition.wire_name()
+        ));
+        return CounterclaimDisposition::CarriesNoWeight;
+    }
+    // Everything above is *eligibility*: the handle is authorized, resolves,
+    // covers the domain, is fresh and carries weight. None of that is opposition.
+    // A source that satisfies all five and agrees with the claim is not a
+    // contradiction of it, and the only thing that can establish opposition is a
+    // [`ClaimOppositionRelation`] whose claim identity, source commitment, span,
+    // conditions and evaluator receipt all verify. An eligible handle with no such
+    // relation is reported as not verifiable, never as `Contradicts`.
+    //
+    // The staleness check above is the eligibility half; `verified_opposition`
+    // re-checks it because an opposition is only meaningful for a source that is
+    // still fresh at the audit instant, and that is a property of the record
+    // rather than of the relation.
+    if let Some(disposition) = verified_opposition(counterclaim_id, claim, record, now_ms, residue)
+    {
+        return disposition;
+    }
+    residue.push(format!(
+        "claim: counterclaim {counterclaim_id} is eligible but no verified opposition relation establishes that it contests this claim"
+    ));
+    CounterclaimDisposition::NotVerifiableInScope
+}
+
+/// Renders one wire name per mismatched condition, in the order the conditions
+/// were compared.
+///
+/// Shared by both mismatch arms so the two cannot drift, and so a consumer
+/// reading the residue sees the same vocabulary the typed disposition carries.
+fn wire_names(dimensions: &[OppositionDimension]) -> String {
+    let names: Vec<&str> = dimensions
+        .iter()
+        .map(|dimension| dimension.wire_name())
+        .collect();
+    names.join(",")
+}
+
+/// Decides whether one eligible handle is verified counterevidence for this claim.
+///
+/// Returns `None` when no relation establishes opposition, which the caller
+/// reports as `NotVerifiableInScope`. Every failure below is a refusal to believe
+/// a relation, and each preserves why: a relation that cannot be proved is not
+/// evidence in either direction.
+///
+/// The checks run most-specific first, and each records its own typed residue
+/// line, so the reason an eligible handle did not contradict is never lost:
+///
+/// * a relation whose own bytes no longer hash to its digest was altered after it
+///   was issued;
+/// * a relation bound to a different claim identity or a different claim revision
+///   says nothing about this claim, and a claim whose wording moved invalidates
+///   every verdict reached through it;
+/// * a relation whose source commitment no longer matches the record contests a
+///   source revision that does not exist any more;
+/// * a relation whose span is not one of the record's own evidence spans rests on
+///   an excerpt the admitted record does not contain;
+/// * a relation that evaluates as agreement is a source that supports the claim,
+///   which can never become counterevidence through any attachment order;
+/// * a condition mismatch leaves the opposition about a different population,
+///   time, unit or modality, and a partial overlap is preserved as partial;
+/// * an `Insufficient` evaluation, a missing evaluator identity, or coverage
+///   below the whole claim is an unknown, not a negative result.
+#[allow(clippy::too_many_lines)]
+fn verified_opposition(
+    counterclaim_id: &str,
+    claim: &AuditedClaim,
+    record: &SourceRecord,
+    now_ms: i64,
+    residue: &mut Vec<String>,
+) -> Option<CounterclaimDisposition> {
+    let relation = claim
+        .opposition_relations
+        .iter()
+        .find(|relation| relation.source_handle == counterclaim_id)?;
+    if relation.claim.claim_id != claim.claim_id {
+        residue.push(format!(
+            "claim: opposition relation {} contests claim {} not {}",
+            relation.relation_id, relation.claim.claim_id, claim.claim_id
+        ));
+        return Some(CounterclaimDisposition::RelationClaimMismatch);
+    }
+    if relation.claim.statement != claim.statement {
+        residue.push(format!(
+            "claim: opposition relation {} is frozen against different statement wording",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::RelationStatementChanged);
+    }
+    let Some(identity) = claim
+        .frozen_identities
+        .iter()
+        .find(|identity| identity.claim_id == claim.claim_id)
+    else {
+        residue.push(
+            "claim: no frozen claim identity, so no opposition can be established".to_owned(),
+        );
+        return Some(CounterclaimDisposition::NoFrozenClaimIdentity);
+    };
+    if identity.claim_revision != relation.claim.claim_revision {
+        residue.push(format!(
+            "claim: opposition relation {} is frozen against revision {} not {}",
+            relation.relation_id, relation.claim.claim_revision, identity.claim_revision
+        ));
+        return Some(CounterclaimDisposition::RelationClaimMismatch);
+    }
+    if identity.verify_integrity().is_err() || relation.verify_integrity().is_err() {
+        residue.push(format!(
+            "claim: opposition relation {} does not match its own frozen digest",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::RelationDigestMismatch);
+    }
+    if !record.binds_span(&relation.span) {
+        residue.push(format!(
+            "claim: opposition relation {} rests on a span the admitted record does not contain",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::SpanNotAdmitted);
+    }
+    if !record
+        .digest()
+        .is_ok_and(|current| current == relation.source_record_digest)
+    {
+        residue.push(format!(
+            "claim: opposition relation {} is frozen against a different source revision",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::RelationSourceRevisionChanged);
+    }
+    if relation.evaluation == SemanticEvaluationOutcome::Insufficient {
+        residue.push(format!(
+            "claim: evaluator {} found the excerpt {} insufficient",
+            relation.evaluator_id, relation.span.span_id
+        ));
+        return Some(CounterclaimDisposition::EvaluationInsufficient);
+    }
+    if relation.evaluator_id.trim().is_empty() || relation.evaluator_revision.trim().is_empty() {
+        residue.push(format!(
+            "claim: opposition relation {} carries no evaluator identity",
+            relation.relation_id
+        ));
+        return Some(CounterclaimDisposition::NoEvaluationRoute);
+    }
+    if relation.polarity == OppositionPolarity::Agrees {
+        residue.push(format!(
+            "claim: source {counterclaim_id} is evaluated as agreeing with the claim on {}",
+            relation.dimension.wire_name()
+        ));
+        return Some(CounterclaimDisposition::AgreesWithClaim);
+    }
+    match relation.condition_compatibility(&identity.conditions) {
+        ConditionCompatibility::Incompatible(mismatched) => {
+            residue.push(format!(
+                "claim: opposition is stated under different conditions ({})",
+                wire_names(&mismatched)
+            ));
+            return Some(CounterclaimDisposition::IncompatibleConditions);
+        }
+        ConditionCompatibility::PartiallyOverlapping(mismatched) => {
+            residue.push(format!(
+                "claim: opposition overlaps only partially; mismatched {}",
+                wire_names(&mismatched)
+            ));
+            return Some(CounterclaimDisposition::PartiallyOverlappingConditions);
+        }
+        ConditionCompatibility::Compatible => {}
+    }
+    if relation.coverage_ppm < 1_000_000 {
+        residue.push(format!(
+            "claim: opposition covers {}ppm of the claim; the remainder is unaccounted",
+            relation.coverage_ppm
+        ));
+        return Some(CounterclaimDisposition::PartialCoverage);
+    }
+    if record.is_stale_at(now_ms) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is stale and cannot contradict"
+        ));
+        return Some(CounterclaimDisposition::Stale);
+    }
+    Some(CounterclaimDisposition::Contradicts)
 }
 
 /// Audits one already-structured claim against the frozen portfolio and
@@ -2098,22 +3968,58 @@ pub fn audit_claim(
     let mut residue: Vec<String> = Vec::new();
     let mut supporting: Vec<&SourceRecord> = Vec::new();
     let mut evidence_map: Vec<String> = Vec::new();
+    let mut unsupported_precision: Vec<UnsupportedPrecisionItem> = Vec::new();
     let mut stale_hit = false;
+    // A manifest whose bytes no longer hash to the digest frozen beside them is
+    // not the manifest that was authorized: an expiry widened, a revocation
+    // cleared or a handle re-admitted after the freeze all leave every field
+    // individually well-formed. The audit refuses to derive anything from it,
+    // which is a different failure from a citation being individually
+    // unverifiable, so it is decided once here rather than per handle.
+    let manifest_intact = manifest.verify_integrity().is_ok();
+    if !manifest_intact {
+        residue.push("claim: manifest does not match its own frozen digest".to_owned());
+    }
+    // These three are recorded where the condition is actually known rather
+    // than recovered later from the rendered residue prose. A residue line is
+    // diagnostic text, and matching a substring of it let an unrelated line
+    // (a counterclaim outside the manifest, say) flip a citation verdict.
+    let mut outside_citation = false;
+    // A manifest that fails its own integrity check is the authorization this
+    // claim was judged under, so the gap is seeded here rather than per handle:
+    // with the manifest unproven, no handle it admits is proven either, and the
+    // claim cannot come out `Supported`.
+    let mut lineage_gap = !manifest_intact;
+    let mut support_gap = false;
     if claim.material && claim.citations.is_empty() {
         residue.push("claim: material claim records no citations".to_owned());
     }
     for handle in &claim.citations {
         if !manifest.allows(handle) {
+            outside_citation = true;
             residue.push(format!("claim: citation {handle} outside frozen manifest"));
             continue;
         }
         let Some(record) = portfolio.records.get(handle) else {
+            lineage_gap = true;
             residue.push(format!(
                 "claim: citation {handle} has no authoritative lineage"
             ));
             continue;
         };
+        // A record that no longer hashes to the commitment this manifest froze
+        // is not the source the manifest admitted. Treating it as a lineage gap
+        // keeps the verdict non-supporting without introducing a second
+        // terminal class for what is, exactly, an unproven lineage.
+        if !manifest.binds_source_record(record) {
+            lineage_gap = true;
+            residue.push(format!(
+                "claim: citation {handle} does not match the frozen source commitment"
+            ));
+            continue;
+        }
         if !record.covers_domain(&claim.domain) {
+            lineage_gap = true;
             residue.push(format!(
                 "claim: source {handle} outside claim domain {}",
                 claim.domain
@@ -2131,9 +4037,16 @@ pub fn audit_claim(
             }
             SourceDisposition::Stale => {
                 stale_hit = true;
+                // A stale source is an accounted gap, exactly as before this
+                // function stopped matching rendered residue prose: the previous
+                // `contains("carries no weight")` scan fired on this line too, so
+                // omitting the flag here would silently reclassify a stale
+                // citation from PartiallySupported to StaleLimited.
+                support_gap = true;
                 residue.push(format!("claim: source {handle} stale carries no weight"));
             }
             _ => {
+                support_gap = true;
                 residue.push(format!(
                     "claim: source {handle} disposition {} carries no weight",
                     record.acquisition.wire_name()
@@ -2143,30 +4056,118 @@ pub fn audit_claim(
     }
     for assertion in &claim.precision {
         if let Err(item) = check_precision(assertion) {
+            // The typed item is retained, not only its rendering: I21.7 records
+            // the over-precise assertion itself so a consumer can tell a false
+            // line anchor from a false causal mechanism.
+            unsupported_precision.push(item.clone());
             residue.push(format!(
                 "claim: unsupported precision asserted {} supports {}",
                 item.asserted, item.highest_supported
             ));
         }
     }
+    // Contradiction is determined from RELEVANT counterevidence under compatible
+    // conditions, never from the mere presence of an attached counterclaim
+    // identity. An identity is preserved either way, with a typed disposition
+    // naming why it did or did not contradict; it contradicts only when it
+    // contests this claim, is authorized, resolves to an authoritative record,
+    // covers the claim's domain, is inside its frozen freshness boundary at the
+    // audit instant, and carries evidentiary weight. Anything else stays explicit
+    // as `NotVerifiableInScope` rather than being smoothed into support or
+    // silently dropped. Absence of contradiction is never read as support.
+    let mut resolutions: Vec<CounterclaimResolution> = Vec::new();
+    for counterclaim_id in &claim.counterclaim_ids {
+        let disposition = resolve_counterclaim(
+            counterclaim_id,
+            claim,
+            portfolio,
+            manifest,
+            now_ms,
+            &mut residue,
+        );
+        resolutions.push(CounterclaimResolution {
+            counterclaim_id: counterclaim_id.clone(),
+            disposition,
+        });
+    }
+    let contradicting: Vec<&CounterclaimResolution> = resolutions
+        .iter()
+        .filter(|entry| entry.disposition.establishes_opposition())
+        .collect();
+    let unverifiable: Vec<&CounterclaimResolution> = resolutions
+        .iter()
+        .filter(|entry| !entry.disposition.establishes_opposition())
+        .collect();
     let counterevidence: Vec<String> = claim.counterclaim_ids.clone();
     let unknowns: Vec<String> = claim.unknown_refs.clone();
-    let outside = residue
+    let precision_gap = !unsupported_precision.is_empty();
+    // The terminal outcome is derived from the named dimensions, and every
+    // dimension is recorded whether or not it failed. I21.8 requires the four
+    // audit dimensions to be observed separately, and `#1765` requires the
+    // precise reasons to survive into the release decision; a single `if/else`
+    // chain that returns on the first hit discards exactly the findings a release
+    // consumer needs. `dimensions` below is the record, and the chain only names
+    // the terminal class.
+    let identity_current = !resolutions.iter().any(|entry| {
+        matches!(
+            entry.disposition,
+            CounterclaimDisposition::RelationStatementChanged
+                | CounterclaimDisposition::RelationClaimMismatch
+                | CounterclaimDisposition::NoFrozenClaimIdentity
+                | CounterclaimDisposition::RelationDigestMismatch
+                | CounterclaimDisposition::RelationSourceRevisionChanged
+        )
+    });
+    // A material claim needs an identity that verifies, not merely one that is
+    // present. `AuditedClaim.frozen_identities` is a caller-writable `Vec` of
+    // plain structs, so a caller can push an identity whose `digest` is empty or
+    // stale, or one frozen against different wording; checking only for presence
+    // would let that self-declared value stand in for a proof. The recorded digest
+    // is the recomputed one and is empty unless the identity proves out, so
+    // `MethodArtifactAlignment` fails on exactly the same condition.
+    //
+    // A claim that cannot prove its identity is accounted for as an open material
+    // claim rather than a supported one. Routing it through
+    // `IncompleteAccounting` rather than a new terminal class keeps the public
+    // five-class projection the only thing a release consumer has to read, while
+    // the dimension records the real reason.
+    let claim_identity = claim
+        .frozen_identities
         .iter()
-        .any(|r| r.contains("outside frozen manifest"));
-    let precision_gap = residue.iter().any(|r| r.contains("unsupported precision"));
-    let lineage_gap = residue
-        .iter()
-        .any(|r| r.contains("no authoritative lineage") || r.contains("outside claim domain"));
-    let support_gap = residue.iter().any(|r| r.contains("carries no weight"));
-    let outcome = if outside {
+        .find(|identity| identity.claim_id == claim.claim_id);
+    let claim_identity_verified = claim_identity.is_some_and(|identity| {
+        identity.verify_integrity().is_ok() && identity.statement == claim.statement
+    });
+    let claim_identity_digest = if claim_identity_verified {
+        claim_identity.map_or(String::new(), |identity| identity.digest.clone())
+    } else {
+        String::new()
+    };
+    let unfrozen_material_claim = claim.material && !claim_identity_verified && !outside_citation;
+    let mut dimensions = vec![
+        AuditDimension::ReferenceVerification,
+        AuditDimension::ValueVerification,
+        AuditDimension::SpecificationCompliance,
+        AuditDimension::MethodArtifactAlignment,
+        AuditDimension::ClaimIdentityCurrent,
+        AuditDimension::CounterevidenceExamined,
+        AuditDimension::AccountingComplete,
+        AuditDimension::PartitionCoherence,
+    ];
+    dimensions.sort();
+    dimensions.dedup();
+    let outcome = if !identity_current {
+        // A claim whose wording moved after the opposition was frozen cannot be
+        // released as supported, and a verdict reached through a stale claim
+        // identity is not a verdict about this claim at all. Checked before the
+        // citation partition for that reason.
+        ClaimOutcome::NotVerifiableInScope
+    } else if outside_citation {
         ClaimOutcome::OutsideManifest
-    } else if !counterevidence.is_empty() {
+    } else if !contradicting.is_empty() {
         ClaimOutcome::Contradicted
-    } else if !unknowns.is_empty()
-        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
-    {
-        ClaimOutcome::IncompleteAccounting
+    } else if !unverifiable.is_empty() {
+        ClaimOutcome::NotVerifiableInScope
     } else if lineage_gap || precision_gap || support_gap {
         if stale_hit && supporting.is_empty() {
             ClaimOutcome::StaleLimited
@@ -2177,9 +4178,25 @@ pub fn audit_claim(
         }
     } else if stale_hit {
         ClaimOutcome::StaleLimited
+    } else if !unknowns.is_empty()
+        || unfrozen_material_claim
+        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
+    {
+        // An open material claim, an unfrozen one, or one with preserved unknowns
+        // is not supported. This arm sits after the support gaps so a claim that
+        // is both unsupported and unfrozen reports the support gap, which is the
+        // more specific finding.
+        ClaimOutcome::IncompleteAccounting
     } else {
         ClaimOutcome::Supported
     };
+    let mut relation_digests: Vec<String> = claim
+        .opposition_relations
+        .iter()
+        .map(|relation| relation.digest.clone())
+        .collect();
+    relation_digests.sort();
+    relation_digests.dedup();
     let grade_ceiling = decide_grade(&supporting, &claim.domain, now_ms).ceiling;
     evidence_map.sort();
     residue.sort();
@@ -2187,14 +4204,29 @@ pub fn audit_claim(
     counter_sorted.sort();
     let mut unknowns_sorted = unknowns;
     unknowns_sorted.sort();
+    let mut sorted_resolutions = resolutions;
+    sorted_resolutions.sort_by(|left, right| {
+        left.counterclaim_id
+            .cmp(&right.counterclaim_id)
+            .then_with(|| {
+                left.disposition
+                    .wire_name()
+                    .cmp(right.disposition.wire_name())
+            })
+    });
     ClaimVerdict {
         claim_id: claim.claim_id.clone(),
         outcome,
         residue,
+        unsupported_precision,
         counterevidence: counter_sorted,
+        counterclaim_resolutions: sorted_resolutions,
         unknowns: unknowns_sorted,
         grade_ceiling,
         evidence_map,
+        dimensions,
+        relation_digests,
+        claim_identity_digest,
     }
 }
 

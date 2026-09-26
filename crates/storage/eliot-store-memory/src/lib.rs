@@ -1967,49 +1967,14 @@ fn automation_state_payload(
             let id = decoded.automation_id.clone().ok_or_else(|| {
                 serde_json::Error::custom("exact automation selector is required")
             })?;
-            let mut revisions = Vec::new();
-            let mut truncated = false;
-            if let Some(requested_revision) = decoded.requested_revision.as_deref() {
-                if let Some(row) = state.automation_revisions.values().find(|row| {
-                    row.automation_id == id
-                        && row.revision == requested_revision
-                        && row.state_fence == *fence
-                }) {
-                    revisions.push(json!({
-                        "automation_id": row.automation_id,
-                        "revision": row.revision,
-                        "revision_json": row.revision_json,
-                    }));
-                }
-            } else {
-                for row in state.automation_revisions.values() {
-                    if row.automation_id != id || row.state_fence != *fence {
-                        continue;
-                    }
-                    // One probe row past the bound decides owner-proven
-                    // completeness: a page that merely happens to be shorter
-                    // than the bound is not proof that no later row exists.
-                    if revisions.len() > limit {
-                        truncated = true;
-                        break;
-                    }
-                    revisions.push(json!({
-                        "automation_id": row.automation_id,
-                        "revision": row.revision,
-                        "revision_json": row.revision_json,
-                    }));
-                }
-                if truncated {
-                    revisions.pop();
-                }
-            }
-            let returned = revisions.len();
-            serde_json::to_value(json!({
-                "revisions": revisions,
-                "revision": returned,
-                "state_fence": fence,
-                "completeness": automation_page_completeness(state, returned, truncated)?,
-            }))
+            automation_history_payload(
+                state,
+                fence,
+                &id,
+                limit,
+                decoded.requested_revision.as_deref(),
+                decoded.cursor.as_ref(),
+            )
         }
         AUTOMATION_QUERY_INVOCATIONS => {
             let id = decoded.automation_id.clone().ok_or_else(|| {
@@ -2021,6 +1986,7 @@ fn automation_state_payload(
                 &id,
                 limit,
                 decoded.requested_occurrence_id.as_deref(),
+                decoded.cursor.as_ref(),
             )
         }
         AUTOMATION_QUERY_FAILURE => {
@@ -2033,76 +1999,287 @@ fn automation_state_payload(
     }
 }
 
+/// One automation denominator page under the single shared slicing rule.
+struct AutomationPageSlice<T> {
+    /// The eligible rows actually returned, in denominator order.
+    rows: Vec<T>,
+    /// Exactly when an additional eligible row exists beyond `rows`.
+    truncated: bool,
+    /// Identity of the last returned row, never the probe row.
+    last_row_id: Option<String>,
+}
+
+/// Applies the single automation page-slicing rule to one eligible row set.
+///
+/// `eligible` is the ordered, already-filtered denominator prefix for this
+/// page: the exact revision/occurrence selector, the admission fence and the
+/// exclusive continuation boundary are all applied before the rule sees a row,
+/// so the probe is always an additional **eligible** row. A foreign or stale
+/// row that a later filter would discard can therefore never decide coverage.
+///
+/// The rule inspects at most the bound plus one eligible row and returns at
+/// most the bound. `truncated` is set exactly when an eligible row exists
+/// beyond the returned slice, so the exact one-over case — a bound-sized page
+/// with one further eligible row — is `TRUNCATED` with exactly one
+/// continuation, and only a page with no further eligible row is `COMPLETE`.
+/// `last_row_id` is the identity of the last row actually returned, so a
+/// continuation is never minted from the probe row or from a row that
+/// truncation removed.
+fn automation_page_slice<T>(
+    eligible: Vec<T>,
+    limit: usize,
+    row_id: impl Fn(&T) -> &str,
+) -> AutomationPageSlice<T> {
+    let truncated = eligible.len() > limit;
+    let mut rows = eligible;
+    rows.truncate(limit);
+    let last_row_id = rows.last().map(|row| row_id(row).to_owned());
+    AutomationPageSlice {
+        rows,
+        truncated,
+        last_row_id,
+    }
+}
+
+/// Projects the bounded same-fence revision set for one automation.
+///
+/// The exact immutable-revision selector addresses one immutable row and never
+/// widens into a bounded page, so it carries no pagination semantics. Every
+/// other read is a paged denominator read served by the shared slicing rule:
+/// first page from the start, continued page strictly after the verified
+/// exclusive row identity, identical semantics on both.
+fn automation_history_payload(
+    state: &MemoryState,
+    fence: &StateFence,
+    automation_id: &str,
+    limit: usize,
+    requested_revision: Option<&str>,
+    cursor: Option<&eliot_store_api::AutomationPageCursor>,
+) -> Result<Value, serde_json::Error> {
+    let mut revisions = Vec::new();
+    let mut truncated = false;
+    let mut last_row_id: Option<String> = None;
+    if let Some(requested_revision) = requested_revision {
+        if let Some(row) = state.automation_revisions.values().find(|row| {
+            row.automation_id == automation_id
+                && row.revision == requested_revision
+                && row.state_fence == *fence
+        }) {
+            revisions.push(json!({
+                "automation_id": row.automation_id,
+                "revision": row.revision,
+                "revision_json": row.revision_json,
+            }));
+        }
+    } else {
+        // Ascending revision identity is the denominator's total ordering, so
+        // the exclusive continuation resumes strictly after the last served row
+        // instead of skipping a fixed count over a moving set.
+        let mut eligible = Vec::new();
+        for row in state.automation_revisions.values() {
+            if row.automation_id != automation_id || row.state_fence != *fence {
+                continue;
+            }
+            if cursor.is_some_and(|cursor| row.revision.as_str() <= cursor.after_row_id.as_str()) {
+                continue;
+            }
+            // The scan stops as soon as it holds the one-over eligible probe
+            // row the shared slicing rule needs.
+            if eligible.len() > limit {
+                break;
+            }
+            eligible.push(row);
+        }
+        let page = automation_page_slice(eligible, limit, |row| row.revision.as_str());
+        truncated = page.truncated;
+        last_row_id = page.last_row_id;
+        revisions = page
+            .rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "revision_json": row.revision_json,
+                })
+            })
+            .collect();
+    }
+    let returned = revisions.len();
+    let read_revision = automation_page_read_revision(state)?;
+    let mut completeness = automation_page_completeness(&read_revision, returned, truncated);
+    if truncated {
+        completeness = automation_page_with_continuation(
+            completeness,
+            AUTOMATION_QUERY_HISTORY,
+            automation_id,
+            &read_revision,
+            fence,
+            last_row_id.as_deref(),
+            limit,
+        )?;
+    }
+    Ok(json!({
+        "revisions": revisions,
+        "revision": returned,
+        "state_fence": fence,
+        "completeness": completeness,
+    }))
+}
+
 /// Projects the bounded same-fence invocation set for one automation.
 ///
-/// The bound plus one probe row decides owner-proven coverage: `truncated`
-/// stays false only when the owner read past the bound and matched no further
-/// same-fence row. `completeness` carries that proof together with the
-/// owner-issued read revision, so a consumer can never read a short first
-/// page as a complete denominator.
+/// The exact occurrence selector addresses one retained row and never widens
+/// into a bounded page, so it carries no pagination semantics. Every other read
+/// is a paged denominator read served by the same shared slicing rule the
+/// revision page uses, first and continued alike.
 fn automation_invocations_payload(
     state: &MemoryState,
     fence: &StateFence,
     automation_id: &str,
     limit: usize,
     requested_occurrence_id: Option<&str>,
+    cursor: Option<&eliot_store_api::AutomationPageCursor>,
 ) -> Result<Value, serde_json::Error> {
     let mut invocations = Vec::new();
     let mut truncated = false;
-    for row in state.automation_invocations.values() {
-        if row.automation_id != automation_id || row.state_fence != *fence {
-            continue;
+    let mut last_row_id: Option<String> = None;
+    if let Some(requested_occurrence_id) = requested_occurrence_id {
+        if let Some(row) = state
+            .automation_invocations
+            .get(requested_occurrence_id)
+            .filter(|row| row.automation_id == automation_id && row.state_fence == *fence)
+        {
+            invocations.push(json!({
+                "occurrence_id": row.occurrence_id,
+                "automation_id": row.automation_id,
+                "invocation_json": row.invocation_json,
+            }));
         }
-        if requested_occurrence_id.is_some_and(|occurrence_id| row.occurrence_id != occurrence_id) {
-            continue;
+    } else {
+        // Ascending occurrence identity is the denominator's total ordering, so
+        // the exclusive continuation resumes strictly after the last served row
+        // instead of skipping a fixed count over a moving set.
+        let mut eligible = Vec::new();
+        for row in state.automation_invocations.values() {
+            if row.automation_id != automation_id || row.state_fence != *fence {
+                continue;
+            }
+            if cursor
+                .is_some_and(|cursor| row.occurrence_id.as_str() <= cursor.after_row_id.as_str())
+            {
+                continue;
+            }
+            // The scan stops as soon as it holds the one-over eligible probe
+            // row the shared slicing rule needs.
+            if eligible.len() > limit {
+                break;
+            }
+            eligible.push(row);
         }
-        if invocations.len() > limit {
-            truncated = true;
-            break;
-        }
-        invocations.push(json!({
-            "occurrence_id": row.occurrence_id,
-            "automation_id": row.automation_id,
-            "invocation_json": row.invocation_json,
-        }));
-    }
-    if truncated {
-        invocations.pop();
+        let page = automation_page_slice(eligible, limit, |row| row.occurrence_id.as_str());
+        truncated = page.truncated;
+        last_row_id = page.last_row_id;
+        invocations = page
+            .rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "occurrence_id": row.occurrence_id,
+                    "automation_id": row.automation_id,
+                    "invocation_json": row.invocation_json,
+                })
+            })
+            .collect();
     }
     let returned = invocations.len();
-    serde_json::to_value(json!({
+    let read_revision = automation_page_read_revision(state)?;
+    let mut completeness = automation_page_completeness(&read_revision, returned, truncated);
+    if truncated {
+        completeness = automation_page_with_continuation(
+            completeness,
+            AUTOMATION_QUERY_INVOCATIONS,
+            automation_id,
+            &read_revision,
+            fence,
+            last_row_id.as_deref(),
+            limit,
+        )?;
+    }
+    Ok(json!({
         "invocations": invocations,
         "revision": returned,
         "state_fence": fence,
-        "completeness": automation_page_completeness(state, returned, truncated)?,
+        "completeness": completeness,
     }))
 }
 
-/// Builds the owner-issued denominator completeness metadata for one page.
+/// Digests the exact revision-head set one automation read observed.
 ///
-/// `read_revision` digests the exact revision-head set this read observed
-/// through the store-api head digest, so it is owner-issued rather than a
-/// caller claim, and it changes whenever a commit advances any head (a new
-/// occurrence, a retirement, or an edit). `coverage` is the closed
-/// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts that the owner read
-/// one probe row past the bound and matched nothing further.
-fn automation_page_completeness(
-    state: &MemoryState,
-    returned: usize,
-    truncated: bool,
-) -> Result<Value, serde_json::Error> {
+/// The value is the owner-issued read revision a page reports and a
+/// continuation is bound to. It changes whenever a commit advances any head,
+/// which is exactly when an outstanding continuation must stop being valid.
+fn automation_page_read_revision(state: &MemoryState) -> Result<String, serde_json::Error> {
     let heads: Vec<(String, u64)> = state
         .revision_heads
         .values()
         .map(|head| (head.key.as_str().to_owned(), head.revision))
         .collect();
-    let read_revision =
-        audit_heads_digest(&heads).map_err(|error| serde_json::Error::custom(error.to_string()))?;
-    Ok(json!({
+    audit_heads_digest(&heads).map_err(|error| serde_json::Error::custom(error.to_string()))
+}
+
+/// Builds the owner-issued denominator completeness metadata for one page.
+///
+/// `read_revision` is the owner-issued digest of the head set this read
+/// observed, so it is not a caller claim. `coverage` is the closed
+/// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts that the owner read
+/// one probe row past the bound and matched nothing further. A truncated page
+/// additionally carries the owner-minted continuation for the next page.
+fn automation_page_completeness(read_revision: &str, returned: usize, truncated: bool) -> Value {
+    json!({
         "read_revision": read_revision,
         "returned": returned,
         "coverage": if truncated { "TRUNCATED" } else { "COMPLETE" },
-    }))
+    })
+}
+
+/// Mints and attaches the owner continuation for one truncated automation page.
+///
+/// A truncated page that carried no successor cursor would be indistinguishable
+/// from a terminator, so the owner refuses rather than serving a page whose
+/// remainder has no address.
+fn automation_page_with_continuation(
+    mut completeness: Value,
+    query: &str,
+    automation_id: &str,
+    read_revision: &str,
+    fence: &StateFence,
+    last_row_id: Option<&str>,
+    max_records: usize,
+) -> Result<Value, serde_json::Error> {
+    let last_row_id = last_row_id.ok_or_else(|| {
+        serde_json::Error::custom("truncated automation page served no row to continue from")
+    })?;
+    let max_records = u16::try_from(max_records).map_err(|_| {
+        serde_json::Error::custom("automation page bound is not representable as a cursor bound")
+    })?;
+    let next_cursor = eliot_store_api::automation_cursor_mint(
+        query,
+        automation_id,
+        read_revision,
+        fence,
+        last_row_id,
+        max_records,
+    )
+    .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let object = completeness.as_object_mut().ok_or_else(|| {
+        serde_json::Error::custom("automation completeness metadata is not an object")
+    })?;
+    object.insert(
+        eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR.to_owned(),
+        Value::String(next_cursor),
+    );
+    Ok(completeness)
 }
 
 /// Projects the last same-fence failure row for one automation, or

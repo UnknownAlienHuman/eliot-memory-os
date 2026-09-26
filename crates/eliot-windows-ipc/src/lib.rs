@@ -5,6 +5,7 @@
 
 #![cfg(windows)]
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -88,6 +89,400 @@ const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
 static LEGACY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
+
+/// Typed outcome of one asynchronous Windows I/O operation (issue #789,
+/// implementation-requirements paragraph 4).
+///
+/// Every overlapped/async unsafe wrapper in this crate classifies its raw
+/// submission, poll, cancel, and drain results through these states instead
+/// of collapsing them into `bool`/`io::Error` at the FFI boundary. The
+/// kernel's ownership of OS-visible request storage (the boxed `OVERLAPPED`
+/// and oplock buffers) is tracked alongside: storage may be released or
+/// reused only after [`AsyncIoOutcome::terminal_storage_release`] yields a
+/// [`TerminalStorageRelease`], which exists exactly for the terminal states.
+/// A `CancelIoEx` return value, a wait timeout, a disconnect, or a handle
+/// close alone never constructs that proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncIoOutcome {
+    /// Request storage is prepared but no submit call has been issued; the
+    /// kernel has never observed the allocations.
+    Prepared,
+    /// The submit call was rejected before the kernel could take ownership
+    /// (validation failure or a synchronous API error other than
+    /// `ERROR_IO_PENDING`). Terminal: storage was never kernel-visible, so
+    /// local release is safe and rebuilding for a retry needs no reconcile.
+    RejectedBeforeSubmit,
+    /// The raw submit call has been issued but its result is not yet
+    /// classified. Transient: every producer classifies immediately after.
+    Submitted,
+    /// The submit call completed synchronously: no pending kernel request
+    /// exists. Terminal for ownership (nothing is outstanding), though the
+    /// oplock wrapper still rejects it as a missing durable lease.
+    SynchronousComplete,
+    /// The kernel accepted the request and owns the storage until a terminal
+    /// observation. The only legal exits are cancel or observation; release,
+    /// reuse, and blind retry are forbidden from this state.
+    Pending,
+    /// A submit (or cancel-directive submit) was issued but its acceptance
+    /// could not be established, so kernel ownership is unknown. Release,
+    /// reuse, and blind retry are forbidden; only a reconciled,
+    /// idempotence-justified re-issue (the observer-shutdown directive) or
+    /// fail-closed retention may follow.
+    UnknownSubmit,
+    /// Cancellation was requested for a pending operation. `CancelIoEx`'s
+    /// own return value is recorded via
+    /// [`AsyncIoOutcome::note_cancel_io_result`] and proves nothing: the
+    /// state stays here until the drain wait observes the terminal signal.
+    CancelRequested,
+    /// The drain wait observed the terminal event signal after a cancel
+    /// request: the kernel finished with the storage. Terminal: release is
+    /// proven.
+    ObservedCancel,
+    /// A poll observed the request's completion event (the oplock break was
+    /// delivered). Terminal for ownership: the kernel wrote its output and
+    /// will not write again. The guard still closes its handle before any
+    /// release.
+    ObservedComplete,
+    /// Observation was attempted but the outcome stays indeterminate (the
+    /// cancel drain timed out without the terminal signal). Storage is
+    /// retained fail-closed (leaked, never freed or reused) and the
+    /// operation must not be retried without a fresh reconciliation, which
+    /// this state refuses.
+    Unresolved,
+}
+
+impl AsyncIoOutcome {
+    /// Records that the raw submit call was issued. `Prepared` becomes the
+    /// transient `Submitted`; re-issuing from `Submitted` or `UnknownSubmit`
+    /// is the reconciled retry of the idempotent observer-shutdown
+    /// directive. Any other input is an illegal transition and fails closed
+    /// to `Unresolved` instead of inventing a state.
+    #[must_use]
+    pub fn submit_issued(self) -> Self {
+        match self {
+            Self::Prepared | Self::Submitted | Self::UnknownSubmit => Self::Submitted,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Classifies one `DeviceIoControl` oplock submit result. `requested` is
+    /// the raw return; `error_code` is the calling thread's last-error code,
+    /// read only when `requested == 0`. A nonzero return completed
+    /// synchronously, `ERROR_IO_PENDING` means the kernel owns the request,
+    /// and any other code rejected the submit before the kernel took
+    /// ownership. Any input other than `Submitted` fails closed.
+    #[must_use]
+    pub fn classify_oplock_submit(self, requested: i32, error_code: Option<i32>) -> Self {
+        if self != Self::Submitted {
+            return Self::Unresolved;
+        }
+        if requested != 0 {
+            return Self::SynchronousComplete;
+        }
+        let pending = i32::try_from(ERROR_IO_PENDING).ok();
+        if error_code.is_some() && error_code == pending {
+            Self::Pending
+        } else {
+            Self::RejectedBeforeSubmit
+        }
+    }
+
+    /// Classifies one zero-timeout oplock-event poll (`WaitForSingleObject`
+    /// result): signaled means the break was delivered, timeout means the
+    /// request is still pending, and any other wait result is a failed
+    /// observation that leaves ownership untouched and surfaces the raw
+    /// system error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the raw system error when the wait itself failed.
+    pub fn classify_oplock_poll(wait_result: u32) -> io::Result<Self> {
+        match wait_result {
+            WAIT_OBJECT_0 => Ok(Self::ObservedComplete),
+            WAIT_TIMEOUT => Ok(Self::Pending),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Classifies one observer-shutdown `PostQueuedCompletionStatus` result:
+    /// nonzero queued the directive, zero left the submission unknown (the
+    /// port may still accept a reconciled re-post of this idempotent
+    /// directive). Any input other than `Submitted` fails closed.
+    #[must_use]
+    pub fn classify_directive_post(self, queued: i32) -> Self {
+        if self != Self::Submitted {
+            return Self::Unresolved;
+        }
+        if queued != 0 {
+            Self::Submitted
+        } else {
+            Self::UnknownSubmit
+        }
+    }
+
+    /// Requests cancellation of a pending operation. Only `Pending` moves;
+    /// an already-observed completion stays complete (there is nothing to
+    /// cancel), and anything else fails closed to `Unresolved`.
+    #[must_use]
+    pub fn request_cancel(self) -> Self {
+        match self {
+            Self::Pending => Self::CancelRequested,
+            Self::ObservedComplete => Self::ObservedComplete,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Records one `CancelIoEx` return value without changing state: the
+    /// return proves the cancel was requested, never that the kernel
+    /// released the storage, so the outcome stays `CancelRequested` until
+    /// the drain wait observes the terminal signal. Any input other than
+    /// `CancelRequested` fails closed.
+    #[must_use]
+    pub fn note_cancel_io_result(self, _cancel_return: i32) -> Self {
+        match self {
+            Self::CancelRequested => Self::CancelRequested,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Classifies the cancel-drain wait (`WaitForSingleObject` on the
+    /// request event after `CancelIoEx` plus the handle close): signaled
+    /// proves the kernel finished (`ObservedCancel`), timeout leaves the
+    /// request indeterminate (`Unresolved`), and a failed wait loses the
+    /// completion evidence entirely (`UnknownSubmit`). From an already
+    /// observed completion a renewed signal keeps `ObservedComplete`;
+    /// anything else fails closed.
+    #[must_use]
+    pub fn classify_cancel_drain(self, wait_result: u32) -> Self {
+        match self {
+            Self::CancelRequested => match wait_result {
+                WAIT_OBJECT_0 => Self::ObservedCancel,
+                WAIT_TIMEOUT => Self::Unresolved,
+                _ => Self::UnknownSubmit,
+            },
+            Self::ObservedComplete if wait_result == WAIT_OBJECT_0 => Self::ObservedComplete,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Exact terminal-ownership proof: yields the release token only for
+    /// states where the kernel provably owns nothing (`RejectedBeforeSubmit`
+    /// and `SynchronousComplete`, which never went outstanding, plus
+    /// `ObservedCancel` and `ObservedComplete`). Every other state —
+    /// including `CancelRequested` after any `CancelIoEx` return, a bare
+    /// timeout, or a closed handle — yields `None`, forcing fail-closed
+    /// retention of the request storage.
+    #[must_use]
+    pub fn terminal_storage_release(self) -> Option<TerminalStorageRelease> {
+        match self {
+            Self::RejectedBeforeSubmit
+            | Self::SynchronousComplete
+            | Self::ObservedCancel
+            | Self::ObservedComplete => Some(TerminalStorageRelease::proven()),
+            Self::Prepared
+            | Self::Submitted
+            | Self::Pending
+            | Self::UnknownSubmit
+            | Self::CancelRequested
+            | Self::Unresolved => None,
+        }
+    }
+
+    /// Reconcile gate for retry after possible submission: only states where
+    /// the kernel provably owns nothing may rebuild and retry. `Pending`,
+    /// `Submitted`, and `CancelRequested` refuse as still possibly live;
+    /// `UnknownSubmit` and `Unresolved` refuse as unknown instead of
+    /// permitting a blind retry against a possibly live kernel request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WouldBlock` for a possibly live operation and `InvalidData`
+    /// for an unknown outcome.
+    pub fn reconcile_before_retry(self) -> io::Result<()> {
+        match self {
+            Self::Prepared
+            | Self::RejectedBeforeSubmit
+            | Self::SynchronousComplete
+            | Self::ObservedCancel
+            | Self::ObservedComplete => Ok(()),
+            Self::Submitted | Self::Pending | Self::CancelRequested => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "async operation may still be live; reconcile before retry",
+            )),
+            Self::UnknownSubmit | Self::Unresolved => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "async operation outcome unknown; reconcile before retry",
+            )),
+        }
+    }
+}
+
+/// Proof token: the kernel provably owns no request storage, so the boxed
+/// `OVERLAPPED`/op-lock allocations may be released. No reuse site exists in
+/// this crate (the oplock request is single-shot); any future reuse must
+/// take this token.
+///
+/// Constructible only through [`AsyncIoOutcome::terminal_storage_release`],
+/// which yields it exactly for the terminal states. There is deliberately
+/// no other constructor: a `CancelIoEx` return, a wait timeout, a
+/// disconnect, or a handle close cannot manufacture this token.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalStorageRelease {
+    sealed: std::marker::PhantomData<fn()>,
+}
+
+impl TerminalStorageRelease {
+    fn proven() -> Self {
+        Self {
+            sealed: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Typed outcome of one bounded Win32 transfer/length observation (issue
+/// #789, implementation-requirements paragraph 5).
+///
+/// Every site that consumes a kernel-reported byte/unit count classifies it
+/// here before touching memory. Only [`TransferOutcome::Complete`] carries
+/// a consumable count, so a partial, empty, or corrupt transfer can never
+/// flow into a full-frame or domain-success value. Counts over this
+/// crate's own plausibility bounds are [`TransferOutcome::Rejected`]
+/// (corrupt); counts the kernel could not fit into the supplied buffer are
+/// [`TransferOutcome::Truncated`] (partial knowledge: grow-and-retry or
+/// fail, never consume).
+///
+/// Zero-length delivery ([`TransferOutcome::Empty`]) stays distinct from
+/// both success-with-data and failure; each site decides whether its own
+/// contract accepts it. There is deliberately no broken-pipe/message-mode
+/// variant with an in-crate producer: this crate never calls
+/// `ReadFile`/`WriteFile`, pipe byte I/O belongs to Tokio above, and
+/// `ERROR_MORE_DATA` (the Win32 message-truncation signal) arrives only as
+/// `Truncated` below.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferOutcome {
+    /// Exact validated unit count, safe to consume (truncate/slice/size).
+    Complete { units: usize },
+    /// Zero units delivered while the call itself succeeded (EOF-shaped).
+    /// Consumable only as zero-length, and only where the site's own
+    /// contract accepts an empty transfer.
+    Empty,
+    /// The kernel reported more than the supplied capacity (message
+    /// truncated, no room for the NUL, scan hit its bound): partial
+    /// knowledge that may size a regrown buffer but never yields data.
+    Truncated { reported: usize, capacity: usize },
+    /// Corrupt count (conversion overflow or over this crate's hard
+    /// plausibility bound): fail closed, never size or slice anything.
+    Rejected,
+}
+
+impl TransferOutcome {
+    /// Returns the consumable count, and only for
+    /// [`TransferOutcome::Complete`]. Every other arm fails closed, so a
+    /// partial, empty, or corrupt transfer can never convert into a full
+    /// frame or domain success. Callers map the generic error to their
+    /// site-specific message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` for any non-complete transfer.
+    pub fn complete_units(self) -> io::Result<usize> {
+        match self {
+            Self::Complete { units } => Ok(units),
+            Self::Empty => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer delivered zero units",
+            )),
+            Self::Truncated { .. } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer was truncated",
+            )),
+            Self::Rejected => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transfer count is invalid",
+            )),
+        }
+    }
+
+    /// Returns the regrow size for [`TransferOutcome::Truncated`]: the
+    /// kernel-reported need that a retry buffer must satisfy. Any other
+    /// state refuses: only a genuine partial may drive grow-and-retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` for any non-truncated transfer.
+    pub fn retry_capacity(self) -> io::Result<usize> {
+        match self {
+            Self::Truncated { reported, .. } => Ok(reported),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "only a truncated transfer can size a retry",
+            )),
+        }
+    }
+}
+
+/// Classifies one bounded NUL-scan length (SID text, credential target
+/// names): zero means the string is empty, reaching the bound means the
+/// terminator was not found (partial knowledge), anything inside is exact.
+fn classify_bounded_scan(length: usize, bound: usize) -> TransferOutcome {
+    if length == 0 {
+        TransferOutcome::Empty
+    } else if length >= bound {
+        TransferOutcome::Truncated {
+            reported: length,
+            capacity: bound,
+        }
+    } else {
+        TransferOutcome::Complete { units: length }
+    }
+}
+
+/// Classifies one `QueryFullProcessImageNameW` reported length: zero or an
+/// unrepresentable value is corrupt, reaching the buffer length means the
+/// image was truncated (no room for the NUL), anything inside is exact.
+fn classify_image_chars(chars: u32, capacity: usize) -> TransferOutcome {
+    let Ok(length) = usize::try_from(chars) else {
+        return TransferOutcome::Rejected;
+    };
+    if length == 0 {
+        TransferOutcome::Empty
+    } else if length >= capacity {
+        TransferOutcome::Truncated {
+            reported: length,
+            capacity,
+        }
+    } else {
+        TransferOutcome::Complete { units: length }
+    }
+}
+
+/// Classifies one kernel-reported count against this crate's bound for it
+/// (token size, enumeration entry count, job process count): zero is an
+/// empty (shape-valid) report, over the bound is corrupt, anything inside
+/// is exact. Whether an empty report satisfies the site is decided by the
+/// caller, never here.
+fn classify_bounded_count(count: usize, bound: usize) -> TransferOutcome {
+    if count > bound {
+        TransferOutcome::Rejected
+    } else if count == 0 {
+        TransferOutcome::Empty
+    } else {
+        TransferOutcome::Complete { units: count }
+    }
+}
+
+/// Classifies one `CREDENTIALW` blob report: over the Win32 blob limit or a
+/// nonzero size with a null pointer is corrupt, zero is an empty (valid)
+/// blob, anything else is exact.
+fn classify_credential_blob(size: usize, blob_is_null: bool) -> TransferOutcome {
+    if size > CRED_MAX_CREDENTIAL_BLOB_SIZE as usize || (size > 0 && blob_is_null) {
+        TransferOutcome::Rejected
+    } else if size == 0 {
+        TransferOutcome::Empty
+    } else {
+        TransferOutcome::Complete { units: size }
+    }
+}
 
 /// Kernel-derived identity of a process observed through a named pipe or Job Object.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -235,6 +630,11 @@ impl PinnedDirectory {
 pub struct DirectoryOplockGuard {
     directory: Option<File>,
     event: OwnedHandle,
+    // Current async-I/O outcome of the single outstanding oplock request
+    // (`Pending` after `acquire`, possibly `ObservedComplete` after a
+    // signaled poll). `Drop` reads it to select the cancel/drain path and
+    // to gate buffer release on the terminal-ownership proof.
+    outcome: Cell<AsyncIoOutcome>,
     // `Option` so `Drop` takes the kernel-visible allocations and, when the
     // cancel drain never signals, intentionally leaks them instead of freeing
     // request storage a late kernel completion may still write.
@@ -249,6 +649,7 @@ pub struct DirectoryOplockGuard {
 // the pending kernel request stays bound to the same allocations. The guard
 // is only moved, never shared (`Sync` is deliberately not implemented), and
 // `Drop` cancels, then frees the boxes only when drained, else leaks them.
+// The outcome cell is plain `Copy` data that moves with the guard.
 unsafe impl Send for DirectoryOplockGuard {}
 
 impl DirectoryOplockGuard {
@@ -308,6 +709,7 @@ impl DirectoryOplockGuard {
         // SAFETY: the file/event are live, all buffers are boxed and remain at
         // stable addresses in the returned guard, and the OVERLAPPED request is
         // canceled and drained before those buffers are dropped.
+        let submitted = AsyncIoOutcome::Prepared.submit_issued();
         let requested = unsafe {
             DeviceIoControl(
                 directory.as_raw_handle().cast(),
@@ -320,22 +722,32 @@ impl DirectoryOplockGuard {
                 overlapped.as_mut(),
             )
         };
-        if requested != 0 {
-            return Err(io::Error::other(
+        // The submit result is classified through the async-outcome model:
+        // synchronous completion, a pending (kernel-owned) request, or a
+        // rejection before the kernel took ownership. The last-error code is
+        // meaningful only when the call returned zero.
+        let submit_error = (requested == 0).then(io::Error::last_os_error);
+        let outcome = submitted.classify_oplock_submit(
+            requested,
+            submit_error.as_ref().and_then(io::Error::raw_os_error),
+        );
+        match outcome {
+            AsyncIoOutcome::Pending => Ok(Self {
+                directory: Some(directory),
+                event,
+                outcome: Cell::new(outcome),
+                overlapped: Some(overlapped),
+                input: Some(input),
+                output: Some(output),
+            }),
+            AsyncIoOutcome::SynchronousComplete => Err(io::Error::other(
                 "directory oplock completed without a durable pending lease",
-            ));
+            )),
+            AsyncIoOutcome::RejectedBeforeSubmit => {
+                Err(submit_error.unwrap_or_else(io::Error::last_os_error))
+            }
+            _ => unreachable!("oplock submit classification is total over the raw result"),
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
-            return Err(error);
-        }
-        Ok(Self {
-            directory: Some(directory),
-            event,
-            overlapped: Some(overlapped),
-            input: Some(input),
-            output: Some(output),
-        })
     }
 
     /// Returns true if Windows has requested an oplock break because a
@@ -345,12 +757,27 @@ impl DirectoryOplockGuard {
     ///
     /// Returns an error when Windows cannot query the oplock event.
     pub fn mutation_attempted(&self) -> io::Result<bool> {
-        // SAFETY: event remains live for the complete guard lifetime.
-        match unsafe { WaitForSingleObject(self.event.0, 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error()),
+        // A signaled manual-reset event latches: once observed complete, the
+        // observation stays complete without another wait call.
+        if self.async_outcome() == AsyncIoOutcome::ObservedComplete {
+            return Ok(true);
         }
+        // SAFETY: event remains live for the complete guard lifetime.
+        let observed =
+            AsyncIoOutcome::classify_oplock_poll(unsafe { WaitForSingleObject(self.event.0, 0) })?;
+        if observed == AsyncIoOutcome::ObservedComplete {
+            self.outcome.set(observed);
+        }
+        Ok(observed == AsyncIoOutcome::ObservedComplete)
+    }
+
+    /// Returns the guard's current async-I/O outcome: `Pending` while the
+    /// kernel may still own the request, `ObservedComplete` once a poll has
+    /// seen the break event. `Drop` consumes this to select its cancel/drain
+    /// path; any other state is unreachable on a live guard.
+    #[must_use]
+    pub fn async_outcome(&self) -> AsyncIoOutcome {
+        self.outcome.get()
     }
 }
 
@@ -364,25 +791,40 @@ impl Drop for DirectoryOplockGuard {
         let mut input = self.input.take();
         let mut output = self.output.take();
         if let Some(directory) = self.directory.take() {
-            if let Some(request) = overlapped.as_ref() {
+            // An already-observed completion has nothing to cancel; any other
+            // stored state requests cancellation of the possibly live kernel
+            // request. Illegal stored states fail closed to `Unresolved`
+            // inside `request_cancel`.
+            let canceling = self.async_outcome().request_cancel();
+            self.outcome.set(canceling);
+            if canceling == AsyncIoOutcome::CancelRequested
+                && let Some(request) = overlapped.as_ref()
+            {
                 // SAFETY: the pending request belongs to this exact file handle and
                 // OVERLAPPED allocation. Closing the handle completes cancellation.
-                unsafe {
-                    CancelIoEx(directory.as_raw_handle().cast(), request.as_ref());
-                }
+                let cancel_return =
+                    unsafe { CancelIoEx(directory.as_raw_handle().cast(), request.as_ref()) };
+                // The return value is recorded explicitly as non-proof: the
+                // outcome stays `CancelRequested` until the drain wait below
+                // observes the terminal signal.
+                self.outcome
+                    .set(canceling.note_cancel_io_result(cancel_return));
             }
             drop(directory);
             // SAFETY: the event outlives this body (it is a later struct
             // field, so it drops after `Drop` returns) and the wait only
             // drains the cancellation before the boxed buffers release below.
             let drained = unsafe { WaitForSingleObject(self.event.0, 5_000) };
-            if drained != WAIT_OBJECT_0 {
-                // Fail-closed: without the terminal event signal the kernel
-                // may still complete the canceled request late and write the
-                // OVERLAPPED/output after this guard is gone, so buffer
-                // ownership is unknown and must not be freed. Leaking three
-                // small allocations once per guard is bounded; a kernel
-                // write-after-free is not.
+            let observed = self.async_outcome().classify_cancel_drain(drained);
+            self.outcome.set(observed);
+            // Release is gated on the exact terminal-ownership proof: only a
+            // drained cancel or an observed completion constructs it. The
+            // `CancelIoEx` return, the 5s timeout, and the handle close above
+            // prove nothing alone, so without the proof the allocations leak
+            // fail-closed instead of freeing storage a late kernel
+            // completion may still write. Leaking three small allocations
+            // once per guard is bounded; a kernel write-after-free is not.
+            if observed.terminal_storage_release().is_none() {
                 if let Some(request) = overlapped.take() {
                     Box::leak(request);
                 }
@@ -427,6 +869,13 @@ pub fn write_new_pinned_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Resolves the PID and executable image of the client connected to a server pipe.
 ///
+/// The returned identity is an unverified kernel observation, not an
+/// authentication verdict: a connected handle proves a client is attached,
+/// not that it is the expected principal, session, or generation. Callers
+/// must bind the PID, image, file identity, and creation ticks against
+/// their expected peer; failures authenticate nothing. Authority and ACL
+/// ownership stay with the existing transport owners.
+///
 /// # Errors
 ///
 /// Returns an error when Windows cannot bind the server pipe to its client PID or
@@ -436,8 +885,16 @@ pub fn named_pipe_client_process(pipe: &NamedPipeServer) -> io::Result<ProcessIm
     // SAFETY: Tokio owns a live server-end pipe handle and `pid` is a valid out pointer.
     let resolved =
         unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle().cast(), &raw mut pid) };
-    if resolved == 0 || pid == 0 {
+    if resolved == 0 {
         return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // Success with no client PID proves nothing about the peer: fail
+        // closed with a typed error instead of a stale last-error value.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "named pipe reported no client process",
+        ));
     }
     Ok(open_process_identity(pid)?.identity)
 }
@@ -477,12 +934,20 @@ pub fn current_process_token_sid() -> io::Result<String> {
     unsafe {
         GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut needed);
     }
-    if needed == 0 || needed > 4096 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process token size is invalid",
-        ));
-    }
+    // The required-size report is classified before it sizes anything: zero
+    // or over the `TOKEN_USER` plausibility bound fails closed here, so only
+    // an exact count reaches the buffer below.
+    let mut needed = match classify_bounded_count(needed as usize, 4096) {
+        TransferOutcome::Complete { units } => u32::try_from(units).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "process token size is invalid")
+        })?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process token size is invalid",
+            ));
+        }
+    };
     // The query writes a TOKEN_USER (8-byte aligned), so the buffer is
     // 8-byte aligned u64 storage sized up from the reported byte count.
     let mut buffer = vec![0u64; (needed as usize).div_ceil(std::mem::size_of::<u64>())];
@@ -530,7 +995,10 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
         }
         len += 1;
     }
-    if len == 0 || len >= 512 {
+    // Only an exact in-bound scan length reaches the slice below: an empty
+    // or unterminated conversion fails closed (freeing first) instead of
+    // exposing a partial SID.
+    let Ok(len) = classify_bounded_scan(len, 512).complete_units() else {
         // SAFETY: `wide` is the live `LocalAlloc` string from the conversion.
         unsafe {
             LocalFree(wide.cast());
@@ -539,7 +1007,7 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
             io::ErrorKind::InvalidData,
             "process SID text is invalid",
         ));
-    }
+    };
     // SAFETY: `wide` holds `len` live units; freed exactly once below.
     let slice = unsafe { std::slice::from_raw_parts(wide, len) };
     let sid = OsString::from_wide(slice).into_string().map_err(|_| {
@@ -600,24 +1068,25 @@ fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
 /// for the NUL) or the length is corrupt, so it fails closed instead of
 /// exposing trailing NULs.
 fn truncate_image_buffer(mut image: Vec<u16>, chars: u32) -> io::Result<PathBuf> {
-    if chars == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process image length is invalid",
-        ));
-    }
-    let chars = usize::try_from(chars).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process image length is invalid",
-        )
-    })?;
-    if chars >= image.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process image length exceeds its buffer",
-        ));
-    }
+    // The reported length is classified before it truncates anything: zero
+    // or unrepresentable is corrupt, reaching the buffer length means the
+    // image was truncated (no room for the NUL), and only an exact count
+    // reaches the truncation below.
+    let chars = match classify_image_chars(chars, image.len()) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process image length is invalid",
+            ));
+        }
+        TransferOutcome::Truncated { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process image length exceeds its buffer",
+            ));
+        }
+    };
     image.truncate(chars);
     Ok(PathBuf::from(OsString::from_wide(&image)))
 }
@@ -1119,14 +1588,27 @@ impl JobProcessObserver {
         if self.thread.is_none() {
             return;
         }
-        // SAFETY: the completion port stays live until the observer thread is joined.
-        unsafe {
-            PostQueuedCompletionStatus(
-                self.completion_port.0,
-                0,
-                JOB_OBSERVER_SHUTDOWN_KEY,
-                ptr::null(),
-            );
+        // The shutdown directive is idempotent (the observer breaks on the
+        // first shutdown key and the port is dropped after the join), so a
+        // failed Post — submission unknown — permits a bounded re-post. Any
+        // further unknown outcome stops the loop; the join below still
+        // bounds observer teardown.
+        let mut directive = AsyncIoOutcome::Prepared;
+        for _ in 0..3 {
+            directive = directive.submit_issued();
+            // SAFETY: the completion port stays live until the observer thread is joined.
+            let queued = unsafe {
+                PostQueuedCompletionStatus(
+                    self.completion_port.0,
+                    0,
+                    JOB_OBSERVER_SHUTDOWN_KEY,
+                    ptr::null(),
+                )
+            };
+            directive = directive.classify_directive_post(queued);
+            if directive == AsyncIoOutcome::Submitted {
+                break;
+            }
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1927,12 +2409,19 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
             let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "Job process count is invalid")
             })?;
-            if count > capacity {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Job process list exceeded its supplied buffer",
-                ));
-            }
+            // A count beyond the supplied buffer contradicts the success
+            // return (corrupt): fail closed instead of slicing past the
+            // buffer. An empty job stays consumable as zero IDs.
+            let count = match classify_bounded_count(count, capacity) {
+                TransferOutcome::Complete { units } => units,
+                TransferOutcome::Empty => 0,
+                TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Job process list exceeded its supplied buffer",
+                    ));
+                }
+            };
             let ids = job_id_slice(&buffer, count)?;
             return ids
                 .iter()
@@ -1950,7 +2439,15 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
             return Err(error);
         }
         let assigned = usize::try_from(header.NumberOfAssignedProcesses).unwrap_or(capacity + 1);
-        capacity = assigned.max(capacity.saturating_mul(2));
+        // Partial enumeration: the kernel kept the remainder, so this
+        // `Truncated` outcome may only size the regrown buffer below; it
+        // never yields IDs and never converts into a complete result.
+        let partial = TransferOutcome::Truncated {
+            reported: assigned,
+            capacity,
+        };
+        let grown = partial.retry_capacity()?;
+        capacity = grown.max(capacity.saturating_mul(2));
         if capacity > MAX_JOB_PROCESS_IDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2444,6 +2941,12 @@ pub fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> 
         if !transient || attempt == 40 {
             return Err(error);
         }
+        // A failed synchronous move submits nothing durable: the attempt was
+        // rejected before the kernel took ownership, so this reconcile check
+        // admits the retry. Any outcome where the kernel may still own the
+        // operation (pending, cancel-requested, unknown, unresolved) refuses
+        // instead of permitting a blind retry.
+        AsyncIoOutcome::RejectedBeforeSubmit.reconcile_before_retry()?;
         std::thread::sleep(Duration::from_millis(25));
     }
     unreachable!("bounded atomic replacement loop always returns")
@@ -2613,12 +3116,20 @@ fn credential_target_name(target: *const u16) -> io::Result<String> {
             length += 1;
         }
     }
-    if length == MAX_CREDENTIAL_TARGET_CHARS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "credential target name exceeded the bounded scan",
-        ));
-    }
+    // Only an exact in-bound scan reaches the slice below: hitting the bound
+    // means the terminator was not found (partial knowledge), so it fails
+    // closed instead of exposing a truncated name. An empty target stays
+    // consumable as zero-length, exactly as before.
+    let length = match classify_bounded_scan(length, MAX_CREDENTIAL_TARGET_CHARS) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty => 0,
+        TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential target name exceeded the bounded scan",
+            ));
+        }
+    };
     // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the
     // scanned prefix): the scan above observed `length` consecutive non-NUL
     // units followed by a NUL at `target[length]`, all within the live
@@ -2676,13 +3187,18 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
     let count = usize::try_from(count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "credential count is invalid"))?;
     // Fail closed on a corrupt count before forming any slice: never default
-    // to zero or truncate, and keep the allocation bounded.
-    if count > MAX_CREDENTIAL_ENUM_ENTRIES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "credential enumeration count exceeds the bound",
-        ));
-    }
+    // to zero or truncate, and keep the allocation bounded. An empty result
+    // stays consumable as zero entries, exactly as before.
+    let count = match classify_bounded_count(count, MAX_CREDENTIAL_ENUM_ENTRIES) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty => 0,
+        TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential enumeration count exceeds the bound",
+            ));
+        }
+    };
     if count.saturating_mul(std::mem::size_of::<*mut CREDENTIALW>()) > isize::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -3039,14 +3555,19 @@ pub fn credential_read_current_user(credential_id: &str) -> io::Result<Option<Ve
             "credential blob size is invalid",
         )
     })?;
-    if credential.CredentialBlobSize > CRED_MAX_CREDENTIAL_BLOB_SIZE
-        || (blob_size > 0 && credential.CredentialBlob.is_null())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "credential blob is invalid",
-        ));
-    }
+    // The blob report is classified before the slice below is formed: an
+    // over-limit or dangling report fails closed, while an empty blob stays
+    // consumable as zero-length, exactly as before.
+    let blob_size = match classify_credential_blob(blob_size, credential.CredentialBlob.is_null()) {
+        TransferOutcome::Complete { units } => units,
+        TransferOutcome::Empty => 0,
+        TransferOutcome::Truncated { .. } | TransferOutcome::Rejected => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "credential blob is invalid",
+            ));
+        }
+    };
     // SAFETY (WORK_UNIT 789, credential family — blob `from_raw_parts`):
     // `credential` is borrowed from the live `buffer` allocation, so
     // `CredentialBlob` (when `blob_size > 0`, proven non-null above) points at

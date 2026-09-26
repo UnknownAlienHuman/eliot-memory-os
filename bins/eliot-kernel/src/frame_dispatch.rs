@@ -374,32 +374,43 @@ impl KernelComposition {
     /// currently verify. The conjunction is:
     ///
     /// 1. the revocable I1.11 supervision step, whose only producer is one
-    ///    Host-observed live SCM Watchdog incarnation bound to the presented
+    ///    independent Host-observed Watchdog observation bound to the presented
     ///    candidate contour, and which a new activation contour revokes;
-    /// 2. a non-zero Watchdog epoch on this candidate's supervision
-    ///    incarnation;
-    /// 3. a signature-verified `Active` supervision lease inside its validity
+    /// 2. that observation is still bound to the presented candidate contour and
+    ///    to the exact target fence being admitted, and is still inside its own
+    ///    finite validity interval;
+    /// 3. a non-zero Watchdog epoch on this candidate's supervision
+    ///    incarnation, which is also the epoch the retained observation was
+    ///    taken under;
+    /// 4. a signature-verified `Active` supervision lease inside its validity
     ///    window under the Kernel trust anchor; and
-    /// 4. a two-sided exact join of that lease to this candidate and to the
-    ///    exact target fence being admitted.
+    /// 5. a two-sided exact join of that lease to this candidate, to the exact
+    ///    target fence being admitted, and to the observed Watchdog epoch — so
+    ///    the retained observation is consumed by the comparison rather than
+    ///    sitting beside it, and a renewed lease cannot stand in for a fresh
+    ///    physical observation.
     ///
-    /// Any missing or mismatched fact refuses. An unexpired signed lease
-    /// alone, a health string, or `eliotd`'s self-reported `watchdog_covered`
-    /// boolean is never coverage.
+    /// Any missing, mismatched, foreign or expired fact refuses. An unexpired
+    /// signed lease alone, a health string, or `eliotd`'s self-reported
+    /// `watchdog_covered` boolean is never coverage.
     #[cfg(windows)]
     pub(crate) fn verify_watchdog_supervision_branch(
         &self,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         target: &StateFence,
     ) -> Result<(), &'static str> {
-        let supervision_verified = self
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|_| "the presented candidate contour has no computable digest")?;
+        // I1.5 (#1750): freshness and binding come from the retained observation
+        // itself. The observation must be current, bound to this exact contour
+        // and this exact fence, and the Watchdog epoch it was taken under is
+        // joined to the signed lease below.
+        let observed_watchdog_epoch = self
             .startup_coordinator
             .lock()
             .map_err(|_| "startup gate lock is poisoned")?
-            .supervision_evidence_is_complete();
-        if !supervision_verified {
-            return Err("no Host-observed Watchdog branch for the current contour");
-        }
+            .admit_supervision_observation(candidate_digest.as_str(), target, unix_ms())?;
         let incarnation = &candidate.supervision_incarnation;
         if incarnation.watchdog_epoch.sequence == 0 {
             return Err("supervision incarnation has no non-zero Watchdog epoch");
@@ -445,6 +456,11 @@ impl KernelComposition {
                 .kernel_epoch
                 .is_same_authority(&target.authority_epoch)
             || binding.watchdog_epoch.value() != incarnation.watchdog_epoch.sequence
+            // The retained observation is consumed here, not merely stored
+            // beside the decision: the signed lease's Watchdog epoch is joined
+            // to the epoch the observation was actually taken under, as a full
+            // (lineage, sequence) tuple rather than a bare number.
+            || incarnation.watchdog_epoch != observed_watchdog_epoch
             || binding.state_fence != *target
             || binding.generation_binding.target_id != candidate.artifact_hash.as_str()
             || binding.generation_binding.target_generation != target.resource_generation
@@ -541,9 +557,24 @@ impl KernelComposition {
                 observe_frame("kernel.frame_validated", "success");
                 observe_frame("kernel.frame_admitted", "success");
                 observe_frame("kernel.frame_dispatched", outcome);
+                observe_frame("kernel.frame_cleanup", "complete");
             }
             Err(error) => {
                 observe_frame("kernel.frame_decode_reject", "fenced");
+                if matches!(
+                    error,
+                    TransportError::Protocol(_)
+                        | TransportError::Io(_)
+                        | TransportError::UnknownOutcome
+                        | TransportError::Timeout
+                ) {
+                    // F-LOG-KERNEL-1 (#897 T10): failed frame input observed
+                    // without payload at the dispatch boundary. Static
+                    // event/outcome only; transport-level partial/zero/EOF at
+                    // `receive_frame` never reaches this seam (the driver
+                    // fences first) and needs a revised explicit assignment.
+                    observe_frame("kernel.frame_input_unknown", "unknown");
+                }
                 if matches!(error, TransportError::Cancelled) {
                     // F-LOG-KERNEL-1 (#897 W2): cancellation observed as the
                     // dispatch disposition, distinct from the cancellation
@@ -552,6 +583,7 @@ impl KernelComposition {
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+                observe_frame("kernel.frame_cleanup", "fenced");
             }
         }
         result
@@ -1172,6 +1204,13 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "agent_activation_reconcile"
             | "publish_owner_bundle"
             | "query_owner_bundle"
+            // Issue #2100 R6: the canonical second-phase read route. The
+            // marker is the one string the admitted dispatch arm already
+            // serves (`QUERY_GRANT_CLOSURE_LINKS_OPERATION`); it was absent
+            // here, so the frame fell through every predicate, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session
+            // before the arm was ever entered.
+            | super::daemon_request_dispatch::QUERY_GRANT_CLOSURE_LINKS_OPERATION
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"
@@ -1220,6 +1259,15 @@ fn is_daemon_operation(operation: &str) -> bool {
             // `ProcessExecutionRequest` decode, and fenced the session.
             | NOTIFICATION_STATE_MUTATION_OPERATION
             | NOTIFICATION_STATE_READ_OPERATION
+            // #1862: the Task Controller claim/result legs and the dedicated
+            // campaign-packet claim/result legs are separate admitted operations
+            // with their own queues and attempt types, so the frame must reach
+            // their own dispatch instead of falling through to the generic
+            // `ProcessExecutionRequest` decode.
+            | "task_controller_claim"
+            | "task_controller_result"
+            | "campaign_packet_claim"
+            | "campaign_packet_result"
     )
 }
 
@@ -1494,7 +1542,18 @@ impl KernelComposition {
             .execute_doctor_request_inner(session, request_id, operation, &payload, control)
             .await;
         match &result {
-            Ok(_) => observe_frame("kernel.frame_doctor_execute", "success"),
+            Ok(_) => {
+                observe_frame("kernel.frame_doctor_execute", "success");
+                if control {
+                    // F-LOG-KERNEL-1 (#897 T18): the control frame's
+                    // cancellation was admitted by the typed cancellation
+                    // owner (`admit_doctor_repair_cancellation`), so the
+                    // requested cancellation is observed as effected here.
+                    // Production-reachable via the driver control arm. Info
+                    // only; this wrapper owns the single terminal.
+                    observe_frame("kernel.frame_cancel_observed", "cancelled");
+                }
+            }
             Err(error) => {
                 observe_frame("kernel.frame_doctor_execute", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
@@ -1794,7 +1853,18 @@ impl KernelComposition {
             .execute_testd_request_inner(session, request_id, operation, &payload, control)
             .await;
         match &result {
-            Ok(_) => observe_frame("kernel.frame_testd_execute", "success"),
+            Ok(_) => {
+                observe_frame("kernel.frame_testd_execute", "success");
+                if control {
+                    // F-LOG-KERNEL-1 (#897 T18): the control frame's
+                    // cancellation was admitted by the typed cancellation
+                    // owner (`admit_testd_cancellation`), so the requested
+                    // cancellation is observed as effected here.
+                    // Production-reachable via the driver control arm. Info
+                    // only; this wrapper owns the single terminal.
+                    observe_frame("kernel.frame_cancel_observed", "cancelled");
+                }
+            }
             Err(error) => {
                 observe_frame("kernel.frame_testd_execute", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));

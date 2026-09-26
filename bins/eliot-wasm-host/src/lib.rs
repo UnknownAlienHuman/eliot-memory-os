@@ -67,9 +67,10 @@ pub use dispatch_material::{
     ValidatedManifestRecord, ValidatedPromotionInput, ValidatedPromotionRecord,
     ValidatedSnapshotInput, ValidatedSnapshotRecord, ValidatedWorkInput, ValidatedWorkRecord,
     WASM_DISPATCH_MATERIAL_WIRE_ID, WASM_DISPATCH_MATERIAL_WIRE_VERSION,
-    WASM_HOST_GUEST_ARTIFACT_FILE_NAME, WASM_HOST_GUEST_INPUT_FILE_NAME,
-    WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path, bind_dispatch_material, consume_staged,
-    read_dispatch_material, read_dispatch_material_from, read_staged_bytes,
+    WASM_HOST_CONTROL_FILE_NAME, WASM_HOST_GUEST_ARTIFACT_FILE_NAME,
+    WASM_HOST_GUEST_INPUT_FILE_NAME, WASM_HOST_MATERIAL_FILE_NAME, admitted_material_path,
+    bind_dispatch_material, consume_staged, read_dispatch_material, read_dispatch_material_from,
+    read_staged_bytes,
 };
 pub use governed_admission::{HostAdmitError, admit_governed_host, check_governed_host_output};
 pub use guest_exec::{
@@ -84,11 +85,11 @@ pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
 pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime};
 pub use request_loop::{
-    AdmittedBinding, DeliverySetChannel, LoopError, MAX_RESULT_FRAME_BYTES, OP_CANCEL, OP_INVOKE,
-    OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError, OrdinaryOutcome, WASM_HOST_REQUEST_WIRE_ID,
-    WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID, WasmHostRequest,
-    WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame, run_ordinary_request_loop,
-    run_request_loop,
+    AdmittedBinding, DeliverySetChannel, KernelControlReader, LoopError, MAX_RESULT_FRAME_BYTES,
+    OP_CANCEL, OP_INVOKE, OP_RECONCILE, OP_SHUTDOWN, OrdinaryDriveError, OrdinaryOutcome,
+    WASM_HOST_REQUEST_WIRE_ID, WASM_HOST_REQUEST_WIRE_VERSION, WASM_HOST_RESULT_WIRE_ID,
+    WasmHostRequest, WasmHostRequestChannel, WasmHostRequestFrame, WasmHostResultFrame,
+    run_ordinary_request_loop, run_request_loop,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{

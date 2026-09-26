@@ -53,7 +53,8 @@ use crate::{
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
     AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
-    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, CanonicalDisposition,
+    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+    BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
     CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
     CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
     CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
@@ -135,6 +136,18 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
+/// Durable owner-backed `backup.verify` results (issue #2802; I5.27, I14.21).
+///
+/// One row per public request operation identity, so an exact replay of the same
+/// operation reads back the same owner-proved result after a Kernel restart or
+/// an Authority Epoch rotation, and a changed archive under the same identity is
+/// a conflict rather than a second answer. It is a new table in the existing ORS
+/// family with the single Kernel verify route as its one writer; it never reuses
+/// [`UNKNOWN_COMMIT_RECOVERY`], because a read-only verification is not a
+/// canonical write attempt and that table's own contract is one staged row per
+/// admitted write attempt.
+const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_backup_verification_results_v1");
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -1425,6 +1438,30 @@ const HOST_REQUEST_LOGICAL_NAMESPACE: &str = "eliot.host-request.logical.v1";
 /// A real component value equal to this marker is rejected at derivation so
 /// bindings can never collide with admitted unbound-capture state.
 const HOST_REQUEST_UNBOUND_MARKER: &str = "-";
+
+/// Content-addressed generated learning views retained atomically with their
+/// authenticated local-read result (`eliot.packet`).
+const CAMPAIGN_LEARNING_STATE_VIEWS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_campaign_learning_state_views_v1");
+/// Immutable typed owner-source rows, keyed by source key plus body digest.
+const CAMPAIGN_SOURCE_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_campaign_source_records_v1");
+/// Current owner-source heads, advanced only after a committed owner receipt.
+const CAMPAIGN_SOURCE_HEADS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_campaign_source_heads_v1");
+/// Pre-commit CAS reservations used to reconcile a crash after canonical
+/// commit but before the ORS source projection is finalized.
+const CAMPAIGN_SOURCE_PENDING: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_campaign_source_pending_v1");
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignSourceReservation {
+    operation_id: String,
+    request_digest: String,
+    publication: eliot_store_api::CampaignSourcePublication,
+}
+
 const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
 const ACTIVATION_LIFECYCLES: TableDefinition<&str, &str> =
@@ -2047,6 +2084,54 @@ pub trait OperationalRecoveryStore: Send + Sync {
         dependency_observation: Option<(&str, &str)>,
         now_unix_ms: u64,
     ) -> Result<ActivationResultRetentionRecord, OrsError>;
+    /// Loads one immutable content-addressed campaign view by exact artifact
+    /// identity. The view was committed with an admitted local-read result.
+    fn load_campaign_learning_state_view(
+        &self,
+        view_id: &eliot_contracts::ArtifactId,
+    ) -> Result<Option<eliot_store_api::CampaignLearningStateViewPublication>, OrsError>;
+    /// Atomically reserves all exact owner source-head CAS expectations for
+    /// one canonical operation before it reaches the owner store.
+    fn reserve_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError>;
+    /// Finalizes the reserved immutable source rows and advances their heads
+    /// only after the exact canonical owner receipt is committed.
+    fn commit_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), OrsError>;
+    /// Releases reservations only after a typed canonical receipt proves the
+    /// owner operation did not commit.
+    fn abort_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError>;
+    /// Reads the requested immutable source revision and exact current owner
+    /// head at the same ORS snapshot.
+    fn load_campaign_source_revision(
+        &self,
+        lookup: &eliot_store_api::CampaignSourceRevisionLookup,
+        read_state_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_store_api::CampaignSourceRevisionRead, OrsError>;
+    /// Atomically retains one opaque Kernel activation result before its
+    /// acknowledgement may be emitted. An exact replay returns the durable
+    /// record; a changed ticket/result identity conflicts and never overwrites.
+    fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+    ) -> Result<ActivationResultRetentionRecord, OrsError>;
     /// Durably terminalizes one result-less ticket as cancelled, expired, or
     /// reconciling. Accepted/result-bearing states never transition here.
     fn terminate_activation_without_result(
@@ -2573,6 +2658,26 @@ impl persistence_codec::PersistedValue for crate::DoctorEffectRecord {
 
 impl persistence_codec::PersistedValue for crate::DoctorBudgetLedger {
     const RECORD_TYPE: &'static str = "doctor_budget";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Binds the durable backup-verification result to the ORS codec, so its row is
+/// encoded, decoded and re-validated exactly like every other record family in
+/// this store: the same JSON codec, the same `IntegrityProblem` record-type
+/// envelope on a bad decode, and the same fail-closed `validate()` gate on
+/// every read. The record type is the published
+/// [`BACKUP_VERIFICATION_RESULT_RECORD_TYPE`] so the Kernel verify route can
+/// name the identity-conflict signal by contract instead of by a copied
+/// literal.
+///
+/// The impl is declared in this file rather than beside its siblings in the
+/// codec module because the record's type and `validate()` live in `model.rs`
+/// and the whole of its persisted contract is exactly that `validate()`.
+impl persistence_codec::PersistedValue for BackupVerificationResultRecord {
+    const RECORD_TYPE: &'static str = BACKUP_VERIFICATION_RESULT_RECORD_TYPE;
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -3322,6 +3427,79 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(Some(resolved))
+    }
+
+    /// Loads one durable `backup.verify` result by exact idempotency key
+    /// (I14.21 readback, issue #2802).
+    ///
+    /// The stored row is re-validated through the same ORS codec every sibling
+    /// reader uses, so a row whose own digests or owner spellings no longer hold
+    /// is an integrity failure rather than a replayable answer. `Ok(None)` means
+    /// this operation identity was never recorded; it is not an unknown answer,
+    /// and a caller must not treat it as one.
+    pub fn load_backup_verification_result(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<BackupVerificationResultRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        table
+            .get(idempotency_key)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BackupVerificationResultRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Stages one durable `backup.verify` result under its operation identity.
+    ///
+    /// Persist-before-answer: the row is committed before the route answers, so
+    /// a lost response reconciles to this same persisted result instead of
+    /// re-deriving a differently-fenced one. An exact replay under the same key
+    /// returns [`BackupVerificationDisposition::AlreadyBound`] with the durable
+    /// winner; a different request digest under the same key fails with
+    /// [`OrsError::IntegrityProblem`] and never overwrites the bound row.
+    pub fn stage_backup_verification_result(
+        &self,
+        record: &BackupVerificationResultRecord,
+    ) -> Result<BackupVerificationDisposition, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let disposition = {
+            let mut table = write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?;
+            let staged_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(BackupVerificationDisposition::Stored);
+            };
+            let existing: BackupVerificationResultRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                    reason: "existing backup-verification binding conflicts".to_owned(),
+                });
+            }
+            BackupVerificationDisposition::AlreadyBound(Box::new(existing))
+        };
+        write.commit().map_err(storage)?;
+        Ok(disposition)
     }
 
     /// Stages one P-04 host-request operation before any acknowledgement.
@@ -4954,6 +5132,10 @@ impl RedbRecoveryStore {
     /// fence is unchanged. A `Requested` operation cannot receive a result
     /// (it must be admitted first); terminal states without a result cannot
     /// gain one.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
+    )]
     pub fn persist_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -4962,6 +5144,7 @@ impl RedbRecoveryStore {
         result_response: &serde_json::Value,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
+        let campaign_view = campaign_view_publication(result_response)?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
         let existing: Option<crate::HostRequestRecord> = {
@@ -4980,6 +5163,37 @@ impl RedbRecoveryStore {
             let same_digest = existing.result_digest.as_deref() == Some(result_digest);
             let same_body = existing.result_response.as_ref() == Some(result_response);
             if same_digest && same_body {
+                if let Some(publication) = campaign_view.as_ref() {
+                    let view_key = publication.view_id.as_str();
+                    let current = {
+                        let table = write
+                            .open_table(CAMPAIGN_LEARNING_STATE_VIEWS)
+                            .map_err(storage)?;
+                        table
+                            .get(view_key)
+                            .map_err(storage)?
+                            .map(|value| {
+                                decode::<eliot_store_api::CampaignLearningStateViewPublication>(
+                                    value.value(),
+                                )
+                            })
+                            .transpose()?
+                    };
+                    match current {
+                        Some(current) if current == *publication => return Ok(Some(existing)),
+                        Some(_) => return Err(campaign_view_identity_conflict(view_key)),
+                        None => {
+                            let encoded = encode(publication)?;
+                            let mut table = write
+                                .open_table(CAMPAIGN_LEARNING_STATE_VIEWS)
+                                .map_err(storage)?;
+                            table.insert(view_key, encoded.as_str()).map_err(storage)?;
+                            drop(table);
+                            write.commit().map_err(storage)?;
+                            return Ok(Some(existing));
+                        }
+                    }
+                }
                 return Ok(Some(existing));
             }
             // Legacy digest-only row completed by the exact same digest: the
@@ -5035,6 +5249,34 @@ impl RedbRecoveryStore {
             next.commit_order = Self::next_operational_order(&write)?;
         }
         next.validate()?;
+        if let Some(publication) = campaign_view.as_ref() {
+            let view_key = publication.view_id.as_str();
+            let current = {
+                let table = write
+                    .open_table(CAMPAIGN_LEARNING_STATE_VIEWS)
+                    .map_err(storage)?;
+                table
+                    .get(view_key)
+                    .map_err(storage)?
+                    .map(|value| {
+                        decode::<eliot_store_api::CampaignLearningStateViewPublication>(
+                            value.value(),
+                        )
+                    })
+                    .transpose()?
+            };
+            match current {
+                Some(current) if current == *publication => {}
+                Some(_) => return Err(campaign_view_identity_conflict(view_key)),
+                None => {
+                    let encoded = encode(publication)?;
+                    let mut table = write
+                        .open_table(CAMPAIGN_LEARNING_STATE_VIEWS)
+                        .map_err(storage)?;
+                    table.insert(view_key, encoded.as_str()).map_err(storage)?;
+                }
+            }
+        }
         if next != existing {
             let payload = encode(&next)?;
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
@@ -6796,8 +7038,9 @@ impl RedbRecoveryStore {
 
     /// Loads one retained replay commitment inside a write transaction:
     /// `None` when the identity has no post-compaction evidence. A live row
-    /// and a commitment never coexist; the stage entry checks the live row
-    /// first, so this is consulted only after the live row is gone.
+    /// and a commitment never coexist; [`Self::check_bridge_retained_replay_in`]
+    /// checks the live row first, so this is consulted only after the live
+    /// row is gone.
     fn load_bridge_commitment_in(
         write: &redb::WriteTransaction,
         namespace: &str,
@@ -7099,6 +7342,14 @@ impl RedbRecoveryStore {
     /// conflicting pending handoff fails here instead of surfacing later.
     /// Identical payload bytes at two genuinely distinct event identities
     /// and positions remain legitimate stage requests.
+    ///
+    /// The retained-history decision itself lives in
+    /// [`Self::check_bridge_retained_replay_in`]: live rows, retained
+    /// replay commitments, and the compacted/retired boundary are
+    /// consulted before anything fresh is allocated, and an existing
+    /// disposition returns with `fresh: false`. Only a genuinely new
+    /// identity falls through to
+    /// [`Self::stage_fresh_bridge_event_checked`].
     pub fn stage_bridge_event_checked(
         &self,
         staged: &serde_json::Value,
@@ -7120,56 +7371,64 @@ impl RedbRecoveryStore {
                 BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
                 BridgeStreamRight::Append,
             )?;
-            let existing: Option<BridgeEventRow> =
-                Self::load_bridge_event_row_in(&write, &stage.key)?;
-            if let Some(row) = existing {
-                row.validate()?;
-                Self::replay_bridge_event_outcome_checked(&write, &access, &row, &stage, &staging)?
-            } else {
-                Self::stage_fresh_bridge_event_checked(&write, &access, &stage, &staging, now_ms)?
+            match Self::check_bridge_retained_replay_in(&write, &access, &stage, &staging)? {
+                Some(outcome) => outcome,
+                None => Self::stage_fresh_bridge_event_checked(
+                    &write, &access, &stage, &staging, now_ms,
+                )?,
             }
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
     }
 
-    /// Stages an identity with no live row (issue #2730, items 1-2, 5):
-    /// retained history is consulted before anything fresh is decided.
-    /// Exact commitment evidence returns the existing disposition with
-    /// `fresh: false`, and changed content under a committed identity
-    /// fails with [`OrsError::DuplicateConflict`]. A position admitted
-    /// under a different event rejects the request before any mutation;
-    /// a request below the retained compacted boundary without exact
-    /// evidence returns the explicit retired disposition with `fresh:
-    /// false` and no mutation; a conflicting pending handoff fails before
-    /// any record/cursor mutation. Only a genuinely new identity at a
-    /// free position above the boundary inserts.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "fresh-identity staging keeps the commitment, position, boundary, and handoff checks in one auditable order"
-    )]
-    fn stage_fresh_bridge_event_checked(
+    /// Decides one owner-checked stage request against retained history
+    /// (issue #2730, item 2): live rows, retained replay commitments, and
+    /// the stream's compacted/retired boundary are consulted before
+    /// anything fresh is allocated, inside the authorized stream
+    /// incarnation the caller already bound. Performs no mutation itself.
+    ///
+    /// Where exact identity/content evidence remains, the existing
+    /// disposition returns with `fresh: false` — the live row's duplicate
+    /// outcome, or the retained commitment's duplicate outcome after
+    /// payload compaction. A frontier alone proves neither a particular
+    /// event ID nor its bytes: when the request names a position at or
+    /// below the retained compacted boundary with no exact evidence left,
+    /// the explicit retired/unverifiable recovery disposition returns with
+    /// `fresh: false`, never a fabricated duplicate or fresh insertion.
+    /// Changed content under a live or committed identity, a position
+    /// admitted under a different event, or a torn position binding with
+    /// no retained evidence fails closed. Returns `Ok(None)` only for a
+    /// genuinely new identity at a free position above the boundary; the
+    /// caller still runs the pending-handoff compatibility check before
+    /// any record/cursor mutation.
+    fn check_bridge_retained_replay_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         stage: &BridgeCheckedStage,
         staging: &BridgeEventPrivacyStaging,
-        now_ms: u64,
-    ) -> Result<serde_json::Value, OrsError> {
-        access.require(BridgeStreamRight::Append)?;
-        let commitment = Self::load_bridge_commitment_in(write, &stage.namespace, &stage.event_id)?;
-        if let Some(commitment) = commitment {
+    ) -> Result<Option<serde_json::Value>, OrsError> {
+        if let Some(row) = Self::load_bridge_event_row_in(write, &stage.key)? {
+            row.validate()?;
+            return Ok(Some(Self::replay_bridge_event_outcome_checked(
+                write, access, &row, stage, staging,
+            )?));
+        }
+        if let Some(commitment) =
+            Self::load_bridge_commitment_in(write, &stage.namespace, &stage.event_id)?
+        {
             if !Self::bridge_commitment_matches(&commitment, stage, staging) {
                 return Err(OrsError::DuplicateConflict);
             }
             let (durable, acked) = Self::bridge_cursors_in_checked(write, access)?;
             let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
-            return Ok(Self::bridge_event_outcome_from_commitment(
+            return Ok(Some(Self::bridge_event_outcome_from_commitment(
                 &commitment,
                 "duplicate",
                 durable,
                 acked,
                 handoff.as_deref(),
-            ));
+            )));
         }
         let cursor = Self::load_bridge_cursor_row_in(write, &access.namespace)?;
         let (durable, acked, compacted) = cursor.as_ref().map_or((0, 0, 0), |row| {
@@ -7197,14 +7456,14 @@ impl RedbRecoveryStore {
             // position index still names this same identity (its
             // commitment may have expired under bound pressure).
             let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
-            return Ok(Self::bridge_event_retired_outcome(
+            return Ok(Some(Self::bridge_event_retired_outcome(
                 stage,
                 staging,
                 durable,
                 acked,
                 compacted,
                 handoff.as_deref(),
-            ));
+            )));
         }
         if torn_position {
             // Above the boundary the position must resolve to retained
@@ -7216,6 +7475,25 @@ impl RedbRecoveryStore {
                     .to_owned(),
             });
         }
+        Ok(None)
+    }
+
+    /// Stages an identity with no retained evidence (issue #2730, items
+    /// 1-2, 5): [`Self::check_bridge_retained_replay_in`] already
+    /// established that no live row, no retained commitment, no occupant
+    /// position, and no retired boundary blocks this identity. A
+    /// conflicting pending handoff still fails before any record/cursor
+    /// mutation; otherwise the row, its ordered position binding, its
+    /// cursor advance, and its pending handoff commit in this one short
+    /// ORS transaction.
+    fn stage_fresh_bridge_event_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        stage: &BridgeCheckedStage,
+        staging: &BridgeEventPrivacyStaging,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        access.require(BridgeStreamRight::Append)?;
         Self::check_bridge_handoff_compatible_in(write, access, stage)?;
         Self::insert_bridge_event_row_checked(write, access, stage, staging, now_ms)
     }
@@ -9478,6 +9756,457 @@ impl RedbRecoveryStore {
             }
         }
         Ok(false)
+    }
+
+    /// Loads one immutable content-addressed campaign view.
+    pub fn load_campaign_learning_state_view(
+        &self,
+        view_id: &eliot_contracts::ArtifactId,
+    ) -> Result<Option<eliot_store_api::CampaignLearningStateViewPublication>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(CAMPAIGN_LEARNING_STATE_VIEWS)
+            .map_err(storage)?;
+        let Some(value) = table.get(view_id.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let publication: eliot_store_api::CampaignLearningStateViewPublication =
+            decode(value.value())?;
+        publication
+            .validate()
+            .map_err(|_| OrsError::IntegrityProblem {
+                record_type: "campaign_learning_state_view",
+                reason: "stored content-addressed view failed validation".to_owned(),
+            })?;
+        if publication.view_id != *view_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "campaign_learning_state_view",
+                reason: "stored view key differs from its content identity".to_owned(),
+            });
+        }
+        Ok(Some(publication))
+    }
+
+    /// Atomically reserves one or more source-head CAS operations before the
+    /// corresponding canonical owner transition is applied.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-head reservation keeps CAS, replay, and pending-state joins in one transaction"
+    )]
+    pub fn reserve_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError> {
+        eliot_store_api::validate_sha256_hex(request_digest, "campaign_source.request_digest")
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if publications.is_empty() || publications.len() > 64 {
+            return Err(OrsError::InvalidField {
+                field: "campaign_source.publications",
+                reason: "must contain between one and 64 source publications",
+            });
+        }
+        let mut source_keys = BTreeSet::new();
+        for publication in publications {
+            publication
+                .validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            let key = campaign_source_key(&publication.record)?;
+            if !source_keys.insert(key.clone()) {
+                return Err(campaign_source_identity_conflict(&key));
+            }
+        }
+
+        let write = self.database.begin_write().map_err(storage)?;
+        let operation_text = operation_id.as_str().to_owned();
+        {
+            let heads = write.open_table(CAMPAIGN_SOURCE_HEADS).map_err(storage)?;
+            let mut pending = write.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
+            for publication in publications {
+                let key = campaign_source_key(&publication.record)?;
+                let current = heads
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<eliot_store_api::CampaignSourceHead>(value.value()))
+                    .transpose()?;
+                let pending_row = pending
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<CampaignSourceReservation>(value.value()))
+                    .transpose()?;
+
+                match &publication.state {
+                    eliot_store_api::CampaignSourcePublicationState::CurrentReference {
+                        current_head,
+                    } => {
+                        if pending_row.is_some() || current.as_ref() != Some(current_head) {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        let row_key =
+                            campaign_source_record_key(&key, &publication.record.content_digest);
+                        let records = write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
+                        let same_record = records
+                            .get(row_key.as_str())
+                            .map_err(storage)?
+                            .map(|value| {
+                                decode::<eliot_store_api::CampaignSourceRecord>(value.value())
+                            })
+                            .transpose()?
+                            .is_some_and(|record| record == publication.record);
+                        if !same_record {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                    }
+                    eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
+                        let expected = publication.state.expected_head();
+                        if current.as_ref() == Some(&publication.next_head()) {
+                            // Exact replay after the canonical receipt and
+                            // source head were both committed.
+                            let row_key = campaign_source_record_key(
+                                &key,
+                                &publication.record.content_digest,
+                            );
+                            let records =
+                                write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
+                            let same_record = records
+                                .get(row_key.as_str())
+                                .map_err(storage)?
+                                .map(|value| {
+                                    decode::<eliot_store_api::CampaignSourceRecord>(value.value())
+                                })
+                                .transpose()?
+                                .is_some_and(|record| record == publication.record);
+                            if !same_record {
+                                return Err(campaign_source_identity_conflict(&key));
+                            }
+                            if let Some(existing) = pending_row {
+                                if existing.operation_id != operation_text
+                                    || existing.request_digest != request_digest
+                                    || existing.publication != *publication
+                                {
+                                    return Err(campaign_source_identity_conflict(&key));
+                                }
+                                pending.remove(key.as_str()).map_err(storage)?;
+                            }
+                            continue;
+                        }
+
+                        if let Some(existing) = pending_row {
+                            if existing.operation_id == operation_text
+                                && existing.request_digest == request_digest
+                                && existing.publication == *publication
+                            {
+                                continue;
+                            }
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        if current.as_ref() != expected {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        let reservation = CampaignSourceReservation {
+                            operation_id: operation_text.clone(),
+                            request_digest: request_digest.to_owned(),
+                            publication: publication.clone(),
+                        };
+                        let payload = encode(&reservation)?;
+                        pending
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                    }
+                }
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Commits all reserved immutable source rows and current heads in one
+    /// ORS transaction after exact canonical receipt validation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-head commit keeps receipt, reservation, row, and head joins atomic"
+    )]
+    pub fn commit_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), OrsError> {
+        receipt
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || receipt.operation_id != *operation_id
+            || receipt.canonical_request_hash != request_digest
+            || publications.is_empty()
+            || publications.len() > 64
+        {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        for publication in publications {
+            publication
+                .validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+            match &publication.state {
+                eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
+                    if publication.record.recorded_state_fence != receipt.state_fence {
+                        return Err(OrsError::FenceMismatch);
+                    }
+                }
+                eliot_store_api::CampaignSourcePublicationState::CurrentReference { .. } => {
+                    if publication.read_receipt.read_state_fence != receipt.state_fence {
+                        return Err(OrsError::FenceMismatch);
+                    }
+                }
+            }
+        }
+
+        let write = self.database.begin_write().map_err(storage)?;
+        let operation_text = operation_id.as_str();
+        {
+            let mut records = write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
+            let mut heads = write.open_table(CAMPAIGN_SOURCE_HEADS).map_err(storage)?;
+            let mut pending = write.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
+            let mut seen = BTreeSet::new();
+            for publication in publications {
+                let key = campaign_source_key(&publication.record)?;
+                if !seen.insert(key.clone()) {
+                    return Err(campaign_source_identity_conflict(&key));
+                }
+                let row_key = campaign_source_record_key(&key, &publication.record.content_digest);
+                let current_head = heads
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<eliot_store_api::CampaignSourceHead>(value.value()))
+                    .transpose()?;
+                let stored_record = records
+                    .get(row_key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<eliot_store_api::CampaignSourceRecord>(value.value()))
+                    .transpose()?;
+                let reservation = pending
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<CampaignSourceReservation>(value.value()))
+                    .transpose()?;
+
+                match &publication.state {
+                    eliot_store_api::CampaignSourcePublicationState::CurrentReference {
+                        current_head: reference_head,
+                    } => {
+                        if reservation.is_some()
+                            || current_head.as_ref() != Some(reference_head)
+                            || stored_record.as_ref() != Some(&publication.record)
+                        {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        // A current reference is an observation only. The
+                        // exact head and immutable row are already durable;
+                        // neither table is advanced or rewritten here.
+                    }
+                    eliot_store_api::CampaignSourcePublicationState::NewRevision { .. } => {
+                        if current_head.as_ref() == Some(&publication.next_head())
+                            && stored_record.as_ref() == Some(&publication.record)
+                        {
+                            // An exact replay after a complete source commit is
+                            // idempotent even though the reservation has been
+                            // cleared.
+                            if let Some(existing) = reservation {
+                                if existing.operation_id != operation_text
+                                    || existing.request_digest != request_digest
+                                    || existing.publication != *publication
+                                {
+                                    return Err(campaign_source_identity_conflict(&key));
+                                }
+                                pending.remove(key.as_str()).map_err(storage)?;
+                            }
+                            continue;
+                        }
+                        let Some(reservation) = reservation else {
+                            return Err(campaign_source_identity_conflict(&key));
+                        };
+                        if reservation.operation_id != operation_text
+                            || reservation.request_digest != request_digest
+                            || reservation.publication != *publication
+                            || current_head.as_ref() != publication.state.expected_head()
+                        {
+                            return Err(campaign_source_identity_conflict(&key));
+                        }
+                        if let Some(existing) = stored_record {
+                            if existing != publication.record {
+                                return Err(campaign_source_identity_conflict(&key));
+                            }
+                        } else {
+                            let payload = encode(&publication.record)?;
+                            records
+                                .insert(row_key.as_str(), payload.as_str())
+                                .map_err(storage)?;
+                        }
+                        let head = publication.next_head();
+                        let payload = encode(&head)?;
+                        heads
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                        pending.remove(key.as_str()).map_err(storage)?;
+                    }
+                }
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Releases reserved source heads after a typed negative canonical
+    /// receipt proves this owner transition did not commit.
+    pub fn abort_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut pending = write.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?;
+            for publication in publications {
+                let key = campaign_source_key(&publication.record)?;
+                let existing = pending
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<CampaignSourceReservation>(value.value()))
+                    .transpose()?;
+                if let Some(existing) = existing
+                    && existing.operation_id == operation_id.as_str()
+                    && existing.request_digest == request_digest
+                    && existing.publication == *publication
+                {
+                    pending.remove(key.as_str()).map_err(storage)?;
+                }
+            }
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Loads a requested immutable source row and its current head under one
+    /// durable read snapshot. Old exact references return `STALE` together
+    /// with the newer head; request selectors never create owner evidence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source readback keeps row, head, digest, and read-receipt joins under one snapshot"
+    )]
+    pub fn load_campaign_source_revision(
+        &self,
+        lookup: &eliot_store_api::CampaignSourceRevisionLookup,
+        read_state_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_store_api::CampaignSourceRevisionRead, OrsError> {
+        lookup
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        read_state_fence
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = campaign_source_key_parts(lookup.role, &lookup.owner_id, &lookup.record_id)?;
+        let heads = read.open_table(CAMPAIGN_SOURCE_HEADS).map_err(storage)?;
+        let Some(head_value) = heads.get(key.as_str()).map_err(storage)? else {
+            return Ok(eliot_store_api::CampaignSourceRevisionRead {
+                status: eliot_store_api::CampaignSourceReadStatus::Missing,
+                source: None,
+                current_head: None,
+                read_receipt: None,
+                read_state_fence: read_state_fence.clone(),
+            });
+        };
+        let head: eliot_store_api::CampaignSourceHead = decode(head_value.value())?;
+        head.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if head.role != lookup.role
+            || head.owner_id != lookup.owner_id
+            || head.record_id != lookup.record_id
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "campaign_source_head",
+                reason: "stored source head key differs from its typed identity".to_owned(),
+            });
+        }
+        let requested_digest = lookup
+            .expected_content_digest
+            .as_deref()
+            .unwrap_or(head.content_digest.as_str());
+        let row_key = campaign_source_record_key(&key, requested_digest);
+        let records = read.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?;
+        let source = records
+            .get(row_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<eliot_store_api::CampaignSourceRecord>(value.value()))
+            .transpose()?;
+        let source = source.filter(|record| {
+            record.role == lookup.role
+                && record.owner_id == lookup.owner_id
+                && record.record_id == lookup.record_id
+                && record.content_digest == requested_digest
+                && lookup
+                    .expected_revision
+                    .as_ref()
+                    .is_none_or(|revision| record.revision == *revision)
+        });
+        if let Some(source) = &source {
+            source
+                .validate()
+                .map_err(|error| OrsError::Contract(error.to_string()))?;
+        }
+        let head_row_key = campaign_source_record_key(&key, &head.content_digest);
+        let head_record = records
+            .get(head_row_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<eliot_store_api::CampaignSourceRecord>(value.value()))
+            .transpose()?
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "campaign_source_record",
+                reason: "current head has no matching immutable source row".to_owned(),
+            })?;
+        head_record
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if !campaign_record_matches_head(&head_record, &head) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "campaign_source_record",
+                reason: "current source head does not match its immutable owner row".to_owned(),
+            });
+        }
+        let read_receipt = source
+            .as_ref()
+            .map(|record| {
+                eliot_store_api::CampaignOwnerReadReceipt::from_record(record, read_state_fence)
+            })
+            .transpose()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let matches_head = source.as_ref().is_some_and(|record| {
+            record.revision == head.revision && record.content_digest == head.content_digest
+        });
+        let requested_is_head = lookup.expected_revision.is_none()
+            || (lookup.expected_revision.as_ref() == Some(&head.revision)
+                && lookup.expected_content_digest.as_deref() == Some(head.content_digest.as_str()));
+        let result = if matches_head && requested_is_head {
+            eliot_store_api::CampaignSourceRevisionRead {
+                status: eliot_store_api::CampaignSourceReadStatus::Current,
+                source,
+                current_head: Some(head),
+                read_receipt,
+                read_state_fence: read_state_fence.clone(),
+            }
+        } else {
+            eliot_store_api::CampaignSourceRevisionRead {
+                status: eliot_store_api::CampaignSourceReadStatus::Stale,
+                source,
+                current_head: Some(head),
+                read_receipt,
+                read_state_fence: read_state_fence.clone(),
+            }
+        };
+        result
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        Ok(result)
     }
 
     /// Stages one native-worker claim intent before any acknowledgement.
@@ -12557,6 +13286,24 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)
     }
 
+    /// Materializes the durable `backup.verify` result table (issue #2802).
+    ///
+    /// It is part of the base family and is created empty on every open exactly
+    /// like every other base table, so a lookup on a store that never verified an
+    /// archive reads authoritatively absent instead of failing on a missing
+    /// table. No row is ever backfilled, inferred or migrated here: a
+    /// verification result exists only once the Kernel verify route recorded one.
+    fn materialize_backup_verification_table(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        drop(
+            write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?,
+        );
+        Ok(())
+    }
+
     /// Materializes the base ORS table family and, when the store is new or
     /// already carries the exact v1 stage-resolution provenance, the
     /// stage-resolution schema marker.
@@ -12576,6 +13323,18 @@ impl RedbRecoveryStore {
         drop(write.open_table(RECOVERY_INBOX).map_err(storage)?);
         drop(write.open_table(RECOVERY_INBOX_HISTORY).map_err(storage)?);
         drop(write.open_table(PROCESS_START_REPLAY).map_err(storage)?);
+        // #1862: the immutable campaign learning-state view and the campaign
+        // source record/head/pending families are part of the base ORS table
+        // contract, so they are materialized with the other base tables and
+        // exist for the exact source-head CAS and view retention reads.
+        drop(
+            write
+                .open_table(CAMPAIGN_LEARNING_STATE_VIEWS)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(CAMPAIGN_SOURCE_RECORDS).map_err(storage)?);
+        drop(write.open_table(CAMPAIGN_SOURCE_HEADS).map_err(storage)?);
+        drop(write.open_table(CAMPAIGN_SOURCE_PENDING).map_err(storage)?);
         drop(write.open_table(AUTHORITY_HANDOFFS).map_err(storage)?);
         drop(write.open_table(PROCESS_EVIDENCE).map_err(storage)?);
         drop(write.open_table(PROCESS_STREAM_RECOVERY).map_err(storage)?);
@@ -12606,6 +13365,10 @@ impl RedbRecoveryStore {
         );
         drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
         drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
+        // #2802: part of the base family, materialized empty on every open like
+        // every other base table, so a lookup on a store that never verified an
+        // archive reads authoritatively absent. No row is backfilled or inferred.
+        Self::materialize_backup_verification_table(write)?;
         drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
         drop(
             write
@@ -17321,6 +18084,81 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn load_campaign_learning_state_view(
+        &self,
+        view_id: &eliot_contracts::ArtifactId,
+    ) -> Result<Option<eliot_store_api::CampaignLearningStateViewPublication>, OrsError> {
+        RedbRecoveryStore::load_campaign_learning_state_view(self, view_id)
+    }
+
+    fn reserve_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError> {
+        RedbRecoveryStore::reserve_campaign_source_publications(
+            self,
+            operation_id,
+            request_digest,
+            publications,
+        )
+    }
+
+    fn commit_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), OrsError> {
+        RedbRecoveryStore::commit_campaign_source_publications(
+            self,
+            operation_id,
+            request_digest,
+            publications,
+            receipt,
+        )
+    }
+
+    fn abort_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError> {
+        RedbRecoveryStore::abort_campaign_source_publications(
+            self,
+            operation_id,
+            request_digest,
+            publications,
+        )
+    }
+
+    fn load_campaign_source_revision(
+        &self,
+        lookup: &eliot_store_api::CampaignSourceRevisionLookup,
+        read_state_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_store_api::CampaignSourceRevisionRead, OrsError> {
+        RedbRecoveryStore::load_campaign_source_revision(self, lookup, read_state_fence)
+    }
+
+    fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        RedbRecoveryStore::commit_activation_result(
+            self,
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+        )
+    }
+
     fn terminate_activation_without_result(
         &self,
         ticket_id: &str,
@@ -17769,6 +18607,81 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         )
     }
 
+    /// Loads one immutable content-addressed campaign view.
+    pub fn load_campaign_learning_state_view(
+        &self,
+        view_id: &eliot_contracts::ArtifactId,
+    ) -> Result<Option<eliot_store_api::CampaignLearningStateViewPublication>, OrsError> {
+        self.store.load_campaign_learning_state_view(view_id)
+    }
+
+    /// Reserves all exact campaign source CAS heads before the canonical
+    /// owner operation executes.
+    pub fn reserve_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError> {
+        self.store
+            .reserve_campaign_source_publications(operation_id, request_digest, publications)
+    }
+
+    /// Finalizes typed campaign sources from the exact committed owner
+    /// receipt.
+    pub fn commit_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), OrsError> {
+        self.store.commit_campaign_source_publications(
+            operation_id,
+            request_digest,
+            publications,
+            receipt,
+        )
+    }
+
+    /// Releases source reservations after an exact typed negative receipt.
+    pub fn abort_campaign_source_publications(
+        &self,
+        operation_id: &eliot_contracts::OperationId,
+        request_digest: &str,
+        publications: &[eliot_store_api::CampaignSourcePublication],
+    ) -> Result<(), OrsError> {
+        self.store
+            .abort_campaign_source_publications(operation_id, request_digest, publications)
+    }
+
+    /// Reads one immutable campaign owner source and its current head at one
+    /// ORS snapshot.
+    pub fn load_campaign_source_revision(
+        &self,
+        lookup: &eliot_store_api::CampaignSourceRevisionLookup,
+        read_state_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_store_api::CampaignSourceRevisionRead, OrsError> {
+        self.store
+            .load_campaign_source_revision(lookup, read_state_fence)
+    }
+
+    /// Retains one opaque Kernel activation result before acknowledgement.
+    pub fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+        claim_owner: &str,
+        dependency_observation: Option<(&str, &str)>,
+        now_unix_ms: u64,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        self.store.commit_activation_result(
+            record,
+            claim_owner,
+            dependency_observation,
+            now_unix_ms,
+        )
+    }
+
     /// Terminalizes one result-less activation ticket.
     pub fn terminate_activation_without_result(
         &self,
@@ -18079,6 +18992,70 @@ fn reconciliation_matches(
 
 fn storage(error: impl std::fmt::Display) -> OrsError {
     OrsError::Storage(error.to_string())
+}
+
+fn campaign_view_publication(
+    response: &serde_json::Value,
+) -> Result<Option<eliot_store_api::CampaignLearningStateViewPublication>, OrsError> {
+    let Some(value) = response.get("campaign_learning_state_view") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let publication: eliot_store_api::CampaignLearningStateViewPublication =
+        serde_json::from_value(value.clone()).map_err(|_| OrsError::InvalidField {
+            field: "host_request_result.campaign_learning_state_view",
+            reason: "campaign view publication is not the closed typed envelope",
+        })?;
+    publication.validate().map_err(|_| OrsError::InvalidField {
+        field: "host_request_result.campaign_learning_state_view",
+        reason: "campaign view publication failed content-addressed binding validation",
+    })?;
+    Ok(Some(publication))
+}
+
+fn campaign_view_identity_conflict(view_id: &str) -> OrsError {
+    OrsError::CampaignLearningStateViewConflict {
+        view_id: view_id.to_owned(),
+    }
+}
+
+fn campaign_source_key(record: &eliot_store_api::CampaignSourceRecord) -> Result<String, OrsError> {
+    campaign_source_key_parts(record.role, &record.owner_id, &record.record_id)
+}
+
+fn campaign_source_key_parts(
+    role: eliot_store_api::CampaignSourceRole,
+    owner_id: &eliot_store_api::OwnerId,
+    record_id: &eliot_store_api::CampaignOwnerRecordId,
+) -> Result<String, OrsError> {
+    let key_bytes = eliot_store_api::canonical_json_bytes(&(role, owner_id, record_id))
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    Ok(eliot_store_api::sha256_hex(&key_bytes))
+}
+
+fn campaign_source_record_key(source_key: &str, content_digest: &str) -> String {
+    format!("{source_key}::{content_digest}")
+}
+
+fn campaign_record_matches_head(
+    record: &eliot_store_api::CampaignSourceRecord,
+    head: &eliot_store_api::CampaignSourceHead,
+) -> bool {
+    record.role == head.role
+        && record.owner_id == head.owner_id
+        && record.record_id == head.record_id
+        && record.revision == head.revision
+        && record.content_digest == head.content_digest
+        && record.recorded_state_fence == head.recorded_state_fence
+        && record.slot_projection_digests == head.slot_projection_digests
+}
+
+fn campaign_source_identity_conflict(key: &str) -> OrsError {
+    OrsError::CampaignSourcePublicationConflict {
+        key: key.to_owned(),
+    }
 }
 
 #[cfg(test)]

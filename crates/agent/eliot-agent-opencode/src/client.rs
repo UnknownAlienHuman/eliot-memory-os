@@ -8,6 +8,7 @@ use crate::{
     RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
     SseConnection, SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields,
     UsageAvailability, UsageTelemetry, bound_session_identity, committed_message_id,
+    wire_route_locator,
 };
 use eliot_agent_api::{EventCursor, PhysicalRouteObservationReceipt};
 use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
@@ -20,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::time::{Instant, sleep, timeout};
 
-const CLIENT_PROTOCOL_REVISION: &str = "eliot-opencode-bootstrap-http-sse-v1";
-const READ_ONLY_AGENT: &str = "plan";
+const CLIENT_PROTOCOL_REVISION: &str = crate::types::OPENCODE_WIRE_LOCATOR_PROTOCOL_REVISION;
+const READ_ONLY_AGENT: &str = crate::types::OPENCODE_WIRE_LOCATOR_AGENT;
 const DEFAULT_SERVER_VERSION: &str = "1.4.3";
 const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONCILIATION_CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1427,11 +1428,16 @@ impl OpenCodeClient {
         projection: MessageProjection,
         events: Vec<OpenCodeEvent>,
     ) -> NoAuthorityRunResult {
-        let route_fingerprint = route_fingerprint(
-            &self.endpoint,
+        // The live locator binds the OBSERVED provider/model (the reconciled
+        // assistant message's identity), never the requested side: the
+        // conversion corroborates it through the shared recipe, so a locator
+        // minted for different live values fails closed there (issue #369
+        // W11/W12).
+        let route_fingerprint = wire_route_locator(
+            self.endpoint.as_str(),
             &prepared.health.version,
-            &request.model,
-            READ_ONLY_AGENT,
+            &projection.observed_model.provider_id,
+            &projection.observed_model.model_id,
         );
         let mut actual_route = OpenCodeWireRouteReceipt::observed(
             request.model.clone(),
@@ -2321,33 +2327,6 @@ fn attest_top_level_output_schema(output: &Value, schema: &Value) -> Result<(), 
         }
     }
     Ok(())
-}
-
-fn route_fingerprint(
-    endpoint: &LoopbackEndpoint,
-    server_version: &str,
-    model: &ModelSelection,
-    agent: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    for component in [
-        CLIENT_PROTOCOL_REVISION,
-        endpoint.as_str(),
-        server_version,
-        &model.provider_id,
-        &model.model_id,
-        agent,
-    ] {
-        hasher.update(component.as_bytes());
-        hasher.update([0]);
-    }
-    let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    format!("sha256:{encoded}")
 }
 
 fn encode_component(value: &str) -> String {

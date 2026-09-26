@@ -760,6 +760,44 @@ type ObservedSideClassification = (
     Option<String>,
 );
 
+/// Canonical live wire-locator agent identity bound into every minted
+/// locator (issue #369 W11/W12). The production minter
+/// (`OpenCodeClient::success_result`) and the conversion verifier
+/// ([`OpenCodeWireRouteReceipt::to_physical_observation`]) share this domain
+/// through this module: a locator minted for different live values never
+/// corroborates.
+pub const OPENCODE_WIRE_LOCATOR_AGENT: &str = "plan";
+/// Canonical live wire-locator protocol revision (issue #369 W11/W12);
+/// shared like [`OPENCODE_WIRE_LOCATOR_AGENT`].
+pub const OPENCODE_WIRE_LOCATOR_PROTOCOL_REVISION: &str = "eliot-opencode-bootstrap-http-sse-v1";
+
+/// Computes the canonical live wire locator over the wire's live-observed
+/// route bindings (issue #369 W11/W12): `sha256:<hex>` over NUL-separated
+/// protocol revision, endpoint, server version, observed provider/model, and
+/// agent. This single recipe is shared by the production minter and the
+/// verifier, so a forged, replayed-across-sessions, or stale locator fails
+/// closed instead of manufacturing `MATCHED`/`DIVERGED`.
+pub fn wire_route_locator(
+    endpoint: &str,
+    server_version: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> String {
+    let mut bytes = Vec::new();
+    for component in [
+        OPENCODE_WIRE_LOCATOR_PROTOCOL_REVISION,
+        endpoint,
+        server_version,
+        provider_id,
+        model_id,
+        OPENCODE_WIRE_LOCATOR_AGENT,
+    ] {
+        bytes.extend_from_slice(component.as_bytes());
+        bytes.push(0);
+    }
+    format!("sha256:{}", sha256_hex(&bytes))
+}
+
 impl<'de> Deserialize<'de> for OpenCodeWireRouteReceipt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -882,8 +920,15 @@ impl OpenCodeWireRouteReceipt {
                 if crate::LoopbackEndpoint::parse(endpoint).is_err() {
                     return Err(OpenCodeWireRouteError::ObservedEndpointNotLoopback);
                 }
-                if is_blank(self.route_fingerprint.as_deref()) {
-                    return Err(OpenCodeWireRouteError::ObservedRouteFingerprintMissing);
+                if !matches!(
+                    self.route_fingerprint.as_deref(),
+                    Some(locator) if is_live_wire_locator(locator)
+                ) {
+                    return Err(if self.route_fingerprint.is_none() {
+                        OpenCodeWireRouteError::ObservedRouteFingerprintMissing
+                    } else {
+                        OpenCodeWireRouteError::ObservedRouteFingerprintMalformed
+                    });
                 }
                 if is_blank(self.session_id.as_deref()) {
                     return Err(OpenCodeWireRouteError::ObservedSessionIdentityMissing);
@@ -936,10 +981,13 @@ impl OpenCodeWireRouteReceipt {
     ///   `Unavailable` becomes `UNOBSERVED` with an explicit reason plus
     ///   `UNKNOWN_OUTCOME` quarantine (`recovery_ref`).
     /// - `Observed` never defaults to `MATCHED`: the observed fingerprint is
-    ///   built from the requested fingerprint with provider/model replaced
+    ///   built from the dispatched binding route with provider/model replaced
     ///   from the wire, then classified via `route_divergence_fields`
     ///   (`Matched` only when field-complete equal, else `Diverged` with the
-    ///   exact difference set and a quarantine `recovery_ref`).
+    ///   exact difference set and a quarantine `recovery_ref`). The wire's
+    ///   live locator must corroborate the wire's own live fields through the
+    ///   shared [`wire_route_locator`] recipe first: a forged or stale
+    ///   locator fails closed instead of manufacturing a classification.
     /// - `request_digest` preserves the bound start-request commitment
     ///   verbatim (never a re-hash of the wire bytes and never a zero
     ///   placeholder); `validate_against` rejects any substituted value.
@@ -948,14 +996,19 @@ impl OpenCodeWireRouteReceipt {
     ///   binding or mismatched admission rejects.
     ///
     /// Builds the observed side of the canonical observation from the
-    /// wire state: `Unavailable` yields no observed fingerprint with an
-    /// explicit reason, `Observed` rebuilds the fingerprint from the
-    /// requested one with provider/model replaced from the wire and
-    /// classifies it field-complete (`Matched` only on full equality,
-    /// else `Diverged` with the exact difference set).
+    /// wire state and the dispatched execution's attested route:
+    /// `Unavailable` yields no observed fingerprint with an explicit reason,
+    /// `Observed` rebuilds the fingerprint from the dispatched binding route
+    /// with provider/model replaced from the wire and classifies it
+    /// field-complete (`Matched` only on full equality, else `Diverged` with
+    /// the exact difference set). The caller-supplied `requested` is the
+    /// classification baseline only: it is never the observed source, so
+    /// provider/model/capability claims are validated from the wire plus the
+    /// dispatched execution, never from the requested side (issue #369 W12).
     fn observed_side(
         &self,
         requested: &RouteFingerprint,
+        binding_route: &RouteFingerprint,
     ) -> Result<ObservedSideClassification, OpenCodeObservationConversionError> {
         match self.state {
             OpenCodeWireRouteState::Unavailable => {
@@ -979,9 +1032,20 @@ impl OpenCodeWireRouteReceipt {
                         .ok_or(OpenCodeObservationConversionError::Wire(
                             OpenCodeWireRouteError::ObservedIdentityMissing,
                         ))?;
-                let mut observed_fp = requested.clone();
-                observed_fp.provider = observed_wire.provider_id.clone();
-                observed_fp.model = observed_wire.model_id.clone();
+                // The observed fingerprint starts from the dispatched
+                // execution's attested route (`binding_route`: the exact
+                // route the execution unit was launched with, confirmed by
+                // the session/message seal), overlaid with the wire-observed
+                // provider/model. Non-wire components are the dispatched
+                // execution's configuration, never re-observed provider
+                // behavior promoted from the requested side (issue #369
+                // W11): a runtime/serializer/tool substitution outside the
+                // wire-observed channels cannot corroborate here, and the
+                // live locator check in `to_physical_observation` fails a
+                // forged or stale wire closed before this classification.
+                let mut observed_fp = binding_route.clone();
+                observed_fp.provider.clone_from(&observed_wire.provider_id);
+                observed_fp.model.clone_from(&observed_wire.model_id);
                 let diverged = route_divergence_fields(requested, &observed_fp);
                 let state = if diverged.is_empty() {
                     RouteObservationState::Matched
@@ -1090,8 +1154,43 @@ impl OpenCodeWireRouteReceipt {
         if binding.route != *requested {
             return Err(eliot_agent_api::ContractError::BindingMismatch.into());
         }
+        // Live-locator corroboration (issue #369 W11/W12): the wire's
+        // locator must be the shared recipe recomputed over the wire's own
+        // live-observed fields (endpoint, server version, observed
+        // provider/model). A locator minted for different live values
+        // (forged, replayed across sessions, or stale) fails closed here
+        // instead of manufacturing `MATCHED`/`DIVERGED` below.
+        if self.state == OpenCodeWireRouteState::Observed {
+            let observed_wire =
+                self.observed
+                    .as_ref()
+                    .ok_or(OpenCodeObservationConversionError::Wire(
+                        OpenCodeWireRouteError::ObservedIdentityMissing,
+                    ))?;
+            let endpoint =
+                self.endpoint
+                    .as_deref()
+                    .ok_or(OpenCodeObservationConversionError::Wire(
+                        OpenCodeWireRouteError::ObservedEndpointMissing,
+                    ))?;
+            let server_version =
+                self.server_version
+                    .as_deref()
+                    .ok_or(OpenCodeObservationConversionError::Wire(
+                        OpenCodeWireRouteError::ObservedServerVersionMissing,
+                    ))?;
+            let expected = wire_route_locator(
+                endpoint,
+                server_version,
+                &observed_wire.provider_id,
+                &observed_wire.model_id,
+            );
+            if self.route_fingerprint.as_deref() != Some(expected.as_str()) {
+                return Err(eliot_agent_api::ContractError::BindingMismatch.into());
+            }
+        }
         let (observed_route, route_state, diverged_fields, unobserved_reason) =
-            self.observed_side(requested)?;
+            self.observed_side(requested, &binding.route)?;
         // Loss handle: every unknown wire field stays addressable by digest.
         let (raw_evidence_digest, raw_evidence_ref) = self.wire_extra_evidence()?;
         // Execution axis follows the route axis without collapsing them:
@@ -1170,6 +1269,21 @@ fn is_blank(value: Option<&str>) -> bool {
     value.is_none_or(|value| value.trim().is_empty())
 }
 
+/// Returns true when the wire route locator is a well-formed live
+/// `sha256:<64 lowercase hex>` locator. Placeholder labels such as
+/// `sha256:runtime` or `sha256:route`, uppercase, short, long, and non-hex
+/// forms are not live observations and never corroborate a classification
+/// (issue #369 W11/W12).
+fn is_live_wire_locator(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum OpenCodeWireRouteError {
     #[error("requested route model is invalid: {0}")]
@@ -1188,6 +1302,8 @@ pub enum OpenCodeWireRouteError {
     ObservedEndpointNotLoopback,
     #[error("observed route receipt fingerprint is missing or blank")]
     ObservedRouteFingerprintMissing,
+    #[error("observed route receipt fingerprint is not a live sha256 locator")]
+    ObservedRouteFingerprintMalformed,
     #[error("observed route receipt session identity is missing or blank")]
     ObservedSessionIdentityMissing,
     #[error("observed route receipt directory is missing")]
@@ -2906,9 +3022,12 @@ mod tests {
             endpoint: Some("http://127.0.0.1:4096".to_owned()),
             // Production-shaped wire fingerprint (`sha256:<hex>` as minted
             // by the client): the wire projection carries the observed
-            // locator, never a `sha256:*` label placeholder.
+            // locator, never a `sha256:*` label placeholder. The value is
+            // the shared `wire_route_locator` recipe over these live fields
+            // (endpoint, server version, observed provider/model), so the
+            // conversion corroborates it instead of trusting it.
             route_fingerprint: Some(
-                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                "sha256:bde1ae7164feed46d95056e5e02e40e3b2be37a535c12063e00763c8d06fa636"
                     .to_owned(),
             ),
             session_id: Some("ses_1".to_owned()),
@@ -2936,7 +3055,7 @@ mod tests {
             "observed": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
             "providerID": "opencode-go",
             "endpointURL": "http://127.0.0.1:4096",
-            "routeFingerprint": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "routeFingerprint": "sha256:bde1ae7164feed46d95056e5e02e40e3b2be37a535c12063e00763c8d06fa636",
             "sessionID": "ses_1",
             "cwd": "C:\\Scratch",
             "serverVersion": "1.4.3",
@@ -3317,6 +3436,12 @@ mod tests {
         let mut wire = observed_wire_receipt()?;
         wire.observed = Some(ModelSelection::new("other-provider", "other-model")?);
         wire.provider = Some("other-provider".to_owned());
+        // The locator must corroborate the mutated live identity: it is the
+        // shared recipe over the observed provider/model, not the requested
+        // side's value.
+        wire.route_fingerprint = Some(
+            "sha256:d7f22aad5729747ca5cf9cb70ae4325b6678214a2307e8046d4943e201f42449".to_owned(),
+        );
         let observation = wire.to_physical_observation(
             &requested,
             &admission,

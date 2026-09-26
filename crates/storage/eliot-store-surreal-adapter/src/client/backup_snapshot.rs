@@ -2,8 +2,9 @@
 //!
 //! Only the four closed `snapshot.*` operations below may execute. Caller text
 //! never becomes a statement: every operation maps to one fixed `&'static str`
-//! built from the single-owner consts in [`crate::schema`] and
-//! [`crate::backup_snapshot`], and a snapshot statement carries no bindings at
+//! built from the single-owner consts in [`crate::schema`],
+//! [`crate::backup_snapshot`] and the `eliot_store_api` capture ceilings, and a
+//! snapshot statement carries no bindings at
 //! all, so no caller value can reach the provider. Connection endpoints and
 //! credentials never cross this seam; they remain inside adapter
 //! configuration.
@@ -67,6 +68,40 @@ const SNAPSHOT_ERROR_OPERATION: &str = "snapshot";
 /// state A13.7 requires.
 const MEMBER_CLASS_CLAUSE: &str = "SELECT * FROM ";
 
+/// Clause that binds the fixed row ceiling onto one class read.
+const MEMBER_CLASS_LIMIT_CLAUSE: &str = " LIMIT ";
+
+/// Row ceiling the fixed member batch places on every captured class.
+///
+/// The provider read is bounded by a *fixed, adapter-owned* ceiling, never by a
+/// caller value. A request-derived `LIMIT` would put caller text into the
+/// statement, which this module forbids outright ("a snapshot statement carries
+/// no bindings at all, so no caller value can reach the provider"), so the
+/// request's own `bounds.max_members` cannot be pushed into the provider read;
+/// what this constant does instead is make the read finite and make overflow
+/// *detectable*.
+///
+/// The value is exactly `eliot_store_api::MAX_SNAPSHOT_MEMBERS`, the same
+/// single-owner ceiling `begin_snapshot` enforces on the observed denominator.
+/// That makes the bound tight rather than arbitrary: a capture that could serve
+/// at most `MAX_SNAPSHOT_MEMBERS` members in total can never legitimately hold
+/// more than that in one class, so this limit never truncates an admissible
+/// capture. Before this bound the member batch read every row of every captured
+/// table with no ceiling at all, so a store too large to capture was read into
+/// bridge memory in full and refused only afterwards.
+pub(crate) const MEMBER_CLASS_ROW_LIMIT: usize = eliot_store_api::MAX_SNAPSHOT_MEMBERS;
+
+/// Row ceiling actually written into the statement: the capture ceiling plus
+/// one, so truncation is *provable* rather than guessed.
+///
+/// A class holding exactly [`MEMBER_CLASS_ROW_LIMIT`] rows is complete, and
+/// refusing it would reject a capture the bounds allow. Reading one row more
+/// than the ceiling is what makes the difference observable: a class that comes
+/// back with more than [`MEMBER_CLASS_ROW_LIMIT`] rows is certainly truncated,
+/// while one that comes back with exactly the ceiling is certainly not. This is
+/// the same one-over discipline the capture bounds use elsewhere.
+const MEMBER_CLASS_ROW_LIMIT_ONE_OVER: usize = MEMBER_CLASS_ROW_LIMIT + 1;
+
 /// Closed snapshot vocabulary, in canonical registration order.
 pub(crate) const SNAPSHOT_OPERATIONS: &[&str] = &[
     SNAPSHOT_BEGIN_OPERATION,
@@ -129,13 +164,18 @@ fn point_batch() -> String {
 }
 
 /// Composes the canonical-member batch: the same capture point, then one
-/// whole-record read per admitted canonical source class, in one transaction.
+/// bounded whole-record read per admitted canonical source class, in one
+/// transaction.
 ///
 /// One batch is one coherent point, so the denominator the capture binds is
 /// observed at exactly the fence and schema generation read by the first two
-/// statements. No paging is applied inside the batch: a page bound would split
-/// the read across two points and destroy the coherence this module exists to
-/// provide. Paging happens in Rust, over the frozen observed member set.
+/// statements. The read is *bounded*, not paged: each class carries the fixed
+/// [`MEMBER_CLASS_ROW_LIMIT_ONE_OVER`] ceiling, because paging inside the batch
+/// would split one logical read across two points and destroy the coherence
+/// this module exists to provide. Paging happens in Rust, over the frozen
+/// observed member set. A class that exceeds the capture ceiling is certainly
+/// truncated, and `read_enumeration` refuses it explicitly rather than letting a
+/// possibly incomplete denominator pass as a complete one.
 fn members_batch() -> String {
     let mut sql = String::with_capacity(4_096);
     sql.push_str(begin_transaction_prefix());
@@ -147,6 +187,10 @@ fn members_batch() -> String {
         sql.push(' ');
         sql.push_str(MEMBER_CLASS_CLAUSE);
         sql.push_str(table);
+        // The ceiling is a `usize` const of this crate, never caller text, so
+        // composing it here adds no caller-reachable input to the statement.
+        sql.push_str(MEMBER_CLASS_LIMIT_CLAUSE);
+        sql.push_str(&MEMBER_CLASS_ROW_LIMIT_ONE_OVER.to_string());
         sql.push(';');
     }
     sql.push(' ');

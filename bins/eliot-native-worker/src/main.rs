@@ -394,8 +394,8 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     use eliot_contracts::{
-        ClockReading, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId,
-        StateFence, TaskId, WorkLeaseId, sha256_hex,
+        ClockReading, DecisionId, EpochId, EpochLineageId, RequestId, ResourceGeneration,
+        SessionId, StateFence, TaskId, WorkLeaseId, sha256_hex,
     };
     use eliot_native_worker::admitted_material::{
         AdmittedClaimEnvelope, AdmittedMaterialError, ValidatedAdmittedMaterial,
@@ -774,7 +774,7 @@ mod tests {
                 CheckpointReceiptFacts::new(
                     "checkpoint-receipt-1",
                     request.checkpoint_ref(),
-                    request.request_id(),
+                    request.request_id().clone(),
                     request.stream_id(),
                     request.producer_generation(),
                     request.authority_epoch().clone(),
@@ -970,7 +970,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
             connection_id: "connection-claim-1".to_owned(),
-            request_id: "start-claim-1".to_owned(),
+            request_id: load(RequestId::new("start-claim-1")),
             trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
             deadline_unix_ms: 5_000,
             artifact_manifest_digest: "facet-manifest-7".to_owned(),
@@ -1124,7 +1124,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
             connection_id: "connection-claim-1".to_owned(),
-            request_id: "health-1".to_owned(),
+            request_id: load(RequestId::new("health-1")),
             trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-health-1".to_owned())]),
             deadline_unix_ms: 5_000,
             authority_epoch: epoch(),
@@ -1266,7 +1266,7 @@ mod tests {
         ))
         .unwrap_or_else(|error| panic!("admitted drive must reach Ready, got {error:?}"));
         assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
-        assert_eq!(ready.request_id, "start-claim-1");
+        assert_eq!(ready.request_id.as_str(), "start-claim-1");
         assert_eq!(ready.stream_id, "claim-1/gen-1");
         assert_eq!(*lock(&admissions), 1);
         assert_eq!(lock(&evidence).len(), 1);
@@ -1529,7 +1529,7 @@ mod tests {
         ))
         .unwrap_or_else(|error| panic!("governed drive must reach Ready, got {error:?}"));
         assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
-        assert_eq!(ready.request_id, "start-claim-1");
+        assert_eq!(ready.request_id.as_str(), "start-claim-1");
         assert_eq!(ready.stream_id, "claim-1/gen-1");
         assert_eq!(actions.len(), 4);
         for (action, operation) in actions
@@ -2097,8 +2097,8 @@ mod tests {
         }
         assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
         assert_eq!(
-            ready.request_id,
-            format!("native-worker-start-{valid_binding}")
+            ready.request_id.as_str(),
+            format!("native-worker-start-{valid_binding}").as_str()
         );
         assert_eq!(ready.stream_id, "claim-kernel-drive-1/gen-1");
         assert_eq!(sink.recorded_len(), 1);
@@ -2113,7 +2113,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
             connection_id: hello_connection,
-            request_id: "health-kernel-drive-1".to_owned(),
+            request_id: load(RequestId::new("health-kernel-drive-1")),
             trace_context: BTreeMap::from([(
                 "trace_id".to_owned(),
                 "trace-kernel-drive-1".to_owned(),

@@ -22,6 +22,7 @@ eliot-authority.workspace = true
 eliot-bootstrap.workspace = true
 eliot-cognitive-quality = { path = "../../crates/smart/eliot-cognitive-quality", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-context.workspace = true
 eliot-context-contracts.workspace = true
 eliot-config.workspace = true
 eliot-controlboard.workspace = true
@@ -46,6 +47,7 @@ eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-learning-contracts.workspace = true
+eliot-learning-state-view.workspace = true
 eliot-maintenance.workspace = true
 eliot-memory-quality = { path = "../../crates/smart/eliot-memory-quality", version = "0.1.0" }
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
@@ -54,6 +56,7 @@ eliot-observation-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
+eliot-product-evaluation = { path = "../../crates/instrument/eliot-product-evaluation", version = "0.1.0" }
 eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-read = { path = "../../crates/governor/eliot-read", version = "0.1.0" }
