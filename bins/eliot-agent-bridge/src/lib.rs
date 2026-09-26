@@ -39,8 +39,8 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes, sha256_hex,
+    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase, ClockReading,
+    ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -152,9 +152,6 @@ struct KernelTransportOwner {
     /// consumed frontier so the Kernel can advance its acked cursors;
     /// process memory only, bounded below, never a reconciliation log.
     delivered_sequences: BTreeMap<String, BTreeSet<u64>>,
-    /// Last contiguous frontier per stream already offered as consumed.
-    /// Monotonic: resends are idempotent no-ops the owner applies safely.
-    consumed_sent: BTreeMap<String, u64>,
     /// Owner-confirmed acked base per stream learned from verified
     /// reconcile replies. Held sequences at or below the base are pruned
     /// as owner-confirmed; the contiguous run always starts above it.
@@ -445,6 +442,45 @@ fn decode_event_port_outcome(
     envelope_sha: &str,
     port: &mut KernelMcpForwardingPort,
 ) -> Result<EventPortOutcome, ProviderFailure> {
+    if let Some(pressure_value) = value.get("capacity_pressure") {
+        let pressure: BridgeEventCapacityPressure = serde_json::from_value(pressure_value.clone())
+            .map_err(|_| {
+                event_shape_failure("event reply refused: malformed typed capacity pressure")
+            })?;
+        let reply_stream = value
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(event_transport_failure)?;
+        let reply_event = value
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(event_transport_failure)?;
+        if !pressure.is_consistent()
+            || !matches!(
+                pressure.dimension,
+                BridgeEventCapacityDimension::EventRecords
+                    | BridgeEventCapacityDimension::EnvelopeBytes
+                    | BridgeEventCapacityDimension::PendingHandoffs
+            )
+            || (matches!(
+                pressure.dimension,
+                BridgeEventCapacityDimension::EventRecords
+                    | BridgeEventCapacityDimension::EnvelopeBytes
+            ) && pressure.local_phase != BridgeEventLocalPhase::NotCommitted)
+            || value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
+            || reply_stream != event.stream_id
+            || reply_event != event.event_id
+            || !matches!(
+                event.delivery_class,
+                DeliveryClass::DurableControl | DeliveryClass::DurableObservation
+            )
+        {
+            return Err(event_shape_failure(
+                "event reply refused: capacity report does not match this durable event",
+            ));
+        }
+        return Err(ProviderFailure::bridge_event_capacity(pressure));
+    }
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -984,6 +1020,8 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: live generation does not match the presenting attach",
         ));
     }
+    let key = verify_reconcile_key(reconciliation)?;
+    decode_handoff_maintenance_pressure(reconciliation)?;
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
     let (stream_facts, stream_list_complete) =
         decode_reconciliation_streams(reconciliation, live_generation, &mut budget, port)?;
@@ -994,7 +1032,6 @@ fn decode_reconciliation_outcome(
         .ok_or_else(|| {
             event_shape_failure("reconciliation refused: owner answer without scope provenance")
         })?;
-    let key = verify_reconcile_key(reconciliation)?;
     let handoffs_reconciled = reconciliation
         .get("handoffs_reconciled")
         .and_then(serde_json::Value::as_u64)
@@ -1032,6 +1069,41 @@ fn decode_reconciliation_outcome(
         )
     })?;
     Ok(ReconciliationPortOutcome::Reconciled(result))
+}
+
+/// Validates typed capacity pressure returned by bounded handoff maintenance.
+/// The event response remains an ordinary reconciliation result, so this leg
+/// must retain its typed pressure instead of dropping it during decode.
+fn decode_handoff_maintenance_pressure(
+    reconciliation: &serde_json::Value,
+) -> Result<(), ProviderFailure> {
+    let Some(maintenance) = reconciliation
+        .get("handoff_maintenance")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for item in maintenance {
+        let Some(pressure_value) = item.get("capacity_pressure") else {
+            continue;
+        };
+        let pressure: BridgeEventCapacityPressure = serde_json::from_value(pressure_value.clone())
+            .map_err(|_| {
+                event_shape_failure(
+                    "reconciliation refused: malformed typed handoff capacity pressure",
+                )
+            })?;
+        if !pressure.is_consistent()
+            || pressure.dimension != BridgeEventCapacityDimension::PendingHandoffs
+            || pressure.local_phase != BridgeEventLocalPhase::Durable
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: handoff capacity report has the wrong resource or phase",
+            ));
+        }
+        return Err(ProviderFailure::bridge_event_capacity(pressure));
+    }
+    Ok(())
 }
 
 /// Decodes the stream enumeration of one owner answer within the
@@ -1310,15 +1382,9 @@ impl KernelMcpForwardingPort {
             && let Some(oldest) = owner.delivered_sequences.keys().next().cloned()
         {
             owner.delivered_sequences.remove(&oldest);
-            owner.consumed_sent.remove(&oldest);
             owner.owner_acked.remove(&oldest);
         }
-        let base = owner
-            .consumed_sent
-            .get(stream_id)
-            .copied()
-            .unwrap_or(0)
-            .max(owner.owner_acked.get(stream_id).copied().unwrap_or(0));
+        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
         let held = owner
             .delivered_sequences
             .entry(stream_id.to_owned())
@@ -1350,12 +1416,7 @@ impl KernelMcpForwardingPort {
         if acked > known {
             owner.owner_acked.insert(stream_id.to_owned(), acked);
         }
-        let base = owner
-            .consumed_sent
-            .get(stream_id)
-            .copied()
-            .unwrap_or(0)
-            .max(owner.owner_acked.get(stream_id).copied().unwrap_or(0));
+        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
         let empty = if let Some(held) = owner.delivered_sequences.get_mut(stream_id) {
             let confirmed: Vec<u64> = held.range(..=base).copied().collect();
             for sequence in confirmed {
@@ -1375,33 +1436,31 @@ impl KernelMcpForwardingPort {
     ///
     /// Per stream, the frontier is the contiguous digest-verified durable
     /// run above the owner-confirmed base: holes and unseen pages are
-    /// never acknowledged, and only newly advanced frontiers are offered.
-    /// Recording the offered frontier is idempotent — the owner applies it
-    /// monotonically, so a lost answer replays safely.
+    /// never acknowledged, and every unconfirmed frontier is re-offered.
+    /// The frontier remains pending locally until a verified reconciliation
+    /// reply reports the owner's acknowledged cursor. A lost, rejected, or
+    /// undecodable answer therefore offers the same exact sequence set on
+    /// the next call.
     fn contiguous_consumed_payload(&mut self) -> Vec<serde_json::Value> {
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+        let Ok(owner) = self.shared.try_borrow() else {
             return Vec::new();
         };
         let mut frontiers: Vec<(String, u64)> = Vec::new();
         for (stream_id, held) in &owner.delivered_sequences {
-            let sent = owner.consumed_sent.get(stream_id).copied().unwrap_or(0);
             let acked = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
-            let mut frontier = sent.max(acked);
+            let mut frontier = acked;
             while held.contains(&frontier.saturating_add(1)) {
                 frontier = frontier.saturating_add(1);
                 if frontier == u64::MAX {
                     break;
                 }
             }
-            if frontier > sent {
+            if frontier > acked {
                 frontiers.push((stream_id.clone(), frontier));
             }
         }
         frontiers.sort_by(|left, right| left.0.cmp(&right.0));
         frontiers.truncate(MAX_RECONCILE_CONSUMED_ENTRIES);
-        for (stream_id, frontier) in &frontiers {
-            owner.consumed_sent.insert(stream_id.clone(), *frontier);
-        }
         frontiers
             .into_iter()
             .map(|(stream_id, sequence)| {
@@ -1533,6 +1592,24 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let reply = self.exchange(&frame)?;
         let value =
             decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        if let Some(pressure_value) = value.get("capacity_pressure") {
+            let pressure: BridgeEventCapacityPressure =
+                serde_json::from_value(pressure_value.clone()).map_err(|_| {
+                    event_shape_failure("gap reply refused: malformed typed capacity pressure")
+                })?;
+            if !pressure.is_consistent()
+                || pressure.dimension != BridgeEventCapacityDimension::ScopedGaps
+                || pressure.local_phase != BridgeEventLocalPhase::NotCommitted
+                || value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
+                || value.get("gap_id").and_then(serde_json::Value::as_str)
+                    != Some(gap.gap_id.as_str())
+            {
+                return Err(event_shape_failure(
+                    "gap reply refused: capacity report does not match the presented gap",
+                ));
+            }
+            return Err(ProviderFailure::bridge_event_capacity(pressure));
+        }
         if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
             || value.get("gap_id").and_then(serde_json::Value::as_str) != Some(gap.gap_id.as_str())
         {
@@ -1812,7 +1889,6 @@ fn kernel_faces_from_admission(
         activated_session: None,
         replay_cache: HashMap::new(),
         delivered_sequences: BTreeMap::new(),
-        consumed_sent: BTreeMap::new(),
         owner_acked: BTreeMap::new(),
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {

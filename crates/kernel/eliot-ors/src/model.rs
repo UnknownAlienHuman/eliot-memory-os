@@ -1,5 +1,6 @@
 use eliot_contracts::{
-    AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
+    AuthorityEpoch, BridgeEventCapacityPressure, EpochId, ResourceGeneration, StateFence,
+    canonical_json_bytes,
 };
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::{
@@ -3160,6 +3161,8 @@ pub struct ActivationRecoverySnapshot {
 /// Typed ORS failures. None grants semantic or completion authority.
 #[derive(Debug, Error)]
 pub enum OrsError {
+    #[error("bridge event capacity exhausted: {0:?}")]
+    BridgeEventCapacityExceeded(BridgeEventCapacityPressure),
     #[error("{field} is invalid: {reason}")]
     InvalidField {
         field: &'static str,

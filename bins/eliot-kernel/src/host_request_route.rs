@@ -3548,14 +3548,19 @@ impl KernelComposition {
                 // foreign digest or cursor leaks.
                 return self.bridge_event_conflict_response(event, evidence, envelope_sha);
             }
-            Err(error) => {
-                return Err(match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
-                    _ => TransportError::SessionFenced,
-                });
+            Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                return Ok(bridge_event_capacity_response(
+                    pressure,
+                    "stream_id",
+                    &event.stream_id,
+                    "event_id",
+                    &event.event_id,
+                ));
             }
+            Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
+                return Err(TransportError::Backpressure);
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
         };
         // An elapsed absolute deadline is staged honestly, then
         // reported as a timeout instead of an admission: the durable
@@ -3588,20 +3593,28 @@ impl KernelComposition {
             "envelope_sha256": envelope_sha,
             "staging_connection": session.connection_id,
         });
-        self.generation_gateway
+        let handoff_result = self
+            .generation_gateway
             .ors
-            .record_bridge_event_handoff_checked(&handoff)
-            .map_err(|error| match error {
-                OrsError::DuplicateConflict => TransportError::IdentityConflict,
-                // Capacity exhaustion is typed backpressure with the
-                // exhausted dimension (issue #2731, item 6): the handoff
-                // table is a bounded delivery budget, never an
-                // authentication failure.
-                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                    TransportError::Backpressure
+            .record_bridge_event_handoff_checked(&handoff);
+        if let Err(error) = handoff_result {
+            match error {
+                OrsError::DuplicateConflict => return Err(TransportError::IdentityConflict),
+                OrsError::BridgeEventCapacityExceeded(pressure) => {
+                    return Ok(bridge_event_capacity_response(
+                        pressure,
+                        "stream_id",
+                        &event.stream_id,
+                        "event_id",
+                        &event.event_id,
+                    ));
                 }
-                _ => TransportError::SessionFenced,
-            })?;
+                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                    return Err(TransportError::Backpressure);
+                }
+                _ => return Err(TransportError::SessionFenced),
+            }
+        }
         Ok(bridge_event_forward_response(&outcome, true))
     }
 
@@ -3739,12 +3752,28 @@ impl KernelComposition {
         let outcome = self
             .generation_gateway
             .ors
-            .record_bridge_event_gap_checked(&gap)
-            .map_err(|error| match error {
-                OrsError::DuplicateConflict => TransportError::IdentityConflict,
-                OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
-                _ => TransportError::SessionFenced,
-            })?;
+            .record_bridge_event_gap_checked(&gap);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                let gap_id = gap
+                    .get("gap_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(TransportError::SessionFenced)?;
+                return Ok(bridge_event_capacity_response(
+                    pressure,
+                    "gap_id",
+                    gap_id,
+                    "stream_id",
+                    gap.get("stream_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                ));
+            }
+            Err(OrsError::DuplicateConflict) => return Err(TransportError::IdentityConflict),
+            Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
+            Err(_) => return Err(TransportError::SessionFenced),
+        };
         let accepted = outcome
             .get("accepted")
             .and_then(serde_json::Value::as_bool)
@@ -3900,12 +3929,68 @@ impl KernelComposition {
                 .unwrap_or(0);
         }
         reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
-        let handoff_maintenance = self.maintain_bridge_event_handoffs(&batch_namespaces)?;
+        // Drive maintenance from the authenticated owner inventory as well
+        // as this request's consumed frontiers. Quiet streams still need
+        // bounded repair/retirement slices after their cursor stops moving.
+        // Resolve each stream again after acknowledgement so maintenance
+        // uses its current owner namespace, revision, and incarnation.
+        let handoff_maintenance = self.maintain_bridge_event_handoffs_for_owner(
+            &presenter,
+            &reconciliation,
+            &batch_namespaces,
+        )?;
         reconciliation["handoff_maintenance"] = serde_json::Value::Array(handoff_maintenance);
         Ok(serde_json::json!({ "status": "known", "value": {
             "accepted": true,
             "reconciliation": reconciliation,
         } }))
+    }
+
+    /// Resolves current owner namespaces after acknowledgement and runs their
+    /// existing bounded maintenance slices.
+    fn maintain_bridge_event_handoffs_for_owner(
+        &self,
+        presenter: &serde_json::Value,
+        reconciliation: &serde_json::Value,
+        batch_namespaces: &[(String, String, u64, u64, u64)],
+    ) -> Result<Vec<serde_json::Value>, TransportError> {
+        let mut stream_ids: std::collections::BTreeSet<String> = batch_namespaces
+            .iter()
+            .map(|(_, stream_id, _, _, _)| stream_id.clone())
+            .collect();
+        let streams = reconciliation
+            .get("streams")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(TransportError::SessionFenced)?;
+        for stream in streams {
+            let stream_id = stream
+                .get("stream_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            stream_ids.insert(stream_id.to_owned());
+        }
+        let mut namespaces = Vec::with_capacity(stream_ids.len());
+        for stream_id in stream_ids {
+            let item = self
+                .generation_gateway
+                .ors
+                .resolve_bridge_ack_item(presenter, &stream_id)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let namespace = item
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            let revision = item
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            let incarnation = item
+                .get("incarnation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            namespaces.push((namespace.to_owned(), stream_id, revision, incarnation));
+        }
+        self.maintain_bridge_event_handoffs(&namespaces)
     }
 
     /// Runs the bounded handoff maintenance for one reconciled scope on the
@@ -3924,11 +4009,11 @@ impl KernelComposition {
     /// preimage contract on [`Self::answer_bridge_event_reconcile`]).
     fn maintain_bridge_event_handoffs(
         &self,
-        batch_namespaces: &[(String, String, u64, u64, u64)],
+        maintenance_namespaces: &[(String, String, u64, u64)],
     ) -> Result<Vec<serde_json::Value>, TransportError> {
         let mut handoff_maintenance: Vec<serde_json::Value> =
-            Vec::with_capacity(batch_namespaces.len());
-        for (namespace, stream_id, _, revision, incarnation) in batch_namespaces {
+            Vec::with_capacity(maintenance_namespaces.len());
+        for (namespace, stream_id, revision, incarnation) in maintenance_namespaces {
             let maintenance_request = serde_json::json!({
                 "namespace": namespace,
                 "expected_revision": revision,
@@ -3947,13 +4032,25 @@ impl KernelComposition {
             let repaired = self
                 .generation_gateway
                 .ors
-                .repair_bridge_event_handoffs_checked(&maintenance_request)
-                .map_err(|error| match error {
-                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                        TransportError::Backpressure
-                    }
-                    _ => TransportError::SessionFenced,
-                })?;
+                .repair_bridge_event_handoffs_checked(&maintenance_request);
+            let repaired = match repaired {
+                Ok(repaired) => repaired,
+                Err(OrsError::BridgeEventCapacityExceeded(pressure)) => {
+                    handoff_maintenance.push(serde_json::json!({
+                        "stream_id": stream_id,
+                        "retired": retired.get("retired")
+                            .and_then(serde_json::Value::as_u64).unwrap_or(0),
+                        "retirement_continuation": retired.get("retirement_continuation")
+                            .and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        "capacity_pressure": pressure,
+                    }));
+                    continue;
+                }
+                Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
+                    return Err(TransportError::Backpressure);
+                }
+                Err(_) => return Err(TransportError::SessionFenced),
+            };
             handoff_maintenance.push(serde_json::json!({
                 "stream_id": stream_id,
                 "retired": retired.get("retired").and_then(serde_json::Value::as_u64).unwrap_or(0),
@@ -4522,6 +4619,33 @@ fn bridge_event_forward_response(outcome: &serde_json::Value, accepted: bool) ->
     let mut value = outcome.clone();
     if let Some(object) = value.as_object_mut() {
         object.insert("accepted".to_owned(), serde_json::Value::Bool(accepted));
+    }
+    serde_json::json!({ "status": "known", "value": value })
+}
+
+/// Returns typed capacity pressure through the ordinary correlated result
+/// frame. The connection remains admitted; the pressure report preserves the
+/// exact ORS resource and acceptance phase.
+fn bridge_event_capacity_response(
+    pressure: eliot_contracts::BridgeEventCapacityPressure,
+    first_key: &str,
+    first_value: &str,
+    second_key: &str,
+    second_value: &str,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "accepted": false,
+        "capacity_pressure": pressure,
+    });
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            first_key.to_owned(),
+            serde_json::Value::String(first_value.to_owned()),
+        );
+        object.insert(
+            second_key.to_owned(),
+            serde_json::Value::String(second_value.to_owned()),
+        );
     }
     serde_json::json!({ "status": "known", "value": value })
 }
