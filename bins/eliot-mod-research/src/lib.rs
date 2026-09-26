@@ -755,11 +755,11 @@ pub fn project_admitted_inquiry(
     // provider starts, but this governance projection is a second, later use of
     // the same request, and a projection that skipped the check would let
     // material assessed under one binding be published under another.
-    admission
-        .validate_request(request)
-        .map_err(|error| crate::R6ProjectionError::UnboundAdmission {
+    admission.validate_request(request).map_err(|error| {
+        crate::R6ProjectionError::UnboundAdmission {
             reason: error.reason(),
-        })?;
+        }
+    })?;
     // The receipt is custody of *this* admitted operation. Without these, a
     // receipt naming a foreign module generation, a foreign executable digest,
     // a foreign process generation, a wider privacy class, a different inquiry
