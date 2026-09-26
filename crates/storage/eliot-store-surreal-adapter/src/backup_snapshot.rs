@@ -458,6 +458,14 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::AUTOMATION_LAST_FAILURE,
     },
+    // Continuations are short-lived owner capabilities, not canonical state.
+    // Backups omit active records, terminal tombstones, and the quota guard;
+    // this capture census alone does not guarantee whether existing target
+    // rows are retained or cleared by a separate restore path. Every use still
+    // verifies the retained request and current canonical snapshot binding.
+    CanonicalSourceClass::OutsideAdmittedGeneration {
+        table: crate::schema::table::AUTOMATION_CONTINUATION,
+    },
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::EXPERIENCE_BANK,
     },

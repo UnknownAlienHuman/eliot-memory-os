@@ -3126,6 +3126,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+ "uuid",
 ]
 
 [[package]]
