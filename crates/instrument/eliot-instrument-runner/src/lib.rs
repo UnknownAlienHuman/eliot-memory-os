@@ -105,6 +105,9 @@ pub enum RunnerError {
     /// Execution did not succeed, so no authoritative PASS exists.
     #[error("instrument execution is not successful: {0}")]
     NotAuthoritative(String),
+    /// The self-change bootstrap receipt does not cover the runner surface.
+    #[error("bootstrap receipt covers '{0}', not the instrument runner surface")]
+    BootstrapRejected(String),
 }
 
 /// The immutable invocation/request pair used for every runner operation.
@@ -502,6 +505,43 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         let mut binding = InstrumentBinding::bind(invocation, port)?;
         binding.verify_executable(entry, resolved)?;
         self.launch(&mut binding, sink).await
+    }
+
+    /// Binds, verifies, and launches only under a runner-surface cutover receipt.
+    ///
+    /// This is the strict [`InstrumentRunner::launch_verified`] path for use
+    /// while the runner surface itself ships a new generation through the
+    /// I18.31 bootstrap: the generation receipt must cover
+    /// [`eliot_verifier::SelfChangeSurface::InstrumentRunner`], then the
+    /// real verified launch runs. Unrelated launches keep using
+    /// [`InstrumentRunner::launch_verified`] directly; the protocol binds
+    /// only the changed surface.
+    ///
+    /// Residual: composition roots switch to this entry when they ship a
+    /// new runner-surface generation (no caller migrates yet), and binding
+    /// the receipt generation to a runner build identity awaits a runner
+    /// build-identity owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunnerError::BootstrapRejected`] when the receipt covers a
+    /// different surface, or the underlying launch error otherwise.
+    pub async fn launch_verified_with_bootstrap(
+        &self,
+        invocation: InstrumentInvocation,
+        port: &dyn InstrumentRequestPort,
+        entry: &RegistryEntry,
+        resolved: Option<&ResolvedExecutableIdentity>,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        receipt: &eliot_verifier::GenerationReceipt,
+    ) -> Result<InstrumentStartReceipt, RunnerError> {
+        if !receipt.covers(eliot_verifier::SelfChangeSurface::InstrumentRunner) {
+            return Err(RunnerError::BootstrapRejected(
+                receipt.surface().as_str().to_owned(),
+            ));
+        }
+        self.launch_verified(invocation, port, entry, resolved, sink)
+            .await
     }
 
     /// Launches the exact immutable binding through P-03.

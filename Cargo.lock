@@ -2155,6 +2155,7 @@ dependencies = [
  "eliot-instrument-scip",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-verifier",
  "serde_json",
  "thiserror",
 ]
