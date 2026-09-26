@@ -160,7 +160,8 @@ fn local_read_state_is_dispatchable(state: HostRequestState) -> bool {
 }
 
 fn local_read_retired_error(state: HostRequestState, deadline_unix_ms: u64) -> TransportError {
-    if state == HostRequestState::Expired || activation_deadline_expired(unix_ms(), deadline_unix_ms)
+    if state == HostRequestState::Expired
+        || activation_deadline_expired(unix_ms(), deadline_unix_ms)
     {
         TransportError::Timeout
     } else {
@@ -880,9 +881,8 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        let dispatchable = !has_digest
-            && !has_body
-            && local_read_state_is_dispatchable(record.state);
+        let dispatchable =
+            !has_digest && !has_body && local_read_state_is_dispatchable(record.state);
         match carrier {
             Some(LocalReadCarrier::Query) if dispatchable => {
                 match self.enqueue_local_read_pair_under_transition(envelope, tool)? {
