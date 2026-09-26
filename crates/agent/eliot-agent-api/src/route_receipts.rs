@@ -398,6 +398,25 @@ pub fn candidate_digest_for(
     typed_digest(sha256_hex(&bytes))
 }
 
+/// Computes the exact route-fingerprint identity: the canonical digest of
+/// the fingerprint bytes (issue #2645).
+///
+/// This is the owner-qualified digest for the requested/selected/observed
+/// route columns retained at durable host-event staging: the requested column
+/// binds [`AdmittedRouteReceipt::requested_route`], and the actual column
+/// binds [`PhysicalRouteObservationReceipt::observed_route`]. It reuses the
+/// same `sha256_hex(canonical_json_bytes(..))` recipe as
+/// [`candidate_digest_for`]; it never substitutes an admission self-digest
+/// (logical-decision identity) for a fingerprint digest (route identity), and
+/// a copied unchecked string never validates because every staging validator
+/// recomputes it from the owner material.
+pub fn route_fingerprint_digest_for(
+    fingerprint: &RouteFingerprint,
+) -> Result<LowercaseSha256, serde_json::Error> {
+    let bytes = canonical_json_bytes(fingerprint)?;
+    typed_digest(sha256_hex(&bytes))
+}
+
 /// Why a v5 legacy candidate wire cannot become a current candidate. Every
 /// reason is evidence-preserving: the legacy bytes digest stays addressable
 /// in [`LegacyRouteQuarantine`] instead of being silently upgraded.
