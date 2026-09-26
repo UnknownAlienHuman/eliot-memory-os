@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_research_exchange_api::{AllowedReferenceManifest, AnchorPrecision, DisclosureClass};
 
 use crate::evidence_portfolio::{SourceRecord, freeze, push_count, push_field, text};
@@ -376,7 +376,7 @@ impl SourceAdmissibilityRecord {
     /// computable canonical commitment. A Governor-facing request must not carry
     /// an invented or empty source identity, so this refuses instead.
     pub fn transition_request(&self) -> Result<GovernorSourceTransitionRequest, InquiryError> {
-        Ok(GovernorSourceTransitionRequest {
+        let mut request = GovernorSourceTransitionRequest {
             request_kind: GovernorSourceTransitionRequest::REQUEST_KIND.to_owned(),
             inquiry_id: self.inquiry_id.clone(),
             evidence_set_id: self.evidence_set_id.clone(),
@@ -391,7 +391,10 @@ impl SourceAdmissibilityRecord {
             state_fence: self.state_fence.clone(),
             candidate_only: true,
             canonical_write_authorized: false,
-        })
+            request_digest: String::new(),
+        };
+        request.request_digest = request.compute_digest()?;
+        Ok(request)
     }
 
     /// Canonical digest over the whole decision shape.
@@ -505,6 +508,26 @@ impl SourceAdmissibilityRecord {
 ///
 /// The domain records the decision; the Governor applies it. The request carries
 /// no canonical-write authority and cannot finish a task.
+///
+/// # Why this request carries its own digest
+///
+/// This record is the boundary artefact: it is the only thing the Researcher
+/// hands across, and it is the half of the pair that a Governor, a Kernel or a
+/// Store reads. Every identity in it — the inquiry, the evidence set, the
+/// profile revision, the source handle, the source record's own digest, the
+/// eligibility, the exact scope and the State Fence — is a *fact about a
+/// decision*, and a request whose fields were rewritten after it was built
+/// would carry those facts without carrying any trace of the rewrite. So the
+/// request commits to its own bytes.
+///
+/// Without that commitment the acceptance requirement this record exists for is
+/// not reachable: "forged source eligibility … cannot change canonical state"
+/// holds at the *receiving* authority only if the request the Researcher emitted
+/// is itself tamper-evident, because the receiving authority has no other way to
+/// tell the decision the Researcher made from a request someone edited in
+/// flight. `request_digest` is the half of the two-record pair that lives on this
+/// side of the boundary; the other half — the Governor/Kernel/Store commit
+/// receipt — is the owner's and does not exist yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernorSourceTransitionRequest {
     /// Closed request-kind discriminator.
@@ -535,11 +558,150 @@ pub struct GovernorSourceTransitionRequest {
     pub candidate_only: bool,
     /// Always false: this domain never authorizes a canonical write.
     pub canonical_write_authorized: bool,
+    /// Digest over every field above, and over the State Fence as its own
+    /// canonical encoding.
+    pub request_digest: String,
 }
 
 impl GovernorSourceTransitionRequest {
     /// Closed request-kind discriminator for a source transition.
     pub const REQUEST_KIND: &'static str = "inquiry_source_admissibility";
+
+    /// Declared identity domain of this request.
+    ///
+    /// `v1` is the first spelling and the only one: the request committed to its
+    /// own bytes from the beginning, so there is no earlier domain to reject. It
+    /// is a named constant rather than an inline literal so a receiving
+    /// authority can name the domain it must accept instead of matching on a
+    /// string buried in a function body.
+    pub const REQUEST_DIGEST_DOMAIN: &'static str = "inquiry-source-admission-request/v1";
+
+    /// Canonical digest over the whole request shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::Unencodable`] when the bound State Fence has no
+    /// canonical encoding. A request that cannot commit to its own fence has no
+    /// request identity, so this refuses rather than hashing a shortened
+    /// preimage.
+    ///
+    /// The field list below is hand-written, so it is coupled to the struct
+    /// above by hand rather than by the compiler — the same hazard #2873 fixed
+    /// for `SourceRecord`. It is stated here rather than left implicit: a field
+    /// added to the struct without a line in this preimage would be published
+    /// beside a digest that does not cover it, and `validate_integrity` would
+    /// report the edited request as the one that was made.
+    fn compute_digest(&self) -> Result<String, InquiryError> {
+        let mut preimage = String::from(Self::REQUEST_DIGEST_DOMAIN);
+        push_field(&mut preimage, "request_kind", &self.request_kind);
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
+        push_field(&mut preimage, "profile_id", &self.profile_id);
+        push_field(
+            &mut preimage,
+            "profile_revision",
+            &self.profile_revision.to_string(),
+        );
+        push_field(&mut preimage, "profile_digest", &self.profile_digest);
+        push_field(&mut preimage, "source_handle", &self.source_handle);
+        push_field(
+            &mut preimage,
+            "source_record_digest",
+            &self.source_record_digest,
+        );
+        push_field(&mut preimage, "eligibility", self.eligibility.wire_name());
+        push_field(
+            &mut preimage,
+            "admissibility_digest",
+            &self.admissibility_digest,
+        );
+        push_field(&mut preimage, "scope", &self.scope);
+        let fence = canonical_json_bytes(&self.state_fence).map_err(|_| {
+            InquiryError::Unencodable {
+                field: "source_transition_request.state_fence",
+            }
+        })?;
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &String::from_utf8(fence).map_err(|_| InquiryError::Unencodable {
+                field: "source_transition_request.state_fence",
+            })?,
+        );
+        push_field(
+            &mut preimage,
+            "candidate_only",
+            if self.candidate_only { "true" } else { "false" },
+        );
+        push_field(
+            &mut preimage,
+            "canonical_write_authorized",
+            if self.canonical_write_authorized {
+                "true"
+            } else {
+                "false"
+            },
+        );
+        Ok(freeze(&preimage))
+    }
+
+    /// Re-proves this request's own digest over the bytes actually present.
+    ///
+    /// This is the readback check a constructor cannot perform. A request
+    /// reloaded or relayed after the fact still has individually well-formed
+    /// fields — a rewritten scope, a rewritten eligibility, a rewritten fence
+    /// and a rewritten source handle are all individually legal values — and
+    /// only recomputing the commitment over the bytes present can say that it is
+    /// no longer the request that was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one, and [`InquiryError::Unencodable`] when the
+    /// fence has no canonical encoding.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.compute_digest()? != self.request_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "source_transition_request.request_digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for GovernorSourceTransitionRequest {
+    /// Renders the request as one bounded, secret-free key/value line.
+    ///
+    /// Only identities, digests, the closed eligibility spelling, the scope and
+    /// the two authority flags appear. No source content, provider prose or
+    /// credential is reproduced, and the line names the request kind and its own
+    /// digest so a reader can match it against the decision it came from.
+    ///
+    /// This is the Researcher half of the two records a positive admitted source
+    /// must show. It deliberately prints no commit receipt, because this domain
+    /// has none: the Governor/Kernel/Store receipt is the owner's, and printing
+    /// a placeholder for it would be exactly the false proof claim A0.3 forbids.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "request_kind={} inquiry={} evidence_set={} profile={}@{} \
+             source={} source_record={} admissibility={} eligibility={} \
+             scope={} request={} candidate_only={} canonical_write_authorized={}",
+            self.request_kind,
+            self.inquiry_id,
+            self.evidence_set_id,
+            self.profile_id,
+            self.profile_revision,
+            self.source_handle,
+            self.source_record_digest,
+            self.admissibility_digest,
+            self.eligibility.wire_name(),
+            self.scope,
+            self.request_digest,
+            self.candidate_only,
+            self.canonical_write_authorized,
+        )
+    }
 }
 
 /// Derives the highest anchor precision a vetted record may be cited at.
