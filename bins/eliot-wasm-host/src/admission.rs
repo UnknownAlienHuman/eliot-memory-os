@@ -775,6 +775,7 @@ pub fn resolve_kernel_port_grant(
         engine_binding.clone(),
         artifact_digest,
         provider_configuration_digest(),
+        &material.operation_id,
     );
     // One retained admission, four local proxies: the slots are separate
     // trait objects over the same owner records, each with its own mutable

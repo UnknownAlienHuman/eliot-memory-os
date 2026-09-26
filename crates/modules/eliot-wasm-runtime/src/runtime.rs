@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use eliot_process::{CancellationStatus, ProcessLifecycle, ProcessRequest};
 use eliot_runtime_contracts::{LeaseState, ModuleGenerationState};
@@ -15,10 +16,10 @@ use crate::replacement::{
 };
 use crate::{
     AuthorityResolution, DerivedExecutionEvidence, EngineInvocation, EngineReport,
-    EngineTermination, GovernorResolution, InvocationDisposition, InvocationRequest,
-    InvocationResult, PortError, ProcessBinding, ProcessLaunchEnvelope, PromotionQuery,
-    PromotionVerification, RuntimeError, RuntimePorts, Sha256Digest, SourceVerification,
-    canonical_digest, validate_text,
+    EngineTermination, GovernorResolution, GuestInterruptHandle, InvocationDisposition,
+    InvocationRequest, InvocationResult, PortError, ProcessBinding, ProcessLaunchEnvelope,
+    PromotionQuery, PromotionVerification, RuntimeError, RuntimePorts, Sha256Digest,
+    SourceVerification, canonical_digest, validate_text,
 };
 
 const MAX_CACHED_INVOCATIONS: usize = 256;
@@ -143,6 +144,16 @@ impl WasmRuntime {
     ) -> Result<RollbackReceipt, ReplacementError> {
         self.generation_coordinator
             .complete_rollback(operation_id, expected_current)
+    }
+
+    /// Returns the seated engine's cloneable cross-thread interruption
+    /// handle, when the engine offers one. The handle is taken before the
+    /// worker owns the ports, so a control thread can request prompt guest
+    /// termination while an invocation is in flight (#2568 A3).
+    pub fn interrupt_handle(&self) -> Option<Arc<dyn GuestInterruptHandle>> {
+        self.ports
+            .as_ref()
+            .and_then(|ports| ports.engine.interrupt_handle())
     }
 
     /// Resolves external authority, starts through P-03, invokes, and caches.
@@ -936,7 +947,11 @@ fn classify_termination(report: EngineReport, p03_verified: bool) -> Termination
             report.proposed_effects,
             Some(report.observed_state_delta),
         ),
-        EngineTermination::Trap(class) => rejected(RuntimeError::Trap(class)),
+        EngineTermination::Trap(class) => rejected_with_evidence(
+            RuntimeError::Trap(class),
+            report.proposed_effects,
+            report.observed_state_delta,
+        ),
         EngineTermination::OutputLimit => rejected(RuntimeError::OutputLimit),
         EngineTermination::HostCallLimit => rejected(RuntimeError::HostCallLimit),
         EngineTermination::FuelExhausted => rejected(RuntimeError::FuelExhausted),
@@ -977,6 +992,30 @@ fn rejected(error: RuntimeError) -> TerminationClassification {
         None,
         Vec::new(),
         None,
+    )
+}
+
+/// Rejected classification that keeps the engine's effect/state evidence: a
+/// trap may have issued effects before trapping, so the evidence rides with
+/// the rejection for the seating evaluator instead of being dropped (#2568
+/// A4). An empty state delta stays absent (`None`), preserving the
+/// measured-empty/absent distinction the lifecycle evaluator reads.
+fn rejected_with_evidence(
+    error: RuntimeError,
+    effects: Vec<crate::EffectProposal>,
+    state_delta: Vec<u8>,
+) -> TerminationClassification {
+    let state_delta = if state_delta.is_empty() {
+        None
+    } else {
+        Some(state_delta)
+    };
+    (
+        InvocationDisposition::Rejected,
+        Some(error),
+        None,
+        effects,
+        state_delta,
     )
 }
 

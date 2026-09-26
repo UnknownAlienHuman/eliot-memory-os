@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use eliot_wasm_runtime::{
     ComponentEnginePort, EngineBinding, EngineInvocation, EngineReport, EngineTermination,
-    EngineUsage, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS, PortError, Sha256Digest, TrapClass,
+    EngineUsage, GuestInterruptHandle, InvocationLimits, MAX_EPOCH_DEADLINE_TICKS, PortError,
+    Sha256Digest, TrapClass,
 };
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
@@ -158,6 +159,26 @@ fn spawn_epoch_driver(identity: &str, task: EpochDriverTask) -> io::Result<threa
     thread::Builder::new()
         .name(identity.to_owned())
         .spawn(move || task.run())
+}
+
+/// Cloneable cross-thread interruption for in-process guest execution
+/// (#2568 A3). Both provider engines are bumped past any admittable Store
+/// epoch deadline, so the running invocation traps promptly; an engine with
+/// no live Store observes only a counter advance. Idempotent: overshooting
+/// an already-tripped deadline changes nothing further.
+#[derive(Clone)]
+pub struct EngineEpochInterrupt {
+    epoch_engine: Engine,
+    fuel_engine: Engine,
+}
+
+impl GuestInterruptHandle for EngineEpochInterrupt {
+    fn interrupt(&self) {
+        for _ in 0..=MAX_EPOCH_DEADLINE_TICKS {
+            self.epoch_engine.increment_epoch();
+            self.fuel_engine.increment_epoch();
+        }
+    }
 }
 
 /// Concrete typed Wasmtime Component Model provider for one admitted artifact.
@@ -582,6 +603,13 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
 
     fn reconcile(&mut self, _invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
         Err(PortError::UnknownOutcome)
+    }
+
+    fn interrupt_handle(&self) -> Option<Arc<dyn GuestInterruptHandle>> {
+        Some(Arc::new(EngineEpochInterrupt {
+            epoch_engine: self.epoch_engine.clone(),
+            fuel_engine: self.fuel_engine.clone(),
+        }))
     }
 }
 
