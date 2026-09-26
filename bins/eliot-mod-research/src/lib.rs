@@ -696,6 +696,20 @@ pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
 /// carry, and never promotes the result: the record stays candidate-only and the
 /// Governor applies any transition.
 ///
+/// This is the validating edge between acquisition and admissibility, so it
+/// proves the binding before it derives anything. `admission.validate_request`
+/// re-proves the request/admission binding over fence, bridge generation,
+/// privacy class, budget, deadline, protocol revision, required schema and
+/// coverage goal, and the receipt is then required to be *this* admitted
+/// operation's receipt — same operation identity, module generation, executable
+/// digest, process generation, privacy class, inquiry digest and denominator
+/// digest, with a well-formed Kernel dispatch digest and admission-receipt digest
+/// present. The candidate's `route` and `provider_generation` are read straight
+/// off the receipt, so an unbound receipt would otherwise mint provenance out of
+/// unverified fields. A provider's own `candidate_sha256` and its `Completed`
+/// label are read nowhere here: I21.11 keeps endpoint reachability, a successful
+/// login and a self-reported result from establishing ELIOT authority.
+///
 /// `failure` is the bridge's retained typed terminal classification. It is what
 /// carries the acquisition coverage gap this run actually suffered, so the
 /// dependent inquiry records the two named `I21.11` outcomes
@@ -707,11 +721,14 @@ pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
 ///
 /// Returns [`R6ProjectionError::UnboundAdmission`] when the admitted request and
 /// the terminal receipt do not bind the same operation, exchange, budget or
-/// deadline, and [`R6ProjectionError::Domain`] when the `R6` domain refuses the
-/// admitted material. Neither variant changes the provider receipt or this
-/// process's exit code: the refusal is reported on the evidence stream.
+/// deadline, when the receipt is not the receipt of the admitted operation's
+/// Kernel dispatch, or when the admitted request and the admission disagree on
+/// any bound dimension; and [`R6ProjectionError::Domain`] when the `R6` domain
+/// refuses the admitted material. Neither variant changes the provider receipt
+/// or this process's exit code: the refusal is reported on the evidence stream.
 pub fn project_admitted_inquiry(
     request: &ResearchQueryRequest,
+    admission: &ProviderAdmission,
     receipt: &ProviderExecutionReceipt,
     failure: Option<&TerminalFailure>,
 ) -> Result<InquiryGovernance, crate::R6ProjectionError> {
@@ -728,6 +745,47 @@ pub fn project_admitted_inquiry(
     if receipt.budget_units != request.budget_units || receipt.deadline_ms != request.deadline_ms {
         return Err(crate::R6ProjectionError::UnboundAdmission {
             reason: "terminal receipt widens the admitted budget or deadline",
+        });
+    }
+    // The request/admission binding is re-proved here, on the edge that turns
+    // retained material into an inquiry candidate.
+    // `ProviderAdmission::validate_request` is the crate's exact binding over
+    // fence, bridge generation, disclosure, budget, deadline, protocol revision,
+    // required schema and coverage goal; the executor applies it before a
+    // provider starts, but this governance projection is a second, later use of
+    // the same request, and a projection that skipped the check would let
+    // material assessed under one binding be published under another.
+    admission
+        .validate_request(request)
+        .map_err(|error| crate::R6ProjectionError::UnboundAdmission {
+            reason: error.reason(),
+        })?;
+    // The receipt is custody of *this* admitted operation. Without these, a
+    // receipt naming a foreign module generation, a foreign executable digest,
+    // a foreign process generation, a wider privacy class, a different inquiry
+    // or denominator, or no Kernel dispatch at all, would still produce a
+    // candidate source and an admissibility decision: the `route` below and
+    // `provider_generation` on every candidate are read straight off the
+    // receipt, so an unbound receipt would mint provenance out of unverified
+    // fields. `ProviderExecutionReceipt::candidate_sha256` is a provider's own
+    // claim and proves nothing, which is why it is not read here.
+    if receipt.module_generation_id != admission.module_generation_id()
+        || receipt.executable_sha256 != admission.bridge().executable_sha256()
+        || receipt.process_generation != admission.process_generation().get()
+        || receipt.disclosure != admitted_disclosure_wire(admission.disclosure())
+        || receipt.inquiry_digest != admission.inquiry_digest()
+        || receipt.denominator_digest != admission.denominator_digest()
+        || receipt.operation_id != admission.operation_id().as_str()
+    {
+        return Err(crate::R6ProjectionError::UnboundAdmission {
+            reason: "terminal receipt is not the receipt of the admitted operation",
+        });
+    }
+    if !is_lowercase_sha256(&receipt.dispatch_sha256)
+        || !is_lowercase_sha256(&receipt.admission_receipt_sha256)
+    {
+        return Err(crate::R6ProjectionError::UnboundAdmission {
+            reason: "terminal receipt carries no verifiable Kernel dispatch or admission receipt",
         });
     }
     let assessment_time_ms = i64::try_from(dispatch_authority::unix_ms()).unwrap_or(i64::MAX);
@@ -764,6 +822,24 @@ pub fn project_admitted_inquiry(
         assessment_time_ms,
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
+}
+
+/// The Kernel's closed wire spelling of one admitted privacy class.
+///
+/// `ProviderExecutionReceipt::disclosure` carries the Kernel's own string
+/// verbatim, because the receipt is custody of what the Kernel admitted and
+/// rewriting it here would destroy that. The admitted `DisclosureClass` has to
+/// be compared against it, so the same four spellings `admit` reads in
+/// `main.rs` are read back out. This is the Kernel research-provider wire
+/// vocabulary, not a second one of this crate's own: a new spelling here would
+/// admit a privacy class the Kernel never sealed.
+const fn admitted_disclosure_wire(class: DisclosureClass) -> &'static str {
+    match class {
+        DisclosureClass::Private => "Private",
+        DisclosureClass::ProjectBound => "ProjectBound",
+        DisclosureClass::ExportableRedacted => "ExportableRedacted",
+        DisclosureClass::Public => "Public",
+    }
 }
 
 /// The reason code one dependent inquiry records for this run.
