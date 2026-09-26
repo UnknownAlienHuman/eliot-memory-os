@@ -1,3 +1,6 @@
+use crate::mcp_stdio::correlation::{
+    McpInvocationCorrelation, check_response_correlation, emit_stdout_frame,
+};
 use crate::mcp_stdio::{AuthenticatedRoleAuthority, CognitiveCapabilityFile, McpDaemon};
 use crate::runtime_instance::{
     RuntimeDiscoveryErrorCode, RuntimeInstance, RuntimePublication, RuntimePublicationState,
@@ -296,7 +299,6 @@ pub(crate) async fn run_stdio_client(
     reject_database_environment()?;
     let mut connection = connect_client(instance, profile, requested_scope.clone()).await?;
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
     let mut stdin = stdin.lock();
     while let Some(line) = read_bounded_stdio_line(&mut stdin)? {
         if line.trim().is_empty() {
@@ -305,6 +307,8 @@ pub(crate) async fn run_stdio_client(
         let request: Value = serde_json::from_str(&line)
             .with_context(|| format!("parse MCP JSON-RPC line: {line}"))?;
         let expects_response = request.get("id").is_some();
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        let mut correlation = McpInvocationCorrelation::receive(&request, method);
         let latest = wait_for_ready_publication(instance, CONNECT_TIMEOUT).await?;
         if !same_runtime_generation(&latest, &connection.publication) {
             connection = connect_client(instance, profile, requested_scope.clone()).await?;
@@ -327,9 +331,15 @@ pub(crate) async fn run_stdio_client(
             }
         };
         if let Some(response) = response {
-            std::io::Write::write_all(&mut stdout, response.as_bytes())?;
-            std::io::Write::write_all(&mut stdout, b"\n")?;
-            std::io::Write::flush(&mut stdout)?;
+            if let Some(request_id) = request.get("id") {
+                check_response_correlation(request_id, &response)?;
+            }
+            let framed = format!("{response}\n");
+            correlation.observe_framed(framed.len());
+            let receipt = emit_stdout_frame(framed.as_bytes());
+            correlation.observe_emission(&receipt);
+            correlation.emit();
+            receipt.into_result(&correlation.mcp_request_id)?;
         }
     }
     Ok(())
