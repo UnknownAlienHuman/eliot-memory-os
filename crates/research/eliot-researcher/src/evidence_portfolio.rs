@@ -18,6 +18,33 @@
 //! Digests are lowercase SHA-256 over an explicit length-prefixed canonical
 //! preimage with `'\0'`-free validated fields, so arrival order never affects
 //! frozen bytes: every set iterates in `BTree` order.
+//!
+//! Scoped absence is a *cross-checked* verdict, not a bare caller-authored
+//! claim. A [`NoMatchEvaluation`] carries the three commitments the frozen owner
+//! map of I21.6 names — the scope/denominator owner's snapshot and revision, the
+//! source/index owner's record and content commitments, and the
+//! query/evaluator owner's exact predicate bytes, identities, receipt, fence and
+//! currentness bounds — and [`assess_absence`] re-derives every one of them
+//! against the coverage accounting, the vetted records and the authorized
+//! manifest it is handed. A member name copied out of the accounting no longer
+//! proves anything: a member reaches the closed set only through a complete
+//! ordered join onto a real record, a manifest that binds it and a recomputed
+//! per-member result identity.
+//!
+//! What that does **not** buy is owner-boundness in the provenance sense, and
+//! this module does not claim it. None of the issuer, evaluator, admission,
+//! fence or work-scope identities inside the record is verified against an
+//! external authority, because this repository holds no owner registry to verify
+//! one against. The record is internally self-consistent and cross-checked
+//! against the manifest and the account the caller also supplies; the residual
+//! trust boundary is exactly those inputs. See the limitation note on
+//! [`NoMatchEvaluation`] for the full statement.
+//!
+//! The assessor performs no I/O, calls no provider and no index, and the
+//! ordinary Researcher route binds no evaluation and no manifest at all, so the
+//! negative is `Unproven` until a live owner supplies one. That residual is
+//! recorded rather than closed: a fabricated evaluator route would be a second
+//! query engine.
 
 #![forbid(unsafe_code)]
 
@@ -1750,45 +1777,778 @@ pub enum AbsenceVerdict {
     },
 }
 
-/// One owner-bound, identity-bearing record of a bounded predicate evaluation
-/// over a named closed population.
+/// Whether an owner-issued evaluation supports a claim about *now* or only a
+/// claim about the past.
 ///
-/// This is neither a verdict nor a flag: it is the identity of the per-member
-/// predicate result. It names the predicate that was evaluated, the frozen
-/// scope snapshot and index revision the evaluation was bounded to, and the
-/// exact members it found no match for. [`assess_absence`] proves absence only
-/// when that member set is exactly the set of declared members the accounting
-/// closed intact, so an incomplete evaluation cannot be presented as
-/// exhaustive and a ranked index can neither add a member to the denominator
-/// of a negative nor remove one from it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A historical evaluation says what was true at its owner-recorded observation
+/// time. Reusing it for a current negative would silently widen a past
+/// observation into a present one, so [`assess_absence`] accepts only
+/// [`NoMatchApplicability::Current`] and the distinction is carried in the
+/// evaluation's own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NoMatchApplicability {
+    /// The evaluation describes the past and never grounds a current negative.
+    Historical,
+    /// The evaluation is current across its declared window and may ground a
+    /// scoped negative.
+    Current,
+}
+
+impl NoMatchApplicability {
+    /// Stable wire spelling of this applicability. The identity preimages must
+    /// not depend on a Rust variant name; see the [`SourceDisposition`] impl for
+    /// the single-owner rationale.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Historical => "HISTORICAL",
+            Self::Current => "CURRENT",
+        }
+    }
+}
+
+impl Serialize for NoMatchApplicability {
+    /// Serializes as the same stable wire spelling [`Self::wire_name`] returns.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+/// The five separately-established facts a scoped negative stands on.
+///
+/// They are distinct obligations, not a summary: an enumeration that completed is
+/// not an acquisition that closed, an acquisition that closed is not a current
+/// source, a current source is not an evaluated predicate, and an evaluated
+/// predicate is not a predicate that returned no match. I21.6/I21.9 keep them
+/// apart for the same reason — an exhausted or partial route never decodes as
+/// completeness, and completeness alone never decodes as a negative. None of
+/// these five substitutes for another, so [`NoMatchEvaluation`] records them as
+/// a set and [`assess_absence`] names each one that is missing.
+///
+/// That is a claim about *reporting*, not about establishment. Each dimension is
+/// one entry in an issuer-supplied set; nothing here re-derives
+/// `EnumerationCompleted` from an enumeration attestation, or `SourceIndexCurrent`
+/// from an index snapshot, or `PredicateReturnedNoMatch` from anything the
+/// evaluator actually returned. Establishing them is the live owner's
+/// obligation, and this crate can only require that all five were asserted. See
+/// the limitation note on [`NoMatchEvaluation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NoMatchDimension {
+    /// The finite denominator was enumerated in full, without truncation.
+    EnumerationCompleted,
+    /// Every member's acquisition closed and each closed member resolves to
+    /// exactly one vetted immutable record.
+    MemberAcquisitionClosed,
+    /// The source and index the predicate ran against are current.
+    SourceIndexCurrent,
+    /// The named predicate was actually executed against the frozen scope.
+    PredicateEvaluated,
+    /// The executed predicate returned no match for that member.
+    PredicateReturnedNoMatch,
+}
+
+impl NoMatchDimension {
+    /// Every dimension, in canonical order. A complete scoped negative
+    /// establishes all five and substitutes none for another.
+    pub const ALL: [Self; 5] = [
+        Self::EnumerationCompleted,
+        Self::MemberAcquisitionClosed,
+        Self::SourceIndexCurrent,
+        Self::PredicateEvaluated,
+        Self::PredicateReturnedNoMatch,
+    ];
+
+    /// Stable wire spelling of this dimension; see
+    /// [`NoMatchApplicability`]'s `Serialize` impl for the single-owner
+    /// rationale.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::EnumerationCompleted => "ENUMERATION_COMPLETED",
+            Self::MemberAcquisitionClosed => "MEMBER_ACQUISITION_CLOSED",
+            Self::SourceIndexCurrent => "SOURCE_INDEX_CURRENT",
+            Self::PredicateEvaluated => "PREDICATE_EVALUATED",
+            Self::PredicateReturnedNoMatch => "PREDICATE_RETURNED_NO_MATCH",
+        }
+    }
+
+    /// The dimensions `established` does not contain, in canonical order. An
+    /// empty result means every dimension is in the set the issuer supplied, and
+    /// nothing more than that: this is a pure projection of
+    /// [`NoMatchEvaluation::established`], which is an issuer-authored set that
+    /// no code path in this crate independently establishes. It cannot report
+    /// that a caller said so, because saying so is all there is to report; what
+    /// it does guarantee is that no dimension silently stands in for another, so
+    /// an incomplete set is named dimension by dimension rather than summarised.
+    #[must_use]
+    pub fn missing(established: &BTreeSet<Self>) -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|dimension| !established.contains(dimension))
+            .collect()
+    }
+}
+
+impl Serialize for NoMatchDimension {
+    /// Serializes as the same stable wire spelling [`Self::wire_name`] returns.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_name())
+    }
+}
+
+/// One owner-issued, identity-bearing per-member predicate result.
+///
+/// A member *name* is not a result. This record names the exact declared member,
+/// the canonical commitment of the exact vetted record the predicate read
+/// ([`SourceRecord::digest`] under [`SOURCE_RECORD_DIGEST_DOMAIN`]), the digest of
+/// the exact content bytes, and the result identity binding all of it to the
+/// predicate, index revision and source revision it was produced under.
+/// [`NoMatchEvaluation::result_identity`] is the single recipe for that identity,
+/// and the record's own shape check recomputes it from the evaluation's
+/// commitments on every construction and on every readback through
+/// [`AbsencePreconditions::derive`], so a member list copied out of the
+/// accounting cannot produce one and neither can a result carried over from
+/// another predicate, index revision, source revision or record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MemberNoMatchResult {
+    /// Declared denominator member this result answers for.
+    pub member: String,
+    /// Canonical commitment of the exact vetted record the predicate read.
+    pub record_digest: String,
+    /// Digest of the exact content bytes the predicate read.
+    pub content_digest: String,
+    /// Identity of this result under the evaluation's own commitments.
+    pub result_identity: String,
+}
+
+impl MemberNoMatchResult {
+    /// Total order used to freeze results deterministically. Ordering is by the
+    /// whole result, so a duplicated `member` with different content still sorts
+    /// deterministically and both copies stay bound until the duplicate check
+    /// rejects them.
+    fn canonical_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.member
+            .cmp(&other.member)
+            .then_with(|| self.record_digest.cmp(&other.record_digest))
+            .then_with(|| self.content_digest.cmp(&other.content_digest))
+            .then_with(|| self.result_identity.cmp(&other.result_identity))
+    }
+}
+
+/// Declared wire schema of [`NoMatchEvaluation`].
+///
+/// The `schema_version` field is validated against this constant, so a record
+/// from a different revision of the evidence shape is refused instead of being
+/// read through field names that may have moved.
+pub const NO_MATCH_EVALUATION_SCHEMA_VERSION: &str = "no-match-evaluation/v1";
+
+/// Declared identity domain of [`NoMatchEvaluation`].
+///
+/// `v1` is the first declared form. It binds the predicate, issuer, evaluator,
+/// admission receipt, State Fence, work scope, scope/snapshot/denominator/manifest
+/// commitments, index and source revisions, owner-recorded observation and
+/// currentness bounds, applicability, the per-member result identities, the
+/// established-dimension set and the proof ceiling, so a record altered in any of
+/// those respects stops verifying against itself.
+pub const NO_MATCH_EVALUATION_DIGEST_DOMAIN: &str = "no-match-evaluation/v1";
+
+/// The single canonical encoder input for [`NoMatchEvaluation`].
+///
+/// The record is borrowed whole; its `digest` field is excluded by
+/// `#[serde(skip)]` on the field itself, so the exclusion is declared next to the
+/// field it excludes rather than reconstructed at each call site.
+#[derive(Serialize)]
+struct NoMatchEvaluationDigestInput<'a> {
+    /// Declared identity domain, bound into the bytes.
+    domain: &'static str,
+    /// The whole owner-issued record, minus its own digest.
+    evaluation: &'a NoMatchEvaluation,
+}
+
+/// One owner-issued, identity-bearing record of a bounded predicate evaluation
+/// over a frozen denominator.
+///
+/// This is neither a verdict nor a flag: it is the *identity* of a completed
+/// evaluation run, and the assessor cross-checks it. The record carries the three
+/// commitments the frozen owner map of I21.6 names, and
+/// [`AbsenceVerdict::Proven`] requires all three to hold:
+///
+/// * the **scope/denominator owner** contributes [`Self::scope_digest`],
+///   [`Self::scope_revision`], [`Self::denominator_digest`],
+///   [`Self::manifest_digest`] and [`Self::manifest_revision`]. What is actually
+///   *checked* is narrow and stated here rather than implied: `scope_digest` is
+///   joined to the frozen scope digest the assessment was scoped to,
+///   `manifest_digest`/`manifest_revision` are joined to the authorized manifest
+///   presented alongside, and `denominator_digest` is joined to that manifest's
+///   own denominator digest. `scope_revision` is carried and identity-bound but
+///   compared to nothing, and none of the four is joined to the accounting's
+///   actual member set — `account.digest()` covers the denominator, and no field
+///   here is matched against it.
+/// * the **source/index owner** contributes [`Self::index_revision`],
+///   [`Self::source_revision`], the owner-recorded
+///   [`Self::observed_at_ms`]/[`Self::current_until_ms`] bounds and, per member,
+///   the [`MemberNoMatchResult`] record and content digests. The per-member
+///   commitments are the ones genuinely re-derived against the vetted record;
+///   `index_revision` and `source_revision` are bound into the result identities
+///   and echoed in diagnostics, but no index snapshot is joined to either.
+/// * the **query/evaluator owner** contributes the exact predicate bytes behind
+///   [`Self::predicate_id`]/[`Self::predicate_revision`]/[`Self::predicate_form`],
+///   the issuer and evaluator identities and revisions, the admitted receipt, the
+///   State Fence and work scope, and the five separately-established
+///   [`NoMatchDimension`]s in [`Self::established`]. The predicate bytes are
+///   re-hashed; the issuer, evaluator, receipt, fence, work scope and the five
+///   dimensions are shape-validated and bound into the record's own identity, and
+///   nothing further.
+///
+/// Researcher only validates and derives from it. Nothing here calls a provider,
+/// an index or a search engine: the evaluation arrives as a pure input and
+/// [`assess_absence`] reads it without performing I/O.
+///
+/// Copying the closed member IDs into a free-form list cannot produce this
+/// record: a [`MemberNoMatchResult`] needs a [`SourceRecord::digest`] that
+/// matches the exact vetted record, a content digest that matches that record's
+/// bytes, and a result identity recomputed from the predicate, index revision and
+/// source revision actually in force.
+///
+/// # What this does not establish
+///
+/// This record is internally self-consistent and cross-checked against the
+/// manifest and the accounting the caller presents. It is **not** owner-bound in
+/// the provenance sense, and this crate cannot make it so, because there is
+/// nothing here to bind it to: no issuer registry, no admission ledger, no
+/// signature and no externally held reference digest exists in this repository
+/// against which [`Self::issuer_id`], [`Self::evaluator_id`],
+/// [`Self::admission_receipt_id`] or [`Self::fence`] could be checked.
+/// [`StateFence::validate`] confirms a non-zero resource generation and nothing
+/// more, and [`Self::verify_integrity`] compares the record against its own
+/// bytes.
+///
+/// The consequence is worth stating as a bound rather than leaving to be
+/// discovered: a caller that controls the source records, the authorized
+/// manifest and the clock can mint a fully self-consistent evaluation for members
+/// it never actually searched, and the assessor will return
+/// [`AbsenceVerdict::Proven`]. Every one of those three inputs is a parameter of
+/// [`AbsencePreconditions::derive`], so the residual trust boundary is exactly
+/// the records, the manifest and `now_ms`.
+///
+/// Closing that boundary needs infrastructure this repository does not have: an
+/// admission owner that holds the issuer identity and the admitted receipt, and
+/// a denominator owner that issues the exact finite member set and its snapshot
+/// digest as a commitment somebody other than the caller can verify. Until one
+/// exists, this record is evidence that a consistent account was presented, not
+/// evidence that a predicate was run — the same named-owner-absent residual
+/// recorded for #1768/#1948/#1949. Fabricating a stand-in for that owner inside
+/// this module would be a second query engine, so the boundary is stated instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NoMatchEvaluation {
+    /// Declared wire schema of this evidence shape.
+    pub schema_version: String,
     /// Exact identity of the predicate that was evaluated.
     pub predicate_id: String,
-    /// Digest of the frozen scope snapshot the evaluation was bounded to.
-    pub frozen_scope_digest: String,
-    /// Revision of the source/index the evaluation ran against.
+    /// Exact revision of that predicate.
+    pub predicate_revision: String,
+    /// Exact canonical predicate/query bytes the evaluator executed.
+    ///
+    /// The predicate commitment [`Self::predicate_digest`] is recomputed from
+    /// this text and the two identity fields, so the commitment cannot be a
+    /// repeated string describing bytes nobody holds.
+    pub predicate_form: String,
+    /// Owner that issued this record.
+    pub issuer_id: String,
+    /// Exact identity of the evaluator that executed the predicate.
+    pub evaluator_id: String,
+    /// Exact evaluator revision the run was produced under.
+    pub evaluator_revision: String,
+    /// Admitted receipt identity for this evaluation.
+    pub admission_receipt_id: String,
+    /// State fence the evaluation was admitted under.
+    pub fence: StateFence,
+    /// Exact work scope the evaluation was bounded to.
+    pub work_scope: String,
+    /// Digest of the frozen scope/denominator snapshot.
+    pub scope_digest: String,
+    /// Revision of that scope snapshot.
+    pub scope_revision: String,
+    /// Canonical denominator digest the member set was frozen from.
+    pub denominator_digest: String,
+    /// Digest of the authorized manifest covering the frozen members.
+    pub manifest_digest: String,
+    /// Revision of that authorized manifest.
+    pub manifest_revision: u64,
+    /// Revision of the source/index the predicate ran against.
     pub index_revision: String,
-    /// Members the predicate found no match for. Normalised into canonical
-    /// order by [`AbsencePreconditions::derive`] so arrival order never
-    /// affects the comparison against the closed denominator.
-    pub no_match_members: Vec<String>,
+    /// Revision of the source corpus the predicate ran against.
+    pub source_revision: String,
+    /// Owner-recorded observation time in Unix milliseconds.
+    ///
+    /// This is the owner clock, not a caller-supplied `now_ms`.
+    /// [`AbsencePreconditions::derive`] requires it to be at or after every
+    /// joined record's retrieval time, to be at or before the caller's assessment
+    /// time, and to sit inside the declared currentness window.
+    pub observed_at_ms: i64,
+    /// Owner-declared last instant, in Unix milliseconds, at which this
+    /// evaluation was still current.
+    pub current_until_ms: i64,
+    /// Whether this evaluation grounds a current claim or only a historical one.
+    pub applicability: NoMatchApplicability,
+    /// Per-member owner-issued no-match results, in canonical member order.
+    ///
+    /// The coverage this record claims *is* this set: it must equal the set of
+    /// members the accounting closed that resolve to a compatible vetted record,
+    /// exactly. There is no separate count that could disagree with it.
+    pub results: Vec<MemberNoMatchResult>,
+    /// The five separately-established facts, none substituting for another.
+    pub established: BTreeSet<NoMatchDimension>,
+    /// Proof ceiling the negative may not exceed; `None` is unknown coverage,
+    /// never unrestricted.
+    pub proof_ceiling_grade: Option<u8>,
+    /// Frozen digest over the whole record shape.
+    ///
+    /// Excluded from its own preimage by `#[serde(skip)]`, so the digest is the
+    /// only field on this struct that is not part of the identity it certifies.
+    #[serde(skip)]
+    pub digest: String,
 }
+
+/// Named constructor arguments for [`NoMatchEvaluation::issue`]. Named fields
+/// block transposition; text uses concrete `String`.
+#[derive(Clone, Debug)]
+pub struct NoMatchEvaluationParams {
+    /// Exact identity of the predicate.
+    pub predicate_id: String,
+    /// Exact predicate revision.
+    pub predicate_revision: String,
+    /// Exact canonical predicate bytes.
+    pub predicate_form: String,
+    /// Issuing owner.
+    pub issuer_id: String,
+    /// Evaluator identity.
+    pub evaluator_id: String,
+    /// Evaluator revision.
+    pub evaluator_revision: String,
+    /// Admitted receipt identity.
+    pub admission_receipt_id: String,
+    /// Admission State Fence.
+    pub fence: StateFence,
+    /// Work scope.
+    pub work_scope: String,
+    /// Frozen scope digest.
+    pub scope_digest: String,
+    /// Scope snapshot revision.
+    pub scope_revision: String,
+    /// Denominator digest.
+    pub denominator_digest: String,
+    /// Authorized manifest digest.
+    pub manifest_digest: String,
+    /// Authorized manifest revision.
+    pub manifest_revision: u64,
+    /// Index revision.
+    pub index_revision: String,
+    /// Source corpus revision.
+    pub source_revision: String,
+    /// Owner-recorded observation time.
+    pub observed_at_ms: i64,
+    /// Owner-declared currentness bound.
+    pub current_until_ms: i64,
+    /// Applicability.
+    pub applicability: NoMatchApplicability,
+    /// Per-member results.
+    pub results: Vec<MemberNoMatchResult>,
+    /// Established dimensions.
+    pub established: BTreeSet<NoMatchDimension>,
+    /// Proof ceiling.
+    pub proof_ceiling_grade: Option<u8>,
+}
+
+impl NoMatchEvaluation {
+    /// Validates and freezes one owner-issued evaluation record.
+    ///
+    /// Results are frozen into canonical member order here, so arrival order
+    /// never affects the identity. Every result identity is recomputed from this
+    /// record's own predicate, index revision and source revision and must equal
+    /// the value supplied, so the issuer cannot ship a result carried over from
+    /// another predicate, index revision or source revision. To produce the values
+    /// this constructor checks, call [`Self::predicate_digest_of`] and then
+    /// [`Self::result_identity`] for every member.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank or malformed identity, revision, digest,
+    /// work scope or result member, [`PortfolioError::Conflict`] for an inverted
+    /// currentness window, a stale schema revision or a result identity that is
+    /// not the identity this record's own commitments imply,
+    /// [`PortfolioError::Duplicate`] for a repeated member,
+    /// [`PortfolioError::IncompleteDenominator`] for an empty result set, which no
+    /// closed population produces, [`PortfolioError::UnknownGrade`] for a ceiling
+    /// outside the canonical ladder, and [`PortfolioError::Unencodable`] when the
+    /// record cannot be encoded into its declared identity domain.
+    pub fn issue(mut params: NoMatchEvaluationParams) -> Result<Self, PortfolioError> {
+        params.results.sort_by(MemberNoMatchResult::canonical_order);
+        let mut evaluation = Self {
+            schema_version: NO_MATCH_EVALUATION_SCHEMA_VERSION.to_owned(),
+            predicate_id: params.predicate_id,
+            predicate_revision: params.predicate_revision,
+            predicate_form: params.predicate_form,
+            issuer_id: params.issuer_id,
+            evaluator_id: params.evaluator_id,
+            evaluator_revision: params.evaluator_revision,
+            admission_receipt_id: params.admission_receipt_id,
+            fence: params.fence,
+            work_scope: params.work_scope,
+            scope_digest: params.scope_digest,
+            scope_revision: params.scope_revision,
+            denominator_digest: params.denominator_digest,
+            manifest_digest: params.manifest_digest,
+            manifest_revision: params.manifest_revision,
+            index_revision: params.index_revision,
+            source_revision: params.source_revision,
+            observed_at_ms: params.observed_at_ms,
+            current_until_ms: params.current_until_ms,
+            applicability: params.applicability,
+            results: params.results,
+            established: params.established,
+            proof_ceiling_grade: params.proof_ceiling_grade,
+            digest: String::new(),
+        };
+        evaluation.validate_shape()?;
+        evaluation.digest = evaluation.canonical_digest()?;
+        Ok(evaluation)
+    }
+
+    /// The one recipe for the predicate commitment, callable before the record
+    /// exists.
+    ///
+    /// An issuer has to compute this commitment *before* it can compute a
+    /// [`Self::result_identity`], and therefore before [`Self::issue`] can accept
+    /// the result at all. Exposing the recipe as an associated function rather
+    /// than only as a method on an already-constructed value is what makes the
+    /// issuing sequence expressible; [`Self::predicate_digest`] is the same recipe
+    /// applied to a value's own fields, so the issuer's preimage and the
+    /// validator's recomputation cannot drift.
+    #[must_use]
+    pub fn predicate_digest_of(
+        predicate_id: &str,
+        predicate_revision: &str,
+        predicate_form: &str,
+    ) -> String {
+        let mut preimage = String::from("no-match-predicate/v1;");
+        push_field(&mut preimage, "predicate_id", predicate_id);
+        push_field(&mut preimage, "predicate_revision", predicate_revision);
+        push_field(&mut preimage, "predicate_form", predicate_form);
+        freeze(&preimage)
+    }
+
+    /// The one recipe for a per-member result identity.
+    ///
+    /// It binds the exact predicate commitment, the exact member, the canonical
+    /// commitment of the exact vetted record, the exact content bytes, the index
+    /// revision and the source revision. The evaluator owner calls this to issue a
+    /// result; the record's own shape check recomputes it for every result the
+    /// record carries, on construction and again on the readback
+    /// [`AbsencePreconditions::derive`] performs, so the two cannot drift and a
+    /// result cannot be carried across a predicate, revision or record boundary.
+    #[must_use]
+    pub fn result_identity(
+        predicate_digest: &str,
+        member: &str,
+        record_digest: &str,
+        content_digest: &str,
+        index_revision: &str,
+        source_revision: &str,
+    ) -> String {
+        let mut preimage = String::from("no-match-result/v1;");
+        push_field(&mut preimage, "predicate", predicate_digest);
+        push_field(&mut preimage, "member", member);
+        push_field(&mut preimage, "record", record_digest);
+        push_field(&mut preimage, "content", content_digest);
+        push_field(&mut preimage, "index_revision", index_revision);
+        push_field(&mut preimage, "source_revision", source_revision);
+        freeze(&preimage)
+    }
+
+    /// Recomputes this record's predicate commitment from the exact bytes the
+    /// evaluator executed, over the declared `no-match-predicate/v1` domain.
+    ///
+    /// This is a recomputation, not a stored claim: the commitment is never a
+    /// field on the record, so it cannot be repeated independently of the
+    /// predicate it describes.
+    #[must_use]
+    pub fn predicate_digest(&self) -> String {
+        Self::predicate_digest_of(
+            &self.predicate_id,
+            &self.predicate_revision,
+            &self.predicate_form,
+        )
+    }
+
+    /// The dimensions this record leaves unestablished, in canonical order.
+    #[must_use]
+    pub fn missing_dimensions(&self) -> Vec<NoMatchDimension> {
+        NoMatchDimension::missing(&self.established)
+    }
+
+    /// Whether this record is bound to exactly this scope snapshot.
+    #[must_use]
+    pub fn covers_scope(&self, frozen_scope_digest: &str) -> bool {
+        self.scope_digest == frozen_scope_digest
+    }
+
+    /// The members this record carries an owner-issued result for, in canonical
+    /// member order.
+    #[must_use]
+    pub fn evaluated_members(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .map(|result| result.member.clone())
+            .collect()
+    }
+
+    /// Validates the record's shape, independently of its frozen digest.
+    ///
+    /// This is the only place the canonical result order is enforced, and it is
+    /// enforced here rather than only in [`Self::issue`] because every field on
+    /// this struct is public: a struct literal bypasses the constructor, and
+    /// [`AbsencePreconditions::derive`] accepts any value of this type. Since the
+    /// canonical encoder sorts object keys but preserves array order
+    /// (`eliot-contracts::canonical_json_bytes`), two otherwise identical
+    /// evaluations whose `results` arrive in different orders would hash
+    /// differently, so exact replay would not be byte-stable. Refusing the
+    /// unordered shape here is what earns that property rather than inheriting it
+    /// from the constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank identity/revision, a malformed digest or
+    /// work scope, a non-positive observation time, an unvalidated State Fence or
+    /// an out-of-ladder proof ceiling; [`PortfolioError::Conflict`] for a stale
+    /// schema revision, an inverted currentness window, a result identity that
+    /// is not the identity this record's own commitments imply, or a `results`
+    /// sequence that is not in canonical order;
+    /// [`PortfolioError::Duplicate`] for a repeated member; and
+    /// [`PortfolioError::IncompleteDenominator`] for an empty result set.
+    fn validate_shape(&self) -> Result<(), PortfolioError> {
+        if self.schema_version != NO_MATCH_EVALUATION_SCHEMA_VERSION {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.schema_version",
+            });
+        }
+        text(&self.predicate_id, "no_match_evaluation.predicate_id")?;
+        text(
+            &self.predicate_revision,
+            "no_match_evaluation.predicate_revision",
+        )?;
+        text(&self.predicate_form, "no_match_evaluation.predicate_form")?;
+        text(&self.issuer_id, "no_match_evaluation.issuer_id")?;
+        text(&self.evaluator_id, "no_match_evaluation.evaluator_id")?;
+        text(
+            &self.evaluator_revision,
+            "no_match_evaluation.evaluator_revision",
+        )?;
+        text(
+            &self.admission_receipt_id,
+            "no_match_evaluation.admission_receipt_id",
+        )?;
+        self.fence.validate().map_err(|_| PortfolioError::Blank {
+            field: "no_match_evaluation.fence",
+        })?;
+        text(&self.work_scope, "no_match_evaluation.work_scope")?;
+        reject_vague(&self.work_scope, "no_match_evaluation.work_scope")?;
+        digest(&self.scope_digest, "no_match_evaluation.scope_digest")?;
+        text(&self.scope_revision, "no_match_evaluation.scope_revision")?;
+        digest(
+            &self.denominator_digest,
+            "no_match_evaluation.denominator_digest",
+        )?;
+        digest(&self.manifest_digest, "no_match_evaluation.manifest_digest")?;
+        text(&self.index_revision, "no_match_evaluation.index_revision")?;
+        text(&self.source_revision, "no_match_evaluation.source_revision")?;
+        if self.observed_at_ms <= 0 {
+            return Err(PortfolioError::Blank {
+                field: "no_match_evaluation.observed_at_ms",
+            });
+        }
+        if self.current_until_ms < self.observed_at_ms {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.current_until_ms",
+            });
+        }
+        if self.results.is_empty() {
+            return Err(PortfolioError::IncompleteDenominator {
+                field: "no_match_evaluation.results",
+            });
+        }
+        let predicate_digest = self.predicate_digest();
+        // Canonical order is a shape requirement, not a convenience of the
+        // constructor: `results` is public, `derive` accepts any value of this
+        // type, and the canonical encoder keeps array order, so an unordered
+        // sequence is refused here rather than hashed into a second identity for
+        // the same evaluation. A strictly *decreasing* pair is the shape check; an
+        // adjacent equal pair is not, so a repeated member still falls through to
+        // the duplicate check below and keeps reporting `Duplicate` rather than
+        // being reported here as an ordering conflict.
+        if self
+            .results
+            .windows(2)
+            .any(|pair| pair[0].canonical_order(&pair[1]).is_gt())
+        {
+            return Err(PortfolioError::Conflict {
+                field: "no_match_evaluation.results",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for result in &self.results {
+            text(&result.member, "no_match_result.member")?;
+            digest(&result.record_digest, "no_match_result.record_digest")?;
+            digest(&result.content_digest, "no_match_result.content_digest")?;
+            digest(&result.result_identity, "no_match_result.result_identity")?;
+            let expected = Self::result_identity(
+                &predicate_digest,
+                &result.member,
+                &result.record_digest,
+                &result.content_digest,
+                &self.index_revision,
+                &self.source_revision,
+            );
+            if result.result_identity != expected {
+                return Err(PortfolioError::Conflict {
+                    field: "no_match_result.result_identity",
+                });
+            }
+            if !seen.insert(result.member.as_str()) {
+                return Err(PortfolioError::Duplicate {
+                    field: "no_match_result.member",
+                });
+            }
+        }
+        if let Some(ceiling) = self.proof_ceiling_grade {
+            grade_name(ceiling)?;
+        }
+        Ok(())
+    }
+
+    /// Deterministic canonical bytes of the whole owner-issued record, with the
+    /// stored digest excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the record cannot be encoded.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PortfolioError> {
+        canonical_json_bytes(&NoMatchEvaluationDigestInput {
+            domain: NO_MATCH_EVALUATION_DIGEST_DOMAIN,
+            evaluation: self,
+        })
+        .map_err(|_| PortfolioError::Unencodable {
+            field: "no_match_evaluation.canonical_body",
+        })
+    }
+
+    /// Canonical digest recomputed from this value's own fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the record cannot be encoded.
+    pub fn canonical_digest(&self) -> Result<String, PortfolioError> {
+        Ok(sha256_hex(&self.canonical_bytes()?))
+    }
+
+    /// Recomputes the canonical digest and compares it with the frozen one.
+    ///
+    /// This is a self-consistency check, not a provenance check, and it is worth
+    /// being exact about which one it is. It catches a *partial* rewrite — a
+    /// record whose predicate, member result, source revision, evaluator
+    /// evidence, fence, scope or ceiling was edited while `digest` was left
+    /// alone. It does not and cannot catch a caller who recomputes `digest` to
+    /// match the edited bytes, because `digest` is a public field and the
+    /// recomputation is over exactly those bytes: a self-consistent rewrite
+    /// verifies against itself, and no reference outside this value exists to
+    /// say otherwise. What it establishes is that the value in hand is the value
+    /// its own bytes describe; what it cannot establish is that any issuer ever
+    /// issued it. See the limitation note on [`NoMatchEvaluation`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortfolioError::Unencodable`] when the record cannot be encoded
+    /// and [`PortfolioError::InvalidDigest`] when the recomputation disagrees.
+    pub fn verify_integrity(&self) -> Result<(), PortfolioError> {
+        if self.canonical_digest()? != self.digest {
+            return Err(PortfolioError::InvalidDigest {
+                field: "no_match_evaluation.digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A member the accounting closed but that cannot support an exact negative:
+/// it carries no acquired source handle, so no vetted record can be joined to it.
+pub const INCOMPATIBLE_MISSING_HANDLE: &str = "missing_acquired_handle";
+/// A closing member names a handle for which no vetted record was supplied.
+pub const INCOMPATIBLE_MISSING_RECORD: &str = "missing_vetted_record";
+/// The record found under the handle is not itself that handle, so the accounting
+/// handle and the record identity are not bound to each other.
+pub const INCOMPATIBLE_SUBSTITUTED_RECORD: &str = "record_handle_mismatch";
+/// A closing member carries no owner-issued per-member predicate result.
+pub const INCOMPATIBLE_RESULT_MISSING: &str = "no_predicate_result";
+/// The result's record commitment is not the recomputed commitment of the vetted
+/// record the accounting closed with.
+pub const INCOMPATIBLE_RESULT_RECORD_MISMATCH: &str = "result_record_digest_mismatch";
+/// The result names content bytes the vetted record does not carry.
+pub const INCOMPATIBLE_RESULT_CONTENT_MISMATCH: &str = "result_content_digest_mismatch";
+/// The vetted record is past its frozen freshness boundary at assessment time.
+pub const INCOMPATIBLE_RECORD_STALE: &str = "record_stale_at_assessment";
+/// No authorized manifest was presented to cover the frozen members.
+pub const INCOMPATIBLE_MANIFEST_ABSENT: &str = "no_authorized_manifest";
+/// The authorized manifest does not allowlist the member's handle.
+pub const INCOMPATIBLE_MANIFEST_REVOKED: &str = "handle_not_allowed_by_manifest";
+/// The authorized manifest does not commit the exact record the accounting closed
+/// with.
+pub const INCOMPATIBLE_MANIFEST_UNBOUND: &str = "manifest_does_not_bind_record";
+/// The authorized manifest presented is not the manifest, revision and denominator
+/// the evaluation claims to have run under.
+pub const INCOMPATIBLE_MANIFEST_MISMATCH: &str = "evaluation_manifest_mismatch";
+/// The evaluation was observed before the record it claims to have read was
+/// retrieved, so it cannot have read those bytes.
+pub const INCOMPATIBLE_EVALUATION_PRECEDES_RECORD: &str = "evaluation_predates_record";
+/// The evaluation's owner-recorded observation time is later than the assessment
+/// time, so its currentness is not established.
+///
+/// This is a route-level condition, not a per-member one: the clock is a property
+/// of the evaluation, so every closed member is affected identically.
+/// [`AbsencePreconditions::derive`] retains it once and [`assess_absence`]
+/// refuses on it as a route, rather than stamping it onto each member and
+/// inflating a per-member count with one fault.
+pub const INCOMPATIBLE_EVALUATION_NOT_OBSERVED: &str = "evaluation_observed_in_future";
+/// The assessment time is past the owner-declared currentness bound of the
+/// evaluation.
+///
+/// Route-level for the same reason as
+/// [`INCOMPATIBLE_EVALUATION_NOT_OBSERVED`]: one clock bound, one refusal.
+pub const INCOMPATIBLE_EVALUATION_EXPIRED: &str = "evaluation_expired_at_assessment";
 
 /// The owner-bound preconditions one exact negative claim is assessed against.
 ///
 /// Every field is derived from the exact coverage accounting, the vetted source
-/// records behind it and the frozen scope snapshot the claim is scoped to, and
-/// every field is private: a precondition set can only be produced by
-/// [`AbsencePreconditions::derive`] over a real [`CoverageAccount`], never
-/// written by a caller. [`assess_absence`] then re-proves the digest before it
-/// reads any of the content and re-checks the bound account digest against the
-/// account it is handed, so a set that was not derived over that account is
-/// refused instead of believed. A caller supplies evidence and never a verdict.
+/// records behind it, the frozen scope snapshot the claim is scoped to, the
+/// authorized manifest covering the frozen members and the owner-issued
+/// [`NoMatchEvaluation`], and every field is private: a precondition set can only
+/// be produced by [`AbsencePreconditions::derive`] over a real
+/// [`CoverageAccount`], never written by a caller. [`assess_absence`] then
+/// re-proves the digest before it reads any of the content and re-checks the
+/// bound account digest against the account it is handed, so a set that was not
+/// derived over that account is refused instead of believed. A caller supplies
+/// evidence and derives a precondition set from it; it never writes one.
+///
+/// "Owner-bound" here means every field traces to a supplied input that was
+/// itself re-proved or cross-checked — it does **not** mean any supplied input was
+/// authorized by an owner. The records, the manifest and the clock are the
+/// caller's; see the limitation note on [`NoMatchEvaluation`].
 ///
 /// The record names which precondition is unmet through the bounded reason
 /// [`AbsenceVerdict::Unproven`] retains, and its digest binds the preconditions
-/// to that exact evidence.
+/// to that exact evidence, including which manifest authorised it. Its identity
+/// domain is `absence-preconditions/v2`: `v1` proved only record staleness,
+/// admitted a closing member with no handle, no record, a substituted handle or
+/// no authorized manifest, and bound a caller-authored member list in place of a
+/// result identity. The field set and the bytes both changed, so the domain says
+/// so.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbsencePreconditions {
     /// Digest of the frozen scope snapshot the claim is scoped to.
@@ -1803,20 +2563,50 @@ pub struct AbsencePreconditions {
     /// Declared members carrying an explicit exclusion. An exclusion is not a
     /// successful search, so an excluded member can never support a negative.
     excluded: Vec<String>,
-    /// Closed members whose source or index is no longer current.
-    incompatible: Vec<String>,
-    /// Declared members the accounting closed intact.
+    /// Members the accounting closed but whose join to a current, owner-issued
+    /// predicate result over the exact record behind them is incomplete, each
+    /// paired with the specific unmet join. Every reason is one of the per-member
+    /// `INCOMPATIBLE_*` constants: a reason here always names a fact about
+    /// *this member*, never a fact about the route as a whole.
+    incompatible: Vec<(String, &'static str)>,
+    /// Route-level conditions the bound evaluation does not meet, in the order
+    /// [`AbsencePreconditions::derive`] checks them. These are facts about the
+    /// evaluation as a whole rather than about any member, so they are retained
+    /// here and refused once, instead of being stamped onto every closed member
+    /// and inflating a per-member count with one fault.
+    route_incompatible: Vec<&'static str>,
+    /// Declared members the accounting closed *and* whose join to a compatible
+    /// vetted record, authorized manifest and owner-issued result is complete.
+    ///
+    /// This is strictly smaller than "the members a closing disposition closed":
+    /// a member whose record is stale, absent or substituted reaches
+    /// [`Self::incompatible`] and is **not** counted here. [`Self::closed_by_account`]
+    /// carries the disposition-only count so nothing has to infer one from the
+    /// other.
     closed: Vec<String>,
-    /// Candidates observed outside the frozen scope. They are counted so an
-    /// empty eligible set stays distinguishable from an enumeration that never
-    /// ran; they close no member and narrow no denominator.
+    /// Declared members a closing disposition closed, before the join above is
+    /// applied. Retained separately so a route-level reason can report how many
+    /// members the accounting closed without over-reporting the post-join count.
+    closed_by_account: usize,
+    /// Digest of the authorized manifest the preconditions were derived against,
+    /// or `None` when the route presented none. Bound into the preconditions
+    /// digest so the retained set records *which* manifest authorised it rather
+    /// than only the member classification that manifest happened to produce.
+    manifest_digest: Option<String>,
+    /// Weakest grade rank over the vetted records behind [`Self::closed`];
+    /// `None` when any of them carries no grade, which is unknown rather than
+    /// unrestricted.
+    closed_grade_ceiling: Option<u8>,
+    /// Candidates observed outside the frozen scope. They are counted so an empty
+    /// eligible set stays distinguishable from an enumeration that never ran; they
+    /// close no member and narrow no denominator.
     observed_outside_scope: usize,
     /// Frontier where a bounded enumeration stopped, when one applied.
     frontier: Option<String>,
     /// The bounded predicate evaluation bound to the requested query, when one
-    /// exists. The research plane records acquisition dispositions, not
-    /// per-member query predicate results, so an inquiry record binds none and
-    /// the negative stays unproven.
+    /// exists. The research plane records acquisition dispositions, not per-member
+    /// query predicate results, so an inquiry record binds none and the negative
+    /// stays unproven.
     evaluation: Option<NoMatchEvaluation>,
     /// Digest over the preconditions.
     digest: String,
@@ -1824,61 +2614,173 @@ pub struct AbsencePreconditions {
 
 impl AbsencePreconditions {
     /// Derives the preconditions of one exact negative claim from the exact
-    /// accounting, the vetted records behind it and the frozen snapshot.
+    /// accounting, the vetted records behind it, the authorized manifest covering
+    /// them, the frozen snapshot and the owner-issued evaluation.
+    ///
+    /// A closing member reaches [`Self::closed`] only when every join below
+    /// holds, and otherwise lands in [`Self::incompatible`] carrying the specific
+    /// reason, in this order: an acquired handle exists; a vetted record exists
+    /// under it; that record carries the same handle; an owner-issued per-member
+    /// result exists; that result's record commitment is the recomputed commitment
+    /// of that record; that result's content digest is that record's content
+    /// digest; the record is current at `now_ms`; an authorized manifest was
+    /// presented; that manifest is the one the evaluation names; it allowlists the
+    /// handle; it binds the exact record; and the evaluation was observed no
+    /// earlier than the record was retrieved. All twelve are facts about one
+    /// member.
+    ///
+    /// Which of them need an evaluation is not "from here on": the per-member
+    /// result joins and the manifest joins apply only when the route bound an
+    /// evaluation, while the handle, record, handle-match and record-currentness
+    /// joins apply either way. A route that binds no evaluation therefore still
+    /// refuses a member with no handle, no record, a substituted handle or a
+    /// stale record, and closes its members on the accounting and the records
+    /// alone. Two further conditions — the evaluation observed after `now_ms`, and
+    /// the evaluation expired at `now_ms` — are facts about the evaluation rather
+    /// than about any member, so they are retained once in
+    /// [`Self::route_incompatible`] and not per member.
+    ///
+    /// A presented manifest is read back before any of its content is used, so a
+    /// manifest whose stored digest never matched its own fields cannot
+    /// authorise anything here.
+    ///
+    /// The owner's clock and the caller's `now_ms` are checked against each other
+    /// rather than either alone: the evaluation carries its own observation time
+    /// and currentness bound, its observation time must be at or after every joined
+    /// record's retrieval time and at or before `now_ms`, and `now_ms` must be at
+    /// or before that currentness bound.
+    ///
+    /// # What this does not establish
+    ///
+    /// `records`, `manifest` and `now_ms` are all parameters here, and nothing in
+    /// this function verifies that the records were acquired, that the manifest
+    /// was authorized by anything, or that the clock is the owner's. See the
+    /// limitation note on [`NoMatchEvaluation`].
     ///
     /// # Errors
     ///
-    /// Returns a digest or field error for a malformed frozen-scope digest or a
-    /// malformed evaluation binding, and
-    /// [`PortfolioError::IncompleteDenominator`] for an evaluation that names
-    /// no member, which no closed population produces.
+    /// Returns a digest, field or grade error for a malformed frozen-scope digest,
+    /// manifest or evaluation, [`PortfolioError::InvalidDigest`] when a supplied
+    /// manifest or evaluation no longer re-proves its own identity,
+    /// [`PortfolioError::Conflict`] when a result identity is not the identity its
+    /// own commitments imply or when a result names a member the accounting never
+    /// closed, and [`PortfolioError::IncompleteDenominator`] for an evaluation
+    /// that names no member, which no closed population produces.
     pub fn derive(
         account: &CoverageAccount,
         records: &BTreeMap<String, SourceRecord>,
+        manifest: Option<&AuthorizedManifest>,
         now_ms: i64,
         frozen_scope_digest: &str,
         evaluation: Option<NoMatchEvaluation>,
     ) -> Result<Self, PortfolioError> {
         digest(frozen_scope_digest, "absence.frozen_scope_digest")?;
-        let mut unclosed: Vec<(String, &'static str)> = Vec::new();
-        let mut closed: Vec<String> = Vec::new();
-        let mut incompatible: Vec<String> = Vec::new();
-        for (member, (disposition, handle)) in &account.outcomes {
-            if disposition.closes_member() {
-                closed.push(member.clone());
-                let stale = handle.as_ref().is_some_and(|handle| {
-                    records
-                        .get(handle)
-                        .is_some_and(|record| record.is_stale_at(now_ms))
-                });
-                if stale {
-                    incompatible.push(member.clone());
-                }
-            } else {
-                unclosed.push((member.clone(), disposition.wire_name()));
-            }
+        // The manifest is read back on the same footing as the evaluation. Without
+        // this, a caller could present a manifest whose stored `digest` never
+        // matched its own content, set `evaluation.manifest_digest` to that
+        // string, and every manifest join below would be measured against
+        // content nobody froze. `AuthorizedManifest::verify_integrity` exists and
+        // was not being called from the absence path; it is now.
+        if let Some(admitted) = manifest {
+            admitted.verify_integrity()?;
         }
-        let evaluation = match evaluation {
-            Some(mut evaluation) => {
-                text(&evaluation.predicate_id, "absence.predicate_id")?;
-                text(&evaluation.index_revision, "absence.index_revision")?;
-                digest(
-                    &evaluation.frozen_scope_digest,
-                    "absence.evaluation_frozen_scope_digest",
-                )?;
-                if evaluation.no_match_members.is_empty() {
-                    return Err(PortfolioError::IncompleteDenominator {
-                        field: "absence.no_match_members",
+        if let Some(evaluation) = &evaluation {
+            // Readback first: a record rewritten after it was issued is refused
+            // before any of its content is believed, let alone joined.
+            evaluation.verify_integrity()?;
+            evaluation.validate_shape()?;
+            // A no-match verdict over a member the accounting never closed is the
+            // evaluator contradicting the run's own accounting, not a gap to
+            // retain, so it is refused here rather than becoming a partition entry.
+            for result in &evaluation.results {
+                let closed_by_account = account
+                    .outcomes
+                    .get(&result.member)
+                    .is_some_and(|(disposition, _)| disposition.closes_member());
+                if !closed_by_account {
+                    return Err(PortfolioError::Conflict {
+                        field: "no_match_result.member",
                     });
                 }
-                for member in &evaluation.no_match_members {
-                    text(member, "absence.no_match_member")?;
-                }
-                evaluation.no_match_members.sort();
-                evaluation.no_match_members.dedup();
-                Some(evaluation)
             }
-            None => None,
+        }
+        let binding = AbsenceJoinBinding::of(manifest, evaluation.as_ref(), now_ms);
+        let results: BTreeMap<&str, &MemberNoMatchResult> = evaluation
+            .as_ref()
+            .map(|evaluation| {
+                evaluation
+                    .results
+                    .iter()
+                    .map(|result| (result.member.as_str(), result))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut unclosed: Vec<(String, &'static str)> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        let mut incompatible: Vec<(String, &'static str)> = Vec::new();
+        let mut closed_grades: Vec<Option<u8>> = Vec::new();
+        // Counted before the join, not after: `closed` below is the post-join set
+        // and is strictly smaller, so the disposition-only count has to be taken
+        // here or not at all.
+        let mut closed_by_account = 0usize;
+        for (member, (disposition, handle)) in &account.outcomes {
+            if !disposition.closes_member() {
+                unclosed.push((member.clone(), disposition.wire_name()));
+                continue;
+            }
+            closed_by_account += 1;
+            let record = handle
+                .as_ref()
+                .and_then(|handle| records.get(handle.as_str()));
+            let reason = member_join_reason(
+                handle.as_ref(),
+                record,
+                results.get(member.as_str()).copied(),
+                &binding,
+            )?;
+            // Declared behaviour change relative to the pre-#2893 ladder, and the
+            // whole point of the defect-B fix: a member reaching `incompatible`
+            // no longer also lands in `closed`. Before, a stale record was pushed
+            // to both and `closed` was therefore "the members a closing
+            // disposition closed"; it is now "…whose join also completed", so it
+            // is strictly smaller. Nothing outside this crate reads the field —
+            // it is private and `assess_absence` only compares it against the
+            // evaluation's own member list — but the boundary moved, and
+            // `closed_by_account` above exists so no caller of the retained
+            // reason has to rediscover the old count from the new one.
+            if let Some(reason) = reason {
+                incompatible.push((member.clone(), reason));
+            } else {
+                closed.push(member.clone());
+                if let Some(record) = record {
+                    closed_grades.push(record.grade);
+                }
+            }
+        }
+        // The two evaluation-clock conditions are route-level, not per-member, so
+        // they are retained once here instead of being stamped onto every closed
+        // member by `member_join_reason`. Reporting them per member made one
+        // clock fault read as N record faults and inflated the per-member count
+        // the reason prints. Order is the order they are checked in.
+        let mut route_incompatible: Vec<&'static str> = Vec::new();
+        if binding.evaluation_bound {
+            if binding.observed_in_future() {
+                route_incompatible.push(INCOMPATIBLE_EVALUATION_NOT_OBSERVED);
+            }
+            if binding.expired() {
+                route_incompatible.push(INCOMPATIBLE_EVALUATION_EXPIRED);
+            }
+        }
+        // Weakest-link ceiling over the grades of the records behind the closed
+        // members: a member with no grade poisons the result to unknown. The rule
+        // itself is not restated here — `weakest_ceiling` is the crate's single
+        // owner for it — and a closed set with no member behind it is `unknown`
+        // rather than the strongest grade, because `weakest_ceiling` refuses an
+        // empty input and that refusal is answered conservatively.
+        let closed_grade_ceiling = if closed_grades.is_empty() {
+            None
+        } else {
+            weakest_ceiling(&closed_grades)?
         };
         let mut preconditions = Self {
             frozen_scope_digest: frozen_scope_digest.to_owned(),
@@ -1887,7 +2789,11 @@ impl AbsencePreconditions {
             unclosed,
             excluded: account.exclusions.keys().cloned().collect(),
             incompatible,
+            route_incompatible,
             closed,
+            closed_by_account,
+            manifest_digest: manifest.map(|admitted| admitted.digest.clone()),
+            closed_grade_ceiling,
             observed_outside_scope: account.observed.len(),
             frontier: account.frontier.clone(),
             evaluation,
@@ -1898,7 +2804,7 @@ impl AbsencePreconditions {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("absence-preconditions/v1;");
+        let mut preimage = String::from("absence-preconditions/v2;");
         push_field(
             &mut preimage,
             "frozen_scope_digest",
@@ -1908,19 +2814,52 @@ impl AbsencePreconditions {
         for (tag, members) in [
             ("unexamined", &self.unexamined),
             ("excluded", &self.excluded),
-            ("incompatible", &self.incompatible),
-            ("closed", &self.closed),
         ] {
             push_count(&mut preimage, tag, members.len());
             for member in members {
                 push_field(&mut preimage, tag, member);
             }
         }
+        push_count(&mut preimage, "incompatible", self.incompatible.len());
+        for (member, reason) in &self.incompatible {
+            push_field(&mut preimage, "incompatible_member", member);
+            push_field(&mut preimage, "incompatible_reason", reason);
+        }
+        push_count(
+            &mut preimage,
+            "route_incompatible",
+            self.route_incompatible.len(),
+        );
+        for reason in &self.route_incompatible {
+            push_field(&mut preimage, "route_incompatible_reason", reason);
+        }
+        push_count(&mut preimage, "closed", self.closed.len());
+        for member in &self.closed {
+            push_field(&mut preimage, "closed", member);
+        }
+        // The disposition-only count is bound alongside the post-join set above,
+        // so a preconditions set records both and a reader never has to infer the
+        // first from the second.
+        push_count(&mut preimage, "closed_by_account", self.closed_by_account);
+        // Which manifest authorised this set, bound as an identity in its own
+        // right. It used to reach the digest only through the member
+        // classification it happened to produce, so two derivations that agreed on
+        // every member but were checked against different manifests were
+        // indistinguishable in the retained record.
+        match &self.manifest_digest {
+            Some(digest) => push_field(&mut preimage, "manifest", digest),
+            None => push_field(&mut preimage, "manifest", "absent"),
+        }
         push_count(&mut preimage, "unclosed", self.unclosed.len());
         for (member, disposition) in &self.unclosed {
             push_field(&mut preimage, "unclosed_member", member);
             push_field(&mut preimage, "unclosed_disposition", disposition);
         }
+        let grade_ceiling = match self.closed_grade_ceiling {
+            Some(ceiling) => ceiling.to_string(),
+            None => "unknown".to_owned(),
+        };
+        push_field(&mut preimage, "closed_grade_ceiling", &grade_ceiling);
         push_count(
             &mut preimage,
             "observed_outside_scope",
@@ -1930,143 +2869,629 @@ impl AbsencePreconditions {
             push_field(&mut preimage, "frontier", frontier);
         }
         match &self.evaluation {
-            Some(evaluation) => {
-                push_field(&mut preimage, "predicate_id", &evaluation.predicate_id);
-                push_field(
-                    &mut preimage,
-                    "evaluation_frozen_scope_digest",
-                    &evaluation.frozen_scope_digest,
-                );
-                push_field(&mut preimage, "index_revision", &evaluation.index_revision);
-                push_count(
-                    &mut preimage,
-                    "no_match_members",
-                    evaluation.no_match_members.len(),
-                );
-                for member in &evaluation.no_match_members {
-                    push_field(&mut preimage, "no_match_member", member);
-                }
-            }
+            // The whole owner-issued record is bound by its own frozen digest
+            // rather than re-spelled field by field here, so this set cannot
+            // disagree with the record it was derived from and a new evaluation
+            // field is picked up without a second field list that could drift from
+            // the record's own identity.
+            Some(evaluation) => push_field(&mut preimage, "evaluation", &evaluation.digest),
             None => push_field(&mut preimage, "evaluation", "absent"),
         }
         freeze(&preimage)
     }
 }
 
+/// The route-level facts every member join is measured against.
+///
+/// [`AbsencePreconditions::derive`] computes these once from what the route
+/// presented, so classifying one member takes that member's handle, the record it
+/// resolves to and the result issued for it, plus one reference to this binding;
+/// the two route-level evaluation-clock conditions are read off the same binding
+/// rather than recomputed per member. The alternative — spelling all six route
+/// facts as a parameter list at the call site — is exactly the transposition
+/// hazard the named-argument discipline elsewhere in this module exists to
+/// remove.
+struct AbsenceJoinBinding<'a> {
+    /// Authorized manifest covering the frozen members, when one was presented.
+    manifest: Option<&'a AuthorizedManifest>,
+    /// Whether that manifest is the manifest, revision and denominator the bound
+    /// evaluation claims to have run under. Vacuously true when no evaluation was
+    /// bound, because no manifest check applies to a route that binds none.
+    manifest_binding: bool,
+    /// Whether a bounded predicate evaluation was bound at all. Every
+    /// per-member-result and manifest join applies only when one was, so a
+    /// research-plane route that binds none keeps naming its accounting facts
+    /// rather than a per-member result gap.
+    evaluation_bound: bool,
+    /// Owner-recorded observation time of the bound evaluation; zero when none.
+    observed_at_ms: i64,
+    /// Owner-declared currentness bound of the bound evaluation; zero when none.
+    current_until_ms: i64,
+    /// The caller's assessment time.
+    now_ms: i64,
+}
+
+impl<'a> AbsenceJoinBinding<'a> {
+    /// The binding one presented manifest and bound evaluation establish.
+    fn of(
+        manifest: Option<&'a AuthorizedManifest>,
+        evaluation: Option<&NoMatchEvaluation>,
+        now_ms: i64,
+    ) -> Self {
+        let manifest_binding = match (manifest, evaluation) {
+            (Some(admitted), Some(evaluation)) => {
+                evaluation.manifest_digest == admitted.digest
+                    && evaluation.manifest_revision == admitted.revision
+                    && evaluation.denominator_digest == admitted.denominator_digest
+            }
+            // An evaluation with no manifest presented is not covered by one; the
+            // per-member check names that as its own reason.
+            (None, Some(_)) => false,
+            (_, None) => true,
+        };
+        Self {
+            manifest,
+            manifest_binding,
+            evaluation_bound: evaluation.is_some(),
+            observed_at_ms: evaluation.map_or(0, |evaluation| evaluation.observed_at_ms),
+            current_until_ms: evaluation.map_or(0, |evaluation| evaluation.current_until_ms),
+            now_ms,
+        }
+    }
+
+    /// Whether the evaluation was observed earlier than the record it claims to
+    /// have read was retrieved, so it cannot have read those bytes.
+    fn predates_record(&self, record: &SourceRecord) -> bool {
+        record
+            .retrieved_ms
+            .is_some_and(|retrieved| retrieved > self.observed_at_ms)
+    }
+
+    /// Whether the evaluation's owner-recorded observation time is later than the
+    /// assessment time, so its currentness is not established.
+    fn observed_in_future(&self) -> bool {
+        self.observed_at_ms > self.now_ms
+    }
+
+    /// Whether the assessment time is past the evaluation's owner-declared
+    /// currentness bound.
+    fn expired(&self) -> bool {
+        self.now_ms > self.current_until_ms
+    }
+}
+
+/// The one ordered join that refuses a closing member, or `None` when every join
+/// holds.
+///
+/// The order is the one [`AbsencePreconditions::derive`] documents, and it is
+/// load-bearing: a member that fails several joins at once is reported under its
+/// earliest unmet one, so the retained reason is the first thing that would have
+/// to be repaired.
+///
+/// Every reason this function can return is a fact about *this member*. The two
+/// evaluation-clock conditions are facts about the route, so they are not
+/// computed here: [`AbsencePreconditions::derive`] retains them once in
+/// `route_incompatible` and [`assess_absence`] refuses on them as a route. What
+/// that leaves is a precise statement about which joins are gated: the
+/// per-member-result joins (result present, record commitment, content digest)
+/// and the manifest joins apply only when the route bound an evaluation, while
+/// the first three joins and the record-currentness join do **not** — a handle,
+/// a record, a matching handle and a non-stale record are properties of the
+/// accounting and the records, and a route that binds no evaluation still
+/// reaches `None` and closes its members on those alone. This is the same
+/// scoping [`AbsenceJoinBinding::evaluation_bound`] states.
+///
+/// # Errors
+///
+/// Returns the joined record's own digest error when its canonical commitment
+/// cannot be recomputed. That is the error the comparison itself raises, and it
+/// is a malformed record rather than a refused negative, so it is not one of the
+/// `INCOMPATIBLE_*` reasons.
+fn member_join_reason(
+    handle: Option<&String>,
+    record: Option<&SourceRecord>,
+    result: Option<&MemberNoMatchResult>,
+    binding: &AbsenceJoinBinding<'_>,
+) -> Result<Option<&'static str>, PortfolioError> {
+    Ok(match (handle, record, result) {
+        (None, _, _) => Some(INCOMPATIBLE_MISSING_HANDLE),
+        (Some(_), None, _) => Some(INCOMPATIBLE_MISSING_RECORD),
+        (Some(handle), Some(record), _) if record.handle != *handle => {
+            Some(INCOMPATIBLE_SUBSTITUTED_RECORD)
+        }
+        (_, _, None) if binding.evaluation_bound => Some(INCOMPATIBLE_RESULT_MISSING),
+        (_, Some(record), Some(result)) if result.record_digest != record.digest()? => {
+            Some(INCOMPATIBLE_RESULT_RECORD_MISMATCH)
+        }
+        (_, Some(record), Some(result)) if result.content_digest != record.content_digest => {
+            Some(INCOMPATIBLE_RESULT_CONTENT_MISMATCH)
+        }
+        (_, Some(record), _) if record.is_stale_at(binding.now_ms) => {
+            Some(INCOMPATIBLE_RECORD_STALE)
+        }
+        (_, _, _) if binding.evaluation_bound && binding.manifest.is_none() => {
+            Some(INCOMPATIBLE_MANIFEST_ABSENT)
+        }
+        (_, _, _) if binding.evaluation_bound && !binding.manifest_binding => {
+            Some(INCOMPATIBLE_MANIFEST_MISMATCH)
+        }
+        (_, _, _)
+            if binding.evaluation_bound
+                && !handle.is_some_and(|handle| {
+                    binding
+                        .manifest
+                        .is_some_and(|admitted| admitted.allows(handle))
+                }) =>
+        {
+            Some(INCOMPATIBLE_MANIFEST_REVOKED)
+        }
+        (_, Some(record), _)
+            if binding.evaluation_bound
+                && !binding
+                    .manifest
+                    .is_some_and(|admitted| admitted.binds_source_record(record)) =>
+        {
+            Some(INCOMPATIBLE_MANIFEST_UNBOUND)
+        }
+        (_, Some(record), _) if binding.evaluation_bound && binding.predates_record(record) => {
+            Some(INCOMPATIBLE_EVALUATION_PRECEDES_RECORD)
+        }
+        _ => None,
+    })
+}
+
 /// Assesses a scoped absence claim over owner-bound preconditions.
 ///
-/// Only a complete denominator, an exact accounting of every declared member,
-/// an intact source/index for each closed member, no exclusion and a bounded
-/// predicate evaluation over exactly the closed members proves absence. A
-/// bounded enumeration that stopped is partial exhaustion. Every rejected claim
-/// names the retained fact that rejected it, so no verdict rests on a
-/// caller-supplied flag.
+/// Only a complete denominator, an exact accounting of every declared member, an
+/// intact and currently-bound source record for each closed member under an
+/// authorized manifest that commits that exact record, an owner-issued per-member
+/// predicate result joined to that record and to the exact predicate and
+/// revisions, all five separately-established dimensions, a current (not
+/// historical) applicability, and a proof ceiling no stronger than the weakest
+/// closed member's grade, proves absence. A bounded enumeration that stopped is
+/// partial exhaustion. Every rejected claim names the retained fact that rejected
+/// it, so no verdict rests on a caller-supplied flag.
+///
+/// Package-level `Proven` is not publication authority, and it is not
+/// owner-bound either: it is the strongest statement this package can make about
+/// evidence the caller presented and the assessor was able to cross-check. The
+/// residual trust boundary is the records, the authorized manifest and `now_ms`,
+/// all three of which are parameters of
+/// [`AbsencePreconditions::derive`]; see the limitation note on
+/// [`NoMatchEvaluation`] for why no in-crate check can close it. The live
+/// composition owner does re-check the retained record: `coverage-receipt/v2`
+/// binds both this verdict's class and the reason it carries, and
+/// `InquiryGovernance::validate_integrity` re-checks that receipt digest against
+/// the evidence freeze and the terminal record. It does **not** re-run this
+/// assessment, and it cannot raise the verdict above the proof ceiling carried on
+/// the bound evaluation.
 ///
 /// `account` is the accounting the preconditions are claimed to describe. It is
 /// required so the preconditions cannot be re-bound to a different accounting
 /// than the one they were derived over, and it is the only trusted account the
-/// assessment has. A precondition set that does not re-prove its own digest, or
-/// whose bound account digest is not this account's, is refused as
-/// [`AbsenceVerdict::Unproven`] before any of its content is read: a claim that
-/// cannot be re-proved is not proved.
+/// assessment has. A precondition set that does not re-prove its own digest, whose
+/// bound account digest is not this account's, or whose bound evaluation no longer
+/// re-proves its own identity, is refused as [`AbsenceVerdict::Unproven`] before
+/// any of its content is read: a claim that cannot be re-proved is not proved.
+///
+/// # The ladder, and what is and is not enforced about it
+///
+/// The ladder below is a sequence of independent refusals, one per retained fact
+/// that can block the negative, in the order the retained fact is most
+/// fundamental. Each refusal names the fact it retains; none of them can be
+/// skipped, reordered or summarised by a caller, and reaching the end is the
+/// only way to [`AbsenceVerdict::Proven`].
+///
+/// Two things about it are worth knowing before editing.
+///
+/// *It is an `if let` chain, not a `match`.* Nothing about this order is
+/// compiler-enforced: the compiler has no way to prove any of these calls
+/// unreachable, so a reordering here compiles silently and changes which reason a
+/// given input retains. An `unreachable_patterns` error can be produced while
+/// *authoring* the ladder as a `match`, but the delivered form is this chain and
+/// the property does not survive it. Order is held by review and by the comments
+/// on each arm, not by the type system.
+///
+/// *Three arms are new relative to the pre-#2893 ladder, and they are inserted,
+/// not appended.* `rewritten_evaluation` sits third, ahead of every accounting
+/// fact, because a rewritten evaluation invalidates the content of every later
+/// arm. `historical_evaluation` and `unestablished_dimensions` sit between the
+/// scope check and the member-set check, so an evaluation that is both
+/// `Historical` and carries the wrong member set now reports the historical
+/// reason, where before there was no historical concept and the member-set
+/// mismatch was reported. The pre-existing arms keep their relative order among
+/// themselves.
 pub fn assess_absence(
     account: &CoverageAccount,
     preconditions: &AbsencePreconditions,
 ) -> AbsenceVerdict {
-    if preconditions.compute_digest() != preconditions.digest {
-        return AbsenceVerdict::Unproven {
-            reason: "absence: the preconditions do not re-prove their own digest, so this set is \
-                     not owner-bound evidence and proves nothing"
-                .to_owned(),
-        };
+    if let Some(verdict) = unreproved_preconditions(preconditions) {
+        return verdict;
     }
-    let account_digest = account.digest();
-    if preconditions.account_digest != account_digest {
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "absence: the preconditions are bound to coverage account {account_digest}, not to \
-                 the account presented with them, so the two cannot be swapped"
-            ),
-        };
+    if let Some(verdict) = rebound_account(preconditions, account) {
+        return verdict;
     }
-    if let Some(frontier) = &preconditions.frontier {
-        return AbsenceVerdict::PartialExhaustion {
-            frontier: frontier.clone(),
-        };
+    if let Some(verdict) = rewritten_evaluation(preconditions) {
+        return verdict;
     }
-    if !preconditions.unexamined.is_empty() {
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "coverage: {} declared denominator member(s) were never examined: {}",
-                preconditions.unexamined.len(),
-                preconditions.unexamined.join(",")
-            ),
-        };
+    if let Some(verdict) = unmet_route_conditions(preconditions) {
+        return verdict;
     }
-    if !preconditions.excluded.is_empty() {
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "coverage: an exclusion is not a successful search; {} member(s) were excluded: {}",
-                preconditions.excluded.len(),
-                preconditions.excluded.join(",")
-            ),
-        };
+    if let Some(verdict) = stopped_enumeration(preconditions) {
+        return verdict;
     }
-    if !preconditions.unclosed.is_empty() {
-        let unclosed = preconditions
-            .unclosed
-            .iter()
-            .map(|(member, disposition)| format!("{member}={disposition}"))
-            .collect::<Vec<String>>()
-            .join(",");
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "coverage: {} examined member(s) did not close their denominator slot: {unclosed}",
-                preconditions.unclosed.len()
-            ),
-        };
+    if let Some(verdict) = unexamined_members(preconditions) {
+        return verdict;
     }
-    if !preconditions.incompatible.is_empty() {
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "coverage: {} closed member(s) are no longer current for the frozen snapshot: {}",
-                preconditions.incompatible.len(),
-                preconditions.incompatible.join(",")
-            ),
-        };
+    if let Some(verdict) = excluded_members(preconditions) {
+        return verdict;
+    }
+    if let Some(verdict) = unclosed_members(preconditions) {
+        return verdict;
+    }
+    if let Some(verdict) = incompatible_members(preconditions) {
+        return verdict;
     }
     let Some(evaluation) = &preconditions.evaluation else {
         return AbsenceVerdict::Unproven {
-            reason: format!(
-                "absence: no bounded predicate evaluation is bound to the requested query over \
-                 frozen scope snapshot {}; accounting {} declared member(s) closed and observing \
-                 {} candidate(s) outside that scope does not prove the query has no match",
-                preconditions.frozen_scope_digest,
-                preconditions.closed.len(),
-                preconditions.observed_outside_scope
-            ),
+            reason: absent_evaluation_reason(preconditions),
         };
     };
-    if evaluation.frozen_scope_digest != preconditions.frozen_scope_digest {
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "absence: the predicate evaluation is bounded to frozen scope snapshot {}, not to {}",
-                evaluation.frozen_scope_digest, preconditions.frozen_scope_digest
-            ),
-        };
+    if let Some(verdict) = foreign_evaluation_scope(evaluation, preconditions) {
+        return verdict;
     }
-    if evaluation.no_match_members != preconditions.closed {
-        return AbsenceVerdict::Unproven {
-            reason: format!(
-                "absence: the predicate evaluation covers {} member(s) over index revision {}, \
-                 not the {} closed member(s) of the frozen denominator",
-                evaluation.no_match_members.len(),
-                evaluation.index_revision,
-                preconditions.closed.len()
-            ),
-        };
+    if let Some(verdict) = historical_evaluation(evaluation) {
+        return verdict;
+    }
+    if let Some(verdict) = unestablished_dimensions(evaluation) {
+        return verdict;
+    }
+    if let Some(verdict) = mismatched_evaluated_members(evaluation, preconditions) {
+        return verdict;
+    }
+    if let Some(verdict) = unchecked_proof_ceiling(evaluation, preconditions) {
+        return verdict;
     }
     AbsenceVerdict::Proven
+}
+
+/// Refuses a precondition set that no longer re-proves its own digest.
+///
+/// A set whose fields were rewritten after the freeze still validates field by
+/// field, so only a recomputation over the bytes actually present can say it is no
+/// longer the owner-bound evidence it claims to be.
+fn unreproved_preconditions(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if preconditions.compute_digest() == preconditions.digest {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: "absence: the preconditions do not re-prove their own digest, so this set is \
+                 not owner-bound evidence and proves nothing"
+            .to_owned(),
+    })
+}
+
+/// Refuses a precondition set bound to a different coverage account than the one
+/// presented with it.
+fn rebound_account(
+    preconditions: &AbsencePreconditions,
+    account: &CoverageAccount,
+) -> Option<AbsenceVerdict> {
+    let account_digest = account.digest();
+    if preconditions.account_digest == account_digest {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the preconditions are bound to coverage account {account_digest}, not to \
+             the account presented with them, so the two cannot be swapped"
+        ),
+    })
+}
+
+/// Refuses a bound predicate evaluation that no longer re-proves its own identity.
+///
+/// [`AbsencePreconditions::derive`] already refuses such a record, so reaching
+/// this means the evaluation was rewritten between derivation and assessment.
+fn rewritten_evaluation(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if let Some(evaluation) = &preconditions.evaluation
+        && evaluation.verify_integrity().is_err()
+    {
+        return Some(AbsenceVerdict::Unproven {
+            reason: "absence: the bound predicate evaluation does not re-prove its own identity, \
+                     so it is not the record the evaluator issued and proves nothing"
+                .to_owned(),
+        });
+    }
+    None
+}
+
+/// Refuses a bound evaluation whose own clock does not support a current claim.
+///
+/// These are route-level conditions, so they are reported once here rather than
+/// once per closed member. Retaining them per member made a single expired
+/// evaluation read as N expired records and printed a per-member count that was
+/// really counting one fault N times.
+fn unmet_route_conditions(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if preconditions.route_incompatible.is_empty() {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the bound predicate evaluation does not support a current claim, and the \
+             condition applies to the whole route rather than to any one member: {}",
+            preconditions.route_incompatible.join(",")
+        ),
+    })
+}
+
+/// Reports bounded exhaustion where a stopped enumeration left the negative
+/// partial rather than refused.
+fn stopped_enumeration(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    preconditions
+        .frontier
+        .as_ref()
+        .map(|frontier| AbsenceVerdict::PartialExhaustion {
+            frontier: frontier.clone(),
+        })
+}
+
+/// Refuses a denominator with declared members no run ever looked at.
+fn unexamined_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if preconditions.unexamined.is_empty() {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "coverage: {} declared denominator member(s) were never examined: {}",
+            preconditions.unexamined.len(),
+            preconditions.unexamined.join(",")
+        ),
+    })
+}
+
+/// Refuses a denominator holding an explicit exclusion, which is not a
+/// successful search.
+fn excluded_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if preconditions.excluded.is_empty() {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "coverage: an exclusion is not a successful search; {} member(s) were excluded: {}",
+            preconditions.excluded.len(),
+            preconditions.excluded.join(",")
+        ),
+    })
+}
+
+/// Refuses members whose disposition did not close their denominator slot.
+fn unclosed_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if preconditions.unclosed.is_empty() {
+        return None;
+    }
+    let unclosed = preconditions
+        .unclosed
+        .iter()
+        .map(|(member, disposition)| format!("{member}={disposition}"))
+        .collect::<Vec<String>>()
+        .join(",");
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "coverage: {} examined member(s) did not close their denominator slot: {unclosed}",
+            preconditions.unclosed.len()
+        ),
+    })
+}
+
+/// Refuses closed members that do not join to a current, owner-issued predicate
+/// result over the exact record behind them, naming each unmet join.
+///
+/// # Declared behaviour change
+///
+/// The reason text is **not** the pre-#2893 text and the count is **not** the
+/// pre-#2893 count. Before, this arm printed `"…are no longer current for the
+/// frozen snapshot: {}"` over a bare list of member names, because `incompatible`
+/// held names and a stale record was the only way into it. It now prints
+/// `member=reason` pairs, and `incompatible` can hold twelve distinct reasons
+/// rather than one. Both changes are required by the issue: Acceptance says a
+/// missing, substituted or stale record "blocks exact absence with the specific
+/// member and reason retained", which the old text could not express.
+///
+/// This arm is reached with a different population than before as well, for the
+/// same reason: a member with no handle, no record or a substituted handle used
+/// to reach the *absent-evaluation* arm instead, because it never entered
+/// `incompatible` at all. No test in this crate asserts this string, so treat it
+/// as unblessed by the suite: changing it is a visible change to every receipt
+/// that carries the reason, and it moves `coverage-receipt/v2`.
+fn incompatible_members(preconditions: &AbsencePreconditions) -> Option<AbsenceVerdict> {
+    if preconditions.incompatible.is_empty() {
+        return None;
+    }
+    let incompatible = preconditions
+        .incompatible
+        .iter()
+        .map(|(member, reason)| format!("{member}={reason}"))
+        .collect::<Vec<String>>()
+        .join(",");
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "coverage: {} closed member(s) do not join to a current, owner-issued predicate \
+             result over the exact record behind them: {incompatible}",
+            preconditions.incompatible.len()
+        ),
+    })
+}
+
+/// The retained fact behind a route that bound no bounded predicate evaluation.
+///
+/// This is the ordinary Researcher outcome rather than a defect: the research
+/// plane records per-source acquisition dispositions, not per-member query
+/// predicate results, and no ordinary route supplies an owner-issued evaluation
+/// for the requested query. The reason states that instead of implying the
+/// accounting was at fault.
+///
+/// The count is [`AbsencePreconditions::closed_by_account`], the
+/// disposition-only count, not `closed.len()`. `closed` is the post-join set and
+/// is strictly smaller, so printing it here would under-report how many members
+/// the accounting closed. The two are equal on exactly the inputs that reach
+/// this arm — the arm only fires when `incompatible` is empty, which forces
+/// `closed == closed_by_account` — but relying on that coincidence would be a
+/// trap for the next editor, so the count that means "declared closed" is
+/// carried explicitly.
+fn absent_evaluation_reason(preconditions: &AbsencePreconditions) -> String {
+    format!(
+        "absence: no bounded predicate evaluation is bound to the requested query over \
+         frozen scope snapshot {}; accounting {} declared member(s) closed and observing \
+         {} candidate(s) outside that scope does not prove the query has no match",
+        preconditions.frozen_scope_digest,
+        preconditions.closed_by_account,
+        preconditions.observed_outside_scope
+    )
+}
+
+/// Refuses an evaluation bounded to a different frozen scope snapshot than the
+/// one the claim is scoped to.
+fn foreign_evaluation_scope(
+    evaluation: &NoMatchEvaluation,
+    preconditions: &AbsencePreconditions,
+) -> Option<AbsenceVerdict> {
+    if evaluation.covers_scope(&preconditions.frozen_scope_digest) {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the predicate evaluation is bounded to frozen scope snapshot {}, not to {}",
+            evaluation.scope_digest, preconditions.frozen_scope_digest
+        ),
+    })
+}
+
+/// Refuses a historical evaluation, which grounds a claim about its own
+/// observation time only.
+fn historical_evaluation(evaluation: &NoMatchEvaluation) -> Option<AbsenceVerdict> {
+    if evaluation.applicability == NoMatchApplicability::Current {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the predicate evaluation is {} and grounds a claim about its observation \
+             time only, not a current scoped negative",
+            evaluation.applicability.wire_name()
+        ),
+    })
+}
+
+/// Refuses an evaluation that left any of the five separately-established facts
+/// unestablished, naming each missing dimension.
+fn unestablished_dimensions(evaluation: &NoMatchEvaluation) -> Option<AbsenceVerdict> {
+    let missing = evaluation.missing_dimensions();
+    if missing.is_empty() {
+        return None;
+    }
+    let named = missing
+        .iter()
+        .copied()
+        .map(|dimension| dimension.wire_name().to_owned())
+        .collect::<Vec<String>>()
+        .join(",");
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the predicate evaluation left {} of the five separately-established \
+             facts unestablished, and none substitutes for another: {named}",
+            missing.len()
+        ),
+    })
+}
+
+/// Refuses an evaluation whose owner-issued results cover a different member set
+/// than the closed members of the frozen denominator.
+///
+/// # Declared behaviour change
+///
+/// Two reasons the text differs from the pre-#2893 arm, both from this issue.
+///
+/// The wording changed: it was `"…covers {} member(s) over index revision {}…"`
+/// and now names the source revision too, because the evaluation carries one
+/// and a member-set mismatch is a statement about which run produced the
+/// results.
+///
+/// The *set it compares against* changed more quietly, and this is the part worth
+/// reading twice. `closed` used to hold every member a closing disposition
+/// closed, so a stale member was compared here as an ordinary closed member.
+/// It is now the post-join set, so a stale member is not in it and an evaluation
+/// that covered exactly the pre-#2893 `closed` set is now a mismatch. Every such
+/// input was already `Unproven` — the incompatibility arm runs first — so no
+/// input changes from `Proven` to `Unproven` or back. What changes is which
+/// reason a caller reads, and it moves `coverage-receipt/v2`. No test in this
+/// crate asserts this string.
+fn mismatched_evaluated_members(
+    evaluation: &NoMatchEvaluation,
+    preconditions: &AbsencePreconditions,
+) -> Option<AbsenceVerdict> {
+    let evaluated = evaluation.evaluated_members();
+    if evaluated == preconditions.closed {
+        return None;
+    }
+    Some(AbsenceVerdict::Unproven {
+        reason: format!(
+            "absence: the predicate evaluation carries an owner-issued result for {} member(s) \
+             over index revision {} and source revision {}, not the {} closed member(s) of the \
+             frozen denominator",
+            evaluated.len(),
+            evaluation.index_revision,
+            evaluation.source_revision,
+            preconditions.closed.len()
+        ),
+    })
+}
+
+/// Refuses a proof ceiling that cannot be checked against the weakest grade
+/// behind the closed members.
+///
+/// Three cases are refused and they are not interchangeable: an absent ceiling is
+/// unknown rather than unrestricted, a ceiling above the weakest record grade
+/// overclaims what the records carry, and a ceiling asserted while a record's
+/// grade is unknown cannot be compared at all.
+fn unchecked_proof_ceiling(
+    evaluation: &NoMatchEvaluation,
+    preconditions: &AbsencePreconditions,
+) -> Option<AbsenceVerdict> {
+    match (
+        evaluation.proof_ceiling_grade,
+        preconditions.closed_grade_ceiling,
+    ) {
+        (None, _) => Some(AbsenceVerdict::Unproven {
+            reason: "absence: the predicate evaluation declares no proof ceiling, and an \
+                     absent coverage ceiling is unknown rather than unrestricted"
+                .to_owned(),
+        }),
+        // The comparison is delegated to `check_ceiling`, the crate's single
+        // owner for the rule, rather than restated as `claimed > ceiling`. Both
+        // ranks are already on the canonical ladder by the time this runs —
+        // `validate_shape` calls `grade_name` on the claimed ceiling and
+        // `closed_grade_ceiling` is `weakest_ceiling` over record grades that
+        // `SourceRecord::new` validated the same way — so the only error
+        // `check_ceiling` can raise here is `CeilingViolation`, and treating any
+        // error as an overclaim here cannot misreport one as the other.
+        (Some(claimed), Some(ceiling)) if check_ceiling(claimed, ceiling).is_err() => {
+            Some(AbsenceVerdict::Unproven {
+                reason: format!(
+                    "absence: the predicate evaluation claims proof ceiling grade {claimed}, above \
+                     the weakest grade {ceiling} of the {} record(s) behind the closed members",
+                    preconditions.closed.len()
+                ),
+            })
+        }
+        (Some(_), Some(_)) => None,
+        (Some(claimed), None) => Some(AbsenceVerdict::Unproven {
+            reason: format!(
+                "absence: the predicate evaluation claims proof ceiling grade {claimed}, while \
+                 the grade of at least one record behind the closed members is unknown, so no \
+                 ceiling can be checked"
+            ),
+        }),
+    }
 }
 
 /// Structured precision kinds for already-structured claim/reference records.

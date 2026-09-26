@@ -2149,7 +2149,11 @@ impl CoverageReceipt {
     /// Returns [`InquiryError::IncompleteDenominator`] when the frozen
     /// denominator has no member to account, a field error for a vague
     /// scope or a malformed frozen-scope digest, and the absence-precondition
-    /// error when a bound predicate evaluation names no member.
+    /// error when a bound predicate evaluation names no member or no longer
+    /// re-proves its own identity. This route binds neither a bounded predicate
+    /// evaluation nor an authorized manifest, so the absence verdict it produces
+    /// can never be [`AbsenceVerdict::Proven`] and the receipt stays
+    /// fail-closed.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         profile: &InquiryProtocolProfile,
@@ -2185,12 +2189,17 @@ impl CoverageReceipt {
         // This plane records per-source acquisition dispositions, not per-member
         // query predicate results, and it holds no authoritative enumeration
         // attestation for the route. It therefore binds no bounded predicate
-        // evaluation here, and the absence assessment names the accounting facts
-        // that block the negative as its reason instead of resting on a
-        // caller-supplied flag.
+        // evaluation and no `AuthorizedManifest` here, and the absence assessment
+        // names the accounting facts that block the negative as its reason
+        // instead of resting on a caller-supplied flag. Both arguments are the
+        // fail-closed answer, not a placeholder: `AbsencePreconditions::derive`
+        // admits an owner-issued `NoMatchEvaluation` only when the live route
+        // supplies one, and #2893 forbids fabricating one here to complete the
+        // receipt.
         let absence_preconditions = AbsencePreconditions::derive(
             account,
             &vetted_records(records),
+            None,
             assessment_time_ms,
             frozen_scope_digest,
             None,
@@ -2241,7 +2250,23 @@ impl CoverageReceipt {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("coverage-receipt/v1;");
+        // Bumped `v1` -> `v2` by #2893, and the reason is that this preimage does
+        // not bind an identity, it binds a *reason string verbatim* (see the
+        // `absence_reason` push below). #2893 changed two of those strings and the
+        // population that reaches them, so for the same run this digest now
+        // produces a different value under one name — the exact defect the
+        // declared-domain rule exists to prevent. The preimage field set did not
+        // change; what changed is the value space of a field that was already
+        // there, which is the same reason `source-record/v1` -> `v2` was recorded.
+        //
+        // Transitively, `evidence-freeze/v1` and `inquiry-terminal-record/v1` bind
+        // this digest and therefore produce different values for the same run.
+        // Their own field sets and domains are unchanged and are deliberately not
+        // bumped: a domain names the shape of the record being hashed, and a
+        // changed value in a field they already declared is exactly the dependency
+        // behaving as declared, not a new shape. `research-debt/v1` is unaffected
+        // because its preimage never named the receipt digest.
+        let mut preimage = String::from("coverage-receipt/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
         push_field(&mut preimage, "requested_scope", &self.requested_scope);

@@ -24,7 +24,9 @@ use eliot_research_exchange_api::{
 // population the account learns, the owner-bound absence preconditions and the
 // verdict they produce. Referenced, never redefined here.
 pub use evidence_portfolio::{
-    AbsencePreconditions, AbsenceVerdict, ManifestSource, NoMatchEvaluation, ObservedOutsideScope,
+    AbsencePreconditions, AbsenceVerdict, ManifestSource, MemberNoMatchResult,
+    NoMatchApplicability, NoMatchDimension, NoMatchEvaluation, NoMatchEvaluationParams,
+    ObservedOutsideScope,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
