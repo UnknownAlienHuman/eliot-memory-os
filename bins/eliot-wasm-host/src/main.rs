@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write};
+use std::path::Path;
 
 use eliot_wasm_host::{
     CliError, PrototypeContourDecision, TypedWorld, admit_generation, admit_prototype,
@@ -95,8 +96,7 @@ fn main() {
         config.experimental_typed_component,
         config.experimental_world,
     ) {
-        run_experimental_describe(component_path, &world_name);
-        return;
+        run_experimental_describe(&component_path, &world_name);
     }
 
     // The live governed path: an owner-admitted delivery set is bound, the
@@ -177,7 +177,7 @@ fn main() {
 /// actually observed imports. A manifest using an undeclared import is
 /// rejected before any success receipt is emitted. This mode is separate
 /// from the governed lane and never stands in for it.
-fn run_experimental_describe(component_path: &str, world_name: &str) -> ! {
+fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
     let Some(world) = TypedWorld::parse(world_name) else {
         emit_error("UNKNOWN_WORLD", world_name);
         std::process::exit(INVALID_ARGUMENT_EXIT);
