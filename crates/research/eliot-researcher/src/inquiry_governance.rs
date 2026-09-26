@@ -3292,16 +3292,31 @@ impl UnadmittedReference {
             "resource_generation",
             &self.state_fence.resource_generation.value().to_string(),
         );
+        // The three optional revisions have three DISTINCT types, so each is
+        // spelled out rather than iterated: an array would require one element
+        // type and would either coerce or fail to compile.
         for (tag, revision) in [
-            ("task_revision", self.state_fence.task_revision),
-            ("policy_revision", self.state_fence.policy_revision),
+            (
+                "task_revision",
+                self.state_fence
+                    .task_revision
+                    .map(|value| value.value().to_string()),
+            ),
+            (
+                "policy_revision",
+                self.state_fence
+                    .policy_revision
+                    .map(|value| value.value().to_string()),
+            ),
             (
                 "integration_revision",
-                self.state_fence.integration_revision,
+                self.state_fence
+                    .integration_revision
+                    .map(|value| value.value().to_string()),
             ),
         ] {
             match revision {
-                Some(value) => push_field(&mut preimage, tag, &value.value().to_string()),
+                Some(value) => push_field(&mut preimage, tag, &value),
                 None => push_field(&mut preimage, tag, "none"),
             }
         }
