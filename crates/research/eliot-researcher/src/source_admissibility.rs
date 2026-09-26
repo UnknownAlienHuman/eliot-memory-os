@@ -259,19 +259,33 @@ pub struct SourceAdmissibilityRecord {
 
 /// Declared identity domain of [`SourceAdmissibilityRecord`].
 ///
-/// Bumped `v1` -> `v2` for two reasons, both of which change the bytes:
+/// Bumped `v2` -> `v3` because the preimage now binds the State Fence.
 ///
-/// 1. the preimage binds the source record's own canonical digest, and that
-///    digest moved to a new declared domain with a complete field set, so the
-///    same decision shape hashes differently than it did under `v1`;
-/// 2. an absent independence root was spelled as the sentinel string
-///    `unknown_lineage`, which collided with a real root carrying that name.
-///    Absence is now bound as its own declared state.
+/// The `v2` preimage named the inquiry, the evidence set, the profile, the
+/// source record, the scope, the eligibility, the taint, the independence root,
+/// the limits, the reasons and the assessment instant — and then published a
+/// `state_fence` field that no byte of the preimage covered. A decision read
+/// back after the fact could therefore carry a *different* fence than the one
+/// it was taken under and still re-prove its own digest: `validate_integrity`
+/// would report the substituted fence as the decision that was made. That is
+/// the same class of defect #2873 fixed for `SourceRecord`, where a hand-written
+/// field list named ten of the record's twenty-nine fields, and it is why the
+/// fence is now inside the preimage.
+///
+/// Two earlier bumps, kept here because the domain string is the only place a
+/// reader can find the whole history:
+///
+/// - `v1` -> `v2` for two reasons, both of which change the bytes: the preimage
+///   began binding the source record's own canonical digest, and that digest
+///   moved to a new declared domain with a complete field set; and an absent
+///   independence root was spelled as the sentinel string `unknown_lineage`,
+///   which collided with a real root carrying that name.
+/// - `v1` is the first spelling.
 ///
 /// A named constant rather than an inline literal, so a consumer or a migration
 /// check can name the domain it must reject instead of matching on a string
 /// buried in a function body.
-pub const SOURCE_ADMISSIBILITY_DIGEST_DOMAIN: &str = "source-admissibility/v2";
+pub const SOURCE_ADMISSIBILITY_DIGEST_DOMAIN: &str = "source-admissibility/v3";
 
 impl SourceAdmissibilityRecord {
     /// Decides whether one vetted source may enter one inquiry evidence set.
@@ -443,6 +457,25 @@ impl SourceAdmissibilityRecord {
             &mut preimage,
             "assessment_time_ms",
             &self.assessment_time_ms.to_string(),
+        );
+        // The fence is bound as the typed value it is, through the shared
+        // canonical serializer, so its five components are bound by their own
+        // contract spellings rather than by whatever a `Debug` render or a
+        // hand-written field list happened to name. This is what makes
+        // `state_fence` a fact about the decision instead of a free field
+        // printed beside it: a decision whose fence was rewritten after the
+        // fact no longer re-proves its own digest.
+        let fence = canonical_json_bytes(&self.state_fence).map_err(|_| {
+            InquiryError::Unencodable {
+                field: "admissibility.state_fence",
+            }
+        })?;
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &String::from_utf8(fence).map_err(|_| InquiryError::Unencodable {
+                field: "admissibility.state_fence",
+            })?,
         );
         Ok(freeze(&preimage))
     }

@@ -8,6 +8,31 @@
 //! outcome as complete. It introduces no acquisition algorithm, no Dreamer
 //! grounding, no authority decision and no canonical write: every function is
 //! a pure audit over supplied records plus the append-only receipt journal.
+//!
+//! # What a seal binds, and what a receipt binds
+//!
+//! These are two different commitments over two different things, and the
+//! distinction is the point:
+//!
+//! - a [`HandoffSeal`] is *evidence custody* over material this exchange
+//!   already received. It names the producer generation and origin the material
+//!   arrived under, the exact retained source digests, the typed degradation
+//!   that was sealed, the admitted manifest, and an expiry — and its digest
+//!   covers every field it publishes, so `verify_seal` re-proves it from the
+//!   seal alone. A seal is not admission: I21.11 keeps a reachable endpoint, a
+//!   successful login and a self-reported generation from establishing ELIOT
+//!   authority, and sealing a producer claim makes the claim tamper-evident, not
+//!   true.
+//! - a [`ReceiptJournal`] entry is *ingestion identity*: a receipt id bound to
+//!   the exact source handle, admitted request, original operation and payload
+//!   digest it was accepted for. Replay is a duplicate only when all four match;
+//!   any divergence is a conflict. That is why the comparison is not digest-only:
+//!   a digest says what arrived, not which operation it was accepted for.
+//!
+//! Neither is a canonical write, and neither grants promotion. Admission and
+//! promotion are the Governor's through the sole canonical writer, and the
+//! Researcher records source admissibility for one inquiry as a separate
+//! decision (I21.1).
 
 #![forbid(unsafe_code)]
 
@@ -320,10 +345,12 @@ impl ReceiptJournal {
 }
 
 /// Frozen evidence handoff seal over one delivered bundle: exact manifest
-/// membership, delivered source lineage behind every citation, preserved
+/// membership, delivered source lineage behind every citation, the producer
+/// generation and origin the material was delivered under, preserved
 /// disclosure, and expiry/revision bounds. The seal digest is canonical over
 /// sorted handles, so irrelevant receipt and source order never changes the
-/// frozen bytes.
+/// frozen bytes, and it covers every field the seal publishes except itself, so
+/// a reader can re-prove it from the seal alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffSeal {
@@ -333,6 +360,21 @@ pub struct HandoffSeal {
     pub job_id: String,
     /// Digest of the delivered bundle.
     pub bundle_digest: String,
+    /// Producer generation the delivered material claimed.
+    ///
+    /// Inside the digest: a seal that named no producer could not distinguish
+    /// two deliveries of otherwise identical content from different Research
+    /// generations, so the same seal digest would describe material from an
+    /// approved generation and from one this run never admitted.
+    pub system_generation: String,
+    /// Producer-origin evidence the delivered bundle carried.
+    ///
+    /// Inside the digest for the same reason, and deliberately *not* an
+    /// authentication: I21.11 says endpoint reachability and a successful login
+    /// establish no ELIOT authority, and neither does a producer's own origin
+    /// string. Sealing it makes the claim tamper-evident so a later reader can
+    /// see exactly which claim travelled, not so the claim becomes true.
+    pub origin_authentication: String,
     /// Completion disposition wire name.
     pub disposition: String,
     /// Disclosure class wire name preserved into the handoff.
@@ -347,6 +389,23 @@ pub struct HandoffSeal {
     /// omissions are sealed evidence and cannot be silently dropped.
     #[serde(default)]
     pub coverage_gap_handles: Vec<String>,
+    /// The typed kind of each sealed coverage gap, in the same frozen order as
+    /// `coverage_gap_handles`.
+    ///
+    /// The handles alone are not the degradation that was observed: a timeout
+    /// gap and a source-unavailable gap over the same handle are different
+    /// acquisition facts about the same missing source, and a seal that carried
+    /// only the handle could not tell them apart.
+    #[serde(default)]
+    pub coverage_gap_kinds: Vec<String>,
+    /// Digest of every delivered source snapshot, in frozen sorted order.
+    ///
+    /// These are the exact retained bytes' identities behind the seal. They were
+    /// already inside the digest preimage, but a reader could not re-prove the
+    /// digest without the bundle, so the commitment was unfalsifiable from the
+    /// seal; publishing it is what makes the seal self-verifying.
+    #[serde(default)]
+    pub source_digests: Vec<String>,
     /// Statement digests in frozen sorted order: statements stay
     /// tamper-evident data and are never interpreted.
     pub statement_digests: Vec<String>,
@@ -391,74 +450,54 @@ fn gap_kind_wire(kind: CoverageGapKind) -> &'static str {
     }
 }
 
-fn seal_preimage(
-    bundle: &ResearchEvidenceBundle,
-    request: &ResearchQueryRequest,
-    manifest_revision: &str,
-    expires_ms: i64,
-) -> String {
-    let mut cited: Vec<&str> = bundle
-        .claims
-        .iter()
-        .flat_map(|claim| claim.citations.iter().map(|c| c.source_handle.as_str()))
-        .collect();
-    cited.sort_unstable();
-    cited.dedup();
-    let mut source_digests: Vec<&str> = bundle
-        .sources
-        .iter()
-        .map(|source| source.snapshot_digest.as_str())
-        .collect();
-    source_digests.sort_unstable();
-    let mut statement_digests: Vec<String> = bundle
-        .claims
-        .iter()
-        .map(|claim| sha256_hex(claim.statement.as_bytes()))
-        .collect();
-    statement_digests.sort();
-    let mut preimage = String::from("evidence-handoff/v1;");
-    push_field(&mut preimage, "exchange_id", &bundle.exchange_id);
-    push_field(&mut preimage, "job_id", &bundle.job_id);
+/// The canonical preimage of one handoff seal, over the seal's own published
+/// shape with `seal_digest` excluded.
+///
+/// Every field the seal publishes is inside it, which is what makes the seal
+/// re-provable: a reader that holds the seal alone can recompute this preimage
+/// and compare, instead of trusting a digest string it cannot check. Before the
+/// preimage was the seal's shape, the commitment covered the delivered bundle
+/// and the request while the seal published only a projection of them, so
+/// `verify_seal` could test the digest's *spelling* and never its *content*.
+///
+/// Collections are pre-frozen in sorted order by `seal_handoff`, so delivery
+/// order is irrelevant here without being re-sorted.
+fn seal_shape_preimage(seal: &HandoffSeal) -> String {
+    let mut preimage = String::from("evidence-handoff/v2;");
+    push_field(&mut preimage, "exchange_id", &seal.exchange_id);
+    push_field(&mut preimage, "job_id", &seal.job_id);
+    push_field(&mut preimage, "bundle_digest", &seal.bundle_digest);
+    push_field(&mut preimage, "system_generation", &seal.system_generation);
     push_field(
         &mut preimage,
-        "bundle_digest",
-        &bundle.immutable_bundle_digest,
+        "origin_authentication",
+        &seal.origin_authentication,
     );
-    push_field(&mut preimage, "disposition", bundle.disposition.wire_name());
-    push_field(
-        &mut preimage,
-        "disclosure",
-        disclosure_wire(bundle.disclosure),
-    );
-    push_field(
-        &mut preimage,
-        "manifest_digest",
-        &request.allowed_references.digest,
-    );
-    push_field(&mut preimage, "manifest_revision", manifest_revision);
-    push_count(&mut preimage, "cited", cited.len());
-    for handle in &cited {
+    push_field(&mut preimage, "disposition", &seal.disposition);
+    push_field(&mut preimage, "disclosure", &seal.disclosure);
+    push_field(&mut preimage, "manifest_digest", &seal.manifest_digest);
+    push_field(&mut preimage, "manifest_revision", &seal.manifest_revision);
+    push_count(&mut preimage, "cited", seal.cited_handles.len());
+    for handle in &seal.cited_handles {
         push_field(&mut preimage, "cited", handle);
     }
-    let mut gaps: Vec<String> = bundle
-        .coverage_gaps
-        .iter()
-        .map(|gap| format!("{}:{}", gap.source_handle, gap_kind_wire(gap.kind)))
-        .collect();
-    gaps.sort();
-    push_count(&mut preimage, "gaps", gaps.len());
-    for gap in &gaps {
-        push_field(&mut preimage, "gap", gap);
+    push_count(&mut preimage, "gaps", seal.coverage_gap_handles.len());
+    for handle in &seal.coverage_gap_handles {
+        push_field(&mut preimage, "gap", handle);
     }
-    push_count(&mut preimage, "sources", source_digests.len());
-    for digest in &source_digests {
+    push_count(&mut preimage, "gap_kinds", seal.coverage_gap_kinds.len());
+    for kind in &seal.coverage_gap_kinds {
+        push_field(&mut preimage, "gap_kind", kind);
+    }
+    push_count(&mut preimage, "sources", seal.source_digests.len());
+    for digest in &seal.source_digests {
         push_field(&mut preimage, "source_digest", digest);
     }
-    push_count(&mut preimage, "statements", statement_digests.len());
-    for digest in &statement_digests {
+    push_count(&mut preimage, "statements", seal.statement_digests.len());
+    for digest in &seal.statement_digests {
         push_field(&mut preimage, "statement", digest);
     }
-    push_field(&mut preimage, "expires_ms", &expires_ms.to_string());
+    push_field(&mut preimage, "expires_ms", &seal.expires_ms.to_string());
     preimage
 }
 
@@ -527,6 +566,15 @@ pub fn seal_handoff(
     if disclosure_rank(bundle.disclosure) > disclosure_rank(request.disclosure) {
         return Err(HandoffError::DisclosureWidened);
     }
+    // The bundle's own disclosure answer is above and keeps its own typed
+    // diagnosis; the producer answer is only available from the ingress entry,
+    // so it is taken here too. A seal over material from a generation this run
+    // never admitted would publish a handoff for a producer it cannot name as
+    // admitted, and the seal's `system_generation` is inside its digest, so
+    // sealing it is a claim only when the claim was checked.
+    bundle
+        .validate_ingress(request)
+        .map_err(HandoffError::Contract)?;
     let mut cited: Vec<String> = bundle
         .claims
         .iter()
@@ -534,39 +582,75 @@ pub fn seal_handoff(
         .collect();
     cited.sort();
     cited.dedup();
-    let mut gap_handles: Vec<String> = bundle
+    // The gap handles and their typed kinds are frozen as two parallel lists in
+    // one sort, so a handle and the degradation observed over it can never be
+    // re-paired differently: the old preimage packed them into one
+    // `handle:kind` string and sorted that, which paired correctly but published
+    // neither half to a reader who held only the seal.
+    let mut gaps: Vec<(String, String)> = bundle
         .coverage_gaps
         .iter()
-        .map(|gap| gap.source_handle.clone())
+        .map(|gap| (gap.source_handle.clone(), gap_kind_wire(gap.kind).to_owned()))
         .collect();
-    gap_handles.sort();
-    gap_handles.dedup();
+    gaps.sort();
+    gaps.dedup();
+    let mut source_digests: Vec<String> = bundle
+        .sources
+        .iter()
+        .map(|source| source.snapshot_digest.clone())
+        .collect();
+    source_digests.sort();
     let mut statement_digests: Vec<String> = bundle
         .claims
         .iter()
         .map(|claim| sha256_hex(claim.statement.as_bytes()))
         .collect();
     statement_digests.sort();
-    let preimage = seal_preimage(bundle, request, manifest_revision, expires_ms);
-    Ok(HandoffSeal {
+    let mut seal = HandoffSeal {
         exchange_id: bundle.exchange_id.clone(),
         job_id: bundle.job_id.clone(),
         bundle_digest: bundle.immutable_bundle_digest.clone(),
+        system_generation: bundle.system_generation.clone(),
+        origin_authentication: bundle.origin_authentication.clone(),
         disposition: bundle.disposition.wire_name().to_owned(),
         disclosure: disclosure_wire(bundle.disclosure).to_owned(),
         manifest_digest: request.allowed_references.digest.clone(),
         manifest_revision: manifest_revision.to_owned(),
         cited_handles: cited,
-        coverage_gap_handles: gap_handles,
+        coverage_gap_handles: gaps.iter().map(|(handle, _)| handle.clone()).collect(),
+        coverage_gap_kinds: gaps.into_iter().map(|(_, kind)| kind).collect(),
+        source_digests,
         statement_digests,
         expires_ms,
-        seal_digest: sha256_hex(preimage.as_bytes()),
-    })
+        seal_digest: String::new(),
+    };
+    // The digest is computed over the assembled seal, so sealing and verifying
+    // cannot drift apart: there is one preimage function and both sides call it.
+    seal.seal_digest = sha256_hex(seal_shape_preimage(&seal).as_bytes());
+    Ok(seal)
 }
 
 /// Verifies one handoff seal against the current frozen manifest digest and
 /// revision at `now_ms`: expiry and manifest revision invalidate the old
-/// audit instead of being reinterpreted.
+/// audit instead of being reinterpreted, and the seal digest is re-proved over
+/// the seal's own bytes.
+///
+/// The digest re-proof is the load-bearing half. The seal's preimage covers
+/// every field the seal publishes, so a seal whose `bundle_digest`,
+/// `system_generation`, `origin_authentication`, `disposition`, `disclosure`,
+/// cited handles, sealed gap handles or kinds, source digests, statement digests
+/// or expiry were altered after sealing cannot present the sealed digest as
+/// evidence of those bytes. I21.11 keeps a producer's own origin string and
+/// generation claim from establishing ELIOT authority; sealing them makes the
+/// claim tamper-evident, and this is the check that makes "tamper-evident" mean
+/// something at read time rather than at seal time only.
+///
+/// # Errors
+///
+/// Returns [`HandoffError::Expired`] past `expires_ms`,
+/// [`HandoffError::StaleManifest`] when the sealed manifest digest or revision is
+/// not the current one, and [`HandoffError::DigestMismatch`] when the digest is
+/// not a lowercase SHA-256 digest or does not cover the presented shape.
 pub fn verify_seal(
     seal: &HandoffSeal,
     manifest_digest: &str,
@@ -579,11 +663,8 @@ pub fn verify_seal(
     if seal.manifest_digest != manifest_digest || seal.manifest_revision != manifest_revision {
         return Err(HandoffError::StaleManifest);
     }
-    if seal.seal_digest.len() != 64
-        || seal
-            .seal_digest
-            .bytes()
-            .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    if !is_payload_digest(&seal.seal_digest)
+        || seal.seal_digest != sha256_hex(seal_shape_preimage(seal).as_bytes())
     {
         return Err(HandoffError::DigestMismatch);
     }
