@@ -40,9 +40,11 @@ After any HTTP attempt the plugin never falls through to the legacy process
 transport because the first request may already have reached durable admission.
 
 When the HTTP bridge is not configured, the existing bounded one-shot process
-bridge remains a compatibility fallback. It receives only an explicit
-environment allowlist. Attached mutating tools fail closed without an explicit
-usable gate decision; passive observations degrade without blocking OpenCode.
+bridge remains a compatibility fallback. The spawned process inherits only
+allowlisted environment variables (names and values, enumerated as
+`BRIDGE_ENV_KEYS` in `plugins/eliot.js`); the event payload below carries
+none. Attached mutating tools fail closed without an explicit usable gate
+decision; passive observations degrade without blocking OpenCode.
 The payload includes identities, event/tool kind, changed path, argument names,
 and versioned effect digests only—never prompts, tool argument values, command
 text, model output, file contents, stdout/stderr, environment values, headers,
