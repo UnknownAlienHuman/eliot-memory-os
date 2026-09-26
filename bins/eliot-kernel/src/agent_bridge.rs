@@ -13,7 +13,7 @@ use super::{
     load_agent_bridge_declaration, sha256_json, unix_ms,
 };
 use eliot_ipc::{
-    PeerIdentity, ServerFirstConnection, Session, TransportError,
+    PeerIdentity, ServerFirstConnection, ServerHandshakePolicy, Session, TransportError,
     agent_bridge_admission_receipt_frame,
 };
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
@@ -27,8 +27,8 @@ use eliot_protocol::{
     AgentActivationResolutionTicket, AgentActivationResolvedBinding, AgentActivationResultAck,
     AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
     AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
-    AgentBridgeAuthenticatedBinding, AgentBridgePeerChallenge, Frame, FrameKind, MessageType,
-    ProtocolPayload, RequestIdentity,
+    AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration, AgentBridgePeerChallenge, Frame,
+    FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 
 fn observe_bridge(event: &'static str, outcome: &'static str) {
@@ -345,6 +345,55 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn construct_agent_bridge_challenge(
+        admission: &AgentBridgeAdmissionDescriptor,
+        declaration: &AgentBridgeClientDeclaration,
+        kernel_policy: &ServerHandshakePolicy,
+        kernel_artifact_sha256: String,
+        kernel_config_snapshot_sha256: String,
+    ) -> Result<
+        (
+            String,
+            AgentBridgePeerChallenge,
+            ServerFirstConnection,
+            Frame,
+        ),
+        TransportError,
+    > {
+        let nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let connection_nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let connection_id = format!("agent-bridge:{connection_nonce}");
+        let challenge = AgentBridgePeerChallenge {
+            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
+            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
+            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+            profile_id: admission.profile_id.as_str().to_owned(),
+            descriptor_sha256: admission.descriptor_sha256.clone(),
+            client_declaration_sha256: admission.client_declaration_sha256.clone(),
+            bridge_generation: admission.generation,
+            state_fence: admission.state_fence.clone(),
+            kernel_principal_binding: kernel_policy.session_principal_binding.clone(),
+            kernel_authority_epoch: kernel_policy.module_generation.state_fence.authority_epoch,
+            kernel_generation: kernel_policy.module_generation.generation,
+            kernel_artifact_sha256,
+            kernel_config_snapshot_sha256,
+            activation_deadline_unix_ms: unix_ms()
+                .saturating_add(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
+            challenge_nonce: nonce,
+            challenge_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+        let exchange = ServerFirstConnection::new(&connection_id, challenge.clone(), declaration)?;
+        let challenge_frame = exchange.challenge_frame()?;
+        Ok((connection_id, challenge, exchange, challenge_frame))
+    }
+
+    #[cfg(windows)]
     fn begin_agent_bridge_inner(
         &self,
         selection: &NamedPipePeerSelection,
@@ -394,36 +443,14 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let nonce = fresh_activation_nonce_material()
-            .map_err(|_| TransportError::SessionFenced)?
-            .to_string();
-        let connection_nonce = fresh_activation_nonce_material()
-            .map_err(|_| TransportError::SessionFenced)?
-            .to_string();
-        let connection_id = format!("agent-bridge:{connection_nonce}");
-        let challenge = AgentBridgePeerChallenge {
-            wire_id: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID.to_owned(),
-            wire_version: AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION,
-            module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
-            profile_id: admission.profile_id.as_str().to_owned(),
-            descriptor_sha256: admission.descriptor_sha256.clone(),
-            client_declaration_sha256: admission.client_declaration_sha256.clone(),
-            bridge_generation: admission.generation,
-            state_fence: admission.state_fence.clone(),
-            kernel_principal_binding: kernel_policy.session_principal_binding,
-            kernel_authority_epoch: kernel_policy.module_generation.state_fence.authority_epoch,
-            kernel_generation: kernel_policy.module_generation.generation,
-            kernel_artifact_sha256,
-            kernel_config_snapshot_sha256,
-            activation_deadline_unix_ms: unix_ms()
-                .saturating_add(AGENT_BRIDGE_ACTIVATION_WINDOW_MS),
-            challenge_nonce: nonce,
-            challenge_sha256: String::new(),
-        }
-        .with_computed_digest()
-        .map_err(|_| TransportError::SessionFenced)?;
-        let exchange = ServerFirstConnection::new(&connection_id, challenge.clone(), &declaration)?;
-        let challenge_frame = exchange.challenge_frame()?;
+        let (connection_id, challenge, exchange, challenge_frame) =
+            Self::construct_agent_bridge_challenge(
+                admission,
+                &declaration,
+                &kernel_policy,
+                kernel_artifact_sha256,
+                kernel_config_snapshot_sha256,
+            )?;
         let current_profile = self
             .agent_bridge_profile
             .lock()
