@@ -13,16 +13,20 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
+use eliot_contracts::{
+    ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity, host_request_operation_id,
+    RequestIdentity, TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
+    host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
@@ -173,6 +177,198 @@ pub enum LocalReadSubmitOutcome {
     /// current attempt can still complete through its own bound capability.
     /// Never a transport error, never retried with the same capability.
     StaleAttempt,
+}
+
+/// Kernel-derived Task Controller claim. The duplicated invocation, envelope,
+/// tool and identity are checked for exact binding before it reaches Governor.
+#[derive(Clone, Debug)]
+pub struct TaskControllerClaimedInvocation {
+    pub invocation: TaskControllerInvocation,
+    pub envelope: HostRequestEnvelope,
+    pub tool: serde_json::Value,
+    pub request_identity: RequestIdentity,
+    pub operation_id: OperationId,
+    pub attempt: TaskControllerAttempt,
+}
+
+/// Typed outcome of one `task_controller_result` submit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskControllerSubmitOutcome {
+    /// Kernel persisted the result body or recognized an exact replay.
+    Accepted,
+    /// The admitted attempt expired before the result was committed.
+    Expired,
+    /// The attempt was replaced, revoked or otherwise stale.
+    StaleAttempt,
+}
+
+fn derive_task_controller_request_identity(
+    invocation: &TaskControllerInvocation,
+    envelope: &HostRequestEnvelope,
+) -> Result<RequestIdentity, String> {
+    let recipe: LearningStateViewRecipe =
+        serde_json::from_value(invocation.learning_state_view_recipe.clone())
+            .map_err(|error| format!("Task Controller learning recipe does not decode: {error}"))?;
+    recipe
+        .validate()
+        .map_err(|error| format!("Task Controller learning recipe is invalid: {error}"))?;
+    if recipe.binding.task_id != invocation.task_id
+        || recipe.binding.scope.as_str()
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .unwrap_or_default()
+        || recipe.binding.state_fence != envelope.state_fence
+        || recipe.binding.request_id.as_str() != envelope.identity.request_id.as_str()
+    {
+        return Err(
+            "Task Controller invocation is not bound to the admitted recipe/envelope".to_owned(),
+        );
+    }
+    let session_id = envelope
+        .identity
+        .session_id
+        .clone()
+        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
+        .transpose()?;
+    let metadata = RequestMetadata {
+        request_id: recipe.binding.request_id.clone(),
+        session_id,
+        task_id: Some(recipe.binding.task_id.clone()),
+        product_id: recipe.binding.product_id.clone(),
+        source_id: recipe.binding.source.owner.clone(),
+        state_fence: envelope.state_fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata,
+            state_fence: envelope.state_fence.clone(),
+        },
+        idempotency_key: envelope.identity.idempotency_key.clone(),
+        deadline_unix_ms: envelope.identity.deadline_unix_ms,
+        cancellation_id: envelope.identity.cancellation_id.clone(),
+    };
+    identity
+        .validate()
+        .map_err(|error| format!("derived Task Controller identity is invalid: {error}"))?;
+    Ok(identity)
+}
+
+/// Parses one unwrapped Task Controller poll answer into its exact admitted
+/// invocation and Kernel-issued attempt.
+pub fn parse_task_controller_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<TaskControllerClaimedInvocation>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel task_controller_claim answer omits pair".to_owned())?;
+    if pair.is_null() {
+        return Ok(None);
+    }
+    if !pair.is_object() {
+        return Err("Kernel task_controller_claim pair is neither an object nor null".to_owned());
+    }
+    let decode = |field: &str| {
+        pair.get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel task_controller_claim pair omits {field}"))
+    };
+    let invocation: TaskControllerInvocation = serde_json::from_value(decode("invocation")?)
+        .map_err(|error| format!("Kernel Task Controller invocation does not decode: {error}"))?;
+    invocation
+        .validate()
+        .map_err(|error| format!("Kernel Task Controller invocation is invalid: {error}"))?;
+    let envelope: HostRequestEnvelope = serde_json::from_value(decode("envelope")?)
+        .map_err(|error| format!("Kernel Task Controller envelope does not decode: {error}"))?;
+    envelope
+        .validate()
+        .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
+    let tool = decode("tool")?;
+    let request_identity: RequestIdentity = match pair.get("identity") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
+        None => derive_task_controller_request_identity(&invocation, &envelope)?,
+    };
+    request_identity
+        .validate()
+        .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
+        .map_err(|error| format!("Kernel Task Controller operation id does not decode: {error}"))?;
+    let attempt: TaskControllerAttempt = serde_json::from_value(decode("attempt")?)
+        .map_err(|error| format!("Kernel Task Controller attempt does not decode: {error}"))?;
+    attempt
+        .validate()
+        .map_err(|error| format!("Kernel Task Controller attempt is invalid: {error}"))?;
+
+    let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
+    let tool_invocation = tool
+        .get("arguments")
+        .cloned()
+        .and_then(|arguments| serde_json::from_value::<TaskControllerInvocation>(arguments).ok());
+    let expected_operation = host_request_operation_id(&envelope);
+    if envelope.kind != eliot_protocol::HostRequestKind::Invocation
+        || envelope.identity.capability != "eliot.task-controller"
+        || envelope.identity.payload_schema_id != "eliot.task-controller.invoke.v1"
+        || tool_name != Some("eliot.task-controller")
+        || tool_invocation.as_ref() != Some(&invocation)
+        || invocation.task_id.as_str() != envelope.identity.task_id.as_deref().unwrap_or_default()
+        || invocation.work_scope_id
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .unwrap_or_default()
+        || request_identity.request.state_fence != envelope.state_fence
+        || request_identity.request.metadata.state_fence != envelope.state_fence
+        || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        || operation_id.as_str() != expected_operation
+        || attempt.operation_id != expected_operation
+        || attempt.task_id != invocation.task_id
+        || attempt.scope_id != invocation.work_scope_id
+        || attempt.state_fence != envelope.state_fence
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+    {
+        return Err("Kernel Task Controller pair does not bind its admitted envelope".to_owned());
+    }
+    Ok(Some(TaskControllerClaimedInvocation {
+        invocation,
+        envelope,
+        tool,
+        request_identity,
+        operation_id,
+        attempt,
+    }))
+}
+
+/// Parses one unwrapped Task Controller result submit answer.
+pub fn parse_task_controller_submit_outcome(
+    value: &serde_json::Value,
+) -> Result<TaskControllerSubmitOutcome, String> {
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "Kernel task_controller_result answer omits accepted outcome".to_owned())?;
+    if accepted {
+        return Ok(TaskControllerSubmitOutcome::Accepted);
+    }
+    if value
+        .get("expired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(TaskControllerSubmitOutcome::Expired);
+    }
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(TaskControllerSubmitOutcome::StaleAttempt);
+    }
+    Err("Kernel task_controller_result answer is not accepted, expired, or stale".to_owned())
 }
 
 /// Parses one unwrapped `local_read_claim` answer value into the claimed
@@ -1233,7 +1429,60 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != "eliot.query"
+                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.query")
+        }) {
+            return Err(super::DaemonError::Kernel(
+                "Kernel local_read_claim returned a non-query pair".to_owned(),
+            ));
+        }
+        Ok(pair)
+    }
+
+    /// Claims one queued admitted `eliot.packet` pair from the dedicated
+    /// campaign-packet queue. The query poller cannot consume this claim.
+    #[cfg(windows)]
+    pub async fn claim_campaign_packet_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "campaign_packet_claim",
+                serde_json::json!({ "operation": "campaign_packet_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != "eliot.packet"
+                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.packet")
+        }) {
+            return Err(super::DaemonError::Kernel(
+                "Kernel campaign_packet_claim returned a non-packet pair".to_owned(),
+            ));
+        }
+        Ok(pair)
+    }
+
+    /// Claims one queued admitted Task Controller invocation and its distinct
+    /// Kernel-issued attempt capability.
+    #[cfg(windows)]
+    pub async fn claim_task_controller_pair_async(
+        &self,
+    ) -> Result<Option<TaskControllerClaimedInvocation>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "task_controller_claim",
+                serde_json::json!({ "operation": "task_controller_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_task_controller_claimed_pair(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one daemon-produced local-read result body for its waiting
@@ -1345,6 +1594,43 @@ impl DaemonKernelClient {
         parse_observe_defer_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
+    /// Submits one result for the exact admitted Task Controller attempt.
+    /// Submits a compiled campaign-packet result through its dedicated queue
+    /// route. The query result operation cannot consume this body.
+    #[cfg(windows)]
+    pub async fn submit_campaign_packet_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "campaign_packet_result",
+                serde_json::json!({ "result": body }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    #[cfg(windows)]
+    pub async fn submit_task_controller_result_async(
+        &self,
+        body: &TaskControllerResultBody,
+    ) -> Result<TaskControllerSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "task_controller_result",
+                serde_json::json!({ "result": body }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_task_controller_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
     /// Executes one closed local read through the authenticated Kernel route.
     ///
     /// Twin of [`store_named_async`](Self::store_named_async): the admitted
@@ -1388,6 +1674,11 @@ impl DaemonKernelClient {
         };
         pair.validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if pair.envelope.identity.capability != "eliot.query" {
+            return Err(KernelPortError::Contract(
+                "campaign packets cannot use the query-only local_read leg".to_owned(),
+            ));
+        }
         attempt
             .validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
@@ -1439,7 +1730,7 @@ impl DaemonKernelClient {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
                 KernelPortError::Contract(
-                    "Kernel local read admission carries no result digest; packet admissions stay admission-only"
+                    "Kernel local read admission carries no result digest; the campaign packet poller must submit its compiled result"
                         .to_owned(),
                 )
             })?;
@@ -1449,7 +1740,7 @@ impl DaemonKernelClient {
             .cloned()
             .ok_or_else(|| {
                 KernelPortError::Contract(
-                    "Kernel local read admission carries no result body; packet admissions stay admission-only"
+                    "Kernel local read admission carries no result body; the campaign packet poller must submit its compiled result"
                         .to_owned(),
                 )
             })?;
@@ -2137,10 +2428,11 @@ mod tests {
             "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
         );
 
-        // Packet pairs stay admission-only: Unavailable, never a read.
+        // The query-only twin refuses packets; the production campaign poller
+        // owns packet claim, owner reads, compilation, and result submit.
         let packet = packet_tool();
         let packet_envelope = test_envelope("eliot.packet", &fence, &tool_digest(&packet)?)?;
-        let admitted_only = runtime.block_on(KernelContextReadClient::execute_local_read(
+        let query_twin_result = runtime.block_on(KernelContextReadClient::execute_local_read(
             &service,
             &fence,
             &packet_envelope,
@@ -2148,10 +2440,10 @@ mod tests {
         ));
         assert!(
             matches!(
-                admitted_only,
+                query_twin_result,
                 Err(ReadError::Store(StoreReadFailure::Unavailable))
             ),
-            "packet must stay admission-only as Unavailable, got {admitted_only:?}"
+            "the query-only twin must refuse a packet, got {query_twin_result:?}"
         );
 
         // The production forwarding bridge fails closed before transport: a

@@ -148,6 +148,13 @@ pub enum ParameterShape {
     /// carry structured values. The value must be a JSON object; leg
     /// completeness is enforced by the notification-state contract.
     NotificationState,
+    /// Closed exact owner and typed revision selector for issue #1862.
+    CampaignSourceLookup,
+    /// Closed, owner-bound campaign source publications carried by an
+    /// admitted owner transition for issue #1862.
+    CampaignSourcePublications,
+    /// Closed content-addressed campaign view selector for issue #1862.
+    CampaignViewLookup,
 }
 
 impl ParameterShape {
@@ -159,6 +166,9 @@ impl ParameterShape {
             Self::OperationId => "operation-id",
             Self::Subject => "subject-text",
             Self::NotificationState => "eliot.notify.state.v1",
+            Self::CampaignSourceLookup => "eliot.learning.campaign-source-lookup.v1",
+            Self::CampaignSourcePublications => "eliot.learning.campaign-source-publications.v1",
+            Self::CampaignViewLookup => "eliot.learning.campaign-view-lookup.v1",
         }
     }
 }
@@ -372,6 +382,18 @@ static GET_TASK_STATE_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
+static GET_CAMPAIGN_SOURCE_REVISION_PARAMETERS: [ParameterDeclaration; 1] =
+    [ParameterDeclaration {
+        name: "lookup",
+        shape: ParameterShape::CampaignSourceLookup,
+        required: true,
+    }];
+static GET_CAMPAIGN_LEARNING_STATE_VIEW_PARAMETERS: [ParameterDeclaration; 1] =
+    [ParameterDeclaration {
+        name: "lookup",
+        shape: ParameterShape::CampaignViewLookup,
+        required: true,
+    }];
 static GET_ATTENTION_AND_PROBLEMS_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
         name: "problem_id",
@@ -833,7 +855,7 @@ static COMMIT_EXPERIENCE_PARAMETERS: [ParameterDeclaration; 6] = [
 /// `expected_revision` as its decimal string (`"1"` on propose, the current
 /// task revision on apply, mirroring how `AppendAuditEvent` carries
 /// `expected_revision`), and the admitted `actor_ref`.
-static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
     ParameterDeclaration {
         name: "task_id",
         shape: ParameterShape::Subject,
@@ -864,6 +886,21 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
         shape: ParameterShape::Subject,
         required: true,
     },
+    ParameterDeclaration {
+        name: "campaign_learning_state_recipe_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "campaign_source_publications_json",
+        shape: ParameterShape::CampaignSourcePublications,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "campaign_source_matrix_complete",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
 ];
 
 /// Returns the canonical operation name bound into manifests and digests.
@@ -883,6 +920,8 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
         NamedReadOperation::GetTaskState => "GetTaskState",
+        NamedReadOperation::GetCampaignSourceRevision => "GetCampaignSourceRevision",
+        NamedReadOperation::GetCampaignLearningStateView => "GetCampaignLearningStateView",
         NamedReadOperation::GetCurrentEpistemicPosition => "GetCurrentEpistemicPosition",
         NamedReadOperation::GetEvidencePack => "GetEvidencePack",
         NamedReadOperation::GetUnderstandingProjectionInputs => "GetUnderstandingProjectionInputs",
@@ -907,6 +946,8 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetScopeRevisionView" => Some(NamedReadOperation::GetScopeRevisionView),
         b"GetOrderingHeads" => Some(NamedReadOperation::GetOrderingHeads),
         b"GetTaskState" => Some(NamedReadOperation::GetTaskState),
+        b"GetCampaignSourceRevision" => Some(NamedReadOperation::GetCampaignSourceRevision),
+        b"GetCampaignLearningStateView" => Some(NamedReadOperation::GetCampaignLearningStateView),
         b"GetCurrentEpistemicPosition" => Some(NamedReadOperation::GetCurrentEpistemicPosition),
         b"GetEvidencePack" => Some(NamedReadOperation::GetEvidencePack),
         b"GetUnderstandingProjectionInputs" => {
@@ -1019,6 +1060,10 @@ pub const fn declared_read_parameters(
         }
         NamedReadOperation::GetCurrentEpistemicPosition => &CURRENT_POSITION_PARAMETERS,
         NamedReadOperation::GetTaskState => &GET_TASK_STATE_PARAMETERS,
+        NamedReadOperation::GetCampaignSourceRevision => &GET_CAMPAIGN_SOURCE_REVISION_PARAMETERS,
+        NamedReadOperation::GetCampaignLearningStateView => {
+            &GET_CAMPAIGN_LEARNING_STATE_VIEW_PARAMETERS
+        }
         NamedReadOperation::GetAttentionAndProblems => &GET_ATTENTION_AND_PROBLEMS_PARAMETERS,
         NamedReadOperation::GetUnderstandingProjectionInputs => {
             &GET_UNDERSTANDING_PROJECTION_INPUTS_PARAMETERS
@@ -1185,7 +1230,11 @@ pub fn verify_declaration_holds_no_payload_encoding(
 ) -> Result<(), StoreError> {
     let structured = match declaration.shape {
         ParameterShape::OperationId | ParameterShape::Subject => false,
-        ParameterShape::EpistemicRevision | ParameterShape::NotificationState => true,
+        ParameterShape::EpistemicRevision
+        | ParameterShape::NotificationState
+        | ParameterShape::CampaignSourceLookup
+        | ParameterShape::CampaignSourcePublications
+        | ParameterShape::CampaignViewLookup => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1320,6 +1369,44 @@ fn check_declared_shape(
                 });
             }
             Ok(())
+        }
+        ParameterShape::CampaignSourceLookup => {
+            let lookup: crate::CampaignSourceRevisionLookup = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            lookup.validate()
+        }
+        ParameterShape::CampaignSourcePublications => {
+            let publications: Vec<crate::CampaignSourcePublication> =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            if publications.is_empty() || publications.len() > 64 {
+                return Err(StoreError::InvalidField {
+                    field: "campaign_source_publications",
+                    reason: "must contain between one and 64 publications",
+                });
+            }
+            let mut keys = std::collections::BTreeSet::new();
+            for publication in &publications {
+                publication.validate()?;
+                let key = serde_json::to_string(&(
+                    publication.record.role,
+                    &publication.record.owner_id,
+                    &publication.record.record_id,
+                ))
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                if !keys.insert(key) {
+                    return Err(StoreError::Duplicate {
+                        field: "campaign_source_publications.key",
+                    });
+                }
+            }
+            Ok(())
+        }
+        ParameterShape::CampaignViewLookup => {
+            let lookup: crate::CampaignLearningStateViewLookup =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            lookup.validate()
         }
     }
 }

@@ -6,8 +6,9 @@
 //! the admitted `eliot.query` pair, serve it through
 //! [`eliot_read::LocalReadPort::evidence_query`], and assert the exact
 //! evidence record returns — never a bare admission. The three fail-closed
-//! legs (wrong fence, packet admission-only, closed mode allowlist) are
-//! preserved through the same bridge.
+//! legs (wrong fence, query-twin packet refusal, and closed mode allowlist)
+//! are preserved through the same bridge; the production packet poller is the
+//! separate campaign dispatch edge.
 //!
 //! Test 2 drives the production poller wire contract the daemon `run_loop`
 //! speaks: one `local_read_claim` answer parses to the exact admitted pair
@@ -283,17 +284,18 @@ async fn admitted_query_serves_the_exact_captured_record() -> TestResult {
         "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
     );
 
-    // Packet pairs stay admission-only: Unavailable, never a read.
+    // The query-only local twin refuses packets; the production campaign
+    // poller owns packet claim, owner reads, compilation, and result submit.
     let packet = packet_tool();
     let packet_envelope = test_envelope("eliot.packet", &fence, &tool_digest(&packet)?)?;
-    let admitted_only =
+    let query_twin_result =
         eliotd::serve_admitted_local_read(&service, &fence, &packet_envelope, &packet).await;
     assert!(
         matches!(
-            admitted_only,
+            query_twin_result,
             Err(ReadError::Store(StoreReadFailure::Unavailable))
         ),
-        "packet must stay admission-only as Unavailable, got {admitted_only:?}"
+        "the query-only twin must refuse a packet, got {query_twin_result:?}"
     );
 
     // A mode outside the closed evidence allowlist never admits the evidence

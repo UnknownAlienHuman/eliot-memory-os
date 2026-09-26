@@ -9,11 +9,18 @@
 //! Forbidden authority: no Store/provider SDK, canonical ownership, semantic
 //! Governor reconstruction, retry/default synthesis, or alternate transport.
 
-use eliot_contracts::OperationId;
-use eliot_governor::{KernelPortError, KernelPortFuture, KernelTransitionPort};
+use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
+use eliot_governor::{
+    KernelPortError, KernelPortFuture, KernelTransitionPort, TaskControllerCampaignSourceHeads,
+};
+use eliot_learning_contracts::{
+    CampaignOwnerRecordId, CampaignSourceRole, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    CanonicalRequestView, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
+    CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
+    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHeadExpectation, ScopeId,
     StoreHealth, WriteReceipt, generated_operation_manifests, validate_store_receipt_envelope,
     verify_canonical_request_hash,
 };
@@ -127,6 +134,70 @@ fn check_identity_binding(
             ))
         })?;
     Ok(())
+}
+
+async fn read_task_controller_source_head(
+    client: &DaemonKernelClient,
+    task_id: &TaskId,
+    scope_id: &str,
+    state_fence: &StateFence,
+    role: CampaignSourceRole,
+) -> Result<Option<CampaignSourceHead>, KernelPortError> {
+    let owner = OwnerId::from_artifact(
+        ArtifactId::new(TASK_CONTROLLER_CAMPAIGN_OWNER_ID.to_owned()).map_err(|error| {
+            KernelPortError::Contract(format!("invalid Task Controller owner identity: {error}"))
+        })?,
+    );
+    let lookup = CampaignSourceRevisionLookup {
+        role,
+        owner_id: owner,
+        record_id: CampaignOwnerRecordId::Task(task_id.clone()),
+        expected_revision: None,
+        expected_content_digest: None,
+    };
+    let request = NamedReadRequest {
+        operation: NamedReadOperation::GetCampaignSourceRevision,
+        scope_id: Some(ScopeId::new(scope_id.to_owned()).map_err(|error| {
+            KernelPortError::Contract(format!("invalid Task Controller source scope: {error}"))
+        })?),
+        consistency: ReadConsistency::ExactFence,
+        state_fence: state_fence.clone(),
+        parameters: lookup.named_parameters().map_err(|error| {
+            KernelPortError::Contract(format!("invalid Task Controller source lookup: {error}"))
+        })?,
+    };
+    let response = client.store_named_async(request).await?;
+    let read =
+        CampaignSourceRevisionRead::from_named_read_response(&response).map_err(|error| {
+            KernelPortError::Contract(format!("invalid Task Controller source read: {error}"))
+        })?;
+    if read.read_state_fence != *state_fence {
+        return Err(KernelPortError::Contract(
+            "Task Controller source read returned a different State Fence".to_owned(),
+        ));
+    }
+    match read.status {
+        CampaignSourceReadStatus::Missing => Ok(None),
+        CampaignSourceReadStatus::Current | CampaignSourceReadStatus::Stale => {
+            let head = read.current_head.ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Task Controller source read omitted its current head".to_owned(),
+                )
+            })?;
+            if head.role != role
+                || head.owner_id != lookup.owner_id
+                || head.record_id != lookup.record_id
+            {
+                return Err(KernelPortError::Contract(
+                    "Task Controller source head does not match its exact owner key".to_owned(),
+                ));
+            }
+            Ok(Some(head))
+        }
+        CampaignSourceReadStatus::Blocked => Err(KernelPortError::Contract(
+            "Task Controller source head read was blocked".to_owned(),
+        )),
+    }
 }
 
 impl KernelTransitionPort for DaemonKernelClient {
@@ -249,6 +320,57 @@ impl KernelTransitionPort for DaemonKernelClient {
             }
             .instrument(span),
         )
+    }
+
+    fn campaign_source_heads(
+        &self,
+        task_id: &TaskId,
+        scope_id: &str,
+        state_fence: &StateFence,
+    ) -> KernelPortFuture<'_, TaskControllerCampaignSourceHeads> {
+        let task_id = task_id.clone();
+        let scope_id = scope_id.to_owned();
+        let state_fence = state_fence.clone();
+        Box::pin(async move {
+            let objective = read_task_controller_source_head(
+                self,
+                &task_id,
+                &scope_id,
+                &state_fence,
+                CampaignSourceRole::TaskObjective,
+            )
+            .await?;
+            let plan = read_task_controller_source_head(
+                self,
+                &task_id,
+                &scope_id,
+                &state_fence,
+                CampaignSourceRole::TaskPlan,
+            )
+            .await?;
+            let acceptance = read_task_controller_source_head(
+                self,
+                &task_id,
+                &scope_id,
+                &state_fence,
+                CampaignSourceRole::TaskAcceptance,
+            )
+            .await?;
+            let open_items = read_task_controller_source_head(
+                self,
+                &task_id,
+                &scope_id,
+                &state_fence,
+                CampaignSourceRole::TaskOpenItems,
+            )
+            .await?;
+            Ok(TaskControllerCampaignSourceHeads {
+                objective,
+                plan,
+                acceptance,
+                open_items,
+            })
+        })
     }
 }
 

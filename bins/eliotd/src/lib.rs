@@ -38,6 +38,16 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod campaign_context_owner;
+pub mod campaign_evaluation_owner;
+pub mod campaign_owner_matrix;
+pub mod campaign_packet;
+pub mod campaign_task_controller;
+
+pub use campaign_context_owner::build_context_owner_publications;
+pub use campaign_evaluation_owner::build_product_evaluation_publications;
+pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publications;
+pub use campaign_task_controller::serve_task_controller_claim;
 pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
@@ -131,7 +141,7 @@ pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome, ObserveSubmitOutcome,
-    OwnerSessionFacts,
+    OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -1637,9 +1647,11 @@ impl DaemonComposition {
     ///
     /// The adapter forwards the exact admitted identity, operation identity,
     /// proposal, context, and command to the Governor canonical task path
-    /// and returns only typed results. No policy, admission, or semantic
-    /// rules live here; a duplicate, stale revision, stale fence, or illegal
-    /// transition fails closed in the Governor owner. Publication happens
+    /// and returns only typed results. Its recipe-bearing proposal/command
+    /// methods publish the learning-state recipe atomically in that same
+    /// Task Controller transition. No policy, admission, or semantic rules
+    /// live here; duplicate, stale revision, stale fence, and illegal
+    /// transitions fail closed in the Governor owner. Publication happens
     /// only via the Governor `refresh_from_kernel` at the returned receipt
     /// revision. Callers take a fresh adapter per operation so a Governor
     /// refresh surfaces as an exact-view mismatch instead of silent

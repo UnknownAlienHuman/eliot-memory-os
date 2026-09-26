@@ -1,70 +1,28 @@
 #![allow(clippy::expect_used, clippy::too_many_lines)]
 use eliot_contracts::{
-    ArtifactId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
-    ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
+    ArtifactId, AuthorityEpoch, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId,
+    RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_learning_activation_assessment::{
-    ActivationAssessmentError, AssessmentInput, AssessmentPolicy, AssessmentResultOrIncomplete,
-    MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES, MissingAssessmentField,
+    ActivationAssessmentError, ActivationSection, ActivationStatus, AdherenceSection,
+    AdherenceStatus, AssessmentInput, AssessmentPolicy, AssessmentResultOrIncomplete,
+    DeliverySection, DeliveryStatus, MAX_INPUT_BYTES, MAX_METRICS, MAX_OUTPUT_BYTES, MAX_STAGES,
+    MissingAssessmentField, RetrievalSection, RetrievalStatus,
 };
 use eliot_learning_contracts::{
-    ActivationSection, ActivationStatus, AdherenceSection, AdherenceStatus, AgentAttemptId,
-    AssessmentDimension, CampaignHarnessOverlayCandidate, CampaignId, CampaignLearningStateView,
-    CausalCeiling, ChangeOperation, ChangeSurface, Completeness, DeliverySection, DeliveryStatus,
-    DimensionAssessment, DimensionStatus, InverseChange, LearningStateViewRecipe, LifecycleStage,
-    MemberId, MemberProjection, MetricObservation, OmissionPolicy, OverlayChange, OverlayId,
-    OverlayOrigin, OwnerId, ProofCeiling, RetrievalSection, RetrievalStatus, SlotDisposition,
-    SlotId, SlotProjection, SlotRequirement, SlotSpec, SourceDenominator, StageDisposition,
-    StageObservation, TargetId, ValueState, WorkScopeId,
+    AgentAttemptId, AssessmentDimension, CampaignActiveOverlayPolicy,
+    CampaignHarnessOverlayCandidate, CampaignHistoryPlanReference, CampaignId,
+    CampaignLearningStateProvenance, CampaignLearningStateView, CampaignOwnerRecordId,
+    CampaignOwnerRevision, CampaignPositionKind, CampaignPositionRef, CampaignSlotProjectionDigest,
+    CampaignSourceBinding, CampaignSourceRequirement, CampaignSourceResolution,
+    CampaignSourceResolutionStatus, CampaignSourceRevisionRef, CampaignSourceRole, CausalCeiling,
+    ChangeOperation, ChangeSurface, Completeness, DimensionAssessment, DimensionStatus,
+    InverseChange, LearningStateViewRecipe, LifecycleStage, MemberId, MemberProjection,
+    MetricObservation, OmissionPolicy, OverlayChange, OverlayId, OverlayOrigin, OwnerId,
+    ProofCeiling, SlotDisposition, SlotId, SlotProjection, SlotRequirement, SlotSpec,
+    SourceDenominator, StageDisposition, StageObservation, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    TargetId, ValueState, WorkScopeId,
 };
-use std::sync::OnceLock;
-
-/// Shared default harness-activation evidence for the legacy `make_input` helper.
-///
-/// All sections default to unknown/missing with empty refs: no retrieval is
-/// claimed, no delivery packet is asserted, no acknowledgement substitutes for
-/// a qualifying use, and adherence stays unknown (I12.24 l256).
-struct DefaultExtra620 {
-    compiled_view_ref: ArtifactId,
-    context_compiler_revision: String,
-    render_profile_revision: String,
-    retrieval: RetrievalSection,
-    delivery: DeliverySection,
-    activation: ActivationSection,
-    adherence: AdherenceSection,
-}
-
-fn default_extra620() -> &'static DefaultExtra620 {
-    static CELL: OnceLock<DefaultExtra620> = OnceLock::new();
-    CELL.get_or_init(|| DefaultExtra620 {
-        compiled_view_ref: ArtifactId::new("compiled-view-620-default")
-            .expect("valid default compiled view ref"),
-        context_compiler_revision: "compiler-rev-620-default".to_owned(),
-        render_profile_revision: "render-rev-620-default".to_owned(),
-        retrieval: RetrievalSection {
-            status: RetrievalStatus::Unknown,
-            expansion_or_tool_query_refs: Vec::new(),
-        },
-        delivery: DeliverySection {
-            status: DeliveryStatus::Missing,
-            packet_position: None,
-            serialized_digest: None,
-            bytes: None,
-            actual_tokens: None,
-        },
-        activation: ActivationSection {
-            status: ActivationStatus::Unknown,
-            acknowledgement_ref: None,
-            observation_limit_reason: None,
-            first_qualifying_observable_use_ref: None,
-        },
-        adherence: AdherenceSection {
-            status: AdherenceStatus::Unknown,
-            early_mid_final_checkpoint_refs: Vec::new(),
-            prescribed_or_avoided_action_and_required_verifier_refs: Vec::new(),
-        },
-    })
-}
 
 fn aid(value: &str) -> Result<ArtifactId, Box<dyn std::error::Error>> {
     Ok(ArtifactId::new(value)?)
@@ -86,6 +44,8 @@ fn test_epoch(sequence: u64) -> EpochId {
 }
 
 fn test_binding() -> Result<eliot_learning_contracts::ContractBinding, Box<dyn std::error::Error>> {
+    let mut state_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+    state_fence.task_revision = Some(TaskRevision::genesis());
     Ok(eliot_learning_contracts::ContractBinding {
         schema_version: 1,
         policy_revision: PolicyRevision::genesis(),
@@ -94,7 +54,7 @@ fn test_binding() -> Result<eliot_learning_contracts::ContractBinding, Box<dyn s
         product_id: ProductId::new("eliot")?,
         task_id: TaskId::new("task-620")?,
         scope: WorkScopeId::new("scope-620")?,
-        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
+        state_fence,
         source: eliot_learning_contracts::identity::SourceLineage {
             owner: SourceId::new("source-620")?,
             snapshot: aid("snapshot-620")?,
@@ -103,6 +63,306 @@ fn test_binding() -> Result<eliot_learning_contracts::ContractBinding, Box<dyn s
         },
         proof_ceiling: ProofCeiling::CandidateArtifact,
     })
+}
+
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+fn campaign_source_contract(
+    tag: &str,
+    binding: &eliot_learning_contracts::ContractBinding,
+) -> Result<
+    (
+        Vec<CampaignSourceRequirement>,
+        CampaignLearningStateProvenance,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let roles = [
+        (CampaignSourceRole::TaskObjective, "task-objective"),
+        (CampaignSourceRole::TaskAcceptance, "task-acceptance"),
+        (CampaignSourceRole::TaskPlan, "task-plan"),
+        (CampaignSourceRole::TaskOpenItems, "task-open-items"),
+        (
+            CampaignSourceRole::AttemptLineageLatestOutcomes,
+            "attempt-lineage-outcomes",
+        ),
+        (CampaignSourceRole::GovernorAdmission, "governor-admission"),
+        (CampaignSourceRole::GovernorEpoch, "governor-epoch"),
+        (CampaignSourceRole::GovernorPolicy, "governor-policy"),
+        (CampaignSourceRole::ContextRecipe, "context-recipe"),
+        (CampaignSourceRole::ContextToolPolicy, "context-tool-policy"),
+        (CampaignSourceRole::ContextDelivery, "context-delivery"),
+        (CampaignSourceRole::EvaluatorContract, "evaluator-contract"),
+        (CampaignSourceRole::EvaluatorHoldout, "evaluator-holdout"),
+        (CampaignSourceRole::EvaluationResults, "evaluation-results"),
+        (CampaignSourceRole::MemoryProjection, "memory-projection"),
+        (
+            CampaignSourceRole::ExperienceProjection,
+            "experience-projection",
+        ),
+        (
+            CampaignSourceRole::ArtifactProjection,
+            "artifact-projection",
+        ),
+        (CampaignSourceRole::FrozenAnchor, "frozen-anchor"),
+        (CampaignSourceRole::StableHarness, "stable-harness"),
+        (CampaignSourceRole::TaskFamilyHarness, "task-family-harness"),
+        (CampaignSourceRole::ActiveOverlay, "active-overlay"),
+        (CampaignSourceRole::CurrentPosition, "current-position"),
+        (
+            CampaignSourceRole::ExperiencePosition,
+            "experience-position",
+        ),
+        (
+            CampaignSourceRole::AdaptationPosition,
+            "adaptation-position",
+        ),
+        (
+            CampaignSourceRole::EvaluationPosition,
+            "evaluation-position",
+        ),
+        (CampaignSourceRole::EconomicsProgress, "economics-progress"),
+    ];
+    let mut source_requirements = Vec::with_capacity(roles.len());
+    let mut source_resolutions = Vec::with_capacity(roles.len());
+    for (role, label) in roles {
+        let task_anchor = role == CampaignSourceRole::TaskPlan;
+        let owner = if task_anchor {
+            OwnerId::from_artifact(aid(TASK_CONTROLLER_CAMPAIGN_OWNER_ID)?)
+        } else {
+            OwnerId::from_artifact(aid(&format!("source-owner-{tag}-{label}"))?)
+        };
+        let expected_reference = if role == CampaignSourceRole::ActiveOverlay || task_anchor {
+            None
+        } else {
+            let record_id = match role {
+                CampaignSourceRole::TaskObjective
+                | CampaignSourceRole::TaskAcceptance
+                | CampaignSourceRole::TaskOpenItems => {
+                    CampaignOwnerRecordId::Task(binding.task_id.clone())
+                }
+                _ => CampaignOwnerRecordId::Artifact(aid(&format!("source-record-{tag}-{label}"))?),
+            };
+            let content_digest = digest(&format!("source-content-{tag}-{label}"));
+            Some(CampaignSourceRevisionRef {
+                role,
+                owner: owner.clone(),
+                record_id,
+                revision: owner_revision(role, &content_digest, binding),
+                content_digest,
+                slot_projection_digests: vec![],
+                recorded_state_fence: binding.state_fence.clone(),
+            })
+        };
+        let reference = if task_anchor {
+            Some(CampaignSourceRevisionRef {
+                role,
+                owner: owner.clone(),
+                record_id: CampaignOwnerRecordId::Task(binding.task_id.clone()),
+                revision: CampaignOwnerRevision::Task(
+                    binding
+                        .state_fence
+                        .task_revision
+                        .clone()
+                        .expect("task anchor revision"),
+                ),
+                content_digest: digest(&format!("task-anchor-{tag}")),
+                slot_projection_digests: vec![],
+                recorded_state_fence: binding.state_fence.clone(),
+            })
+        } else {
+            expected_reference.clone()
+        };
+        let status = if reference.is_some() {
+            CampaignSourceResolutionStatus::Current
+        } else {
+            CampaignSourceResolutionStatus::Missing
+        };
+        source_requirements.push(CampaignSourceRequirement {
+            role,
+            source_binding: if role == CampaignSourceRole::ActiveOverlay {
+                CampaignSourceBinding::ExplicitlyAbsent
+            } else if task_anchor {
+                CampaignSourceBinding::AuthenticatedTaskAnchor
+            } else {
+                CampaignSourceBinding::ExactReference
+            },
+            owner,
+            expected_reference: expected_reference.clone(),
+            load_bearing: expected_reference.is_some() || task_anchor,
+        });
+        source_resolutions.push(CampaignSourceResolution {
+            role,
+            status,
+            reference,
+            read_state_fence: binding.state_fence.clone(),
+        });
+    }
+
+    let positions = [
+        (
+            CampaignPositionKind::Current,
+            CampaignSourceRole::CurrentPosition,
+            "current",
+        ),
+        (
+            CampaignPositionKind::Experience,
+            CampaignSourceRole::ExperiencePosition,
+            "experience",
+        ),
+        (
+            CampaignPositionKind::Adaptation,
+            CampaignSourceRole::AdaptationPosition,
+            "adaptation",
+        ),
+        (
+            CampaignPositionKind::Evaluation,
+            CampaignSourceRole::EvaluationPosition,
+            "evaluation",
+        ),
+        (
+            CampaignPositionKind::EconomicsProgress,
+            CampaignSourceRole::EconomicsProgress,
+            "economics-progress",
+        ),
+    ]
+    .into_iter()
+    .map(|(kind, source_role, label)| {
+        let source = source_resolutions
+            .iter()
+            .find(|resolution| resolution.role == source_role)
+            .and_then(|resolution| resolution.reference.as_ref())
+            .expect("position role has an exact current source");
+        CampaignPositionRef {
+            kind,
+            source_role,
+            record_id: source.record_id.clone(),
+            revision: source.revision.clone(),
+            source_content_digest: source.content_digest.clone(),
+            position_digest: source.content_digest.clone(),
+        }
+    })
+    .collect();
+    let frozen_anchor_digest = source_resolutions
+        .iter()
+        .find(|resolution| resolution.role == CampaignSourceRole::FrozenAnchor)
+        .and_then(|resolution| resolution.reference.as_ref())
+        .map(|reference| reference.content_digest.clone())
+        .expect("frozen anchor has an exact current source");
+
+    Ok((
+        source_requirements,
+        CampaignLearningStateProvenance {
+            source_resolutions,
+            frozen_anchor_digest,
+            positions,
+            history_plans: vec![CampaignHistoryPlanReference {
+                retrieval_plan_digest: digest(&format!("retrieval-plan-{tag}")),
+                selected_handles: vec![aid(&format!("history-handle-{tag}"))?],
+                summary_digest: Some(digest(&format!("history-summary-{tag}"))),
+                diff_digests: vec![digest(&format!("history-diff-{tag}"))],
+                policy_slice_handles: vec![],
+            }],
+            generated_at_ms: 1_790_208_000_000,
+            expires_at_ms: None,
+            rebuild_reason: None,
+        },
+    ))
+}
+
+fn bind_slot_source_contract(
+    recipe: &mut LearningStateViewRecipe,
+    provenance: &mut CampaignLearningStateProvenance,
+    projections: &[SlotProjection],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for spec in &recipe.slots {
+        let requirement = recipe
+            .source_requirements
+            .iter_mut()
+            .find(|requirement| requirement.role == spec.source_role)
+            .expect("slot source role is declared");
+        requirement.owner = spec.owner.clone();
+        if let Some(reference) = requirement.expected_reference.as_mut() {
+            reference.owner = spec.owner.clone();
+        }
+        let resolution = provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved");
+        if let Some(reference) = resolution.reference.as_mut() {
+            reference.owner = spec.owner.clone();
+        }
+    }
+    for projection in projections {
+        let spec = recipe
+            .slots
+            .iter()
+            .find(|spec| spec.slot_id == projection.slot_id)
+            .expect("projection is declared by recipe");
+        let digest = projection.canonical_digest()?;
+        let requirement = recipe
+            .source_requirements
+            .iter_mut()
+            .find(|requirement| requirement.role == spec.source_role)
+            .expect("slot source role is declared");
+        requirement
+            .expected_reference
+            .as_mut()
+            .expect("slot source has an exact expected reference")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
+                digest: digest.clone(),
+            });
+        provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved")
+            .reference
+            .as_mut()
+            .expect("slot source has an exact current reference")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
+                digest,
+            });
+    }
+    recipe.seal()?;
+    Ok(())
+}
+
+fn owner_revision(
+    role: CampaignSourceRole,
+    content_digest: &str,
+    binding: &eliot_learning_contracts::ContractBinding,
+) -> CampaignOwnerRevision {
+    match role {
+        CampaignSourceRole::TaskObjective
+        | CampaignSourceRole::TaskAcceptance
+        | CampaignSourceRole::TaskPlan
+        | CampaignSourceRole::TaskOpenItems
+        | CampaignSourceRole::ContextRecipe
+        | CampaignSourceRole::ContextDelivery
+        | CampaignSourceRole::CurrentPosition => {
+            CampaignOwnerRevision::Task(TaskRevision::genesis())
+        }
+        CampaignSourceRole::GovernorEpoch => {
+            CampaignOwnerRevision::AuthorityEpoch(AuthorityEpoch::genesis())
+        }
+        CampaignSourceRole::GovernorPolicy | CampaignSourceRole::ContextToolPolicy => {
+            CampaignOwnerRevision::Policy(binding.policy_revision)
+        }
+        CampaignSourceRole::MemoryProjection
+        | CampaignSourceRole::StableHarness
+        | CampaignSourceRole::TaskFamilyHarness => {
+            CampaignOwnerRevision::ResourceGeneration(binding.state_fence.resource_generation)
+        }
+        CampaignSourceRole::FrozenAnchor | CampaignSourceRole::ArtifactProjection => {
+            CampaignOwnerRevision::ResourceSnapshot(content_digest.to_owned())
+        }
+        _ => CampaignOwnerRevision::Counter(1),
+    }
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_lines)]
@@ -122,6 +382,7 @@ fn fixture() -> Result<
     let required = SlotSpec {
         slot_id: SlotId::from_artifact(aid("slot-required")?),
         owner: OwnerId::from_artifact(aid("owner-required")?),
+        source_role: CampaignSourceRole::ArtifactProjection,
         target: target.clone(),
         requirement: SlotRequirement::Required,
         declared_members: vec![MemberId::from_artifact(aid("member-required")?)],
@@ -131,20 +392,24 @@ fn fixture() -> Result<
     let mut optional = required.clone();
     optional.slot_id = SlotId::from_artifact(aid("slot-optional")?);
     optional.owner = OwnerId::from_artifact(aid("owner-optional")?);
+    optional.source_role = CampaignSourceRole::MemoryProjection;
     optional.declared_members = vec![MemberId::from_artifact(aid("member-optional")?)];
     optional.requirement = SlotRequirement::Optional;
+    let (source_requirements, mut provenance) =
+        campaign_source_contract("work-unit-620", &binding)?;
     let mut recipe = LearningStateViewRecipe {
         recipe_id: aid("recipe-620")?,
         campaign_id: CampaignId::from_artifact(aid("campaign-620")?),
         target: target.clone(),
         binding: binding.clone(),
         slots: vec![required.clone(), optional.clone()],
+        source_requirements,
+        active_overlay_policy: CampaignActiveOverlayPolicy::ExplicitlyAbsentAllowed,
         freshness: eliot_evidence::EvidenceFreshness::ExactCandidate,
         privacy_class: "task-local".to_owned(),
         omission_policy: OmissionPolicy::RequiredSlots,
         canonical_digest: String::new(),
     };
-    recipe.seal()?;
     let member = MemberProjection {
         member_id: required.declared_members[0].clone(),
         owner: required.owner.clone(),
@@ -154,19 +419,22 @@ fn fixture() -> Result<
         value_digest: Some(digest("learning-value")),
         evidence: vec![aid("view-evidence")?],
     };
+    let slots = vec![SlotProjection {
+        slot_id: required.slot_id.clone(),
+        disposition: SlotDisposition::Current,
+        members: vec![member],
+        evidence: vec![aid("slot-evidence")?],
+    }];
+    bind_slot_source_contract(&mut recipe, &mut provenance, &slots)?;
     let mut view = CampaignLearningStateView {
-        view_id: aid("view-620")?,
+        view_id: aid("pending-campaign-learning-state-view")?,
         recipe_id: recipe.recipe_id.clone(),
         campaign_id: recipe.campaign_id.clone(),
         target: target.clone(),
         binding: binding.clone(),
         recipe_digest: recipe.canonical_digest.clone(),
-        slots: vec![SlotProjection {
-            slot_id: required.slot_id.clone(),
-            disposition: SlotDisposition::Current,
-            members: vec![member],
-            evidence: vec![aid("slot-evidence")?],
-        }],
+        provenance,
+        slots,
         denominator: SourceDenominator {
             declared: 2,
             observed: 1,
@@ -180,7 +448,7 @@ fn fixture() -> Result<
         invalidation_reason: None,
         canonical_digest: String::new(),
     };
-    view.seal()?;
+    view.seal_content_addressed()?;
     let proposed = ValueState {
         present: true,
         digest: Some(digest("proposal")),
@@ -223,7 +491,7 @@ fn fixture() -> Result<
     let mut overlay = CampaignHarnessOverlayCandidate {
         binding: binding.clone(),
         overlay_id: OverlayId::from_artifact(aid("overlay-620")?),
-        campaign_id: view.campaign_id.clone(),
+        campaign_id: CampaignId::from_artifact(aid("campaign-620")?),
         admission_receipt: None,
         revision: 1,
         supersedes: None,
@@ -254,14 +522,16 @@ fn fixture() -> Result<
         protected_surface_base_digest: digest("protected"),
         protected_surface_proposed_digest: digest("protected"),
         fixed_before_observation_discriminator: aid("overlay-fixed")?,
-        intended_mechanism: "assessment-mechanism".to_owned(),
-        prediction: "assessment-prediction".to_owned(),
-        expected_observable: "assessment-observable".to_owned(),
-        possible_regressions: "assessment-regressions".to_owned(),
-        confounders: "assessment-confounders".to_owned(),
-        preserved_success_constraint: "assessment-preserved".to_owned(),
-        next_discriminator_text: "assessment-next".to_owned(),
-        rollback_condition: "assessment-rollback".to_owned(),
+        intended_mechanism: "overlay-620 adds the task-local context proposal for target-620"
+            .to_owned(),
+        prediction: "target-620 carries the proposed task-local context digest".to_owned(),
+        expected_observable: "slot-required observes the proposed value digest".to_owned(),
+        possible_regressions: "the protected surface digest changes".to_owned(),
+        confounders: "no concurrent intervention is recorded for this candidate".to_owned(),
+        preserved_success_constraint: "protected surface base and proposed digests stay equal"
+            .to_owned(),
+        next_discriminator_text: "overlay-fixed".to_owned(),
+        rollback_condition: "the protected surface digest differs from its base".to_owned(),
         expires_at_ms: 2_000,
         invalidated: false,
         canonical_digest: String::new(),
@@ -308,6 +578,34 @@ fn policy_with_stages(stages: Vec<LifecycleStage>) -> AssessmentPolicy {
     policy
 }
 
+// The fixtures in this file supply no retrieval, delivery, observable-activation
+// or adherence evidence for an attempt. These are the honest "no evidence
+// observed" sections the receipt contract requires; every status guard is inert
+// for them, so the stage, dimension and causal-ceiling expectations asserted
+// below are unchanged by their presence.
+static FIXTURE_RETRIEVAL: RetrievalSection = RetrievalSection {
+    status: RetrievalStatus::Unknown,
+    expansion_or_tool_query_refs: Vec::new(),
+};
+static FIXTURE_DELIVERY: DeliverySection = DeliverySection {
+    status: DeliveryStatus::Missing,
+    packet_position: None,
+    serialized_digest: None,
+    bytes: None,
+    actual_tokens: None,
+};
+static FIXTURE_ACTIVATION: ActivationSection = ActivationSection {
+    status: ActivationStatus::NotObserved,
+    acknowledgement_ref: None,
+    observation_limit_reason: None,
+    first_qualifying_observable_use_ref: None,
+};
+static FIXTURE_ADHERENCE: AdherenceSection = AdherenceSection {
+    status: AdherenceStatus::Unknown,
+    early_mid_final_checkpoint_refs: Vec::new(),
+    prescribed_or_avoided_action_and_required_verifier_refs: Vec::new(),
+};
+
 #[allow(clippy::too_many_arguments)]
 fn make_input<'a>(
     view: &'a CampaignLearningStateView,
@@ -328,9 +626,6 @@ fn make_input<'a>(
     dimensions: &'a [DimensionAssessment],
     external_refs: &'a [ArtifactId],
 ) -> AssessmentInput<'a> {
-    let extra = default_extra620();
-    let empty_refs: &[ArtifactId] = &[];
-    let empty_strings: &[String] = &[];
     AssessmentInput {
         binding,
         target,
@@ -350,24 +645,24 @@ fn make_input<'a>(
         dimensions,
         external_review_refs: external_refs,
         policy,
-        compiled_view_ref: &extra.compiled_view_ref,
-        context_compiler_revision: extra.context_compiler_revision.as_str(),
-        render_profile_revision: extra.render_profile_revision.as_str(),
-        stable_harness_refs: empty_refs,
-        task_family_harness_refs: empty_refs,
-        skill_refs: empty_refs,
-        memory_refs: empty_refs,
-        procedure_refs: empty_refs,
+        compiled_view_ref: &view.view_id,
+        context_compiler_revision: "context-compiler-620",
+        render_profile_revision: "render-profile-620",
+        stable_harness_refs: &[],
+        task_family_harness_refs: &[],
+        skill_refs: &[],
+        memory_refs: &[],
+        procedure_refs: &[],
         preserved_success_ref: None,
         eligibility_and_retrieval_reason: None,
-        retrieval: &extra.retrieval,
-        delivery: &extra.delivery,
-        activation: &extra.activation,
-        adherence: &extra.adherence,
-        conflicts_suppression_or_compaction_loss: empty_refs,
-        downstream_refs: empty_refs,
-        receipt_completeness_and_missing_fields: empty_strings,
-        invalidation_expiry_and_missingness: empty_strings,
+        retrieval: &FIXTURE_RETRIEVAL,
+        delivery: &FIXTURE_DELIVERY,
+        activation: &FIXTURE_ACTIVATION,
+        adherence: &FIXTURE_ADHERENCE,
+        conflicts_suppression_or_compaction_loss: &[],
+        downstream_refs: &[],
+        receipt_completeness_and_missing_fields: &[],
+        invalidation_expiry_and_missingness: &[],
     }
 }
 
@@ -1988,7 +2283,7 @@ fn case_19_complete_target_member_stage_denominator() -> Result<(), Box<dyn std:
         observed: 2,
     };
     bad_view.canonical_digest.clear();
-    bad_view.seal()?;
+    bad_view.seal_content_addressed()?;
     let error = eliot_learning_activation_assessment::assess_learning_activation(&make_input(
         &bad_view,
         &delta,
@@ -3324,9 +3619,6 @@ fn case_39_evidence_next_step_owner_link_without_promotion()
     let (view, delta, overlay, binding, target, recipe) = fixture()?;
     let policy = base_policy();
     let empty: [StageObservation; 0] = [];
-    let extra39 = default_extra620();
-    let empty_refs39: &[ArtifactId] = &[];
-    let empty_strings39: &[String] = &[];
     let outcome =
         eliot_learning_activation_assessment::assess_learning_activation(&AssessmentInput {
             binding: &binding,
@@ -3347,24 +3639,24 @@ fn case_39_evidence_next_step_owner_link_without_promotion()
             dimensions: &[],
             external_review_refs: &[],
             policy: &policy,
-            compiled_view_ref: &extra39.compiled_view_ref,
-            context_compiler_revision: extra39.context_compiler_revision.as_str(),
-            render_profile_revision: extra39.render_profile_revision.as_str(),
-            stable_harness_refs: empty_refs39,
-            task_family_harness_refs: empty_refs39,
-            skill_refs: empty_refs39,
-            memory_refs: empty_refs39,
-            procedure_refs: empty_refs39,
+            compiled_view_ref: &view.view_id,
+            context_compiler_revision: "context-compiler-620",
+            render_profile_revision: "render-profile-620",
+            stable_harness_refs: &[],
+            task_family_harness_refs: &[],
+            skill_refs: &[],
+            memory_refs: &[],
+            procedure_refs: &[],
             preserved_success_ref: None,
             eligibility_and_retrieval_reason: None,
-            retrieval: &extra39.retrieval,
-            delivery: &extra39.delivery,
-            activation: &extra39.activation,
-            adherence: &extra39.adherence,
-            conflicts_suppression_or_compaction_loss: empty_refs39,
-            downstream_refs: empty_refs39,
-            receipt_completeness_and_missing_fields: empty_strings39,
-            invalidation_expiry_and_missingness: empty_strings39,
+            retrieval: &FIXTURE_RETRIEVAL,
+            delivery: &FIXTURE_DELIVERY,
+            activation: &FIXTURE_ACTIVATION,
+            adherence: &FIXTURE_ADHERENCE,
+            conflicts_suppression_or_compaction_loss: &[],
+            downstream_refs: &[],
+            receipt_completeness_and_missing_fields: &[],
+            invalidation_expiry_and_missingness: &[],
         })?;
     let AssessmentResultOrIncomplete::Incomplete(incomplete) = outcome else {
         return Err("expected incomplete".into());

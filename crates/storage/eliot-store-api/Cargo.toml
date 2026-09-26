@@ -11,9 +11,11 @@ base64.workspace = true
 eliot-contracts = { workspace = true }
 eliot-evidence = { workspace = true }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
+eliot-learning-contracts.workspace = true
 eliot-protocol = { workspace = true }
 eliot-receipts = { workspace = true }
 eliot-security-contracts = { workspace = true }
+eliot-reactive-context-plan = { path = "../../smart/eliot-reactive-context-plan", version = "0.1.0" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
