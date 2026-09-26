@@ -3937,7 +3937,7 @@ mod tests {
             fn reconciliation_imported(
                 &mut self,
                 _binding: &AttachBinding,
-                _result: &ReconciliationPortResult,
+                _result: &eliot_agent_bridge_core::ReconciliationPortResult,
             ) {
             }
         }
@@ -4343,7 +4343,7 @@ mod tests {
             fn reconciliation_imported(
                 &mut self,
                 _binding: &AttachBinding,
-                _result: &ReconciliationPortResult,
+                _result: &eliot_agent_bridge_core::ReconciliationPortResult,
             ) {
             }
         }

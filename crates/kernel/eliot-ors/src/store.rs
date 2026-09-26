@@ -217,6 +217,10 @@ const MAX_BRIDGE_EVENT_GAPS_PER_STREAM: usize = 256;
 /// with [`OrsError::ProjectionLimitExceeded`] (typed backpressure), never
 /// with silent loss or an unbounded index.
 const MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE: usize = 4096;
+// `event_id` is bounded by `validate_text` to 1,024 UTF-8 bytes. JSON may
+// escape each input byte as six bytes, and `{"event_id":""}` contributes
+// 15 fixed bytes (field name, quotes, colon, and object delimiters).
+const MAX_BRIDGE_POSITION_RECORD_BYTES: usize = 15 + 6 * 1_024;
 const MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE: usize = 4;
 const MAX_BRIDGE_RECOVERY_WINDOWS: usize = 64;
 const MAX_BRIDGE_RECOVERY_CUTS: usize = 4096;
@@ -12238,13 +12242,16 @@ impl RedbRecoveryStore {
         Ok(response)
     }
 
-    /// Streams one namespace's #2730 ordered position range and accounts its
-    /// count and encoded key/value bytes (issue #2731, item 4). Each row's
-    /// decoded value and canonical namespace/sequence key are validated; no
-    /// rows are collected. Read-only — positions are owned, written, and
-    /// capped by #2730/#2885 and are never mutated here. Called by
-    /// [`Self::bridge_capacity_accounting_for`]; kept separate so the
-    /// inventory stays within its line budget.
+    /// Counts one namespace's #2730 ordered position rows with their total
+    /// encoded bytes (issue #2731, item 4): key bytes plus serialized-record
+    /// bytes, the accountable persisted size. Read-only — positions are
+    /// owned, written, and capped by #2730/#2885 and are never mutated
+    /// here. The namespace key range bounds the inspected row count at
+    /// [`MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE`]; legacy overflow fails
+    /// with [`OrsError::ProjectionLimitExceeded`] instead of returning a
+    /// partial count. Serialized values are size-checked before decoding.
+    /// Called by [`Self::bridge_capacity_accounting_for`]; kept separate so
+    /// the inventory stays within its line budget.
     fn bridge_position_accounting_for(
         read: &redb::ReadTransaction,
         namespace: &str,
@@ -12270,6 +12277,12 @@ impl RedbRecoveryStore {
                     reason: "position key does not match its exact namespace and sequence"
                         .to_owned(),
                 });
+            }
+            if positions >= MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE as u64 {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            if value.value().len() > MAX_BRIDGE_POSITION_RECORD_BYTES {
+                return Err(OrsError::ProjectionLimitExceeded);
             }
             let position: BridgeEventPosition = decode(value.value())?;
             position.validate()?;

@@ -3862,11 +3862,13 @@ impl KernelComposition {
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
         });
-        let pure_read = scope.recovery_scope.is_some() || scope.consumed.is_empty();
+        let pure_read = scope.recovery_scope.is_some();
         // Resolve every consumed entry to its admitted namespace before
         // mutating: any foreign, stale, or ambiguous item rejects the
-        // whole scope with nothing changed. An open read with no consumed
-        // frontiers is also pure and does not run handoff maintenance.
+        // whole scope with nothing changed. An explicit continuation read
+        // remains mutation-free and does not run handoff maintenance. An
+        // ordinary reconcile with no consumed entries still reaches owner
+        // maintenance for its presented namespace inventory.
         let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
         let mut batch_namespaces: Vec<(String, String, u64, u64, u64)> =
             Vec::with_capacity(scope.consumed.len());
@@ -3930,7 +3932,12 @@ impl KernelComposition {
                 live_generation,
                 scope.recovery_scope.as_ref(),
             )
-            .map_err(|_| TransportError::SessionFenced)?;
+            .map_err(|error| match error {
+                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                    TransportError::Backpressure
+                }
+                _ => TransportError::SessionFenced,
+            })?;
         reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
         reconciliation["live_generation"] = serde_json::Value::from(live_generation);
         reconciliation["reconcile_key_version"] = serde_json::Value::from(1_u64);
