@@ -6,7 +6,9 @@
 //! capture route reuses [`CaptureRoute`]. Only material without an existing
 //! owner is defined here: source modality, per-property modality status,
 //! type-relative identity hypotheses, the before/after state diff, the
-//! continuity observation itself, and the fail-closed ingestion rules.
+//! continuity observation itself, the workflow continuity material behind the
+//! I12.35 `WorkflowStateView` clauses `artifact lineage` and `unresolved
+//! representation gaps`, and the fail-closed ingestion rules.
 //!
 //! A [`ContinuityObservation`] preserves continuity across code, documents,
 //! images, audio/video, GUI state, services and professional workflows
@@ -48,6 +50,11 @@ pub const MAX_CONTRARY_EVIDENCE: usize = 16;
 /// allocation guard on a deserialized list, while repeated kinds inside one
 /// list are refused separately as malformed rather than as oversized.
 pub const MAX_TRANSFORM_KINDS: usize = 8;
+/// Maximum artifact lineage hops carried by one workflow continuity record.
+pub const MAX_ARTIFACT_LINEAGE: usize = 32;
+/// Maximum unresolved representation gaps carried by one workflow continuity
+/// record.
+pub const MAX_WORKFLOW_REPRESENTATION_GAPS: usize = 32;
 
 /// Validation and ingestion failures at the continuity boundary.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -94,6 +101,19 @@ pub enum ContinuityError {
     /// A degraded, unknown, or derived property has no loss warning.
     #[error("degraded, unknown, or derived material requires a loss warning")]
     MissingLossWarning,
+    /// An artifact lineage hop rests only on filename or similarity evidence.
+    #[error("artifact lineage identity rests only on filename or similarity evidence")]
+    LineageIdentityWithoutProof {
+        /// Subject whose lineage is unproven.
+        subject: String,
+    },
+    /// An unresolved representation gap claims a status its evidence cannot
+    /// support.
+    #[error("unresolved representation gap claims a status its evidence cannot support")]
+    UnsupportedGapStatus {
+        /// Subject whose gap is unsupported.
+        subject: String,
+    },
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ContinuityError> {
@@ -709,6 +729,222 @@ pub fn admit_continuity_observation(
     observation: &ContinuityObservation,
 ) -> Result<(), ContinuityError> {
     observation.validate()
+}
+
+/// One governed workflow step reference.
+///
+/// The step is the anchor the projection owner binds a
+/// [`WorkflowStateView`] against, so it is typed here rather than carried as
+/// free text.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStepRef {
+    /// Workflow the step belongs to.
+    pub workflow_id: String,
+    /// Step identity inside that workflow.
+    pub step_id: String,
+}
+
+impl WorkflowStepRef {
+    fn validate(&self) -> Result<(), ContinuityError> {
+        text(&self.workflow_id, "step.workflow_id")?;
+        text(&self.step_id, "step.step_id")
+    }
+}
+
+/// Where one artifact lineage hop's identity comes from.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LineageProvenance {
+    /// The hop rests on an admitted identity hypothesis.
+    IdentityHypothesis,
+    /// The owning workflow step declared the hop without a hypothesis.
+    DeclaredByStep,
+}
+
+/// One hop of the artifact lineage a workflow position depends on.
+///
+/// A hop asserts that one artifact came from another, which is exactly the
+/// continuity claim I12.35 admits no filename or semantic similarity for, so
+/// the hop names the hypothesis it rests on and the basis of that hypothesis.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactLineageEntry {
+    /// Subject the hop is about.
+    pub subject_ref: String,
+    /// Which kind of identity the hop speaks about.
+    pub subject_kind: IdentityKind,
+    /// Predecessor the subject was produced from.
+    pub predecessor_ref: String,
+    /// Transform relating the predecessor to the subject.
+    pub relation: ContinuityTransformKind,
+    /// Admitted hypothesis the hop rests on, when one was proven.
+    pub hypothesis_id: Option<String>,
+    /// Where the hop's identity comes from.
+    pub provenance: LineageProvenance,
+    /// Basis of the admitted hypothesis; absent for a step-declared hop.
+    pub basis: Option<IdentityBasis>,
+}
+
+impl ArtifactLineageEntry {
+    fn validate(&self) -> Result<(), ContinuityError> {
+        text(&self.subject_ref, "artifact_lineage.subject_ref")?;
+        text(&self.predecessor_ref, "artifact_lineage.predecessor_ref")?;
+        if let Some(hypothesis) = &self.hypothesis_id {
+            text(hypothesis, "artifact_lineage.hypothesis_id")?;
+        }
+        Ok(())
+    }
+}
+
+/// One unresolved representation gap a workflow position does not resolve.
+///
+/// A gap is a property the record does not settle, so it carries the admitted
+/// status of that property while the gap stands together with the loss warning
+/// the gap itself is.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepresentationGap {
+    /// Subject whose representation is unresolved.
+    pub subject_ref: String,
+    /// Property the representation does not settle.
+    pub property: String,
+    /// Modality the property belongs to.
+    pub modality: SourceModality,
+    /// Admitted status of that property while the gap stands.
+    pub property_status: ModalityPropertyStatus,
+    /// Competent evaluator behind a partial measurement, if any.
+    pub evaluator: Option<EvaluatorRef>,
+    /// Warning recorded for the unresolved representation.
+    pub loss_warning: String,
+}
+
+impl RepresentationGap {
+    fn validate(&self) -> Result<(), ContinuityError> {
+        text(&self.subject_ref, "representation_gaps.subject_ref")?;
+        text(&self.property, "representation_gaps.property")?;
+        text(&self.loss_warning, "representation_gaps.loss_warning")?;
+        if let Some(evaluator) = &self.evaluator {
+            evaluator.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Observation-owner continuity material for a governed workflow state view.
+///
+/// Field-to-owner mapping: the projection owner
+/// (`eliot_memory_projection_contracts::WorkflowStateView`) carries the
+/// bounded read shape, and this record supplies the evidence the observation
+/// owner governs for the two I12.35 view clauses that are continuity claims
+/// rather than workflow bookkeeping, `artifact lineage` and `unresolved
+/// representation gaps`, plus the typed step identity that anchors the record
+/// to the view's current or previous step. It duplicates no view field and
+/// adds no second canonical record family.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowContinuity {
+    /// Workflow the record belongs to.
+    pub workflow_id: String,
+    /// Workflow step the record belongs to.
+    pub step: WorkflowStepRef,
+    /// Artifact lineage the workflow position depends on.
+    pub artifact_lineage: Vec<ArtifactLineageEntry>,
+    /// Representation gaps the workflow position does not resolve.
+    pub unresolved_representation_gaps: Vec<RepresentationGap>,
+}
+
+impl WorkflowContinuity {
+    /// Validates shape, bounds, and the fail-closed continuity rules: no
+    /// lineage hop may rest on filename or similarity evidence alone, and no
+    /// unresolved gap may claim a status its evidence cannot support.
+    pub fn validate(&self) -> Result<(), ContinuityError> {
+        text(&self.workflow_id, "workflow_continuity.workflow_id")?;
+        self.step.validate()?;
+        // The step anchor names its own workflow, so a record that points at
+        // one workflow while anchored in another would bind to no view at all.
+        if self.step.workflow_id != self.workflow_id {
+            return Err(ContinuityError::InvalidField {
+                field: "workflow_continuity.step.workflow_id",
+                reason: "must equal workflow_continuity.workflow_id",
+            });
+        }
+        if self.artifact_lineage.len() > MAX_ARTIFACT_LINEAGE {
+            return Err(ContinuityError::Bounds {
+                field: "workflow_continuity.artifact_lineage",
+            });
+        }
+        for entry in &self.artifact_lineage {
+            entry.validate()?;
+            check_lineage_provenance(entry)?;
+        }
+        if self.unresolved_representation_gaps.len() > MAX_WORKFLOW_REPRESENTATION_GAPS {
+            return Err(ContinuityError::Bounds {
+                field: "workflow_continuity.unresolved_representation_gaps",
+            });
+        }
+        for gap in &self.unresolved_representation_gaps {
+            gap.validate()?;
+            check_gap_status(gap)?;
+        }
+        Ok(())
+    }
+}
+
+/// Refuses an artifact lineage hop that no proven hypothesis stands behind.
+///
+/// A hop is a continuity claim, and I12.35 admits none on filename or
+/// semantic similarity, so a hop whose only basis is a weak hint is the silent
+/// merge the canon forbids. A hop the owning step declared without a
+/// hypothesis is admitted as the weaker statement it is, and may not be
+/// dressed as an identity proof: it carries neither hypothesis nor basis.
+fn check_lineage_provenance(entry: &ArtifactLineageEntry) -> Result<(), ContinuityError> {
+    if matches!(entry.provenance, LineageProvenance::DeclaredByStep) {
+        if entry.hypothesis_id.is_some() || entry.basis.is_some() {
+            return Err(ContinuityError::InvalidField {
+                field: "workflow_continuity.artifact_lineage",
+                reason: "a step-declared hop carries neither hypothesis nor basis",
+            });
+        }
+        return Ok(());
+    }
+    if entry.hypothesis_id.is_none() {
+        return Err(ContinuityError::LineageIdentityWithoutProof {
+            subject: entry.subject_ref.clone(),
+        });
+    }
+    match entry.basis {
+        Some(basis) if !basis.is_weak() => Ok(()),
+        _ => Err(ContinuityError::LineageIdentityWithoutProof {
+            subject: entry.subject_ref.clone(),
+        }),
+    }
+}
+
+/// Refuses an unresolved representation gap whose status its evidence cannot
+/// support.
+///
+/// A gap is by definition a property the record does not resolve, so
+/// `Measured` on one is a false proof claim. `Degraded` claims a competent
+/// evaluator measured partially, so it must name an evaluator competent in the
+/// gap's own modality; without one the honest status is `Unknown`, which
+/// [`assess_modality_property`] already draws.
+fn check_gap_status(gap: &RepresentationGap) -> Result<(), ContinuityError> {
+    if matches!(gap.property_status, ModalityPropertyStatus::Measured) {
+        return Err(ContinuityError::UnsupportedGapStatus {
+            subject: gap.subject_ref.clone(),
+        });
+    }
+    if matches!(gap.property_status, ModalityPropertyStatus::Degraded) {
+        let competent =
+            matches!(gap.evaluator.as_ref(), Some(evaluator) if evaluator.modality == gap.modality);
+        if !competent {
+            return Err(ContinuityError::UnsupportedGapStatus {
+                subject: gap.subject_ref.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
