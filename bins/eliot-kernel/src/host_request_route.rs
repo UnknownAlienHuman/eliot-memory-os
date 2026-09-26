@@ -85,8 +85,8 @@ const HOST_REQUEST_OPERATION_ID_PREFIX: &str = "hostreq:";
 ///
 /// Names follow the `agent_activation_*` daemon-operation style. The payload
 /// carries the exact envelope under `envelope` (plus the exact admission
-/// receipt under `receipt` for rehydrate); the operation string only selects
-/// which closed entry — admit, cancel, reconcile, or rehydrate — consumes it.
+/// receipt under `receipt` for rehydrate, or the typed resolve query under
+/// `query` for resolve); the operation string only selects which closed entry — admit, cancel, reconcile, rehydrate, or resolve — consumes it.
 /// There is no generic JSON command dispatch: the envelope is decoded as the
 /// typed [`HostRequestEnvelope`] (with its canonical digest check) and the
 /// envelope kind is re-enforced by the callee.
@@ -94,6 +94,18 @@ pub(crate) const AGENT_HOST_REQUEST_SUBMIT_OPERATION: &str = "agent_host_request
 pub(crate) const AGENT_HOST_REQUEST_CANCEL_OPERATION: &str = "agent_host_request_cancel";
 pub(crate) const AGENT_HOST_REQUEST_RECONCILE_OPERATION: &str = "agent_host_request_reconcile";
 pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydrate";
+/// Closed lookup-only resolve entry (issue #2571: cross-restart replay
+/// without double execution).
+///
+/// Carries the exact current-transport resolve envelope (always the
+/// observation-only `Status` kind) plus the typed resolve query under
+/// `query` (`logical-key` or `operation-handle` form). The entry never
+/// stages a row, issues a receipt, advances state, or runs provider work: it
+/// answers the durable record in the existing rehydrated shape on a hit, or
+/// an explicit `accepted:false` resolve value (`absent` or `conflict`)
+/// otherwise. A `Status` envelope without a parent is accepted on this entry
+/// only; every other entry keeps the exact-parent rule.
+pub(crate) const AGENT_HOST_REQUEST_RESOLVE_OPERATION: &str = "agent_host_request_resolve";
 /// Closed invoke-read entry for local reads (Implements #18: local read result).
 ///
 /// Carries the exact envelope plus the exact canonical tool bytes it admits,
@@ -145,6 +157,7 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_CANCEL_OPERATION
             | AGENT_HOST_REQUEST_RECONCILE_OPERATION
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
+            | AGENT_HOST_REQUEST_RESOLVE_OPERATION
             | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
             | AGENT_BRIDGE_EVENT_FORWARD_OPERATION
             | AGENT_BRIDGE_HOOK_FORWARD_OPERATION
@@ -380,9 +393,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
         };
         let stored = self
-            .generation_gateway
-            .ors
-            .stage_host_request(&requested)
+            .stage_host_request_with_logical_claim(&requested)
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
                 _ => TransportError::SessionFenced,
@@ -442,6 +453,33 @@ impl KernelComposition {
 
         self.note_host_request_operation_under_transition(envelope)?;
         Ok((admission_receipt, admitted))
+    }
+
+    /// Stages one `Requested` host-request row, claiming its logical key when
+    /// it carries one (issue #2571: the production logical-key writer).
+    ///
+    /// Records with a canonical logical key (session-bound `Invocation` or
+    /// `Cancellation`) go through the owner's atomic resolve-or-stage entry,
+    /// so the key claim and the operation row commit in one write
+    /// transaction: the first stage wins, an exact replay returns the winner
+    /// unchanged, and a changed commitment under a known key fails as an
+    /// identity conflict. Records without a key (every other kind, or a
+    /// missing session) keep the legacy stage path unchanged. A winner
+    /// reached under a different operation identity fails closed through the
+    /// advance join in the admit path, which only ever advances the
+    /// presented identity.
+    fn stage_host_request_with_logical_claim(
+        &self,
+        requested: &HostRequestRecord,
+    ) -> Result<HostRequestRecord, OrsError> {
+        let keyed = RedbRecoveryStore::host_request_logical_key_for_record(requested)?.is_some();
+        if keyed {
+            self.generation_gateway
+                .ors
+                .resolve_or_stage_host_request(requested)
+        } else {
+            self.generation_gateway.ors.stage_host_request(requested)
+        }
     }
 
     /// Admits one Watchdog spool intent batch through the fenced named Kernel
@@ -808,6 +846,128 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         Ok(stored)
+    }
+
+    /// Resolves one logical host request or one exact operation handle
+    /// without staging or dispatch (issue #2571).
+    ///
+    /// Lookup-only recovery read for a restarted Bridge: the presenting
+    /// resolve envelope is current transport (connection, session, fence,
+    /// descriptor), never the recovered operation's authority, so no receipt
+    /// is issued, no state is advanced, and no provider work runs. A `Status`
+    /// envelope without a parent is accepted on this entry only; the admit
+    /// path keeps its exact-parent rule untouched.
+    ///
+    /// The `logical-key` form carries the presented key plus the occurrence,
+    /// capability, and payload selectors: a store miss answers authoritatively
+    /// absent, a hit whose winner recomputes to the presented key and matches
+    /// every selector answers the durable record in the rehydrated shape with
+    /// the key echo, and a hit under a changed commitment answers conflict.
+    /// A divergent link or any storage failure fails closed as
+    /// `SessionFenced` — never absence, never a fresh-operation permit. The
+    /// `operation-handle` form loads the exact handle and checks session
+    /// continuity and current generation rights; denial answers exactly like
+    /// absence so no foreign task or payload is disclosed.
+    fn resolve_host_request_by_logical_key(
+        &self,
+        envelope: &HostRequestEnvelope,
+        query: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        if envelope.kind != HostRequestKind::Status {
+            return Err(TransportError::SessionFenced);
+        }
+        let (descriptor, _) = self.host_request_connection_gate_under_transition(envelope)?;
+        self.host_request_service_gate(&descriptor, envelope)?;
+        {
+            let profile = self
+                .agent_bridge_profile
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .clone()
+                .ok_or(TransportError::SessionFenced)?;
+            if envelope.descriptor_sha256 != profile.admission.descriptor_sha256
+                || envelope.state_fence != profile.admission.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let session = envelope
+            .identity
+            .session_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let object = query.as_object().ok_or(TransportError::SessionFenced)?;
+        match object.get("form").and_then(serde_json::Value::as_str) {
+            Some("logical-key") => {
+                if envelope.identity.parent_operation_id.is_some() {
+                    return Err(TransportError::SessionFenced);
+                }
+                let key = resolve_digest_field(object, "logical_key")?;
+                let occurrence = resolve_text_field(object, "occurrence")?;
+                let capability = resolve_text_field(object, "capability")?;
+                let payload = resolve_digest_field(object, "payload_digest")?;
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request_by_logical_key(&key)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(record) = stored else {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "absent",
+                        Some(&key),
+                        None,
+                    ));
+                };
+                let recomputed = RedbRecoveryStore::host_request_logical_key_for_record(&record)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                if recomputed != key {
+                    return Err(TransportError::SessionFenced);
+                }
+                if record.request_id.as_str() != occurrence
+                    || record.capability_ref.as_str() != capability
+                    || record.payload_digest != payload
+                    || record.session_ref.as_ref().map(OpaqueLabel::as_str)
+                        != Some(session.as_str())
+                {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "conflict",
+                        Some(&key),
+                        None,
+                    ));
+                }
+                Ok(host_request_resolved_response(&record, Some(&key)))
+            }
+            Some("operation-handle") => {
+                let handle = resolve_text_field(object, "operation_handle")?;
+                if envelope.identity.parent_operation_id.as_deref() != Some(handle.as_str()) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let (operation, digest) = resolve_handle_key(&handle)?;
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation, &digest)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(record) = stored else {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "absent", None, None,
+                    ));
+                };
+                if record.session_ref.as_ref().map(OpaqueLabel::as_str) != Some(session.as_str())
+                    || require_current_generation_parent(&record, &descriptor).is_err()
+                {
+                    return Ok(host_request_resolve_unresolved_response(
+                        "absent", None, None,
+                    ));
+                }
+                let logical = RedbRecoveryStore::host_request_logical_key_for_record(&record)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(host_request_resolved_response(&record, logical.as_deref()))
+            }
+            _ => Err(TransportError::SessionFenced),
+        }
     }
 
     /// Fences every indexed host request after a bridge profile promotion.
@@ -2015,6 +2175,13 @@ impl KernelComposition {
                 let record = self.rehydrate_host_request(&envelope, &receipt)?;
                 host_request_rehydrated_response(&record)
             }
+            AGENT_HOST_REQUEST_RESOLVE_OPERATION => {
+                let query = payload
+                    .get("query")
+                    .cloned()
+                    .ok_or(TransportError::SessionFenced)?;
+                self.resolve_host_request_by_logical_key(&envelope, &query)?
+            }
             AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
                 let tool = host_request_tool_from_payload(&payload)?;
                 let (receipt, record) = self.invoke_read_host_request(&envelope, &tool)?;
@@ -3203,6 +3370,119 @@ pub(crate) fn host_request_rehydrated_response(record: &HostRequestRecord) -> se
         },
         "recovery": null,
     })
+}
+
+/// Typed answer for an owner-resolved host request (issue #2571).
+///
+/// The rehydrated shape — the original handle plus the full durable record
+/// with its original digest — with the queried logical key echoed beside it,
+/// so the bridge can verify the returned commitment before adopting the
+/// handle, state, or result. No new receipt is issued and no state advances.
+pub(crate) fn host_request_resolved_response(
+    record: &HostRequestRecord,
+    logical_key: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "accepted": true,
+        "operation_id": record.operation_id.as_str(),
+        "record": record,
+    });
+    if let Some(key) = logical_key {
+        value["logical_key"] = serde_json::Value::String(key.to_owned());
+    }
+    serde_json::json!({
+        "status": "known",
+        "value": value,
+        "recovery": null,
+    })
+}
+
+/// Typed answer when the resolve entry proves absence or conflict
+/// (issue #2571).
+///
+/// `accepted:false` with the closed `resolve` disposition (`absent`: no
+/// operation was ever staged under this key; `conflict`: the key is bound
+/// to a different commitment). The queried logical key is echoed when the
+/// query carried one; the handle form echoes nothing, so denial stays
+/// indistinguishable from absence.
+pub(crate) fn host_request_resolve_unresolved_response(
+    disposition: &str,
+    logical_key: Option<&str>,
+    operation_handle: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "accepted": false,
+        "resolve": disposition,
+    });
+    if let Some(key) = logical_key {
+        value["logical_key"] = serde_json::Value::String(key.to_owned());
+    }
+    if let Some(handle) = operation_handle {
+        value["operation_handle"] = serde_json::Value::String(handle.to_owned());
+    }
+    serde_json::json!({
+        "status": "known",
+        "value": value,
+        "recovery": null,
+    })
+}
+
+/// Extracts validated non-blank resolve selector text.
+///
+/// Blank or control-bearing selectors fail closed: a confused selector must
+/// never address another request's history.
+fn resolve_text_field(
+    query: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<String, TransportError> {
+    let text = query
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(text.to_owned())
+}
+
+/// Extracts one validated lowercase SHA-256 resolve digest.
+///
+/// Keys, payload commitments, and handle digests are fixed-size digests;
+/// anything else fails closed before any store lookup.
+fn resolve_digest_field(
+    query: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<String, TransportError> {
+    let digest = resolve_text_field(query, field)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(digest)
+}
+
+/// Splits one exact operation handle into its ORS key.
+///
+/// The handle deterministically carries the admitted envelope digest after
+/// the prefix; the digest is re-validated before any lookup so a malformed
+/// reference answers absent rather than fencing.
+fn resolve_handle_key(handle: &str) -> Result<(OperationIdentity, String), TransportError> {
+    let digest = handle
+        .strip_prefix(HOST_REQUEST_OPERATION_ID_PREFIX)
+        .ok_or(TransportError::SessionFenced)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let operation =
+        OperationIdentity::new(handle.to_owned()).map_err(|_| TransportError::SessionFenced)?;
+    Ok((operation, digest.to_owned()))
 }
 
 /// Closed EBP route identity for one Watchdog spool intent batch.
