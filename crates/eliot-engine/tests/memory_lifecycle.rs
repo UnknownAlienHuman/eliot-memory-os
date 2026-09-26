@@ -387,6 +387,7 @@ fn l0_fixture() -> RecallL0Response {
         memory_confidence: eliot_types::MemoryConfidence::Found,
         query_mode: "fixture".to_owned(),
         rank_trace: eliot_types::L0RankTrace::default(),
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: TruncationInfo {
             truncated: false,
             limit: 3,

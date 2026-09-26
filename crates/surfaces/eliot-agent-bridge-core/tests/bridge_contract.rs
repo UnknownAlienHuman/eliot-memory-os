@@ -1611,6 +1611,7 @@ fn recall_projection_is_bounded_handles_first_with_receipt_and_trace_handle()
             feature_scores: scores,
             ..Default::default()
         },
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: TruncationInfo {
             truncated: false,
             limit: 12,
@@ -1679,6 +1680,7 @@ fn recall_projection_rejects_forged_disposition_and_hides_suppressed_content()
             ],
             ..Default::default()
         },
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: TruncationInfo {
             truncated: false,
             limit: 12,
@@ -1730,6 +1732,7 @@ fn recall_projection_reports_stale_projection_and_empty_corpus_with_bound_receip
             candidates_returned: 0,
             ..Default::default()
         },
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: TruncationInfo {
             truncated: false,
             limit: 12,
@@ -1771,6 +1774,7 @@ fn recall_projection_reports_stale_projection_and_empty_corpus_with_bound_receip
             normalized_query: "recall".to_owned(),
             ..Default::default()
         },
+        conflict: eliot_types::RecallConflictObservation::default(),
         truncation: TruncationInfo {
             truncated: false,
             limit: 12,
