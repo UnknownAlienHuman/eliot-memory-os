@@ -219,6 +219,55 @@ const BRIDGE_EVENT_HANDOFF_HANDED_OFF: &str = "handed_off";
 /// Handoff state once the event reconcile entry binds the row to a
 /// reconciliation key at or past its sequence.
 const BRIDGE_EVENT_HANDOFF_RECONCILED: &str = "reconciled";
+/// Durable bridge-stream owner bindings (issue #2729): one authenticated
+/// owner binding per admitted stream namespace plus one per unscoped-gap
+/// reporter occurrence. Keyed by the versioned namespace digest; the row
+/// carries the full binding (installation/authority lineage, principal,
+/// producer, creating session occurrence, stream incarnation) and its
+/// revision. The last-staging connection stays observation metadata on the
+/// cursor/event rows only — never scope material here.
+const BRIDGE_STREAM_OWNERS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_stream_owners_v1");
+/// Owner-namespace domain for admitted event streams (issue #2729).
+///
+/// The namespace binds, in order: this literal, the authority lineage, the
+/// Kernel-observed principal, the admitted producer, and the local stream
+/// name. Connection, deadline, fence, epoch sequence, and generation are
+/// transport/era binding and are never key material: the recovery transport
+/// carries its own current identity while the recovered stream keeps its
+/// original one (mirrors the #2571 logical-key rule).
+const BRIDGE_STREAM_OWNER_NAMESPACE: &str = "eliot.bridge-event.stream-owner.v1";
+/// Owner-namespace domain for connection-level (unscoped) coverage gaps
+/// (issue #2729). Binds this literal, the authority lineage, and the
+/// Kernel-observed principal, with the producer and stream slots fixed to
+/// the explicit unbound marker: the gap has its own admitted
+/// producer/session occurrence even when no stream is known, namespaced
+/// through that owner's explicit continuity rather than a bare global gap
+/// ID or a fabricated task.
+const BRIDGE_GAP_OWNER_NAMESPACE: &str = "eliot.bridge-event.gap-owner.v1";
+/// Version of the bridge-stream owner binding carried by every owner row.
+const BRIDGE_STREAM_OWNER_VERSION: u16 = 1;
+/// Incarnation assigned at the first admitted bind of a stream namespace.
+/// Re-creation under a new incarnation belongs to retention/recreation
+/// (#2731), which owns no writer here: the store assigns this value, never
+/// the caller.
+const BRIDGE_STREAM_OWNER_INITIAL_INCARNATION: u64 = 1;
+/// Revision assigned at the first admitted bind of a stream namespace.
+/// Expected-revision checks in the acknowledgement batch detect an owner
+/// change between resolution and commit.
+const BRIDGE_STREAM_OWNER_INITIAL_REVISION: u64 = 1;
+/// Owner-row kind for an admitted event stream namespace.
+const BRIDGE_STREAM_OWNER_KIND_STREAM: &str = "stream";
+/// Owner-row kind for an unscoped-gap reporter occurrence namespace.
+const BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP: &str = "unscoped-gap";
+/// Maximum bound owner namespaces. Mirrors the bridge-event record bound:
+/// breach fails with [`OrsError::ProjectionLimitExceeded`] (typed
+/// backpressure), never with silent loss of ownership state.
+const MAX_BRIDGE_STREAM_OWNERS: usize = 2048;
+/// Maximum acknowledgement items applied by one owner-checked batch.
+/// Mirrors the reconcile consumed-frontier bound so one batch never exceeds
+/// what one reconcile frame may present.
+const MAX_BRIDGE_ACK_BATCH: usize = 1024;
 
 /// One durably staged bridge-forwarded event (issue #2561).
 ///
@@ -252,6 +301,13 @@ struct BridgeEventRow {
     staging_connection: String,
     staged_at_ms: u64,
     phase: String,
+    /// Versioned owner namespace digest binding this event to its admitted
+    /// stream owner (issue #2729). Empty on rows staged before owner
+    /// binding existed: such legacy rows validate as before and stay
+    /// preserved, but owner-checked reads never select them, so they are
+    /// neither silently adopted nor deleted.
+    #[serde(default)]
+    owner_namespace: String,
     #[serde(default)]
     transport_hash: String,
     #[serde(default)]
@@ -301,6 +357,9 @@ impl BridgeEventRow {
                 field: "phase",
                 reason: "staged bridge events persist the DURABLE phase",
             });
+        }
+        if !self.owner_namespace.is_empty() {
+            crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
         }
         self.validate_privacy()
     }
@@ -412,6 +471,12 @@ struct BridgeEventCursorRow {
     last_acked_sequence: u64,
     last_staging_connection: String,
     last_producer_generation: u64,
+    /// Versioned owner namespace digest this cursor belongs to (issue
+    /// #2729). Empty on legacy rows; owner-checked cursors carry their
+    /// namespace and are keyed by it. The staging connection/generation
+    /// above stay observation metadata only — never scope material.
+    #[serde(default)]
+    owner_namespace: String,
 }
 
 impl BridgeEventCursorRow {
@@ -425,6 +490,9 @@ impl BridgeEventCursorRow {
                 field: "last_acked_sequence",
                 reason: "acked cursor must never pass the durable cursor",
             });
+        }
+        if !self.owner_namespace.is_empty() {
+            crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
         }
         Ok(())
     }
@@ -453,6 +521,12 @@ struct BridgeEventGapRow {
     reason_ref: String,
     staging_connection: String,
     recorded_at_ms: u64,
+    /// Versioned owner namespace digest this gap is visible under (issue
+    /// #2729): the stream namespace for scoped gaps, the reporter-occurrence
+    /// namespace for unscoped gaps. Empty on legacy rows, which stay
+    /// preserved but invisible to owner-checked recovery.
+    #[serde(default)]
+    owner_namespace: String,
 }
 
 impl BridgeEventGapRow {
@@ -484,6 +558,9 @@ impl BridgeEventGapRow {
         }
         crate::model::validate_text(&self.reason_ref, "reason_ref")?;
         crate::model::validate_text(&self.staging_connection, "staging_connection")?;
+        if !self.owner_namespace.is_empty() {
+            crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        }
         Ok(())
     }
 }
@@ -523,6 +600,11 @@ struct BridgeEventHandoffRow {
     reconcile_key: String,
     #[serde(default)]
     reconciled_at_ms: u64,
+    /// Versioned owner namespace digest this handoff belongs to (issue
+    /// #2729). Empty on legacy rows; owner-checked handoffs carry their
+    /// stream namespace and are keyed by it.
+    #[serde(default)]
+    owner_namespace: String,
 }
 
 impl BridgeEventHandoffRow {
@@ -564,6 +646,9 @@ impl BridgeEventHandoffRow {
                 });
             }
         }
+        if !self.owner_namespace.is_empty() {
+            crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        }
         Ok(())
     }
 }
@@ -574,6 +659,230 @@ impl persistence_codec::PersistedValue for BridgeEventHandoffRow {
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
     }
+}
+
+/// Validates one owner-namespace key component (issue #2729).
+///
+/// Components are non-blank, control-free, bounded text that never equals
+/// the explicit unbound marker, so a real binding can never collide with
+/// admitted unbound-capture state (mirrors the #2571 logical-key rule).
+/// The `\x1f`-labeled digest encoding stays unambiguous because
+/// `validate_text` already refuses control characters; no ad-hoc
+/// concatenation is improvised.
+fn bridge_owner_component(value: &str, field: &'static str) -> Result<(), OrsError> {
+    crate::model::validate_text(value, field)?;
+    if value == HOST_REQUEST_UNBOUND_MARKER {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner binding components must not equal the unbound marker",
+        });
+    }
+    Ok(())
+}
+
+/// One authenticated bridge-stream owner binding (issue #2729).
+///
+/// Retained at the first admitted bind of a stream namespace — or of an
+/// unscoped-gap reporter occurrence — through the existing Kernel owner:
+/// the binding names the authority lineage, the Kernel-observed principal,
+/// the admitted producer, the local stream (or the explicit unbound marker
+/// for connection-level gaps), the stream incarnation, and the creating
+/// session occurrence. The last-staging connection is observation metadata
+/// on the cursor/event rows, never scope material here. Rows are immutable
+/// once written in this scope: incarnation and revision are assigned by
+/// the store, never by the caller, so an expected-owner/revision check
+/// detects any owner change between resolution and commit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeStreamOwnerRow {
+    contract_version: u16,
+    owner_version: u16,
+    namespace: String,
+    kind: String,
+    local_stream: String,
+    authority_lineage: String,
+    principal: String,
+    producer: String,
+    creating_connection: String,
+    creating_launch_nonce: String,
+    creating_session_epoch: u64,
+    incarnation: u64,
+    revision: u64,
+    created_at_ms: u64,
+}
+
+impl BridgeStreamOwnerRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if self.owner_version != BRIDGE_STREAM_OWNER_VERSION {
+            return Err(OrsError::InvalidField {
+                field: "owner_version",
+                reason: "bridge stream owner binding carries the current owner version",
+            });
+        }
+        crate::model::validate_digest(&self.namespace, "owner_namespace")?;
+        if self.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
+            && self.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP
+        {
+            return Err(OrsError::InvalidField {
+                field: "owner_kind",
+                reason: "bridge stream owner is a stream or an unscoped-gap occurrence",
+            });
+        }
+        if self.local_stream == HOST_REQUEST_UNBOUND_MARKER {
+            if self.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP {
+                return Err(OrsError::InvalidField {
+                    field: "local_stream",
+                    reason: "only an unscoped-gap occurrence binds the unbound scope",
+                });
+            }
+        } else {
+            bridge_identity_text(&self.local_stream, "local_stream")?;
+        }
+        bridge_owner_component(&self.authority_lineage, "authority_lineage")?;
+        bridge_owner_component(&self.principal, "principal")?;
+        if self.producer == HOST_REQUEST_UNBOUND_MARKER {
+            if self.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP {
+                return Err(OrsError::InvalidField {
+                    field: "producer",
+                    reason: "only an unscoped-gap occurrence binds the unbound producer",
+                });
+            }
+        } else {
+            bridge_owner_component(&self.producer, "producer")?;
+        }
+        crate::model::validate_text(&self.creating_connection, "creating_connection")?;
+        crate::model::validate_text(&self.creating_launch_nonce, "creating_launch_nonce")?;
+        if self.creating_session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "creating_session_epoch",
+                reason: "bridge stream owner binds a nonzero creating session epoch",
+            });
+        }
+        if self.incarnation != BRIDGE_STREAM_OWNER_INITIAL_INCARNATION {
+            return Err(OrsError::InvalidField {
+                field: "incarnation",
+                reason: "bridge stream owner incarnation is store-assigned at first bind",
+            });
+        }
+        if self.revision != BRIDGE_STREAM_OWNER_INITIAL_REVISION {
+            return Err(OrsError::InvalidField {
+                field: "revision",
+                reason: "bridge stream owner revision is store-assigned at first bind",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeStreamOwnerRow {
+    const RECORD_TYPE: &'static str = "bridge_stream_owner";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Right carried by one checked bridge-stream access object (issue
+/// #2729). Read access never implies acknowledgement, append, or gap
+/// publication: each entry resolves exactly the right it enforces, and
+/// recovery of an old stream never permits a new event under the old
+/// producer generation (the append entry keeps its own live-generation
+/// gate at the route).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeStreamRight {
+    ReadRecover,
+    Acknowledge,
+    Append,
+    PublishGap,
+}
+
+/// Checked internal access for one bridge-stream namespace (issue #2729).
+/// Constructed only inside the store after the owner row is loaded and
+/// the expected revision/incarnation are verified against it:
+/// JSON-carried namespace/revision values are untrusted lookup inputs to
+/// that check, never authority, and no caller-authored `authorized` flag
+/// exists anywhere on this path.
+struct BridgeStreamAccess {
+    namespace: String,
+    right: BridgeStreamRight,
+}
+
+impl BridgeStreamAccess {
+    fn require(&self, right: BridgeStreamRight) -> Result<(), OrsError> {
+        if self.right != right {
+            return Err(OrsError::InvalidField {
+                field: "owner_right",
+                reason: "checked bridge-stream access carries exactly one operation right",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Kernel-derived owner evidence for one stream bind (issue #2729).
+///
+/// Built by the Kernel route from the retained Session and the presenting
+/// fence only — never from bridge-authored session text. The store treats
+/// every field as an untrusted input to the namespace digest and the
+/// stored-row equality check, never as authority: a forged digest selects
+/// at most another row, which then fails the field-equality check.
+struct BridgeOwnerEvidence {
+    lineage: String,
+    principal: String,
+    producer: String,
+    local: String,
+    connection: String,
+    launch_nonce: String,
+    session_epoch: u64,
+}
+
+/// One parsed acknowledgement-batch item: the resolved namespace with
+/// its expected owner revision/incarnation, the presenter's lineage and
+/// principal for the in-transaction equality recheck, and the requested
+/// sequence.
+struct BridgeAckItem {
+    namespace: String,
+    expected_revision: u64,
+    expected_incarnation: u64,
+    sequence: u64,
+    lineage: String,
+    principal: String,
+}
+
+/// Parsed inputs for one owner-checked stage (issue #2729): the bound
+/// sidecar identity with its verified owner evidence and namespace, plus
+/// the canonical envelope bytes with their digest.
+struct BridgeCheckedStage {
+    evidence: BridgeOwnerEvidence,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    producer_generation: u64,
+    authority_epoch: String,
+    presented_sha: String,
+    staging_connection: String,
+    namespace: String,
+    key: String,
+}
+
+/// Parsed inputs for one owner-checked gap record (issue #2729): the gap
+/// identity and interval with the presenter's lineage, principal, and
+/// creating occurrence.
+struct BridgeCheckedGap {
+    gap_id: String,
+    stream_id: String,
+    start_sequence: u64,
+    end_sequence: u64,
+    reason_ref: String,
+    staging_connection: String,
+    lineage: String,
+    principal: String,
+    connection: String,
+    launch_nonce: String,
+    session_epoch: u64,
 }
 
 /// Resolved I7.23 disclosure staging for canonical envelope bytes.
@@ -4656,6 +4965,7 @@ impl RedbRecoveryStore {
                     || row.authority_epoch != authority_epoch
                     || row.redacted != staging.denied
                     || row.transport_hash != staging.transport_hash
+                    || !row.owner_namespace.is_empty()
                 {
                     return Err(OrsError::DuplicateConflict);
                 }
@@ -4676,6 +4986,11 @@ impl RedbRecoveryStore {
                     staging_connection,
                     staged_at_ms: now_ms,
                     phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
+                    // Legacy entry: no owner binding was presented, so the
+                    // row stays ownerless. Owner-checked entries use
+                    // `stage_bridge_event_checked`, which binds the admitted
+                    // namespace here instead of leaving it empty.
+                    owner_namespace: String::new(),
                     transport_hash: staging.transport_hash,
                     redacted: staging.denied,
                     redaction_reason: if staging.denied {
@@ -4811,7 +5126,10 @@ impl RedbRecoveryStore {
             };
             if let Some(row) = existing {
                 row.validate()?;
-                if row.envelope_sha256 != envelope_sha256 || row.sequence != sequence {
+                if row.envelope_sha256 != envelope_sha256
+                    || row.sequence != sequence
+                    || !row.owner_namespace.is_empty()
+                {
                     return Err(OrsError::DuplicateConflict);
                 }
                 json!({
@@ -4835,6 +5153,10 @@ impl RedbRecoveryStore {
                     handed_off_at_ms: now_ms,
                     reconcile_key: String::new(),
                     reconciled_at_ms: 0,
+                    // Legacy entry: no owner binding was presented, so the
+                    // row stays ownerless. `record_bridge_event_handoff_checked`
+                    // binds the admitted namespace on the owner-checked path.
+                    owner_namespace: String::new(),
                 };
                 row.validate()?;
                 {
@@ -5125,6 +5447,7 @@ impl RedbRecoveryStore {
                 || existing.start_sequence != start_sequence
                 || existing.end_sequence != end_sequence
                 || existing.reason_ref != reason_ref
+                || !existing.owner_namespace.is_empty()
             {
                 return Err(OrsError::DuplicateConflict);
             }
@@ -5140,6 +5463,10 @@ impl RedbRecoveryStore {
             reason_ref,
             staging_connection,
             recorded_at_ms: now_ms,
+            // Legacy entry: no owner binding was presented, so the row
+            // stays ownerless. `record_bridge_event_gap_checked` binds the
+            // admitted namespace on the owner-checked path.
+            owner_namespace: String::new(),
         };
         row.validate()?;
         {
@@ -5338,6 +5665,10 @@ impl RedbRecoveryStore {
                 .as_ref()
                 .map_or(String::new(), |(connection, _)| connection.clone()),
             last_producer_generation: stager.map_or(0, |(_, generation)| generation),
+            // Legacy entry: cursors written without an owner-checked stage
+            // stay ownerless; `advance_bridge_cursor_in_checked` binds the
+            // admitted namespace on the owner-checked path.
+            owner_namespace: String::new(),
         };
         cursor.validate()?;
         {
@@ -5373,6 +5704,10 @@ impl RedbRecoveryStore {
                 .as_ref()
                 .map_or(String::new(), |row| row.last_staging_connection.clone()),
             last_producer_generation: prior.map_or(0, |row| row.last_producer_generation),
+            // Legacy entry: preserves the prior ownerlessness; the
+            // owner-checked path writes through
+            // `write_bridge_cursors_in_checked` instead.
+            owner_namespace: String::new(),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -5380,6 +5715,1689 @@ impl RedbRecoveryStore {
             .insert(stream_id, encode(&cursor)?.as_str())
             .map_err(storage)?;
         Ok(())
+    }
+
+    /// Extracts one required owner text field from a staged JSON object.
+    fn bridge_owner_field(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<String, OrsError> {
+        let text =
+            value
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field,
+                    reason: "bridge event owner evidence must carry text",
+                })?;
+        bridge_owner_component(text, field)?;
+        Ok(text.to_owned())
+    }
+
+    /// Extracts the creating session epoch from a staged JSON object.
+    fn bridge_owner_epoch(value: &serde_json::Value) -> Result<u64, OrsError> {
+        let epoch = value
+            .get("owner_session_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field: "owner_session_epoch",
+                reason: "bridge event owner evidence must carry a session epoch",
+            })?;
+        if epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "owner_session_epoch",
+                reason: "bridge event owner evidence binds a nonzero session epoch",
+            });
+        }
+        Ok(epoch)
+    }
+
+    /// Extracts the Kernel-derived stream owner evidence from a staged
+    /// JSON object (issue #2729). The producer and local stream ride the
+    /// top-level identity fields; the lineage, principal, and creating
+    /// occurrence ride the `owner_*` fields the Kernel route derived from
+    /// the retained Session and the presenting fence.
+    fn bridge_stream_evidence_from(
+        staged: &serde_json::Value,
+    ) -> Result<BridgeOwnerEvidence, OrsError> {
+        let producer = bridge_key_text(staged, "producer_id")?;
+        if producer == HOST_REQUEST_UNBOUND_MARKER {
+            return Err(OrsError::InvalidField {
+                field: "producer_id",
+                reason: "owner-bound producers must not equal the unbound marker",
+            });
+        }
+        let local = bridge_key_text(staged, "stream_id")?;
+        if local == HOST_REQUEST_UNBOUND_MARKER {
+            return Err(OrsError::InvalidField {
+                field: "stream_id",
+                reason: "owner-bound streams must not equal the unbound marker",
+            });
+        }
+        Ok(BridgeOwnerEvidence {
+            lineage: Self::bridge_owner_field(staged, "owner_authority_lineage")?,
+            principal: Self::bridge_owner_field(staged, "owner_principal")?,
+            producer,
+            local,
+            connection: bridge_text(staged, "owner_connection")?,
+            launch_nonce: bridge_text(staged, "owner_launch_nonce")?,
+            session_epoch: Self::bridge_owner_epoch(staged)?,
+        })
+    }
+
+    /// Extracts the presenter identity (lineage plus principal) used for
+    /// owner-scoped resolution and enumeration (issue #2729).
+    fn bridge_owner_presenter_from(
+        value: &serde_json::Value,
+    ) -> Result<(String, String), OrsError> {
+        Ok((
+            Self::bridge_owner_field(value, "owner_authority_lineage")?,
+            Self::bridge_owner_field(value, "owner_principal")?,
+        ))
+    }
+
+    /// Computes the versioned owner-namespace digest for one admitted
+    /// stream (issue #2729). The digest binds the namespace literal, the
+    /// authority lineage, the principal, the producer, and the local
+    /// stream as labeled `\x1f`-separated components — the same unambiguous
+    /// encoding as the #2571 logical key — so distinct admitted producers
+    /// using the same local name remain distinct namespaces.
+    fn bridge_stream_owner_digest(
+        lineage: &str,
+        principal: &str,
+        producer: &str,
+        local: &str,
+    ) -> Result<String, OrsError> {
+        bridge_owner_component(lineage, "owner_authority_lineage")?;
+        bridge_owner_component(principal, "owner_principal")?;
+        bridge_owner_component(producer, "producer_id")?;
+        bridge_owner_component(local, "stream_id")?;
+        let text = format!(
+            "{BRIDGE_STREAM_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fproducer={producer}\x1fstream={local}"
+        );
+        Ok(crate::model::sha256_hex(text.as_bytes()))
+    }
+
+    /// Computes the versioned owner-namespace digest for one
+    /// connection-level gap reporter occurrence (issue #2729). The producer
+    /// and stream slots are fixed to the explicit unbound marker by
+    /// construction — never taken from caller input — so the namespace
+    /// names the reporter's admitted occurrence without fabricating a
+    /// producer or a task.
+    fn bridge_gap_owner_digest(lineage: &str, principal: &str) -> Result<String, OrsError> {
+        bridge_owner_component(lineage, "owner_authority_lineage")?;
+        bridge_owner_component(principal, "owner_principal")?;
+        let unbound = HOST_REQUEST_UNBOUND_MARKER;
+        let text = format!(
+            "{BRIDGE_GAP_OWNER_NAMESPACE}\x1flineage={lineage}\x1fprincipal={principal}\x1fproducer={unbound}\x1fstream={unbound}"
+        );
+        Ok(crate::model::sha256_hex(text.as_bytes()))
+    }
+
+    /// Loads one owner row inside a write transaction (issue #2729). A
+    /// missing row is [`OrsError::RecoveryOwnerMismatch`]: the namespace
+    /// is unproven, never an empty success.
+    fn load_bridge_owner_row_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+    ) -> Result<BridgeStreamOwnerRow, OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        owners
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| {
+                let row: BridgeStreamOwnerRow = decode(value.value())?;
+                row.validate()?;
+                if row.namespace != namespace {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_stream_owner",
+                        reason: "owner row identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(row)
+            })
+            .transpose()?
+            .ok_or(OrsError::RecoveryOwnerMismatch)
+    }
+
+    /// Loads one owner row under a read transaction for mutation-free
+    /// projections (issue #2729). Missing rows report
+    /// [`OrsError::RecoveryOwnerMismatch`], never a synthesized binding.
+    fn load_bridge_owner_row_for(
+        database: &Database,
+        namespace: &str,
+    ) -> Result<BridgeStreamOwnerRow, OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let read = database.begin_read().map_err(storage)?;
+        let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        owners
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| {
+                let row: BridgeStreamOwnerRow = decode(value.value())?;
+                row.validate()?;
+                if row.namespace != namespace {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_stream_owner",
+                        reason: "owner row identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(row)
+            })
+            .transpose()?
+            .ok_or(OrsError::RecoveryOwnerMismatch)
+    }
+
+    /// Binds one stream owner namespace inside a write transaction (issue
+    /// #2729): the first admitted bind durably retains the binding with
+    /// its store-assigned incarnation and revision, while a later bind
+    /// under the same namespace must present the identical binding —
+    /// changed lineage, principal, producer, or local scope fails with
+    /// [`OrsError::DuplicateConflict`] and never overwrites the retained
+    /// owner. Enforces the owner-table bound for fresh namespaces.
+    fn bind_bridge_stream_owner_in(
+        write: &redb::WriteTransaction,
+        evidence: &BridgeOwnerEvidence,
+        kind: &str,
+        namespace: &str,
+        now_ms: u64,
+    ) -> Result<BridgeStreamOwnerRow, OrsError> {
+        let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        if owners.len().map_err(storage)? >= MAX_BRIDGE_STREAM_OWNERS as u64
+            && owners.get(namespace).map_err(storage)?.is_none()
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let existing: Option<BridgeStreamOwnerRow> = owners
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        if let Some(row) = existing {
+            row.validate()?;
+            if row.namespace != namespace
+                || row.kind != kind
+                || row.authority_lineage != evidence.lineage
+                || row.principal != evidence.principal
+                || row.producer != evidence.producer
+                || row.local_stream != evidence.local
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            return Ok(row);
+        }
+        drop(owners);
+        let row = BridgeStreamOwnerRow {
+            contract_version: crate::CONTRACT_VERSION,
+            owner_version: BRIDGE_STREAM_OWNER_VERSION,
+            namespace: namespace.to_owned(),
+            kind: kind.to_owned(),
+            local_stream: evidence.local.clone(),
+            authority_lineage: evidence.lineage.clone(),
+            principal: evidence.principal.clone(),
+            producer: evidence.producer.clone(),
+            creating_connection: evidence.connection.clone(),
+            creating_launch_nonce: evidence.launch_nonce.clone(),
+            creating_session_epoch: evidence.session_epoch,
+            incarnation: BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
+            revision: BRIDGE_STREAM_OWNER_INITIAL_REVISION,
+            created_at_ms: now_ms,
+        };
+        row.validate()?;
+        {
+            let mut owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+            owners
+                .insert(namespace, encode(&row)?.as_str())
+                .map_err(storage)?;
+        }
+        Ok(row)
+    }
+
+    /// Verifies the presented expected revision/incarnation against the
+    /// stored owner row and returns the checked access object (issue
+    /// #2729). A mismatch is [`OrsError::StaleWriterEpoch`]: ownership
+    /// changed between resolution and commit, so the batch must fail
+    /// without mutating anything.
+    fn check_bridge_stream_access(
+        row: &BridgeStreamOwnerRow,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        right: BridgeStreamRight,
+    ) -> Result<BridgeStreamAccess, OrsError> {
+        if row.revision != expected_revision || row.incarnation != expected_incarnation {
+            return Err(OrsError::StaleWriterEpoch);
+        }
+        Ok(BridgeStreamAccess {
+            namespace: row.namespace.clone(),
+            right,
+        })
+    }
+
+    /// Reads the per-namespace durable/acked cursors inside a write
+    /// transaction (issue #2729). Unknown namespaces report zero cursors;
+    /// cursor state is never synthesized from transport provenance.
+    fn bridge_cursors_in_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+    ) -> Result<(u64, u64), OrsError> {
+        let cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(access.namespace.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                if row.owner_namespace != access.namespace {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_cursor",
+                        reason: "checked cursor row carries a foreign owner namespace".to_owned(),
+                    });
+                }
+                Ok((row.last_durable_sequence, row.last_acked_sequence))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Reads the per-namespace durable/acked cursors under a read
+    /// transaction for mutation-free projections (issue #2729).
+    fn bridge_cursors_for_checked(
+        database: &Database,
+        namespace: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let read = database.begin_read().map_err(storage)?;
+        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                if row.owner_namespace != namespace {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_cursor",
+                        reason: "checked cursor row carries a foreign owner namespace".to_owned(),
+                    });
+                }
+                Ok((row.last_durable_sequence, row.last_acked_sequence))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// Advances the durable cursor over the contiguous staged frontier of
+    /// one owner namespace and persists the cursor row keyed by that
+    /// namespace (issue #2729). Only rows carrying the namespace advance
+    /// it; legacy ownerless rows never move a checked cursor. The staging
+    /// connection/generation recorded here stay observation metadata.
+    fn advance_bridge_cursor_in_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        local_stream: &str,
+    ) -> Result<(u64, u64), OrsError> {
+        let (mut durable, acked) = Self::bridge_cursors_in_checked(write, access)?;
+        let mut stager: Option<(String, u64)> = None;
+        loop {
+            let wanted = durable + 1;
+            let found: Option<(String, u64)> = {
+                let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+                let mut hit = None;
+                for entry in records.iter().map_err(storage)? {
+                    let (_, value) = entry.map_err(storage)?;
+                    let row: BridgeEventRow = decode(value.value())?;
+                    if row.owner_namespace == access.namespace && row.sequence == wanted {
+                        row.validate()?;
+                        hit = Some((row.staging_connection.clone(), row.producer_generation));
+                        break;
+                    }
+                }
+                hit
+            };
+            let Some((connection, generation)) = found else {
+                break;
+            };
+            durable = wanted;
+            stager = Some((connection, generation));
+        }
+        let cursor = BridgeEventCursorRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: local_stream.to_owned(),
+            last_durable_sequence: durable,
+            last_acked_sequence: acked,
+            last_staging_connection: stager
+                .as_ref()
+                .map_or(String::new(), |(connection, _)| connection.clone()),
+            last_producer_generation: stager.map_or(0, |(_, generation)| generation),
+            owner_namespace: access.namespace.clone(),
+        };
+        cursor.validate()?;
+        {
+            let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .insert(access.namespace.as_str(), encode(&cursor)?.as_str())
+                .map_err(storage)?;
+        }
+        Ok((durable, acked))
+    }
+
+    /// Persists the per-namespace cursor row, preserving its staging
+    /// observation metadata (issue #2729).
+    fn write_bridge_cursors_in_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        local_stream: &str,
+        durable: u64,
+        acked: u64,
+    ) -> Result<(), OrsError> {
+        let prior: Option<BridgeEventCursorRow> = {
+            let cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            cursors
+                .get(access.namespace.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(row) = &prior {
+            row.validate()?;
+            if !row.owner_namespace.is_empty() && row.owner_namespace != access.namespace {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_cursor",
+                    reason: "checked cursor row carries a foreign owner namespace".to_owned(),
+                });
+            }
+        }
+        let cursor = BridgeEventCursorRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: local_stream.to_owned(),
+            last_durable_sequence: durable,
+            last_acked_sequence: acked,
+            last_staging_connection: prior
+                .as_ref()
+                .map_or(String::new(), |row| row.last_staging_connection.clone()),
+            last_producer_generation: prior.map_or(0, |row| row.last_producer_generation),
+            owner_namespace: access.namespace.clone(),
+        };
+        cursor.validate()?;
+        let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        cursors
+            .insert(access.namespace.as_str(), encode(&cursor)?.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Binds the staged sidecar identity fields to the canonical envelope
+    /// before persistence (issue #2729, item 4). The sidecar
+    /// stream/event/producer/sequence/epoch must equal the envelope's own
+    /// fields exactly; a mismatch fails closed instead of persisting a row
+    /// whose sidecar names a different event than its bytes.
+    fn bridge_envelope_sidecar_bind(
+        envelope: &serde_json::Value,
+        stream_id: &str,
+        event_id: &str,
+        sequence: u64,
+        producer_id: &str,
+        producer_generation: u64,
+        authority_epoch: &str,
+    ) -> Result<(), OrsError> {
+        const FIELD: &str = "envelope";
+        const REASON: &str =
+            "sidecar stream/event/producer/sequence fields must bind the canonical envelope";
+        let bound = envelope
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text == stream_id)
+            && envelope
+                .get("event_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text == event_id)
+            && envelope.get("sequence").and_then(serde_json::Value::as_u64) == Some(sequence)
+            && envelope
+                .get("producer_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text == producer_id)
+            && envelope
+                .get("producer_generation")
+                .and_then(serde_json::Value::as_u64)
+                == Some(producer_generation);
+        if !bound {
+            return Err(OrsError::InvalidField {
+                field: FIELD,
+                reason: REASON,
+            });
+        }
+        let epoch = envelope
+            .get("authority_epoch")
+            .ok_or(OrsError::InvalidField {
+                field: FIELD,
+                reason: REASON,
+            })?;
+        let lineage = epoch
+            .get("lineage_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: FIELD,
+                reason: REASON,
+            })?;
+        let sequence = epoch
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|sequence| *sequence != 0)
+            .ok_or(OrsError::InvalidField {
+                field: FIELD,
+                reason: REASON,
+            })?;
+        if format!("{lineage}:{sequence}") != authority_epoch {
+            return Err(OrsError::InvalidField {
+                field: FIELD,
+                reason: REASON,
+            });
+        }
+        Ok(())
+    }
+
+    /// Durably stages one bridge-forwarded event under its admitted owner
+    /// namespace before any acknowledgement (issue #2729).
+    ///
+    /// Behaves as [`Self::stage_bridge_event`] plus the owner relation:
+    /// the sidecar identity is bound to the canonical envelope, the
+    /// Kernel-derived owner evidence selects the versioned namespace
+    /// (binding it at first admission), and the row, its key, and its
+    /// cursor advance are all namespaced. Exact replays return the stored
+    /// outcome; changed bytes, a changed producer/epoch, or a changed
+    /// owner binding under the same identity fail with
+    /// [`OrsError::DuplicateConflict`]. Disclosure staging is unchanged.
+    pub fn stage_bridge_event_checked(
+        &self,
+        staged: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let (stage, staging) = Self::parse_bridge_stage_checked(staged)?;
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let owner = Self::bind_bridge_stream_owner_in(
+                &write,
+                &stage.evidence,
+                BRIDGE_STREAM_OWNER_KIND_STREAM,
+                &stage.namespace,
+                now_ms,
+            )?;
+            let access = Self::check_bridge_stream_access(
+                &owner,
+                BRIDGE_STREAM_OWNER_INITIAL_REVISION,
+                BRIDGE_STREAM_OWNER_INITIAL_INCARNATION,
+                BridgeStreamRight::Append,
+            )?;
+            let existing: Option<BridgeEventRow> =
+                Self::load_bridge_event_row_in(&write, &stage.key)?;
+            if let Some(row) = existing {
+                row.validate()?;
+                Self::replay_bridge_event_outcome_checked(&write, &access, &row, &stage, &staging)?
+            } else {
+                Self::insert_bridge_event_row_checked(&write, &access, &stage, staging, now_ms)?
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Parses and validates one owner-checked stage request (issue #2729):
+    /// the sidecar identity, the Kernel-derived owner evidence, the
+    /// sidecar-to-envelope bind, the digest, and the disclosure staging.
+    fn parse_bridge_stage_checked(
+        staged: &serde_json::Value,
+    ) -> Result<(BridgeCheckedStage, BridgeEventPrivacyStaging), OrsError> {
+        let stream_id = bridge_key_text(staged, "stream_id")?;
+        let event_id = bridge_key_text(staged, "event_id")?;
+        let sequence = bridge_sequence(staged, "sequence")?;
+        let producer_id = bridge_text(staged, "producer_id")?;
+        let producer_generation = bridge_generation(staged, "producer_generation")?;
+        let authority_epoch = bridge_text(staged, "authority_epoch")?;
+        let staging_connection = bridge_text(staged, "staging_connection")?;
+        let evidence = Self::bridge_stream_evidence_from(staged)?;
+        if evidence.producer != producer_id || evidence.local != stream_id {
+            return Err(OrsError::InvalidField {
+                field: "owner_evidence",
+                reason: "owner evidence must name the staged producer and stream",
+            });
+        }
+        let envelope_value = staged
+            .get("envelope")
+            .cloned()
+            .ok_or(OrsError::InvalidField {
+                field: "envelope",
+                reason: "bridge event must carry its canonical envelope JSON",
+            })?;
+        Self::bridge_envelope_sidecar_bind(
+            &envelope_value,
+            &stream_id,
+            &event_id,
+            sequence,
+            &producer_id,
+            producer_generation,
+            &authority_epoch,
+        )?;
+        let envelope_bytes =
+            canonical_json_bytes(&envelope_value).map_err(|_| OrsError::InvalidField {
+                field: "envelope",
+                reason: "bridge event envelope is not canonicalizable",
+            })?;
+        if envelope_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        let presented_sha = bridge_text(staged, "envelope_sha256")?;
+        crate::model::validate_digest(&presented_sha, "envelope_sha256")?;
+        if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        let staging = Self::bridge_event_privacy_staging(staged, &envelope_bytes)?;
+        let namespace = Self::bridge_stream_owner_digest(
+            &evidence.lineage,
+            &evidence.principal,
+            &evidence.producer,
+            &evidence.local,
+        )?;
+        let key = format!("{namespace}::{event_id}");
+        let stage = BridgeCheckedStage {
+            evidence,
+            stream_id,
+            event_id,
+            sequence,
+            producer_generation,
+            authority_epoch,
+            presented_sha,
+            staging_connection,
+            namespace,
+            key,
+        };
+        Ok((stage, staging))
+    }
+
+    /// Answers an exact replay under an owner-checked identity (issue
+    /// #2729). Changed bytes, producer, epoch, or owner binding under the
+    /// same identity fail with [`OrsError::DuplicateConflict`]; the
+    /// durable row is never overwritten.
+    fn replay_bridge_event_outcome_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        row: &BridgeEventRow,
+        stage: &BridgeCheckedStage,
+        staging: &BridgeEventPrivacyStaging,
+    ) -> Result<serde_json::Value, OrsError> {
+        if row.owner_namespace != stage.namespace
+            || row.envelope_sha256 != stage.presented_sha
+            || row.sequence != stage.sequence
+            || row.producer_id != stage.evidence.producer
+            || row.producer_generation != stage.producer_generation
+            || row.authority_epoch != stage.authority_epoch
+            || row.redacted != staging.denied
+            || row.transport_hash != staging.transport_hash
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let (durable, acked) = Self::bridge_cursors_in_checked(write, access)?;
+        let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
+        Ok(Self::bridge_event_outcome_checked(
+            row,
+            "duplicate",
+            durable,
+            acked,
+            false,
+            handoff.as_deref(),
+            &stage.namespace,
+        ))
+    }
+
+    /// Inserts one fresh owner-checked row and advances its cursor (issue
+    /// #2729). Runs inside the stage transaction owned by
+    /// [`Self::stage_bridge_event_checked`].
+    fn insert_bridge_event_row_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        stage: &BridgeCheckedStage,
+        staging: BridgeEventPrivacyStaging,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        let row = BridgeEventRow {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: stage.stream_id.clone(),
+            event_id: stage.event_id.clone(),
+            sequence: stage.sequence,
+            producer_id: stage.evidence.producer.clone(),
+            producer_generation: stage.producer_generation,
+            authority_epoch: stage.authority_epoch.clone(),
+            envelope_sha256: stage.presented_sha.clone(),
+            envelope_bytes: staging.stored_bytes,
+            staging_connection: stage.staging_connection.clone(),
+            staged_at_ms: now_ms,
+            phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
+            owner_namespace: stage.namespace.clone(),
+            transport_hash: staging.transport_hash,
+            redacted: staging.denied,
+            redaction_reason: if staging.denied {
+                BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned()
+            } else {
+                String::new()
+            },
+            redacted_classes: staging.classes,
+            redaction_marker: if staging.denied {
+                BRIDGE_EVENT_REDACTED_PROJECTION_MARKER.to_owned()
+            } else {
+                String::new()
+            },
+            redaction_version: if staging.denied {
+                crate::CONTRACT_VERSION
+            } else {
+                0
+            },
+        };
+        row.validate()?;
+        {
+            let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records
+                .insert(stage.key.as_str(), encode(&row)?.as_str())
+                .map_err(storage)?;
+        }
+        let (durable, acked) =
+            Self::advance_bridge_cursor_in_checked(write, access, &stage.stream_id)?;
+        let handoff = Self::bridge_handoff_state_checked_in(write, access, &stage.event_id)?;
+        Ok(Self::bridge_event_outcome_checked(
+            &row,
+            "accepted",
+            durable,
+            acked,
+            true,
+            handoff.as_deref(),
+            &stage.namespace,
+        ))
+    }
+
+    /// Builds the stage/lookup outcome object for one owner-checked row:
+    /// the shared outcome plus the admitted namespace the row was verified
+    /// under. The namespace is Kernel-internal scope evidence, never a
+    /// foreign digest: conflict and lookup replies only carry it for the
+    /// proven owner (see [`Self::load_bridge_event_conflict_view`]).
+    fn bridge_event_outcome_checked(
+        row: &BridgeEventRow,
+        disposition: &str,
+        durable: u64,
+        acked: u64,
+        fresh: bool,
+        handoff: Option<&str>,
+        namespace: &str,
+    ) -> serde_json::Value {
+        let mut outcome = bridge_event_outcome(row, disposition, durable, acked, fresh, handoff);
+        if let Some(object) = outcome.as_object_mut() {
+            object.insert(
+                "owner_namespace".to_owned(),
+                serde_json::Value::String(namespace.to_owned()),
+            );
+        }
+        outcome
+    }
+
+    /// Reads the handoff state for one owner-checked identity inside a
+    /// write transaction. The key is namespaced, so a foreign stream never
+    /// shares a handoff slot with the proven owner.
+    fn bridge_handoff_state_checked_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        event_id: &str,
+    ) -> Result<Option<String>, OrsError> {
+        Self::bridge_handoff_state_in(write, &access.namespace, event_id)
+    }
+
+    /// Loads the conflict view for one owner-checked identity (issue
+    /// #2729, item 4). The query carries the presenter's owner evidence
+    /// plus the presented producer, local stream, and event: the store
+    /// derives the candidate namespace internally, then returns the stored
+    /// facts only when the row exists under exactly that namespace. A
+    /// foreign or unknown identity returns `Ok(None)` — indistinguishable
+    /// by design — so a rejected caller never learns another stream's
+    /// digest, cursors, or gap contents through the conflict response.
+    pub fn load_bridge_event_conflict_view(
+        &self,
+        query: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, OrsError> {
+        let (lineage, principal) = Self::bridge_owner_presenter_from(query)?;
+        let producer = bridge_key_text(query, "producer_id")?;
+        let local = bridge_key_text(query, "stream_id")?;
+        let event_id = bridge_key_text(query, "event_id")?;
+        let namespace = Self::bridge_stream_owner_digest(&lineage, &principal, &producer, &local)?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = format!("{namespace}::{event_id}");
+        let row: Option<BridgeEventRow> = {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        row.validate()?;
+        if row.owner_namespace != namespace {
+            return Ok(None);
+        }
+        // The record exists under the derived namespace, so its owner row
+        // must exist too: the checked stage binds both atomically. The
+        // read-grade access object records which right served this view.
+        let owner = Self::load_bridge_owner_row_for(&self.database, &namespace)?;
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            owner.revision,
+            owner.incarnation,
+            BridgeStreamRight::ReadRecover,
+        )?;
+        let handoff: Option<String> = {
+            let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            handoffs
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .map(|row: BridgeEventHandoffRow| {
+                    row.validate()?;
+                    Ok::<String, OrsError>(row.state)
+                })
+                .transpose()?
+        };
+        let (durable, acked) = Self::bridge_cursors_for_checked(&self.database, &access.namespace)?;
+        Ok(Some(Self::bridge_event_outcome_checked(
+            &row,
+            "conflict",
+            durable,
+            acked,
+            false,
+            handoff.as_deref(),
+            &access.namespace,
+        )))
+    }
+
+    /// Serves one bounded pending page inside an owner namespace (issue
+    /// #2729). Same shape and bounds as
+    /// [`Self::bridge_event_pending_page`], but rows are selected by the
+    /// verified namespace instead of the bare local name, so a page
+    /// continuation revalidated against the namespace can never walk into
+    /// a foreign stream. Legacy ownerless rows are never served here.
+    pub fn bridge_event_pending_page_checked(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+        page_limit: usize,
+    ) -> Result<serde_json::Value, OrsError> {
+        let owner = Self::load_bridge_owner_row_for(&self.database, namespace)?;
+        if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        // The read-grade access object records which right served this
+        // page; callers re-resolve the namespace through the owner row on
+        // every continuation.
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            owner.revision,
+            owner.incarnation,
+            BridgeStreamRight::ReadRecover,
+        )?;
+        if page_limit == 0 || page_limit > MAX_BRIDGE_EVENT_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let mut rows: Vec<BridgeEventRow> = Vec::new();
+        {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            for entry in records.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace == access.namespace && row.sequence > after_sequence {
+                    rows.push(row);
+                }
+            }
+        }
+        rows.sort_by_key(|row| row.sequence);
+        let continuation = if rows.len() > page_limit {
+            rows.truncate(page_limit);
+            rows.last().map(|row| row.sequence)
+        } else {
+            None
+        };
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "event_id": row.event_id,
+                    "sequence": row.sequence,
+                    "phase": row.phase,
+                    "disposition": "accepted",
+                    "envelope_sha256": row.envelope_sha256,
+                    "producer_id": row.producer_id,
+                    "producer_generation": row.producer_generation,
+                    "staging_connection": row.staging_connection,
+                })
+            })
+            .collect();
+        let (durable, acked) = Self::bridge_cursors_for_checked(&self.database, &access.namespace)?;
+        Ok(json!({
+            "stream_id": owner.local_stream,
+            "durable_cursor": durable,
+            "acked_cursor": acked,
+            "items": items,
+            "continuation": continuation,
+        }))
+    }
+
+    /// Finds the stream owner rows matching one presenter and local name
+    /// inside a write transaction (issue #2729). Used where the presented
+    /// entry names no producer (acknowledgement frontier, scoped gap):
+    /// exactly one match resolves; zero or several fail closed with
+    /// [`OrsError::RecoveryOwnerMismatch`] instead of guessing.
+    fn find_stream_owners_in(
+        write: &redb::WriteTransaction,
+        lineage: &str,
+        principal: &str,
+        local: &str,
+    ) -> Result<Vec<BridgeStreamOwnerRow>, OrsError> {
+        let owners = write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        let mut matched = Vec::new();
+        for entry in owners.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let row: BridgeStreamOwnerRow = decode(value.value())?;
+            row.validate()?;
+            if row.kind == BRIDGE_STREAM_OWNER_KIND_STREAM
+                && row.authority_lineage == lineage
+                && row.principal == principal
+                && row.local_stream == local
+            {
+                matched.push(row);
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Finds the stream owner rows matching one presenter and local name
+    /// under a read transaction (issue #2729). Read-only counterpart of
+    /// [`Self::find_stream_owners_in`] for the pre-commit resolution step.
+    fn find_stream_owners_for(
+        database: &Database,
+        lineage: &str,
+        principal: &str,
+        local: &str,
+    ) -> Result<Vec<BridgeStreamOwnerRow>, OrsError> {
+        let read = database.begin_read().map_err(storage)?;
+        let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+        let mut matched = Vec::new();
+        for entry in owners.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let row: BridgeStreamOwnerRow = decode(value.value())?;
+            row.validate()?;
+            if row.kind == BRIDGE_STREAM_OWNER_KIND_STREAM
+                && row.authority_lineage == lineage
+                && row.principal == principal
+                && row.local_stream == local
+            {
+                matched.push(row);
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Resolves one acknowledgement-frontier entry to its admitted owner
+    /// namespace without mutating anything (issue #2729, item 3). The
+    /// evidence carries the presenter's lineage and principal plus the
+    /// local stream; the producer comes from the retained binding, never
+    /// from the entry. Zero or ambiguous matches fail the whole batch
+    /// closed at the route: a foreign or stale item changes no cursor.
+    pub fn resolve_bridge_ack_item(
+        &self,
+        evidence: &serde_json::Value,
+        local_stream: &str,
+    ) -> Result<serde_json::Value, OrsError> {
+        let (lineage, principal) = Self::bridge_owner_presenter_from(evidence)?;
+        bridge_identity_text(local_stream, "stream_id")?;
+        let matched =
+            Self::find_stream_owners_for(&self.database, &lineage, &principal, local_stream)?;
+        let [row] = matched.as_slice() else {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        };
+        Ok(json!({
+            "namespace": row.namespace,
+            "incarnation": row.incarnation,
+            "revision": row.revision,
+        }))
+    }
+
+    /// Applies one accepted acknowledgement batch atomically (issue #2729,
+    /// item 3). Every item carries the resolved namespace with its
+    /// expected revision/incarnation plus the presenter's lineage and
+    /// principal and the requested sequence. The single write transaction
+    /// first validates every item — shape, contradictory duplicates,
+    /// stored binding, expected revision/incarnation, lineage/principal
+    /// equality, and phase/frontier — and only then advances the cursors
+    /// and compacts. Any failure aborts the transaction, so a foreign or
+    /// stale item changes no batch cursor or retained payload. The commit
+    /// is the last fallible operation: after it, only infallible JSON
+    /// assembly remains, so a storage/response failure past the commit is
+    /// an unknown/replayable result, never evidence that nothing
+    /// happened. No atomicity with the separate Governor store is
+    /// claimed: handoff reconciliation stays a separate step owned by the
+    /// route.
+    pub fn acknowledge_bridge_event_batch(
+        &self,
+        batch: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let items = batch
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(OrsError::InvalidField {
+                field: "ack_batch",
+                reason: "acknowledgement batch must carry a bounded item list",
+            })?;
+        if items.is_empty() || items.len() > MAX_BRIDGE_ACK_BATCH {
+            return Err(OrsError::InvalidField {
+                field: "ack_batch",
+                reason: "acknowledgement batch must be nonempty and bounded",
+            });
+        }
+        let parsed = Self::parse_bridge_ack_batch(items)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut outcomes = Vec::with_capacity(parsed.len());
+        for item in &parsed {
+            let owner = Self::load_bridge_owner_row_in(&write, &item.namespace)?;
+            if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
+                || owner.authority_lineage != item.lineage
+                || owner.principal != item.principal
+            {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            }
+            let access = Self::check_bridge_stream_access(
+                &owner,
+                item.expected_revision,
+                item.expected_incarnation,
+                BridgeStreamRight::Acknowledge,
+            )?;
+            let (durable, mut acked) = Self::bridge_cursors_in_checked(&write, &access)?;
+            if item.sequence > durable {
+                return Err(OrsError::InvalidTransition);
+            }
+            if item.sequence > acked {
+                acked = item.sequence;
+                Self::write_bridge_cursors_in_checked(
+                    &write,
+                    &access,
+                    &owner.local_stream,
+                    durable,
+                    acked,
+                )?;
+            }
+            let pruned = Self::compact_bridge_events_in_checked(&write, &access, acked)?;
+            outcomes.push(json!({
+                "namespace": access.namespace,
+                "durable_cursor": durable,
+                "acked_cursor": acked,
+                "pruned": pruned,
+            }));
+        }
+        write.commit().map_err(storage)?;
+        Ok(json!({ "streams": outcomes }))
+    }
+
+    /// Parses and deduplicates one acknowledgement batch (issue #2729).
+    /// Contradictory duplicate entries — the same namespace twice with a
+    /// different sequence, lineage, principal, or expectation — fail the
+    /// whole batch; exact duplicates collapse to one item.
+    fn parse_bridge_ack_batch(items: &[serde_json::Value]) -> Result<Vec<BridgeAckItem>, OrsError> {
+        let mut parsed: Vec<BridgeAckItem> = Vec::with_capacity(items.len());
+        for item in items {
+            let namespace = bridge_text(item, "namespace")?;
+            crate::model::validate_digest(&namespace, "owner_namespace")?;
+            let expected_revision = item
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(OrsError::InvalidField {
+                    field: "expected_revision",
+                    reason: "acknowledgement items must carry the expected owner revision",
+                })?;
+            let expected_incarnation = item
+                .get("expected_incarnation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(OrsError::InvalidField {
+                    field: "expected_incarnation",
+                    reason: "acknowledgement items must carry the expected stream incarnation",
+                })?;
+            if expected_revision == 0 || expected_incarnation == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "expected_revision",
+                    reason: "expected owner revision and incarnation must be nonzero",
+                });
+            }
+            let sequence = item
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(OrsError::InvalidField {
+                    field: "sequence",
+                    reason: "acknowledgement sequence must be a non-negative integer",
+                })?;
+            if sequence == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "sequence",
+                    reason: "acknowledgement sequence must be nonzero",
+                });
+            }
+            let (lineage, principal) = Self::bridge_owner_presenter_from(item)?;
+            let candidate = BridgeAckItem {
+                namespace,
+                expected_revision,
+                expected_incarnation,
+                sequence,
+                lineage,
+                principal,
+            };
+            if let Some(prior) = parsed
+                .iter()
+                .find(|prior| prior.namespace == candidate.namespace)
+            {
+                if prior.sequence != candidate.sequence
+                    || prior.expected_revision != candidate.expected_revision
+                    || prior.expected_incarnation != candidate.expected_incarnation
+                    || prior.lineage != candidate.lineage
+                    || prior.principal != candidate.principal
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "ack_batch",
+                        reason: "acknowledgement batch carries contradictory duplicate entries",
+                    });
+                }
+                continue;
+            }
+            parsed.push(candidate);
+        }
+        Ok(parsed)
+    }
+
+    /// Compacts acknowledged rows of one owner namespace past the
+    /// retention window inside the acknowledgement transaction (issue
+    /// #2729). Only durable rows at or below the acked frontier minus the
+    /// retained window are eligible; unacknowledged rows, the retention
+    /// window, and the cursor facts are never touched.
+    fn compact_bridge_events_in_checked(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        acked: u64,
+    ) -> Result<u64, OrsError> {
+        access.require(BridgeStreamRight::Acknowledge)?;
+        let floor = acked.saturating_sub(RETAIN_BRIDGE_EVENT_ACKED_PER_STREAM);
+        if floor == 0 {
+            return Ok(0);
+        }
+        let victims: Vec<String> = {
+            let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            let mut found = Vec::new();
+            for entry in records.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let row: BridgeEventRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace == access.namespace
+                    && row.sequence <= floor
+                    && row.phase == BRIDGE_EVENT_PHASE_DURABLE
+                {
+                    found.push(key.value().to_owned());
+                }
+            }
+            found
+        };
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        let mut pruned = 0_u64;
+        let mut records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+        for victim in &victims {
+            records.remove(victim.as_str()).map_err(storage)?;
+            pruned += 1;
+        }
+        Ok(pruned)
+    }
+
+    /// Records one forwarded coverage gap under its admitted owner
+    /// namespace without touching any cursor (issue #2729, items 4-5).
+    ///
+    /// The gap JSON carries the presenter's owner evidence plus the
+    /// occurrence the Kernel route derived from the retained Session. A
+    /// scoped gap (nonempty stream) resolves to the stream's retained
+    /// owner — exactly one match, never created by the gap itself — and
+    /// rides that stream's visibility. An unscoped gap (empty stream)
+    /// binds-or-creates the reporter-occurrence namespace, giving the
+    /// connection-level observation its own admitted owner without a
+    /// fabricated task or a bare global gap ID. Changed content under a
+    /// known key fails with [`OrsError::DuplicateConflict`]; a gap for an
+    /// unknown or ambiguous stream fails with
+    /// [`OrsError::RecoveryOwnerMismatch`].
+    pub fn record_bridge_event_gap_checked(
+        &self,
+        gap: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let parsed = Self::parse_bridge_gap_checked(gap)?;
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let (namespace, key) = Self::resolve_bridge_gap_key_in(&write, &parsed, now_ms)?;
+        {
+            let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            if gaps.get(key.as_str()).map_err(storage)?.is_none() {
+                let mut scoped_gaps = 0_usize;
+                for entry in gaps.iter().map_err(storage)? {
+                    let (_, value) = entry.map_err(storage)?;
+                    let row: BridgeEventGapRow = decode(value.value())?;
+                    row.validate()?;
+                    if row.owner_namespace == namespace {
+                        scoped_gaps += 1;
+                    }
+                }
+                if scoped_gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+            }
+        }
+        if let Some(existing) = {
+            let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            gaps.get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        } {
+            let existing: BridgeEventGapRow = existing;
+            existing.validate()?;
+            if existing.owner_namespace != namespace
+                || existing.stream_id != parsed.stream_id
+                || existing.start_sequence != parsed.start_sequence
+                || existing.end_sequence != parsed.end_sequence
+                || existing.reason_ref != parsed.reason_ref
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            write.commit().map_err(storage)?;
+            return Ok(json!({ "gap_id": parsed.gap_id, "accepted": true, "fresh": false }));
+        }
+        let row = BridgeEventGapRow {
+            contract_version: crate::CONTRACT_VERSION,
+            gap_id: parsed.gap_id.clone(),
+            stream_id: parsed.stream_id.clone(),
+            start_sequence: parsed.start_sequence,
+            end_sequence: parsed.end_sequence,
+            reason_ref: parsed.reason_ref.clone(),
+            staging_connection: parsed.staging_connection.clone(),
+            recorded_at_ms: now_ms,
+            owner_namespace: namespace,
+        };
+        row.validate()?;
+        {
+            let mut gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            gaps.insert(key.as_str(), encode(&row)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(json!({ "gap_id": parsed.gap_id, "accepted": true, "fresh": true }))
+    }
+
+    /// Parses and validates one owner-checked gap request (issue #2729):
+    /// the gap identity and interval with the presenter's lineage,
+    /// principal, and creating occurrence.
+    fn parse_bridge_gap_checked(gap: &serde_json::Value) -> Result<BridgeCheckedGap, OrsError> {
+        let start_sequence = bridge_sequence(gap, "start_sequence")?;
+        let end_sequence = bridge_sequence(gap, "end_sequence")?;
+        if end_sequence < start_sequence {
+            return Err(OrsError::InvalidField {
+                field: "end_sequence",
+                reason: "gap interval must not end before it starts",
+            });
+        }
+        let (lineage, principal) = Self::bridge_owner_presenter_from(gap)?;
+        Ok(BridgeCheckedGap {
+            gap_id: bridge_text(gap, "gap_id")?,
+            stream_id: bridge_gap_stream_text(gap)?,
+            start_sequence,
+            end_sequence,
+            reason_ref: bridge_text(gap, "reason_ref")?,
+            staging_connection: bridge_text(gap, "staging_connection")?,
+            lineage,
+            principal,
+            connection: bridge_text(gap, "owner_connection")?,
+            launch_nonce: bridge_text(gap, "owner_launch_nonce")?,
+            session_epoch: Self::bridge_owner_epoch(gap)?,
+        })
+    }
+
+    /// Resolves the owner namespace and storage key for one checked gap
+    /// inside the record transaction (issue #2729). Scoped gaps resolve
+    /// to exactly one retained stream owner — the gap never creates
+    /// stream ownership. Unscoped gaps bind-or-create the reporter's own
+    /// occurrence namespace.
+    fn resolve_bridge_gap_key_in(
+        write: &redb::WriteTransaction,
+        parsed: &BridgeCheckedGap,
+        now_ms: u64,
+    ) -> Result<(String, String), OrsError> {
+        if parsed.stream_id.is_empty() {
+            let namespace = Self::bridge_gap_owner_digest(&parsed.lineage, &parsed.principal)?;
+            let evidence = BridgeOwnerEvidence {
+                lineage: parsed.lineage.clone(),
+                principal: parsed.principal.clone(),
+                producer: HOST_REQUEST_UNBOUND_MARKER.to_owned(),
+                local: HOST_REQUEST_UNBOUND_MARKER.to_owned(),
+                connection: parsed.connection.clone(),
+                launch_nonce: parsed.launch_nonce.clone(),
+                session_epoch: parsed.session_epoch,
+            };
+            Self::bind_bridge_stream_owner_in(
+                write,
+                &evidence,
+                BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
+                &namespace,
+                now_ms,
+            )?;
+            let key = format!("{namespace}::{gap}", gap = parsed.gap_id);
+            return Ok((namespace, key));
+        }
+        let matched = Self::find_stream_owners_in(
+            write,
+            &parsed.lineage,
+            &parsed.principal,
+            &parsed.stream_id,
+        )?;
+        let [owner] = matched.as_slice() else {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        };
+        let access = Self::check_bridge_stream_access(
+            owner,
+            owner.revision,
+            owner.incarnation,
+            BridgeStreamRight::PublishGap,
+        )?;
+        let key = format!("{}::{gap}", access.namespace, gap = parsed.gap_id);
+        Ok((access.namespace, key))
+    }
+
+    /// Records the Governor-handoff for one owner-checked staged event
+    /// (issue #2729, item 4). Verifies the namespace names a retained
+    /// owner, then persists the handoff under the namespaced key with the
+    /// staged envelope digest. Exact replays return the existing handoff;
+    /// changed bytes fail with [`OrsError::DuplicateConflict`].
+    pub fn record_bridge_event_handoff_checked(
+        &self,
+        handoff: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let namespace = bridge_text(handoff, "owner_namespace")?;
+        crate::model::validate_digest(&namespace, "owner_namespace")?;
+        let event_id = bridge_key_text(handoff, "event_id")?;
+        let sequence = bridge_sequence(handoff, "sequence")?;
+        let envelope_sha256 = bridge_text(handoff, "envelope_sha256")?;
+        crate::model::validate_digest(&envelope_sha256, "envelope_sha256")?;
+        let staging_connection = bridge_text(handoff, "staging_connection")?;
+        let key = format!("{namespace}::{event_id}");
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = {
+            let owner = Self::load_bridge_owner_row_in(&write, &namespace)?;
+            let access = Self::check_bridge_stream_access(
+                &owner,
+                owner.revision,
+                owner.incarnation,
+                BridgeStreamRight::Append,
+            )?;
+            let existing: Option<BridgeEventHandoffRow> = {
+                let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64
+                    && handoffs.get(key.as_str()).map_err(storage)?.is_none()
+                {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                handoffs
+                    .get(key.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+            };
+            if let Some(row) = existing {
+                row.validate()?;
+                if row.owner_namespace != access.namespace
+                    || row.envelope_sha256 != envelope_sha256
+                    || row.sequence != sequence
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                json!({
+                    "event_id": row.event_id,
+                    "sequence": row.sequence,
+                    "envelope_sha256": row.envelope_sha256,
+                    "state": row.state,
+                    "staging_connection": row.staging_connection,
+                    "fresh": false,
+                })
+            } else {
+                let row = BridgeEventHandoffRow {
+                    contract_version: crate::CONTRACT_VERSION,
+                    stream_id: owner.local_stream.clone(),
+                    event_id: event_id.clone(),
+                    sequence,
+                    envelope_sha256: envelope_sha256.clone(),
+                    state: BRIDGE_EVENT_HANDOFF_HANDED_OFF.to_owned(),
+                    staging_connection: staging_connection.clone(),
+                    handed_off_at_ms: now_ms,
+                    reconcile_key: String::new(),
+                    reconciled_at_ms: 0,
+                    owner_namespace: access.namespace.clone(),
+                };
+                row.validate()?;
+                {
+                    let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                    handoffs
+                        .insert(key.as_str(), encode(&row)?.as_str())
+                        .map_err(storage)?;
+                }
+                json!({
+                    "event_id": event_id,
+                    "sequence": sequence,
+                    "envelope_sha256": envelope_sha256,
+                    "state": BRIDGE_EVENT_HANDOFF_HANDED_OFF,
+                    "staging_connection": staging_connection,
+                    "fresh": true,
+                })
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    /// Binds owner-checked handed-off events to one reconciliation key
+    /// once the consumed frontier covers their sequences (issue #2729,
+    /// item 4). Only handoffs carrying the verified namespace reconcile;
+    /// legacy ownerless rows and foreign namespaces are untouched. No
+    /// cross-store atomicity with the Governor intake is claimed: this
+    /// step is idempotent, so a lost answer replays safely.
+    pub fn reconcile_bridge_event_handoffs_checked(
+        &self,
+        namespace: &str,
+        acked_sequence: u64,
+        reconcile_key: &str,
+    ) -> Result<serde_json::Value, OrsError> {
+        let owner = Self::load_bridge_owner_row_for(&self.database, namespace)?;
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            owner.revision,
+            owner.incarnation,
+            BridgeStreamRight::Acknowledge,
+        )?;
+        if acked_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "acked_sequence",
+                reason: "handoff reconcile sequence must be nonzero",
+            });
+        }
+        crate::model::validate_digest(reconcile_key, "reconcile_key")?;
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut reconciled = 0_u64;
+        {
+            let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            let mut due = Vec::new();
+            for entry in handoffs.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let row: BridgeEventHandoffRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace == access.namespace
+                    && row.sequence <= acked_sequence
+                    && row.state == BRIDGE_EVENT_HANDOFF_HANDED_OFF
+                {
+                    due.push(key.value().to_owned());
+                }
+            }
+            if !due.is_empty() {
+                drop(handoffs);
+                let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+                for key in due {
+                    let mut row: BridgeEventHandoffRow = handoffs
+                        .get(key.as_str())
+                        .map_err(storage)?
+                        .map(|value| decode(value.value()))
+                        .transpose()?
+                        .ok_or(OrsError::InvalidField {
+                            field: "event_id",
+                            reason: "bridge event handoff disappeared during reconcile",
+                        })?;
+                    row.validate()?;
+                    if row.state != BRIDGE_EVENT_HANDOFF_HANDED_OFF
+                        || row.owner_namespace != access.namespace
+                    {
+                        continue;
+                    }
+                    BRIDGE_EVENT_HANDOFF_RECONCILED.clone_into(&mut row.state);
+                    reconcile_key.clone_into(&mut row.reconcile_key);
+                    row.reconciled_at_ms = now_ms;
+                    row.validate()?;
+                    handoffs
+                        .insert(key.as_str(), encode(&row)?.as_str())
+                        .map_err(storage)?;
+                    reconciled += 1;
+                }
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(json!({
+            "namespace": access.namespace,
+            "acked_sequence": acked_sequence,
+            "reconciled": reconciled,
+        }))
+    }
+
+    /// Reconciles event ownership and cursors for one proven presenter
+    /// (issue #2729, items 2, 4-6).
+    ///
+    /// Scope rule, enforced here and nowhere else: no stream listing
+    /// exists. The enumeration covers exactly the stream namespaces whose
+    /// retained owner binding matches the presenter's lineage and
+    /// principal — never the last-staging connection, never bare
+    /// generation ordering. Each covered stream reports its cursors, its
+    /// pending first page, and its scoped gaps; unscoped gaps report under
+    /// the presenter's reporter-occurrence namespaces only. Legacy
+    /// ownerless rows stay preserved but unlisted; when any record, cursor,
+    /// gap, or handoff row exists outside the proven scope (legacy or
+    /// foreign), `unproven_scope_present` is true, so the answer is never
+    /// an empty successful inventory. The generation argument is validated
+    /// nonzero for wire discipline but never filters: generation ordering
+    /// is not an ownership grant, and recovery of an old stream needs no
+    /// new-generation permission.
+    pub fn reconcile_bridge_events_for_owner(
+        &self,
+        presenter: &serde_json::Value,
+        live_generation: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        let (lineage, principal) = Self::bridge_owner_presenter_from(presenter)?;
+        if live_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "live_generation",
+                reason: "live producer generation must be nonzero",
+            });
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let mut namespaces: Vec<BridgeStreamOwnerRow> = Vec::new();
+        let mut gap_namespaces: Vec<BridgeStreamOwnerRow> = Vec::new();
+        {
+            let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
+            for entry in owners.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeStreamOwnerRow = decode(value.value())?;
+                row.validate()?;
+                if row.authority_lineage == lineage && row.principal == principal {
+                    if row.kind == BRIDGE_STREAM_OWNER_KIND_STREAM {
+                        namespaces.push(row);
+                    } else {
+                        gap_namespaces.push(row);
+                    }
+                }
+            }
+        }
+        namespaces.sort_by(|left, right| left.local_stream.cmp(&right.local_stream));
+        drop(read);
+        let mut covered = Vec::with_capacity(namespaces.len());
+        for owner in &namespaces {
+            let (durable, acked) =
+                Self::bridge_cursors_for_checked(&self.database, &owner.namespace)?;
+            let page = self.bridge_event_pending_page_checked(
+                &owner.namespace,
+                acked,
+                MAX_BRIDGE_EVENT_PAGE,
+            )?;
+            let gaps = self.bridge_scoped_gaps_for_checked(&owner.namespace)?;
+            let (stager, generation) =
+                Self::bridge_cursor_provenance_for(&self.database, &owner.namespace)?;
+            covered.push(json!({
+                "stream_id": owner.local_stream,
+                "durable_cursor": durable,
+                "acked_cursor": acked,
+                "last_staging_connection": stager,
+                "last_producer_generation": generation,
+                "pending_first_page": page,
+                "gaps": gaps,
+            }));
+        }
+        let mut unscoped_gaps = Vec::new();
+        for owner in &gap_namespaces {
+            unscoped_gaps.extend(self.bridge_scoped_gaps_for_checked(&owner.namespace)?);
+        }
+        let unproven_scope_present =
+            self.bridge_unproven_scope_present(&namespaces, &gap_namespaces)?;
+        Ok(json!({
+            "streams": covered,
+            "unscoped_gaps": unscoped_gaps,
+            "unproven_scope_present": unproven_scope_present,
+        }))
+    }
+
+    /// Reads the recorded gaps of one owner namespace, oldest first
+    /// (issue #2729). Scoped gaps ride their stream's visibility;
+    /// unscoped gaps are selected by the reporter-occurrence namespace.
+    /// Legacy ownerless rows are never served here.
+    fn bridge_scoped_gaps_for_checked(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<serde_json::Value>, OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        let mut rows: Vec<BridgeEventGapRow> = Vec::new();
+        for entry in gaps.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let row: BridgeEventGapRow = decode(value.value())?;
+            row.validate()?;
+            if row.owner_namespace == namespace {
+                rows.push(row);
+            }
+        }
+        rows.sort_by_key(|row| (row.start_sequence, row.gap_id.clone()));
+        Ok(rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "gap_id": row.gap_id,
+                    "start_sequence": row.start_sequence,
+                    "end_sequence": row.end_sequence,
+                    "reason_ref": row.reason_ref,
+                })
+            })
+            .collect())
+    }
+
+    /// Reads the staging observation metadata of one owner namespace
+    /// (issue #2729). Reported for coverage only; never scope material.
+    fn bridge_cursor_provenance_for(
+        database: &Database,
+        namespace: &str,
+    ) -> Result<(String, u64), OrsError> {
+        crate::model::validate_digest(namespace, "owner_namespace")?;
+        let read = database.begin_read().map_err(storage)?;
+        let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+        let row: Option<BridgeEventCursorRow> = cursors
+            .get(namespace)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        match row {
+            Some(row) => {
+                row.validate()?;
+                Ok((row.last_staging_connection, row.last_producer_generation))
+            }
+            None => Ok((String::new(), 0)),
+        }
+    }
+
+    /// Reports whether any bridge-event row exists outside the proven
+    /// owner scope (issue #2729, items 5-6). Legacy ownerless rows and
+    /// foreign-namespace rows count as unproven: they stay preserved and
+    /// unlisted, but the reconcile answer carries the flag instead of an
+    /// empty successful inventory. The flag reveals no digest, cursor, or
+    /// gap content.
+    fn bridge_unproven_scope_present(
+        &self,
+        namespaces: &[BridgeStreamOwnerRow],
+        gap_namespaces: &[BridgeStreamOwnerRow],
+    ) -> Result<bool, OrsError> {
+        let mut proven: Vec<&str> = Vec::with_capacity(namespaces.len() + gap_namespaces.len());
+        for owner in namespaces.iter().chain(gap_namespaces.iter()) {
+            proven.push(owner.namespace.as_str());
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let check = |namespace: &str| !namespace.is_empty() && !proven.contains(&namespace);
+        {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            for entry in records.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace.is_empty() || check(&row.owner_namespace) {
+                    return Ok(true);
+                }
+            }
+        }
+        {
+            let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
+            for entry in cursors.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventCursorRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace.is_empty() || check(&row.owner_namespace) {
+                    return Ok(true);
+                }
+            }
+        }
+        {
+            let gaps = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            for entry in gaps.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventGapRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace.is_empty() || check(&row.owner_namespace) {
+                    return Ok(true);
+                }
+            }
+        }
+        {
+            let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            for entry in handoffs.iter().map_err(storage)? {
+                let (_, value) = entry.map_err(storage)?;
+                let row: BridgeEventHandoffRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace.is_empty() || check(&row.owner_namespace) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Stages one native-worker claim intent before any acknowledgement.
@@ -8244,6 +10262,17 @@ impl RedbRecoveryStore {
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
                 .map_err(storage)?,
         );
+        // #2729: the bridge-event family (records, cursors, gaps,
+        // handoffs) plus the stream-owner index are part of the base
+        // family, materialized empty on every open like every other base
+        // table, so an owner-scoped lookup on a store that never staged
+        // bridge events reads authoritatively absent instead of failing on
+        // a missing table. Legacy rows are never backfilled here.
+        drop(write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?);
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write
