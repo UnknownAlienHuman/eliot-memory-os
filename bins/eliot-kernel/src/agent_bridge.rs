@@ -52,7 +52,9 @@ fn bridge_terminal_code(error: &TransportError) -> &'static str {
         TransportError::UnknownOutcome => "bridge_unknown_outcome",
         TransportError::IdentityConflict => "bridge_identity_conflict",
         TransportError::Cancelled => "bridge_cancelled",
-        TransportError::Backpressure => "bridge_backpressure",
+        TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
+            "bridge_backpressure"
+        }
         TransportError::InvalidLimits => "bridge_invalid_limits",
         TransportError::UnauthenticatedPeer => "bridge_unauthenticated_peer",
         TransportError::InvalidPipeName => "bridge_invalid_pipe",

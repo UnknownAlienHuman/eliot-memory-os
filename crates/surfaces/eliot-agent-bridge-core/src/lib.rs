@@ -17,7 +17,7 @@ pub use eliot_agent_api::{
     AttemptId, AttemptState, EventCursor, EventId, HostEventEnvelope, HostEventKind,
     RouteFingerprint, SessionId, TaskId, WorkUnitId,
 };
-use eliot_contracts::{BridgeEventCapacityPressure, RequestMetadata};
+use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, RequestMetadata};
 pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
@@ -4717,6 +4717,7 @@ pub struct ProviderFailure {
     provider: &'static str,
     reason: &'static str,
     capacity_pressure: Option<BridgeEventCapacityPressure>,
+    transport_backpressure: Option<BridgeTransportBackpressure>,
 }
 
 impl ProviderFailure {
@@ -4725,6 +4726,7 @@ impl ProviderFailure {
             provider,
             reason,
             capacity_pressure: None,
+            transport_backpressure: None,
         }
     }
 
@@ -4734,12 +4736,29 @@ impl ProviderFailure {
             provider: "eliot-kernel-front-door",
             reason: "typed bridge-event capacity pressure",
             capacity_pressure: Some(pressure),
+            transport_backpressure: None,
+        }
+    }
+
+    /// Creates a provider result that preserves generic front-door transport
+    /// backpressure without assigning a local commit phase.
+    pub const fn bridge_transport_backpressure(backpressure: BridgeTransportBackpressure) -> Self {
+        Self {
+            provider: "eliot-kernel-front-door",
+            reason: "typed bridge transport backpressure",
+            capacity_pressure: None,
+            transport_backpressure: Some(backpressure),
         }
     }
 
     /// Returns the exact typed capacity report, when this failure carries one.
     pub const fn capacity_pressure(&self) -> Option<BridgeEventCapacityPressure> {
         self.capacity_pressure
+    }
+
+    /// Returns the exact typed front-door transport disposition, when present.
+    pub const fn transport_backpressure(&self) -> Option<BridgeTransportBackpressure> {
+        self.transport_backpressure
     }
 }
 
@@ -4759,6 +4778,8 @@ pub enum BridgeError {
     Provider(#[from] ProviderFailure),
     #[error("bridge-event capacity exhausted: {0:?}")]
     Backpressure(BridgeEventCapacityPressure),
+    #[error("bridge transport backpressure: {0:?}")]
+    TransportBackpressure(BridgeTransportBackpressure),
     #[error("bridge is not attached")]
     NotAttached,
     #[error("activation denied: {0}")]
@@ -4812,10 +4833,17 @@ pub enum BridgeError {
 
 impl BridgeError {
     fn from_forwarding_failure(failure: ProviderFailure) -> Self {
-        match failure.capacity_pressure() {
-            Some(pressure) if pressure.is_consistent() => Self::Backpressure(pressure),
-            _ => Self::Provider(failure),
+        if let Some(pressure) = failure.capacity_pressure()
+            && pressure.is_consistent()
+        {
+            return Self::Backpressure(pressure);
         }
+        if let Some(backpressure) = failure.transport_backpressure()
+            && backpressure.is_consistent()
+        {
+            return Self::TransportBackpressure(backpressure);
+        }
+        Self::Provider(failure)
     }
 }
 

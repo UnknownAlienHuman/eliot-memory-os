@@ -70,7 +70,9 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
         TransportError::PeerIdentityUnavailable => "control_peer_unavailable",
         TransportError::Protocol(_) => "control_protocol",
         TransportError::SessionFenced => "control_fenced",
-        TransportError::Backpressure => "control_backpressure",
+        TransportError::Backpressure | TransportError::AttributedBackpressure(_) => {
+            "control_backpressure"
+        }
         TransportError::Timeout => "control_timeout",
         TransportError::Cancelled => "control_cancelled",
         TransportError::InvalidPipeName => "control_invalid_pipe",

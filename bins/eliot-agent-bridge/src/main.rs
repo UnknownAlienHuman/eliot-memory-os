@@ -14,7 +14,7 @@ use eliot_agent_bridge_core::{
     DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest,
     RecoveryProjectionPage, SessionId,
 };
-use eliot_contracts::{BridgeEventCapacityPressure, EpochId};
+use eliot_contracts::{BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId};
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
@@ -345,6 +345,10 @@ enum Response {
     /// phase remain structured through the host response.
     Backpressure {
         pressure: BridgeEventCapacityPressure,
+    },
+    /// Typed transport refusal from the kernel; local durable phase is unknown.
+    TransportBackpressure {
+        pressure: BridgeTransportBackpressure,
     },
     /// Typed acknowledgement of one live reactive admission.
     ///
@@ -1078,6 +1082,7 @@ fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<Unders
         | Response::Stopped { bootstrap, .. } => Some(bootstrap),
         Response::Bootstrap { .. }
         | Response::Backpressure { .. }
+        | Response::TransportBackpressure { .. }
         | Response::Error { .. }
         | Response::ActivationDenied { .. }
         | Response::DryRun { .. } => None,
@@ -1161,7 +1166,8 @@ fn forward_stage(error: &BridgeError) -> &'static str {
         | BridgeError::OutstandingDeliveryReconciliationRequired { .. }
         | BridgeError::ExternalAttachReconciliationRequired
         | BridgeError::ExternalReconciliationDenied(_)
-        | BridgeError::Backpressure(_) => "durability",
+        | BridgeError::Backpressure(_)
+        | BridgeError::TransportBackpressure(_) => "durability",
         BridgeError::InvalidContract { .. }
         | BridgeError::ProviderContract(_)
         | BridgeError::AckIdentityMismatch
@@ -1981,6 +1987,10 @@ fn bridge_error(error: &BridgeError) -> Response {
         }
     } else if let BridgeError::Backpressure(pressure) = error {
         Response::Backpressure {
+            pressure: *pressure,
+        }
+    } else if let BridgeError::TransportBackpressure(pressure) = error {
+        Response::TransportBackpressure {
             pressure: *pressure,
         }
     } else if let BridgeError::ActivationDenied(report) = error {

@@ -40,8 +40,9 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
-    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase, ClockReading,
-    ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
+    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
+    BridgeTransportBackpressure, ClockReading, ProductId, RequestId, RequestMetadata, SourceId,
+    StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -374,30 +375,55 @@ fn bridge_event_frame_for_operation(
 }
 
 /// Strictly decodes one event-route reply: response/result shape, connection
-/// and correlation joins, and the closed `known` status. Any mismatch is an
-/// unknown delivery (`None`), never a guessed outcome or phase.
-fn decode_bridge_event_reply(reply: &Frame, frame: &Frame) -> Option<serde_json::Value> {
-    reply.validate().ok()?;
+/// and correlation joins, the closed `known` status, and typed generic
+/// backpressure. Transport outcomes retain their exact disposition but never
+/// claim a local commit phase.
+fn decode_bridge_event_reply(
+    reply: &Frame,
+    frame: &Frame,
+) -> Result<serde_json::Value, ProviderFailure> {
+    reply.validate().map_err(|_| event_transport_failure())?;
     if reply.kind != FrameKind::Response || reply.message_type != MessageType::Result {
-        return None;
+        return Err(event_transport_failure());
     }
     if reply.connection_id != frame.connection_id {
-        return None;
+        return Err(event_transport_failure());
     }
     if reply.request_id != frame.request_id {
-        return None;
+        return Err(event_transport_failure());
     }
     if reply.request_identity.is_some() {
-        return None;
+        return Err(event_transport_failure());
     }
     let payload = match &reply.payload {
         ProtocolPayload::Json(value) => value.clone(),
-        _ => return None,
+        _ => return Err(event_transport_failure()),
     };
-    if payload.get("status")?.as_str()? != "known" {
-        return None;
+    if payload.get("status").and_then(serde_json::Value::as_str) != Some("known") {
+        return Err(event_transport_failure());
     }
-    Some(payload.get("value")?.clone())
+    let value = payload
+        .get("value")
+        .cloned()
+        .ok_or_else(event_transport_failure)?;
+    let carries_backpressure_fields = value.as_object().is_some_and(|object| {
+        ["backpressure", "dimension", "recovery_action", "shed_work"]
+            .iter()
+            .any(|field| object.contains_key(*field))
+    });
+    if carries_backpressure_fields {
+        let backpressure: BridgeTransportBackpressure =
+            serde_json::from_value(value).map_err(|_| {
+                event_shape_failure("event route refused: malformed or unsupported backpressure")
+            })?;
+        if !backpressure.is_consistent() {
+            return Err(event_shape_failure(
+                "event route refused: inconsistent typed transport backpressure",
+            ));
+        }
+        return Err(ProviderFailure::bridge_transport_backpressure(backpressure));
+    }
+    Ok(value)
 }
 
 /// Parses one owner phase without inventing values: unknown phase strings
@@ -462,12 +488,14 @@ fn decode_event_port_outcome(
                 pressure.dimension,
                 BridgeEventCapacityDimension::EventRecords
                     | BridgeEventCapacityDimension::EnvelopeBytes
+                    | BridgeEventCapacityDimension::PositionRows
                     | BridgeEventCapacityDimension::PendingHandoffs
             )
             || (matches!(
                 pressure.dimension,
                 BridgeEventCapacityDimension::EventRecords
                     | BridgeEventCapacityDimension::EnvelopeBytes
+                    | BridgeEventCapacityDimension::PositionRows
             ) && pressure.local_phase != BridgeEventLocalPhase::NotCommitted)
             || value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
             || reply_stream != event.stream_id
@@ -1881,8 +1909,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             now_ms,
         )?;
         let reply = self.exchange(&frame)?;
-        let value =
-            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        let value = decode_bridge_event_reply(&reply, &frame)?;
         if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
             || value.get("received").and_then(serde_json::Value::as_bool) != Some(true)
             || value.get("hook_digest").and_then(serde_json::Value::as_str) != Some(&hook_digest)
@@ -1928,8 +1955,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             now_ms,
         )?;
         let reply = self.exchange(&frame)?;
-        let value =
-            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        let value = decode_bridge_event_reply(&reply, &frame)?;
         decode_event_port_outcome(event, &value, &envelope_sha, self)
     }
     fn forward_gap(
@@ -1965,8 +1991,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             now_ms,
         )?;
         let reply = self.exchange(&frame)?;
-        let value =
-            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        let value = decode_bridge_event_reply(&reply, &frame)?;
         if let Some(pressure_value) = value.get("capacity_pressure") {
             let pressure: BridgeEventCapacityPressure =
                 serde_json::from_value(pressure_value.clone()).map_err(|_| {
@@ -2017,8 +2042,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             now_ms,
         )?;
         let reply = self.exchange(&frame)?;
-        let value =
-            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        let value = decode_bridge_event_reply(&reply, &frame)?;
         decode_reconciliation_outcome(binding, &facts, &value, consumed_frontiers, None)
     }
     /// Reads one bounded recovery page inside the declared window through
@@ -2082,8 +2106,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
             now_ms,
         )?;
         let reply = self.exchange(&frame)?;
-        let value =
-            decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        let value = decode_bridge_event_reply(&reply, &frame)?;
         decode_reconciliation_outcome(binding, &facts, &value, Vec::new(), Some(request))
     }
 

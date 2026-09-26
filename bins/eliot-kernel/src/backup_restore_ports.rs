@@ -1345,6 +1345,9 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
                 eliot_contracts::BridgeEventCapacityDimension::ScopedGaps => {
                     "bridge scoped-gap capacity pressure"
                 }
+                eliot_contracts::BridgeEventCapacityDimension::PositionRows => {
+                    "bridge live-position capacity pressure"
+                }
             };
             // Backup/restore operations cannot admit bridge events. Keep the
             // failure in the existing unexpected-component class rather than

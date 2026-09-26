@@ -52,7 +52,8 @@ fn transport_terminal_code(error: &eliot_ipc::TransportError) -> &'static str {
         eliot_ipc::TransportError::UnknownOutcome => "unknown_outcome",
         eliot_ipc::TransportError::IdentityConflict => "identity_conflict",
         eliot_ipc::TransportError::Cancelled => "cancelled",
-        eliot_ipc::TransportError::Backpressure => "backpressure",
+        eliot_ipc::TransportError::Backpressure
+        | eliot_ipc::TransportError::AttributedBackpressure(_) => "backpressure",
         eliot_ipc::TransportError::InvalidLimits => "invalid_limits",
         eliot_ipc::TransportError::InvalidPipeName => "invalid_pipe_name",
         eliot_ipc::TransportError::RegistryFull => "registry_full",
