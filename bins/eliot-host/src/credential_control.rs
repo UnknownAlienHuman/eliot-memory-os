@@ -55,16 +55,26 @@ const PHASE_B_QUEUE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration:
 // (#984 still open).
 //
 // Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never credential
-// values, ownership keys, envelopes, digests of secrets, paths carrying
-// identity beyond the frozen operation labels, or arbitrary error text — so
-// bounding limits size, not sensitivity (I15.4). Sink outcome never alters
-// result/order/status/cleanup. There is no mutable global dedup cache: one
-// terminal emission per failed credential-owned operation is enforced by the
-// single outermost observer per operation (the `handle` outcome check for
-// request outcomes, the guard for `serve_one` transport), while relayed
-// Phase-B outcomes keep the terminal owned by their Phase-B handler and inner
-// phases correlate by stage order only.
+// the semantic owner. The boundary label is a frozen literal; request-bound
+// observations additionally project the CURRENT nonsecret identities of the
+// live request and serving epoch (`CredentialObservation`): operation,
+// idempotency pair, installation plan digest, source and request digests,
+// generation, owner epoch, binding fence, root-lease subject digest, and the
+// credential target reference (I15.4: diagnostics may record which reference
+// was used, never the value). Still never carried: credential values,
+// ownership keys, envelope or marker bytes, digests over secret-bearing
+// bytes, raw paths (roots enter as path-identity digests only), or arbitrary
+// `Debug`/error text — so bounding limits size, not sensitivity (I15.4).
+// Stale/foreign/conflict reasons stay in the frozen labels. Sink outcome
+// never alters result/order/status/cleanup. There is no mutable global dedup
+// cache: one terminal emission per failed credential-owned operation is
+// enforced by the single outermost observer per operation (the `handle`
+// outcome check for request outcomes, the guard for `serve_one` transport),
+// while relayed Phase-B outcomes keep the terminal owned by their Phase-B
+// handler and inner phases correlate by stage order only. The three
+// pre-request marks (`acquire requested`, `acquired owner-epoch`, `serve
+// requested`) keep frozen labels only: no operation identity exists yet at
+// those boundaries.
 fn credential_control_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
 }
@@ -80,6 +90,94 @@ fn credential_control_observe(detail: &str) {
 fn credential_control_observe_terminal(code: &str) {
     credential_control_note_event_log_unavailable();
     crate::host_diagnostics::observe_terminal_error(code);
+}
+
+/// Stable diagnostic label for one credential operation (F-LOG-HOST-2 W3).
+///
+/// A 1:1 mapping in this file's hyphenated label vocabulary, never `Debug`:
+/// diagnostics project owner vocabulary without formatting type internals.
+fn credential_operation_label(operation: HostCredentialControlOperation) -> &'static str {
+    match operation {
+        HostCredentialControlOperation::Inspect => "inspect",
+        HostCredentialControlOperation::Provision => "provision",
+        HostCredentialControlOperation::Reconcile => "reconcile",
+        HostCredentialControlOperation::Delete => "delete",
+        HostCredentialControlOperation::MaterializePhaseB => "materialize-phase-b",
+        HostCredentialControlOperation::ReconcilePhaseB => "reconcile-phase-b",
+        HostCredentialControlOperation::FinalizePhaseB => "finalize-phase-b",
+    }
+}
+
+/// Current nonsecret identities bound to one credential observation
+/// (F-LOG-HOST-2 W3). Every field projects a fact the semantic owner already
+/// produced for the live request; see the observation-only contract above for
+/// the exact carried/forbidden sets.
+struct CredentialObservation<'a> {
+    label: &'static str,
+    operation: &'static str,
+    transaction_id: &'a str,
+    effect_id: &'a str,
+    installation: &'a str,
+    source_digest: &'a str,
+    request_digest: &'a str,
+    generation: u64,
+    epoch: &'a str,
+    fence: &'a str,
+    root_lease: String,
+    credential_ref: &'a str,
+}
+
+impl<'a> CredentialObservation<'a> {
+    /// Binds the current request identities plus the serving owner epoch.
+    /// The root lease enters as the path-identity digest of the
+    /// request-claimed protected root: pure string hashing, no filesystem
+    /// effect and no raw path crossing into diagnostics.
+    fn for_request(
+        label: &'static str,
+        request: &'a HostCredentialControlRequest,
+        epoch: &'a PlatformHandle,
+    ) -> Self {
+        let intent = &request.intent;
+        let provision = &intent.provision;
+        Self {
+            label,
+            operation: credential_operation_label(intent.operation),
+            transaction_id: intent.transaction_id.as_str(),
+            effect_id: intent.effect_id.as_str(),
+            installation: intent.installation_plan_digest.as_str(),
+            source_digest: provision.config_digest.as_str(),
+            request_digest: intent.request_digest.as_str(),
+            generation: provision.generation.value(),
+            epoch: epoch.as_str(),
+            fence: intent.effect_binding_digest.as_str(),
+            root_lease: windows_path_identity_digest(Path::new(provision.host_state_root.as_str())),
+            credential_ref: provision.target.as_str(),
+        }
+    }
+}
+
+/// Emits one identity-bound credential observation through the #889 facade.
+///
+/// The frozen boundary label stays first so label-prefix consumers keep
+/// matching; the current identities follow as `k=v` pairs. Length stays under
+/// the facade's detail bound for pinned handle shapes, and any longer input
+/// is cut by that bound with its truncation honesty record.
+fn credential_control_observe_bound(observation: &CredentialObservation) {
+    credential_control_observe(&format!(
+        "{label} op={operation} tx={transaction} effect={effect} install={installation} src={source} req={request} gen={generation} epoch={epoch} fence={fence} lease={lease} target={target}",
+        label = observation.label,
+        operation = observation.operation,
+        transaction = observation.transaction_id,
+        effect = observation.effect_id,
+        installation = observation.installation,
+        source = observation.source_digest,
+        request = observation.request_digest,
+        generation = observation.generation,
+        epoch = observation.epoch,
+        fence = observation.fence,
+        lease = observation.root_lease,
+        target = observation.credential_ref,
+    ));
 }
 
 /// Single-terminal guard for one credential transport operation.
@@ -273,7 +371,11 @@ impl HostCredentialControl {
         // Phase-B handler (observed here as relay-only); credential-owned
         // inspect/provision/revoke Unknown outcomes own the single terminal
         // emitted below. Inner phases correlate by stage order only.
-        credential_control_observe("host.credential requested");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential requested",
+            request,
+            &self.core.host_epoch_digest,
+        ));
         if matches!(
             request.intent.operation,
             HostCredentialControlOperation::MaterializePhaseB
@@ -282,13 +384,21 @@ impl HostCredentialControl {
         ) {
             let response = self.enqueue_phase_b(request).await;
             if matches!(response, HostCredentialControlResponse::Unknown { .. }) {
-                credential_control_observe("host.credential phase-b relayed unknown");
+                credential_control_observe_bound(&CredentialObservation::for_request(
+                    "host.credential phase-b relayed unknown",
+                    request,
+                    &self.core.host_epoch_digest,
+                ));
             }
             return response;
         }
         let response = self.core.handle(request);
         if matches!(response, HostCredentialControlResponse::Unknown { .. }) {
-            credential_control_observe("host.credential unknown");
+            credential_control_observe_bound(&CredentialObservation::for_request(
+                "host.credential unknown",
+                request,
+                &self.core.host_epoch_digest,
+            ));
             credential_control_observe_terminal("host-credential-unknown");
         }
         response
@@ -302,27 +412,51 @@ impl HostCredentialControl {
         // relay outcomes are phase observations only; the single terminal for
         // a credential-owned Unknown stays with `handle`, and relayed
         // Phase-B Unknowns stay with their Phase-B handler.
-        credential_control_observe("host.credential phase-b enqueue requested");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential phase-b enqueue requested",
+            request,
+            &self.core.host_epoch_digest,
+        ));
         if request.validate().is_err() {
-            credential_control_observe("host.credential phase-b enqueue validation unknown");
+            credential_control_observe_bound(&CredentialObservation::for_request(
+                "host.credential phase-b enqueue validation unknown",
+                request,
+                &self.core.host_epoch_digest,
+            ));
             return unknown(request, "phase-b-request-validation");
         }
         let Some(intent) = request.phase_b.clone() else {
-            credential_control_observe("host.credential phase-b enqueue intent unknown");
+            credential_control_observe_bound(&CredentialObservation::for_request(
+                "host.credential phase-b enqueue intent unknown",
+                request,
+                &self.core.host_epoch_digest,
+            ));
             return unknown(request, "phase-b-request-intent");
         };
         let Some(credential_receipt) = request.expected_receipt.clone() else {
-            credential_control_observe("host.credential phase-b enqueue receipt unknown");
+            credential_control_observe_bound(&CredentialObservation::for_request(
+                "host.credential phase-b enqueue receipt unknown",
+                request,
+                &self.core.host_epoch_digest,
+            ));
             return unknown(request, "phase-b-request-credential-receipt");
         };
         let (reply, response) = oneshot::channel();
         {
             let Ok(mut queue) = self.phase_b_queue.lock() else {
-                credential_control_observe("host.credential phase-b enqueue lock unknown");
+                credential_control_observe_bound(&CredentialObservation::for_request(
+                    "host.credential phase-b enqueue lock unknown",
+                    request,
+                    &self.core.host_epoch_digest,
+                ));
                 return unknown(request, "phase-b-queue-lock");
             };
             if queue.len() >= MAX_PHASE_B_QUEUE_DEPTH {
-                credential_control_observe("host.credential phase-b enqueue full unknown");
+                credential_control_observe_bound(&CredentialObservation::for_request(
+                    "host.credential phase-b enqueue full unknown",
+                    request,
+                    &self.core.host_epoch_digest,
+                ));
                 return unknown(request, "phase-b-queue-full");
             }
             queue.push_back(HostPhaseBRequest {
@@ -333,14 +467,22 @@ impl HostCredentialControl {
                 reply,
             });
         }
-        credential_control_observe("host.credential phase-b enqueued");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential phase-b enqueued",
+            request,
+            &self.core.host_epoch_digest,
+        ));
         match tokio::time::timeout(PHASE_B_QUEUE_RESPONSE_TIMEOUT, response).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) | Err(_) => {
                 // Cancellation/timeout/late result retains possible effect:
                 // the owner thread may still complete the handoff, so this
                 // stays Unknown and never claims success or failure.
-                credential_control_observe("host.credential phase-b queue response unknown");
+                credential_control_observe_bound(&CredentialObservation::for_request(
+                    "host.credential phase-b queue response unknown",
+                    request,
+                    &self.core.host_epoch_digest,
+                ));
                 unknown(request, "phase-b-queue-response")
             }
         }
@@ -385,7 +527,11 @@ impl HostCredentialControl {
             .await
             .map_err(|error| error.to_string())?;
         serve_terminal.disarm();
-        credential_control_observe("host.credential serve admitted");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential serve admitted",
+            &request,
+            &self.core.host_epoch_digest,
+        ));
         Ok(())
     }
 }
@@ -411,7 +557,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         {
             // F-LOG-HOST-2 (#893): admission validation failed; the single
             // terminal for this Unknown stays with `handle`.
-            credential_control_observe("host.credential admission unknown");
+            credential_control_observe_bound(&CredentialObservation::for_request(
+                "host.credential admission unknown",
+                request,
+                &self.host_epoch_digest,
+            ));
             return unknown(request, "credential-control-admission");
         }
         match request.intent.operation {
@@ -430,7 +580,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
     fn inspect(&self, request: &HostCredentialControlRequest) -> HostCredentialControlResponse {
         // F-LOG-HOST-2 (#893): inspect boundary. Absence is a positive
         // observation distinct from Unknown; no value is referenced.
-        credential_control_observe("host.credential inspect requested");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential inspect requested",
+            request,
+            &self.host_epoch_digest,
+        ));
         let root = match self.primitive.inspect(&self.root_spec) {
             Ok(InstallerRootPrimitiveObservation::Matching(root)) => root,
             _ => return unknown(request, "credential-host-root"),
@@ -465,7 +619,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             };
         // F-LOG-HOST-2 (#893): marker and target are both absent; the receipt
         // below carries reference identities only, never secret values.
-        credential_control_observe("host.credential inspect absent receipt");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential inspect absent receipt",
+            request,
+            &self.host_epoch_digest,
+        ));
         HostCredentialControlResponse::Absent {
             snapshot,
             response_digest,
@@ -479,7 +637,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         // F-LOG-HOST-2 (#893): provision/consume boundary. Consumed versus
         // revoked outcomes stay distinct; Unknowns keep the single terminal
         // owned by `handle`.
-        credential_control_observe("host.credential provision requested");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential provision requested",
+            request,
+            &self.host_epoch_digest,
+        ));
         let marker_path = marker_path(&self.root_spec.root, request);
         let key = request.ownership_key.as_slice();
         let marker = match self.primitive.read_local_service_protected_file(
@@ -506,7 +668,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                     return if target.is_none() {
                         // F-LOG-HOST-2 (#893): reconcile observed durable
                         // absence; a revoked receipt, never a consumed one.
-                        credential_control_observe("host.credential reconcile revoked receipt");
+                        credential_control_observe_bound(&CredentialObservation::for_request(
+                            "host.credential reconcile revoked receipt",
+                            request,
+                            &self.host_epoch_digest,
+                        ));
                         deleted_response_for_receipt(request, receipt)
                     } else if let Some(target) = target {
                         // A crash may occur after the protected marker delete
@@ -624,7 +790,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
                     .unwrap_or_else(|| unreachable!());
                 // F-LOG-HOST-2 (#893): reconcile observed durable absence
                 // after marker cleanup; a revoked receipt, never consumed.
-                credential_control_observe("host.credential reconcile revoked receipt");
+                credential_control_observe_bound(&CredentialObservation::for_request(
+                    "host.credential reconcile revoked receipt",
+                    request,
+                    &self.host_epoch_digest,
+                ));
                 return deleted_response_for_receipt(request, receipt);
             }
             if matches!(marker.1.phase, MarkerPhase::Finalized) {
@@ -723,7 +893,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         // F-LOG-HOST-2 (#893): credential consumed under the exact marker and
         // epoch binding; the receipt carries reference identities only, never
         // secret values.
-        credential_control_observe("host.credential provision consumed receipt");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential provision consumed receipt",
+            request,
+            &self.host_epoch_digest,
+        ));
         HostCredentialControlResponse::Matching { receipt }
     }
 
@@ -732,7 +906,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         // positive observation distinct from Unknown; cleanup failure below is
         // a distinct non-success that keeps the single terminal owned by
         // `handle`.
-        credential_control_observe("host.credential revoke requested");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential revoke requested",
+            request,
+            &self.host_epoch_digest,
+        ));
         let marker_path = marker_path(&self.root_spec.root, request);
         let readback = match self.primitive.read_local_service_protected_file(
             &self.root_spec,
@@ -778,7 +956,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
             // F-LOG-HOST-2 (#893): cleanup did not reach proven absence, so
             // this must never read as revoked; the Unknown keeps the single
             // terminal owned by `handle`.
-            credential_control_observe("host.credential revoke cleanup unknown");
+            credential_control_observe_bound(&CredentialObservation::for_request(
+                "host.credential revoke cleanup unknown",
+                request,
+                &self.host_epoch_digest,
+            ));
             return unknown(request, "credential-delete-readback");
         }
         let absence_digest = match credential_deleted_response_digest(
@@ -792,7 +974,11 @@ impl<B: CredentialBackend> HostCredentialControlCore<B> {
         };
         // F-LOG-HOST-2 (#893): credential and marker both verified absent;
         // the receipt carries reference identities only, never secret values.
-        credential_control_observe("host.credential revoked absent");
+        credential_control_observe_bound(&CredentialObservation::for_request(
+            "host.credential revoked absent",
+            request,
+            &self.host_epoch_digest,
+        ));
         HostCredentialControlResponse::Deleted { absence_digest }
     }
 }
@@ -808,7 +994,11 @@ fn delete_credential_with_readback<B: CredentialBackend>(
     // F-LOG-HOST-2 (#893): revoke readback boundary. The verified-absence
     // outcome is observed by the `delete` caller; this entry only marks the
     // readback attempt, never secret values.
-    credential_control_observe("host.credential revoke readback requested");
+    credential_control_observe_bound(&CredentialObservation::for_request(
+        "host.credential revoke readback requested",
+        request,
+        host_epoch,
+    ));
     let mut verify = |target: &CredentialSecret| {
         decode_envelope(request, ownership_key, host_epoch, marker, target.expose()).is_ok()
     };
