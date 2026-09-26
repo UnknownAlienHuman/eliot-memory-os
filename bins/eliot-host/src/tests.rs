@@ -1129,7 +1129,7 @@ fn store_recovery_changes_only_store_identity_kernel_fence_invariants_hold() -> 
             &activation_generation,
             eliot_host_state::ActivationState::Starting,
             "store-recovery-test-starting",
-            &super::test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     let snapshot_before = journal.snapshot()?;
@@ -1227,7 +1227,7 @@ fn store_recovery_same_host_response_loss_preserves_commit_and_idempotent_replay
             &activation_generation,
             eliot_host_state::ActivationState::Starting,
             "crash-reopen-starting",
-            &super::test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     let req = HostRuntimeControlRequest::new(

@@ -264,7 +264,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
             &activation_generation,
             ActivationState::Starting,
             "readiness-starting",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     let kernel_artifact = PlatformHandle::new("a".repeat(64))?;
@@ -2669,7 +2669,7 @@ fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
             &generation,
             ActivationState::Stopped,
             "test-open",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     append_clean_marker(&journal, &host, &activation_id, &generation)?;
@@ -2689,7 +2689,7 @@ fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
             &child_generation,
             ActivationState::Stopped,
             "test-child-open",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     assert_eq!(reopened.snapshot()?.sequence, 1);
@@ -2714,7 +2714,7 @@ fn unknown_commit_is_reconciled_by_transaction_identity() -> TestResult {
             &generation,
             ActivationState::Stopped,
             "unknown-open",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     assert_eq!(journal.snapshot()?.sequence, 1);
@@ -2735,7 +2735,7 @@ fn torn_current_epoch_fails_closed() -> TestResult {
             &generation,
             ActivationState::Stopped,
             "torn-open",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     let backend = journal.into_backend()?;
@@ -2800,7 +2800,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
             &activation_generation,
             ActivationState::Starting,
             "reconcile-starting",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
 
@@ -3047,7 +3047,7 @@ fn store_rebind_disposition_uses_exact_operation_and_request_identity() -> TestR
             &activation_generation,
             ActivationState::Starting,
             "store-rebind-disposition-starting",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
     let make_pending =
@@ -3449,7 +3449,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
             &activation_generation,
             ActivationState::Starting,
             "store-recovery-physical-starting",
-            &test_activation_ingress(),
+            &crate::journal_append::test_activation_ingress(),
         )?),
     )?;
 
