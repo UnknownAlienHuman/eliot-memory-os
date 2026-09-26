@@ -119,12 +119,6 @@ impl LiveAuthority {
         self.revoked.store(true, Ordering::SeqCst);
     }
 
-    /// Returns the grant expiry the window closes at.
-    #[must_use]
-    pub const fn expires_at_unix_ms(&self) -> u64 {
-        self.expires_at_unix_ms
-    }
-
     /// Returns whether the binding is still inside its live window.
     #[must_use]
     pub fn is_live(&self) -> bool {

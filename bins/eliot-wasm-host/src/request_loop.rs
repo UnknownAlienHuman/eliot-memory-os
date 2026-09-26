@@ -169,36 +169,6 @@ impl AdmittedBinding {
             max_output_bytes: ceilings.max_output_bytes,
         }
     }
-
-    /// Returns the grant digest every request must name.
-    #[must_use]
-    pub fn grant_digest(&self) -> &str {
-        &self.grant_digest
-    }
-
-    /// Returns the admitted component identity.
-    #[must_use]
-    pub fn component_id(&self) -> &str {
-        &self.component_id
-    }
-
-    /// Returns the admitted operation identity.
-    #[must_use]
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-
-    /// Returns the claim identity the delivery set was admitted under.
-    #[must_use]
-    pub fn claim_id(&self) -> &str {
-        &self.claim_id
-    }
-
-    /// Returns the sealed request digest the admitted operation carries.
-    #[must_use]
-    pub fn request_digest(&self) -> &str {
-        &self.request_digest
-    }
 }
 
 /// The admitted invoke request: exact claim, grant, target, input, and
@@ -1159,24 +1129,49 @@ impl std::error::Error for OrdinaryDriveError {}
 /// set, and serves the bounded request loop to its correlated terminal
 /// frame.
 ///
+/// Generation replacement closes here. After the current set is consumed,
+/// the staged path is re-read through the same validated loader: a
+/// replacement set — one naming a grant this process has not served — is
+/// revalidated through the identical full admission path with fresh
+/// authority, while the previous generation's binding, permit, and
+/// authority cell are dropped, never reused. A re-staged copy of the grant
+/// this process already served ends the chain without a second execution:
+/// spent one-shot authority is never revived, and the completed outcome —
+/// whose terminal frame was already published — stands.
+///
 /// # Errors
 ///
 /// Returns [`OrdinaryDriveError`] when the delivery set, the installation
 /// binding, the one-shot permit, the admitted world, the request source,
 /// the result sink, or a request binding fails closed.
 pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError> {
-    let Some(material) = read_admitted_material().map_err(OrdinaryDriveError::Drive)? else {
-        return Err(OrdinaryDriveError::NoDeliverySet);
-    };
-    let runtime =
-        build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
-    let outcome = run_request_loop(runtime, &material);
-    // The delivery set is one-shot: it is consumed exactly once, so a
-    // leftover is a fresh-drive signal rather than a silent reuse. The
-    // in-memory retention of the terminal frame above is the readback path,
-    // not a second execution.
-    consume_delivery_set();
-    outcome.map_err(OrdinaryDriveError::Loop)
+    let mut served_grant: Option<String> = None;
+    let mut outcome: Option<OrdinaryOutcome> = None;
+    // The staged path is the owner's only route into this process, and the
+    // previous set was consumed, so any set observed here is either a
+    // replacement generation or a same-grant re-stage. Nothing is carried
+    // across iterations except the served grant digest below, so no
+    // accumulation is possible.
+    while let Some(material) = read_admitted_material().map_err(OrdinaryDriveError::Drive)? {
+        if served_grant.as_deref() == Some(material.grant.grant_digest.as_str()) {
+            // Same grant this process already served to its published
+            // terminal frame. Serving it again would revive spent one-shot
+            // authority for a new effect, so the chain ends here.
+            break;
+        }
+        let runtime =
+            build_admitted_runtime(&material, edge_now_ms()).map_err(OrdinaryDriveError::Drive)?;
+        let frame = run_request_loop(runtime, &material);
+        // The delivery set is one-shot: it is consumed exactly once, so a
+        // leftover is a fresh-drive signal rather than a silent reuse. The
+        // in-memory retention of the terminal frame above is the readback
+        // path, not a second execution.
+        consume_delivery_set();
+        let frame = frame.map_err(OrdinaryDriveError::Loop)?;
+        served_grant = Some(material.grant.grant_digest.as_str().to_owned());
+        outcome = Some(frame);
+    }
+    outcome.ok_or(OrdinaryDriveError::NoDeliverySet)
 }
 
 /// Consumes the staged delivery set beside this installation. Best effort by
