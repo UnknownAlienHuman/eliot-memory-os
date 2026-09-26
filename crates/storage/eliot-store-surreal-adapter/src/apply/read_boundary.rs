@@ -1888,6 +1888,10 @@ async fn automation_current_payload(
 /// reads one row past the bound and, only when that probe row is absent,
 /// reports `COMPLETE`. A page that merely happens to be shorter than the
 /// bound is never completeness.
+///
+/// A verified continuation resumes strictly after the exclusive last revision
+/// identity the owner minted, on the same total `revision` ordering the first
+/// page used, so the two pages partition the denominator.
 async fn automation_history_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -1899,7 +1903,10 @@ async fn automation_history_payload(
     let limit = usize::from(decoded.max_records.max(1));
     let exact_revision = decoded.requested_revision.as_deref();
     let mut truncated;
-    let rows = if let Some(requested_revision) = exact_revision {
+    let rows = if let Some(cursor) = decoded.cursor.as_ref() {
+        truncated = false;
+        read_revisions_after(db, config, &automation_id, &cursor.after_row_id, limit + 1).await?
+    } else if let Some(requested_revision) = exact_revision {
         truncated = false;
         super::surreal_automation::read_revision_for_read(
             db,
@@ -1925,6 +1932,7 @@ async fn automation_history_payload(
         rows
     };
     let mut revisions = Vec::new();
+    let mut last_row_id: Option<String> = None;
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
@@ -1933,6 +1941,7 @@ async fn automation_history_payload(
             truncated = true;
             break;
         }
+        last_row_id = Some(row.revision.clone());
         revisions.push(json!({
             "automation_id": row.automation_id,
             "revision": row.revision,
@@ -1941,21 +1950,139 @@ async fn automation_history_payload(
     }
     if truncated {
         revisions.pop();
+        last_row_id = revisions
+            .last()
+            .and_then(|row| row.get("revision"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
     let returned = revisions.len();
     let revision = projection_len(returned)?;
+    let mut completeness = automation_page_completeness(read_heads, returned, truncated)?;
+    if truncated {
+        completeness = automation_page_with_continuation(
+            completeness,
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            &automation_id,
+            read_heads,
+            state_fence,
+            last_row_id.as_deref(),
+            decoded.max_records,
+        )?;
+    }
     Ok(json!({
         "revisions": revisions,
         "revision": revision,
         "state_fence": state_fence,
-        "completeness": automation_page_completeness(read_heads, returned, truncated)?,
+        "completeness": completeness,
     }))
+}
+
+/// Reads the revision rows of one automation strictly after one row identity, in
+/// ascending `revision` order.
+///
+/// The continuation is a key comparison against the denominator's total
+/// ordering, never a row offset, so a concurrent edit, a retirement or a
+/// reordering between pages can neither drop nor repeat a logical identity.
+async fn read_revisions_after(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    after_revision: &str,
+    limit: usize,
+) -> Result<Vec<super::surreal_automation::StoredAutomationRevision>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert("automation_id".to_owned(), json!(automation_id));
+    bindings.insert("after_revision".to_owned(), json!(after_revision));
+    let sql = format!(
+        "SELECT * FROM {} WHERE automation_id = $automation_id AND revision > $after_revision ORDER BY revision ASC LIMIT {limit};",
+        schema::table::AUTOMATION_REVISION
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "automation.read_revisions_after",
+        &sql,
+        bindings,
+    )
+    .await?;
+    let errors = response.take_errors();
+    if super::surreal_automation::missing_automation_table(&errors) {
+        return Ok(Vec::new());
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::Store(StoreError::Serialization(
+            "automation continuation query failed".to_owned(),
+        )));
+    }
+    let rows: Vec<Value> = response.take(0)?;
+    rows.iter()
+        .map(|row| {
+            let object = row
+                .as_object()
+                .ok_or(AdapterError::Store(StoreError::InvalidField {
+                    field: "automation.row",
+                    reason: "automation row must be an object",
+                }))?;
+            Ok(super::surreal_automation::StoredAutomationRevision {
+                automation_id: automation_row_text(object, "automation_id")?,
+                revision: automation_row_text(object, "revision")?,
+                revision_json: automation_row_text(object, "revision_json")?,
+                state_fence: automation_row_fence(object)?,
+            })
+        })
+        .collect()
+}
+
+/// Mints and attaches the owner continuation for one truncated automation page.
+///
+/// A truncated page that carried no successor cursor would be indistinguishable
+/// from a terminator, so the owner refuses rather than serving a page whose
+/// remainder has no address.
+fn automation_page_with_continuation(
+    mut completeness: Value,
+    query: &str,
+    automation_id: &str,
+    read_heads: &[RevisionHead],
+    state_fence: &StateFence,
+    last_row_id: Option<&str>,
+    max_records: u16,
+) -> Result<Value, AdapterError> {
+    let last_row_id = last_row_id.ok_or(AdapterError::Store(StoreError::InvalidField {
+        field: "automation.page",
+        reason: "truncated automation page served no row to continue from",
+    }))?;
+    let next_cursor = eliot_store_api::automation_cursor_mint(
+        query,
+        automation_id,
+        &automation_page_read_revision(read_heads)?,
+        state_fence,
+        last_row_id,
+        max_records,
+    )
+    .map_err(AdapterError::Store)?;
+    completeness
+        .as_object_mut()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.completeness",
+            reason: "automation completeness metadata is not an object",
+        }))?
+        .insert(
+            eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR.to_owned(),
+            Value::String(next_cursor),
+        );
+    Ok(completeness)
 }
 
 /// Projects the bounded invocation set for one automation.
 ///
 /// Same owner-proven coverage rule as the revision page: the bound plus one
 /// probe row is what turns an unknown remainder into a `COMPLETE` proof.
+///
+/// A verified continuation resumes strictly after the exclusive last row
+/// identity the owner minted, on the same total `occurrence_id` ordering the
+/// first page used, so the two pages partition the denominator instead of
+/// overlapping or leaving a gap.
 async fn automation_invocations_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -1967,7 +2094,10 @@ async fn automation_invocations_payload(
     let limit = usize::from(decoded.max_records.max(1));
     let exact_occurrence = decoded.requested_occurrence_id.as_deref();
     let mut truncated;
-    let rows = if let Some(occurrence_id) = exact_occurrence {
+    let rows = if let Some(cursor) = decoded.cursor.as_ref() {
+        truncated = false;
+        read_invocations_after(db, config, &automation_id, &cursor.after_row_id, limit + 1).await?
+    } else if let Some(occurrence_id) = exact_occurrence {
         truncated = false;
         super::surreal_automation::read_invocation_for_read(
             db,
@@ -1990,6 +2120,7 @@ async fn automation_invocations_payload(
         rows
     };
     let mut invocations = Vec::new();
+    let mut last_row_id: Option<String> = None;
     for row in rows {
         if row.state_fence != *state_fence {
             continue;
@@ -2005,6 +2136,7 @@ async fn automation_invocations_payload(
             truncated = true;
             break;
         }
+        last_row_id = Some(row.occurrence_id.clone());
         invocations.push(json!({
             "occurrence_id": row.occurrence_id,
             "automation_id": row.automation_id,
@@ -2013,15 +2145,123 @@ async fn automation_invocations_payload(
     }
     if truncated {
         invocations.pop();
+        last_row_id = invocations
+            .last()
+            .and_then(|row| row.get("occurrence_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
     let returned = invocations.len();
     let revision = projection_len(returned)?;
+    let mut completeness = automation_page_completeness(read_heads, returned, truncated)?;
+    if truncated {
+        completeness = automation_page_with_continuation(
+            completeness,
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            &automation_id,
+            read_heads,
+            state_fence,
+            last_row_id.as_deref(),
+            decoded.max_records,
+        )?;
+    }
     Ok(json!({
         "invocations": invocations,
         "revision": revision,
         "state_fence": state_fence,
-        "completeness": automation_page_completeness(read_heads, returned, truncated)?,
+        "completeness": completeness,
     }))
+}
+
+/// Reads the invocation rows of one automation strictly after one row identity,
+/// in ascending `occurrence_id` order.
+///
+/// The continuation is a key comparison against the denominator's total
+/// ordering, never a row offset, so a concurrent append, a retirement or a
+/// reordering between pages can neither drop nor repeat a logical identity.
+async fn read_invocations_after(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    after_occurrence_id: &str,
+    limit: usize,
+) -> Result<Vec<super::surreal_automation::StoredAutomationInvocation>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert("automation_id".to_owned(), json!(automation_id));
+    bindings.insert("after_occurrence_id".to_owned(), json!(after_occurrence_id));
+    // Table names cannot travel as bindings in a FROM clause, so the crate
+    // table constant is inlined here while row keys stay bound.
+    let sql = format!(
+        "SELECT * FROM {} WHERE automation_id = $automation_id AND occurrence_id > $after_occurrence_id ORDER BY occurrence_id ASC LIMIT {limit};",
+        schema::table::AUTOMATION_INVOCATION
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "automation.read_invocations_after",
+        &sql,
+        bindings,
+    )
+    .await?;
+    let errors = response.take_errors();
+    if super::surreal_automation::missing_automation_table(&errors) {
+        return Ok(Vec::new());
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::Store(StoreError::Serialization(
+            "automation continuation query failed".to_owned(),
+        )));
+    }
+    let rows: Vec<Value> = response.take(0)?;
+    rows.iter()
+        .map(|row| {
+            let object = row
+                .as_object()
+                .ok_or(AdapterError::Store(StoreError::InvalidField {
+                    field: "automation.row",
+                    reason: "automation row must be an object",
+                }))?;
+            Ok(super::surreal_automation::StoredAutomationInvocation {
+                occurrence_id: automation_row_text(object, "occurrence_id")?,
+                automation_id: automation_row_text(object, "automation_id")?,
+                invocation_json: automation_row_text(object, "invocation_json")?,
+                state_fence: automation_row_fence(object)?,
+            })
+        })
+        .collect()
+}
+
+/// Reads one stored automation row's bounded text field.
+fn automation_row_text(object: &Map<String, Value>, name: &str) -> Result<String, AdapterError> {
+    object
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.row",
+            reason: "automation row is missing a text field",
+        }))
+}
+
+/// Reads one stored automation row's admission fence.
+fn automation_row_fence(object: &Map<String, Value>) -> Result<StateFence, AdapterError> {
+    serde_json::from_value(object.get("state_fence").cloned().unwrap_or(Value::Null))
+        .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))
+}
+
+/// Digests the exact revision-head set one automation read observed.
+///
+/// The value is the owner-issued read revision a page reports and a
+/// continuation is bound to. It is derived from the same head set the response
+/// returns, so a page never claims a denominator revision the response did not
+/// serve, and it changes whenever a commit advances any head — which is exactly
+/// when an outstanding continuation must stop being valid.
+fn automation_page_read_revision(read_heads: &[RevisionHead]) -> Result<String, AdapterError> {
+    let heads: Vec<(String, u64)> = read_heads
+        .iter()
+        .map(|head| (head.key.as_str().to_owned(), head.revision))
+        .collect();
+    audit_heads_digest(&heads).map_err(AdapterError::Store)
 }
 
 /// Builds the owner-issued denominator completeness metadata for one page.
@@ -2032,17 +2272,14 @@ async fn automation_invocations_payload(
 /// to the same head set the response reports, so a page never claims a
 /// denominator revision the response did not serve. `coverage` is the closed
 /// `COMPLETE`/`TRUNCATED` disposition: `COMPLETE` asserts the owner read one
-/// probe row past the bound and matched nothing further.
+/// probe row past the bound and matched nothing further. A truncated page
+/// additionally carries the owner-minted continuation for the next page.
 fn automation_page_completeness(
     read_heads: &[RevisionHead],
     returned: usize,
     truncated: bool,
 ) -> Result<Value, AdapterError> {
-    let heads: Vec<(String, u64)> = read_heads
-        .iter()
-        .map(|head| (head.key.as_str().to_owned(), head.revision))
-        .collect();
-    let read_revision = audit_heads_digest(&heads).map_err(AdapterError::Store)?;
+    let read_revision = automation_page_read_revision(read_heads)?;
     let returned = u64::try_from(returned).map_err(|_| {
         AdapterError::Store(StoreError::Serialization(
             "automation completeness count overflow".to_owned(),

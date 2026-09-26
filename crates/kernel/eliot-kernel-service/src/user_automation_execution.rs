@@ -10,12 +10,14 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    AutomationCapabilityProfile, AutomationExecutionReference, AutomationWorkClass,
-    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
-    UserAutomationExecutionMode, UserAutomationFailureProjection, UserAutomationInvocation,
-    UserAutomationPreflightContext, UserAutomationPreflightDecision,
-    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
+    AutomationCapabilityProfile, AutomationExecutionReference, AutomationReconciliationCause,
+    AutomationWorkClass, ProviderFingerprintPolicy, UserAutomationConfigurationState,
+    UserAutomationError, UserAutomationExecutionMode, UserAutomationExecutionProjection,
+    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
+    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
+    UserAutomationPreflightReceipt, UserAutomationRevision,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
@@ -25,8 +27,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    UserAutomationMutationResult, UserAutomationService, UserAutomationServiceError,
-    UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStorePort,
+    UserAutomationMutationResult, UserAutomationReadResult, UserAutomationService,
+    UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
+    UserAutomationStorePort,
 };
 
 /// Errors returned by an existing Durable Job, WakeIntent, or notification
@@ -1133,6 +1136,15 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         runtime: &R,
     ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError> {
         request.validate()?;
+        // Execution admission consumes the complete, fail-closed owner view, not
+        // a bounded subset of it (issue #2808). An occurrence denominator the
+        // owner could not prove complete is missing coverage evidence, which is
+        // `unknown` rather than "no unresolved effect" (I5.16), so it is refused
+        // here instead of being reported as an ordinary preflight deferral that a
+        // caller could retry as if it were transient capacity. Preflight still
+        // owns the genuinely unresolved-effect case, where the correct outcome is
+        // `Deferred { ReconciliationRequired }`.
+        require_complete_occurrence_view(&request.projection.execution)?;
         let context = UserAutomationPreflightContext {
             request_metadata: request.context.clone(),
         };
@@ -1274,6 +1286,65 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             .await
     }
 
+    /// Reads the complete owner execution view for one automation through the
+    /// same `Status` read every other consumer uses, and refuses when the
+    /// declared occurrence denominator is not owner-proven complete.
+    ///
+    /// The Store adapter builds `unresolved_reconciliation_refs` over the
+    /// complete declared denominator by paging it under one owner-issued read
+    /// revision, and records a denominator it could not prove complete as an
+    /// [`AutomationReconciliationCause::IncompleteDenominator`] obligation
+    /// carrying the durable owner query handle rather than as an empty set
+    /// (issue #2808, I5.16). Reading it here is what makes the runtime
+    /// boundaries — execution admission and wake cancellation — consume that
+    /// complete view instead of a bounded subset of it.
+    ///
+    /// The read is deliberately bounded: the projection carries typed
+    /// references plus one durable query handle, never unbounded history rows,
+    /// and `current_execution_refs` stays the stored Durable Job projection, so
+    /// Durable Job history is not duplicated. The `Status` leg is the canonical
+    /// read for exactly this reason; `History` carries the same projection but
+    /// additionally walks the immutable revision denominator, which the runtime
+    /// boundary does not need.
+    ///
+    /// The read reuses the caller's admitted operation identity rather than
+    /// minting one: this service never creates a canonical operation identity,
+    /// it only carries the identity the authenticated route admitted. The read
+    /// issues no transition and no receipt, so the retirement or execution the
+    /// caller came for is unaffected by it.
+    pub async fn owner_execution_view(
+        &self,
+        request: &UserAutomationServiceRequest,
+        automation_id: &str,
+    ) -> Result<UserAutomationExecutionProjection, UserAutomationExecutionError> {
+        let response = self
+            .dispatch(UserAutomationServiceRequest {
+                context: request.context.clone(),
+                authenticated_principal: request.authenticated_principal.clone(),
+                identity: request.identity.clone(),
+                intent: UserAutomationOperatorIntent {
+                    intent_id: format!("{}:owner-execution-view", request.intent.intent_id),
+                    principal_ref: request.authenticated_principal.clone(),
+                    state_fence: request.context.state_fence.clone(),
+                    operation: eliot_kernel_core::UserAutomationOperation::Status {
+                        automation_id: automation_id.to_owned(),
+                    },
+                },
+            })
+            .await?;
+        match response.outcome {
+            UserAutomationStoreOutcome::Read {
+                result: UserAutomationReadResult::Status { execution, .. },
+            } => {
+                require_complete_occurrence_view(&execution)?;
+                Ok(execution)
+            }
+            _ => Err(UserAutomationExecutionError::OperationMismatch(
+                "owner execution view did not return a status projection",
+            )),
+        }
+    }
+
     /// Retires one revision and cancels the exact owner-issued pending wake
     /// targets observed for that revision.
     pub async fn remove_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
@@ -1293,6 +1364,19 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
                 ));
             }
         };
+        // Wake cancellation acts on the same complete, fail-closed owner view as
+        // execution admission (issue #2808). `remove_and_cancel_with_targets`
+        // is one of the four consumer legs of the single `execution_projection`
+        // constructor, and the Store's retirement gate refuses to commit the
+        // transition unless the declared occurrence denominator is owner-proven
+        // complete at one read revision. Asserting the same gate on the
+        // cancellation that follows the commit means the scheduler owner is
+        // never asked to cancel from a bounded subset, and a Store adapter that
+        // did not gate the retirement is caught here rather than silently
+        // proceeding. Retirement itself is never refused because an effect is
+        // unresolved: those obligations are preserved verbatim.
+        let owner_view = self.owner_execution_view(&request, &automation_id).await?;
+        require_complete_occurrence_view(&owner_view)?;
         let response = self.dispatch(request.clone()).await?;
         let (receipt, result, replayed) = match response.outcome {
             UserAutomationStoreOutcome::Committed { receipt, result } => (receipt, result, false),
@@ -1336,6 +1420,39 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             replayed,
         })
     }
+}
+
+/// Refuses a runtime boundary whose owner view is not a complete, fail-closed
+/// occurrence denominator.
+///
+/// The canonical Store adapter builds `unresolved_reconciliation_refs` over the
+/// complete declared denominator, paging it under one owner-issued read
+/// revision, and encodes a denominator it could not prove complete as an
+/// [`AutomationReconciliationCause::IncompleteDenominator`] obligation carrying
+/// the durable owner query handle — never as an empty set (issue #2808, I5.16).
+///
+/// This is the shared fail-closed gate for the two runtime boundaries that act
+/// on automation state: execution admission (`execute_occurrence_with_material`)
+/// and wake cancellation (`remove_and_cancel_with_targets`). An unresolved
+/// effect on any page therefore blocks identically to one on the first page, and
+/// an incomplete denominator blocks as recovery-required instead of letting the
+/// boundary act on a bounded subset. The gate reads only the caller's typed
+/// projection: it loads no extra history, and Durable Job history is not
+/// duplicated because `current_execution_refs` stays the stored Durable Job
+/// projection.
+fn require_complete_occurrence_view(
+    execution: &UserAutomationExecutionProjection,
+) -> Result<(), UserAutomationExecutionError> {
+    if execution
+        .unresolved_reconciliation_refs
+        .iter()
+        .any(|obligation| obligation.cause == AutomationReconciliationCause::IncompleteDenominator)
+    {
+        return Err(UserAutomationExecutionError::Contract(
+            UserAutomationError::Invalid("execution.occurrence_denominator"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), UserAutomationExecutionError> {

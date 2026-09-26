@@ -741,12 +741,18 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
     },
 ];
 
-/// Owner-approved user-automation read selectors (issue #1779): the query
-/// discriminator, the optional exact automation selector, the optional exact
-/// immutable revision selector for current/history reads, the retired-row
-/// inclusion flag, the decimal page bound, and the optional exact occurrence
-/// selector for invocation reads.
-static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 6] = [
+/// Owner-approved user-automation read selectors (issue #1779; issue #2808
+/// adds the continuation): the query discriminator, the optional exact
+/// automation selector, the optional exact immutable revision selector for
+/// current/history reads, the retired-row inclusion flag, the decimal page
+/// bound, the optional exact occurrence selector for invocation reads, and the
+/// owner-minted page continuation for the two paged denominator reads.
+///
+/// Membership is exact, so the continuation is declared here rather than
+/// smuggled through as an undeclared name: a cursor the owner never minted, or
+/// one presented to a read that does not page, is refused pre-dispatch by
+/// `validate_automation_read_params` rather than reaching a backend.
+static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 7] = [
     ParameterDeclaration {
         name: "query",
         shape: ParameterShape::Subject,
@@ -776,6 +782,11 @@ static GET_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 6] = [
         name: "max_records",
         shape: ParameterShape::Subject,
         required: true,
+    },
+    ParameterDeclaration {
+        name: "cursor",
+        shape: ParameterShape::Subject,
+        required: false,
     },
 ];
 
