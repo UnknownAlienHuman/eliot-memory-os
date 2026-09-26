@@ -452,7 +452,8 @@ pub struct QualifiedInfluenceEdge {
 /// - `max_depth`: the depth of an admitted dependent;
 /// - `max_result`: the cardinality of the emitted result, checked when the
 ///   page finishes against the emitted affected references and never against
-///   node admission;
+///   node admission — `max_nodes` alone bounds the admitted set, and no
+///   continuation counter re-applies this bound to the admitted length;
 /// - `max_work`: cumulative work units (edge examinations plus admissions);
 /// - `max_frontier`: the width of outstanding work, i.e. the number of
 ///   admitted-but-unexpanded node references the traversal may hold at once;
@@ -499,25 +500,25 @@ impl RevocationBounds {
     /// Reject a bounds set with any zero limit.
     pub fn validate(&self) -> Result<(), InfluenceError> {
         if self.max_nodes == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_nodes"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_nodes"));
         }
         if self.max_edges == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_edges"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_edges"));
         }
         if self.max_depth == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_depth"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_depth"));
         }
         if self.max_result == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_result"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_result"));
         }
         if self.max_work == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_work"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_work"));
         }
         if self.max_frontier == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_frontier"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_frontier"));
         }
         if self.max_time == 0 {
-            return Err(InfluenceError::InvalidField("bounds.max_time"));
+            return Err(InfluenceError::InvalidBounds("bounds.max_time"));
         }
         Ok(())
     }
@@ -579,12 +580,18 @@ pub struct RevocationOmission {
 
 /// Bounded revocation request over an explicit qualified edge set.
 ///
-/// Every identity the operation is bound to is carried explicitly and is
-/// frozen by [`digest`](Self::digest): the principal whose allowance the
-/// revocation removes, the origin grant the closure is rooted at, the admitted
-/// task and work scope, the authority epoch, and the observing receipt. None of
-/// them is derived from the edge set, so a resumed operation cannot be
-/// re-pointed at another principal, origin, scope, epoch, or receipt.
+/// The identities this request actually freezes are the ones
+/// [`digest`](Self::digest) hashes: the request id, the origin grant the closure
+/// is rooted at (`root_ref`), the revocation reason, the state fence, the
+/// declared completeness, and the exact qualified-edge multiset digest. The
+/// authority epoch is frozen inside `state_fence.authority_epoch`, so it travels
+/// with the same canonical bytes rather than as a separate field.
+///
+/// The principal, the admitted task, the admitted work scope and the observing
+/// receipt are NOT frozen on this type. There is no field for them here and no
+/// owner in the repository that produces an admitted value for the authority
+/// recovery recheck; `digest` states the same residual. Do not read this
+/// paragraph as proof that they are bound.
 ///
 /// `resumed_visited` remains on the wire for source compatibility only.  A
 /// nonempty value is refused: a visited list cannot identify unexpanded
@@ -638,8 +645,11 @@ pub struct BoundedRevocationPendingEdge {
 /// The continuation is the authority-bearing position of the original
 /// operation.  It is not a visited-only hint: admitted nodes, fully expanded
 /// nodes, unexpanded queue entries, and unexamined edge positions are kept
-/// separately.  All identities are checked by
-/// [`resume_bounded_revocation`] before traversal resumes.
+/// separately.  Every identity this crate actually freezes — the request
+/// digest, the bounds digest, the graph snapshot digest and the state fence —
+/// is re-checked by [`resume_bounded_revocation`] before traversal resumes; the
+/// principal, task, work-scope and observing-receipt identities are not bound
+/// on this type at all.
 ///
 /// `admitted_nodes` is the depth-bearing form of `admitted_refs`.  The
 /// separate `examined_edges` and `pending_edges` vectors make the edge
@@ -854,11 +864,12 @@ impl BoundedRevocationRequest {
     /// `resumed_visited` compatibility field is not part of this identity and
     /// is refused by the bounded engine when nonempty.
     ///
-    /// The principal, origin-grant, task, scope, authority-epoch, and receipt
-    /// identities are part of this digest, so they are frozen: the digest
-    /// becomes the operation binding's `request_digest`, which is copied into
-    /// the continuation and re-checked against this request before any resumed
-    /// page runs.
+    /// The request id, origin grant (`root_ref`), reason, state fence,
+    /// completeness and qualified-edge multiset digest are part of this digest,
+    /// so they are frozen: the digest becomes the operation binding's
+    /// `request_digest`, which is copied into the continuation and re-checked
+    /// against this request before any resumed page runs. The authority epoch
+    /// is inside the hashed `state_fence`.
     ///
     /// The principal, origin-grant, task, scope, authority-epoch and receipt
     /// identities are deliberately NOT frozen here yet. No owner in the
@@ -1586,12 +1597,13 @@ fn check_bounded_header(
     request: &BoundedRevocationRequest,
     bounds: &RevocationBounds,
 ) -> Result<(), InfluenceError> {
-    text(&request.request_id, "request_id")?;
-    text(&request.root_ref, "root_ref")?;
+    text(&request.request_id, "request_id")
+        .map_err(|_| InfluenceError::InvalidRequest("request_id"))?;
+    text(&request.root_ref, "root_ref").map_err(|_| InfluenceError::InvalidRequest("root_ref"))?;
     request
         .state_fence
         .validate()
-        .map_err(|_| InfluenceError::InvalidField("state_fence"))?;
+        .map_err(|_| InfluenceError::StaleEvidence("state_fence"))?;
     bounds.validate()?;
     if matches!(request.completeness, ClosureCompleteness::Partial) {
         return Err(InfluenceError::UnknownCompleteness);
@@ -1607,8 +1619,10 @@ fn dedup_qualified_edges(
 ) -> Result<BTreeMap<(String, String), InfluenceEdgeDisposition>, InfluenceError> {
     let mut dispositions: BTreeMap<(String, String), InfluenceEdgeDisposition> = BTreeMap::new();
     for edge in &request.edges {
-        text(&edge.source_ref, "edge.source_ref")?;
-        text(&edge.dependent_ref, "edge.dependent_ref")?;
+        text(&edge.source_ref, "edge.source_ref")
+            .map_err(|_| InfluenceError::InvalidEdge("edge.source_ref"))?;
+        text(&edge.dependent_ref, "edge.dependent_ref")
+            .map_err(|_| InfluenceError::InvalidEdge("edge.dependent_ref"))?;
         let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
         if let Some(existing) = dispositions.get(&key) {
             if *existing != edge.disposition {
@@ -1782,11 +1796,18 @@ fn validate_continuation_counters(
     admitted_len: u64,
     examined_len: u64,
 ) -> Result<(), InfluenceError> {
+    // `max_result` is deliberately absent from this conjunction. It is the
+    // emitted-cardinality ceiling and is enforced once, in `finish`, against
+    // the affected references actually emitted. Re-applying it to the admitted
+    // length here made it a second node-admission bound under another name:
+    // `max_nodes` already bounds the admitted set, and a continuation whose
+    // admitted set exceeded `max_result` was refused as `InvalidContinuation`
+    // instead of reaching the incomplete outcome `finish` returns for it, so
+    // the two readings of the same bound disagreed.
     if continuation.edges_examined > bounds.max_edges
         || continuation.work_spent > bounds.max_work
         || continuation.rounds > bounds.max_time
         || admitted_len > bounds.max_nodes
-        || admitted_len > bounds.max_result
         || continuation.edges_examined != examined_len
     {
         return Err(InfluenceError::InvalidContinuation);
@@ -3014,6 +3035,33 @@ pub enum InfluenceError {
     ContinuationBindingMismatch,
     #[error("unsupported bounded revocation continuation schema")]
     UnsupportedContinuation,
+    /// A qualified influence edge is not usable: an endpoint reference is
+    /// absent, blank or unbounded in length.
+    ///
+    /// Previously this refusal was `InvalidField("edge.source_ref")` /
+    /// `InvalidField("edge.dependent_ref")`, which named the field but not the
+    /// cause, so a caller could not tell a malformed edge from a malformed
+    /// request. The field name is still carried as the payload, so the
+    /// diagnostic stays bounded and redacted.
+    #[error("qualified influence edge is invalid at {0}")]
+    InvalidEdge(&'static str),
+    /// A declared bound is unusable: zero, or a value the engine cannot honour.
+    ///
+    /// Replaces the seven `InvalidField("bounds.max_*")` refusals, which named
+    /// the dimension but not the fact that the refusal is about a bound.
+    #[error("revocation bound is invalid at {0}")]
+    InvalidBounds(&'static str),
+    /// The bounded request itself is not usable, before any graph work starts.
+    #[error("bounded revocation request is invalid at {0}")]
+    InvalidRequest(&'static str),
+    /// The supplied evidence is stale: its state fence does not validate, so the
+    /// request cannot claim to describe the current world.
+    ///
+    /// Distinct from `FenceOrLineageMismatch`, which is the fence disagreeing
+    /// with a provenance record the caller supplied alongside it. This cause is
+    /// the fence failing on its own terms.
+    #[error("revocation evidence is stale at {0}")]
+    StaleEvidence(&'static str),
 }
 
 #[cfg(test)]
