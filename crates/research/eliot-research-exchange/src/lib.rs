@@ -263,6 +263,13 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// interrupted exchange can report it instead of repeating the transfer. A
     /// running job cannot present a closable disposition as partial work: only
     /// a terminal close may, and only through the supported-close witness.
+    ///
+    /// Partial work is still delivered material, so it answers the same producer
+    /// ingress question a close does: the delivered generation must be the one
+    /// the request admitted and the delivered material must travel at the
+    /// admitted privacy class. Progress accounting that widened disclosure or
+    /// accepted a foreign producer's generation would be a transfer that never
+    /// had to survive the close checks.
     pub fn record_partial_bundle(
         &mut self,
         job_id: &str,
@@ -283,7 +290,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         {
             return Err(ExchangeError::InvalidTransition);
         }
-        bundle.validate_against(&job.request)?;
+        bundle.validate_ingress(&job.request)?;
         if bundle.disposition.may_close_inquiry() {
             return Err(ExchangeError::Contract(
                 ResearchContractError::InvalidDisposition,
@@ -305,9 +312,16 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// handle, every delivered artifact handle must be admitted, and every typed
     /// coverage-gap handle must be admitted too — the handoff seal publishes
     /// `coverage_gap_handles` inside its own digest, so an unadmitted gap handle
-    /// would cross a sealed boundary. A bundle that fails any of these is
-    /// refused and never becomes this job's result, so it can produce no
-    /// evidence edge and no supported citation.
+    /// would cross a sealed boundary.
+    ///
+    /// The ingress runs [`ResearchEvidenceBundle::validate_ingress`], not
+    /// `validate_against`, because a bundle is admitted material only when its
+    /// producer generation is the one the request admitted and its material
+    /// travels at the admitted privacy class. A bundle that names a foreign
+    /// generation, or that re-labels itself or one of its snapshots at a wider
+    /// disclosure class, is refused here and never becomes this job's result, so
+    /// it can produce no evidence edge, no supported citation and no admissibility
+    /// decision.
     pub fn import_bundle(
         &mut self,
         bundle: ResearchEvidenceBundle,
@@ -317,7 +331,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             .jobs
             .get_mut(&bundle.job_id)
             .ok_or(ExchangeError::NotFound)?;
-        bundle.validate_against(&job.request)?;
+        bundle.validate_ingress(&job.request)?;
         if !matches!(
             job.status,
             ExchangeStatus::Accepted | ExchangeStatus::Running | ExchangeStatus::Partial
@@ -383,13 +397,16 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// route." This is that second validation point, so the export boundary does
     /// not trust the promotion boundary: it re-proves the admitted manifest
     /// (including its digest over its own content), refuses a job whose State
-    /// Fence moved, re-runs the full pre-promotion firewall over the delivered
-    /// bundle, requires every exported source handle to still be admitted
-    /// by that manifest, and requires the export's return channel to be an
-    /// admitted expansion route. A result admitted under one manifest can never
-    /// be exported against another, a stale or revoked handle can never leave,
-    /// an unadmitted handle can never be named in an export, and a result can
-    /// never be routed somewhere the manifest does not admit.
+    /// Fence moved, re-runs the full pre-promotion firewall *and* the producer
+    /// ingress check over the delivered bundle, requires every exported source
+    /// handle to still be admitted by that manifest, and requires the export's
+    /// return channel to be an admitted expansion route. A result admitted under
+    /// one manifest can never be exported against another, a stale or revoked
+    /// handle can never leave, an unadmitted handle can never be named in an
+    /// export, a result can never be routed somewhere the manifest does not
+    /// admit, and old eligibility is not a permanent grant: the producer
+    /// generation and the disclosure decision are proved again here, because a
+    /// material delivered under an earlier decision does not inherit it.
     pub fn export(
         &self,
         job_id: &str,
@@ -414,10 +431,12 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             return Err(ExchangeError::ExportDenied);
         }
         let result = job.result.as_ref().ok_or(ExchangeError::ExportDenied)?;
-        // The pre-promotion firewall, re-run at the export boundary: citation
-        // membership, anchor precision, delivered source lineage, URL locators
-        // and artifact handles are all re-checked against this manifest.
-        result.validate_against(&job.request)?;
+        // The pre-promotion firewall and the producer ingress decision, re-run
+        // at the export boundary: citation membership, anchor precision,
+        // delivered source lineage, URL locators, artifact handles, the
+        // approved producer generation and the disclosure class are all
+        // re-checked against this manifest.
+        result.validate_ingress(&job.request)?;
         if export.source_handles.iter().any(|h| {
             !result
                 .sources

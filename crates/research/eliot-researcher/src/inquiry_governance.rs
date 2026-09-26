@@ -197,6 +197,17 @@ pub enum InquiryError {
         /// Failing field path.
         field: &'static str,
     },
+    /// A record has no canonical encoding, so it has no decision identity.
+    ///
+    /// Refused rather than defaulted: a digest computed over a silently
+    /// shortened preimage would look like provenance while covering fewer bytes
+    /// than the record it claims to identify. The spelling matches
+    /// [`PortfolioError::Unencodable`], which is the same refusal on the
+    /// acquisition side of this domain.
+    Unencodable {
+        /// Failing field path.
+        field: &'static str,
+    },
     /// The frozen acquisition-side discipline refused the material.
     Portfolio(PortfolioError),
     /// The exchange contract refused the admitted reference manifest.
@@ -266,6 +277,12 @@ impl std::fmt::Display for InquiryError {
                 write!(
                     formatter,
                     "{field} does not match its own recomputed digest"
+                )
+            }
+            Self::Unencodable { field } => {
+                write!(
+                    formatter,
+                    "{field} cannot be encoded into its canonical preimage"
                 )
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
@@ -4272,6 +4289,13 @@ pub struct InquiryGovernance {
     /// Governor-facing profile admission request.
     pub profile_admission_request: GovernorInquiryAdmissionRequest,
     /// Governor-facing source transition requests.
+    ///
+    /// The Researcher half of the two-record pair, one request per
+    /// admissibility decision, each committed to its own bytes. There is
+    /// deliberately no owner receipt field beside them: the
+    /// Governor/Kernel/Store commit receipt is the owner's, this domain has no
+    /// named transition to submit to, and inventing a placeholder for it would
+    /// be a false proof claim under A0.3.
     pub source_admission_requests: Vec<GovernorSourceTransitionRequest>,
     /// Compiler inputs for the existing `TaskGraphCompiler` owner.
     pub compilation_inputs: TaskGraphCompilationInputs,
@@ -4439,6 +4463,44 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
+        // The Researcher half of the two-record pair a positive admitted source
+        // has to show is re-proved here rather than trusted: each
+        // Governor-facing request is an artefact that leaves this domain, and a
+        // request whose inquiry, evidence set, profile revision, source handle,
+        // source-record digest, eligibility, scope or fence was rewritten after
+        // it was built would otherwise be published beside a decision it no
+        // longer describes. The other half of the pair — the actual
+        // Governor/Kernel/Store commit receipt — is deliberately absent and this
+        // domain does not synthesize one; I21.1 puts the transition through the
+        // sole canonical writer.
+        if self.source_admission_requests.len() != self.admissibility.len() {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.source_admission_requests",
+            });
+        }
+        for (request, record) in self
+            .source_admission_requests
+            .iter()
+            .zip(&self.admissibility)
+        {
+            request.validate_integrity()?;
+            // The request must still be the request for *this* decision under
+            // *this* inquiry and evidence set. Its own digest proves it was not
+            // edited; these bindings prove it was not swapped for a well-formed
+            // request about a different source, a different decision or a
+            // different set.
+            if request.inquiry_id != self.inquiry_id
+                || request.evidence_set_id != self.evidence_set_id
+                || request.admissibility_digest != record.digest
+                || request.source_handle != record.record.handle
+                || request.eligibility != record.eligibility
+                || request.state_fence != record.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request_binding",
+                });
+            }
+        }
         for diagnostic in &self.unadmitted_references {
             diagnostic.validate_integrity()?;
             if diagnostic.inquiry_id != self.inquiry_id
@@ -4464,6 +4526,13 @@ impl std::fmt::Display for InquiryGovernance {
     /// dispositions appear: no provider prose, payload body or credential is
     /// reproduced, and the candidate-only flag is printed so a reader cannot
     /// mistake the line for an admitted result.
+    ///
+    /// The Governor-facing source-admission requests are counted and their
+    /// digests published here, which is what makes this line the Researcher half
+    /// of the two-record pair a positive admitted source has to show. They are
+    /// proposals, so the line states that no owner receipt exists: the
+    /// Governor/Kernel/Store commit receipt is the owner's, and a line that
+    /// implied one would be a false proof claim under A0.3.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terminal = &self.terminal;
         let eligible = self
@@ -4485,7 +4554,9 @@ impl std::fmt::Display for InquiryGovernance {
              debt_kinds={} debt_restricted={} debt_restriction_refused={} \
              disposition={} terminal_denominator_kind={} may_close={} \
              acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
-             next_probe={} reason={} authority_epoch={}/{} candidate_only={}",
+             next_probe={} reason={} authority_epoch={}/{} candidate_only={} \
+             source_admission_requests={} source_admission_request_digests={} \
+             source_admission_owner_receipt=none",
             self.inquiry_id,
             self.evidence_set_id,
             self.profile.profile_id,
@@ -4544,6 +4615,12 @@ impl std::fmt::Display for InquiryGovernance {
             terminal.state_fence.authority_epoch.lineage_id,
             terminal.state_fence.authority_epoch.sequence,
             terminal.candidate_only,
+            self.source_admission_requests.len(),
+            self.source_admission_requests
+                .iter()
+                .map(|request| request.request_digest.as_str())
+                .collect::<Vec<&str>>()
+                .join(","),
         )
     }
 }

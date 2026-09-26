@@ -49,6 +49,31 @@ pub enum ResearchContractError {
         /// Closed [`LocatorAmbiguity`] wire name. Never the supplied locator.
         reason: &'static str,
     },
+    /// The producer generation the delivered material claims is not the
+    /// approved bridge generation this request admitted.
+    ///
+    /// I21.11 binds each exchange to the exact Research system/bridge
+    /// generation. `ResearchEvidenceBundle::system_generation` is the producer's
+    /// own claim about which generation produced the bundle, and I21.11 gives
+    /// that claim no authority: a reachable endpoint, a successful login and a
+    /// self-reported generation establish neither source coverage nor
+    /// permission. Only the generation the admitted request bound is the
+    /// authority, so material whose own claim disagrees is refused at the
+    /// ingress instead of entering an evidence set as if it were admitted
+    /// material.
+    #[error("delivered producer generation is not the approved bridge generation")]
+    ProducerGenerationNotAdmitted,
+    /// Delivered material travels at a privacy class wider than the admitted
+    /// request allows.
+    ///
+    /// Disclosure is an admitted decision, not a description the producer
+    /// writes about its own output. I21.11 binds each exchange to a disclosure
+    /// policy and a retention contract, so both the bundle's own class and every
+    /// delivered source snapshot's class may travel at the admitted class or
+    /// narrower and never above it: re-labelling narrower material as a wider
+    /// class is a widening, not a description.
+    #[error("delivered material is wider than the admitted disclosure class")]
+    DisclosureWidened,
     #[error("citation precision exceeds the declared source anchor")]
     UnsupportedPrecision,
     #[error("bundle disposition is incompatible with its evidence")]
@@ -1710,6 +1735,67 @@ impl ResearchEvidenceBundle {
                 }
                 text(&citation.anchor, "citation.anchor")?;
             }
+        }
+        Ok(())
+    }
+
+    /// Validates one delivered bundle at the exchange ingress, before any of it
+    /// can be proposed for canonical promotion.
+    ///
+    /// [`Self::validate_against`] is the I21.7 reference firewall and stays the
+    /// *shape* answer: it decides which references a delivered bundle may carry
+    /// at all. This adds the two answers that are not about reference text but
+    /// about the producer behind it, and it is deliberately a separate entry so
+    /// that the reference firewall keeps its own callers and its own diagnosis
+    /// (a handoff seal's `MissingSourceLineage`, for instance, must stay
+    /// reachable, and it is decided after `validate_against`, not instead of it).
+    ///
+    /// 1. **The approved runtime/bridge generation.**
+    ///    `system_generation` is the producer's own claim about which generation
+    ///    produced this bundle. I21.11 states that endpoint reachability and a
+    ///    successful login prove neither source coverage nor permission, and the
+    ///    same is true of a self-reported generation: only the
+    ///    `ResearchQueryRequest::bridge_generation` the run admitted is the
+    ///    authority. Before this entry existed nothing in the repository compared
+    ///    the two, so a bundle could name any generation it liked and still
+    ///    validate.
+    /// 2. **The current disclosure decision.**
+    ///    The bundle's own `disclosure` and every delivered `SourceSnapshot`'s
+    ///    `disclosure` are a decision about how this material may travel, and
+    ///    the admitted request is what admits it. Both may travel at the
+    ///    admitted class or narrower, never wider. A per-source check exists
+    ///    because a bundle-level class only bounds the bundle: one snapshot
+    ///    relabelled wider inside a correctly-classified bundle is still a
+    ///    widened record, and `SourceSnapshot::disclosure` had no comparison
+    ///    anywhere in the repository.
+    ///
+    /// Neither check decides truth, admissibility or promotion. A bundle that
+    /// passes is a well-formed delivery from the admitted generation at the
+    /// admitted privacy class; whether its sources are eligible for an inquiry
+    /// evidence set is the Researcher's separate decision, and whether any of it
+    /// becomes canonical state is the Governor's.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`Self::validate_against`] error, plus
+    /// [`ResearchContractError::ProducerGenerationNotAdmitted`] and
+    /// [`ResearchContractError::DisclosureWidened`].
+    pub fn validate_ingress(
+        &self,
+        request: &ResearchQueryRequest,
+    ) -> Result<(), ResearchContractError> {
+        self.validate_against(request)?;
+        if self.system_generation != request.bridge_generation {
+            return Err(ResearchContractError::ProducerGenerationNotAdmitted);
+        }
+        let admitted = disclosure_breadth(request.disclosure);
+        if disclosure_breadth(self.disclosure) > admitted
+            || self
+                .sources
+                .iter()
+                .any(|source| disclosure_breadth(source.disclosure) > admitted)
+        {
+            return Err(ResearchContractError::DisclosureWidened);
         }
         Ok(())
     }

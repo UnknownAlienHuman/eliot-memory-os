@@ -171,7 +171,12 @@ fn run() -> Result<String, Failure> {
             // empty attempt list records that fact rather than hiding it.
             ReconciliationEvidence::not_required(),
         );
-        report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
+        report_admitted_inquiry(
+            &admitted.request,
+            &admission,
+            &receipt,
+            bridge.last_failure(),
+        );
         return Ok(receipt.to_string());
     }
     // The bridge retains the typed terminal classification, the raw evidence
@@ -215,7 +220,12 @@ fn run() -> Result<String, Failure> {
         records,
         reconciliation,
     );
-    report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
+    report_admitted_inquiry(
+        &admitted.request,
+        &admission,
+        &receipt,
+        bridge.last_failure(),
+    );
     Err(Failure::Degraded(Box::new(receipt)))
 }
 
@@ -244,10 +254,11 @@ fn run() -> Result<String, Failure> {
 /// probe instead of reporting a generic acquisition code.
 fn report_admitted_inquiry(
     request: &eliot_research_exchange_api::ResearchQueryRequest,
+    admission: &ProviderAdmission,
     receipt: &ProviderExecutionReceipt,
     failure: Option<&eliot_mod_research::TerminalFailure>,
 ) {
-    match project_admitted_inquiry(request, receipt, failure) {
+    match project_admitted_inquiry(request, admission, receipt, failure) {
         Ok(inquiry) => {
             let _ = writeln!(
                 io::stderr(),
