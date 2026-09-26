@@ -4,13 +4,13 @@
 //! (`eliot_platform_windows`, landed `bf37d3e1` / #1706): admitted
 //! start/stop/failure events map to the fixed source, event ids, severity,
 //! and one redacted insertion string, and delivery goes through
-//! `report_local_event`. [`report_admitted_event`] is the production entry
-//! point the Host diagnostics facade calls for every projected request that
-//! an owner already proved, and it is the only path that reaches
-//! [`report_event`]. The wrapper registers no source, edits no registry,
-//! and performs no elevation; it acquires no Event Log FFI and never fakes
-//! delivery through another sink. Production delivery smoke on isolated
-//! Windows stays an honest residual for the test phase.
+//! `report_local_event`. The Host diagnostics facade uses
+//! [`try_admit_admitted_event`] for nonblocking producer admission; one
+//! bounded worker owns every synchronous call to [`report_event`]. The
+//! wrapper registers no source, edits no registry, and performs no
+//! elevation; it acquires no Event Log FFI on the producer path and never
+//! fakes delivery through another sink. Production delivery smoke on
+//! isolated Windows stays an honest residual for the test phase.
 //!
 //! Delivery outcomes stay five-way distinct: OS acceptance under the fixed
 //! registered-source profile, the explicitly admitted degraded Application
@@ -30,6 +30,10 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
+use std::thread;
 
 use eliot_platform_windows::{
     AdmittedEventLogEvent, EventLogError, is_event_log_supported, report_local_event,
@@ -358,9 +362,10 @@ pub fn event_log_sink_status() -> Result<(), WindowsEventLogError> {
 /// proves OS acceptance only, under the registered-source profile; source
 /// registration, formatted-message availability, and downstream delivery
 /// stay unproven. The degraded Application profile is never substituted
-/// silently. This call is synchronous and may block inside the OS port; it
-/// never spawns a worker, never logs through the sink (no recursion), and
-/// never changes the caller's Host result.
+/// silently. This low-level seam is synchronous and may block inside the OS
+/// port. Production Host code uses [`try_admit_admitted_event`]; direct
+/// callers must not invoke it from Host control work. It never spawns a
+/// worker, logs through the Event Log sink, or changes a Host result.
 pub fn report_event(record: &EventLogRecord) -> Result<EventLogDelivery, WindowsEventLogError> {
     let event = record.event();
     match report_local_event(to_platform_event(event), record.insertion()) {
@@ -381,6 +386,19 @@ pub fn report_event(record: &EventLogRecord) -> Result<EventLogDelivery, Windows
     }
 }
 
+/// Legacy synchronous seam for direct Event Log callers.
+///
+/// This call may block inside the OS port. Production Host diagnostics use
+/// [`try_admit_admitted_event`] so Host control work never waits for delivery.
+/// Callers outside the producer must keep this operation off Host control
+/// paths.
+pub fn report_admitted_event(
+    event: AdmittedEvent,
+    correlation: &str,
+) -> Result<EventLogDelivery, WindowsEventLogError> {
+    report_event(&EventLogRecord::new(event, correlation))
+}
+
 /// Maps one admitted wrapper event to #984's platform event.
 fn to_platform_event(event: AdmittedEvent) -> AdmittedEventLogEvent {
     match event {
@@ -388,28 +406,6 @@ fn to_platform_event(event: AdmittedEvent) -> AdmittedEventLogEvent {
         AdmittedEvent::ServiceStop => AdmittedEventLogEvent::ServiceStop,
         AdmittedEvent::ServiceFailure => AdmittedEventLogEvent::ServiceFailure,
     }
-}
-
-/// Reports one admitted Host event to the Windows Event Log.
-///
-/// This is the wrapper's production delivery entry point: the caller states
-/// the admitted event it already decided and one bounded nonsecret
-/// correlation (a frozen stage, operation, or terminal code), and the wrapper
-/// builds the record, submits it through [`report_event`], and returns the
-/// typed delivery disposition. Only the start/stop/failure events
-/// [`AdmittedEvent`] admits are ever mapped, so this is the sole way a Host
-/// event reaches the fixed source, event id, and severity.
-///
-/// The call is synchronous and may block inside the OS port, so callers
-/// belong on lifecycle boundaries rather than hot paths. It never logs
-/// through the sink (no recursion), never spawns a worker, and never changes
-/// the caller's Host result: the returned outcome is a diagnostic
-/// disposition, not a semantic one.
-pub fn report_admitted_event(
-    event: AdmittedEvent,
-    correlation: &str,
-) -> Result<EventLogDelivery, WindowsEventLogError> {
-    report_event(&EventLogRecord::new(event, correlation))
 }
 
 /// Maps #984's typed port failure to the wrapper's typed outcome.
@@ -544,4 +540,530 @@ impl QueueShutdown {
     pub const fn dropped_total(&self) -> u64 {
         self.dropped_total
     }
+}
+
+/// Queue work count from a nonblocking producer or shutdown snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventLogWorkCount {
+    /// The count was observed while holding the queue lock.
+    Known(usize),
+    /// The nonblocking snapshot could not acquire the queue lock.
+    Unknown,
+}
+
+impl EventLogWorkCount {
+    /// Returns the observed count, or `None` when a nonblocking snapshot
+    /// could not establish it.
+    #[must_use]
+    pub const fn known(self) -> Option<usize> {
+        match self {
+            Self::Known(count) => Some(count),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Delivery knowledge for work left outstanding by shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventLogWorkDisposition {
+    /// Shutdown did not prove acceptance, completion, or cancellation.
+    Unknown,
+}
+
+impl EventLogWorkDisposition {
+    /// Stable name for the outstanding-work disposition.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of one finite, nonblocking Event Log producer admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventLogAdmission {
+    /// The bounded record was admitted. `truncated` reports bounded-detail
+    /// truncation; `dropped_total` includes prior capacity or sink drops.
+    Admitted {
+        /// Whether the redacted insertion was truncated to its byte bound.
+        truncated: bool,
+        /// Monotone process-wide drop count observed at this admission.
+        dropped_total: u64,
+    },
+    /// The finite queue was full; this record was counted as dropped.
+    DroppedQueueFull {
+        /// Monotone process-wide drop count after this drop.
+        dropped_total: u64,
+    },
+    /// The queue lock was busy; this record was dropped without waiting.
+    DroppedProducerBusy {
+        /// Monotone process-wide drop count after this drop.
+        dropped_total: u64,
+    },
+    /// Bounded record construction panicked and was contained.
+    DroppedFormattingPanic {
+        /// Monotone process-wide drop count after this drop.
+        dropped_total: u64,
+    },
+    /// Startup has not run, so admission did not create a worker.
+    RejectedNotStarted {
+        /// Current count, or zero before producer state exists.
+        dropped_total: u64,
+    },
+    /// Shutdown has started; this record was not admitted.
+    RejectedShutdown {
+        /// Current count; closed admission does not increment it.
+        dropped_total: u64,
+    },
+    /// The single worker could not start or has exited; this record was
+    /// counted as dropped.
+    RejectedWorkerUnavailable {
+        /// Monotone process-wide drop count after this drop.
+        dropped_total: u64,
+    },
+}
+
+impl EventLogAdmission {
+    /// Stable outcome name suitable for the bounded stderr diagnostic.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted {
+                truncated: false, ..
+            } => "admitted",
+            Self::Admitted {
+                truncated: true, ..
+            } => "admitted_truncated",
+            Self::DroppedQueueFull { .. } => "queue_full",
+            Self::DroppedProducerBusy { .. } => "producer_busy",
+            Self::DroppedFormattingPanic { .. } => "formatting_panic_contained",
+            Self::RejectedNotStarted { .. } => "not_started",
+            Self::RejectedShutdown { .. } => "shutdown",
+            Self::RejectedWorkerUnavailable { .. } => "worker_unavailable",
+        }
+    }
+
+    /// Monotone drop count observed when this outcome was produced.
+    #[must_use]
+    pub const fn dropped_total(self) -> u64 {
+        match self {
+            Self::Admitted { dropped_total, .. }
+            | Self::DroppedQueueFull { dropped_total }
+            | Self::DroppedProducerBusy { dropped_total }
+            | Self::DroppedFormattingPanic { dropped_total }
+            | Self::RejectedNotStarted { dropped_total }
+            | Self::RejectedShutdown { dropped_total }
+            | Self::RejectedWorkerUnavailable { dropped_total } => dropped_total,
+        }
+    }
+}
+
+/// Point-in-time producer status captured without waiting for queue access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventLogProducerSnapshot {
+    worker_started: bool,
+    dropped_total: u64,
+    queued: EventLogWorkCount,
+    in_flight: EventLogWorkCount,
+    shutdown: bool,
+}
+
+impl EventLogProducerSnapshot {
+    /// Whether the process-wide worker thread was created successfully.
+    #[must_use]
+    pub const fn worker_started(self) -> bool {
+        self.worker_started
+    }
+
+    /// Current process-wide monotone drop count.
+    #[must_use]
+    pub const fn dropped_total(self) -> u64 {
+        self.dropped_total
+    }
+
+    /// Number of records waiting in the bounded queue, when observable.
+    #[must_use]
+    pub const fn queued(self) -> EventLogWorkCount {
+        self.queued
+    }
+
+    /// Number of records held by the sole worker, when observable (zero or
+    /// one).
+    #[must_use]
+    pub const fn in_flight(self) -> EventLogWorkCount {
+        self.in_flight
+    }
+
+    /// Whether shutdown was requested.
+    #[must_use]
+    pub const fn is_shutdown(self) -> bool {
+        self.shutdown
+    }
+}
+
+/// Nonblocking terminal view of outstanding Event Log work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventLogShutdownSnapshot {
+    dropped_total: u64,
+    queued: EventLogWorkCount,
+    in_flight: EventLogWorkCount,
+    delivery_disposition: EventLogWorkDisposition,
+}
+
+impl EventLogShutdownSnapshot {
+    /// Current process-wide monotone drop count.
+    #[must_use]
+    pub const fn dropped_total(self) -> u64 {
+        self.dropped_total
+    }
+
+    /// Number of records retained in the bounded queue, when observable.
+    #[must_use]
+    pub const fn queued(self) -> EventLogWorkCount {
+        self.queued
+    }
+
+    /// Number of records held by the sole worker, when observable (zero or
+    /// one).
+    #[must_use]
+    pub const fn in_flight(self) -> EventLogWorkCount {
+        self.in_flight
+    }
+
+    /// Delivery status for outstanding work. Shutdown does not claim a drain
+    /// or abort.
+    #[must_use]
+    pub const fn delivery_disposition(self) -> EventLogWorkDisposition {
+        self.delivery_disposition
+    }
+}
+
+const WORKER_NOT_STARTED: u8 = 0;
+const WORKER_STARTING: u8 = 1;
+const WORKER_RUNNING: u8 = 2;
+const WORKER_EXITED: u8 = 3;
+const WORKER_UNAVAILABLE: u8 = 4;
+
+struct EventLogProducerState {
+    queue: Mutex<WindowsEventLogQueue>,
+    wake: Condvar,
+    shutdown: AtomicBool,
+    start_attempted: AtomicBool,
+    worker_spawned: AtomicBool,
+    worker_state: AtomicU8,
+    in_flight: AtomicBool,
+    dropped_total: AtomicU64,
+}
+
+impl EventLogProducerState {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(WindowsEventLogQueue::with_default_capacity()),
+            wake: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            start_attempted: AtomicBool::new(false),
+            worker_spawned: AtomicBool::new(false),
+            worker_state: AtomicU8::new(WORKER_NOT_STARTED),
+            in_flight: AtomicBool::new(false),
+            dropped_total: AtomicU64::new(0),
+        }
+    }
+}
+
+static EVENT_LOG_PRODUCER: OnceLock<Arc<EventLogProducerState>> = OnceLock::new();
+static EVENT_LOG_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn producer_state() -> &'static Arc<EventLogProducerState> {
+    EVENT_LOG_PRODUCER.get_or_init(|| Arc::new(EventLogProducerState::new()))
+}
+
+/// Starts the process-wide Event Log worker at most once.
+///
+/// Call during process setup before the first diagnostic projection. Startup
+/// creates one worker and never retries. The worker owns synchronous OS port
+/// calls; this function does not acquire the Event Log source.
+#[must_use]
+pub fn start_event_log_producer() -> EventLogProducerSnapshot {
+    let state = producer_state();
+    if !state.start_attempted.swap(true, Ordering::AcqRel) {
+        if EVENT_LOG_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+            || state.shutdown.load(Ordering::Acquire)
+        {
+            state
+                .worker_state
+                .store(WORKER_UNAVAILABLE, Ordering::Release);
+        } else {
+            state.worker_state.store(WORKER_STARTING, Ordering::Release);
+            let worker_state = Arc::clone(state);
+            let panic_state = Arc::clone(state);
+            let spawned = catch_unwind(AssertUnwindSafe(|| {
+                thread::Builder::new()
+                    .name("eliot-event-log".to_owned())
+                    .spawn(move || {
+                        if catch_unwind(AssertUnwindSafe(|| {
+                            run_event_log_worker(&worker_state);
+                        }))
+                        .is_err()
+                        {
+                            mark_worker_exited(&panic_state);
+                        }
+                    })
+            }));
+            match spawned {
+                Ok(Ok(worker)) => {
+                    state.worker_spawned.store(true, Ordering::Release);
+                    drop(worker);
+                }
+                Ok(Err(_)) | Err(_) => state
+                    .worker_state
+                    .store(WORKER_UNAVAILABLE, Ordering::Release),
+            }
+        }
+    }
+    producer_snapshot(state)
+}
+
+/// Nonblocking admission for an owner-admitted start, stop, or failure.
+///
+/// The producer bounds the redacted insertion, uses the fixed 64-entry queue,
+/// and returns immediately on queue-lock contention or saturation. It never
+/// calls the OS port, waits for the worker, retries, or logs through the
+/// Event Log sink.
+#[must_use]
+pub fn try_admit_admitted_event(event: AdmittedEvent, correlation: &str) -> EventLogAdmission {
+    let Some(state) = EVENT_LOG_PRODUCER.get() else {
+        return if EVENT_LOG_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            EventLogAdmission::RejectedShutdown { dropped_total: 0 }
+        } else {
+            EventLogAdmission::RejectedNotStarted { dropped_total: 0 }
+        };
+    };
+    if EVENT_LOG_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+        || state.shutdown.load(Ordering::Acquire)
+    {
+        return EventLogAdmission::RejectedShutdown {
+            dropped_total: state.dropped_total.load(Ordering::Relaxed),
+        };
+    }
+    if !state.worker_spawned.load(Ordering::Acquire) {
+        return EventLogAdmission::RejectedWorkerUnavailable {
+            dropped_total: increment_dropped_total(state),
+        };
+    }
+    match state.worker_state.load(Ordering::Acquire) {
+        WORKER_STARTING | WORKER_RUNNING => {}
+        _ => {
+            return EventLogAdmission::RejectedWorkerUnavailable {
+                dropped_total: increment_dropped_total(state),
+            };
+        }
+    }
+
+    let Ok(record) = catch_unwind(AssertUnwindSafe(|| EventLogRecord::new(event, correlation)))
+    else {
+        return EventLogAdmission::DroppedFormattingPanic {
+            dropped_total: increment_dropped_total(state),
+        };
+    };
+    let truncated = record.truncated();
+    let mut queue = match state.queue.try_lock() {
+        Ok(queue) => queue,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            return EventLogAdmission::DroppedProducerBusy {
+                dropped_total: increment_dropped_total(state),
+            };
+        }
+    };
+    if EVENT_LOG_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+        || state.shutdown.load(Ordering::Acquire)
+        || queue.is_closed()
+    {
+        return EventLogAdmission::RejectedShutdown {
+            dropped_total: state.dropped_total.load(Ordering::Relaxed),
+        };
+    }
+    match state.worker_state.load(Ordering::Acquire) {
+        WORKER_STARTING | WORKER_RUNNING => {}
+        _ => {
+            return EventLogAdmission::RejectedWorkerUnavailable {
+                dropped_total: increment_dropped_total(state),
+            };
+        }
+    }
+    match queue.try_admit(record) {
+        Ok(()) => {
+            state.wake.notify_one();
+            EventLogAdmission::Admitted {
+                truncated,
+                dropped_total: state.dropped_total.load(Ordering::Relaxed),
+            }
+        }
+        Err(WindowsEventLogError::QueueFull) => EventLogAdmission::DroppedQueueFull {
+            dropped_total: increment_dropped_total(state),
+        },
+        Err(WindowsEventLogError::Closed) => EventLogAdmission::RejectedShutdown {
+            dropped_total: state.dropped_total.load(Ordering::Relaxed),
+        },
+        Err(_) => EventLogAdmission::RejectedWorkerUnavailable {
+            dropped_total: increment_dropped_total(state),
+        },
+    }
+}
+
+/// Requests worker shutdown and returns a nonblocking terminal snapshot.
+///
+/// The worker stops dequeuing after shutdown is requested. Queued records stay
+/// parked and the synchronous report already held by the worker may continue.
+/// No join, drain, or abort is attempted. The queue and in-flight counts are
+/// exact when the queue lock is immediately available; otherwise both are
+/// `Unknown`. Outstanding records retain an `Unknown` delivery disposition.
+#[must_use]
+pub fn shutdown_event_log_producer() -> EventLogShutdownSnapshot {
+    EVENT_LOG_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+    let Some(state) = EVENT_LOG_PRODUCER.get() else {
+        return EventLogShutdownSnapshot {
+            dropped_total: 0,
+            queued: EventLogWorkCount::Known(0),
+            in_flight: EventLogWorkCount::Known(0),
+            delivery_disposition: EventLogWorkDisposition::Unknown,
+        };
+    };
+    state.shutdown.store(true, Ordering::Release);
+    let counts = match state.queue.try_lock() {
+        Ok(mut queue) => {
+            let shutdown = queue.shutdown();
+            (
+                EventLogWorkCount::Known(shutdown.unsent()),
+                EventLogWorkCount::Known(usize::from(state.in_flight.load(Ordering::Acquire))),
+            )
+        }
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let mut queue = poisoned.into_inner();
+            let shutdown = queue.shutdown();
+            (
+                EventLogWorkCount::Known(shutdown.unsent()),
+                EventLogWorkCount::Known(usize::from(state.in_flight.load(Ordering::Acquire))),
+            )
+        }
+        Err(TryLockError::WouldBlock) => (EventLogWorkCount::Unknown, EventLogWorkCount::Unknown),
+    };
+    state.wake.notify_all();
+    EventLogShutdownSnapshot {
+        dropped_total: state.dropped_total.load(Ordering::Relaxed),
+        queued: counts.0,
+        in_flight: counts.1,
+        delivery_disposition: EventLogWorkDisposition::Unknown,
+    }
+}
+
+fn producer_snapshot(state: &EventLogProducerState) -> EventLogProducerSnapshot {
+    let (queued, in_flight) = match state.queue.try_lock() {
+        Ok(queue) => (
+            EventLogWorkCount::Known(queue.len()),
+            EventLogWorkCount::Known(usize::from(state.in_flight.load(Ordering::Acquire))),
+        ),
+        Err(TryLockError::Poisoned(poisoned)) => {
+            let queue = poisoned.into_inner();
+            (
+                EventLogWorkCount::Known(queue.len()),
+                EventLogWorkCount::Known(usize::from(state.in_flight.load(Ordering::Acquire))),
+            )
+        }
+        Err(TryLockError::WouldBlock) => (EventLogWorkCount::Unknown, EventLogWorkCount::Unknown),
+    };
+    EventLogProducerSnapshot {
+        worker_started: state.worker_spawned.load(Ordering::Acquire),
+        dropped_total: state.dropped_total.load(Ordering::Relaxed),
+        queued,
+        in_flight,
+        shutdown: EVENT_LOG_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+            || state.shutdown.load(Ordering::Acquire),
+    }
+}
+
+fn increment_dropped_total(state: &EventLogProducerState) -> u64 {
+    let previous = state
+        .dropped_total
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1))
+        })
+        .unwrap_or_else(|current| current);
+    previous.saturating_add(1)
+}
+
+fn run_event_log_worker(state: &EventLogProducerState) {
+    state.worker_state.store(WORKER_RUNNING, Ordering::Release);
+    let _exit = EventLogWorkerExit(state);
+    loop {
+        let record = {
+            let mut queue = match state.queue.lock() {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            loop {
+                if EVENT_LOG_SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                    || state.shutdown.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                if let Some(record) = queue.queue.pop_front() {
+                    state.in_flight.store(true, Ordering::Release);
+                    break record;
+                }
+                queue = match state.wake.wait(queue) {
+                    Ok(queue) => queue,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+        };
+
+        let event = record.event();
+        let delivery_result = catch_unwind(AssertUnwindSafe(|| report_event(&record)));
+        let (outcome, dropped) = match delivery_result {
+            Ok(Ok(delivery)) => (delivery.as_str(), false),
+            Ok(Err(error)) => (error.as_str(), true),
+            Err(_) => ("report_panic_contained", true),
+        };
+        if dropped {
+            increment_dropped_total(state);
+        }
+        let tracing_result = catch_unwind(AssertUnwindSafe(|| {
+            tracing::info!(
+                target: "eliot_host::windows_event_log",
+                event = "host.event_log_delivery",
+                operation = event.as_str(),
+                event_id = event.event_id(),
+                severity = event.severity().as_str(),
+                outcome = outcome,
+                "host event log delivery outcome"
+            );
+        }));
+        if tracing_result.is_err() {
+            // Tracing panic is contained; delivery already has its own
+            // disposition and remains independent of Host semantics.
+        }
+
+        let _queue = match state.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.in_flight.store(false, Ordering::Release);
+    }
+}
+
+struct EventLogWorkerExit<'a>(&'a EventLogProducerState);
+
+impl Drop for EventLogWorkerExit<'_> {
+    fn drop(&mut self) {
+        mark_worker_exited(self.0);
+    }
+}
+
+fn mark_worker_exited(state: &EventLogProducerState) {
+    if state.in_flight.swap(false, Ordering::AcqRel) {
+        increment_dropped_total(state);
+    }
+    state.worker_state.store(WORKER_EXITED, Ordering::Release);
 }
