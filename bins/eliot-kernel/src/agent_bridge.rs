@@ -2200,9 +2200,16 @@ impl KernelComposition {
     /// terminal records, stay under their owner's continuation rules.
     #[cfg(windows)]
     pub fn revoke_agent_bridge(&self, connection_id: &str) {
+        // F-LOG-KERNEL-1 (#897 W3): revocation tears down the bridge
+        // connection and fences its session, so this is the owned
+        // session-cleanup seam. Driver-direct non-bridge session fence
+        // stays unobserved (outside #897 scope) and needs a revised
+        // explicit assignment. Observation only.
         observe_bridge("kernel.bridge_cleanup", "attempt");
+        observe_bridge("kernel.session_cleanup", "attempt");
         let Ok(_transition) = self.agent_bridge_transition_read() else {
             observe_bridge("kernel.bridge_cleanup", "fenced");
+            observe_bridge("kernel.session_cleanup", "fenced");
             return;
         };
         let (mut pending, pending_poisoned) = match self.agent_activation_pending.lock() {
@@ -2212,8 +2219,10 @@ impl KernelComposition {
         let revocation = self.revoke_agent_bridge_under_transition(connection_id, &mut pending);
         if pending_poisoned || revocation.is_err() {
             observe_bridge("kernel.bridge_cleanup", "fenced");
+            observe_bridge("kernel.session_cleanup", "fenced");
         } else {
             observe_bridge("kernel.bridge_cleanup", "complete");
+            observe_bridge("kernel.session_cleanup", "complete");
         }
     }
 

@@ -114,6 +114,11 @@ impl KernelComposition {
         &self,
         peers: &NamedPipePeerSet,
     ) -> Result<NamedPipeServer, KernelBuildError> {
+        // F-LOG-KERNEL-1 (#897 T2): this is the production front-door bind
+        // (the driver calls only the `with_peer_set` entries), so create,
+        // bind and accept-ready are emitted here distinctly. Observation
+        // only; the bind itself is unchanged.
+        observe_listener("kernel.front_door_listener_create", "attempt");
         observe_listener("kernel.front_door_listener_bind", "attempt");
         let result: Result<NamedPipeServer, KernelBuildError> = (|| {
             if self
@@ -133,6 +138,7 @@ impl KernelComposition {
         })();
         match &result {
             Ok(_) => {
+                observe_listener("kernel.front_door_listener_create", "success");
                 observe_listener("kernel.front_door_listener_bind", "success");
                 observe_listener("kernel.front_door_listener_accept_ready", "success");
             }
@@ -142,6 +148,7 @@ impl KernelComposition {
                 // emitter for this startup bind failure is `exit_error`
                 // (`COMPOSITION_FAILURE`); correlation is single-funnel
                 // adjacency, not a threaded op identity.
+                observe_listener("kernel.front_door_listener_create", "fenced");
                 observe_listener("kernel.front_door_listener_bind", "fenced");
             }
         }
