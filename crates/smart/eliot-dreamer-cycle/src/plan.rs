@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{
     CYCLE_SCHEMA_VERSION, CyclePhase, CyclePolicy, DreamerCycleState, InertOwnerRequest,
-    MAX_CANONICAL_BYTES, MAX_REQUESTS, MAX_TEXT_BYTES, OutcomeDisposition, PendingRequest,
-    validate_text,
+    MAX_CANONICAL_BYTES, MAX_REQUESTS, MAX_TEXT_BYTES, ObservedOutcome, OutcomeDisposition,
+    PendingRequest, RequestKind, validate_text,
 };
 use crate::error::CycleError;
 use crate::sample::CycleSample;
@@ -203,8 +203,7 @@ impl CyclePlan {
                 reason: "plan frontier differs from the frozen state",
             });
         }
-        self.validate_experiments(sample)?;
-        self.validate_requests(sample, policy)?;
+        self.validate_projection(sample, state, policy)?;
         if self.plan_digest != self.computed_digest()? {
             return Err(CycleError::IdentityConflict {
                 identity: "plan.plan_digest".to_owned(),
@@ -213,7 +212,12 @@ impl CyclePlan {
         Ok(())
     }
 
-    fn validate_experiments(&self, sample: &CycleSample) -> Result<(), CycleError> {
+    fn validate_projection(
+        &self,
+        sample: &CycleSample,
+        state: &DreamerCycleState,
+        policy: &CyclePolicy,
+    ) -> Result<(), CycleError> {
         if self.experiments.len() > MAX_REQUESTS {
             return Err(CycleError::Bound {
                 field: "plan.experiments",
@@ -229,25 +233,7 @@ impl CyclePlan {
                     identity: experiment.target.clone(),
                 });
             }
-            let sampled = sample
-                .sampled_pending
-                .iter()
-                .any(|identity| identity.as_str() == experiment.target);
-            if !sampled {
-                return Err(CycleError::BindingMismatch {
-                    field: "experiment.target",
-                    reason: "experiment target is outside the frozen sample",
-                });
-            }
         }
-        Ok(())
-    }
-
-    fn validate_requests(
-        &self,
-        sample: &CycleSample,
-        policy: &CyclePolicy,
-    ) -> Result<(), CycleError> {
         if self.requests.len() > policy.max_requests as usize || self.requests.len() > MAX_REQUESTS
         {
             return Err(CycleError::BudgetBlocked);
@@ -260,16 +246,20 @@ impl CyclePlan {
                     maximum: MAX_TEXT_BYTES,
                 });
             }
-            let sampled = sample
-                .sampled_pending
-                .iter()
-                .any(|identity| identity == &request.request_id);
-            if !sampled {
-                return Err(CycleError::BindingMismatch {
-                    field: "plan.request",
-                    reason: "plan request is outside the frozen sample",
-                });
-            }
+        }
+        let (expected_requests, expected_experiments) =
+            plan_projection(sample, state, policy, self.to_phase)?;
+        if self.requests != expected_requests {
+            return Err(CycleError::BindingMismatch {
+                field: "plan.requests",
+                reason: "requests differ from the frozen pending and outcome projection",
+            });
+        }
+        if self.experiments != expected_experiments {
+            return Err(CycleError::BindingMismatch {
+                field: "plan.experiments",
+                reason: "experiments differ from the frozen pending and outcome projection",
+            });
         }
         Ok(())
     }
@@ -280,29 +270,122 @@ impl CyclePlan {
 /// This mirrors the controller transition so a plan never probes a target the
 /// controller itself has stopped requesting.
 fn pending_has_blocked_outcome(state: &DreamerCycleState, pending: &PendingRequest) -> bool {
-    state
-        .outcomes
-        .iter()
-        .rev()
-        .find(|outcome| outcome.receipt.core.request.metadata.request_id == pending.request_id)
-        .is_some_and(|outcome| {
-            !matches!(
-                outcome.disposition,
-                OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
-            )
-        })
+    latest_outcome_for_pending(state, pending).is_some_and(|outcome| {
+        !matches!(
+            outcome.disposition,
+            OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+        )
+    })
 }
 
-fn experiment_kind_for(state: &DreamerCycleState, pending: &PendingRequest) -> ExperimentKind {
-    let needs_reconciliation = state
-        .outcomes
-        .iter()
-        .any(|outcome| outcome.receipt.core.request.metadata.request_id == pending.request_id);
-    if needs_reconciliation {
+fn latest_outcome_for_pending<'a>(
+    state: &'a DreamerCycleState,
+    pending: &PendingRequest,
+) -> Option<&'a ObservedOutcome> {
+    state.outcomes.iter().rev().find(|outcome| {
+        outcome.receipt.core.request.metadata.request_id == pending.request_id
+            && outcome.receipt.core.operation.request_id == pending.request_id
+            && outcome.receipt.core.operation.operation_id == pending.operation_id
+            && outcome.receipt.core.operation.idempotency_key == pending.idempotency_key
+            && outcome.payload_digest == pending.payload_digest
+    })
+}
+
+fn experiment_kind_for(outcome: Option<&ObservedOutcome>) -> ExperimentKind {
+    if outcome.is_some_and(|outcome| {
+        matches!(
+            outcome.disposition,
+            OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+        )
+    }) {
         ExperimentKind::ReconciliationProbe
     } else {
         ExperimentKind::ClarificationProbe
     }
+}
+
+fn inert_request_for_pending(
+    pending: &PendingRequest,
+    outcome: Option<&ObservedOutcome>,
+) -> InertOwnerRequest {
+    let mut request = InertOwnerRequest {
+        request_id: pending.request_id.clone(),
+        operation_id: pending.operation_id.clone(),
+        attempt_id: pending.attempt_id.clone(),
+        owner: pending.owner.clone(),
+        kind: pending.kind,
+        phase: pending.phase,
+        payload_digest: pending.payload_digest.clone(),
+        task_id: pending.task_id.clone(),
+        scope_id: pending.scope_id.clone(),
+        state_fence: pending.state_fence.clone(),
+        predecessor_receipt_id: pending.predecessor_receipt_id.clone(),
+        reason: "awaiting an externally supplied owner observation".to_owned(),
+    };
+    if let Some(outcome) = outcome.filter(|outcome| {
+        matches!(
+            outcome.disposition,
+            OutcomeDisposition::Accepted | OutcomeDisposition::Unknown
+        )
+    }) {
+        request.kind = RequestKind::EffectReconciliation;
+        request.predecessor_receipt_id = Some(outcome.receipt.identity.receipt_id.clone());
+        "reconcile the same operation; do not issue a replacement retry"
+            .clone_into(&mut request.reason);
+    }
+    request
+}
+
+/// Derives the complete serialized projection from the paired frozen inputs.
+/// Both construction and validation use this function so an embedded field
+/// cannot redirect an otherwise digest-valid plan.
+fn plan_projection(
+    sample: &CycleSample,
+    state: &DreamerCycleState,
+    policy: &CyclePolicy,
+    to_phase: CyclePhase,
+) -> Result<(Vec<InertOwnerRequest>, Vec<ExperimentCandidate>), CycleError> {
+    let mut requests = Vec::new();
+    let mut experiments = Vec::new();
+    for identity in &sample.sampled_pending {
+        let Some(pending) = state
+            .pending
+            .iter()
+            .find(|pending| &pending.request_id == identity)
+        else {
+            return Err(CycleError::BindingMismatch {
+                field: "plan.request",
+                reason: "sampled pending identity is missing from frozen state",
+            });
+        };
+        let outcome = latest_outcome_for_pending(state, pending);
+        if pending_has_blocked_outcome(state, pending) {
+            continue;
+        }
+        if pending.phase != to_phase {
+            return Err(CycleError::PhaseViolation(
+                "sampled pending request is not in the adjacent phase",
+            ));
+        }
+        crate::policy::validate_pending_rule(pending, policy)?;
+        requests.push(inert_request_for_pending(pending, outcome));
+        experiments.push(ExperimentCandidate {
+            target: identity.as_str().to_owned(),
+            kind: experiment_kind_for(outcome),
+            horizon: PlanHorizon::OneCycle,
+            reason: "one bounded automatic probe within the single adjacent phase".to_owned(),
+        });
+    }
+    if requests.len() > policy.max_requests as usize || requests.len() > MAX_REQUESTS {
+        return Err(CycleError::BudgetBlocked);
+    }
+    if experiments.len() > MAX_REQUESTS {
+        return Err(CycleError::Bound {
+            field: "plan.experiments",
+            maximum: MAX_REQUESTS,
+        });
+    }
+    Ok((requests, experiments))
 }
 
 /// Derives a one-cycle plan over a frozen sample of a frozen snapshot.
@@ -324,57 +407,7 @@ pub fn plan_cycle(
             "plan horizon has no adjacent phase",
         ));
     };
-    let mut requests = Vec::new();
-    let mut experiments = Vec::new();
-    let mut planned_targets = BTreeSet::new();
-    for identity in &sample.sampled_pending {
-        let Some(pending) = state
-            .pending
-            .iter()
-            .find(|pending| &pending.request_id == identity)
-        else {
-            return Err(CycleError::BindingMismatch {
-                field: "plan.request",
-                reason: "sampled pending identity is missing from frozen state",
-            });
-        };
-        if pending_has_blocked_outcome(state, pending) {
-            continue;
-        }
-        requests.push(InertOwnerRequest {
-            request_id: pending.request_id.clone(),
-            operation_id: pending.operation_id.clone(),
-            attempt_id: pending.attempt_id.clone(),
-            owner: pending.owner.clone(),
-            kind: pending.kind,
-            phase: pending.phase,
-            payload_digest: pending.payload_digest.clone(),
-            task_id: pending.task_id.clone(),
-            scope_id: pending.scope_id.clone(),
-            state_fence: pending.state_fence.clone(),
-            predecessor_receipt_id: pending.predecessor_receipt_id.clone(),
-            reason: "awaiting an externally supplied owner observation".to_owned(),
-        });
-        // Only adjacent-phase targets are actionable within one cycle, and
-        // each target receives at most one automatic experiment.
-        if pending.phase == to_phase && planned_targets.insert(identity.as_str().to_owned()) {
-            experiments.push(ExperimentCandidate {
-                target: identity.as_str().to_owned(),
-                kind: experiment_kind_for(state, pending),
-                horizon: PlanHorizon::OneCycle,
-                reason: "one bounded automatic probe within the single adjacent phase".to_owned(),
-            });
-        }
-    }
-    if requests.len() > policy.max_requests as usize || requests.len() > MAX_REQUESTS {
-        return Err(CycleError::BudgetBlocked);
-    }
-    if experiments.len() > MAX_REQUESTS {
-        return Err(CycleError::Bound {
-            field: "plan.experiments",
-            maximum: MAX_REQUESTS,
-        });
-    }
+    let (requests, experiments) = plan_projection(sample, state, policy, to_phase)?;
     let mut plan = CyclePlan {
         schema_version: CYCLE_SCHEMA_VERSION,
         cycle_id: state.cycle_id.clone(),
