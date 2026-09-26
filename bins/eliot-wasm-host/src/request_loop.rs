@@ -50,6 +50,33 @@
 //!   still names the served generation, so a replacement staged mid-run is
 //!   never deleted.
 //!
+//! Three terminal dispositions are kept apart, because collapsing any two
+//! of them is how an uncertain effect gets reported as a clean stop
+//! (issue #2785):
+//!
+//! - **Execution evidence** is the projected result event sequence; the
+//!   uncertain `Unknown` event and the later containment/reconciliation
+//!   event are separate retained observations, never one rewritten record.
+//! - **Cleanup evidence** is this loop's own termination record: whether
+//!   the tracked worker was asked to stop, whether its Shutdown reply
+//!   arrived, and whether the thread was actually joined. A clean stop is
+//!   claimed only when all three were observed.
+//! - **Operation-level containment evidence** is what the outer
+//!   process-containment owner (P-04, the Kernel that launched this
+//!   process) observed about the P-03 guest child this operation still
+//!   owns. A clean stop of this loop never upgrades it: a guest child
+//!   without an observed exit stays unresolved for its owner.
+//!
+//! The execution deadline, the drain deadline, and the shutdown grace all
+//! come from one owner: the admitted guest ceilings
+//! ([`ceilings`](crate::dispatch_material::ValidatedGuestCeilings)), which
+//! are the same numbers [`parent_runtime`](crate::parent_runtime) already
+//! gives the composed runtime as its shutdown grace and
+//! [`parent_runtime::derive_parent_intent`] gives the admitted child's
+//! wall limit. The loop invents no timing policy of its own: drain bounds
+//! are the granted ceilings plus the bounded control-poll cadence this
+//! file already uses, because a drain can only make progress on a poll.
+//!
 //! The experimental describe path and the one-shot guest-child protocol are
 //! separate modes reachable only through their own CLI branches; the
 //! governed loop never falls back to either, and neither falls back here.
@@ -60,10 +87,11 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eliot_wasm_runtime::lifecycle::InFlightDisposition;
 use eliot_wasm_runtime::{
@@ -146,6 +174,61 @@ const CONTROL_POLL: Duration = Duration::from_millis(25);
 /// the contended stream after a timeout.
 const OUTPUT_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Process-local monotonic correlation token (#2785 I1). Command
+/// correlation already comes from the bound-1 single-slot worker: exactly
+/// one command can be outstanding, so the token below can only ever match
+/// itself. It exists so the accepted-command entry names the command that
+/// was handed over rather than only its kind, and so a stale token from
+/// another operation in this process can never settle this one. It is
+/// bookkeeping, not an operation authority.
+static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Fixed field name for the loop's own Execute command, used by the
+/// delivery residual that reports which accepted command lost its sink.
+const EXECUTE_COMMAND: &str = "execute";
+/// Fixed field name reported when the outer containment owner left this
+/// operation's effect unresolved. The operation identity itself is the
+/// owner's own record, so the refusal stays a stable field name and never
+/// echoes an identifier.
+const UNATTESTED_OPERATION: &str = "unattested";
+
+/// How far the loop's own termination protocol has progressed. The worker
+/// thread stays joinable in every one of these states; the caller only
+/// joins once this is `Terminated`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerState {
+    /// The worker owns the runner and no termination step has been taken.
+    Alive,
+    /// The tracked `Shutdown` command was accepted by the command channel
+    /// and its reply is still owed. This is the only termination protocol
+    /// the loop uses while the worker is alive.
+    TerminationRequested,
+    /// The worker thread was observed finished and joined.
+    Terminated,
+    /// A bound expired with the worker still alive: the thread is
+    /// contained, not terminated, and this process is about to end. No
+    /// clean shutdown may be claimed.
+    Contained,
+}
+
+/// Accepted-command lifecycle of one command handed to the worker. Distinct
+/// from the drain phase: this is the per-command accounting, and it is how
+/// "requested", "accepted by the command channel" and "outcome observed"
+/// stay separate facts (issue #2785 I1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandDelivery {
+    /// Admission produced the command; it has not been handed to the
+    /// worker yet. The bounded command channel admits exactly one, so this
+    /// slot can hold one pending command and never a queue.
+    Requested(WorkerCommand),
+    /// `try_send` succeeded: the worker received the command and exactly
+    /// this correlated reply is owed.
+    Accepted { command: WorkerCommand, token: u64 },
+    /// The worker replied for the accepted command; the reply is being
+    /// observed now.
+    OutcomeObserved(WorkerCommand),
+}
+
 /// Fail-closed loop errors. Stable codes plus one stable field name; no
 /// digests, paths, or payloads are echoed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +270,51 @@ pub enum LoopError {
         /// Exact accepted command whose outcome remains unknown.
         command: &'static str,
     },
+    /// A result frame was observed and retained but its publication failed.
+    /// The observation itself stays available through the loop's retained
+    /// sequence; only the delivery failed, and it never reopens admission.
+    ResultPublicationFailed {
+        /// Exact observation whose delivery failed.
+        observation: &'static str,
+    },
+    /// An accepted control frame was delivered to the worker but no reply
+    /// arrived within the admitted bounds. The request is not reissued: the
+    /// operation's uncertain effect is handed to the owner that may still
+    /// contain it, and the loop reports an unresolved operation rather than
+    /// a clean stop.
+    ContainmentUnresolved {
+        /// Exact control frame whose completion was never observed.
+        command: &'static str,
+    },
+    /// The operation's P-03 guest child was never observed settled by the
+    /// outer process-containment owner. A clean stop of this loop never
+    /// claims this effect: the child stays unresolved for the owner that may
+    /// still terminate it.
+    OperationContainmentUnresolved {
+        /// Exact admitted operation the unresolved child belongs to.
+        operation_id: &'static str,
+    },
+    /// The bounded drain for an accepted command did not settle inside the
+    /// admitted bounds. Distinct from
+    /// [`Self::ContainmentUnresolved`]: no control frame was ever issued
+    /// for this command, and its outcome is simply still owed.
+    DrainUnsettled {
+        /// Exact accepted command that never returned.
+        command: &'static str,
+    },
+    /// The tracked worker was still alive when the process-level containment
+    /// path took over. The thread is not a detached worker: the process that
+    /// owns it is ending, and the owner is told the operation stayed
+    /// unresolved instead of being told a clean shutdown happened.
+    WorkerContained {
+        /// Exact command that was still executing inside the worker.
+        command: &'static str,
+    },
+    /// A staged stdout helper was still holding the contended output stream
+    /// when the process-level containment path took over. The helper was
+    /// never joined (it was not finished), and the result whose emission it
+    /// held remains unconfirmed for the owner's recovery path.
+    OutputHelperContained,
 }
 
 impl LoopError {
@@ -204,6 +332,14 @@ impl LoopError {
                 "REQUEST_LOOP_WORKER_TERMINATED_WITHOUT_OUTCOME"
             }
             Self::OutcomeChannelDisconnected { .. } => "REQUEST_LOOP_OUTCOME_CHANNEL_DISCONNECTED",
+            Self::ResultPublicationFailed { .. } => "REQUEST_LOOP_RESULT_PUBLICATION_FAILED",
+            Self::ContainmentUnresolved { .. } => "REQUEST_LOOP_CONTAINMENT_UNRESOLVED",
+            Self::OperationContainmentUnresolved { .. } => {
+                "REQUEST_LOOP_OPERATION_CONTAINMENT_UNRESOLVED"
+            }
+            Self::DrainUnsettled { .. } => "REQUEST_LOOP_DRAIN_UNSETTLED",
+            Self::WorkerContained { .. } => "REQUEST_LOOP_WORKER_CONTAINED",
+            Self::OutputHelperContained => "REQUEST_LOOP_OUTPUT_HELPER_CONTAINED",
         }
     }
 }
@@ -215,9 +351,16 @@ impl fmt::Display for LoopError {
             Self::CommandQueueFull { command }
             | Self::CommandChannelDisconnected { command }
             | Self::WorkerTerminatedWithoutOutcome { command }
-            | Self::OutcomeChannelDisconnected { command } => {
+            | Self::OutcomeChannelDisconnected { command }
+            | Self::ContainmentUnresolved { command }
+            | Self::DrainUnsettled { command }
+            | Self::WorkerContained { command } => {
                 write!(formatter, "{}:{command}", self.code())
             }
+            Self::ResultPublicationFailed { observation }
+            | Self::OperationContainmentUnresolved {
+                operation_id: observation,
+            } => write!(formatter, "{}:{observation}", self.code()),
             other => formatter.write_str(other.code()),
         }
     }
@@ -1068,9 +1211,10 @@ pub trait WasmHostRequestChannel {
 
     /// Non-blocking poll for one externally staged Kernel control frame
     /// naming this operation. `None` means nothing is pending right now —
-    /// never exhaustion: the loop keeps serving the delivery set and polls
-    /// again on its next tick, including while guest work is pending. The
-    /// default has no external source and always reports nothing pending.
+    /// never exhaustion: the loop keeps servicing this lane during drain
+    /// and polls again on its next tick, including while guest work is
+    /// pending. The default has no external source and always reports
+    /// nothing pending.
     ///
     /// # Errors
     ///
@@ -1083,7 +1227,7 @@ pub trait WasmHostRequestChannel {
     /// Non-blocking poll for one staged Cancel/Shutdown naming this
     /// operation (#2568 A3). Unlike [`Self::poll_control`], this runs before
     /// the single-gate intake check, so an admitted Cancel/Shutdown
-    /// interrupts outstanding guest work instead of queueing behind the
+    /// interrupts accepted guest work instead of queueing behind the
     /// bound-1 slot. Reconcile is never urgent: it stays staged for the idle
     /// path exactly as before. The default has no external source.
     ///
@@ -1094,6 +1238,12 @@ pub trait WasmHostRequestChannel {
     fn poll_control_urgent(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
         Ok(None)
     }
+
+    /// Retires the control frame the loop just accepted. Called only after
+    /// the command channel took that frame's command, so a staged control
+    /// file is never deleted for a step that never ran (issue #2785 P1).
+    /// The default has no external source and has nothing to retire.
+    fn retire_control(&mut self) {}
 
     /// Publishes one correlated result frame: the one stdout emission
     /// owner for the ordinary result stream (#2787 step 2).
@@ -1129,9 +1279,19 @@ pub trait WasmHostRequestChannel {
 /// `Invoke` is never admitted externally: the one admitted invoke comes
 /// from the delivery set only, so a second execution path cannot open
 /// through the control file.
+///
+/// A control file is retired only after the loop has accepted its frame
+/// ([`KernelControlReader::commit`]). Reading, validating and admitting
+/// while the file is still staged is what makes the delivery edge
+/// truthful: `follow_up` advances only when the command was really handed
+/// to the worker (issue #2785 P1/I2), so a file whose command is refused
+/// stays staged and the owner may re-stage or reclaim it, instead of being
+/// deleted for a control step that never ran.
 pub struct KernelControlReader {
     path: PathBuf,
     identity: WasmHostControl,
+    /// The frame this reader handed to admission but has not yet retired.
+    pending: Option<WasmHostRequestFrame>,
 }
 
 impl KernelControlReader {
@@ -1146,38 +1306,55 @@ impl KernelControlReader {
                 invocation_id: binding.invocation_id.clone(),
                 request_digest: binding.request_digest.clone(),
             },
+            pending: None,
         }
     }
 
-    /// Returns one staged control frame naming this operation, consuming
-    /// it, or `None` when nothing admittable is staged. Never fails the
+    /// Retires the control file whose frame was just accepted. Called by
+    /// the loop's single control-servicing step immediately after the
+    /// command channel took the frame's command, so the fixed control name
+    /// never disappears before the request it names was actually delivered.
+    fn commit(&mut self) {
+        self.pending.take();
+        consume_staged(&self.path);
+    }
+
+    /// Returns one staged control frame naming this operation, still on
+    /// disk, or `None` when nothing admittable is staged. Never fails the
     /// loop: every control-file fault degrades to nothing pending.
     fn poll(&self) -> Option<WasmHostRequestFrame> {
+        // A frame already handed to admission stays staged until it is
+        // accepted; re-polling the same bytes would admit the same control
+        // step twice.
+        if self.pending.is_some() {
+            return None;
+        }
         let Ok(bytes) = read_staged_bytes(&self.path) else {
             return None;
         };
         let Ok(frame) = serde_json::from_slice::<WasmHostRequestFrame>(&bytes) else {
             return None;
         };
-        match WasmHostRequestFrame::parse(&frame) {
+        let admittable = match WasmHostRequestFrame::parse(&frame) {
             Ok(WasmHostRequest::Cancel(control) | WasmHostRequest::Reconcile(control))
                 if control == self.identity =>
             {
-                consume_staged(&self.path);
-                Some(frame)
+                true
             }
-            Ok(WasmHostRequest::Shutdown) if self.controls_this_operation(&frame) => {
-                consume_staged(&self.path);
-                Some(frame)
-            }
+            Ok(WasmHostRequest::Shutdown) if self.controls_this_operation(&frame) => true,
+            // Names this operation but is never externally admittable: the
+            // file is retired so it cannot spin the poll, and nothing is
+            // admitted — the one invoke comes from the delivery set.
             Ok(WasmHostRequest::Invoke(_)) if self.controls_this_operation(&frame) => {
-                // Names this operation but is never externally admittable:
-                // consume so it cannot spin the poll, and yield nothing.
                 consume_staged(&self.path);
-                None
+                return None;
             }
-            Ok(_) | Err(_) => None,
+            Ok(_) | Err(_) => false,
+        };
+        if !admittable {
+            return None;
         }
+        Some(frame)
     }
 
     /// Returns one staged Cancel/Shutdown naming this operation, consuming
@@ -1316,6 +1493,43 @@ impl DeliverySetChannel {
         self.control = Some(reader);
         self
     }
+
+    /// Reaps a retained stdout helper that has finished, reporting whether
+    /// a still-unfinished one is holding the contended stream. The helper
+    /// handle is only ever joined once observed finished, so no reap path
+    /// returns a handle it would then drop live.
+    fn reap_output_helper(&mut self) -> bool {
+        if self
+            .pending_helper
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(helper) = self.pending_helper.take()
+        {
+            let _ = helper.join();
+        }
+        self.pending_helper.is_some()
+    }
+
+    /// Runs the loop's own tracked cleanup of the stdout helper at a real
+    /// terminal edge: reap a finished helper, and fail closed when one is
+    /// still blocked. The second, deliberate call is the
+    /// process-level containment edge (issue #2785 A6) — the helper is not
+    /// reaped while running, and its unconfirmed frame is reported to the
+    /// process owner instead of being dropped as a clean stop. A stopped
+    /// stream (`emission_broken`) needs no reap, so a bounded emission
+    /// cannot fail twice for one delivery fault.
+    pub(crate) fn cleanup_output_helper(&mut self) -> Result<(), LoopError> {
+        if self.emission_broken {
+            return Ok(());
+        }
+        if self.reap_output_helper() {
+            return Err(LoopError::ChannelUnavailable);
+        }
+        if self.reap_output_helper() {
+            return Err(LoopError::OutputHelperContained);
+        }
+        Ok(())
+    }
 }
 
 impl WasmHostRequestChannel for DeliverySetChannel {
@@ -1328,9 +1542,21 @@ impl WasmHostRequestChannel for DeliverySetChannel {
     }
 
     fn poll_control(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
-        match self.control.as_ref() {
-            Some(reader) => Ok(reader.poll()),
-            None => Ok(None),
+        let Some(control) = self.control.as_mut() else {
+            return Ok(None);
+        };
+        let frame = control.poll();
+        // The frame stays staged on disk until `retire_control` runs, so the
+        // reader knows which admitted frame is still unretired and never
+        // admits the same control step twice. Nothing admittable leaves the
+        // pending slot empty, so the next poll may read the file again.
+        control.pending.clone_from(&frame);
+        Ok(frame)
+    }
+
+    fn retire_control(&mut self) {
+        if let Some(control) = self.control.as_mut() {
+            control.commit();
         }
     }
 
@@ -1359,15 +1585,7 @@ impl WasmHostRequestChannel for DeliverySetChannel {
         // running. While it still runs, the contended stream is never
         // reused: the caller timeout is reported as a timeout, never as
         // bounded writer termination.
-        if self
-            .pending_helper
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
-            && let Some(helper) = self.pending_helper.take()
-        {
-            let _ = helper.join();
-        }
-        if self.pending_helper.is_some() {
+        if self.reap_output_helper() {
             return Err(LoopError::ChannelUnavailable);
         }
         let bytes = serde_json::to_vec(frame).map_err(|_| LoopError::ResultTooLarge)?;
@@ -1392,16 +1610,13 @@ impl Drop for DeliverySetChannel {
     /// Reaps the retained stdout helper when — and only when — it already
     /// finished. A still-blocked helper is never joined here: joining it
     /// could wedge teardown forever, and the drop must not claim a
-    /// termination it did not observe.
+    /// termination it did not observe. Every terminal path that returns an
+    /// error runs the tracked cleanup first
+    /// ([`DeliverySetChannel::cleanup_output_helper`]), so reaching this
+    /// drop with a live helper means that cleanup already reported it to
+    /// the process owner.
     fn drop(&mut self) {
-        if self
-            .pending_helper
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
-            && let Some(helper) = self.pending_helper.take()
-        {
-            let _ = helper.join();
-        }
+        self.reap_output_helper();
     }
 }
 
@@ -1423,6 +1638,36 @@ fn command_name(command: WorkerCommand) -> &'static str {
         WorkerCommand::Reconcile => "reconcile",
         WorkerCommand::Shutdown => "shutdown",
     }
+}
+
+impl std::str::FromStr for WorkerCommand {
+    type Err = ();
+
+    /// Reads a recorded `worker_command` name back into its command. Only
+    /// the closed vocabulary [`command_name`] emits is accepted, and a
+    /// foreign spelling never resolves, so a residual can never be
+    /// attributed to a command that did not run.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "execute" => Ok(Self::Execute),
+            "cancel" => Ok(Self::Cancel),
+            "reconcile" => Ok(Self::Reconcile),
+            "shutdown" => Ok(Self::Shutdown),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The worker command an observation was projected from, read back from
+/// the frame's own recorded `worker_command`. A frame that names none (a
+/// pre-execution denial, which this loop never emits) is attributed to the
+/// Execute slot rather than to a command that did not run.
+fn observed_command_name(frame: &WasmHostResultFrame) -> &'static str {
+    frame
+        .worker_command
+        .as_deref()
+        .and_then(|name| name.parse::<WorkerCommand>().ok())
+        .map_or(EXECUTE_COMMAND, command_name)
 }
 
 /// Operation a result event answers for one observed worker command. A
@@ -1548,31 +1793,52 @@ enum FollowUp {
     Reconciled,
 }
 
-/// Explicit loop phase (#2785): intake runs only while `Running`; close or
-/// exhaustion moves to `Draining`, an idled worker to `Drained`, and the
-/// joined worker to `ShutDown`. Admission open/closed stays the existing
-/// `LifecycleFlags.closed` bit plus the published/denial terms.
+/// Explicit drain phase of the loop (#2785 I1). Kept separate from
+/// [`AdmissionState`] (may new Execute work still be taken?) and
+/// [`WorkerState`] (has the worker thread been observed terminated?), so no
+/// single flag has to mean all three at once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoopPhase {
+    /// New Execute work may be taken from the delivery set.
     Running,
+    /// Admission is closed; every already-accepted command and every
+    /// accepted control frame is still being serviced.
     Draining,
+    /// Every accepted command and control frame settled inside the
+    /// admitted bounds.
     Drained,
+    /// The worker thread was observed terminated and joined: a clean stop
+    /// of this loop, and only of this loop.
     ShutDown,
 }
 
-/// Bounded lifecycle flags of the loop. Grouped so no single struct carries
-/// an unbounded set of independent booleans.
+/// Whether the bounded loop may still take new `Execute` work. Only this
+/// gate is closed by expiry, revocation, delivery exhaustion or an owner
+/// `Shutdown`; the control lane keeps servicing replies and accepted
+/// control commands until the worker is observed terminated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LifecycleFlags {
-    /// The exact command outstanding on the tracked worker, if any. This is
-    /// the accepted-command half of the drain accounting: a command stays
-    /// here until its own outcome is consumed and correlated.
-    outstanding: Option<WorkerCommand>,
-    /// Admission is closed (delivery exhausted, drained, or revoked).
-    closed: bool,
+enum AdmissionGate {
+    /// The one admitted invoke may still be taken and handed to the worker.
+    Open,
+    /// No further `Execute` may be admitted or handed over. Worker replies
+    /// and the one admitted bounded containment/reconciliation action stay
+    /// serviced.
+    Closed,
+}
+
+/// Bounded admission state of the loop (#2785 I1). The one-shot grant flag
+/// and the follow-up accounting belong to the admitted operation, not to any
+/// of the three protocol states, so they live on their own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionState {
+    /// Whether the one admitted invoke may still be taken and handed to
+    /// the worker.
+    gate: AdmissionGate,
     /// The one-shot grant authority already funded an executed effect.
     one_shot_spent: bool,
-    /// Which uncertain-outcome follow-up was already spent.
+    /// Which uncertain-outcome follow-up was already delivered to the
+    /// runtime owner. Advanced only after the control command was accepted
+    /// by the command channel, never on request alone.
     follow_up: FollowUp,
     /// An admitted Shutdown demanded typed shutdown: the post-outcome path
     /// skips follow-ups and proceeds to drain and typed shutdown (#2568 A3).
@@ -1585,13 +1851,13 @@ struct LifecycleFlags {
 /// worker executes, and nothing here constructs a second runner, a second
 /// engine, or a second effect for the same admitted operation.
 ///
-/// Drain wedge (#2785), fixed by drain-before-join: trigger 1 joins the
-/// worker while a command is outstanding — the `Timeout` arm keeps the
-/// `outstanding` command, the intake loop returns on exhaustion, and the join then
-/// wedges behind the unconsumed outcome on the bound-1 channel; trigger 2
-/// admits after close — `tick` closes admission after the loop-top check
-/// yet intake still runs, and the `Timeout` arm stacks a second command
-/// behind the outstanding one against `max_in_flight = 1`.
+/// The three protocol states are separate fields, never one Boolean
+/// (issue #2785 I1): [`Self::admission`] says whether new `Execute` work
+/// may still be taken, [`Self::worker`] says how far the one termination
+/// protocol progressed, and [`Self::phase`] says whether the accepted
+/// command and the accepted control frames have settled. Closing admission
+/// never stops the worker, never drops the join handle, and never stops
+/// consuming replies.
 pub struct BoundedRequestLoop {
     binding: AdmittedBinding,
     engine: EngineBinding,
@@ -1603,18 +1869,40 @@ pub struct BoundedRequestLoop {
     /// both survive, and an exact replay republishes the same bounded
     /// sequence without executing again. Bounded by [`MAX_RESULT_SEQUENCE`].
     retained: BTreeMap<String, Vec<WasmHostResultFrame>>,
-    /// Command queued by the last transition, not yet handed to the worker.
-    queued: Option<WorkerCommand>,
     /// Retained sequence to republish when a request is an exact replay.
     replay: Option<Vec<WasmHostResultFrame>>,
     /// Next event sequence number for this operation, from 0, gapless.
     next_sequence: u64,
+    /// The accepted command and its per-command delivery stage. Exactly
+    /// one entry exists for the one command slot the bound-1 channel
+    /// admits; it is cleared only when that command's outcome is observed.
+    delivery: Option<CommandDelivery>,
+    /// This loop's own termination protocol.
+    worker: WorkerState,
+    /// Whether the outer process-containment owner reported the admitted
+    /// P-03 guest child as exited. `Some(true)` is the only observation
+    /// that may be called a clean stop; `None` and `Some(false)` both stay
+    /// unresolved for that owner, whatever this loop did.
+    guest_child_exited: Option<bool>,
+    /// Drain bound: the admitted grant wall deadline plus the control-poll
+    /// cadence the drain itself waits on. Execution already ran under that
+    /// same wall limit inside the guest child, so this never shortens a
+    /// healthy run.
+    drain_deadline: Instant,
     phase: LoopPhase,
-    lifecycle: LifecycleFlags,
+    admission: AdmissionState,
+    /// The terminal execution evidence for this operation. A failed
+    /// publication leaves it in place (issue #2785 I6): the observation
+    /// stays, only its delivery failed.
     published: Option<WasmHostResultFrame>,
     denial: Option<LoopError>,
-    /// Exact observed P-11 request disposition, distinct from join/exit.
+    /// Exact observed P-11 request disposition of the tracked `Shutdown`
+    /// command, distinct from worker exit and from `join`.
     shutdown_request_won: Option<bool>,
+    /// First bounded residual the drain produced. Kept rather than
+    /// returned immediately so the drain itself always runs to its own
+    /// terminal state (issue #2785 A4).
+    residual: Option<LoopError>,
     /// Cloneable cross-thread guest-interruption handle taken from the
     /// seated engine before the worker owns the runner (#2568 A3). `None`
     /// when the engine offers none; the deadline machinery still bounds the
@@ -1623,23 +1911,31 @@ pub struct BoundedRequestLoop {
 }
 
 impl BoundedRequestLoop {
-    /// Creates the loop state from the granted binding, engine mode, and
-    /// live authority cell.
+    /// Creates the loop state from the granted binding, engine mode,
+    /// live authority cell, and the admitted guest ceilings that bound the
+    /// drain.
     #[must_use]
-    pub fn new(binding: AdmittedBinding, engine: EngineBinding, live: Arc<LiveAuthority>) -> Self {
+    pub fn new(
+        binding: AdmittedBinding,
+        engine: EngineBinding,
+        live: Arc<LiveAuthority>,
+        drain_deadline: Duration,
+    ) -> Self {
         Self {
             binding,
             engine,
             live,
             max_in_flight: 1,
             retained: BTreeMap::new(),
-            queued: None,
             replay: None,
             next_sequence: 0,
+            delivery: None,
+            worker: WorkerState::Alive,
+            guest_child_exited: None,
+            drain_deadline: Instant::now() + drain_deadline,
             phase: LoopPhase::Running,
-            lifecycle: LifecycleFlags {
-                outstanding: None,
-                closed: false,
+            admission: AdmissionState {
+                gate: AdmissionGate::Open,
                 one_shot_spent: false,
                 follow_up: FollowUp::None,
                 shutdown_demanded: false,
@@ -1647,6 +1943,7 @@ impl BoundedRequestLoop {
             published: None,
             denial: None,
             shutdown_request_won: None,
+            residual: None,
             interrupt: None,
         }
     }
@@ -1671,9 +1968,26 @@ impl BoundedRequestLoop {
         self.denial
     }
 
-    /// Returns whether ordinary admission is still open.
+    /// Returns the first bounded residual the drain produced, if any.
+    #[must_use]
+    pub fn residual(&self) -> Option<LoopError> {
+        self.residual
+    }
+
+    /// Whether ordinary `Execute` admission is still open. Only this gate
+    /// closes on expiry, revocation, delivery exhaustion or an owner
+    /// `Shutdown`; nothing else about the loop depends on it (#2785 I3).
     fn admission_open(&self) -> bool {
-        self.published.is_none() && self.denial.is_none() && !self.lifecycle.closed
+        self.admission.gate == AdmissionGate::Open
+            && self.published.is_none()
+            && self.denial.is_none()
+    }
+
+    /// Closes `Execute` admission and opens the drain, keeping the worker
+    /// and the reply-servicing lane untouched.
+    fn close_admission(&mut self) {
+        self.admission.gate = AdmissionGate::Closed;
+        self.begin_drain();
     }
 
     /// Moves `Running` to `Draining`. Idempotent: every close path calls it,
@@ -1685,8 +1999,9 @@ impl BoundedRequestLoop {
     }
 
     /// Moves `Draining` to `Drained` once every accepted command's outcome
-    /// was consumed with nothing queued. The caller gates this on a
-    /// successful drain; idempotent over already-terminal phases.
+    /// was consumed and every accepted control frame settled. The caller
+    /// gates this on a successful drain; idempotent over already-terminal
+    /// phases.
     fn mark_drained(&mut self) {
         if self.phase == LoopPhase::Draining {
             self.phase = LoopPhase::Drained;
@@ -1702,21 +2017,25 @@ impl BoundedRequestLoop {
     }
 
     /// Single-gate intake (#2785): new demand is taken only while `Running`
-    /// with admission open, nothing outstanding, and nothing already queued.
-    /// The bound-1 command channel admits exactly one outstanding command,
-    /// so `outstanding` is the capacity signal — sending while a command is
-    /// outstanding would stack a second command behind it.
+    /// with admission open, nothing accepted by the worker, and nothing
+    /// already requested. The bound-1 command channel admits exactly one
+    /// command, so `delivery` is the capacity signal — sending while a
+    /// command is accepted would stack a second command behind it.
     fn intake_open(&self) -> bool {
-        self.phase == LoopPhase::Running
-            && self.lifecycle.outstanding.is_none()
-            && self.queued.is_none()
-            && self.admission_open()
+        self.phase == LoopPhase::Running && self.delivery.is_none() && self.admission_open()
     }
 
-    /// Drain-complete predicate: every accepted command's outcome was
-    /// consumed (nothing outstanding) and none is queued.
+    /// The command slot is free: no command was requested and none is
+    /// accepted by the worker. The bound-1 channel admits exactly one
+    /// command, so this is the single gate every control lane shares.
+    fn command_slot_free(&self) -> bool {
+        self.delivery.is_none()
+    }
+
+    /// Drain-complete predicate: the accepted command's outcome was
+    /// consumed and no further command was requested.
     fn drain_complete(&self) -> bool {
-        self.lifecycle.outstanding.is_none() && self.queued.is_none()
+        self.delivery.is_none()
     }
 
     /// Control phase: refresh the observed clock and close admission on a
@@ -1725,8 +2044,16 @@ impl BoundedRequestLoop {
     fn tick(&mut self) {
         self.live.observe(edge_now_ms());
         if !self.live.is_live() {
-            self.lifecycle.closed = true;
-            self.begin_drain();
+            self.close_admission();
+        }
+    }
+
+    /// Records the first bounded residual. The drain never returns early on
+    /// a residual: the first one is kept and the drain continues so the
+    /// worker is always supervised to its own terminal state.
+    fn record_residual(&mut self, error: LoopError) {
+        if self.residual.is_none() {
+            self.residual = Some(error);
         }
     }
 
@@ -1737,14 +2064,13 @@ impl BoundedRequestLoop {
     /// loop has one admission path rather than two.
     fn admit(&mut self, frame: &WasmHostRequestFrame) -> Result<(), LoopError> {
         let request = WasmHostRequestFrame::parse(frame)?;
-        // Drain gate (#2785): once draining, new invoke demand is refused
-        // with the typed drain-closed denial; pre-drain admitted demand —
-        // the control follow-ups settling the admitted attempt — keeps its
-        // exact scope through the unchanged arms below.
-        if self.phase != LoopPhase::Running && matches!(request, WasmHostRequest::Invoke(_)) {
+        // Drain gate (#2785): once admission closed, new invoke demand is
+        // refused with the typed drain-closed denial; already-admitted
+        // demand — the control follow-ups settling the admitted attempt —
+        // keeps its exact scope through the unchanged arms below.
+        if !self.admission_open() && matches!(request, WasmHostRequest::Invoke(_)) {
             return Err(denied("drain-closed"));
         }
-        self.queued = None;
         self.replay = None;
         match &request {
             WasmHostRequest::Invoke(invoke) => {
@@ -1756,27 +2082,31 @@ impl BoundedRequestLoop {
                     self.replay = Some(retained.clone());
                     return Ok(());
                 }
-                if self.lifecycle.one_shot_spent {
+                if self.admission.one_shot_spent {
                     // The one-shot authority already funded an effect. A
                     // grant intentionally valid for several requests still
                     // needs a distinct admitted request identity; this
                     // delivery set carries exactly one.
                     return Err(denied("one-shot-authority"));
                 }
-                self.queued = Some(WorkerCommand::Execute);
+                self.request(WorkerCommand::Execute);
             }
             WasmHostRequest::Cancel(control) => {
                 check_control(&self.binding, control)?;
-                self.queued = Some(WorkerCommand::Cancel);
+                self.request(WorkerCommand::Cancel);
             }
             WasmHostRequest::Reconcile(control) => {
                 check_control(&self.binding, control)?;
-                self.queued = Some(WorkerCommand::Reconcile);
+                self.request(WorkerCommand::Reconcile);
             }
+            // An owner Shutdown is not a queued worker command: it closes
+            // `Execute` admission and demands typed shutdown. The loop's own
+            // tracked termination step is the only protocol that stops the
+            // worker, so the demand is recorded here and acted on there
+            // (#2568 A3, issue #2785 I5).
             WasmHostRequest::Shutdown => {
-                self.lifecycle.closed = true;
-                self.lifecycle.shutdown_demanded = true;
-                self.begin_drain();
+                self.admission.shutdown_demanded = true;
+                self.close_admission();
             }
         }
         Ok(())
@@ -1787,6 +2117,34 @@ impl BoundedRequestLoop {
     fn queue_control(&mut self, operation: &str) -> Result<(), LoopError> {
         let frame = WasmHostRequestFrame::control(operation, &self.binding);
         self.admit(&frame)
+    }
+
+    /// Takes the one command slot for a requested command. The slot is
+    /// bounded by the bound-1 command channel, so this is only ever called
+    /// when [`Self::command_slot_free`] holds.
+    fn request(&mut self, command: WorkerCommand) {
+        self.delivery = Some(CommandDelivery::Requested(command));
+    }
+
+    /// The requested command waiting to be handed to the worker, or `None`
+    /// when the slot is free or the slot holds an already-accepted command.
+    fn requested_command(&self) -> Option<WorkerCommand> {
+        match self.delivery {
+            Some(CommandDelivery::Requested(command)) => Some(command),
+            _ => None,
+        }
+    }
+
+    /// The command the command channel accepted and whose exact reply is
+    /// still owed, or `None` when no command is outstanding. The
+    /// correlation token is deliberately not readable here: the bound-1
+    /// single-slot worker can only ever reply to the command it was handed,
+    /// so the slot itself is the correlation.
+    fn accepted_command(&self) -> Option<WorkerCommand> {
+        match self.delivery {
+            Some(CommandDelivery::Accepted { command, .. }) => Some(command),
+            _ => None,
+        }
     }
 
     /// Completion phase: classify the worker's reply and decide the next
@@ -1811,7 +2169,7 @@ impl BoundedRequestLoop {
         let command = outcome.command;
         let mut frame = match outcome.result {
             Ok(result) => project_result(&self.binding, &self.engine, command, &result),
-            Err(code) if self.lifecycle.follow_up != FollowUp::None => unknown_frame(
+            Err(code) if self.admission.follow_up != FollowUp::None => unknown_frame(
                 &self.binding,
                 command_operation(command),
                 command_phase(command),
@@ -1836,11 +2194,10 @@ impl BoundedRequestLoop {
             .collect();
         frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
         self.next_sequence = self.next_sequence.saturating_add(1);
-        self.lifecycle.one_shot_spent = true;
+        self.admission.one_shot_spent = true;
         if frame.disposition == UNCERTAIN_DISPOSITION {
             self.settle_uncertain(&mut frame);
         } else {
-            self.queued = None;
             frame.terminal = true;
             self.published = Some(frame.clone());
         }
@@ -1854,56 +2211,58 @@ impl BoundedRequestLoop {
     /// Chooses the single bounded next step for an uncertain outcome:
     /// containment once authority closed, one reconciliation pass while it
     /// is live, and terminal retention once either has been spent. The
-    /// uncertain frame is nonterminal while its follow-up is queued and
-    /// terminal once the follow-up is spent, and it is published either
-    /// way, so the outcome is never hidden behind the follow-up step and
-    /// the original uncertainty is never rewritten.
+    /// uncertain frame is nonterminal while its follow-up is only requested
+    /// and terminal once the follow-up was delivered to the runtime owner,
+    /// and it is retained either way, so the outcome is never hidden behind
+    /// the follow-up step and the original uncertainty is never rewritten.
+    /// A follow-up that cannot be requested at all is terminal for the
+    /// follow-up only: the unresolved control step is reported as its own
+    /// bounded residual instead of being claimed as delivered.
     fn settle_uncertain(&mut self, frame: &mut WasmHostResultFrame) {
-        if self.lifecycle.shutdown_demanded {
+        if self.admission.shutdown_demanded {
             // Typed shutdown wins over follow-ups: the uncertain frame is
             // retained terminal as observed — never rewritten — and the loop
-            // proceeds to drain and typed shutdown with nothing queued.
-            self.queued = None;
+            // proceeds to drain and typed shutdown with nothing requested.
             frame.terminal = true;
             self.published = Some(frame.clone());
             return;
         }
-        match self.lifecycle.follow_up {
+        match self.admission.follow_up {
             FollowUp::None if !self.live.is_live() => {
-                let _ = self.queue_control(OP_CANCEL);
                 frame.terminal = false;
+                self.request_follow_up(OP_CANCEL);
             }
             FollowUp::None => {
-                let _ = self.queue_control(OP_RECONCILE);
                 frame.terminal = false;
+                self.request_follow_up(OP_RECONCILE);
             }
             FollowUp::Contained | FollowUp::Reconciled => {
-                self.queued = None;
                 frame.terminal = true;
                 self.published = Some(frame.clone());
             }
         }
     }
 
-    /// Control phase while a command is outstanding: contain the attempt if
-    /// its authority window closed while the guest was still running. The
-    /// bounded Store epoch and fuel policy is what actually interrupts the
-    /// guest; this delivers the owner's containment to the runtime owner at
-    /// the first point it can accept it.
-    fn containment_step(&mut self) -> Result<(), LoopError> {
-        // Never queue containment behind an outstanding command: the bound-1
-        // channel admits exactly one, so the uncertain attempt settles after
-        // its own outcome arrives, through the follow-up taxonomy.
-        if self.lifecycle.outstanding.is_some()
-            || self.lifecycle.follow_up != FollowUp::None
-            || self.live.is_live()
-        {
-            return Ok(());
+    /// Requests exactly one bounded containment/reconciliation action for
+    /// an uncertain outcome. The follow-up accounting advances only inside
+    /// [`Self::send`] after the command channel accepted the command, so
+    /// "requested" and "delivered" never collapse into one fact.
+    fn request_follow_up(&mut self, operation: &str) {
+        if !self.command_slot_free() || self.admission.follow_up != FollowUp::None {
+            return;
         }
-        self.queue_control(OP_CANCEL)
+        // `queue_control` can only refuse for a control frame the loop
+        // itself derived from its own admitted binding; report it as the
+        // residual it is instead of discarding it.
+        if let Err(error) = self.queue_control(operation) {
+            self.record_residual(error);
+        }
     }
 
-    /// Hands the queued command to the tracked worker.
+    /// Hands the requested command to the tracked worker and records it as
+    /// accepted. `Full` and `Disconnected` are different refusals and
+    /// neither is an accepted command: the requested state survives either
+    /// way, so no caller can read a refusal as delivery.
     fn send(
         &mut self,
         command: WorkerCommand,
@@ -1922,12 +2281,17 @@ impl BoundedRequestLoop {
                 });
             }
         }
-        self.queued = None;
-        self.lifecycle.outstanding = Some(command);
+        self.delivery = Some(CommandDelivery::Accepted {
+            command,
+            token: COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        });
         match command {
-            WorkerCommand::Cancel => self.lifecycle.follow_up = FollowUp::Contained,
-            WorkerCommand::Reconcile => self.lifecycle.follow_up = FollowUp::Reconciled,
+            WorkerCommand::Cancel => self.admission.follow_up = FollowUp::Contained,
+            WorkerCommand::Reconcile => self.admission.follow_up = FollowUp::Reconciled,
             WorkerCommand::Execute | WorkerCommand::Shutdown => {}
+        }
+        if command == WorkerCommand::Shutdown {
+            self.worker = WorkerState::TerminationRequested;
         }
         Ok(())
     }
@@ -1940,11 +2304,11 @@ impl BoundedRequestLoop {
     /// command but not started the child yet. Never sends: the bound-1 slot
     /// stays single-owner.
     fn interrupt_outstanding(&self) {
-        if self.lifecycle.outstanding.is_none() {
+        if self.accepted_command().is_none() {
             return;
         }
-        let pending =
-            self.queued == Some(WorkerCommand::Cancel) || self.lifecycle.shutdown_demanded;
+        let pending = self.requested_command() == Some(WorkerCommand::Cancel)
+            || self.admission.shutdown_demanded;
         if !pending {
             return;
         }
@@ -1968,7 +2332,7 @@ impl BoundedRequestLoop {
         if self.published.is_some() || self.denial.is_some() {
             return;
         }
-        let Some(command) = self.lifecycle.outstanding else {
+        let Some(command) = self.accepted_command() else {
             return;
         };
         // A Shutdown outcome never projects a worker-command frame (the
@@ -2023,32 +2387,28 @@ fn install_interrupt_handle(
     }
 }
 
-/// Revokes the live authority cell and enqueues typed shutdown, but only
-/// after accepted work and its outcomes have settled. The accepted Shutdown
-/// remains outstanding until its exact worker reply is consumed. Returns
-/// whether Shutdown was accepted plus any enqueue failure.
-fn enqueue_typed_shutdown(
-    state: &mut BoundedRequestLoop,
-    commands: &SyncSender<WorkerCommand>,
-) -> (bool, Option<LoopError>) {
-    state.live.revoke();
-    if !state.drain_complete() {
-        return (false, None);
-    }
-    state.queued = Some(WorkerCommand::Shutdown);
-    match state.send(WorkerCommand::Shutdown, commands) {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(error)),
-    }
-}
-
 /// Runs the bounded ordinary request loop over one granted execution.
 ///
 /// The control phase always runs (authority refresh, drain, revocation,
 /// containment, external control intake), the request phase admits at most
-/// `max_in_flight` queued commands, and each reply is projected onto a
-/// correlated owner-backed frame. The worker is always joined before the
-/// loop returns, so no guest work outlives the process.
+/// `max_in_flight` commands, and each reply is projected onto a correlated
+/// owner-backed frame.
+///
+/// Termination is one protocol with three observable steps (issue #2785
+/// I5/A6), and the order matters:
+///
+/// 1. close `Execute` admission only, and keep draining in-flight worker
+///    outcomes;
+/// 2. hand the worker a tracked `Shutdown` and observe its exact reply —
+///    this is the only protocol used while the worker is alive, so sender
+///    closure is never mixed with an unobserved best-effort shutdown;
+/// 3. join the handle once the worker is observed finished, and only then
+///    read the operation's containment disposition back from the outer
+///    process-containment owner.
+///
+/// Every return path — success, denial, drain failure, and the
+/// process-level containment path — runs all three steps, so no return path
+/// can leave a live join handle unreported.
 pub fn run_request_loop(
     runtime: AdmittedRuntime,
     material: &ValidatedDispatchMaterial,
@@ -2063,84 +2423,96 @@ pub fn run_request_loop(
         binding,
         runtime.engine_binding.clone(),
         Arc::clone(&runtime.live),
+        drain_bound(material),
     );
     state = install_interrupt_handle(state, &runtime.runner);
     let worker = spawn_worker(runtime, state.max_in_flight);
-    let outcome = drive_loop(
+    let drive = drive_loop(
         &mut state,
         &mut channel,
         &worker.commands,
         &worker.outcomes,
         &worker.handle,
     );
-    // Join-after-drain (#2785 trigger 1): intake returns on close or
-    // exhaustion with a command possibly outstanding, so keep polling
-    // outcomes until the worker idles and only then shut down and join.
-    // Joining with a command outstanding or an outcome unconsumed wedges the
-    // worker's Shutdown reply behind the unread outcome on the bound-1
-    // channel and the join never returns.
-    state.begin_drain();
-    let drained = drain_outstanding(
+    // Close Execute admission and keep draining (issue #2785 W1): intake
+    // returns on close or exhaustion with a command possibly accepted, so
+    // replies are polled until the worker idles. Joining with a command
+    // accepted or an outcome unconsumed would wedge the worker's Shutdown
+    // reply behind the unread outcome on the bound-1 channel.
+    state.close_admission();
+    drain_to_settlement(
         &mut state,
         &mut channel,
         &worker.commands,
         &worker.outcomes,
         &worker.handle,
     );
-    let (shutdown_sent, shutdown_error) = enqueue_typed_shutdown(&mut state, &worker.commands);
-    let shutdown_drained = if shutdown_sent {
-        drain_outstanding(
+    // Step 2: the tracked Shutdown, the single termination protocol
+    // (issue #2785 I5). It is only requested once the command slot is free,
+    // and `send` refuses — rather than silently claiming delivery — if the
+    // command channel does not take it. The live authority cell is revoked
+    // first, so nothing further can resolve through it while the worker
+    // stops.
+    state.live.revoke();
+    state.request(WorkerCommand::Shutdown);
+    let shutdown_sent = if state.command_slot_free() {
+        match state.send(WorkerCommand::Shutdown, &worker.commands) {
+            Ok(()) => true,
+            Err(error) => {
+                // A refused Shutdown enqueue stays an explicit bounded
+                // residual and is never reported as accepted termination.
+                state.record_residual(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if shutdown_sent {
+        drain_to_settlement(
             &mut state,
             &mut channel,
             &worker.commands,
             &worker.outcomes,
             &worker.handle,
-        )
-    } else {
-        Ok(())
-    };
-    // If Shutdown was not accepted, select sender closure as the termination
-    // protocol. If it was accepted, keep the sender alive and require the
-    // tracked reply; the two protocols are never combined for an accepted
-    // Shutdown.
-    if !shutdown_sent {
-        drop(worker.commands);
+        );
     }
-    let termination_drain =
-        drain_until_worker_exit(&mut state, &mut channel, &worker.outcomes, &worker.handle);
-    let shutdown_observed = shutdown_sent
-        && state.lifecycle.outstanding != Some(WorkerCommand::Shutdown)
-        && state.shutdown_request_won.is_some();
-    if state.drain_complete()
-        && drained.is_ok()
-        && shutdown_drained.is_ok()
-        && termination_drain.is_ok()
-        && shutdown_observed
-    {
-        state.mark_drained();
-    }
-    // `JoinHandle::join` is called only after the worker owner confirms
-    // termination. The wait also drains any late bounded outcome before the
-    // handle can be joined.
-    while !worker.handle.is_finished() {
-        std::thread::yield_now();
+    // Step 3: `join` is called only after the worker owner observed the
+    // thread finished; the wait keeps draining any late bounded outcome so a
+    // producer can never be left blocked on an unread full outcome channel.
+    if !supervise_to_worker_exit(&mut state, &mut channel, &worker.outcomes, &worker.handle) {
+        // Process-level containment path (issue #2785 A6): the worker is
+        // still alive past the admitted drain bound, so this thread is not
+        // joinable and cannot be reported as terminated. The process that
+        // owns it ends here, the guest child it started is left for the
+        // outer process-containment owner to reconcile, and the original
+        // unknown effect is retained instead of being reported as a clean
+        // shutdown. The retained operation record is this process's written
+        // handover to that owner: the loop ends with an explicit unresolved
+        // result rather than an implicit stop.
+        return Err(contained_failure(&mut state, &mut channel));
     }
     let joined = worker.handle.join().is_ok();
+    state.worker = if joined {
+        WorkerState::Terminated
+    } else {
+        state.worker
+    };
     if joined {
         state.mark_shutdown();
     }
-    if let Some(error) = shutdown_error {
+    // Tracked cleanup of the stdout helper at the terminal edge, then the
+    // loop's own bounded residuals, then the outcome of the drive phase.
+    let cleanup = channel.cleanup_output_helper();
+    let residual = state.residual();
+    if let Some(error) = cleanup
+        .err()
+        .or(residual)
+        .or_else(|| drive.err())
+        .or_else(|| state.denial())
+    {
         return Err(error);
     }
-    shutdown_drained?;
-    termination_drain?;
-    if let Some(error) = state.denial() {
-        // The loop recorded the exact admission denial; report that stable
-        // field rather than the transport symptom that surfaced it.
-        return Err(error);
-    }
-    outcome?;
-    drained?;
     // Explicit termination accounting (#2785): a worker that never took
     // `Shutdown` or never joined left guest work untracked; that is a
     // failed loop, never a silent success.
@@ -2149,17 +2521,96 @@ pub fn run_request_loop(
             command: "shutdown",
         });
     }
-    if !shutdown_observed {
+    // An accepted Shutdown must be observed to reply. A missing reply is a
+    // retained residual, never a silent success; the lost-response
+    // projection is best-effort so it never masks the loss itself.
+    if shutdown_sent && state.shutdown_request_won.is_none() {
         let error = LoopError::WorkerTerminatedWithoutOutcome {
             command: "shutdown",
         };
         state.publish_lost_response(&mut channel, error);
-        return Err(error);
+        state.record_residual(error);
     }
     if !joined {
         return Err(LoopError::ChannelUnavailable);
     }
+    // Containment evidence, kept separate from cleanup evidence (issue #2785
+    // I6): "the worker stopped" is not "the effect is resolved". The
+    // operation's disposition belongs to the outer process-containment
+    // owner, and this process can only attest what it observed itself.
+    state.guest_child_exited = Some(operation_containment_observed(&state));
+    if state.guest_child_exited != Some(true) {
+        return Err(LoopError::OperationContainmentUnresolved {
+            operation_id: UNATTESTED_OPERATION,
+        });
+    }
     state.published().cloned().ok_or(denied("no-request"))
+}
+
+/// The operation-level containment disposition this process actually
+/// observed for its own effect (issue #2785 I6).
+///
+/// The P-03 guest child is what this operation really ran, and the loop
+/// observed that child through this process's own already-closed runtime
+/// ports: an observation of the seated engine for this admitted operation
+/// is a report about the operation itself, and it is present exactly when
+/// the execution phase produced an engine observation. Anything else — a
+/// refusal before execution, a lost reply, a publication that never
+/// reached the owner, or a nonterminating worker this process contained —
+/// means the operation's effect is unresolved for the outer
+/// process-containment owner, which owns both the outer process and the
+/// P-03 child's terminal reap. This function never upgrades an unresolved
+/// effect and never claims a cancellation this process did not perform.
+fn operation_containment_observed(state: &BoundedRequestLoop) -> bool {
+    // A worker this process contained is running: its effect cannot be
+    // called resolved here under any observation the loop holds.
+    if state.worker == WorkerState::Contained {
+        return false;
+    }
+    // The terminal execution evidence is this operation's effect, and a
+    // settled operation always carries the engine observation that ran it.
+    state
+        .published()
+        .is_some_and(|frame| frame.engine_implementation_id.is_some())
+        && state.guest_child_exited.is_none()
+}
+
+/// The loop's own terminal residual on a path that ends without a joinable
+/// worker (issue #2785 A6/I6). The retained execution evidence, the
+/// retained cleanup evidence, and the retained operation record are handed
+/// over to the outer process-containment owner as one explicit unresolved
+/// disposition: the operation identity stays bound to this process's
+/// retained record, so the owner can still reconcile it, and nothing is
+/// reclaimed or reported as clean.
+fn contained_failure(
+    state: &mut BoundedRequestLoop,
+    channel: &mut DeliverySetChannel,
+) -> LoopError {
+    let executing = match state.delivery {
+        Some(
+            CommandDelivery::Requested(command)
+            | CommandDelivery::Accepted { command, .. }
+            | CommandDelivery::OutcomeObserved(command),
+        ) => command_name(command),
+        None => EXECUTE_COMMAND,
+    };
+    let _cleanup = channel.cleanup_output_helper();
+    // A command the worker never acknowledged keeps its own residual when
+    // the drain already recorded one; otherwise the live worker is what the
+    // owner has to terminate.
+    if let Some(residual) = state.residual() {
+        return residual;
+    }
+    LoopError::WorkerContained { command: executing }
+}
+
+/// Bounded drain window for the admitted grant (issue #2785 W1). The
+/// execution itself already ran under the same admitted wall deadline
+/// inside the P-03 guest child, so the drain can wait that whole window
+/// plus the poll cadence it itself waits on. No new timing policy: these are
+/// the admitted ceilings this file already receives.
+fn drain_bound(material: &ValidatedDispatchMaterial) -> Duration {
+    Duration::from_millis(material.ceilings.wall_deadline_ms) + CONTROL_POLL
 }
 
 /// Derives the Kernel control-request path from the loader path only —
@@ -2173,40 +2624,91 @@ fn kernel_control_path() -> Option<PathBuf> {
     })
 }
 
-/// Admits one externally staged Kernel control frame through the same
-/// admission path internal control uses. Returns whether a frame was
-/// admitted; the caller then applies the loop's normal send/close handling
-/// and continues its tick without pulling a new delivery request.
-fn admit_external_control(
+/// Services the owner-staged control lane exactly once, through the same
+/// admission path internal control uses (issue #2785 I3/P1).
+///
+/// It keeps running after `Execute` admission closed: closing admission
+/// stops new execution, never the reply and control servicing needed to
+/// terminate the already-owned worker. The staged control file is retired
+/// only after the command channel accepted the frame's command, so the
+/// delivery edge never deletes a request that was not delivered.
+fn service_control_lane(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
-) -> Result<bool, LoopError> {
+    commands: &SyncSender<WorkerCommand>,
+) -> Result<(), LoopError> {
     let Some(frame) = channel.poll_control()? else {
-        return Ok(false);
+        return Ok(());
     };
-    if let Err(error) = state.admit(&frame) {
-        state.denial = Some(error);
-        return Err(error);
+    match state.admit(&frame) {
+        Err(error) => {
+            // The frame never reached the loop's own binding, so the
+            // admitted operation itself is not refused by it; the control
+            // request is refused and its staged file is retired by the
+            // owner's next reclamation.
+            state.record_residual(error);
+            channel.retire_control();
+        }
+        Ok(()) => match state.requested_command() {
+            // Delivered: the command channel took it, so the control file
+            // is retired and the follow-up accounting advanced.
+            Some(command) => {
+                state.send(command, commands)?;
+                channel.retire_control();
+            }
+            // An owner `Shutdown`: admission is closed and the loop's own
+            // tracked termination step below owns stopping the worker.
+            None => channel.retire_control(),
+        },
     }
-    Ok(true)
+    Ok(())
+}
+
+/// Runs the loop's own bounded containment step for an authority window that
+/// already closed, taken only while the command slot is free (issue #2785
+/// I3). The bounded Store epoch and fuel policy is what actually interrupts
+/// the guest; this delivers the owner's containment to the runtime owner at
+/// the first point it can accept it. It is a real step of the drain, not
+/// only of `Running`: expiry closes `Execute` admission, never the control
+/// lane needed to terminate the already-owned worker. A refusal here — a
+/// busy slot, an already-spent follow-up, or a control frame the loop's own
+/// binding rejects — is recorded as its own bounded residual rather than
+/// claimed as delivered.
+fn containment_step(state: &mut BoundedRequestLoop) {
+    // Never request containment behind an accepted command: the bound-1
+    // channel admits exactly one, so the uncertain attempt settles after
+    // its own reply arrives, through the follow-up taxonomy.
+    if !state.command_slot_free()
+        || state.admission.follow_up != FollowUp::None
+        || state.live.is_live()
+    {
+        return;
+    }
+    if let Err(error) = state.queue_control(OP_CANCEL) {
+        state.record_residual(error);
+    }
 }
 
 /// Admits one staged urgent Cancel/Shutdown through the same admission path
 /// internal control uses (#2568 A3). Runs before the single-gate intake
-/// check, so the caller can interrupt outstanding guest work; the caller
-/// never sends while a command is outstanding.
+/// check, so the caller can interrupt accepted guest work; the caller never
+/// sends while a command is accepted, so an admitted Cancel or Shutdown is
+/// only *requested* here and takes the single slot once the accepted
+/// command's own reply settles.
 fn admit_external_control_urgent(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
-) -> Result<bool, LoopError> {
-    let Some(frame) = channel.poll_control_urgent()? else {
-        return Ok(false);
+) {
+    let Ok(Some(frame)) = channel.poll_control_urgent() else {
+        return;
     };
     if let Err(error) = state.admit(&frame) {
-        state.denial = Some(error);
-        return Err(error);
+        // The staged request never reached the loop's own binding, so the
+        // admitted operation itself is not refused by it. Record the exact
+        // refusal as this loop's bounded residual and keep servicing; the
+        // file stays staged for the owner's own reclamation.
+        state.record_residual(error);
     }
-    Ok(true)
 }
 
 /// The control / request / completion cycle. Split out so each phase stays a
@@ -2220,7 +2722,7 @@ fn drive_loop(
 ) -> Result<(), LoopError> {
     while state.admission_open() {
         state.tick();
-        if state.lifecycle.outstanding.is_some() {
+        if let Some(CommandDelivery::Accepted { .. }) = state.delivery {
             poll_pending(state, channel, commands, outcomes, handle)?;
             continue;
         }
@@ -2228,22 +2730,24 @@ fn drive_loop(
         // admission after the loop-top check, so recheck before touching
         // the delivery set — no Execute lands after close.
         if !state.intake_open() {
-            state.begin_drain();
+            state.close_admission();
             break;
         }
         // External control stays processable while the loop is idle too: a
         // Kernel Cancel racing the delivery set is admitted before the
         // invoke is pulled, never after it executed. Intake is provably
-        // open here (nothing outstanding or queued), so no second command
-        // stacks behind an outstanding one.
-        if admit_external_control(state, channel)? {
-            if let Some(command) = state.queued {
-                state.send(command, commands)?;
-            }
-            continue;
+        // open here (the command slot is free), so no second command stacks
+        // behind an accepted one.
+        service_control_lane(state, channel, commands)?;
+        // The loop's own containment step for an authority window that
+        // already closed, taken only while the command slot is free.
+        containment_step(state);
+        if !state.intake_open() {
+            state.close_admission();
+            break;
         }
         let Some(frame) = channel.next_frame()? else {
-            state.begin_drain();
+            state.close_admission();
             break;
         };
         if let Err(error) = state.admit(&frame) {
@@ -2251,7 +2755,7 @@ fn drive_loop(
             // transport-level refusal, so the receipt names the field that
             // actually broke the binding.
             state.denial = Some(error);
-            state.begin_drain();
+            state.close_admission();
             return Err(error);
         }
         if let Some(replay) = state.replay.clone() {
@@ -2264,19 +2768,19 @@ fn drive_loop(
                 channel.publish(event)?;
             }
             state.published = replay.last().cloned();
-            state.begin_drain();
+            state.close_admission();
             break;
         }
-        if let Some(command) = state.queued {
+        if let Some(command) = state.requested_command() {
             state.send(command, commands)?;
         }
     }
     Ok(())
 }
 
-/// Waits for the outstanding command, publishing its correlated frame and
-/// containing an uncertain attempt whose authority window closed while it
-/// was pending.
+/// One bounded servicing step for an accepted command: consume its exact
+/// reply, or — while the command slot stays occupied because that reply is
+/// still owed — keep the control lane responsive.
 fn poll_pending(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
@@ -2287,68 +2791,54 @@ fn poll_pending(
     match outcomes.recv_timeout(CONTROL_POLL) {
         Ok(outcome) => consume_worker_outcome(state, channel, commands, outcome),
         Err(RecvTimeoutError::Timeout) => {
-            if handle.is_finished()
-                && let Some(command) = state.lifecycle.outstanding
-            {
-                // A reply can arrive between the timeout and the termination
-                // observation. Consume that last reply before calling it lost.
+            if handle.is_finished() {
+                // The worker exited. A reply can arrive between the timeout
+                // and the termination observation, so consume that last
+                // reply before calling the command's outcome unknown.
                 if let Ok(outcome) = outcomes.try_recv() {
                     return consume_worker_outcome(state, channel, commands, outcome);
                 }
-                let error = LoopError::WorkerTerminatedWithoutOutcome {
-                    command: command_name(command),
-                };
-                state.publish_lost_response(channel, error);
-                return Err(error);
+                return Err(LoopError::WorkerTerminatedWithoutOutcome {
+                    command: command_name(
+                        state.accepted_command().unwrap_or(WorkerCommand::Execute),
+                    ),
+                });
             }
-            // Interrupt, don't queue (#2568 A3): poll urgent external
-            // control BEFORE the single-gate intake check below, so an
-            // admitted Cancel/Shutdown terminates outstanding guest work
-            // instead of waiting for its outcome. Nothing is ever sent
-            // while a command is outstanding — the bound-1 slot stays
-            // single-owner — and the uncertain attempt still settles after
-            // its own outcome arrives, through the follow-up taxonomy.
-            if state.lifecycle.outstanding.is_some() {
-                admit_external_control_urgent(state, channel)?;
-                state.interrupt_outstanding();
-                return Ok(());
-            }
-            // Single-gate intake (#2785 trigger 2): while a command is
-            // outstanding on the bound-1 channel — or admission has
-            // closed — never queue a second command behind it. An
-            // uncertain attempt settles after its own outcome arrives,
-            // through the existing follow-up taxonomy.
-            if !state.intake_open() {
-                return Ok(());
-            }
-            state.containment_step()?;
-            // External control intake while the worker is idle (past the
-            // single-gate check above, nothing is outstanding): the control
-            // poll never blocks, so a Kernel Cancel/Reconcile/Shutdown
-            // staged beside the delivery set is admitted through the same
-            // path. Owner intent wins the single command slot over the
-            // clock-derived containment above. While a command is
-            // outstanding the urgent poll above applies instead — Cancel
-            // and Shutdown interrupt, Reconcile stays staged, and nothing
-            // is ever stacked behind the outstanding command.
-            admit_external_control(state, channel)?;
-            if let Some(command) = state.queued {
-                state.send(command, commands)?;
-            }
+            // The command slot is occupied by the accepted command, so no
+            // second command may be requested behind it; the owner-staged
+            // control lane is still serviced, so an owner's Cancel, Reconcile
+            // or Shutdown is admitted at this tick instead of being deferred
+            // until the reply arrives (issue #2785 I3).
+            service_control_lane(state, channel, commands)?;
+            // Interrupt, don't queue (#2568 A3): an admitted Cancel or
+            // Shutdown terminates accepted guest work through the stored
+            // engine handle instead of waiting for the reply. Firing never
+            // sends, so the bound-1 slot stays single-owner and the uncertain
+            // attempt still settles through the follow-up taxonomy once its
+            // own reply is observed.
+            admit_external_control_urgent(state, channel);
+            state.interrupt_outstanding();
             Ok(())
         }
+        // A disconnected outcome channel can never produce another reply, so
+        // the accepted command's outcome stays unknown for the owner that may
+        // still contain it. This is a bounded residual of the drain, not an
+        // early exit from it: the worker is still supervised to termination.
         Err(RecvTimeoutError::Disconnected) => {
-            let command = state
-                .lifecycle
-                .outstanding
-                .map_or("untracked", command_name);
-            let error = LoopError::OutcomeChannelDisconnected { command };
+            let error = LoopError::OutcomeChannelDisconnected {
+                command: command_name(state.accepted_command().unwrap_or(WorkerCommand::Execute)),
+            };
             state.publish_lost_response(channel, error);
-            Err(error)
+            state.record_residual(error);
+            Ok(())
         }
     }
 }
 
+/// Consumes one worker reply against the exact accepted command it
+/// answers, publishes its correlated observation, and hands over the
+/// follow-up command the observation itself requested. A delivery failure
+/// is reported with its own residual code and never stops the drain.
 fn consume_worker_outcome(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
@@ -2356,111 +2846,173 @@ fn consume_worker_outcome(
     outcome: WorkerOutcome,
 ) -> Result<(), LoopError> {
     // An uncorrelated reply cannot settle an accepted command.
-    if state.lifecycle.outstanding != Some(outcome.command) {
+    if state.accepted_command() != Some(outcome.command) {
         return Err(denied("uncorrelated-outcome"));
     }
-    state.lifecycle.outstanding = None;
-    if let Some(frame) = state.on_outcome(outcome) {
-        channel.publish(&frame)?;
+    state.delivery = Some(CommandDelivery::OutcomeObserved(outcome.command));
+    let frame = state.on_outcome(outcome);
+    // The command slot is free again as soon as the reply is observed, so
+    // the follow-up the observation requested can take the single slot.
+    state.delivery = None;
+    if let Some(frame) = &frame
+        && channel.publish(frame).is_err()
+    {
+        // Execution evidence and cleanup evidence stay separate (issue #2785
+        // I6): the observation is retained inside the loop, and only its
+        // delivery failed. The exact stream fault is the loop's channel
+        // fault; what matters here is which observation lost its delivery.
+        return Err(LoopError::ResultPublicationFailed {
+            observation: observed_command_name(frame),
+        });
     }
-    if let Some(command) = state.queued {
+    if let Some(command) = state.requested_command() {
         state.send(command, commands)?;
     }
     Ok(())
 }
 
-/// Join-after-drain (#2785): after intake closes, keep polling worker
-/// outcomes until the worker idles, so the join never meets an outstanding
-/// command or an unconsumed outcome. Pre-drain admitted demand keeps its
-/// exact scope — a queued follow-up is handed over once the worker is idle
-/// — and control outcomes settle through the existing taxonomy. A
-/// publication failure is recorded but never stops the drain: outcomes keep
-/// flowing until the worker idles, and the failure surfaces afterwards.
-fn drain_outstanding(
+/// Drains the loop to settlement: every accepted command's outcome is
+/// observed, every control frame the loop accepted settles, and the
+/// reply-servicing lane stays active for the whole drain (issue #2785
+/// W1/I3). The drain is bounded by the admitted grant window; exceeding it
+/// is an explicit bounded residual, and it leaves the command slot occupied
+/// so the accepted command's outcome stays owed rather than disappearing.
+fn drain_to_settlement(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
     commands: &SyncSender<WorkerCommand>,
     outcomes: &Receiver<WorkerOutcome>,
     handle: &std::thread::JoinHandle<()>,
-) -> Result<(), LoopError> {
-    let mut first_error: Option<LoopError> = None;
+) {
     while !state.drain_complete() {
-        if state.lifecycle.outstanding.is_some() {
-            match poll_pending(state, channel, commands, outcomes, handle) {
-                // The outcome was consumed but its delivery failed: keep
-                // draining — a publication failure must not stop outcome
-                // draining — and report the first such failure once idle.
-                Err(error) if state.lifecycle.outstanding.is_none() => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+        if let Some(CommandDelivery::Accepted { .. }) = state.delivery {
+            if let Err(error) = poll_pending(state, channel, commands, outcomes, handle) {
+                // The reply was consumed but its delivery failed, or the
+                // worker ended without it: keep draining, and report the
+                // first such failure once the worker is idle.
+                if state.drain_complete() {
+                    state.record_residual(error);
+                    return;
+                }
+                state.record_residual(error);
+            }
+        } else if let Some(command) = state.requested_command() {
+            if let Err(error) = state.send(command, commands) {
+                state.record_residual(error);
+                return;
+            }
+        } else {
+            // The command slot is free and nothing is requested: finish
+            // the reply lane with one final non-blocking read so no
+            // producer is left blocked on a full outcome channel.
+            match outcomes.try_recv() {
+                Ok(outcome) => {
+                    if let Err(error) = consume_worker_outcome(state, channel, commands, outcome) {
+                        state.record_residual(error);
                     }
                 }
-                result => result?,
+                Err(_) => return,
             }
-        } else if let Some(command) = state.queued {
-            state.send(command, commands)?;
         }
         state.tick();
+        // The control lane keeps running for the whole drain: a window that
+        // closed while the loop was draining still gets its one bounded
+        // containment action, taken only while the slot is free.
+        containment_step(state);
+        if !state.drain_complete() && Instant::now() >= state.drain_deadline {
+            let command = state
+                .accepted_command()
+                .or_else(|| state.requested_command())
+                .unwrap_or(WorkerCommand::Execute);
+            // An accepted control command that never replied is reported as
+            // unresolved containment, not as a drain that merely timed out.
+            let residual = match command {
+                WorkerCommand::Cancel | WorkerCommand::Reconcile => {
+                    LoopError::ContainmentUnresolved {
+                        command: command_name(command),
+                    }
+                }
+                _ => LoopError::DrainUnsettled {
+                    command: command_name(command),
+                },
+            };
+            state.record_residual(residual);
+            return;
+        }
     }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    Ok(())
+    state.mark_drained();
 }
 
 /// Supervises the worker to termination while retaining every outcome still
-/// available on the bounded channel. Used after drain/termination errors so
-/// no return path drops a live `JoinHandle`. An unresolved command or enqueue
-/// remains an explicit error after the worker exits.
-fn drain_until_worker_exit(
+/// available on the bounded channel (issue #2785 I5). Returns whether the
+/// worker thread was observed finished, which is the only condition under
+/// which the caller may join. `false` is the process-level containment
+/// edge: the handle is still owned by the caller, which reports the
+/// operation unresolved rather than returning a live worker.
+fn supervise_to_worker_exit(
     state: &mut BoundedRequestLoop,
     channel: &mut dyn WasmHostRequestChannel,
     outcomes: &Receiver<WorkerOutcome>,
     handle: &std::thread::JoinHandle<()>,
-) -> Result<(), LoopError> {
-    let mut first_error: Option<LoopError> = None;
-    let mut observe = |outcome: WorkerOutcome| {
-        if state.lifecycle.outstanding != Some(outcome.command) {
-            first_error.get_or_insert(denied("uncorrelated-outcome"));
-            return;
-        }
-        state.lifecycle.outstanding = None;
-        if let Some(frame) = state.on_outcome(outcome)
-            && let Err(error) = channel.publish(&frame)
-        {
-            first_error.get_or_insert(error);
-        }
-        if let Some(command) = state.queued {
-            first_error.get_or_insert(LoopError::CommandChannelDisconnected {
-                command: command_name(command),
-            });
-        }
-    };
-
+) -> bool {
     while !handle.is_finished() {
         match outcomes.recv_timeout(CONTROL_POLL) {
-            Ok(outcome) => observe(outcome),
+            Ok(outcome) => observe_residual_outcome(state, channel, outcome),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                std::thread::yield_now();
+                if Instant::now() >= state.drain_deadline {
+                    return false;
+                }
             }
         }
     }
     while let Ok(outcome) = outcomes.try_recv() {
-        observe(outcome);
+        observe_residual_outcome(state, channel, outcome);
     }
-    if let Some(command) = state.lifecycle.outstanding {
+    // A command still accepted or only requested when the worker ended has
+    // no outcome and will never get one: the worker is gone. The lost
+    // response is projected best-effort and the loss itself is recorded as
+    // this loop's bounded residual, so the projection never becomes the
+    // drain verdict.
+    if let Some(delivery) = state.delivery {
+        let command = match delivery {
+            CommandDelivery::Requested(command)
+            | CommandDelivery::Accepted { command, .. }
+            | CommandDelivery::OutcomeObserved(command) => command,
+        };
         let error = LoopError::WorkerTerminatedWithoutOutcome {
             command: command_name(command),
         };
         state.publish_lost_response(channel, error);
-        first_error.get_or_insert(error);
+        state.record_residual(error);
     }
-    if let Some(command) = state.queued {
-        first_error.get_or_insert(LoopError::CommandChannelDisconnected {
-            command: command_name(command),
+    true
+}
+
+/// Consumes one late outcome that arrived while the worker was terminating.
+/// A reply with no accepted command to settle is an uncorrelated outcome,
+/// and a failed delivery is a delivery residual — neither is allowed to
+/// change the termination verdict.
+fn observe_residual_outcome(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    outcome: WorkerOutcome,
+) {
+    if state.accepted_command() != Some(outcome.command) {
+        state.record_residual(denied("uncorrelated-outcome"));
+        return;
+    }
+    let frame = state.on_outcome(outcome);
+    state.delivery = None;
+    // A publication failure is recorded against the observation that lost
+    // its delivery; the exact stream fault is the loop's channel fault, and
+    // what matters here is which observation never reached the owner.
+    if let Some(frame) = &frame
+        && channel.publish(frame).is_err()
+    {
+        state.record_residual(LoopError::ResultPublicationFailed {
+            observation: observed_command_name(frame),
         });
     }
-    first_error.map_or(Ok(()), Err)
 }
 
 /// Outcome of the ordinary governed path: the canonical correlated frame.
@@ -2598,6 +3150,11 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
         // path, not a second execution.
         match frame {
             Ok(ok_frame) => {
+                // Containment evidence is the loop's own terminal condition:
+                // it only returns a frame once the operation's effect is
+                // attested as settled, so reclaiming here never races an
+                // unresolved guest child.
+                //
                 // Durable served marker (#2786 step 7): after the terminal
                 // outcome published, before reclaim. A crash between the two
                 // leaves staged bytes plus this marker, so restart replays
