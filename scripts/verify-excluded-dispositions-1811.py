@@ -23,10 +23,16 @@ There is currently no per-crate evidence framework (SBOM/lock/provenance
 artifacts stay out of Git per docs/DEPENDENCY_POLICY.md), so any such
 consumer is fail-closed rejected with the evidence list named. The gate
 passes when no non-standalone consumer exists and no inventoried name is
-locked, which is the current tree state (11 standalone, 0 consumers).
+locked, which is the current tree state (9 standalone, 0 consumers, after the
+#2612 admission of crates/governor/eliot-memory-projection-provider as a root
+workspace member; the 11-package figure in the inventory header is the
+historical denominator measured at that file's `base_sha`).
 
 Discovery never trusts the inventory: the denominator is derived from the
-tree with the same rule as scripts/verify-standalone-crates.py.
+tree with the same rule as scripts/verify-standalone-crates.py. The declared
+`standalone_package_count` is checked against both the unique inventory rows
+and the discovered set, so a stale count fails closed instead of passing
+silently.
 """
 
 from __future__ import annotations
@@ -172,6 +178,24 @@ def main() -> int:
     for entry in sorted(exclude):
         if entry not in by_path:
             failures.append(f"undeclared excluded input: {entry}")
+    # 2b. declared count must equal the unique current rows and tree discovery
+    declared_count = data.get("standalone_package_count")
+    if isinstance(declared_count, bool) or not isinstance(declared_count, int):
+        failures.append(
+            "standalone_package_count must be an integer, got "
+            f"{declared_count!r}"
+        )
+    else:
+        if declared_count != len(by_path):
+            failures.append(
+                "standalone_package_count drift: declared "
+                f"{declared_count} vs {len(by_path)} unique inventory rows"
+            )
+        if declared_count != len(discovered):
+            failures.append(
+                "standalone_package_count drift: declared "
+                f"{declared_count} vs {len(discovered)} discovered standalone packages"
+            )
     # 3. every row: disposition verb + named owner
     for path in sorted(by_path):
         row = by_path[path]
