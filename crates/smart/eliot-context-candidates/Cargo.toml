@@ -24,6 +24,7 @@ agent_order = 16
 eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
 eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
 eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+eliot-memory-projection-contracts = { path = "../../foundation/eliot-memory-projection-contracts", version = "0.1.0" }
 eliot-cue-contracts = { path = "../eliot-cue-contracts", version = "0.1.0" }
 eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
 eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }

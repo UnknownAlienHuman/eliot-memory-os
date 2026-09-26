@@ -21,11 +21,11 @@ discriminator = "Missing provider or fence cases return incomplete candidate set
 primary_responsibility = "Map immutable task, attention, epistemic, cue-activation, negative-memory, evidence and affordance projections into whole context candidates with lineage."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["TaskFrame projection", "CriticalAttention and Conflict handles", "CurrentEpistemicPosition", "ActivationResult", "negative-memory and affordance projections", "applicable-memory slot, structural binding only (typed ApplicableMemorySet import deferred to workspace admission, issue #43)"]
+inputs = ["TaskFrame projection", "CriticalAttention and Conflict handles", "CurrentEpistemicPosition", "ActivationResult", "negative-memory and affordance projections", "applicable-memory slot from the typed ApplicableMemorySet contract (issue #43)"]
 outputs = ["ContextCandidateSet", "coverage manifest", "missing-input and unknown list"]
 # eliot-cue-activation is the runtime producer of the explicit ActivationResult
 # input (A-14a #600) and is never imported or called by this pure mapper.
-depends_on = ["eliot-cue-contracts", "eliot-epistemic-contracts", "eliot-context-contracts"]
+depends_on = ["eliot-cue-contracts", "eliot-epistemic-contracts", "eliot-context-contracts", "eliot-memory-projection-contracts"]
 providers = ["Governor read projections", "cue activation", "memory projection provider (eighth-slot design only; mapper adoption deferred past #41)"]
 consumers = ["context admission"]
 non_goals = ["store queries", "ranking", "rendering", "semantic synthesis"]

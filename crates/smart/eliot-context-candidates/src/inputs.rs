@@ -10,11 +10,12 @@
 //!
 //! Issue #43 designs the eighth provider slot (applicable memory) at this
 //! input boundary without changing the mapped denominator yet: [`MemoryInput`]
-//! carries the evaluated `ApplicableMemorySet` shape structurally (binding,
-//! slot state, applicable/excluded handles, advisory cue hits,
-//! denominator/truncation flags) because the typed
-//! `eliot-memory-projection-contracts` dependency can only land with
-//! workspace admission (registry flip deferred). The mapper still enforces
+//! is the slot shape (binding, slot state, applicable/excluded handles,
+//! advisory cue hits, denominator/truncation flags) and
+//! [`MemoryInput::from_applicable_set`] builds it from the typed
+//! `ApplicableMemorySet` evaluator output, depending only on the
+//! `eliot-memory-projection-contracts` contract cell — never on the
+//! evaluator or provider implementations. The mapper still enforces
 //! the seven-slot denominator; [`eight_slots`] and
 //! [`check_denominator_is_seven_or_eight`] name the migration target the
 //! mapper adopts after #41 merges. No eighth provider, unknown field, or
@@ -38,6 +39,7 @@ use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId
 use eliot_cue_contracts::{ActivationResult, Completeness};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition, SourceAssurance};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope};
+use eliot_memory_projection_contracts::{ApplicableMemorySet, DenominatorState, ExclusionReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -596,16 +598,42 @@ pub const MEMORY_PROVIDER: &str = "eliot.memory-applicability.v1";
 
 /// Hard ceiling on advisory cue-hit handles carried by one memory input.
 ///
-/// This mirrors the evaluator advisory bound structurally; the typed import
-/// lands with workspace admission.
+/// This mirrors the evaluator advisory bound; the typed evaluator output is
+/// consumed through [`MemoryInput::from_applicable_set`].
 pub const MAX_MEMORY_CUE_HITS: usize = 512;
+
+/// Stable reason class for one typed evaluator exclusion.
+///
+/// Bare classes name the failed rule; precondition variants suffix the exact
+/// gate identity (`PRECONDITION_FAILED:<id>`) so the failed gate is never
+/// lost in the slot view. The match is exhaustive on purpose: a new
+/// evaluator rule must receive a conscious class here, never a silent
+/// default. There is deliberately no cue-hit class: a cue hit is advisory
+/// evidence recorded on [`MemoryExclusion::cue_hit`], never a reason.
+#[must_use]
+pub fn exclusion_reason_class(reason: &ExclusionReason) -> String {
+    match reason {
+        ExclusionReason::Stale => "STALE".to_owned(),
+        ExclusionReason::Conflicted => "CONFLICTED".to_owned(),
+        ExclusionReason::Rejected => "REJECTED".to_owned(),
+        ExclusionReason::EpistemicallyUnknown => "EPISTEMICALLY_UNKNOWN".to_owned(),
+        ExclusionReason::Protected => "PROTECTED".to_owned(),
+        ExclusionReason::NegativeMemory => "NEGATIVE_MEMORY".to_owned(),
+        ExclusionReason::PreconditionFailed { id } => format!("PRECONDITION_FAILED:{id}"),
+        ExclusionReason::PreconditionUnassessed { id } => {
+            format!("PRECONDITION_UNASSESSED:{id}")
+        }
+        ExclusionReason::LifecycleInactive => "LIFECYCLE_INACTIVE".to_owned(),
+        ExclusionReason::FenceMismatch => "FENCE_MISMATCH".to_owned(),
+        ExclusionReason::ScopeMismatch => "SCOPE_MISMATCH".to_owned(),
+    }
+}
 
 /// One excluded applicable-memory handle with its substantive reason.
 ///
-/// The reason travels as a bounded reason class (never a cue-hit flag):
-/// the typed `ExclusionReason` enum lives in
-/// `eliot-memory-projection-contracts` and is imported directly once that
-/// crate is workspace-admitted. A cue hit on an excluded handle is recorded
+/// The reason travels as a bounded reason class (never a cue-hit flag);
+/// [`exclusion_reason_class`] maps the typed evaluator `ExclusionReason`.
+/// A cue hit on an excluded handle is recorded
 /// on `cue_hit` and never promotes the handle into `applicable`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -696,6 +724,68 @@ impl MemoryInput {
             }
         }
         Ok(())
+    }
+
+    /// Build the memory slot from the typed evaluator output contract.
+    ///
+    /// The caller supplies the compilation binding and the slot projection
+    /// state; the set supplies the verdict. Task and scope must equal the
+    /// set binding exactly and the fences must be compatible, otherwise the
+    /// set belongs to another read and is rejected. Applicable handles,
+    /// exclusions with exact reason classes, advisory cue-hit flags, the
+    /// known-denominator bit, and the truncation flag all transfer
+    /// field-for-field; cue-hit handles are re-sorted for a deterministic
+    /// slot order. Roles, session binding, and the revalidation flag stay on
+    /// the typed set, which the caller keeps: the slot references handles,
+    /// it never restates evaluator standing, and a `truncated` slot always
+    /// implies revalidation downstream. Cue-hit handles that named no
+    /// evaluated record are unrepresentable here and correctly absent.
+    pub fn from_applicable_set(
+        set: &ApplicableMemorySet,
+        binding: ContextBinding,
+        state: ProjectionState,
+    ) -> Result<Self, ContextError> {
+        if set.binding.task_id != binding.task_id || set.binding.scope_id != binding.scope_id {
+            return Err(ContextError::InvalidField("memory.binding"));
+        }
+        if !set
+            .binding
+            .state_fence
+            .is_compatible_with(&binding.state_fence)
+        {
+            return Err(ContextError::InvalidField("memory.binding"));
+        }
+        let mut applicable = Vec::with_capacity(set.applicable.len());
+        let mut excluded = Vec::with_capacity(set.excluded.len());
+        let mut cue_hits = Vec::new();
+        for record in &set.applicable {
+            if record.cue_hit {
+                cue_hits.push(record.handle.clone());
+            }
+            applicable.push(record.handle.clone());
+        }
+        for record in &set.excluded {
+            if record.cue_hit {
+                cue_hits.push(record.handle.clone());
+            }
+            excluded.push(MemoryExclusion {
+                handle: record.handle.clone(),
+                reason: exclusion_reason_class(&record.reason),
+                cue_hit: record.cue_hit,
+            });
+        }
+        cue_hits.sort();
+        let input = Self {
+            binding,
+            state,
+            applicable,
+            excluded,
+            cue_hits,
+            denominator_known: matches!(set.denominator, DenominatorState::Known { .. }),
+            truncated: set.truncated,
+        };
+        input.validate()?;
+        Ok(input)
     }
 }
 
