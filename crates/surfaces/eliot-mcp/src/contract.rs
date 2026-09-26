@@ -1029,7 +1029,7 @@ fn finish_arguments_contain_legacy_proof(value: &Value) -> bool {
         .is_some()
 }
 
-fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), TypedRejection> {
+pub(crate) fn reject_duplicate_keys(bytes: &[u8]) -> Result<(), TypedRejection> {
     let text = std::str::from_utf8(bytes).map_err(|_| TypedRejection::Malformed {
         reason: "request is not valid UTF-8 JSON",
     })?;
