@@ -1935,16 +1935,27 @@ impl JsonRpcId {
     /// form, and the same mapping applies on both negotiated wire profiles.
     ///
     /// Compatibility: transport generations using the previous lossy
-    /// projection (bare `"7"` for both wire forms) never match a qualified
-    /// key, so an old retained entry is never silently reinterpreted as the
-    /// new encoding. A lookup against such an entry misses and follows the
-    /// existing unknown-target path (no new execution; durable recovery stays
-    /// kernel-side), and no active operation is evicted to avoid a collision
-    /// because distinct wire identities now key distinct entries. The result
-    /// is validated again by `HostCorrelationId::new` at construction;
-    /// over-long wire strings fail closed there, while blank wire strings are
-    /// rejected by the builders before encoding so the previous admission
-    /// boundary is preserved.
+    /// projection (bare `"7"` for both wire forms) key durable rows the new
+    /// encoding never matches directly, so a bare pre-upgrade row is never
+    /// silently reinterpreted as a qualified key — and replaying the same
+    /// wire presentation must not stage a second operation for it either.
+    /// The wire correlation is the durable logical-key occurrence and the
+    /// durable record's `request_id` (issue #2571), so the invocation replay
+    /// path consults the bounded legacy alias
+    /// ([`legacy_bare_occurrence`]) before treating an authoritative
+    /// `Absent` as permission to submit: a repeated admitted logical
+    /// request returns the original operation/result with no second
+    /// dispatch, and no pre-upgrade row is orphaned. A legacy bare row is
+    /// a shared ancestor — both `int:7` and `str:7` alias the same bare
+    /// row, preserving the pre-upgrade sharing exactly — while every row
+    /// staged under the qualified encoding stays distinct. Cancellation
+    /// needs no alias: an absent qualified intent falls back to the
+    /// observation-only parent probe, which never issues execution. The
+    /// legacy form is computed, never stored: stripping one 4-byte type
+    /// tag from an admitted correlation (at most
+    /// `MAX_HOST_CORRELATION_BYTES` per `HostCorrelationId::new`) always
+    /// fits the same bound, so the probe is one extra bounded lookup with
+    /// no alias tables and no new byte-limit surface.
     #[must_use]
     pub fn correlation_text(&self) -> String {
         match self {
@@ -1961,6 +1972,34 @@ impl JsonRpcId {
             Self::Int(number) => json!(*number),
         }
     }
+}
+
+/// Projects one qualified correlation back to the previous transport
+/// generation's bare occurrence (issue #2765 W4: the durable-compat alias
+/// consulted by invocation replay before any fresh submit).
+///
+/// The pre-`int:`/`str:` projection carried the wire identity verbatim —
+/// integers as decimal text, strings verbatim — so the bare occurrence of
+/// `"int:7"` and `"str:7"` is `"7"`, and of `"str:int:7"` (a client string
+/// resembling the integer tag) is `"int:7"`. Exactly one leading type tag
+/// is stripped; input without a tag, with an empty or blank remainder,
+/// with control characters, or in the `cancel:` intent domain has no
+/// legacy invocation occurrence and yields `None`. The result borrows the
+/// input: no allocation, no table, at most one alias probe per replay
+/// miss. Byte accounting: the bare form is the qualified form minus the
+/// 4-byte tag, so every admitted qualified correlation (bounded by
+/// `MAX_HOST_CORRELATION_BYTES` at `HostCorrelationId::new`, blank and
+/// control characters already rejected there) projects inside the same
+/// bound with room to spare.
+#[must_use]
+pub fn legacy_bare_occurrence(qualified: &str) -> Option<&str> {
+    let bare = qualified
+        .strip_prefix(CORRELATION_INT_TAG)
+        .or_else(|| qualified.strip_prefix(CORRELATION_STR_TAG))?;
+    if bare.trim().is_empty() || bare.chars().any(char::is_control) {
+        return None;
+    }
+    Some(bare)
 }
 
 /// One decoded MCP JSON-RPC frame: envelope only, no dispatch.

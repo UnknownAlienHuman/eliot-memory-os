@@ -30,7 +30,7 @@ use eliot_contracts::{
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
     HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
-    ToolRequest,
+    ToolRequest, legacy_bare_occurrence,
 };
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, HARD_STRUCTURED_RESPONSE_BYTES,
@@ -311,14 +311,36 @@ fn logical_invocation_key(
     session: &str,
     payload_digest: &str,
 ) -> Result<String, PortFailure> {
+    logical_invocation_key_for_occurrence(
+        request.correlation_id.as_str(),
+        request.tool.canonical_name(),
+        session,
+        payload_digest,
+    )
+}
+
+/// Derives the logical key for one explicit invocation occurrence.
+///
+/// Shared by the qualified replay lookup and the bounded legacy-alias
+/// probe (issue #2765 W4): the alias passes the previous transport
+/// generation's bare occurrence for the same session, capability, and
+/// payload commitment, so a pre-upgrade row resolves under the exact key
+/// it was staged with — no kernel or store change, the owner recomputes
+/// the key from the presented selectors either way.
+fn logical_invocation_key_for_occurrence(
+    occurrence: &str,
+    capability: &str,
+    session: &str,
+    payload_digest: &str,
+) -> Result<String, PortFailure> {
     logical_host_request_key(
         LOGICAL_KIND_INVOCATION,
         session,
-        request.correlation_id.as_str(),
+        occurrence,
         None,
         None,
         None,
-        request.tool.canonical_name(),
+        capability,
         payload_digest,
     )
 }
@@ -592,9 +614,11 @@ impl KernelHostRequestClient {
     /// owner BEFORE any fresh invocation is constructed — including when
     /// no earlier admission acknowledgement reached the Bridge — so a
     /// restarted Bridge with an empty cache returns the original
-    /// operation/result instead of dispatching twice. A fresh envelope is
-    /// built only for an authoritatively absent key; conflict and
-    /// unavailable owner answers never build one.
+    /// operation/result instead of dispatching twice. When the qualified
+    /// key answers authoritatively absent, the bounded legacy alias for
+    /// the previous transport generation's bare occurrence is resolved
+    /// next (issue #2765 W4); a fresh envelope is built only when both
+    /// miss. Conflict and unavailable owner answers never build one.
     fn replay_or_build_invocation(
         &mut self,
         correlation: &str,
@@ -653,6 +677,23 @@ impl KernelHostRequestClient {
                 Ok(InvocationPreparation::Recovered(record, logical_key))
             }
             LogicalOwnerOutcome::Absent => {
+                // Issue #2765 W4: the qualified key misses pre-upgrade
+                // bare-occurrence rows by construction, and the wire
+                // correlation IS the durable occurrence, so an `Absent`
+                // here must not submit yet. The bounded legacy alias is
+                // consulted first: a repeated admitted logical request
+                // returns its original operation/result with no second
+                // dispatch, and a fresh envelope is built only when the
+                // alias misses too.
+                if let Some((record, legacy_key)) = self.resolve_legacy_invocation_alias(
+                    request,
+                    facts,
+                    session_id,
+                    payload_digest,
+                    now_ms,
+                )? {
+                    return Ok(InvocationPreparation::Recovered(record, legacy_key));
+                }
                 let envelope =
                     build_invocation_envelope(request, facts, session_id, payload_digest, now_ms)?;
                 self.shared
@@ -670,6 +711,75 @@ impl KernelHostRequestClient {
             }
             LogicalOwnerOutcome::Conflict => Err(PortFailure::IdempotencyConflict),
             LogicalOwnerOutcome::Unavailable => Err(unknown_resolve_outcome(&logical_key)),
+        }
+    }
+
+    /// Probes the bounded legacy alias for one invocation whose qualified
+    /// key answered authoritatively absent (issue #2765 W4).
+    ///
+    /// The previous transport generation staged rows under the bare
+    /// occurrence (`"7"` for both numeric `7` and string `"7"`); the
+    /// qualified encoding never matches those keys directly. This probe
+    /// re-resolves under the computed bare occurrence for the same
+    /// session, capability, and payload commitment — the owner recomputes
+    /// the key from the presented selectors and echoes it, so the hit is
+    /// verified exactly like the primary lookup, with no kernel or store
+    /// change. `Ok(None)` means submit may proceed: no legacy form, a
+    /// bare occurrence that cannot derive a key (staging runs the
+    /// identical validation, so no pre-upgrade row can exist under it),
+    /// or an authoritative alias absence. Conflict stays an idempotency
+    /// conflict and an unavailable owner stays the explicit limitation —
+    /// neither authorizes a fresh operation. Bounded: the alias is
+    /// computed per miss (never stored), strictly shorter than the
+    /// admitted correlation, and costs at most one extra lookup-only
+    /// resolve exchange — no alias tables, no new execution.
+    fn resolve_legacy_invocation_alias(
+        &mut self,
+        request: &HostInvocationRequest,
+        facts: &TransportFacts,
+        session_id: &str,
+        payload_digest: &str,
+        now_ms: u64,
+    ) -> Result<Option<(Box<AdmittedReplyView>, String)>, PortFailure> {
+        let Some(bare) = legacy_bare_occurrence(request.correlation_id.as_str()) else {
+            return Ok(None);
+        };
+        let capability = request.tool.canonical_name();
+        let Ok(legacy_key) =
+            logical_invocation_key_for_occurrence(bare, capability, session_id, payload_digest)
+        else {
+            return Ok(None);
+        };
+        let resolve_label = resolve_request_label(bare);
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_label,
+            None,
+            facts,
+            session_id,
+            capability,
+            payload_digest,
+            now_ms,
+        )?;
+        let query = resolve_key_query(&legacy_key, bare, capability, payload_digest);
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, facts)?;
+        let outcome = match self.exchange(&frame) {
+            Ok(reply) => decode_resolve_reply(
+                &reply,
+                &resolve_envelope,
+                &ResolveQuery::LogicalKey {
+                    key: legacy_key.clone(),
+                },
+            ),
+            Err(_) => LogicalOwnerOutcome::Unavailable,
+        };
+        match outcome {
+            LogicalOwnerOutcome::Resolved(record) => {
+                verify_resolved_key_commitment(&record, &legacy_key)?;
+                Ok(Some((record, legacy_key)))
+            }
+            LogicalOwnerOutcome::Absent => Ok(None),
+            LogicalOwnerOutcome::Conflict => Err(PortFailure::IdempotencyConflict),
+            LogicalOwnerOutcome::Unavailable => Err(unknown_resolve_outcome(&legacy_key)),
         }
     }
 
