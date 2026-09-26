@@ -2714,10 +2714,14 @@ impl KernelComposition {
         // probe, against the same observation record the supervised branch is
         // verified from — so a probe cannot author a ready receipt on an
         // observation that has already expired or belongs to another contour or
-        // fence. The observed Watchdog epoch is consumed again inside that
-        // verification, where it is joined to the signed lease.
-        let _probe_watchdog_epoch = self
-            .startup_coordinator
+        // fence.
+        //
+        // This is a gate, not a value producer: the observed Watchdog epoch it
+        // reads is deliberately not bound here. `verify_watchdog_supervision_branch`
+        // re-reads the same record itself and joins the epoch to the signed
+        // lease, so binding it at this call site would produce a value nothing
+        // consumes.
+        self.startup_coordinator
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?
             .admit_supervision_observation(candidate_digest.as_str(), target, unix_ms())
