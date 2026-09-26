@@ -671,25 +671,12 @@ function Close-NativeDirectoryPin([object]$Pin) {
     if ($Pin -and $Pin.handle -and -not $Pin.handle.IsClosed) { $Pin.handle.Dispose() }
 }
 
-function Get-AuthenticodeRoleDefinitions {
-    # The eleven non-CLI executable roles are admitted by
-    # bins/eliot/src/source_bundle_materializer.rs::REQUIRED_ROLES.  The Rust
-    # CLI is an additional trust role: it is the install-authoritative front
-    # door named by the production handoff, but it is not a Phase-A payload
-    # role.  Governor, Operator UI, and other payload remain outside this
-    # exact signing scope and fail closed via
-    # Assert-CompleteCodeBearingDenominator until #1189 (legacy retirement)
-    # + #1217 (provider/host-integration route) land.  This script never
-    # deletes governor/Codex payload; it refuses to finalize a bundle that
-    # contains unmanifested/unsigned executables.  A bundle whose RELEASE.json
-    # carries a retired governor disposition under a detached owner approval
-    # R(C) (issue #2968: verified independently by the
-    # Assert-GovernorRetirementApprovalReadback readback against the exact
-    # source commit, the pinned tree, the root-owned trust policy and the
-    # offline approval/trust material the bundle carries)
-    # canonically omits the governor/Codex executables entirely; that absence
-    # passes this denominator, while any stray governor/Codex executable
-    # still fails closed here.
+function Get-StaticRuntimeAuthenticodeRoleDefinitions {
+    # This fixed allowlist only admits runtime artifact roles established by
+    # the materializer and the install-authoritative CLI.  Additional bundle
+    # roles are admitted below only through exact joins to the independently
+    # verified Operator/runtime source receipts; the staged manifest never
+    # chooses its own signing authority.
     @(
         [ordered]@{ role = 'cli'; path = 'runtime/eliot.exe' }
         [ordered]@{ role = 'host'; path = 'runtime/eliot-host.exe' }
@@ -706,31 +693,43 @@ function Get-AuthenticodeRoleDefinitions {
     )
 }
 
+function Get-AuthenticodePeRoleExtensions {
+    @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node', '.com')
+}
+
 function Get-CodeBearingExecutableExtensions {
-    # Closed code-bearing denominator (Part B, #1227 gap f).  Every file
-    # with one of these extensions is executable code and requires an
-    # explicit trusted-signature disposition via
-    # Get-AuthenticodeRoleDefinitions.  Operator payload (.dll/.exe/.winmd),
-    # plugin/governor binaries (.exe/.dll), and runtime PEs all fall in this
-    # set.  All other extensions carry an explicit non-executable disposition
-    # (data, manifests, resources, docs) and must never be executed.
-    # GATED (#1189/#1217/#1719): legacy eliot-governor/Codex bridge binaries
-    # and the flagged #1719 Claude Code front-door bridge
-    # (eliot-agent-bridge.exe) remain canonical on disk at this base; they
-    # are NOT deleted here.  They fail closed in
-    # Assert-CompleteCodeBearingDenominator as unmanifested/unsigned
-    # executables until their owners land retirement or an explicit signed
-    # role.  Owner-proven retirement (issue #2968) is implemented in the
-    # builder: staged bundles carry the retired governor disposition only
-    # from a detached owner approval R(C) that verifies for the exact source
-    # commit AND tree against the independently recomputed consumer closure
-    # and an owner-admitted issuer; source absence alone never retires.  Retired bundles
-    # canonically omit the governor/Codex executables (absence passes;
-    # stray presence still fails closed).
-    # Full governor retire/re-home is BLOCKED-BY #18
-    # (legacy-deletion owner); the Codex entry re-home additionally awaits
-    # the eliot-mcp behavior track per canon.
-    @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node')
+    # Closed executable/code-bearing extension set used by both finalizer
+    # and builder.  PE members can be Authenticode roles.  Script, bytecode,
+    # package and source-code members are detected here but rejected by the
+    # PE signing flow; HTML/SVG active content is also rejected because this
+    # flow has no bounded content proof that it is inert.  These paths can
+    # never become non-executable by manifest claim.
+    @(
+        '.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node', '.com',
+        '.ps1', '.psm1', '.psd1', '.cmd', '.bat', '.vbs', '.vbe', '.wsf', '.wsh', '.hta',
+        '.js', '.jse', '.mjs', '.cjs', '.ts', '.tsx', '.html', '.htm', '.svg',
+        '.py', '.pyw', '.sh', '.bash', '.zsh', '.lua', '.pl', '.rb', '.wasm', '.jar', '.class',
+        '.msi', '.msix', '.appx'
+    )
+}
+
+function Get-NonExecutableDataExtensions {
+    # Positive allowlist shared with the builder.  Unknown extensions,
+    # extensionless files, scripts, and active HTML/SVG are not data by default.
+    @(
+        '.json', '.txt', '.md', '.toml', '.yaml', '.yml', '.xml', '.config', '.lock',
+        '.png', '.jpg', '.jpeg', '.ico', '.css', '.woff', '.woff2', '.ttf', '.otf',
+        '.pdb', '.mui', '.pri', '.xbf'
+    )
+}
+
+function Test-IsAllowlistedNonExecutableDataPath([string]$RelativePath) {
+    $extension = [System.IO.Path]::GetExtension(([string]$RelativePath).Replace('\', '/'))
+    if ([string]::IsNullOrWhiteSpace($extension)) { return $false }
+    foreach ($candidate in @(Get-NonExecutableDataExtensions)) {
+        if ($extension -ieq $candidate) { return $true }
+    }
+    return $false
 }
 
 function Test-IsCodeBearingReleasePath([string]$RelativePath) {
@@ -754,7 +753,7 @@ function Test-IsPeImageHeader([string]$Path) {
             [System.IO.FileAccess]::Read,
             [System.IO.FileShare]::Read)
         try {
-            if ($stream.Length -lt 256) { return $false }
+            if ($stream.Length -lt 64) { return $false }
             $header = [byte[]]::new(256)
             $read = $stream.Read($header, 0, 256)
             if ($read -lt 64) { return $false }
@@ -772,43 +771,533 @@ function Test-IsPeImageHeader([string]$Path) {
         }
         finally { $stream.Dispose() }
     }
-    catch { return $false }
+    catch { throw "release denominator could not complete the bounded PE-header probe: $Path ($($_.Exception.Message))" }
 }
 
-function Assert-CompleteCodeBearingDenominator([string]$Bundle) {
-    # Fail-closed complete denominator (Part B, #1227 gaps f/h): every
-    # code-bearing file in the bundle must be an exact signed role.
-    # Non-executable files carry an explicit non-executable disposition by
-    # falling outside the closed extension set AND failing the PE-header
-    # probe.  Any unmanifested/unsigned executable — including Operator
-    # Eliot.Operator.exe + .dll/.winmd deps and plugin/governor
-    # code-bearing files outside the 10 PE roles — fails finalization here,
-    # before any signing mutation.
-    $resolved = Get-FullyQualifiedWindowsPath $Bundle 'code-bearing denominator bundle'
-    $roles = @(Get-AuthenticodeRoleDefinitions)
-    $roleSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($role in $roles) { [void]$roleSet.Add((([string]$role.path).Replace('\', '/'))) }
-    $inventory = @(Get-ReleaseFileInventory $resolved)
-    foreach ($entry in $inventory) {
-        $relative = ([string]$entry.path).Replace('\', '/')
-        if ($relative -ieq $script:StagingOwnerMarker) { continue }
-        $isCodeBearing = Test-IsCodeBearingReleasePath $relative
-        $candidate = Join-Path $resolved ($relative.Replace('/', '\'))
-        if (-not $isCodeBearing) {
-            if (Test-IsPeImageHeader $candidate) {
-                throw "release bundle contains a hidden PE executable outside the exact signing scope: $relative (rename does not confer non-executable disposition; see #1227 gaps f/h)"
+function Test-IsAuthenticodePeRolePath([string]$RelativePath) {
+    $extension = [System.IO.Path]::GetExtension(([string]$RelativePath).Replace('\', '/'))
+    foreach ($candidate in @(Get-AuthenticodePeRoleExtensions)) {
+        if ($extension -ieq $candidate) { return $true }
+    }
+    return $false
+}
+
+function Assert-CanonicalSigningInventoryPath([string]$Path, [string]$Purpose) {
+    $value = [string]$Path
+    $segments = @($value -split '/')
+    if ([string]::IsNullOrWhiteSpace($value) -or
+        $value.Contains('\') -or
+        [System.IO.Path]::IsPathRooted($value) -or
+        $value.Contains(':') -or
+        $segments -contains '' -or $segments -contains '.' -or $segments -contains '..' -or
+        $value.StartsWith('/', [System.StringComparison]::Ordinal) -or
+        $value -cnotmatch '^[^\x00-\x1f]+$') {
+        throw "$Purpose is not a canonical bundle-relative forward-slash path: $value"
+    }
+    return $value
+}
+
+function Assert-ChecksumManifestFileBinding([string]$Bundle, [string]$RelativePath) {
+    $checksumPath = Join-Path $Bundle 'SHA256SUMS.json'
+    if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+        throw 'source-bound signing inventory requires SHA256SUMS.json'
+    }
+    $checksum = Get-Content -LiteralPath $checksumPath -Raw | ConvertFrom-Json
+    $matches = @($checksum.files | Where-Object { [string]$_.path -ceq $RelativePath })
+    if ($matches.Count -ne 1) {
+        throw "SHA256SUMS.json does not bind exactly one source file: $RelativePath"
+    }
+    $filePath = Join-Path $Bundle ($RelativePath.Replace('/', '\'))
+    $digest = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bytes = [int64](Get-Item -LiteralPath $filePath).Length
+    if ([string]$matches[0].sha256 -cne $digest -or [int64]$matches[0].bytes -ne $bytes) {
+        throw "SHA256SUMS.json source binding differs for $RelativePath"
+    }
+}
+
+function Get-AuthenticodeRoleDefinitions([string]$Bundle, [string]$UnsignedSourceBundle = '') {
+    # The signing inventory is descriptive, not authoritative. Reconstruct
+    # the only permitted role set from fixed runtime role/path pairs plus
+    # exact Operator and bundle-signing receipt records in the unsigned
+    # source, then demand byte-for-byte inventory agreement.
+    $resolvedBundle = Get-FullyQualifiedWindowsPath $Bundle 'signing role bundle'
+    $bundleReleasePath = Join-Path $resolvedBundle 'RELEASE.json'
+    $bundleRuntimePath = Join-Path $resolvedBundle 'runtime/RUNTIME_ARTIFACTS.json'
+    $bundlePayloadPath = Join-Path $resolvedBundle 'STAGED_PAYLOAD_MANIFEST.json'
+    foreach ($requiredPath in @($bundleReleasePath, $bundleRuntimePath, $bundlePayloadPath)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "signing role bundle is missing a required manifest: $requiredPath"
+        }
+    }
+    $bundleRelease = Get-Content -LiteralPath $bundleReleasePath -Raw | ConvertFrom-Json
+    $bundleRuntime = Get-Content -LiteralPath $bundleRuntimePath -Raw | ConvertFrom-Json
+    $bundlePayload = Get-Content -LiteralPath $bundlePayloadPath -Raw | ConvertFrom-Json
+    if ($bundleRuntime.signed -ne $bundleRelease.signed) {
+        throw 'RELEASE.json and RUNTIME_ARTIFACTS.json disagree about the signing boundary'
+    }
+    $isSignedBundle = $bundleRuntime.signed -eq $true
+    if ([string]::IsNullOrWhiteSpace($UnsignedSourceBundle)) {
+        if ($isSignedBundle) {
+            throw 'signed role resolution requires its immutable unsigned source bundle'
+        }
+        $UnsignedSourceBundle = $resolvedBundle
+    }
+    $source = Get-FullyQualifiedWindowsPath $UnsignedSourceBundle 'unsigned signing role source bundle'
+    $sourceReleasePath = Join-Path $source 'RELEASE.json'
+    $sourceRuntimePath = Join-Path $source 'runtime/RUNTIME_ARTIFACTS.json'
+    $sourcePayloadPath = Join-Path $source 'STAGED_PAYLOAD_MANIFEST.json'
+    foreach ($requiredPath in @($sourceReleasePath, $sourceRuntimePath, $sourcePayloadPath)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "unsigned signing role source is missing a required manifest: $requiredPath"
+        }
+    }
+    $sourceRelease = Get-Content -LiteralPath $sourceReleasePath -Raw | ConvertFrom-Json
+    $sourceRuntime = Get-Content -LiteralPath $sourceRuntimePath -Raw | ConvertFrom-Json
+    $sourcePayload = Get-Content -LiteralPath $sourcePayloadPath -Raw | ConvertFrom-Json
+    if ($sourceRelease.signed -ne $false -or $sourceRuntime.signed -ne $false -or
+        [string]$sourceRelease.signature_evidence -cne 'not-issued' -or
+        [string]$sourceRuntime.signature_evidence -cne 'not-issued') {
+        throw 'source-bound signing role resolution requires an explicitly unsigned source bundle'
+    }
+    if ([string]$sourceRelease.source_commit -cne [string]$bundleRelease.source_commit -or
+        [string]$sourceRelease.version -cne [string]$bundleRelease.version -or
+        [string]$sourceRelease.architecture -cne [string]$bundleRelease.architecture) {
+        throw 'signed bundle and unsigned source do not share one release identity'
+    }
+
+    $sourceManifestHash = (Get-FileHash -LiteralPath $sourcePayloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $bundleManifestHash = (Get-FileHash -LiteralPath $bundlePayloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([string]$sourceRelease.staged_payload_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$sourceRelease.staged_payload_manifest_sha256 -cne $sourceManifestHash -or
+        [string]$bundleRelease.staged_payload_manifest_sha256 -cne $bundleManifestHash -or
+        $sourceManifestHash -cne $bundleManifestHash) {
+        throw 'staged payload manifest is not immutably bound from unsigned source through signed RELEASE.json'
+    }
+    $manifestCheckBundles = [System.Collections.Generic.List[string]]::new()
+    $manifestCheckBundles.Add($source)
+    if (-not [string]::Equals($source, $resolvedBundle, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $manifestCheckBundles.Add($resolvedBundle)
+    }
+    foreach ($bundlePath in $manifestCheckBundles) {
+        [void](Assert-ChecksumManifestFileBinding $bundlePath 'STAGED_PAYLOAD_MANIFEST.json')
+        [void](Assert-ChecksumManifestFileBinding $bundlePath 'operator/OPERATOR_BUILD_RECEIPT.json')
+    }
+    if ($isSignedBundle -and ($source -ieq $resolvedBundle)) {
+        throw 'signed bundle cannot serve as its own unsigned signing role source'
+    }
+
+    $sourceInventory = Read-ObjectProperty $sourcePayload 'signing_inventory'
+    $bundleInventory = Read-ObjectProperty $bundlePayload 'signing_inventory'
+    if (-not $sourceInventory -or -not $bundleInventory -or
+        [string]$sourceInventory.schema -cne 'eliot-signing-role-inventory-v1' -or
+        [string]$sourceInventory.policy -cne 'closed-source-bound-per-file-v1' -or
+        [string]$bundleInventory.schema -cne 'eliot-signing-role-inventory-v1' -or
+        [string]$bundleInventory.policy -cne 'closed-source-bound-per-file-v1') {
+        throw 'staged payload manifest does not carry the exact closed source-bound signing inventory schema'
+    }
+    foreach ($inventory in @($sourceInventory, $bundleInventory)) {
+        $inventoryProperties = @($inventory.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        if (($inventoryProperties -join ',') -cne 'entries,policy,schema') {
+            throw 'signing_inventory contains missing or unrecognized schema fields'
+        }
+    }
+    $sourceInventoryJson = [string]($sourceInventory | ConvertTo-Json -Depth 12 -Compress)
+    $bundleInventoryJson = [string]($bundleInventory | ConvertTo-Json -Depth 12 -Compress)
+    if ($sourceInventoryJson -cne $bundleInventoryJson) {
+        throw 'signed bundle signing inventory differs from the immutable unsigned staged manifest'
+    }
+
+    $sourceOperatorReceiptPath = Join-Path $source 'operator/OPERATOR_BUILD_RECEIPT.json'
+    $sourceRuntimeReceiptPath = Join-Path $source 'runtime/RUNTIME_ARTIFACTS.json'
+    $operatorReceiptHash = (Get-FileHash -LiteralPath $sourceOperatorReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $runtimeReceiptHash = (Get-FileHash -LiteralPath $sourceRuntimeReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    [void](Assert-ChecksumManifestFileBinding $source 'operator/OPERATOR_BUILD_RECEIPT.json')
+    [void](Assert-ChecksumManifestFileBinding $source 'runtime/RUNTIME_ARTIFACTS.json')
+    if ([string]$sourceRelease.operator_build.receipt_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$sourceRelease.operator_build.receipt_sha256 -cne $operatorReceiptHash -or
+        [string]$bundleRelease.operator_build.receipt_sha256 -cne $operatorReceiptHash -or
+        [string]$sourceRelease.operator_build.invocation_id -cne [string]$bundleRelease.operator_build.invocation_id) {
+        throw 'Operator receipt raw digest/invocation is not bound by both unsigned and signed RELEASE.json'
+    }
+    $operatorReceipt = Get-Content -LiteralPath $sourceOperatorReceiptPath -Raw | ConvertFrom-Json
+    $invocation = [string]$sourceRelease.operator_build.invocation_id
+    $parsedInvocation = [guid]::Empty
+    if ([string]$operatorReceipt.schema -cne 'eliot-operator-build-receipt-v2' -or
+        [string]$operatorReceipt.source_commit -cne [string]$sourceRelease.source_commit -or
+        [string]$operatorReceipt.invocation_id -cne $invocation -or
+        [string]$operatorReceipt.build.invocation_id -cne $invocation -or
+        -not [guid]::TryParseExact($invocation, 'D', [ref]$parsedInvocation) -or
+        $parsedInvocation.ToString('D') -cne $invocation -or
+        [string]$operatorReceipt.build.result -cne 'succeeded' -or
+        [string]$operatorReceipt.build.target -cne 'Publish' -or
+        $operatorReceipt.restore_locked_mode -ne $true -or
+        [string]$sourceRelease.operator_build.publish_target -cne 'Publish' -or
+        [string]$sourceRelease.operator_build.publish_result -cne 'succeeded' -or
+        $sourceRelease.operator_build.restore_locked_mode -ne $true) {
+        throw 'Operator receipt source_commit/invocation/publish proof is malformed or not bound to RELEASE.json'
+    }
+
+    $sourceFiles = @(Get-ReleaseFileInventory $source)
+    $sourceFilesByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $sourceFiles) {
+        $path = Assert-CanonicalSigningInventoryPath ([string]$file.path) 'source bundle file inventory path'
+        if ($sourceFilesByPath.ContainsKey($path)) { throw "source bundle has a case-insensitive duplicate path: $path" }
+        $sourceFilesByPath.Add($path, $file)
+    }
+    $bundleFiles = @(Get-ReleaseFileInventory $resolvedBundle)
+    $bundleFilesByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $bundleFiles) {
+        $path = Assert-CanonicalSigningInventoryPath ([string]$file.path) 'signed bundle file inventory path'
+        if ($bundleFilesByPath.ContainsKey($path)) { throw "signed bundle has a case-insensitive duplicate path: $path" }
+        $bundleFilesByPath.Add($path, $file)
+    }
+
+    $runtimeReceiptRecords = @($sourceRuntime.artifacts)
+    $staticRuntimeRoles = @(Get-StaticRuntimeAuthenticodeRoleDefinitions)
+    if ($runtimeReceiptRecords.Count -ne $staticRuntimeRoles.Count) {
+        throw "runtime source receipt role count is not the exact fixed set: expected=$($staticRuntimeRoles.Count) actual=$($runtimeReceiptRecords.Count)"
+    }
+    $runtimeEntries = [System.Collections.Generic.List[object]]::new()
+    foreach ($definition in $staticRuntimeRoles) {
+        $matches = @($runtimeReceiptRecords | Where-Object {
+                ([string]$_.path).Replace('\', '/') -ceq [string]$definition.path -and
+                [string]$_.role -ceq [string]$definition.role
+            })
+        if ($matches.Count -ne 1) {
+            throw "runtime source receipt does not bind exactly one fixed PE role $($definition.role): $($definition.path)"
+        }
+        $record = $matches[0]
+        $relative = [string]$definition.path
+        if ([string]$definition.role -ceq 'database' -and [string]$record.package -cne 'surrealdb') {
+            throw 'runtime database role is not source-bound to the pinned SurrealDB package record'
+        }
+        $expectedOwner = if ([string]$definition.role -ceq 'database') {
+            'external-lock:docs/release/SURREALDB_WINDOWS_X64.lock.json'
+        }
+        else { 'cargo-package:' + [string]$record.package }
+        if ([string]::IsNullOrWhiteSpace([string]$record.package) -or
+            [string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$record.bytes -le 0) {
+            throw "runtime source receipt record is incomplete: $relative"
+        }
+        [void]$runtimeEntries.Add([pscustomobject][ordered]@{
+                path = $relative
+                role = [string]$definition.role
+                owner = $expectedOwner
+                source_receipt = 'runtime/RUNTIME_ARTIFACTS.json'
+                source_receipt_sha256 = $runtimeReceiptHash
+                unsigned_sha256 = [string]$record.sha256
+                unsigned_bytes = [int64]$record.bytes
+                source_record = $record
+            })
+    }
+
+    $operatorEntries = [System.Collections.Generic.List[object]]::new()
+    $operatorFiles = @($operatorReceipt.artifacts.files)
+    if ($operatorFiles.Count -eq 0) { throw 'Operator receipt has no published artifact file records' }
+    $operatorReceiptPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $operatorFiles) {
+        $relativeFile = Assert-CanonicalSigningInventoryPath ([string]$file.path) 'Operator receipt artifact path'
+        if (-not $operatorReceiptPaths.Add($relativeFile) -or
+            [string]$file.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$file.bytes -le 0) {
+            throw "Operator receipt has an invalid or duplicate artifact record: $relativeFile"
+        }
+        if (-not (Test-IsCodeBearingReleasePath $relativeFile)) { continue }
+        if (-not (Test-IsAuthenticodePeRolePath $relativeFile)) {
+            throw "Operator receipt contains unsupported non-PE code-bearing content: operator/$relativeFile"
+        }
+        [void]$operatorEntries.Add([pscustomobject][ordered]@{
+                path = "operator/$relativeFile"
+                role = 'operator'
+                owner = 'apps/Eliot.Operator'
+                source_receipt = 'operator/OPERATOR_BUILD_RECEIPT.json'
+                source_receipt_sha256 = $operatorReceiptHash
+                unsigned_sha256 = [string]$file.sha256
+                unsigned_bytes = [int64]$file.bytes
+                source_record = $file
+            })
+    }
+
+    $bundleSigningRecords = @($sourceRuntime.bundle_signing_artifacts)
+    $bundleSigningEntries = [System.Collections.Generic.List[object]]::new()
+    $bundleSigningPaths = @{
+        governor = 'eliot-governor.exe'
+        'agent-bridge' = 'eliot-agent-bridge.exe'
+    }
+    $bundleSigningPackages = @{
+        governor = 'eliot-app'
+        'agent-bridge' = 'eliot-agent-bridge'
+    }
+    $bundleSigningBinaries = @{
+        governor = 'eliot-governor'
+        'agent-bridge' = 'eliot-agent-bridge'
+    }
+    $bundleSigningRoles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($record in $bundleSigningRecords) {
+        $roleName = [string]$record.role
+        if (-not $bundleSigningPaths.ContainsKey($roleName) -or -not $bundleSigningRoles.Add($roleName)) {
+            throw "runtime source receipt has an unsupported or duplicate bundle signing role: $roleName"
+        }
+        $expectedPath = [string]$bundleSigningPaths[$roleName]
+        if ([string]$record.path -cne $expectedPath -or
+            [string]$record.package -cne [string]$bundleSigningPackages[$roleName] -or
+            [string]$record.binary -cne [string]$bundleSigningBinaries[$roleName] -or
+            [string]$record.source -cne 'cargo' -or
+            [string]$record.version -cne [string]$sourceRuntime.version -or
+            [string]$record.architecture -cne 'windows-x64' -or
+            [string]$record.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [int64]$record.bytes -le 0) {
+            throw "runtime source receipt bundle-signing record is not the exact approved $roleName path/package/binary/source/version/architecture/digest"
+        }
+        [void]$bundleSigningEntries.Add([pscustomobject][ordered]@{
+                path = $expectedPath
+                role = $roleName
+                owner = 'cargo-package:' + [string]$bundleSigningPackages[$roleName]
+                source_receipt = 'runtime/RUNTIME_ARTIFACTS.json'
+                source_receipt_sha256 = $runtimeReceiptHash
+                unsigned_sha256 = [string]$record.sha256
+                unsigned_bytes = [int64]$record.bytes
+                source_record = $record
+        })
+    }
+    $expectedBundleSigningRecordCount = 0
+    if (-not ([string]$sourceRelease.governor_disposition).StartsWith('retired', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $expectedBundleSigningRecordCount++
+    }
+    if ([string]$sourceRelease.claude_code_front_door.selection -ceq 'agent-bridge') {
+        $expectedBundleSigningRecordCount++
+    }
+    if ($bundleSigningEntries.Count -ne $expectedBundleSigningRecordCount) {
+        throw "runtime source receipt bundle-signing role count differs from RELEASE dispositions: expected=$expectedBundleSigningRecordCount actual=$($bundleSigningEntries.Count)"
+    }
+    $releaseDisposition = [string]$sourceRelease.governor_disposition
+    $governorEntry = @($bundleSigningEntries | Where-Object { [string]$_.role -ceq 'governor' })
+    $pluginPath = 'integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe'
+    $pluginEntries = [System.Collections.Generic.List[object]]::new()
+    if ($releaseDisposition.StartsWith('retired', [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($governorEntry.Count -ne 0) { throw 'retired Governor disposition cannot retain a Governor signing role' }
+    }
+    else {
+        if ($governorEntry.Count -ne 1) { throw 'retained Governor disposition requires exactly one source-bound Governor signing role' }
+        [void]$pluginEntries.Add([pscustomobject][ordered]@{
+                path = $pluginPath
+                role = 'codex-plugin-governor'
+                owner = 'plugin/eliot-governor'
+                source_receipt = 'runtime/RUNTIME_ARTIFACTS.json'
+                source_receipt_sha256 = $runtimeReceiptHash
+                unsigned_sha256 = [string]$governorEntry[0].unsigned_sha256
+                unsigned_bytes = [int64]$governorEntry[0].unsigned_bytes
+                source_record = $governorEntry[0].source_record
+            })
+    }
+    $frontDoorSelection = [string]$sourceRelease.claude_code_front_door.selection
+    $bridgeEntry = @($bundleSigningEntries | Where-Object { [string]$_.role -ceq 'agent-bridge' })
+    if ($frontDoorSelection -ceq 'agent-bridge') {
+        if ($bridgeEntry.Count -ne 1) { throw 'agent-bridge front-door selection requires exactly one source-bound Bridge role' }
+        if ([string]$bridgeEntry[0].unsigned_sha256 -cne [string]$sourceRelease.claude_code_front_door.bridge_sha256 -or
+            [int64]$bridgeEntry[0].unsigned_bytes -ne [int64]$sourceRelease.claude_code_front_door.bridge_bytes -or
+            [string]$sourceRelease.claude_code_front_door.bridge_path -cne 'eliot-agent-bridge.exe') {
+            throw 'agent-bridge source receipt record differs from the RELEASE front-door digest/path binding'
+        }
+    }
+    elseif ($frontDoorSelection -ceq 'legacy') {
+        if ($bridgeEntry.Count -ne 0) { throw 'legacy front-door selection cannot retain an unselected Bridge signing role' }
+    }
+    else { throw 'source RELEASE.json has no exact supported Claude Code front-door selection' }
+
+    $expectedEntries = @((@($runtimeEntries.ToArray()) + @($bundleSigningEntries.ToArray()) +
+            @($pluginEntries.ToArray()) + @($operatorEntries.ToArray())) | Sort-Object -Property path -CaseSensitive)
+    $sourceFilesByPathLocal = $sourceFilesByPath
+    foreach ($entry in $expectedEntries) {
+        $relative = Assert-CanonicalSigningInventoryPath ([string]$entry.path) 'source-bound signing role path'
+        if (-not $sourceFilesByPathLocal.ContainsKey($relative)) { throw "source-bound signing role file is missing: $relative" }
+        $sourceFile = $sourceFilesByPathLocal[$relative]
+        if ([string]$sourceFile.path -cne $relative -or
+            [string]$sourceFile.sha256 -cne [string]$entry.unsigned_sha256 -or
+            [int64]$sourceFile.bytes -ne [int64]$entry.unsigned_bytes) {
+            throw "source-bound signing role digest/size differs from staged file bytes: $relative"
+        }
+        if (-not $bundleFilesByPath.ContainsKey($relative)) { throw "signed bundle is missing a source-bound signing role: $relative" }
+        if ([string]$bundleFilesByPath[$relative].path -cne $relative) {
+            throw "signed bundle role path casing differs from source inventory: $relative"
+        }
+        $sourceRolePath = Join-Path $source ($relative.Replace('/', '\'))
+        $signedRolePath = Join-Path $resolvedBundle ($relative.Replace('/', '\'))
+        if (-not (Test-IsAuthenticodePeRolePath $relative) -or
+            -not (Test-IsCodeBearingReleasePath $relative) -or
+            -not (Test-IsPeImageHeader $sourceRolePath) -or
+            -not (Test-IsPeImageHeader $signedRolePath)) {
+            throw "source-bound signing role is not a readable PE executable in both bundles: $relative"
+        }
+    }
+    $expectedByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $expectedEntries) {
+        $relative = [string]$entry.path
+        if ($expectedByPath.ContainsKey($relative)) { throw "source receipt roles collide on one normalized path: $relative" }
+        $expectedByPath.Add($relative, $entry)
+    }
+
+    $inventoryEntries = @($sourceInventory.entries)
+    if ($inventoryEntries.Count -ne $expectedEntries.Count) {
+        throw "signing_inventory does not enumerate the complete receipt-derived role set: expected=$($expectedEntries.Count) actual=$($inventoryEntries.Count)"
+    }
+    $inventoryByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    $expectedEntryProperties = @('path', 'role', 'owner', 'source_receipt', 'source_receipt_sha256', 'unsigned_sha256', 'unsigned_bytes')
+    for ($entryIndex = 0; $entryIndex -lt $inventoryEntries.Count; $entryIndex++) {
+        $entry = $inventoryEntries[$entryIndex]
+        $relative = Assert-CanonicalSigningInventoryPath ([string]$entry.path) 'signing_inventory path'
+        if ($inventoryByPath.ContainsKey($relative)) {
+            throw "signing_inventory contains a duplicate normalized path: $relative"
+        }
+        $inventoryByPath.Add($relative, $entry)
+        $propertyNames = @($entry.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        $expectedPropertyNames = @($expectedEntryProperties | Sort-Object -CaseSensitive)
+        if (($propertyNames -join "`n") -cne ($expectedPropertyNames -join "`n")) {
+            throw "signing_inventory entry has missing or unrecognized fields: $relative"
+        }
+        if ([string]$entry.path -cne [string]$expectedEntries[$entryIndex].path) {
+            throw "signing_inventory entry order differs from the validated canonical path order at $relative"
+        }
+        if (-not $expectedByPath.ContainsKey($relative)) { throw "signing_inventory self-authorizes an unrecognized role path: $relative" }
+        $expected = $expectedByPath[$relative]
+        if ([string]$entry.path -cne [string]$expected.path -or
+            [string]$entry.role -cne [string]$expected.role -or
+            [string]$entry.owner -cne [string]$expected.owner -or
+            [string]$entry.source_receipt -cne [string]$expected.source_receipt -or
+            [string]$entry.source_receipt_sha256 -cne [string]$expected.source_receipt_sha256 -or
+            [string]$entry.unsigned_sha256 -cne [string]$expected.unsigned_sha256 -or
+            [int64]$entry.unsigned_bytes -ne [int64]$expected.unsigned_bytes) {
+            throw "signing_inventory fields do not exactly match the source-verified receipt role: $relative"
+        }
+    }
+    foreach ($entry in $expectedEntries) {
+        if (-not $inventoryByPath.ContainsKey([string]$entry.path)) {
+            throw "signing_inventory omitted a source-verified code-bearing role: $($entry.path)"
+        }
+    }
+    return @($expectedEntries | ForEach-Object {
+            [pscustomobject][ordered]@{
+                role = [string]$_.role
+                path = [string]$_.path
+                owner = [string]$_.owner
+                source_receipt = [string]$_.source_receipt
+                source_receipt_sha256 = [string]$_.source_receipt_sha256
+                unsigned_sha256 = [string]$_.unsigned_sha256
+                unsigned_bytes = [int64]$_.unsigned_bytes
             }
-            continue
+        })
+}
+
+function Get-CodeBearingDenominatorEvidence([string]$Bundle, [object[]]$Roles, [switch]$FinalizationTransition) {
+    $resolved = Get-FullyQualifiedWindowsPath $Bundle 'code-bearing denominator bundle'
+    $inventory = @(Get-ReleaseFileInventory $resolved)
+    $filePaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $inventory) { [void]$filePaths.Add(([string]$entry.path).Replace('\', '/')) }
+    if ($FinalizationTransition) {
+        [void]$filePaths.Remove('SIGNING_REQUIRED.txt')
+        if (-not $filePaths.Contains('SIGNING_VERIFIED.json')) { [void]$filePaths.Add('SIGNING_VERIFIED.json') }
+    }
+    $roleByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in @($Roles)) {
+        $relative = Assert-CanonicalSigningInventoryPath ([string]$role.path) 'denominator signing role path'
+        if ($roleByPath.ContainsKey($relative)) { throw "signing roles duplicate one normalized path: $relative" }
+        $roleByPath.Add($relative, $role)
+    }
+    $codeBearing = [System.Collections.Generic.List[object]]::new()
+    $nonExecutable = [System.Collections.Generic.List[string]]::new()
+    foreach ($relative in $filePaths) {
+        if ($relative -ieq $script:StagingOwnerMarker) { continue }
+        $candidate = Join-Path $resolved ($relative.Replace('/', '\'))
+        $extensionIsCode = Test-IsCodeBearingReleasePath $relative
+        $isPe = if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            Test-IsPeImageHeader $candidate
         }
-        if (-not $roleSet.Contains($relative)) {
-            throw "release bundle contains an unmanifested code-bearing executable outside the exact signing scope: $relative (expected one of the exact Authenticode roles; Operator/plugin/governor/front-door legacy gated on #1189/#1217/#1719 - retirement or explicit signed role required, never silent adoption)"
+        elseif ($FinalizationTransition -and $relative -ceq 'SIGNING_VERIFIED.json') {
+            $false
+        }
+        else { throw "code-bearing denominator path disappeared during inspection: $relative" }
+        if ($extensionIsCode -or $isPe) {
+            if (-not $roleByPath.ContainsKey($relative)) {
+                throw "release bundle contains unmanifested code-bearing content: $relative (closed extension set/PE-header probe found executable code without a source-bound signing role)"
+            }
+            $role = $roleByPath[$relative]
+            if (-not (Test-IsAuthenticodePeRolePath $relative) -or -not $isPe) {
+                throw "release bundle contains unsupported non-PE code-bearing content: $relative (PE Authenticode evidence cannot sign scripts, source, bytecode, or packages)"
+            }
+            [void]$codeBearing.Add([pscustomobject][ordered]@{
+                    path = $relative
+                    role = [string]$role.role
+                    owner = [string]$role.owner
+                    source_receipt = [string]$role.source_receipt
+                    source_receipt_sha256 = [string]$role.source_receipt_sha256
+                    unsigned_sha256 = [string]$role.unsigned_sha256
+                    unsigned_bytes = [int64]$role.unsigned_bytes
+                    disposition = 'authenticode-signature-with-rfc3161-timestamp'
+                })
+        }
+        else {
+            if ($roleByPath.ContainsKey($relative)) { throw "signing_inventory assigns an Authenticode role to non-code content: $relative" }
+            if (-not (Test-IsAllowlistedNonExecutableDataPath $relative)) {
+                $extension = [System.IO.Path]::GetExtension($relative)
+                throw "release bundle contains content without an explicit non-executable data disposition: $relative (unknown or non-allowlisted extension '$extension')"
+            }
+            [void]$nonExecutable.Add($relative)
         }
     }
-    foreach ($role in $roles) {
-        if (-not (Test-IsCodeBearingReleasePath ([string]$role.path))) {
-            throw "signing role is not a code-bearing executable path: $($role.path)"
+    foreach ($role in @($Roles)) {
+        $foundRole = $false
+        foreach ($entry in $codeBearing) {
+            if ([string]$entry.path -ieq [string]$role.path) { $foundRole = $true; break }
+        }
+        if (-not $foundRole) {
+            throw "source-bound signing role is outside the complete code-bearing denominator: $($role.path)"
         }
     }
+    $sortedCodeBearing = @($codeBearing.ToArray() | Sort-Object path)
+    $sortedNonExecutable = @($nonExecutable.ToArray() | Sort-Object)
+    [ordered]@{
+        schema = 'eliot-code-bearing-denominator-v1'
+        policy = 'closed-code-bearing-and-positive-data-extension-sets-plus-bounded-pe-header-probe-v1'
+        code_bearing_files = $sortedCodeBearing
+        non_executable_files = $sortedNonExecutable
+        non_executable_disposition = 'non-executable-by-positive-data-extension-allowlist-and-negative-pe-probe'
+    }
+}
+
+function Assert-CompleteCodeBearingDenominator([string]$Bundle, [object[]]$Roles, [switch]$FinalizationTransition) {
+    $resolved = Get-FullyQualifiedWindowsPath $Bundle 'code-bearing denominator bundle'
+    if (-not $Roles) { $Roles = @(Get-AuthenticodeRoleDefinitions $resolved) }
+    return Get-CodeBearingDenominatorEvidence $resolved @($Roles) -FinalizationTransition:$FinalizationTransition
+}
+
+function Assert-AuthenticodeRoleSetsEqual([object[]]$Expected, [object[]]$Actual, [string]$Purpose) {
+    if (@($Expected).Count -ne @($Actual).Count) {
+        throw "$Purpose role count differs: expected=$(@($Expected).Count) actual=$(@($Actual).Count)"
+    }
+    $expectedByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in @($Expected)) {
+        $path = Assert-CanonicalSigningInventoryPath ([string]$role.path) "$Purpose expected role path"
+        if ($expectedByPath.ContainsKey($path)) { throw "$Purpose expected roles duplicate path: $path" }
+        $expectedByPath.Add($path, $role)
+    }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in @($Actual)) {
+        $path = Assert-CanonicalSigningInventoryPath ([string]$role.path) "$Purpose actual role path"
+        if (-not $seen.Add($path) -or -not $expectedByPath.ContainsKey($path)) {
+            throw "$Purpose actual role path is duplicated or unexpected: $path"
+        }
+        $expectedRole = $expectedByPath[$path]
+        foreach ($field in @('role', 'owner', 'source_receipt', 'source_receipt_sha256', 'unsigned_sha256', 'unsigned_bytes')) {
+            if ([string]$role.$field -cne [string]$expectedRole.$field) {
+                throw "$Purpose role binding differs for $path ($field)"
+            }
+        }
+    }
+    if ($seen.Count -ne $expectedByPath.Count) { throw "$Purpose omitted a source-bound signing role" }
 }
 
 function Assert-AuthorSignerPublisherDisjointness([object]$Plan, [object]$UnsignedRelease) {
@@ -1204,28 +1693,13 @@ function New-AuthenticodeSigningPlan(
     # repetition semantics; no silent default.
     [void](Get-VerifiedStagedGenerationBinding $release $runtime)
 
-    $roles = @(Get-AuthenticodeRoleDefinitions)
-    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($role in $roles) {
-        $relative = [string]$role.path
-        if (-not $seen.Add($relative)) {
-            throw "signing role path is duplicated: $relative"
-        }
-        $candidate = Join-Path $source $relative
-        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-            throw "exact Authenticode signing role is missing: $relative"
-        }
-        $entries = @($runtime.artifacts | Where-Object { [string]$_.path -eq $relative })
-        if ($entries.Count -ne 1 -or [string]$entries[0].role -ne [string]$role.role) {
-            throw "runtime artifact manifest does not bind exact signing role $($role.role): $relative"
-        }
-    }
+    $roles = @(Get-AuthenticodeRoleDefinitions $source $source)
 
     # Part B (#1227 gaps f/g/h): fail closed here — before any mutation —
-    # on any code-bearing file outside the exact 10 PE roles (Operator DLLs,
-    # plugin/governor executables, hidden PEs), and enforce
-    # Author→Signer→Publisher evidence disjointness at plan time.
-    [void](Assert-CompleteCodeBearingDenominator $source)
+    # on every unmanifested executable, including extension-detected script/
+    # code/package content and renamed PE images. The resulting roles are
+    # already independently reconstructed from builder/source receipts.
+    $denominator = Assert-CompleteCodeBearingDenominator $source $roles
     # Issue #2968: independently re-resolve and re-verify the detached owner
     # approval R(C) against the exact source commit BEFORE any mutation. The
     # Authenticode role set is chosen by what is present; this gate is what
@@ -1257,6 +1731,7 @@ function New-AuthenticodeSigningPlan(
         signer_eku = $script:AuthenticodeCodeSigningEku
         signing_scope = $script:AuthenticodeSigningScope
         roles = @($roles)
+        source_denominator = $denominator
         governor_retirement_approval = $governorApprovalReadback.approval_reference
         governor_retirement_approval_replay = $governorApprovalReadback.replay
     }
@@ -1284,6 +1759,8 @@ function New-AuthenticodeVerificationPlan(
     # inherits the signing run's belief about which approval authorized the
     # omitted artifact set.
     $release = Get-Content -LiteralPath (Join-Path $source 'RELEASE.json') -Raw | ConvertFrom-Json
+    $roles = @(Get-AuthenticodeRoleDefinitions $source $source)
+    [void](Assert-CompleteCodeBearingDenominator $source $roles)
     $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval
     [pscustomobject][ordered]@{
         unsigned_bundle = $source
@@ -1294,6 +1771,8 @@ function New-AuthenticodeVerificationPlan(
         certificate_store_name = $store.store
         certificate_thumbprint = Get-NormalizedThumbprint $CertificateThumbprint 'CertificateThumbprint'
         timestamp_url = Assert-ExplicitRfc3161TimestampUrl $TimestampUrl
+        roles = @($roles)
+        source_denominator = Assert-CompleteCodeBearingDenominator $source $roles
         governor_retirement_approval = $governorApprovalReadback.approval_reference
         governor_retirement_approval_replay = $governorApprovalReadback.replay
     }
@@ -1502,7 +1981,7 @@ function Get-PeCertificateLayout([string]$Path) {
 function Get-UnsignedPeBaselineEvidence([string]$Path, [string]$RolePath) {
     $layout = Get-PeCertificateLayout $Path
     if ([uint64]$layout.certificate_offset -ne 0 -or [uint64]$layout.certificate_size -ne 0) {
-        throw "unsigned source contains a PE certificate table: $RolePath"
+        throw "source-bound PE role is already signed and cannot enter this finalizer's single-signer normalized-delta policy: $RolePath (pre-signed publisher/timestamp evidence requires an explicit trust policy; this finalizer fails closed)"
     }
     $normalized = [byte[]]$layout.bytes_data.Clone()
     for ($index = 0; $index -lt 4; $index++) { $normalized[[int]$layout.checksum_offset + $index] = 0 }
@@ -1772,16 +2251,36 @@ function Assert-RuntimeArtifactBindings([string]$Bundle) {
 
 function New-ReleaseFinalizationBaseline([string]$Bundle) {
     [void](Assert-RuntimeArtifactBindings $Bundle)
+    $roles = @(Get-AuthenticodeRoleDefinitions $Bundle $Bundle)
     # Part B: the unsigned baseline is only valid over a complete
     # code-bearing denominator.  Extra executables fail here, not later.
-    [void](Assert-CompleteCodeBearingDenominator $Bundle)
-    $peRoles = foreach ($role in @(Get-AuthenticodeRoleDefinitions)) {
-        Get-UnsignedPeBaselineEvidence (Join-Path $Bundle $role.path) ([string]$role.path)
+    $denominator = Assert-CompleteCodeBearingDenominator $Bundle $roles
+    $files = @(Get-ReleaseFileInventory $Bundle)
+    $filesByPath = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $files) { $filesByPath.Add([string]$file.path, $file) }
+    foreach ($role in $roles) {
+        $path = [string]$role.path
+        if (-not $filesByPath.ContainsKey($path) -or
+            [string]$filesByPath[$path].path -cne $path -or
+            [string]$filesByPath[$path].sha256 -cne [string]$role.unsigned_sha256 -or
+            [int64]$filesByPath[$path].bytes -ne [int64]$role.unsigned_bytes) {
+            throw "unsigned baseline file inventory is not the exact source-bound role set: $path"
+        }
+    }
+    $peRoles = foreach ($role in $roles) {
+        $peBaseline = Get-UnsignedPeBaselineEvidence (Join-Path $Bundle $role.path) ([string]$role.path)
+        if ([int64]$peBaseline.unsigned_bytes -ne [int64]$role.unsigned_bytes) {
+            throw "unsigned PE baseline size differs from its receipt-bound role: $($role.path)"
+        }
+        $peBaseline
     }
     [ordered]@{
         bundle = [System.IO.Path]::GetFullPath($Bundle)
-        files = @(Get-ReleaseFileInventory $Bundle)
+        files = $files
         directories = @(Get-ReleaseDirectoryInventory $Bundle)
+        roles = @($roles)
+        denominator = $denominator
         pe_roles = @($peRoles)
     }
 }
@@ -1801,8 +2300,10 @@ function Assert-ExactFinalizationDelta([object]$Baseline, [string]$FinalBundle) 
     foreach ($entry in $before) { $beforeByPath[[string]$entry.path] = $entry }
     foreach ($entry in $after) { $afterByPath[[string]$entry.path] = $entry }
 
+    $finalRoles = @(Get-AuthenticodeRoleDefinitions $FinalBundle ([string]$Baseline.bundle))
+    Assert-AuthenticodeRoleSetsEqual @($Baseline.roles) $finalRoles 'finalization delta role set'
     $rolePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($role in @(Get-AuthenticodeRoleDefinitions)) { [void]$rolePaths.Add([string]$role.path) }
+    foreach ($role in @($Baseline.roles)) { [void]$rolePaths.Add([string]$role.path) }
     $manifestPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($path in @('RELEASE.json', 'runtime/RUNTIME_ARTIFACTS.json', 'SHA256SUMS.json')) {
         [void]$manifestPaths.Add($path)
@@ -1840,7 +2341,7 @@ function Assert-ExactFinalizationDelta([object]$Baseline, [string]$FinalBundle) 
         -not $afterByPath.ContainsKey('SIGNING_VERIFIED.json')) {
         throw 'finalization marker transition is not exact create-new/remove-old'
     }
-    $peEvidence = foreach ($role in @(Get-AuthenticodeRoleDefinitions)) {
+    $peEvidence = foreach ($role in @($Baseline.roles)) {
         $peBaseline = @($Baseline.pe_roles | Where-Object { [string]$_.role_path -eq [string]$role.path })
         if ($peBaseline.Count -ne 1) { throw "PE baseline is missing or duplicated: $($role.path)" }
         # Part B explicit unsigned↔signed per-file link: only declared
@@ -1853,11 +2354,12 @@ function Assert-ExactFinalizationDelta([object]$Baseline, [string]$FinalBundle) 
     [void](Assert-RuntimeArtifactBindings $FinalBundle)
     # Part B: the signed bundle must also satisfy the complete denominator;
     # signing must never introduce an unmanifested executable.
-    [void](Assert-CompleteCodeBearingDenominator $FinalBundle)
+    $finalDenominator = Assert-CompleteCodeBearingDenominator $FinalBundle $finalRoles
     [ordered]@{
         signed_roles_changed = $rolePaths.Count
         manifests_changed = $manifestPaths.Count
         marker_transition = 'SIGNING_REQUIRED.txt->SIGNING_VERIFIED.json'
+        code_bearing_denominator = $finalDenominator
         pe_normalization = @($peEvidence)
     }
 }
@@ -2315,6 +2817,8 @@ function Copy-BundleIntoOwnedStaging([string]$Source, [object]$Ownership) {
 
 function ConvertTo-SignatureEvidence([object]$Plan, [object]$Certificate, [object[]]$RoleEvidence) {
     $firstRole = @($RoleEvidence)[0]
+    $finalDenominator = Get-CodeBearingDenominatorEvidence `
+        ([string]$Plan.unsigned_bundle) @($Plan.roles) -FinalizationTransition
     [ordered]@{
         schema = 'eliot-authenticode-signature-evidence-v1'
         status = 'VERIFIED'
@@ -2336,6 +2840,7 @@ function ConvertTo-SignatureEvidence([object]$Plan, [object]$Certificate, [objec
         }
         verifier = 'SignTool(/pa,/all,/v,/tw)+Get-AuthenticodeSignature/WinTrust+RFC3161-CMS'
         roles = @($RoleEvidence)
+        denominator = $finalDenominator
     }
 }
 
@@ -2385,6 +2890,24 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
         }
         [pscustomobject]$copy
     }
+    $bundleSigningArtifacts = foreach ($artifact in @($runtime.bundle_signing_artifacts)) {
+        $path = ([string]$artifact.path).Replace('\', '/')
+        $role = [string]$artifact.role
+        $matches = @($RoleEvidence | Where-Object {
+                [string]$_.role_path -ceq $path -and [string]$_.role -ceq $role
+            })
+        if ($matches.Count -ne 1) {
+            throw "bundle signing source record has no unique signed role evidence: $role $path"
+        }
+        $copy = [ordered]@{}
+        foreach ($property in $artifact.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+        $candidate = Join-Path $Bundle ($path.Replace('/', '\'))
+        $copy['sha256'] = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
+        $copy['bytes'] = [int64](Get-Item -LiteralPath $candidate).Length
+        $copy['signature_policy'] = $script:AuthenticodeSigningPolicy
+        $copy['signature_evidence'] = $matches[0]
+        [pscustomobject]$copy
+    }
     Set-ObjectProperty $runtime 'signed' $true
     Set-ObjectProperty $runtime 'signature_policy' $script:AuthenticodeSigningPolicy
     Set-ObjectProperty $runtime 'signature_evidence' $signatureEvidence
@@ -2393,6 +2916,7 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
     # Preserve the exact staged generation_binding through signing so the
     # RELEASE/RUNTIME_ARTIFACTS repetition invoke byte-compares is retained.
     Set-ObjectProperty $runtime 'generation_binding' $stagedGenerationBinding
+    Set-ObjectProperty $runtime 'bundle_signing_artifacts' @($bundleSigningArtifacts)
     Set-JsonFile $runtimePath $runtime
 
     $releaseArtifacts = foreach ($artifact in @($release.runtime_artifacts)) {
@@ -2478,10 +3002,16 @@ function Test-FinalizedReleaseBundle(
 ) {
     $resolved = Assert-ExistingBundleDirectory $Path 'SignedBundle'
     Assert-NoReleaseSecrets $resolved
-    # Part B: fail closed on any unmanifested/unsigned executable in the
-    # signed bundle (complete denominator, gap f).  Signing must never
-    # introduce or retain code outside the exact 10 PE roles.
-    [void](Assert-CompleteCodeBearingDenominator $resolved)
+    if (-not $ExpectedPlan -or -not $ExpectedCertificate -or -not $Baseline) {
+        throw 'finalized verification requires an unsigned-source plan, exact source baseline and certificate readback'
+    }
+    $roles = @(Get-AuthenticodeRoleDefinitions $resolved ([string]$ExpectedPlan.unsigned_bundle))
+    Assert-AuthenticodeRoleSetsEqual @($ExpectedPlan.roles) $roles 'finalized readback role set'
+    Assert-AuthenticodeRoleSetsEqual @($Baseline.roles) $roles 'finalized baseline role set'
+    # Part B: fail closed on all code-bearing files in the final namespace.
+    # The same source-derived role set is used for signature evidence and the
+    # complete extension + renamed-PE denominator.
+    $finalDenominator = Assert-CompleteCodeBearingDenominator $resolved $roles
     foreach ($required in @(
             'RELEASE.json',
             'runtime/RUNTIME_ARTIFACTS.json',
@@ -2604,13 +3134,15 @@ function Test-FinalizedReleaseBundle(
     if ($finalBindingJson -cne $verifiedBindingJson) {
         throw 'signed generation_binding is not exactly repeated across RELEASE/RUNTIME_ARTIFACTS/SIGNING_VERIFIED'
     }
-    $roles = @(Get-AuthenticodeRoleDefinitions)
     $evidenceRoles = @($release.signature_evidence.roles)
     if ($evidenceRoles.Count -ne $roles.Count) {
         throw "finalized signature evidence role count mismatch: $($evidenceRoles.Count)"
     }
-    if (-not $ExpectedPlan -or -not $ExpectedCertificate) {
-        throw 'finalized verification requires an external signing plan and exact certificate readback'
+    $declaredDenominator = $release.signature_evidence.denominator
+    if (-not $declaredDenominator -or
+        [string]($declaredDenominator | ConvertTo-Json -Depth 12 -Compress) -cne
+        [string]($finalDenominator | ConvertTo-Json -Depth 12 -Compress)) {
+        throw 'finalized signature evidence does not enumerate the exact code-bearing and non-executable denominator'
     }
     Assert-CodeSigningCertificateIdentity $ExpectedCertificate $ExpectedPlan.certificate_store_location $ExpectedPlan.certificate_thumbprint | Out-Null
     $plan = [pscustomobject]@{
@@ -2645,6 +3177,11 @@ function Test-FinalizedReleaseBundle(
             throw "finalized signature evidence is missing or duplicated for $relative"
         }
         if ([string]$receipt[0].role -cne [string]$role.role -or
+            [string]$receipt[0].owner -cne [string]$role.owner -or
+            [string]$receipt[0].source_receipt -cne [string]$role.source_receipt -or
+            [string]$receipt[0].source_receipt_sha256 -cne [string]$role.source_receipt_sha256 -or
+            [string]$receipt[0].unsigned_sha256 -cne [string]$role.unsigned_sha256 -or
+            [int64]$receipt[0].unsigned_bytes -ne [int64]$role.unsigned_bytes -or
             [string]$receipt[0].status -cne 'Valid' -or
             [string]$receipt[0].signer_thumbprint -cne [string]$plan.certificate_thumbprint -or
             [string]$receipt[0].signer_subject -cne [string]$release.signature_evidence.signer.subject -or
@@ -2672,24 +3209,47 @@ function Test-FinalizedReleaseBundle(
             throw "RFC3161 timestamp certificate substitution/readback mismatch for $relative"
         }
 
-        $runtimeArtifact = @($runtime.artifacts | Where-Object { ([string]$_.path).Replace('\', '/') -eq $relative })
-        $releaseArtifact = @($release.runtime_artifacts | Where-Object { ([string]$_.path).Replace('\', '/') -eq $relative })
-        $runtimeArtifactEvidence = ''
-        $releaseArtifactEvidence = ''
+        $runtimeArtifact = @($runtime.artifacts | Where-Object { ([string]$_.path).Replace('\', '/') -ceq $relative })
+        $releaseArtifact = @($release.runtime_artifacts | Where-Object { ([string]$_.path).Replace('\', '/') -ceq $relative })
+        $bundleSigningArtifact = @($runtime.bundle_signing_artifacts | Where-Object {
+                ([string]$_.path).Replace('\', '/') -ceq $relative -and [string]$_.role -ceq [string]$role.role
+            })
         $receiptEvidence = [string]($receipt[0] | ConvertTo-Json -Depth 12 -Compress)
         if ($runtimeArtifact.Count -eq 1 -and $releaseArtifact.Count -eq 1) {
             $runtimeArtifactEvidence = [string]($runtimeArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress)
             $releaseArtifactEvidence = [string]($releaseArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress)
+            if ([string]$runtimeArtifact[0].signature_policy -cne $script:AuthenticodeSigningPolicy -or
+                [string]$releaseArtifact[0].signature_policy -cne $script:AuthenticodeSigningPolicy -or
+                $runtimeArtifactEvidence -cne $releaseArtifactEvidence -or
+                $runtimeArtifactEvidence -cne $receiptEvidence) {
+                throw "runtime/release artifact signature binding is not coherent for $relative"
+            }
         }
-        if ($runtimeArtifact.Count -ne 1 -or $releaseArtifact.Count -ne 1) {
-            throw "runtime/release artifact signature binding is missing or duplicated for $relative"
+        elseif ($bundleSigningArtifact.Count -eq 1 -and
+            [string]$role.role -in @('governor', 'agent-bridge')) {
+            $bundleEvidence = [string]($bundleSigningArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress)
+            $signedDigest = (Get-FileHash -LiteralPath $pathValue -Algorithm SHA256).Hash.ToLowerInvariant()
+            $signedBytes = [int64](Get-Item -LiteralPath $pathValue).Length
+            if ([string]$bundleSigningArtifact[0].signature_policy -cne $script:AuthenticodeSigningPolicy -or
+                [string]$bundleSigningArtifact[0].sha256 -cne $signedDigest -or
+                [int64]$bundleSigningArtifact[0].bytes -ne $signedBytes -or
+                $bundleEvidence -cne $receiptEvidence) {
+                throw "bundle signing source record signature binding is not coherent for $relative"
+            }
         }
-        if ([string]$runtimeArtifact[0].signature_policy -cne $script:AuthenticodeSigningPolicy -or
-            [string]$releaseArtifact[0].signature_policy -cne $script:AuthenticodeSigningPolicy -or
-            $runtimeArtifactEvidence -cne $releaseArtifactEvidence -or
-            $runtimeArtifactEvidence -cne $receiptEvidence) {
-            throw "runtime/release artifact signature binding is not coherent for $relative"
+        elseif ([string]$role.role -ceq 'operator' -or [string]$role.role -ceq 'codex-plugin-governor') {
+            # These receipt-bound files are fully represented by the exact
+            # top-level per-file signature evidence and unsigned/signed PE
+            # link; they are not runtime artifact records.
         }
+        else {
+            throw "finalized signature evidence has no matching source-bound artifact record for $relative"
+        }
+    }
+    $expectedBundleSigningRoles = @($roles | Where-Object { [string]$_.role -in @('governor', 'agent-bridge') })
+    $signedBundleSigningRoles = @($runtime.bundle_signing_artifacts)
+    if ($signedBundleSigningRoles.Count -ne $expectedBundleSigningRoles.Count) {
+        throw "signed runtime bundle_signing_artifacts count differs from source-bound roles: expected=$($expectedBundleSigningRoles.Count) actual=$($signedBundleSigningRoles.Count)"
     }
     if ([string]($verified.signature_evidence | ConvertTo-Json -Depth 12 -Compress) -cne $releaseEvidence) {
         throw 'SIGNING_VERIFIED.json does not repeat the exact release signature evidence'
@@ -2735,9 +3295,7 @@ function Test-FinalizedReleaseBundle(
         }
     }
     [void](Assert-RuntimeArtifactBindings $resolved)
-    if ($Baseline) {
-        [void](Assert-ExactFinalizationDelta $Baseline $resolved)
-    }
+    [void](Assert-ExactFinalizationDelta $Baseline $resolved)
     [ordered]@{
         component = 'eliot_windows_x64_release_verify'
         status = 'VERIFIED_SIGNED'
@@ -2803,11 +3361,12 @@ function Invoke-ReleaseBundleFinalization {
 
         # A builder-produced input must still be genuinely unsigned; a stale
         # signed directory may not be adopted merely because its JSON says false.
-        foreach ($role in @(Get-AuthenticodeRoleDefinitions)) {
+        Assert-AuthenticodeRoleSetsEqual @($Plan.roles) @($baseline.roles) 'pre-mutation baseline role set'
+        foreach ($role in @($Plan.roles)) {
             $sourceRole = Join-Path $Plan.unsigned_bundle $role.path
             $readback = & $SignatureReader $sourceRole
             if (-not $readback -or [string]$readback.Status -cne 'NotSigned') {
-                throw "UnsignedBundle role is not independently NotSigned: $($role.path)"
+                throw "UnsignedBundle code role is not independently NotSigned: $($role.path) (pre-signed publisher/timestamp pass-through is not admitted by this finalizer; a source-bound trust policy is required)"
             }
         }
 
@@ -2826,10 +3385,13 @@ function Invoke-ReleaseBundleFinalization {
         Assert-NoReleaseSecrets $staging
         & $InputValidator $staging $Plan.governor_retirement_approval | Out-Null
         Assert-InventoryEqual @($baseline.files) @(Get-ReleaseFileInventory $staging) 'validated unsigned staging bundle'
+        $stagingRoles = @(Get-AuthenticodeRoleDefinitions $staging ([string]$Plan.unsigned_bundle))
+        Assert-AuthenticodeRoleSetsEqual @($Plan.roles) $stagingRoles 'pre-mutation staging role set'
+        [void](Assert-CompleteCodeBearingDenominator $staging $stagingRoles)
         Assert-SourceBaselineReadback $baseline
 
         $roleEvidence = [System.Collections.Generic.List[object]]::new()
-        foreach ($role in @(Get-AuthenticodeRoleDefinitions)) {
+        foreach ($role in @($Plan.roles)) {
             $path = Join-Path $staging $role.path
             $arguments = @(Get-SignToolArguments $Plan $path)
             & $SignToolInvoker $Plan.signtool_path $arguments $path
@@ -2846,11 +3408,15 @@ function Invoke-ReleaseBundleFinalization {
             # Bind the unsigned baseline hash into the signed receipt so the
             # unsigned↔signed link is auditable per file (no live data).
             $receipt.unsigned_normalized_image_sha256 = [string]$peBaseline[0].normalized_image_sha256
-            $receipt.unsigned_bytes = [int64]$peBaseline[0].unsigned_bytes
+            $receipt.unsigned_sha256 = [string]$role.unsigned_sha256
+            $receipt.unsigned_bytes = [int64]$role.unsigned_bytes
             $receipt.role = [string]$role.role
+            $receipt.owner = [string]$role.owner
+            $receipt.source_receipt = [string]$role.source_receipt
+            $receipt.source_receipt_sha256 = [string]$role.source_receipt_sha256
             [void]$roleEvidence.Add([pscustomobject]$receipt)
         }
-        $expectedRoleCount = @((Get-AuthenticodeRoleDefinitions)).Count
+        $expectedRoleCount = @($Plan.roles).Count
         if ($roleEvidence.Count -ne $expectedRoleCount) {
             throw "exact Authenticode role set was not signed: expected=$expectedRoleCount actual=$($roleEvidence.Count)"
         }
@@ -2949,7 +3515,7 @@ function Invoke-ReleaseBundleFinalization {
             durable_install_authority = $false
             next_authoritative_handoff = 'scripts/invoke-eliot-windows-x64-production.ps1'
             signed_scope = $script:AuthenticodeSigningScope
-            roles = @((Get-AuthenticodeRoleDefinitions)).Count
+            roles = @($Plan.roles).Count
             signature_evidence = $signatureEvidence
             detail = 'The committed directory passed immediate readback but its namespace cannot remain frozen through a durable consumer handoff.'
         }

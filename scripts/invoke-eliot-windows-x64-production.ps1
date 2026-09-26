@@ -734,16 +734,90 @@ function Test-PinnedCliObservationEqual([object]$Left, [object]$Right) {
         [string]$Left.sha256 -ceq [string]$Right.sha256
 }
 
-function New-TrustedSignedRolePins([string]$SignedBundlePath) {
+function Assert-TrustedSignedRoleDefinitionSet(
+    [object[]]$Pins,
+    [object[]]$Definitions,
+    [string]$Purpose
+) {
+    if (-not $Definitions -or $Definitions.Count -eq 0 -or
+        -not $Pins -or $Pins.Count -ne $Definitions.Count) {
+        throw "$Purpose signed-role set does not match the complete source-bound inventory"
+    }
+
+    $expected = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($definition in $Definitions) {
+        $role = [string]$definition.role
+        $path = ([string]$definition.path).Replace('\', '/')
+        if ([string]::IsNullOrWhiteSpace($role) -or
+            [string]::IsNullOrWhiteSpace($path) -or
+            [string]::IsNullOrWhiteSpace([string]$definition.owner) -or
+            [string]::IsNullOrWhiteSpace([string]$definition.source_receipt) -or
+            [string]$definition.source_receipt_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$definition.unsigned_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [int64]$definition.unsigned_bytes -le 0 -or
+            $expected.ContainsKey($path)) {
+            throw "$Purpose source-bound signed-role inventory contains a missing or duplicate path"
+        }
+        $expected.Add($path, [pscustomobject]@{
+                role = $role
+                path = $path
+                owner = [string]$definition.owner
+                source_receipt = [string]$definition.source_receipt
+                source_receipt_sha256 = [string]$definition.source_receipt_sha256
+                unsigned_sha256 = [string]$definition.unsigned_sha256
+                unsigned_bytes = [int64]$definition.unsigned_bytes
+            })
+    }
+
+    $actual = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($pin in $Pins) {
+        $role = [string]$pin.role
+        $path = ([string]$pin.role_path).Replace('\', '/')
+        if ([string]::IsNullOrWhiteSpace($role) -or
+            [string]::IsNullOrWhiteSpace($path) -or $actual.ContainsKey($path)) {
+            throw "$Purpose retained signed-role set contains a missing or duplicate path"
+        }
+        $actual.Add($path, $pin)
+    }
+
+    foreach ($path in $expected.Keys) {
+        if (-not $actual.ContainsKey($path)) {
+            throw "$Purpose retained signed-role set is missing source-bound path: $path"
+        }
+        $expectedEntry = $expected[$path]
+        $actualEntry = $actual[$path]
+        foreach ($field in @('role', 'owner', 'source_receipt', 'source_receipt_sha256', 'unsigned_sha256')) {
+            if ([string]$actualEntry.$field -cne [string]$expectedEntry.$field) {
+                throw "$Purpose retained signed-role identity differs from the source-bound inventory: $path ($field)"
+            }
+        }
+        if ([string]$actualEntry.role_path -cne [string]$expectedEntry.path -or
+            [int64]$actualEntry.unsigned_bytes -ne [int64]$expectedEntry.unsigned_bytes) {
+            throw "$Purpose retained signed-role identity differs from the source-bound inventory: $path (path/bytes)"
+        }
+    }
+}
+
+function New-TrustedSignedRolePins([string]$SignedBundlePath, [string]$UnsignedSourceBundlePath) {
+    $definitions = @(Get-AuthenticodeRoleDefinitions `
+            -Bundle $SignedBundlePath `
+            -UnsignedSourceBundle $UnsignedSourceBundlePath)
     $pins = [System.Collections.Generic.List[object]]::new()
     try {
-        foreach ($definition in @(Get-AuthenticodeRoleDefinitions)) {
+        foreach ($definition in $definitions) {
             $path = Join-Path $SignedBundlePath ([string]$definition.path).Replace('/', '\')
             $handle = [EliotReleaseNativeFileSystem]::OpenFileReadFence($path)
             try {
                 [void]$pins.Add([pscustomobject]@{
                         role = [string]$definition.role
                         role_path = ([string]$definition.path).Replace('\', '/')
+                        owner = [string]$definition.owner
+                        source_receipt = [string]$definition.source_receipt
+                        source_receipt_sha256 = [string]$definition.source_receipt_sha256
+                        unsigned_sha256 = [string]$definition.unsigned_sha256
+                        unsigned_bytes = [int64]$definition.unsigned_bytes
                         path = [System.IO.Path]::GetFullPath($path)
                         handle = $handle
                         observation = Get-PinnedCliObservation $handle $path
@@ -754,12 +828,12 @@ function New-TrustedSignedRolePins([string]$SignedBundlePath) {
                 if ($handle -and -not $handle.IsClosed) { $handle.Dispose() }
             }
         }
-        # Part B (#1227): exact eleven-plus-CLI PE role count (12).  Bound
-        # dynamically to the finalizer denominator so scripts, manifests and
-        # the aggregator agree; hardcoded seven/nine counts are forbidden.
-        $expectedRoleCount = @(Get-AuthenticodeRoleDefinitions).Count
-        if ($pins.Count -ne $expectedRoleCount) { throw "trusted release role pin inventory is not exactly $expectedRoleCount" }
-        return ,@($pins)
+        $pinArray = $pins.ToArray()
+        Assert-TrustedSignedRoleDefinitionSet `
+            -Pins $pinArray `
+            -Definitions $definitions `
+            -Purpose 'trusted release pin inventory'
+        return ,$pinArray
     }
     catch {
         foreach ($pin in $pins) {
@@ -769,11 +843,19 @@ function New-TrustedSignedRolePins([string]$SignedBundlePath) {
     }
 }
 
-function Assert-TrustedSignedRolePins([object[]]$Pins, [string]$Purpose) {
-    $expectedRoleCount = @(Get-AuthenticodeRoleDefinitions).Count
-    if (-not $Pins -or $Pins.Count -ne $expectedRoleCount) {
-        throw "$Purpose retained signed-role set is incomplete (expected exactly $expectedRoleCount)"
-    }
+function Assert-TrustedSignedRolePins(
+    [object[]]$Pins,
+    [string]$SignedBundlePath,
+    [string]$UnsignedSourceBundlePath,
+    [string]$Purpose
+) {
+    $definitions = @(Get-AuthenticodeRoleDefinitions `
+            -Bundle $SignedBundlePath `
+            -UnsignedSourceBundle $UnsignedSourceBundlePath)
+    Assert-TrustedSignedRoleDefinitionSet `
+        -Pins $Pins `
+        -Definitions $definitions `
+        -Purpose $Purpose
     foreach ($pin in $Pins) {
         $current = Get-PinnedCliObservation $pin.handle ([string]$pin.path)
         if (-not (Test-PinnedCliObservationEqual $pin.observation $current)) {
@@ -839,6 +921,7 @@ function New-TrustedCliManifestPins([string]$SignedBundlePath) {
         [pscustomobject]@{ name = 'runtime'; path = (Join-Path $SignedBundlePath 'runtime\RUNTIME_ARTIFACTS.json') }
         [pscustomobject]@{ name = 'checksums'; path = (Join-Path $SignedBundlePath 'SHA256SUMS.json') }
         [pscustomobject]@{ name = 'verified'; path = (Join-Path $SignedBundlePath 'SIGNING_VERIFIED.json') }
+        [pscustomobject]@{ name = 'operator_receipt'; path = (Join-Path $SignedBundlePath 'operator\OPERATOR_BUILD_RECEIPT.json') }
     )
     $pins = [System.Collections.Generic.List[object]]::new()
     try {
@@ -871,7 +954,7 @@ function New-TrustedCliManifestPins([string]$SignedBundlePath) {
 }
 
 function Assert-TrustedCliManifestPins([object[]]$Pins, [string]$Purpose) {
-    if (-not $Pins -or $Pins.Count -ne 4) {
+    if (-not $Pins -or $Pins.Count -ne 5) {
         throw "$Purpose retained manifest set is incomplete"
     }
     foreach ($pin in $Pins) {
@@ -898,12 +981,17 @@ function Get-TrustedCliManifestTexts([object[]]$Pins) {
             throw "trusted CLI retained manifest is duplicated: $($pin.name)"
         }
         $texts[[string]$pin.name] = [string]$pin.text
+        if ([string]$pin.name -ceq 'operator_receipt') {
+            $texts['operator_receipt_sha256'] = [string]$pin.observation.sha256
+            $texts['operator_receipt_bytes'] = [int64]$pin.observation.bytes
+        }
     }
     return [pscustomobject]$texts
 }
 
 function Get-VerifiedSignedRoleManifestBinding(
     [string]$SignedBundlePath,
+    [string]$UnsignedSourceBundlePath,
     [string]$RoleName,
     [string]$RolePath,
     [object]$PinnedObservation,
@@ -914,9 +1002,17 @@ function Get-VerifiedSignedRoleManifestBinding(
 ) {
     $bundle = Assert-ExistingBundleDirectory $SignedBundlePath 'SignedBundle'
     $normalizedRolePath = $RolePath.Replace('\', '/')
-    # Part B (#1227): exact eleven-plus-CLI verification size, bound
-    # dynamically to the finalizer denominator (11), not a stale seven.
-    $expectedVerificationRoles = @(Get-AuthenticodeRoleDefinitions).Count
+    $roleDefinitions = @(Get-AuthenticodeRoleDefinitions `
+            -Bundle $SignedBundlePath `
+            -UnsignedSourceBundle $UnsignedSourceBundlePath)
+    $expectedVerificationRoles = $roleDefinitions.Count
+    $matchingRoleDefinition = @($roleDefinitions | Where-Object {
+            [string]$_.role -ceq $RoleName -and
+            ([string]$_.path).Replace('\', '/') -ceq $normalizedRolePath
+        })
+    if ($matchingRoleDefinition.Count -ne 1) {
+        throw 'trusted CLI binding is outside the source-bound signed-role inventory'
+    }
     if (-not $Verification -or [string]$Verification.status -cne 'VERIFIED_SIGNED' -or
         [string]$Verification.verification_kind -cne 'READ_ONLY_SNAPSHOT' -or
         $Verification.durable_install_authority -ne $false -or
@@ -933,6 +1029,7 @@ function Get-VerifiedSignedRoleManifestBinding(
     $runtime = [string]$PinnedManifestTexts.runtime | ConvertFrom-Json
     $checksums = [string]$PinnedManifestTexts.checksums | ConvertFrom-Json
     $verified = [string]$PinnedManifestTexts.verified | ConvertFrom-Json
+    $operatorReceipt = [string]$PinnedManifestTexts.operator_receipt | ConvertFrom-Json
     foreach ($manifest in @($release, $runtime, $checksums)) {
         if ($manifest.signed -ne $true -or
             [string]$manifest.signature_policy -cne $script:ProductionCliSigningPolicy -or
@@ -956,19 +1053,115 @@ function Get-VerifiedSignedRoleManifestBinding(
             ([string]$_.role_path).Replace('\', '/') -ceq $normalizedRolePath -and
             [string]$_.role -ceq $RoleName
         })
-    if ($releaseArtifact.Count -ne 1 -or $runtimeArtifact.Count -ne 1 -or
-        $checksumEntry.Count -ne 1 -or $roleReceipt.Count -ne 1) {
+    if ($checksumEntry.Count -ne 1 -or $roleReceipt.Count -ne 1 -or
+        $releaseArtifact.Count -gt 1 -or $runtimeArtifact.Count -gt 1) {
         throw 'trusted CLI signed artifact/hash/receipt binding is missing or duplicated'
     }
 
+    $roleDefinition = $matchingRoleDefinition[0]
     $receiptJson = [string]($roleReceipt[0] | ConvertTo-Json -Depth 12 -Compress)
     $globalEvidenceJson = [string]($release.signature_evidence | ConvertTo-Json -Depth 12 -Compress)
+    foreach ($field in @('role', 'owner', 'source_receipt', 'source_receipt_sha256', 'unsigned_sha256')) {
+        if ([string]$roleReceipt[0].$field -cne [string]$roleDefinition.$field) {
+            throw "trusted CLI signature receipt differs from the source-bound inventory: $normalizedRolePath ($field)"
+        }
+    }
+    if ([string]$roleReceipt[0].role_path -cne $normalizedRolePath -or
+        [int64]$roleReceipt[0].unsigned_bytes -ne [int64]$roleDefinition.unsigned_bytes) {
+        throw "trusted CLI signature receipt differs from the source-bound inventory: $normalizedRolePath (path/bytes)"
+    }
     if ($globalEvidenceJson -cne [string]($runtime.signature_evidence | ConvertTo-Json -Depth 12 -Compress) -or
         $globalEvidenceJson -cne [string]($checksums.signature_evidence | ConvertTo-Json -Depth 12 -Compress) -or
-        $globalEvidenceJson -cne [string]($verified.signature_evidence | ConvertTo-Json -Depth 12 -Compress) -or
-        $receiptJson -cne [string]($releaseArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress) -or
-        $receiptJson -cne [string]($runtimeArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress)) {
+        $globalEvidenceJson -cne [string]($verified.signature_evidence | ConvertTo-Json -Depth 12 -Compress)) {
         throw 'trusted CLI signature evidence is not exactly repeated across signed manifests'
+    }
+
+    $bundleSigningArtifact = @($runtime.bundle_signing_artifacts | Where-Object {
+            ([string]$_.path).Replace('\', '/') -ceq $normalizedRolePath -and
+            [string]$_.role -ceq $RoleName
+        })
+    if ($releaseArtifact.Count -eq 1 -and $runtimeArtifact.Count -eq 1) {
+        $runtimeArtifactEvidence = [string]($runtimeArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress)
+        $releaseArtifactEvidence = [string]($releaseArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress)
+        if ($bundleSigningArtifact.Count -ne 0 -or
+            [string]$runtimeArtifact[0].signature_policy -cne $script:ProductionCliSigningPolicy -or
+            [string]$releaseArtifact[0].signature_policy -cne $script:ProductionCliSigningPolicy -or
+            [string]$runtimeArtifact[0].sha256 -cne [string]$PinnedObservation.sha256 -or
+            [int64]$runtimeArtifact[0].bytes -ne [int64]$PinnedObservation.bytes -or
+            [string]$releaseArtifact[0].sha256 -cne [string]$PinnedObservation.sha256 -or
+            [int64]$releaseArtifact[0].bytes -ne [int64]$PinnedObservation.bytes -or
+            $runtimeArtifactEvidence -cne $releaseArtifactEvidence -or
+            $runtimeArtifactEvidence -cne $receiptJson) {
+            throw "trusted CLI runtime artifact signature binding is not coherent: $normalizedRolePath"
+        }
+    }
+    elseif ($releaseArtifact.Count -eq 0 -and $runtimeArtifact.Count -eq 0 -and
+        [string]$RoleName -in @('governor', 'agent-bridge')) {
+        if ($bundleSigningArtifact.Count -ne 1 -or
+            [string]$bundleSigningArtifact[0].signature_policy -cne $script:ProductionCliSigningPolicy -or
+            [string]$bundleSigningArtifact[0].sha256 -cne [string]$PinnedObservation.sha256 -or
+            [int64]$bundleSigningArtifact[0].bytes -ne [int64]$PinnedObservation.bytes -or
+            [string]($bundleSigningArtifact[0].signature_evidence | ConvertTo-Json -Depth 12 -Compress) -cne $receiptJson) {
+            throw "trusted CLI bundle signing artifact binding is not coherent: $normalizedRolePath"
+        }
+    }
+    elseif ($releaseArtifact.Count -eq 0 -and $runtimeArtifact.Count -eq 0 -and
+        $bundleSigningArtifact.Count -eq 0 -and [string]$RoleName -ceq 'operator') {
+        if ([string]$roleDefinition.owner -cne 'apps/Eliot.Operator' -or
+            [string]$roleDefinition.source_receipt -cne 'operator/OPERATOR_BUILD_RECEIPT.json' -or
+            [string]$roleDefinition.source_receipt_sha256 -cne [string]$PinnedManifestTexts.operator_receipt_sha256 -or
+            [string]$release.operator_build.receipt_sha256 -cne [string]$PinnedManifestTexts.operator_receipt_sha256 -or
+            [string]$operatorReceipt.schema -cne 'eliot-operator-build-receipt-v2' -or
+            [string]$operatorReceipt.source_commit -cne [string]$release.source_commit -or
+            [string]$operatorReceipt.invocation_id -cne [string]$release.operator_build.invocation_id -or
+            [string]$operatorReceipt.build.invocation_id -cne [string]$release.operator_build.invocation_id -or
+            [string]$operatorReceipt.build.result -cne 'succeeded' -or
+            [string]$operatorReceipt.build.target -cne 'Publish' -or
+            $operatorReceipt.restore_locked_mode -ne $true) {
+            throw 'trusted CLI Operator receipt/release digest binding is malformed'
+        }
+        $operatorReceiptChecksum = @($checksums.files | Where-Object {
+                ([string]$_.path).Replace('\', '/') -ceq 'operator/OPERATOR_BUILD_RECEIPT.json'
+            })
+        if (-not $normalizedRolePath.StartsWith('operator/', [System.StringComparison]::Ordinal)) {
+            throw 'trusted CLI Operator signing path is outside the Operator payload root'
+        }
+        $operatorRelativePath = $normalizedRolePath.Substring('operator/'.Length)
+        $operatorReceiptFiles = @($operatorReceipt.artifacts.files | Where-Object {
+                [string]$_.path -ceq $operatorRelativePath
+            })
+        if ($operatorReceiptChecksum.Count -ne 1 -or
+            [string]$operatorReceiptChecksum[0].sha256 -cne [string]$PinnedManifestTexts.operator_receipt_sha256 -or
+            [int64]$operatorReceiptChecksum[0].bytes -ne [int64]$PinnedManifestTexts.operator_receipt_bytes -or
+            $operatorReceiptFiles.Count -ne 1 -or
+            [string]$operatorReceiptFiles[0].sha256 -cne [string]$roleDefinition.unsigned_sha256 -or
+            [int64]$operatorReceiptFiles[0].bytes -ne [int64]$roleDefinition.unsigned_bytes) {
+            throw "trusted CLI Operator artifact is not bound to its immutable build receipt: $normalizedRolePath"
+        }
+        if ($operatorRelativePath -ceq 'Eliot.Operator.exe' -and
+            ([string]$operatorReceipt.artifact.path -cne $operatorRelativePath -or
+                [string]$operatorReceipt.artifact.sha256 -cne [string]$release.operator_build.exe_sha256 -or
+                [int64]$operatorReceipt.artifact.bytes -ne [int64]$release.operator_build.exe_bytes -or
+                [string]$roleDefinition.unsigned_sha256 -cne [string]$release.operator_build.exe_sha256 -or
+                [int64]$roleDefinition.unsigned_bytes -ne [int64]$release.operator_build.exe_bytes)) {
+            throw 'trusted CLI Operator executable digest differs from the receipt/release binding'
+        }
+    }
+    elseif ($releaseArtifact.Count -eq 0 -and $runtimeArtifact.Count -eq 0 -and
+        $bundleSigningArtifact.Count -eq 0 -and [string]$RoleName -ceq 'codex-plugin-governor') {
+        $governorDefinition = @($roleDefinitions | Where-Object {
+                [string]$_.role -ceq 'governor' -and [string]$_.path -ceq 'eliot-governor.exe'
+            })
+        if ([string]$roleDefinition.owner -cne 'plugin/eliot-governor' -or
+            [string]$roleDefinition.source_receipt -cne 'runtime/RUNTIME_ARTIFACTS.json' -or
+            $governorDefinition.Count -ne 1 -or
+            [string]$governorDefinition[0].unsigned_sha256 -cne [string]$roleDefinition.unsigned_sha256 -or
+            [int64]$governorDefinition[0].unsigned_bytes -ne [int64]$roleDefinition.unsigned_bytes) {
+            throw 'trusted CLI Codex plugin signing role is not bound to the retained Governor source artifact'
+        }
+    }
+    else {
+        throw "trusted CLI signing role has no exact source-bound artifact record: $normalizedRolePath"
     }
 
     $thumbprint = Get-NormalizedThumbprint $ExpectedThumbprint 'CertificateThumbprint'
@@ -991,7 +1184,7 @@ function Get-VerifiedSignedRoleManifestBinding(
         throw 'trusted CLI signer/EKU/RFC3161 public-readback binding is malformed'
     }
 
-    foreach ($artifact in @($releaseArtifact[0], $runtimeArtifact[0], $checksumEntry[0])) {
+    foreach ($artifact in @($checksumEntry[0])) {
         if ([string]$artifact.sha256 -cne [string]$PinnedObservation.sha256 -or
             [int64]$artifact.bytes -ne [int64]$PinnedObservation.bytes) {
             throw 'trusted CLI retained bytes do not match the signed release inventory'
@@ -1001,6 +1194,11 @@ function Get-VerifiedSignedRoleManifestBinding(
     return [pscustomobject]@{
         role = $RoleName
         role_path = $normalizedRolePath
+        owner = [string]$roleDefinition.owner
+        source_receipt = [string]$roleDefinition.source_receipt
+        source_receipt_sha256 = [string]$roleDefinition.source_receipt_sha256
+        unsigned_sha256 = [string]$roleDefinition.unsigned_sha256
+        unsigned_bytes = [int64]$roleDefinition.unsigned_bytes
         sha256 = [string]$PinnedObservation.sha256
         bytes = [int64]$PinnedObservation.bytes
         signer_thumbprint = $thumbprint
@@ -1017,27 +1215,44 @@ function Get-VerifiedSignedRoleManifestBinding(
 
 function Get-VerifiedSignedRoleManifestBindings(
     [string]$SignedBundlePath,
+    [string]$UnsignedSourceBundlePath,
     [object[]]$RolePins,
     [object]$PinnedManifestTexts,
     [object]$Verification,
     [string]$ExpectedThumbprint,
     [string]$ExpectedTimestampUrl
 ) {
+    $roleDefinitions = @(Get-AuthenticodeRoleDefinitions `
+            -Bundle $SignedBundlePath `
+            -UnsignedSourceBundle $UnsignedSourceBundlePath)
+    $releaseManifest = [string]$PinnedManifestTexts.release | ConvertFrom-Json
+    Assert-TrustedSignedRoleDefinitionSet `
+        -Pins $RolePins `
+        -Definitions $roleDefinitions `
+        -Purpose 'signed-role manifest binding'
+    Assert-TrustedSignedRoleDefinitionSet `
+        -Pins @($releaseManifest.signature_evidence.roles) `
+        -Definitions $roleDefinitions `
+        -Purpose 'global signature evidence role set'
     $bindings = [System.Collections.Generic.List[object]]::new()
     foreach ($pin in $RolePins) {
         [void]$bindings.Add((Get-VerifiedSignedRoleManifestBinding `
-                    $SignedBundlePath `
-                    ([string]$pin.role) `
-                    ([string]$pin.role_path) `
-                    $pin.observation `
-                    $PinnedManifestTexts `
-                    $Verification `
-                    $ExpectedThumbprint `
-                    $ExpectedTimestampUrl))
+                    -SignedBundlePath $SignedBundlePath `
+                    -UnsignedSourceBundlePath $UnsignedSourceBundlePath `
+                    -RoleName ([string]$pin.role) `
+                    -RolePath ([string]$pin.role_path) `
+                    -PinnedObservation $pin.observation `
+                    -PinnedManifestTexts $PinnedManifestTexts `
+                    -Verification $Verification `
+                    -ExpectedThumbprint $ExpectedThumbprint `
+                    -ExpectedTimestampUrl $ExpectedTimestampUrl))
     }
-    $expectedBindingCount = @(Get-AuthenticodeRoleDefinitions).Count
-    if ($bindings.Count -ne $expectedBindingCount) { throw "signed role binding inventory is not exactly $expectedBindingCount" }
-    return ,@($bindings)
+    $bindingArray = $bindings.ToArray()
+    Assert-TrustedSignedRoleDefinitionSet `
+        -Pins $bindingArray `
+        -Definitions $roleDefinitions `
+        -Purpose 'verified signed-role manifest binding'
+    return ,$bindingArray
 }
 
 function Assert-ProductionSignedGenerationBinding(
@@ -1404,7 +1619,9 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
     try {
         $directoryPins = New-TrustedCliDirectoryPins $runtimeDirectory
         $manifestPins = New-TrustedCliManifestPins $signed
-        $rolePins = New-TrustedSignedRolePins $signed
+        $rolePins = New-TrustedSignedRolePins `
+            -SignedBundlePath $signed `
+            -UnsignedSourceBundlePath ([string]$Contract.unsigned_bundle)
         $materializePathPins = New-ProductionMaterializePathPins $Contract
         $cliPin = Get-TrustedSignedRolePin $rolePins 'cli'
         $cliPath = [string]$cliPin.path
@@ -1412,7 +1629,11 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
         $manifestTexts = Get-TrustedCliManifestTexts $manifestPins
         Assert-TrustedCliDirectoryPins $directoryPins 'trusted CLI path before verification'
         Assert-TrustedCliManifestPins $manifestPins 'trusted CLI evidence before verification'
-        Assert-TrustedSignedRolePins $rolePins 'trusted release before verification'
+        Assert-TrustedSignedRolePins `
+            -Pins $rolePins `
+            -SignedBundlePath $signed `
+            -UnsignedSourceBundlePath ([string]$Contract.unsigned_bundle) `
+            -Purpose 'trusted release before verification'
         Assert-ProductionMaterializePathPins $materializePathPins 'materialize paths before verification'
         Assert-ProductionMaterializeOutputsAbsent $Contract 'materialize preflight'
 
@@ -1425,7 +1646,13 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
         $verification = Test-FinalizedReleaseBundle `
             $signed $null $baseline $plan $certificateIdentity
         $bindings = Get-VerifiedSignedRoleManifestBindings `
-            $signed $rolePins $manifestTexts $verification $Thumbprint $Rfc3161Url
+            -SignedBundlePath $signed `
+            -UnsignedSourceBundlePath ([string]$Contract.unsigned_bundle) `
+            -RolePins $rolePins `
+            -PinnedManifestTexts $manifestTexts `
+            -Verification $verification `
+            -ExpectedThumbprint $Thumbprint `
+            -ExpectedTimestampUrl $Rfc3161Url
         # Part B (#1227 gaps j/k): install-time generation/registry/config/
         # schema/rollback compatibility + stale-generation refusal, BEFORE any
         # mutation (before CreateSuspended and before the CLI can create
@@ -1433,7 +1660,11 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
         $generationBinding = Assert-ProductionSignedGenerationBinding $manifestTexts $Contract
         Assert-TrustedCliDirectoryPins $directoryPins 'trusted CLI path after verification'
         Assert-TrustedCliManifestPins $manifestPins 'trusted CLI evidence after verification'
-        Assert-TrustedSignedRolePins $rolePins 'trusted release after verification'
+        Assert-TrustedSignedRolePins `
+            -Pins $rolePins `
+            -SignedBundlePath $signed `
+            -UnsignedSourceBundlePath ([string]$Contract.unsigned_bundle) `
+            -Purpose 'trusted release after verification'
         Assert-ProductionMaterializePathPins $materializePathPins 'materialize paths after verification'
         Assert-ProductionMaterializeOutputsAbsent $Contract 'materialize post-verification prelaunch'
         # The generation gate above must precede this absent-outputs gate in
@@ -1465,7 +1696,11 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
 
         Assert-TrustedCliDirectoryPins $directoryPins 'trusted CLI path before resume'
         Assert-TrustedCliManifestPins $manifestPins 'trusted CLI evidence before resume'
-        Assert-TrustedSignedRolePins $rolePins 'trusted release before resume'
+        Assert-TrustedSignedRolePins `
+            -Pins $rolePins `
+            -SignedBundlePath $signed `
+            -UnsignedSourceBundlePath ([string]$Contract.unsigned_bundle) `
+            -Purpose 'trusted release before resume'
         Assert-ProductionMaterializePathPins $materializePathPins 'materialize paths before resume'
         Assert-ProductionMaterializeOutputsAbsent $Contract 'materialize suspended-child boundary'
         $beforeResumeFile = Get-PinnedCliObservation $cliPin.handle $cliPath
@@ -1480,7 +1715,11 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
         $processOutcome = $process.ResumeAndWait()
         Assert-TrustedCliDirectoryPins $directoryPins 'trusted CLI path after child completion'
         Assert-TrustedCliManifestPins $manifestPins 'trusted CLI evidence after child completion'
-        Assert-TrustedSignedRolePins $rolePins 'trusted release after child completion'
+        Assert-TrustedSignedRolePins `
+            -Pins $rolePins `
+            -SignedBundlePath $signed `
+            -UnsignedSourceBundlePath ([string]$Contract.unsigned_bundle) `
+            -Purpose 'trusted release after child completion'
         Assert-ProductionMaterializePathPins $materializePathPins 'materialize paths after child completion'
         $afterCompletion = Get-PinnedCliObservation $cliPin.handle $cliPath
         if (-not (Test-PinnedCliObservationEqual $pinned $afterCompletion) -or
