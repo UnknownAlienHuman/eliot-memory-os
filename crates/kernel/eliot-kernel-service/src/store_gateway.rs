@@ -50,12 +50,15 @@ use crate::store_write_reservation::{
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
     StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
-    UserAutomationExecutionPhase, UserAutomationMutationResult, UserAutomationOperatorTransition,
-    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationRuntimePort,
-    UserAutomationService, UserAutomationServiceRequest, UserAutomationStoreRequest,
-    UserAutomationWakePhase, UserAutomationWakePort, committed_configuration_state,
+    UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
+    UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
+    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationService, UserAutomationServiceRequest,
+    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
+    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
     run_now_wake_read_request,
 };
+use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
@@ -1237,15 +1240,46 @@ impl KernelStoreGateway {
         let (wake, execution) = self
             .user_automation_runtime_handoff(&sealed, &configuration, runtime)
             .await?;
-        let transition = UserAutomationOperatorTransition::new(
+        let horizon = self
+            .publish_schedule_horizon(&sealed, &configuration, runtime)
+            .await?;
+        let transition = UserAutomationOperatorTransition::with_horizon(
             sealed.identity.clone(),
             sealed.context.state_fence.clone(),
             configuration,
             wake,
             execution,
+            horizon,
         );
         transition.validate()?;
         Ok(transition)
+    }
+
+    /// Reads the complete owner execution projection for one automation through
+    /// the same `Status` read every other consumer uses.
+    ///
+    /// This is the gateway-level entry for runtime boundaries that must inspect
+    /// the canonical Durable Job projection before crossing into an effect owner
+    /// — the due-wake consumer's duplicate guard, for example. It delegates to
+    /// [`UserAutomationService::owner_execution_view`], so it inherits the
+    /// complete-denominator gate: a denominator the owner could not prove
+    /// complete is refused instead of answered as "no admitted job". It reuses
+    /// the caller's admitted operation identity and issues no transition, so it
+    /// mints no canonical identity and needs no runtime port.
+    pub async fn read_user_automation_owner_execution_view(
+        &self,
+        request: &UserAutomationServiceRequest,
+        automation_id: &str,
+    ) -> Result<UserAutomationExecutionProjection, String> {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
+            self.store.as_ref(),
+        ));
+        // The `Status` join carries the whole read projection and its response
+        // across the await, so it is pinned rather than held inline; the pinned
+        // form is the same production Store path the operator route uses.
+        Box::pin(UserAutomationService::new(&store).owner_execution_view(request, automation_id))
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Seals the canonical request hash over the exact prepared transition.
@@ -1331,6 +1365,130 @@ impl KernelStoreGateway {
                 not_applicable_execution(),
             )),
             _ => Ok((not_applicable_wake(), not_applicable_execution())),
+        }
+    }
+
+    /// Compiles and publishes the bounded recurring wake horizon this committed
+    /// operation owns, if any.
+    ///
+    /// `Create`, a `Resume` of the same immutable revision, and an `Edit` that
+    /// committed a new `Active` revision each own exactly one publication
+    /// obligation. It is reported as its own phase beside the wake publication or
+    /// cancellation phase, because a superseding `Edit` also owns the
+    /// predecessor's unresolved cancellation obligation: collapsing the two
+    /// would either hide the new horizon or silently answer for a cancellation
+    /// this contour does not perform.
+    ///
+    /// The horizon is compiled from the committed revision and nothing else: its
+    /// own immutable normalized occurrence denominator, the compiled trigger
+    /// basis, and the publishing State Fence. An inactive committed revision
+    /// owns no wake at all and publishes nothing. A revision that owns a horizon
+    /// with no reachable schedule owner reports the exact requested and
+    /// remaining sets with a replay handle, which is the failure cut of issue
+    /// #2806: a committed configuration plus an explicit publication obligation,
+    /// never a silent success.
+    async fn publish_schedule_horizon<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        configuration: &UserAutomationConfigurationPhase,
+        runtime: Option<&R>,
+    ) -> Result<Option<UserAutomationHorizonPhase>, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let Some(trigger) = schedule_horizon_trigger(&sealed.intent.operation) else {
+            return Ok(None);
+        };
+        let Some(revision) = committed_revision(configuration) else {
+            return Err(
+                "a configuration mutation that owns a wake horizon did not return a canonical \
+                 revision"
+                    .to_owned(),
+            );
+        };
+        if revision.configuration_state != UserAutomationConfigurationState::Active {
+            // A committed non-active revision admits no future occurrence, so it
+            // owns no horizon. That is a complete answer about an obligation
+            // that never existed, not a partial publication.
+            return Ok(None);
+        }
+        let publication = compile_wake_horizon(
+            revision,
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            sealed.context.state_fence.clone(),
+            trigger,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let requested_occurrence_ids = publication.requested_occurrence_ids();
+        let retry_handle = publication
+            .retry_handle(&requested_occurrence_ids)
+            .map_err(|error| error.to_string())?;
+        let Some(runtime) = runtime else {
+            return Ok(Some(unreached_horizon_phase(
+                &publication,
+                &requested_occurrence_ids,
+                retry_handle,
+                UnreachedHorizonKind::Unavailable,
+                UNREACHED_WAKE_OWNER_REASON,
+            )));
+        };
+        match UserAutomationWakePort::publish_wake_horizon(runtime, publication.clone()).await {
+            Ok(acknowledgement) => {
+                acknowledgement
+                    .validate_for(&publication)
+                    .map_err(|error| error.to_string())?;
+                let publication_operation_id =
+                    Box::new(acknowledgement.publication_operation_id.clone());
+                let outcome = if acknowledgement.acknowledged_all() {
+                    UserAutomationHorizonOutcome::Published {
+                        publication_operation_id,
+                    }
+                } else {
+                    UserAutomationHorizonOutcome::Partial {
+                        publication_operation_id,
+                        reason: format!(
+                            "the schedule owner acknowledged {} of the {} requested occurrences of \
+                             revision {}; the exact remaining set is retained and must be \
+                             replayed under its handle before the horizon counts as published",
+                            acknowledgement.acknowledged_occurrence_ids.len(),
+                            requested_occurrence_ids.len(),
+                            publication.automation_revision
+                        ),
+                    }
+                };
+                Ok(Some(UserAutomationHorizonPhase {
+                    trigger: publication.trigger,
+                    automation_id: publication.automation_id.clone(),
+                    automation_revision: publication.automation_revision.clone(),
+                    revision_digest: publication.revision_digest.clone(),
+                    requested_occurrence_ids,
+                    remaining_occurrence_ids: acknowledgement.remaining_occurrence_ids,
+                    retry_handle: acknowledgement.retry_handle,
+                    outcome,
+                }))
+            }
+            Err(UserAutomationRuntimeError::Unavailable(reason)) => {
+                Ok(Some(unreached_horizon_phase(
+                    &publication,
+                    &requested_occurrence_ids,
+                    retry_handle,
+                    UnreachedHorizonKind::Unavailable,
+                    &reason,
+                )))
+            }
+            Err(UserAutomationRuntimeError::UnknownOutcome(reason)) => {
+                Ok(Some(unreached_horizon_phase(
+                    &publication,
+                    &requested_occurrence_ids,
+                    retry_handle,
+                    UnreachedHorizonKind::UnknownOutcome,
+                    &reason,
+                )))
+            }
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -2305,6 +2463,74 @@ fn committed_revision(
     match configuration.mutation_result()? {
         UserAutomationMutationResult::Revision { revision, .. } => Some(revision),
         UserAutomationMutationResult::RunNow { .. } => None,
+    }
+}
+
+/// Whether a committed configuration operation owns one bounded recurring wake
+/// horizon publication, and which closed reason names that slice.
+fn schedule_horizon_trigger(
+    operation: &UserAutomationOperation,
+) -> Option<UserAutomationHorizonTrigger> {
+    match operation {
+        UserAutomationOperation::Create { .. } => {
+            Some(UserAutomationHorizonTrigger::AcceptedRevision)
+        }
+        UserAutomationOperation::Resume { .. } => {
+            Some(UserAutomationHorizonTrigger::ResumedRevision)
+        }
+        UserAutomationOperation::Edit { .. } => Some(UserAutomationHorizonTrigger::SupersedingEdit),
+        UserAutomationOperation::List { .. }
+        | UserAutomationOperation::Status { .. }
+        | UserAutomationOperation::History { .. }
+        | UserAutomationOperation::Pause { .. }
+        | UserAutomationOperation::RunNow { .. }
+        | UserAutomationOperation::Remove { .. }
+        | UserAutomationOperation::InspectLastFailure { .. } => None,
+    }
+}
+
+/// Whether an unacknowledged horizon is a request that was never sent or a
+/// request whose answer was lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnreachedHorizonKind {
+    Unavailable,
+    UnknownOutcome,
+}
+
+/// Reason used when this transition composes no schedule owner at all.
+const UNREACHED_WAKE_OWNER_REASON: &str = "no authenticated UserAutomation runtime channel was composed for this transition, so the \
+     compiled wake horizon was never handed to the schedule owner and no wake is retained";
+
+/// Projects a horizon that the schedule owner did not fully acknowledge.
+///
+/// The exact requested and remaining occurrence sets and the replay handle are
+/// always retained. A failure answer never reports an empty remainder: an empty
+/// set would claim that nothing is outstanding, which is exactly the answer this
+/// boundary cannot prove without an owner.
+fn unreached_horizon_phase(
+    publication: &UserAutomationWakeHorizonPublication,
+    requested_occurrence_ids: &[String],
+    retry_handle: String,
+    kind: UnreachedHorizonKind,
+    reason: &str,
+) -> UserAutomationHorizonPhase {
+    let outcome = match kind {
+        UnreachedHorizonKind::Unavailable => UserAutomationHorizonOutcome::Unavailable {
+            reason: reason.to_owned(),
+        },
+        UnreachedHorizonKind::UnknownOutcome => UserAutomationHorizonOutcome::UnknownOutcome {
+            reason: reason.to_owned(),
+        },
+    };
+    UserAutomationHorizonPhase {
+        trigger: publication.trigger,
+        automation_id: publication.automation_id.clone(),
+        automation_revision: publication.automation_revision.clone(),
+        revision_digest: publication.revision_digest.clone(),
+        requested_occurrence_ids: requested_occurrence_ids.to_vec(),
+        remaining_occurrence_ids: requested_occurrence_ids.to_vec(),
+        retry_handle,
+        outcome,
     }
 }
 
