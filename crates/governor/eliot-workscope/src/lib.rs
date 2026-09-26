@@ -2,6 +2,8 @@
 //!
 //! This crate only evaluates caller-supplied observations. It does not inspect
 //! filesystems, processes, repositories, credentials, stores or task authority.
+//! The scan disclosure store performs only the port-assigned local durable
+//! capture of already-validated receipts; it never reads for discovery.
 
 use std::collections::BTreeSet;
 
@@ -61,12 +63,13 @@ pub use resolver::{
 pub use scanner::{
     AdapterEvidence, ArtifactDirEvidence, BootstrapDiscoveryInputs, BootstrapScanEvidence,
     BootstrapScanOutcome, BootstrapScanner, ChangeSummary, DiscoveryLeaseKey,
-    DiscoveryLeaseRequest, DiscoveryOperation, EditorWorkspaceEvidence, ExistingRecordEvidence,
-    FileTypeCount, ForbiddenScanClass, MAX_DISCOVERY_CONSUMPTION, ManifestEvidence,
-    OnboardingRecommendation, PrivacyBoundary, ProvisionalScopeProfile, RegisteredBuildProfile,
-    RootServiceEvidence, SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureReceipt,
-    ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs, authorize_operation,
-    candidate_source_roles, derive_lease_ref, issue_discovery_lease, run_bootstrap_discovery,
+    DiscoveryLeaseRequest, DiscoveryOperation, DurableScanDisclosureStore, EditorWorkspaceEvidence,
+    ExistingRecordEvidence, FileTypeCount, ForbiddenScanClass, MAX_DISCOVERY_CONSUMPTION,
+    ManifestEvidence, OnboardingRecommendation, PrivacyBoundary, ProvisionalScopeProfile,
+    RegisteredBuildProfile, RootServiceEvidence, SCAN_PRIVACY_BOUNDARY_REQUIRED,
+    ScanDisclosureReceipt, ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs,
+    authorize_operation, candidate_source_roles, derive_lease_ref, issue_discovery_lease,
+    run_bootstrap_discovery, run_bootstrap_discovery_durable,
 };
 pub use transition::{
     CandidateRecordStanding, ScopeTransition, ScopeTransitionKind, ScopeTransitionReceipt,
@@ -500,6 +503,8 @@ pub enum WorkScopeError {
     BindingReceiptNotMatched,
     #[error("scope binding guard receipt does not match the retained binding")]
     BindingReceiptMismatch,
+    #[error("scan disclosure receipt cannot be durably captured")]
+    DisclosureCaptureFailed,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), WorkScopeError> {

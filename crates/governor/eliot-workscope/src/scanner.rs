@@ -35,9 +35,13 @@ use super::{
     ResolutionOutcome, ResolutionRequest, ResourceExecutionIdentity, ScopeKind,
     WorkScopeCandidateSet, WorkScopeError, WorkScopeResolver, counter, digest, text, unique,
 };
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write as _};
+use std::path::PathBuf;
 
 /// Agent-facing code returned when no applicable privacy boundary exists.
 ///
@@ -621,6 +625,105 @@ pub trait ScanDisclosureStore {
     ) -> Result<ScanReceiptHandle, WorkScopeError>;
 }
 
+/// Production durable capture for scan disclosure receipts (issue #1788).
+///
+/// This is the non-test [`ScanDisclosureStore`]: the owner designates an
+/// absolute capture directory, and every validated receipt is captured there
+/// as canonical JSON under its content address
+/// (`scan-disclosure-<sha256>.json`, from [`canonical_json_bytes`] and
+/// [`sha256_hex`]). The write uses create-new so an existing capture is never
+/// truncated or overwritten, the file is synced before the handle is
+/// returned, and the stored bytes are read back and compared before
+/// completion is reported. Any capture failure — blank or relative directory,
+/// directory creation failure, serialization failure, write or sync failure,
+/// a differing receipt already captured under the same address, or a
+/// read-back mismatch — fails closed with
+/// [`WorkScopeError::DisclosureCaptureFailed`]; the scan then fails instead
+/// of completing without a persisted receipt.
+///
+/// The store performs only this port-assigned local durable capture of
+/// already-validated receipts under the scan privacy boundary. It never reads
+/// for discovery: no filesystem inspection, no neighboring-root reads, no
+/// credential reads. The scanner itself stays IO-free; the durable write
+/// lives behind the [`ScanDisclosureStore`] port exactly so scan semantics
+/// and store mechanics stay separate.
+#[derive(Debug)]
+pub struct DurableScanDisclosureStore {
+    store_dir: PathBuf,
+}
+
+impl DurableScanDisclosureStore {
+    /// Binds the store to the owner's absolute capture directory, creating it
+    /// when absent.
+    ///
+    /// The directory must be absolute so captures never resolve against an
+    /// ambient working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkScopeError::InvalidText`] when the directory is blank or
+    /// not absolute, and [`WorkScopeError::DisclosureCaptureFailed`] when the
+    /// directory cannot be created.
+    pub fn new(store_dir: impl Into<PathBuf>) -> Result<Self, WorkScopeError> {
+        let store_dir = store_dir.into();
+        if store_dir.as_os_str().is_empty() || !store_dir.is_absolute() {
+            return Err(WorkScopeError::InvalidText { field: "store_dir" });
+        }
+        fs::create_dir_all(&store_dir).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
+        Ok(Self { store_dir })
+    }
+}
+
+impl ScanDisclosureStore for DurableScanDisclosureStore {
+    /// Durably captures one validated disclosure receipt under its content
+    /// address and returns the handle naming that capture.
+    ///
+    /// A receipt already captured under the same address succeeds only when
+    /// the stored bytes equal this receipt exactly; a differing capture under
+    /// the same address fails closed and is never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns the receipt validation error when the receipt is malformed,
+    /// and [`WorkScopeError::DisclosureCaptureFailed`] when the receipt
+    /// cannot be captured (see [`DurableScanDisclosureStore::new`]).
+    fn store_receipt(
+        &mut self,
+        receipt: &ScanDisclosureReceipt,
+    ) -> Result<ScanReceiptHandle, WorkScopeError> {
+        receipt.validate()?;
+        let bytes =
+            canonical_json_bytes(receipt).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
+        let file_name = format!("scan-disclosure-{}.json", sha256_hex(&bytes));
+        let path = self.store_dir.join(&file_name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&bytes)
+                    .map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
+                file.sync_all()
+                    .map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
+                drop(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing =
+                    fs::read(&path).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
+                if existing != bytes {
+                    return Err(WorkScopeError::DisclosureCaptureFailed);
+                }
+            }
+            Err(_) => return Err(WorkScopeError::DisclosureCaptureFailed),
+        }
+        let stored = fs::read(&path).map_err(|_| WorkScopeError::DisclosureCaptureFailed)?;
+        if stored != bytes {
+            return Err(WorkScopeError::DisclosureCaptureFailed);
+        }
+        Ok(ScanReceiptHandle {
+            receipt_ref: receipt.scan_ref.clone(),
+            store_ref: file_name,
+        })
+    }
+}
+
 /// Deterministic pre-scope profile emitted by a completed scan (I4.3 output).
 ///
 /// All values derive from caller-supplied scan evidence without a model call.
@@ -1158,6 +1261,32 @@ pub fn run_bootstrap_discovery(
         discovery.governing_source_refs.clone(),
         discovery.now,
     )
+}
+
+/// Runs the production bootstrap discovery flow against the owner's durable
+/// receipt capture.
+///
+/// This is the production caller that needs no test double: it binds
+/// `store_dir` as the durable capture directory through
+/// [`DurableScanDisclosureStore`], then runs [`run_bootstrap_discovery`],
+/// which verifies the lease key, runs the forbidden-operation guard, charges
+/// the lease, binds evidence to live observations, and durably writes the
+/// receipt through [`BootstrapScanner::scan`] before reporting completion.
+///
+/// # Errors
+///
+/// Returns [`WorkScopeError::InvalidText`] when the capture directory is
+/// blank or not absolute, [`WorkScopeError::DisclosureCaptureFailed`] when
+/// the directory or receipt cannot be durably captured, and the same errors
+/// as [`run_bootstrap_discovery`] when the scan itself fails.
+pub fn run_bootstrap_discovery_durable(
+    store_dir: impl Into<PathBuf>,
+    lease: &mut DiscoveryReadLease,
+    key: &DiscoveryLeaseKey,
+    discovery: &BootstrapDiscoveryInputs,
+) -> Result<BootstrapScanOutcome, WorkScopeError> {
+    let mut store = DurableScanDisclosureStore::new(store_dir)?;
+    run_bootstrap_discovery(&mut store, lease, key, discovery)
 }
 
 /// Privacy boundary admitted for one scan: the privacy profile plus the
