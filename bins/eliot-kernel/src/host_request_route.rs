@@ -3929,12 +3929,68 @@ impl KernelComposition {
                 .unwrap_or(0);
         }
         reconciliation["handoffs_reconciled"] = serde_json::Value::from(handoffs_reconciled);
-        let handoff_maintenance = self.maintain_bridge_event_handoffs(&batch_namespaces)?;
+        // Drive maintenance from the authenticated owner inventory as well
+        // as this request's consumed frontiers. Quiet streams still need
+        // bounded repair/retirement slices after their cursor stops moving.
+        // Resolve each stream again after acknowledgement so maintenance
+        // uses its current owner namespace, revision, and incarnation.
+        let handoff_maintenance = self.maintain_bridge_event_handoffs_for_owner(
+            &presenter,
+            &reconciliation,
+            &batch_namespaces,
+        )?;
         reconciliation["handoff_maintenance"] = serde_json::Value::Array(handoff_maintenance);
         Ok(serde_json::json!({ "status": "known", "value": {
             "accepted": true,
             "reconciliation": reconciliation,
         } }))
+    }
+
+    /// Resolves current owner namespaces after acknowledgement and runs their
+    /// existing bounded maintenance slices.
+    fn maintain_bridge_event_handoffs_for_owner(
+        &self,
+        presenter: &serde_json::Value,
+        reconciliation: &serde_json::Value,
+        batch_namespaces: &[(String, String, u64, u64, u64)],
+    ) -> Result<Vec<serde_json::Value>, TransportError> {
+        let mut stream_ids: std::collections::BTreeSet<String> = batch_namespaces
+            .iter()
+            .map(|(_, stream_id, _, _, _)| stream_id.clone())
+            .collect();
+        let streams = reconciliation
+            .get("streams")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(TransportError::SessionFenced)?;
+        for stream in streams {
+            let stream_id = stream
+                .get("stream_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            stream_ids.insert(stream_id.to_owned());
+        }
+        let mut namespaces = Vec::with_capacity(stream_ids.len());
+        for stream_id in stream_ids {
+            let item = self
+                .generation_gateway
+                .ors
+                .resolve_bridge_ack_item(presenter, &stream_id)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let namespace = item
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            let revision = item
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            let incarnation = item
+                .get("incarnation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            namespaces.push((namespace.to_owned(), stream_id, revision, incarnation));
+        }
+        self.maintain_bridge_event_handoffs(&namespaces)
     }
 
     /// Runs the bounded handoff maintenance for one reconciled scope on the
@@ -3953,11 +4009,11 @@ impl KernelComposition {
     /// preimage contract on [`Self::answer_bridge_event_reconcile`]).
     fn maintain_bridge_event_handoffs(
         &self,
-        batch_namespaces: &[(String, String, u64, u64, u64)],
+        maintenance_namespaces: &[(String, String, u64, u64)],
     ) -> Result<Vec<serde_json::Value>, TransportError> {
         let mut handoff_maintenance: Vec<serde_json::Value> =
-            Vec::with_capacity(batch_namespaces.len());
-        for (namespace, stream_id, _, revision, incarnation) in batch_namespaces {
+            Vec::with_capacity(maintenance_namespaces.len());
+        for (namespace, stream_id, revision, incarnation) in maintenance_namespaces {
             let maintenance_request = serde_json::json!({
                 "namespace": namespace,
                 "expected_revision": revision,

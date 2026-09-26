@@ -152,9 +152,6 @@ struct KernelTransportOwner {
     /// consumed frontier so the Kernel can advance its acked cursors;
     /// process memory only, bounded below, never a reconciliation log.
     delivered_sequences: BTreeMap<String, BTreeSet<u64>>,
-    /// Last contiguous frontier per stream already offered as consumed.
-    /// Monotonic: resends are idempotent no-ops the owner applies safely.
-    consumed_sent: BTreeMap<String, u64>,
     /// Owner-confirmed acked base per stream learned from verified
     /// reconcile replies. Held sequences at or below the base are pruned
     /// as owner-confirmed; the contiguous run always starts above it.
@@ -1385,15 +1382,9 @@ impl KernelMcpForwardingPort {
             && let Some(oldest) = owner.delivered_sequences.keys().next().cloned()
         {
             owner.delivered_sequences.remove(&oldest);
-            owner.consumed_sent.remove(&oldest);
             owner.owner_acked.remove(&oldest);
         }
-        let base = owner
-            .consumed_sent
-            .get(stream_id)
-            .copied()
-            .unwrap_or(0)
-            .max(owner.owner_acked.get(stream_id).copied().unwrap_or(0));
+        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
         let held = owner
             .delivered_sequences
             .entry(stream_id.to_owned())
@@ -1425,12 +1416,7 @@ impl KernelMcpForwardingPort {
         if acked > known {
             owner.owner_acked.insert(stream_id.to_owned(), acked);
         }
-        let base = owner
-            .consumed_sent
-            .get(stream_id)
-            .copied()
-            .unwrap_or(0)
-            .max(owner.owner_acked.get(stream_id).copied().unwrap_or(0));
+        let base = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
         let empty = if let Some(held) = owner.delivered_sequences.get_mut(stream_id) {
             let confirmed: Vec<u64> = held.range(..=base).copied().collect();
             for sequence in confirmed {
@@ -1450,33 +1436,31 @@ impl KernelMcpForwardingPort {
     ///
     /// Per stream, the frontier is the contiguous digest-verified durable
     /// run above the owner-confirmed base: holes and unseen pages are
-    /// never acknowledged, and only newly advanced frontiers are offered.
-    /// Recording the offered frontier is idempotent — the owner applies it
-    /// monotonically, so a lost answer replays safely.
+    /// never acknowledged, and every unconfirmed frontier is re-offered.
+    /// The frontier remains pending locally until a verified reconciliation
+    /// reply reports the owner's acknowledged cursor. A lost, rejected, or
+    /// undecodable answer therefore offers the same exact sequence set on
+    /// the next call.
     fn contiguous_consumed_payload(&mut self) -> Vec<serde_json::Value> {
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+        let Ok(owner) = self.shared.try_borrow() else {
             return Vec::new();
         };
         let mut frontiers: Vec<(String, u64)> = Vec::new();
         for (stream_id, held) in &owner.delivered_sequences {
-            let sent = owner.consumed_sent.get(stream_id).copied().unwrap_or(0);
             let acked = owner.owner_acked.get(stream_id).copied().unwrap_or(0);
-            let mut frontier = sent.max(acked);
+            let mut frontier = acked;
             while held.contains(&frontier.saturating_add(1)) {
                 frontier = frontier.saturating_add(1);
                 if frontier == u64::MAX {
                     break;
                 }
             }
-            if frontier > sent {
+            if frontier > acked {
                 frontiers.push((stream_id.clone(), frontier));
             }
         }
         frontiers.sort_by(|left, right| left.0.cmp(&right.0));
         frontiers.truncate(MAX_RECONCILE_CONSUMED_ENTRIES);
-        for (stream_id, frontier) in &frontiers {
-            owner.consumed_sent.insert(stream_id.clone(), *frontier);
-        }
         frontiers
             .into_iter()
             .map(|(stream_id, sequence)| {
@@ -1905,7 +1889,6 @@ fn kernel_faces_from_admission(
         activated_session: None,
         replay_cache: HashMap::new(),
         delivered_sequences: BTreeMap::new(),
-        consumed_sent: BTreeMap::new(),
         owner_acked: BTreeMap::new(),
     }));
     let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
