@@ -28,8 +28,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use eliot_contracts::{
-    ClockReading, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence,
-    TaskId, WorkLeaseId, sha256_hex,
+    ClockReading, DecisionId, EpochId, EpochLineageId, RequestId, ResourceGeneration, SessionId,
+    StateFence, TaskId, WorkLeaseId, sha256_hex,
 };
 use eliot_native_worker::{
     AdmittedLifecycle, KernelReplayPort, KernelReplayTransport, NativeWorker, NativeWorkerError,
@@ -297,7 +297,7 @@ impl KernelReplayTransport for FakeTransport {
                                 .iter()
                                 .filter(|event| {
                                     event.stream_id == self.stream_id
-                                        && event.request_id == request_id
+                                        && event.request_id.as_str() == request_id
                                 })
                                 .cloned()
                                 .collect();
@@ -479,7 +479,7 @@ impl DurableCheckpointPort for TestCheckpoint {
             CheckpointReceiptFacts::new(
                 "checkpoint-receipt-1",
                 request.checkpoint_ref(),
-                request.request_id(),
+                request.request_id().clone(),
                 request.stream_id(),
                 request.producer_generation(),
                 request.authority_epoch().clone(),
@@ -686,7 +686,7 @@ fn hello() -> WorkerHello {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-claim-1".to_owned(),
-        request_id: "start-claim-1".to_owned(),
+        request_id: load(RequestId::new("start-claim-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
         artifact_manifest_digest: "facet-manifest-7".to_owned(),
@@ -837,7 +837,7 @@ fn health_frame() -> WorkerFrame {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-claim-1".to_owned(),
-        request_id: "health-1".to_owned(),
+        request_id: load(RequestId::new("health-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-health-1".to_owned())]),
         deadline_unix_ms: 5_000,
         authority_epoch: epoch(),
@@ -962,7 +962,7 @@ fn admitted_drive_reaches_ready_and_serves_bounded_frame() {
     .unwrap_or_else(|error| panic!("admitted drive must reach Ready, got {error:?}"));
 
     assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
-    assert_eq!(ready.request_id, "start-claim-1");
+    assert_eq!(ready.request_id.as_str(), "start-claim-1");
     assert_eq!(ready.stream_id, "claim-1/gen-1");
     assert_eq!(lifecycle.registrations, 1);
     assert_eq!(lifecycle.claims, 1);
@@ -1071,23 +1071,24 @@ fn kernel_replay_port_carries_five_ops_with_binding_and_echo() {
     let transport = FakeTransport::new(&claim_value);
     let mut port = KernelReplayPort::new(transport, claim_value.clone(), registration.clone())
         .unwrap_or_else(|error| panic!("replay port binds: {error:?}"));
+    let request_id = load(RequestId::new("request-1"));
 
     // lookup then begin a new durable identity, then conflict on changed fingerprint.
     assert!(matches!(
-        port.lookup_request(&stream_id, "request-1", "fingerprint-1"),
+        port.lookup_request(&stream_id, &request_id, "fingerprint-1"),
         Ok(DurableRequestDecision::New)
     ));
     assert!(matches!(
-        port.begin_request(&stream_id, "request-1", "fingerprint-1"),
+        port.begin_request(&stream_id, &request_id, "fingerprint-1"),
         Ok(DurableRequestDecision::New)
     ));
     assert!(matches!(
-        port.begin_request(&stream_id, "request-1", "fingerprint-changed"),
+        port.begin_request(&stream_id, &request_id, "fingerprint-changed"),
         Ok(DurableRequestDecision::Conflict)
     ));
     // Wrong stream fails closed before transport.
     assert!(
-        port.lookup_request("foreign/gen-9", "request-1", "fingerprint-1")
+        port.lookup_request("foreign/gen-9", &request_id, "fingerprint-1")
             .is_err()
     );
 
@@ -1347,7 +1348,7 @@ fn stdio_frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-claim-1".to_owned(),
-        request_id: request_id.to_owned(),
+        request_id: load(RequestId::new(request_id)),
         trace_context: BTreeMap::from([("trace_id".to_owned(), format!("trace-{request_id}"))]),
         deadline_unix_ms: 5_000,
         authority_epoch: epoch(),

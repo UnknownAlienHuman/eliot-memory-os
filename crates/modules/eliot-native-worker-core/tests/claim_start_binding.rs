@@ -21,7 +21,9 @@ use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind, ResourceGeneration,
     StateFence, WorkLeaseId,
 };
-use eliot_contracts::{DecisionId, EpochId, EpochLineageId, SessionId, TaskId, sha256_hex};
+use eliot_contracts::{
+    DecisionId, EpochId, EpochLineageId, RequestId, SessionId, TaskId, sha256_hex,
+};
 use eliot_native_worker_core::{
     AdmissionLivenessOutcome, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
     CapabilityAdmissionPort, CapabilityAdmissionRequest, CapabilityLivenessRequest,
@@ -164,7 +166,7 @@ impl DurableReplayPort for FakeReplay {
     fn lookup_request(
         &mut self,
         _stream_id: &str,
-        _request_id: &str,
+        _request_id: &RequestId,
         _fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         Err(ProviderFailure::new(
@@ -176,7 +178,7 @@ impl DurableReplayPort for FakeReplay {
     fn begin_request(
         &mut self,
         _stream_id: &str,
-        _request_id: &str,
+        _request_id: &RequestId,
         _fingerprint: &str,
     ) -> Result<DurableRequestDecision, ProviderFailure> {
         Err(ProviderFailure::new(
@@ -353,7 +355,7 @@ fn hello() -> WorkerHello {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
         connection_id: "connection-claim-1".to_owned(),
-        request_id: "start-claim-1".to_owned(),
+        request_id: load(RequestId::new("start-claim-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
         artifact_manifest_digest: "manifest-digest-1".to_owned(),

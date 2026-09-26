@@ -2601,6 +2601,7 @@ dependencies = [
  "eliot-agent-api",
  "eliot-contracts",
  "eliot-process",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
