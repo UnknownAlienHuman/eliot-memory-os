@@ -2263,7 +2263,12 @@ struct McpFrontDoor {
     initialized: bool,
     handles: Vec<(String, HostOperationHandle)>,
     cancelled: Vec<String>,
-    resources: Vec<(String, eliot_agent_bridge::ResourceHandle)>,
+    resources: Vec<(
+        String,
+        eliot_agent_bridge::ResourceHandle,
+        HostOperationHandle,
+        String,
+    )>,
 }
 
 impl McpFrontDoor {
@@ -2321,30 +2326,50 @@ impl McpFrontDoor {
 
     /// Retains one exact hot-resource handle under its exact URI, retiring
     /// the oldest entry past the bound.
-    fn retain_resource(&mut self, uri: &str, handle: eliot_agent_bridge::ResourceHandle) {
-        if let Some(slot) = self.resources.iter_mut().find(|(known, _)| known == uri) {
+    fn retain_resource(
+        &mut self,
+        uri: &str,
+        handle: eliot_agent_bridge::ResourceHandle,
+        operation_handle: HostOperationHandle,
+        binding: String,
+    ) {
+        if let Some(slot) = self
+            .resources
+            .iter_mut()
+            .find(|(known, _, _, _)| known == uri)
+        {
             slot.1 = handle;
+            slot.2 = operation_handle;
+            slot.3 = binding;
             return;
         }
         if self.resources.len() >= MAX_RETAINED_RESOURCES {
             self.resources.remove(0);
         }
-        self.resources.push((uri.to_owned(), handle));
+        self.resources
+            .push((uri.to_owned(), handle, operation_handle, binding));
     }
 
-    /// Returns the exact retained handle for one resource URI.
-    fn find_resource(&self, uri: &str) -> Option<&eliot_agent_bridge::ResourceHandle> {
+    /// Returns the exact retained resource and its source-operation binding.
+    fn find_resource(
+        &self,
+        uri: &str,
+    ) -> Option<(
+        &eliot_agent_bridge::ResourceHandle,
+        &HostOperationHandle,
+        &str,
+    )> {
         self.resources
             .iter()
-            .find(|(known, _)| known == uri)
-            .map(|(_, handle)| handle)
+            .find(|(known, _, _, _)| known == uri)
+            .map(|(_, handle, operation, binding)| (handle, operation, binding.as_str()))
     }
 
     /// Lists every retained resource as its exact URI plus media type.
     fn list_resources(&self) -> Vec<Value> {
         self.resources
             .iter()
-            .map(|(uri, _)| {
+            .map(|(uri, _, _, _)| {
                 serde_json::json!({
                     "uri": uri,
                     "name": uri,
@@ -2629,6 +2654,7 @@ fn handle_mcp_frame(
             valid(Some(handle_mcp_resources_list(state, &id, &request.params)))
         }
         (Some(id), "resources/read") => valid(Some(handle_mcp_resources_read(
+            port,
             runner,
             state,
             &id,
@@ -2762,7 +2788,7 @@ fn handle_mcp_tools_call(
     };
     match gateway.invoke_with_receipt(port, &request) {
         Ok((result, receipt)) => {
-            render_mcp_invocation(runner, state, id, &correlation, &result, &receipt)
+            render_mcp_invocation(port, runner, state, id, &correlation, &result, &receipt)
         }
         Err(error) => {
             let (code, message) = gateway_error_to_wire(&error);
@@ -2781,6 +2807,7 @@ fn handle_mcp_tools_call(
 /// result, retaining the exact admitted handle and any hot-resource
 /// evidence for later cancellation and expansion.
 fn render_mcp_invocation(
+    port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
@@ -2801,7 +2828,7 @@ fn render_mcp_invocation(
             response,
         } => {
             state.retain_handle(correlation, operation_handle.clone());
-            let evidence = record_mcp_delivery(runner, state, result.outcome());
+            let evidence = record_mcp_delivery(port, runner, state, result.outcome());
             match render_responded_result(operation_handle, response, evidence.as_ref()) {
                 Ok(result) => render_result(id, result),
                 Err(rejection) => render_rejection(Some(id), &rejection),
@@ -2821,15 +2848,50 @@ fn render_mcp_invocation(
 ///
 /// Mirrors the private `Invoke` delivery recording: only supported
 /// candidate/projection content beyond the hot preview bound snapshots, and
-/// only a UTF-8 preview rides the wire. Anything else leaves the owner
-/// response exactly as shaped.
+/// only a UTF-8 preview rides the wire. A resource is retained only after a
+/// fresh exact-operation owner resolve verifies the actual response and
+/// captures its current attach/session/task/scope binding. Anything else
+/// leaves the owner response exactly as shaped.
 fn record_mcp_delivery(
+    port: &mut KernelHostRequestClient,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     outcome: &HostInvocationOutcome,
 ) -> Option<Value> {
+    let HostInvocationOutcome::Responded {
+        operation_handle,
+        response,
+        ..
+    } = outcome
+    else {
+        return None;
+    };
+    if !matches!(
+        response.kind,
+        eliot_mcp::ResponseKind::Candidate | eliot_mcp::ResponseKind::Projection
+    ) {
+        return None;
+    }
+    let content_bytes = serde_json::to_vec(&response.content).ok()?;
+    if content_bytes.len() <= eliot_agent_bridge::MAX_PREVIEW_BYTES
+        || content_bytes.len() > eliot_agent_bridge::MAX_CONTENT_BYTES
+    {
+        return None;
+    }
+    let binding = match port.capture_resource_binding(operation_handle, response) {
+        Ok(binding) => binding,
+        Err(error) => {
+            emit_error("RESOURCE_SOURCE_REFUSED", &error.to_string());
+            return None;
+        }
+    };
     let view = runner.record_tool_result_delivery(outcome)?;
-    state.retain_resource(view.handle().uri().as_str(), view.handle().clone());
+    state.retain_resource(
+        view.handle().uri().as_str(),
+        view.handle().clone(),
+        operation_handle.clone(),
+        binding,
+    );
     let preview = std::str::from_utf8(view.preview()).ok()?;
     Some(serde_json::json!({
         "uri": view.handle().uri().as_str(),
@@ -2857,6 +2919,7 @@ fn handle_mcp_resources_list(state: &McpFrontDoor, id: &JsonRpcId, params: &Valu
 /// Unknown URIs fail explicitly: only handles retained from a real delivery
 /// on this connection expand, never an invented or stale identity.
 fn handle_mcp_resources_read(
+    port: &mut KernelHostRequestClient,
     runner: &BridgeRunner,
     state: &McpFrontDoor,
     id: &JsonRpcId,
@@ -2866,8 +2929,8 @@ fn handle_mcp_resources_read(
         Ok(uri) => uri,
         Err(rejection) => return render_rejection(Some(id), &rejection),
     };
-    let handle = match state.find_resource(uri) {
-        Some(handle) => handle,
+    let (handle, operation_handle, binding) = match state.find_resource(uri) {
+        Some(resource) => resource,
         None => {
             return render_error(
                 Some(id),
@@ -2877,6 +2940,15 @@ fn handle_mcp_resources_read(
             );
         }
     };
+    if let Err(error) = port.authorize_resource_read(operation_handle, binding) {
+        emit_error("RESOURCE_SOURCE_REFUSED", &error.to_string());
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "resource source is not authorized by the current Kernel attach",
+            Value::Null,
+        );
+    }
     let bytes = match runner.expand_resource(handle) {
         Ok(bytes) => bytes,
         Err(error) => {

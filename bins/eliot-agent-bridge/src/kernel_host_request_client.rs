@@ -17,7 +17,8 @@
 //! Ownership: this module is the sole owner of the invocation/cancellation/reconciliation/
 //! rehydration envelope builders, the envelope frame builder, the admitted-reply decoder
 //! (submit-family and receipt-less rehydrate shapes), the replay-cache
-//! entry shape, and the production `KernelHostRequestPort` impl. Non-ownership: activation,
+//! entry shape, resource-source owner resolves, and the production
+//! `KernelHostRequestPort` impl. Non-ownership: activation,
 //! kernel admission/dispatch, gateway validation/correlation, and any durable ledger.
 
 use std::collections::BTreeMap;
@@ -179,6 +180,31 @@ pub(super) struct TransportFacts {
     pub(super) descriptor_sha256: String,
     pub(super) receipt_sha256: String,
     pub(super) session: Option<String>,
+}
+
+/// Exact owner-derived facts retained beside one bridge-local resource URI.
+///
+/// This is only a local comparison commitment. Every read repeats an
+/// operation-handle resolve under the current transport and compares the
+/// complete owner result and attach binding before allowing registry
+/// expansion; the digest itself never grants authority.
+#[derive(serde::Serialize)]
+struct ResourceAuthorizationPreimage<'a> {
+    version: &'static str,
+    operation_handle: &'a str,
+    connection_id: &'a str,
+    session_id: &'a str,
+    state_fence: &'a StateFence,
+    descriptor_sha256: &'a str,
+    receipt_sha256: &'a str,
+    request_digest: &'a str,
+    request_id: &'a str,
+    capability: &'a str,
+    payload_digest: &'a str,
+    result_digest: &'a str,
+    result_response: &'a serde_json::Value,
+    task_ref: Option<&'a str>,
+    scope_ref: Option<&'a str>,
 }
 
 /// Exact parent reference resolved from the replay cache for cancel/probe envelopes.
@@ -426,6 +452,12 @@ fn request_failure() -> PortFailure {
     }
 }
 
+fn resource_source_refused() -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: "resource source is not authorized by the current Kernel attach".to_owned(),
+    }
+}
+
 fn plan_gap_bind(detail: &str) -> PortFailure {
     PortFailure::PlanGap {
         missing_capability: "kernel.host-request.bind-dispatch".to_owned(),
@@ -581,6 +613,102 @@ impl KernelHostRequestClient {
             .try_borrow_mut()
             .map_err(|_| request_failure())?
             .exchange_host_request_frame(frame)
+    }
+
+    /// Captures owner-verified source-result and attach facts for a resource
+    /// created from this exact responded operation. The returned digest is a
+    /// local comparison commitment only; reads must call
+    /// [`Self::authorize_resource_read`] to resolve the owner again.
+    pub fn capture_resource_binding(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        response: &McpResponse,
+    ) -> Result<String, PortFailure> {
+        let (facts, record) = self.resolve_resource_source(operation_handle)?;
+        let expected_response = serde_json::to_value(response).map_err(|_| request_failure())?;
+        if record.result_response.as_ref() != Some(&expected_response) {
+            return Err(resource_source_refused());
+        }
+        resource_authorization_digest(operation_handle, &facts, &record)
+    }
+
+    /// Re-resolves the exact source operation on every resource read and
+    /// requires the complete owner result and current attach binding to match
+    /// the binding captured when that exact response produced the resource.
+    pub fn authorize_resource_read(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        expected_binding: &str,
+    ) -> Result<(), PortFailure> {
+        let (facts, record) = self.resolve_resource_source(operation_handle)?;
+        let current = resource_authorization_digest(operation_handle, &facts, &record)?;
+        if current != expected_binding {
+            return Err(resource_source_refused());
+        }
+        Ok(())
+    }
+
+    /// Performs a fresh, observation-only exact-handle resolve under the
+    /// current admitted transport. No local parent/replay cache is consulted.
+    fn resolve_resource_source(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+    ) -> Result<(TransportFacts, AdmittedReplyView), PortFailure> {
+        let handle = operation_handle.as_str();
+        parse_operation_handle(handle).map_err(|_| resource_source_refused())?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(resource_source_refused)?;
+        let now_ms = unix_ms()?;
+        let digest = handle
+            .strip_prefix(HOST_REQUEST_OPERATION_ID_PREFIX)
+            .ok_or_else(resource_source_refused)?;
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_request_label(digest),
+            Some(handle),
+            &facts,
+            &session,
+            RESOLVE_HANDLE_CAPABILITY_FILLER,
+            RESOLVE_HANDLE_PAYLOAD_FILLER,
+            now_ms,
+        )?;
+        let query = resolve_handle_query(handle);
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, &facts)?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|_| resource_source_refused())?;
+        let record = match decode_resolve_reply(
+            &reply,
+            &resolve_envelope,
+            &ResolveQuery::OperationHandle {
+                handle: handle.to_owned(),
+            },
+        ) {
+            LogicalOwnerOutcome::Resolved(record) => *record,
+            LogicalOwnerOutcome::Absent
+            | LogicalOwnerOutcome::Conflict
+            | LogicalOwnerOutcome::Unavailable => return Err(resource_source_refused()),
+        };
+        if record.operation_id != handle
+            || record.kind.as_deref() != Some("INVOCATION")
+            || record.session_ref.as_deref() != Some(session.as_str())
+            || record.request_digest.is_none()
+            || record.request_id.is_none()
+            || record.capability_ref.is_none()
+            || record.payload_digest.is_none()
+            || record.result_digest.is_none()
+            || record.result_response.is_none()
+            || !matches!(
+                record.state,
+                HostRequestRecordState::ResultReceived | HostRequestRecordState::Terminal
+            )
+        {
+            return Err(resource_source_refused());
+        }
+        Ok((facts, record))
     }
 
     /// Replays, resolves, or builds one invocation (issue #2571).
@@ -760,14 +888,83 @@ impl KernelHostRequestClient {
         }
     }
 
+    /// Resolves the exact parent operation after a cancellation result and
+    /// maps that owner's current state, never the cancellation-intent state.
+    /// This deliberately bypasses the replay cache: only a fresh operation-
+    /// handle resolve on the admitted transport can establish disposition.
+    fn resolve_cancellation_parent_disposition(
+        &mut self,
+        parent: &ParentLink,
+        facts: &TransportFacts,
+        session_id: &str,
+    ) -> Result<HostCancellationPortOutcome, PortFailure> {
+        let unknown = || unknown_cancel_outcome(&parent.handle);
+        if facts.session.as_deref() != Some(session_id) {
+            return Err(unknown());
+        }
+        let digest = parse_operation_handle(&parent.handle).map_err(|_| unknown())?;
+        let logical_key = logical_host_request_key(
+            LOGICAL_KIND_INVOCATION,
+            session_id,
+            parent.request_base.as_str(),
+            None,
+            None,
+            None,
+            parent.capability.as_str(),
+            parent.payload_digest.as_str(),
+        )
+        .map_err(|_| unknown())?;
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_request_label(&digest),
+            Some(parent.handle.as_str()),
+            facts,
+            session_id,
+            RESOLVE_HANDLE_CAPABILITY_FILLER,
+            RESOLVE_HANDLE_PAYLOAD_FILLER,
+            unix_ms().map_err(|_| unknown())?,
+        )
+        .map_err(|_| unknown())?;
+        let query = resolve_handle_query(parent.handle.as_str());
+        let frame =
+            host_request_resolve_frame(&query, &resolve_envelope, facts).map_err(|_| unknown())?;
+        let outcome = match self.exchange(&frame) {
+            Ok(reply) => decode_resolve_reply(
+                &reply,
+                &resolve_envelope,
+                &ResolveQuery::OperationHandle {
+                    handle: parent.handle.clone(),
+                },
+            ),
+            Err(_) => LogicalOwnerOutcome::Unavailable,
+        };
+        let LogicalOwnerOutcome::Resolved(record) = outcome else {
+            return Err(unknown());
+        };
+        if record.operation_id != parent.handle
+            || record.request_digest.as_deref() != Some(digest.as_str())
+            || record.kind.as_deref() != Some("INVOCATION")
+            || record.session_ref.as_deref() != Some(session_id)
+            || record.request_id.as_deref() != Some(parent.request_base.as_str())
+            || record.parent_operation_id.is_some()
+            || record.task_ref.is_some()
+            || record.scope_ref.is_some()
+            || record.capability_ref.as_deref() != Some(parent.capability.as_str())
+            || record.payload_digest.as_deref() != Some(parent.payload_digest.as_str())
+        {
+            return Err(unknown());
+        }
+        verify_resolved_key_commitment(&record, &logical_key).map_err(|_| unknown())?;
+        map_parent_cancellation_disposition(record.state, parent.handle.as_str())
+    }
+
     /// Resolves one cancellation's retained intent after an unknown
     /// delivery (issue #2571).
     ///
     /// The cancellation's own logical identity — its correlation bound to
-    /// the original parent — is looked up before any probe: a staged
-    /// intent whose acknowledgement was lost returns its retained outcome
-    /// instead of generating another effectful cancellation from a fresh
-    /// timestamp. An authoritatively absent intent falls back to the
+    /// the original parent — is looked up before any probe. A staged intent
+    /// whose acknowledgement was lost is reconciled without another cancel;
+    /// its state is not the target disposition, so a fresh exact parent
+    /// resolve follows. An authoritatively absent intent falls back to the
     /// observation-only parent probe; a conflicting intent is an
     /// idempotency conflict for the caller to re-issue under a new
     /// correlation; an unavailable owner stays the explicit limitation.
@@ -815,7 +1012,7 @@ impl KernelHostRequestClient {
             LogicalOwnerOutcome::Resolved(record) => {
                 verify_resolved_key_commitment(&record, &logical_key)
                     .map_err(|_| unknown_cancel_outcome(&parent.handle))?;
-                map_cancel_record_state(record.state)
+                self.resolve_cancellation_parent_disposition(parent, facts, session_id)
             }
             LogicalOwnerOutcome::Absent => {
                 self.probe_confirms_parent(facts, session_id, parent, cancel_envelope, now_ms)
@@ -1684,6 +1881,72 @@ fn decode_record_view(
     Some(record)
 }
 
+/// Commits to the exact source record plus the live transport binding.
+///
+/// Versioned preimage fields are explicit so the retained token cannot be
+/// mistaken for a Kernel receipt or authority. The owner record and current
+/// facts are re-read and this same preimage is rebuilt before every resource
+/// expansion.
+fn resource_authorization_digest(
+    operation_handle: &HostOperationHandle,
+    facts: &TransportFacts,
+    record: &AdmittedReplyView,
+) -> Result<String, PortFailure> {
+    let request_digest = record
+        .request_digest
+        .as_deref()
+        .ok_or_else(resource_source_refused)?;
+    let request_id = record
+        .request_id
+        .as_deref()
+        .ok_or_else(resource_source_refused)?;
+    let capability = record
+        .capability_ref
+        .as_deref()
+        .ok_or_else(resource_source_refused)?;
+    let payload_digest = record
+        .payload_digest
+        .as_deref()
+        .ok_or_else(resource_source_refused)?;
+    let result_digest = record
+        .result_digest
+        .as_deref()
+        .ok_or_else(resource_source_refused)?;
+    let result_response = record
+        .result_response
+        .as_ref()
+        .ok_or_else(resource_source_refused)?;
+    let session = record
+        .session_ref
+        .as_deref()
+        .ok_or_else(resource_source_refused)?;
+    if record.operation_id != operation_handle.as_str()
+        || facts.session.as_deref() != Some(session)
+        || record.kind.as_deref() != Some("INVOCATION")
+    {
+        return Err(resource_source_refused());
+    }
+    let preimage = ResourceAuthorizationPreimage {
+        version: "eliot.bridge.resource-source.v1",
+        operation_handle: operation_handle.as_str(),
+        connection_id: facts.connection_id.as_str(),
+        session_id: session,
+        state_fence: &facts.state_fence,
+        descriptor_sha256: facts.descriptor_sha256.as_str(),
+        receipt_sha256: facts.receipt_sha256.as_str(),
+        request_digest,
+        request_id,
+        capability,
+        payload_digest,
+        result_digest,
+        result_response,
+        task_ref: record.task_ref.as_deref(),
+        scope_ref: record.scope_ref.as_deref(),
+    };
+    let bytes = canonical_json_bytes(&preimage).map_err(|_| request_failure())?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// Builds the typed rejection for a restore reply whose body does not bind
 /// the admitted request.
 fn invalid_restore(detail: &str) -> PortFailure {
@@ -1985,35 +2248,29 @@ fn submit_outcome_for_resolved(
     }
 }
 
-/// Maps one cancellation record state to the cancellation outcome
-/// (issue #2571).
+/// Maps one exact parent operation's durable owner state to its cancellation
+/// disposition (issue #2571).
 ///
-/// Shared by the fresh-cancel decode and the retained-intent resolve:
-/// requested/observed states (including a received result on the parent)
-/// settle as acceptance of the cancellation intent, expiry stays a
-/// timeout, and terminal states stay terminal. Cancellation requested,
-/// cancellation observed, and unresolved prior effects therefore stay
-/// separate outcomes instead of collapsing into a fresh effect.
-fn map_cancel_record_state(
+/// Only an owner-observed `CANCELLED` parent proves cancellation. A completed
+/// or otherwise terminal parent is already terminal; every nonterminal or
+/// unresolved state remains an exact-handle unknown outcome.
+fn map_parent_cancellation_disposition(
     state: HostRequestRecordState,
+    operation_handle: &str,
 ) -> Result<HostCancellationPortOutcome, PortFailure> {
     match state {
-        HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
+        HostRequestRecordState::Cancelled => Ok(HostCancellationPortOutcome::Accepted),
+        HostRequestRecordState::ResultReceived
+        | HostRequestRecordState::Terminal
+        | HostRequestRecordState::Conflicted
+        | HostRequestRecordState::Expired => Ok(HostCancellationPortOutcome::AlreadyTerminal),
         HostRequestRecordState::Requested
         | HostRequestRecordState::Admitted
         | HostRequestRecordState::Routed
         | HostRequestRecordState::Submitted
         | HostRequestRecordState::PossiblyEffected
         | HostRequestRecordState::Unknown
-        | HostRequestRecordState::Reconciling
-        | HostRequestRecordState::ResultReceived
-        | HostRequestRecordState::Cancelled => Ok(HostCancellationPortOutcome::Accepted),
-        HostRequestRecordState::Conflicted | HostRequestRecordState::Terminal => {
-            Err(PortFailure::TransportBindingRejected {
-                reason: "cancellation record is already terminal; reconcile the exact operation"
-                    .to_owned(),
-            })
-        }
+        | HostRequestRecordState::Reconciling => Err(unknown_cancel_outcome(operation_handle)),
     }
 }
 
@@ -2160,7 +2417,9 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             );
         };
         match decode_admitted_reply(&reply, &envelope) {
-            Some((_, record)) => map_cancel_record_state(record.state),
+            Some((_, _intent_record)) => {
+                self.resolve_cancellation_parent_disposition(&parent, &facts, &session)
+            }
             None => self.resolve_retained_cancellation(
                 &parent,
                 cancel_correlation.as_str(),
