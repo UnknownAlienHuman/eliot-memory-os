@@ -103,16 +103,68 @@ pub(crate) const TESTD_MODULE_ID: &str = "eliot-testd";
 /// against the live server policy by
 /// [`KernelComposition::validate_native_worker_client_binding`].
 ///
-/// NOTE (front-door reuse): no dedicated `AuthenticatedNativeWorkerSession`
-/// type exists on this base, so the module binds through the same
-/// front-door session mechanism Doctor/Testd use (generation-bound
-/// `ClientHello` proof plus least-privilege capabilities intersected down
-/// to the single admitted native-worker claim wire). See
-/// [`KernelComposition::bind_native_worker_session`].
-///
-/// NOTE (platform boundary): like Doctor/Testd, the native worker rides an
-/// already-authenticated pipe peer until a dedicated OS role lands.
+/// NOTE (front-door reuse): the Watchdog submits its retained `watchdog.redb`
+/// intent spool through the same closed front-door frame route every other
+/// local peer uses, so it needs no second pipe family and no server-first
+/// transport owner. It is admitted as its own peer role and bound to its own
+/// least-privilege session below; see
+/// [`KernelComposition::bind_watchdog_session`].
 pub(crate) const NATIVE_MODULE_ID: &str = "eliot-native-worker";
+
+/// Stable module identity of the independent supervision service.
+///
+/// The Watchdog never self-asserts authority through this string:
+/// [`KernelComposition::bind_session`] admits it only over an already
+/// pipe-authenticated peer role whose process identity the platform adapter
+/// observed from the live SCM service, and only after
+/// [`KernelComposition::validate_watchdog_client_binding`] proves its
+/// `ClientHello` generation-bound against the live server policy.
+///
+/// NOTE (front-door reuse): like Doctor/Testd, the Watchdog has no
+/// server-first transport owner and no dedicated session bootstrap, so it
+/// rides the ordinary client-first handshake and the same admitted frame
+/// gateway. It requires no agent-bridge Session, no bridge activation, and no
+/// bridge profile.
+pub(crate) const WATCHDOG_MODULE_ID: &str = "eliot-watchdog";
+
+/// Builds the front-door `Watchdog` peer role, or `None` when no Watchdog
+/// service process is currently observable.
+///
+/// The Watchdog is an SCM-owned sibling of the Host service, so the Kernel
+/// holds no launch receipt for it and never receives one. Its process identity
+/// is therefore taken from the process the platform adapter observes live from
+/// the canonical SCM service, and its account SID is resolved from the same
+/// canonical service name. Both facts come from the operating system, never
+/// from a caller, a request, or a Host-injected value; the role carries no
+/// static profile identity and is admitted at exactly the strength the Host
+/// and `eliotd` roles get.
+///
+/// A Watchdog that is not currently running contributes no role at all. That
+/// leaves the peer set unable to select it, so such a connection is refused
+/// closed; it is never replaced by a broader Host or bridge role, and a
+/// transient observation failure is never treated as an admission.
+///
+/// # Errors
+///
+/// Returns [`KernelBuildError::Principal`] when the Watchdog service process is
+/// observable but its account SID cannot be resolved, or when the observed
+/// process and the resolved SID cannot form a valid static expectation.
+#[cfg(windows)]
+fn front_door_watchdog_peer_profile(
+    expected_session_id: u32,
+) -> Result<Option<NamedPipePeerProfile>, KernelBuildError> {
+    let Ok(observed) = observe_running_eliot_watchdog_process() else {
+        return Ok(None);
+    };
+    let sid = resolve_service_sid(ELIOT_WATCHDOG_SERVICE_NAME)
+        .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+    let expectation =
+        NamedPipePeerExpectation::new_with_process_binding(sid, expected_session_id, observed)
+            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+    NamedPipePeerProfile::new(NamedPipePeerKind::Watchdog, expectation, None)
+        .map(Some)
+        .map_err(|error| KernelBuildError::Principal(error.to_string()))
+}
 
 /// The only transport implementation admitted by the Windows-first Kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,7 +225,10 @@ impl KernelComposition {
     /// Host and Eliotd are pinned to fresh OS-observed process bindings. The
     /// bridge is dynamic: its stable SID, image and file identity come from
     /// the promoted Host descriptor while PID/start/session are observed by
-    /// the platform adapter for each pipe handle.
+    /// the platform adapter for each pipe handle. The Watchdog sibling service
+    /// is pinned the same way Host and `eliotd` are: the platform adapter
+    /// observes its live SCM-reported process, so no Host-injected, client
+    /// supplied, or request-supplied value enters its expectation.
     #[cfg(windows)]
     fn front_door_peer_set_inner(
         &self,
@@ -271,6 +326,15 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Principal(error.to_string()))?,
             );
         }
+
+        // The Watchdog is an SCM-owned sibling of the Host service, so the
+        // Kernel holds no launch receipt for it and never receives one.
+        if let Some(profile) =
+            front_door_watchdog_peer_profile(host_expectation.expected_session_id())?
+        {
+            entries.push(profile);
+        }
+
         NamedPipePeerSet::new(entries)
             .map_err(|error| KernelBuildError::Principal(error.to_string()))
     }
@@ -589,6 +653,20 @@ impl KernelComposition {
             // Generation/epoch/artifact are proven against live server
             // policy inside; nothing client-asserted becomes authority.
             return self.bind_native_worker_session(connection_id, peer, client);
+        }
+        if client.module_bridge_identity == WATCHDOG_MODULE_ID {
+            // The independent supervision service binds at session scope over
+            // its already pipe-authenticated Watchdog peer role. It presents
+            // only its own retained `watchdog.redb` intent spool through the
+            // closed `watchdog_intent_submit` frame route, and it needs no
+            // agent-bridge Session, bridge activation, or bridge profile: a
+            // Watchdog has none of those, and demanding them is exactly what
+            // previously left the spool with no transport at all.
+            // Generation/epoch/artifact are proven against live server policy
+            // inside; nothing client-asserted becomes authority, and the
+            // fenced intent route still resolves every submission against the
+            // retained supervision lease the Kernel itself holds.
+            return self.bind_watchdog_session(connection_id, peer, client);
         }
         if client.module_bridge_identity != ACTIVE_DAEMON_CALLER
             && !self
@@ -998,6 +1076,105 @@ impl KernelComposition {
     /// generation/epoch/artifact join above plus pipe authentication is the
     /// gate — the same shape Doctor/Testd use.
     fn validate_native_worker_client_binding(
+        policy: &ServerHandshakePolicy,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<(), TransportError> {
+        if client.module_generation.generation != policy.module_generation.generation
+            || client.module_generation.artifact_id != policy.module_generation.artifact_id
+            || client.artifact_hash != policy.module_generation.artifact_id
+            || !client
+                .authority_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+            || !client
+                .module_generation
+                .state_fence
+                .is_compatible_with(&policy.module_generation.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Binds an authenticated Watchdog supervision service to a
+    /// least-privilege session.
+    ///
+    /// The presenting pipe peer was already authenticated by the listener's
+    /// peer set, which admitted the `Watchdog` role only against the process
+    /// the platform adapter observed live from the canonical SCM service. This
+    /// entry then proves the Watchdog `ClientHello` generation-bound against
+    /// the live server policy (exact generation, exact artifact, same-authority
+    /// epoch, compatible fence) and establishes the transport session.
+    /// Capabilities are intersected down to the single admitted Watchdog wire
+    /// operation and effects are never session-bound: the submission is an
+    /// observation intake, and even that is re-resolved against the retained
+    /// supervision lease inside
+    /// [`KernelComposition::admit_watchdog_intent_batch`]. The issued
+    /// `ServerHello` advertises exactly that one operation; an invalid peer or
+    /// epoch fences before any protected input.
+    ///
+    /// The Watchdog gains no canonical, `HostStateJournal`, ORS-authoring,
+    /// task, Architecture, completion, or budget authority here. The durable
+    /// record this route stages is a non-canonical pending intent awaiting the
+    /// Governor's own Problem/Incident transition.
+    fn bind_watchdog_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_watchdog_bind", "attempt");
+        let connection_id = connection_id.into();
+        if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        Self::validate_watchdog_client_binding(&policy, client)?;
+        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
+        session.capabilities = vec![WATCHDOG_INTENT_SUBMIT_OPERATION.to_owned()];
+        session
+            .privacy_classes
+            .retain(|class| policy.allowed_privacy_classes.contains(class));
+        session.effects = Vec::new();
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: policy.session_principal_binding.clone(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot: policy.config_snapshot.clone(),
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel.clone(),
+            rejection_reason: None,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
+    }
+
+    /// Proves a Watchdog `ClientHello` generation-bound against live server
+    /// policy.
+    ///
+    /// Every Watchdog-asserted value is compared against the server-owned
+    /// policy; nothing is copied into authority. The exact generation and
+    /// artifact must match, the epoch must be the same authority, and the
+    /// presented fence must be compatible with the live fence, so a stale or
+    /// foreign generation can never bind. This is deliberately the same proof
+    /// the Doctor, testd, and native-worker binds apply: pipe authentication
+    /// plus this join, never a weaker substitute.
+    fn validate_watchdog_client_binding(
         policy: &ServerHandshakePolicy,
         client: &eliot_protocol::ClientHello,
     ) -> Result<(), TransportError> {
