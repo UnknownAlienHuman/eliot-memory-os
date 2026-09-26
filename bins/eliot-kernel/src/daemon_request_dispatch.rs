@@ -1021,11 +1021,24 @@ impl KernelComposition {
                 observe_daemon_request("kernel.daemon_request_admitted", "success");
                 observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
                 observe_daemon_request("kernel.daemon_response_prepared", "success");
-                observe_daemon_request("kernel.daemon_response_delivered", "success");
+                // F-LOG-KERNEL-1 (#897 W3): the reply value is prepared here
+                // and handed to the front-door driver transport boundary. The
+                // only delivery witness is the driver-owned `send_checked`
+                // write (`front_door_driver.rs`, outside #897 scope), so
+                // delivery stays `unknown` at this boundary: a prepared
+                // response is not a delivered response.
+                observe_daemon_request("kernel.daemon_response_delivered", "unknown");
             }
             Err(error) => {
                 observe_daemon_request("kernel.daemon_request_validated", "fenced");
                 observe_daemon_operation(trusted_daemon_operation(operation), "fenced");
+                if matches!(error, TransportError::Cancelled) {
+                    // F-LOG-KERNEL-1 (#897 W3): cancellation observed as the
+                    // terminal disposition, distinct from the cancellation
+                    // request (`kernel.daemon_cancel_requested`). Info only;
+                    // the terminal below stays the single designated terminal.
+                    observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
+                }
                 super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
             }
         }
@@ -1496,8 +1509,17 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             "agent_host_request_cancel" => {
+                // F-LOG-KERNEL-1 (#897 W3): cancellation requested through the
+                // closed daemon dispatcher. Info only; the observed wrapper
+                // owns the single designated terminal for this operation.
+                observe_daemon_request("kernel.daemon_cancel_requested", "attempt");
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
-                let (receipt, record) = self.cancel_host_request(&envelope)?;
+                let cancel = self.cancel_host_request(&envelope);
+                match &cancel {
+                    Ok(_) => observe_daemon_request("kernel.daemon_cancel_requested", "success"),
+                    Err(_) => observe_daemon_request("kernel.daemon_cancel_requested", "fenced"),
+                }
+                let (receipt, record) = cancel?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))

@@ -515,7 +515,9 @@ impl KernelComposition {
     /// Diagnostic wrapper: received/validated/admitted/dispatched stay
     /// distinct, decode uses only trusted identities, and exactly one
     /// terminal is emitted per failed dispatch. Subordinate route helpers
-    /// emit info only.
+    /// emit info only. Reply actions are admitted (prepared) here; the
+    /// front-door driver owns the transport write, so preparation is never
+    /// reported as delivery.
     pub fn dispatch_frame(
         &self,
         session: &Session,
@@ -526,7 +528,7 @@ impl KernelComposition {
         match &result {
             Ok(action) => {
                 let outcome = match action {
-                    KernelFrameAction::Reply(_) => "replied",
+                    KernelFrameAction::Reply(_) => "reply_admitted",
                     KernelFrameAction::Daemon { .. } => "daemon_admitted",
                     KernelFrameAction::Process { .. } => "process_admitted",
                     KernelFrameAction::Doctor { .. } => "doctor_admitted",
@@ -541,6 +543,13 @@ impl KernelComposition {
             }
             Err(error) => {
                 observe_frame("kernel.frame_decode_reject", "fenced");
+                if matches!(error, TransportError::Cancelled) {
+                    // F-LOG-KERNEL-1 (#897 W2): cancellation observed as the
+                    // dispatch disposition, distinct from the cancellation
+                    // request (`kernel.frame_cancel_requested`). Info only;
+                    // the terminal below stays the single designated terminal.
+                    observe_frame("kernel.frame_cancel_observed", "cancelled");
+                }
                 super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
             }
         }
@@ -1246,6 +1255,12 @@ impl KernelComposition {
         observe_frame("kernel.frame_doctor_dispatch", "attempt");
         let control = frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
         if control {
+            // F-LOG-KERNEL-1 (#897 W2): cancellation requested through the
+            // closed Doctor route. Info only; `dispatch_frame` owns the
+            // single designated terminal for this frame.
+            observe_frame("kernel.frame_cancel_requested", "attempt");
+        }
+        if control {
             if !matches!(
                 self.service_state()
                     .map_err(|_| TransportError::SessionFenced)?,
@@ -1515,6 +1530,12 @@ impl KernelComposition {
     ) -> Result<KernelFrameAction, TransportError> {
         observe_frame("kernel.frame_testd_dispatch", "attempt");
         let control = frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
+        if control {
+            // F-LOG-KERNEL-1 (#897 W2): cancellation requested through the
+            // closed testd route. Info only; `dispatch_frame` owns the
+            // single designated terminal for this frame.
+            observe_frame("kernel.frame_cancel_requested", "attempt");
+        }
         if control {
             if !matches!(
                 self.service_state()

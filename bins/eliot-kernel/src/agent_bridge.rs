@@ -519,7 +519,16 @@ impl KernelComposition {
         let _transition = self.agent_bridge_transition_read()?;
         let result = self.agent_bridge_admission_receipt_frame_inner(connection_id);
         match &result {
-            Ok(_) => observe_bridge("kernel.bridge_receipt_prepared", "success"),
+            Ok(_) => {
+                observe_bridge("kernel.bridge_receipt_prepared", "success");
+                // F-LOG-KERNEL-1 (#897 W2): the receipt value is prepared here
+                // and handed to the front-door driver transport boundary. The
+                // only write witness is the driver-owned `send_checked` write
+                // (`front_door_driver.rs`, outside #897 scope), so the write
+                // stays `unknown` at this boundary: a prepared receipt is a
+                // partial outcome, never a delivered one.
+                observe_bridge("kernel.bridge_receipt_unknown", "unknown");
+            }
             Err(error) => {
                 observe_bridge("kernel.bridge_receipt_prepared", "fenced");
                 super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
