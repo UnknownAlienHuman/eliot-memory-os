@@ -13,6 +13,53 @@ path = "src/lib.rs"
 name = "eliotd"
 path = "src/main.rs"
 
+# Issue #18 required work 1, implemented through the #13
+# capability-cell-registry contract. `eliotd` is the production Governor
+# composition root (crates/eliotd/src/lib.rs:1-7), so it hosts the daemon
+# capability cells the generated `CapabilityCellRegistry` is compiled from
+# (I2.8 package metadata; I2.23 capability cell registry). Each cell below is a
+# real capability with a real single mutable-state owner; the owner is named
+# here instead of inferred from a crate or binary name.
+[package.metadata.eliot]
+layer = "C1"
+purpose = "Compose the production Governor daemon from an authenticated Kernel-generation port: own the process composition, the declared startup capability binding ledger, the poll contour, the Kernel transport client, the volatile operator replay handle, the Skill catalogue handle, the capability admission view and the durable learning-closure owner. It owns no Kernel, canonical store client, store adapter or physical process executor."
+source_maintenance_owner = "governor.daemon"
+functional_cell_refs = [
+  "governor.daemon.composition",
+  "governor.daemon.startup-binding",
+  "governor.daemon.poll-contour",
+  "governor.daemon.kernel-transport",
+  "governor.daemon.operator-replay",
+  "governor.daemon.skill-catalogue",
+  "governor.daemon.capability-admission",
+  "governor.daemon.learning-closure",
+]
+independent_proof_profile = "eliotd"
+contract_refs = [
+  "ARCH-AUTH-01",
+  "ARCH-MOD-03",
+  "ARCH-SEC-02",
+  "ARCH-FIN-01",
+  "ARCH-OBS-01",
+  "ELIOT_IMPLEMENTATION:I1.8",
+  "ELIOT_IMPLEMENTATION:I2.23",
+  "ELIOT_IMPLEMENTATION:I5.19",
+  "ELIOT_IMPLEMENTATION:I6.10",
+]
+# One owner per mutable state. `bins/eliotd` holds exactly one instance of each
+# value below for the process lifetime, so a second owner cannot exist here.
+# (I2.23: a cell with an undeclared state owner is a registry defect.)
+functional_cell_state_owners = [
+  { cell = "governor.daemon.composition", state = "daemon-composition", owner = "eliotd::DaemonComposition" },
+  { cell = "governor.daemon.startup-binding", state = "startup-capability-bindings", owner = "eliotd::StartupCapabilityBindings" },
+  { cell = "governor.daemon.poll-contour", state = "daemon-poll-contour", owner = "eliotd::daemon_runtime::run" },
+  { cell = "governor.daemon.kernel-transport", state = "daemon-kernel-transport", owner = "eliotd::DaemonKernelClient" },
+  { cell = "governor.daemon.operator-replay", state = "operator-replay", owner = "eliotd::controlboard_adapters::SharedOperatorReplay" },
+  { cell = "governor.daemon.skill-catalogue", state = "skill-catalogue", owner = "eliot_skill::SkillCatalogue" },
+  { cell = "governor.daemon.capability-admission", state = "capability-admission-view", owner = "eliotd::capability_evidence_wiring::GovernorCapabilityAdmission" },
+  { cell = "governor.daemon.learning-closure", state = "learning-closure", owner = "eliot_governor::LearningClosureService" },
+]
+
 [dependencies]
 eliot-agent-api.workspace = true
 eliot-agent-bridge-core.workspace = true
