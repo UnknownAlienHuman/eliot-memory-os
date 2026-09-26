@@ -1400,14 +1400,27 @@ impl WasmJoinTable {
     }
 
     /// Registers one published join bound to its delivery identity
-    /// (#2786 step 8): the join/launch binding of the claim. Replaces
-    /// any prior record for the pair; the staged generation slot and
-    /// the fixed-name set were just published with it, so re-publication
-    /// of the same delivery re-arms the exact operation under the same
-    /// identity, never a spent permit.
+    /// (#2786 steps 3 and 8): the join/launch binding of the claim. A
+    /// byte-identical re-publication of an already-consumed delivery
+    /// preserves the spent record instead of re-arming it, so an exact
+    /// replay can never mint a second one-shot admission under the same
+    /// authority. Any differing binding replaces the prior record; a
+    /// fresh claim, grant, or launch nonce presents different digests,
+    /// while a slot revision alone carries no new authority.
     pub fn register_delivery(&mut self, join: &WasmJoinGate, delivery: &WasmDeliveryIdentity) {
+        let key = (join.claim_id.clone(), join.operation_id.clone());
+        if let Some(record) = self.records.get(&key)
+            && record.consumed
+            && record.authority_id == join.authority_id
+            && record.grant_digest == join.grant_digest
+            && record.invocation_digest == join.invocation_digest
+            && record.expires_at == join.expires_at
+            && record.envelope_digest.as_deref() == Some(delivery.envelope_digest.as_str())
+        {
+            return;
+        }
         self.records.insert(
-            (join.claim_id.clone(), join.operation_id.clone()),
+            key,
             WasmJoinRecord {
                 authority_id: join.authority_id.clone(),
                 grant_digest: join.grant_digest.clone(),
