@@ -225,6 +225,11 @@ fn produce(
         measurement_digest: &"d".repeat(64),
         measurement_serializer: "json-v1",
         verified,
+        // Every production in this file is for the local permit's own target
+        // task, so the distinct cross-task carryover is absent by
+        // construction; the producer re-checks it against the local admission
+        // when one is presented.
+        cross_task: None,
     })
 }
 

@@ -10,8 +10,11 @@
 //!   refuses before anything renders, and the plain base-view projection
 //!   survives untouched;
 //! - the same revision under a new governed admission (fresh expiry and
-//!   admission handle) delivers again, including to another campaign when a
-//!   valid permit-bound [`CrossTaskAdmission`] revalidates the carryover;
+//!   admission handle) delivers again to its own campaign, and no longer
+//!   reaches another campaign under a revalidation that only re-spelled the
+//!   local admission (#1869: a carryover needs a distinct, owner-issued
+//!   admission, and a request from the admitted task under a foreign campaign
+//!   label is refused as cross-campaign leakage);
 //! - the invalidated revision refuses even with live expiry.
 //!
 //! Note: `eliot-learning-contracts::overlay_eligibility` and
@@ -45,7 +48,7 @@ use eliot_governor::{
     QueueLimits, VerifiedLearningAdmission, issue_learning_admission, verify_learning_admission,
 };
 use eliot_improvement::candidate_bounds::{
-    BoundedBacklog, CrossTaskAdmission, GovernedOverlay, OverlayState,
+    BoundedBacklog, CrossTaskCarryover, GovernedOverlay, OverlayState,
 };
 use eliot_improvement::{PresentedLearning, datetime_from_unix};
 use eliot_receipts::{ProofCeiling, WorkScopeId};
@@ -423,26 +426,13 @@ fn overlay_revision_1864(
     }
 }
 
-fn cross_task_admission_1864() -> CrossTaskAdmission {
-    CrossTaskAdmission {
-        admission_id: "xadmit-1864-1".to_string(),
-        source_campaign_id: CAMPAIGN_1864.to_string(),
-        target_task_id: TASK_1864.to_string(),
-        scope_ref: "scope-1864".to_string(),
-        authority_ref: "governor-1864".to_string(),
-        retention_ref: "retention-1864".to_string(),
-        evaluator_ref: "evaluator-1864-a".to_string(),
-        rollback_ref: "rollback-1864".to_string(),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn presented_1864<'a>(
     governor: &'a Governor,
     verified: &'a VerifiedLearningAdmission<'a>,
     overlay: &'a GovernedOverlay,
     backlog: &'a BoundedBacklog,
-    cross_task_admission: Option<&'a CrossTaskAdmission>,
+    cross_task: Option<&'a CrossTaskCarryover<'a>>,
     requesting_campaign_id: &'a str,
     now: u64,
 ) -> PresentedLearning<'a> {
@@ -452,7 +442,7 @@ fn presented_1864<'a>(
         ticket: verified.permit().ticket(),
         overlay: Some(overlay),
         backlog,
-        cross_task_admission,
+        cross_task,
         requesting_campaign_id,
         requesting_task_id: TASK_1864,
         now_unix_secs: now,
@@ -466,7 +456,7 @@ fn assemble_marked_1864(
     verified: &VerifiedLearningAdmission<'_>,
     overlay: &GovernedOverlay,
     backlog: &BoundedBacklog,
-    cross_task_admission: Option<&CrossTaskAdmission>,
+    cross_task: Option<&CrossTaskCarryover<'_>>,
     requesting_campaign_id: &str,
     now: u64,
 ) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
@@ -482,7 +472,7 @@ fn assemble_marked_1864(
             verified,
             overlay,
             backlog,
-            cross_task_admission,
+            cross_task,
             requesting_campaign_id,
             now,
         ),
@@ -550,9 +540,17 @@ fn expired_overlay_revision_refuses_later_delivery_and_plain_projection_survives
 }
 
 /// A3, re-admission: the same revision (identical identity bytes) under a new
-/// governed admission delivers again — here to another campaign, carried by a
-/// valid permit-bound cross-task admission. No new admission, no delivery
+/// governed admission delivers again. No new admission, no delivery
 /// (see the expired test above).
+///
+/// The old fixture asked for that delivery to ANOTHER campaign on the strength
+/// of a "cross-task admission" that re-spelled this very permit's own bound
+/// values and named this very task, so no other task was involved at all —
+/// the defect #1869 removes. A carryover is now a distinct, owner-issued
+/// admission, and a request from the admitted task under a foreign campaign
+/// label is refused as cross-campaign leakage, so that leg is pinned as the
+/// refusal it now is and the re-admitted revision is proved on the campaign
+/// its learning belongs to.
 #[test]
 fn readmitted_overlay_revision_delivers_to_other_campaign_with_new_admission() {
     let governor = governor_1864();
@@ -568,15 +566,30 @@ fn readmitted_overlay_revision_delivers_to_other_campaign_with_new_admission() {
         LATER_1864 + 3600,
     );
     let backlog = BoundedBacklog::default();
-    let admission = cross_task_admission_1864();
+    let refusal = assemble_marked_1864(
+        &value,
+        &governor,
+        &verified,
+        &overlay,
+        &backlog,
+        None,
+        OTHER_CAMPAIGN_1864,
+        LATER_1864,
+    );
+    assert_eq!(
+        refusal,
+        Err(AssemblyError::Contract(ContextError::IdentityConflict)),
+        "another campaign is not a carryover a re-spelled local admission buys"
+    );
+
     let view = assemble_marked_1864(
         &value,
         &governor,
         &verified,
         &overlay,
         &backlog,
-        Some(&admission),
-        OTHER_CAMPAIGN_1864,
+        None,
+        CAMPAIGN_1864,
         LATER_1864,
     )
     .expect("readmitted revision delivers with new governed admission");

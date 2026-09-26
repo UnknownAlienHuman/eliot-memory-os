@@ -39,6 +39,12 @@
 //! [`LearningAdmissionPermit::verify_cross_task_admission`] re-verifies both
 //! permits through the same [`verify_learning_admission`] live checks and
 //! re-checks the record's revalidated values against the cross-task permit.
+//! Its step set is factored so a consumer that already holds two
+//! [`VerifiedLearningAdmission`] handles can re-check a presented record
+//! without re-deriving the identity digest:
+//! [`LearningAdmissionPermit::verify_cross_task_record`] runs the record rules
+//! alone and is not an alternative authorization path, because a
+//! [`VerifiedLearningAdmission`] is obtainable only from live owner state.
 //! Distinctness there is structural, not nominal: an admission that
 //! revalidates the local admission's own target task, or that mints an
 //! identical digest, is refused with a typed
@@ -541,48 +547,33 @@ impl LearningAdmissionPermit {
         Ok((cross_task, record))
     }
 
-    /// Re-verify a cross-task admission and return the record a consumer may
-    /// act on.
+    /// Re-check a presented cross-task record against two permits the caller
+    /// has ALREADY re-bound to live owner state, without consulting a
+    /// [`Governor`] again.
     ///
-    /// Both admissions are re-bound to live owner state through the same
-    /// [`verify_learning_admission`] checks, each against the fence of its own
-    /// task: `local_fence` for this admission's task and `cross_task_fence`
-    /// for the foreign target task's. The presented `record` is then held to
-    /// the same rules as issuance:
+    /// This is steps 1 and 3-5 of [`Self::verify_cross_task_admission`] and
+    /// nothing else, factored out so a consumer that already holds two
+    /// [`VerifiedLearningAdmission`] handles can re-check the record without
+    /// re-deriving the identity digest — and therefore cannot drift from the
+    /// single definition of it. The rules are unchanged: shape, distinctness,
+    /// `admission_id` recomputed from the two issuance digests, the record's
+    /// two digests equal to the two permits' digests, and the record's
+    /// revalidated values equal to the values the cross-task permit binds,
+    /// field by field.
     ///
-    /// 1. shape — supported version and usable text in every field;
-    /// 2. live owner verification of both permits (admitting state, digest
-    ///    recomputation, live epoch/generation, exact fence);
-    /// 3. the cross-task distinctness rule;
-    /// 4. `admission_id` recomputed from the two verified digests, and the
-    ///    record's two digests equal to the two permits' digests;
-    /// 5. the record's revalidated values equal to the values the cross-task
-    ///    permit binds, field by field, with the field named in the refusal.
-    ///
-    /// The returned borrow is the presented record, kept alive only as long as
-    /// the evidence verified: a record alone, or a record presented without
-    /// both owner-issued permits, authorizes nothing and cannot be obtained
-    /// from here.
-    ///
-    /// What this does not claim: that the owner reviewed each revalidated
-    /// value for the target task. The Governor can only admit the claim it is
-    /// handed, under the live epoch/generation/fence and the authority ref it
-    /// binds. A consumer that needs a revalidated value to match its own
-    /// policy must compare that value itself, which is exactly what the
-    /// returned record exposes.
-    pub fn verify_cross_task_admission<'a>(
-        &'a self,
-        governor: &Governor,
+    /// This is NOT a second authorization path. A
+    /// [`VerifiedLearningAdmission`] is constructible only by
+    /// [`verify_learning_admission`] against a live [`Governor`], so a caller
+    /// that reaches this method has already paid the live owner checks for BOTH
+    /// permits — the method adds distinctness and record binding, never
+    /// freshness. Where live state must be re-read at the point of use, use
+    /// [`Self::verify_cross_task_admission`], which does both.
+    pub fn verify_cross_task_record<'a>(
+        &self,
         cross_task: &'a LearningAdmissionPermit,
         presented: &'a CrossTaskAdmissionRecord,
-        local_fence: &StateFence,
-        cross_task_fence: &StateFence,
     ) -> Result<&'a CrossTaskAdmissionRecord, CrossTaskAdmissionError> {
         presented.validate()?;
-        verify_learning_admission(governor, self, local_fence)
-            .map_err(CrossTaskAdmissionError::OwnerAdmission)?;
-        verify_learning_admission(governor, cross_task, cross_task_fence)
-            .map_err(CrossTaskAdmissionError::OwnerAdmission)?;
         check_cross_task_distinct(self, cross_task)?;
         if presented.admission_id != cross_task_admission_identity(self, cross_task)?
             || presented.source_admission_digest != self.digest()
@@ -632,6 +623,50 @@ impl LearningAdmissionPermit {
             }
         }
         Ok(presented)
+    }
+
+    /// Re-verify a cross-task admission and return the record a consumer may
+    /// act on.
+    ///
+    /// Both admissions are re-bound to live owner state through the same
+    /// [`verify_learning_admission`] checks, each against the fence of its own
+    /// task: `local_fence` for this admission's task and `cross_task_fence`
+    /// for the foreign target task's. The presented `record` is then held to
+    /// the same rules as issuance:
+    ///
+    /// 1. shape — supported version and usable text in every field;
+    /// 2. live owner verification of both permits (admitting state, digest
+    ///    recomputation, live epoch/generation, exact fence);
+    /// 3. the cross-task distinctness rule;
+    /// 4. `admission_id` recomputed from the two verified digests, and the
+    ///    record's two digests equal to the two permits' digests;
+    /// 5. the record's revalidated values equal to the values the cross-task
+    ///    permit binds, field by field, with the field named in the refusal.
+    ///
+    /// The returned borrow is the presented record, kept alive only as long as
+    /// the evidence verified: a record alone, or a record presented without
+    /// both owner-issued permits, authorizes nothing and cannot be obtained
+    /// from here.
+    ///
+    /// What this does not claim: that the owner reviewed each revalidated
+    /// value for the target task. The Governor can only admit the claim it is
+    /// handed, under the live epoch/generation/fence and the authority ref it
+    /// binds. A consumer that needs a revalidated value to match its own
+    /// policy must compare that value itself, which is exactly what the
+    /// returned record exposes.
+    pub fn verify_cross_task_admission<'a>(
+        &'a self,
+        governor: &Governor,
+        cross_task: &'a LearningAdmissionPermit,
+        presented: &'a CrossTaskAdmissionRecord,
+        local_fence: &StateFence,
+        cross_task_fence: &StateFence,
+    ) -> Result<&'a CrossTaskAdmissionRecord, CrossTaskAdmissionError> {
+        verify_learning_admission(governor, self, local_fence)
+            .map_err(CrossTaskAdmissionError::OwnerAdmission)?;
+        verify_learning_admission(governor, cross_task, cross_task_fence)
+            .map_err(CrossTaskAdmissionError::OwnerAdmission)?;
+        self.verify_cross_task_record(cross_task, presented)
     }
 }
 

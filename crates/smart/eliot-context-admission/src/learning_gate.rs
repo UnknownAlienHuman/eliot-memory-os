@@ -20,15 +20,19 @@
 //!   freshly re-verified against the live owner epoch/generation and the
 //!   exact compilation fence; overlay subjects require the exact live
 //!   `LOCAL_ADMITTED` overlay; reusable subjects require an ACTIVE backlog
-//!   entry; cross-task carryover requires a distinct revalidating admission.
-//!   Any failure refuses the whole retrieval before any value surfaces.
+//!   entry; cross-task carryover requires the distinct owner-issued
+//!   revalidating admission. Any failure refuses the whole retrieval before
+//!   any value surfaces.
 //! - [`screen_admission_input_learning`] remains the standalone preflight
 //!   fragment (per-mark binding against an owner-verified permit). It is NOT
 //!   sufficient for authority on its own: production retrieval MUST go
 //!   through [`admit_context_with_learning`].
-//! - Cross-task rule: the compilation task must equal the permit's admitted
-//!   target task. A different task needs its own owner-issued permit —
-//!   permits do not stretch, and bare strings never authorize.
+//! - Cross-task rule: the compilation task must equal the task the presented
+//!   admission admits. That is the LOCAL permit's target task when no carryover
+//!   is presented, and the FOREIGN task a distinct owner-issued cross-task
+//!   admission names when one is. Permits do not stretch and bare strings never
+//!   authorize; a different task needs its own admission, and a carryover that
+//!   does not re-check against the local one is refused here as well.
 //!
 //! Host-only logic: this module names the live Governor owner and the
 //! governed registries, and must never enter a `wasm32` guest closure. It
@@ -37,6 +41,7 @@
 use eliot_context_contracts::{AdmissionInput, AdmissionResult, ContextError, LearningProvenance};
 use eliot_contracts::{ArtifactId, StateFence, fences_match_exact};
 use eliot_governor::VerifiedLearningAdmission;
+use eliot_improvement::candidate_bounds::{CrossTaskCarryover, bound_compilation_task};
 use eliot_improvement::{
     CarriageMark, PresentedLearning, bounds_to_context_error, check_governed_carriage,
 };
@@ -53,19 +58,26 @@ pub struct LearningSubject<'a> {
 
 /// Screen learning-marked atoms against an owner-verified permit.
 ///
-/// `now_unix_secs` MUST be owner/host-sourced live time, never a
-/// requester-envelope value (see [`admit_context_with_learning`]).
+/// `cross_task` is the distinct owner-issued admission when the compilation is
+/// for another task; the expected compilation task is resolved from it by the
+/// shared [`bound_compilation_task`] rule, which also re-checks the carryover
+/// against the local admission. `now_unix_secs` MUST be owner/host-sourced
+/// live time, never a requester-envelope value (see
+/// [`admit_context_with_learning`]).
 ///
-/// Fail-closed: the first violation refuses the whole retrieval. Order:
-/// origin campaign, target task, exact fence, cited issuance digest,
+/// Fail-closed: the first violation refuses the whole retrieval. Order: the
+/// cross-task carryover is re-checked against the local admission once, up
+/// front, so a bare or stale record never reaches a per-atom comparison; then,
+/// per atom, origin campaign, target task, exact fence, cited issuance digest,
 /// overlay subject, candidate subject, expiry, draft state, reusable
 /// closure/owner status.
 ///
 /// Preflight fragment only: authority additionally requires the governed
 /// carriage check in [`admit_context_with_learning`].
-pub fn screen_learning_subjects(
+pub fn screen_learning_subjects<'a>(
     subjects: &[LearningSubject<'_>],
-    verified: &VerifiedLearningAdmission<'_>,
+    verified: &VerifiedLearningAdmission<'a>,
+    cross_task: Option<&CrossTaskCarryover<'a>>,
     now_unix_secs: u64,
 ) -> Result<(), ContextError> {
     if subjects.len() > 4096 {
@@ -73,13 +85,15 @@ pub fn screen_learning_subjects(
             field: "learning.subjects",
         });
     }
+    let bound_task =
+        bound_compilation_task(verified, cross_task).map_err(|_| ContextError::IdentityConflict)?;
     let permit = verified.permit();
     for subject in subjects {
         let mark = subject.provenance;
         if mark.campaign_id != permit.source_campaign_id() {
             return Err(ContextError::IdentityConflict);
         }
-        if subject.binding_task_id != permit.target_task_id() {
+        if subject.binding_task_id != bound_task {
             return Err(ContextError::IdentityConflict);
         }
         if !fences_match_exact(subject.binding_fence, permit.fence()) {
@@ -129,13 +143,17 @@ pub fn screen_learning_subjects(
 /// Standalone host-preflight primitive: screen every learning-marked atom in
 /// an admission input against an owner-verified permit, without deciding.
 ///
+/// `cross_task` is the distinct owner-issued admission when the compilation is
+/// for another task; pass `None` for a same-task compilation.
+///
 /// The documented preflight for native callers (including the wasm-host
 /// composition root) before invoking the guest/native retrieval entrypoint:
 /// `Err` means the input must not be compiled for the bound task. Preflight
 /// only: production retrieval MUST use [`admit_context_with_learning`].
-pub fn screen_admission_input_learning(
+pub fn screen_admission_input_learning<'a>(
     input: &AdmissionInput,
-    verified: &VerifiedLearningAdmission<'_>,
+    verified: &VerifiedLearningAdmission<'a>,
+    cross_task: Option<&CrossTaskCarryover<'a>>,
     now_unix_secs: u64,
 ) -> Result<(), ContextError> {
     let mut subjects = Vec::new();
@@ -150,12 +168,12 @@ pub fn screen_admission_input_learning(
             });
         }
     }
-    screen_learning_subjects(&subjects, verified, now_unix_secs)
+    screen_learning_subjects(&subjects, verified, cross_task, now_unix_secs)
 }
 
 /// Governed retrieval entrypoint: run the owner-bound carriage gate
 /// (ticket re-verification, overlay liveness, backlog backing, cross-task
-/// admission) plus the per-mark screen, then the unchanged
+/// carryover) plus the per-mark screen, then the unchanged
 /// [`admit_context_inner`] decision.
 ///
 /// Inputs without learning marks and without tickets are decided exactly
@@ -191,6 +209,11 @@ pub fn admit_context_with_learning(
         check_governed_carriage(&presented, &input.binding.state_fence, &marks)
             .map_err(bounds_to_context_error)?;
     }
-    screen_admission_input_learning(input, presented.verified, presented.now_unix_secs)?;
+    screen_admission_input_learning(
+        input,
+        presented.verified,
+        presented.cross_task,
+        presented.now_unix_secs,
+    )?;
     admit_context_inner(input)
 }

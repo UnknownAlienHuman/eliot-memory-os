@@ -26,9 +26,14 @@
 //!   Draft deltas, unclosed reusable candidates, expired overlays, and
 //!   ownerless records are ineligible for retrieval, delivery, compilation,
 //!   or use by another task.
-//! - Cross-task carryover requires a distinct, newly governed
-//!   [`CrossTaskAdmission`] revalidating scope, authority, retention,
-//!   evaluator, and rollback.
+//! - Cross-task carryover requires a distinct, newly governed admission. That
+//!   admission is a [`CrossTaskCarryover`]: a SECOND, Governor-issued
+//!   [`eliot_governor::LearningAdmissionPermit`] for the foreign target task
+//!   together with the owner-issued
+//!   [`eliot_governor::CrossTaskAdmissionRecord`] that revalidates scope,
+//!   authority, retention, evaluator and rollback for it. Both halves are
+//!   unforgeable outside the Governor, so a cross-task claim cannot be spelled
+//!   from bare strings, and it names a genuinely different task.
 //!
 //! Overlay and reusable-candidate material is **owner-retained**, not
 //! caller-presented: [`BoundedBacklog::bind_local_overlay`] and
@@ -63,7 +68,10 @@
 
 use blake3::Hasher;
 use eliot_contracts::{StateFence, fences_match_exact};
-use eliot_governor::VerifiedLearningAdmission;
+use eliot_governor::{
+    CrossTaskAdmissionError, CrossTaskAdmissionRecord, Governor, LearningAdmissionPermit,
+    VerifiedLearningAdmission,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -1583,17 +1591,16 @@ impl ReusableCandidateRef {
     }
 }
 
-/// Distinct, newly governed admission permitting cross-task carryover.
+/// The five values a distinct cross-task admission revalidated for the
+/// foreign target task (I12.24:295: scope, authority, retention, evaluator,
+/// rollback).
 ///
-/// Revalidates scope, authority, retention, evaluator, and rollback for the
-/// target task. Authentication comes from the owner-verified permit: every
-/// ref below must equal the corresponding permit-bound value, so the
-/// revalidation record cannot be assembled from bare strings.
+/// Present in a [`RetrievalDecision`] on the cross-task branch and nowhere
+/// else, and copied from the VERIFIED owner-issued record — never from the
+/// requester. So a cross-task decision cannot be represented without them, and
+/// a same-task decision cannot claim them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrossTaskAdmission {
-    pub admission_id: String,
-    pub source_campaign_id: String,
-    pub target_task_id: String,
+pub struct CrossTaskRevalidation {
     pub scope_ref: String,
     pub authority_ref: String,
     pub retention_ref: String,
@@ -1601,36 +1608,171 @@ pub struct CrossTaskAdmission {
     pub rollback_ref: String,
 }
 
-impl CrossTaskAdmission {
-    pub fn validate(&self) -> Result<(), BoundsError> {
-        for (field, value) in [
-            ("admission_id", &self.admission_id),
-            ("source_campaign_id", &self.source_campaign_id),
-            ("target_task_id", &self.target_task_id),
-            ("scope_ref", &self.scope_ref),
-            ("authority_ref", &self.authority_ref),
-            ("retention_ref", &self.retention_ref),
-            ("evaluator_ref", &self.evaluator_ref),
-            ("rollback_ref", &self.rollback_ref),
-        ] {
-            if value.trim().is_empty() {
-                return Err(BoundsError::MissingField(field));
-            }
-        }
+/// Owner-verified evidence for exactly one distinct cross-task carryover
+/// (I12.24:295, #1869).
+///
+/// A cross-task use is eligible only when this value exists, and it can exist
+/// only when the Governor owner produced BOTH halves:
+///
+/// - `cross_task` — the SECOND admission, minted for the FOREIGN target task
+///   by [`eliot_governor::LearningAdmissionPermit::issue_cross_task_admission`]
+///   through the same live owner checks as any other admission and re-bound to
+///   live owner state by [`eliot_governor::verify_learning_admission`]. It is
+///   a [`VerifiedLearningAdmission`], so no caller can assemble one.
+/// - `record` — the owner-issued [`CrossTaskAdmissionRecord`] whose
+///   `admission_id` is a purpose-tagged canonical digest over the two issuance
+///   digests, and whose five revalidated values are copied from that second
+///   permit rather than from the requester.
+///
+/// The fields are private, so [`Self::verify`] is the only way to obtain one.
+/// That is the whole point of the type. It replaces the former
+/// `CrossTaskAdmission`, an eight-`String` struct a caller could assemble from
+/// bare text and which the retrieval gate accepted by comparing those strings
+/// with the LOCAL permit's own bound values — a "cross-task admission" that
+/// was a copy of the local one. A carryover cannot be a copy of the local
+/// admission: distinctness is structural, because a different ticket digest is
+/// required and the digest binds every field of the admission.
+///
+/// Live state is consulted at two points on purpose. [`Self::recheck`] runs at
+/// retrieval and needs no [`Governor`], because both handles it reads are
+/// already owner-verified values; [`Self::reverify_live`] runs at delivery and
+/// re-reads live owner state for BOTH permits, so an epoch rotation between
+/// retrieval and delivery refuses the carryover.
+///
+/// State Fence, stated honestly: the compilation stays bound to the LOCAL
+/// admission's fence, which is what the local wire ticket and the local
+/// permit are re-verified against. The cross-task admission's own fence is
+/// verified separately against the value its owner channel supplied, and is
+/// never equated with the local one — a foreign task's own plan revision is
+/// not this crate's to assert, and requiring the two fences to be identical
+/// would make a real carryover unrepresentable.
+#[derive(Clone, Copy, Debug)]
+pub struct CrossTaskCarryover<'a> {
+    cross_task: &'a VerifiedLearningAdmission<'a>,
+    record: &'a CrossTaskAdmissionRecord,
+}
+
+impl<'a> CrossTaskCarryover<'a> {
+    /// Owner-side construction: re-verify the pair against live owner state
+    /// and return the evidence a consumer binds to.
+    ///
+    /// `local` is the verified LOCAL admission the carryover starts from and
+    /// `local_fence` the fence its task is operating under.
+    /// `cross_task_fence` is the fence the owner channel says the foreign
+    /// target task admitted the carryover under; supplying a value that is not
+    /// the cross-task permit's own fence is refused, so this parameter cannot
+    /// be used to smuggle a different decision scope past the check.
+    ///
+    /// Returns the stored record as the Governor verifier returned it, so the
+    /// value a consumer holds is the verified one rather than the presented
+    /// one.
+    ///
+    /// Like [`eliot_governor::issue_learning_admission`] and
+    /// [`eliot_governor::verify_learning_admission`], this is an owner-side
+    /// entry point called from the authenticated owner channel that holds the
+    /// live [`Governor`], not from a retrieval or delivery gate. It is
+    /// deliberately the ONLY constructor: a public struct with public fields
+    /// would put the "distinct admission record" back into the caller's hands.
+    pub fn verify(
+        governor: &Governor,
+        local: &VerifiedLearningAdmission<'a>,
+        cross_task: &'a VerifiedLearningAdmission<'a>,
+        record: &'a CrossTaskAdmissionRecord,
+        local_fence: &StateFence,
+        cross_task_fence: &StateFence,
+    ) -> Result<Self, CrossTaskAdmissionError> {
+        let owner_record = local.permit().verify_cross_task_admission(
+            governor,
+            cross_task.permit(),
+            record,
+            local_fence,
+            cross_task_fence,
+        )?;
+        Ok(Self {
+            cross_task,
+            record: owner_record,
+        })
+    }
+
+    /// The distinct cross-task admission, as the owner verified it.
+    pub fn cross_task_permit(&self) -> &'a LearningAdmissionPermit {
+        self.cross_task.permit()
+    }
+
+    /// The owner-issued record, as the owner verified it.
+    pub fn record(&self) -> &'a CrossTaskAdmissionRecord {
+        self.record
+    }
+
+    /// Re-check the stored record against this carryover and the local
+    /// admission, using only the two owner-verified handles. No [`Governor`]
+    /// is needed and none is consulted: both handles are unforgeable,
+    /// already-re-bound evidence, so this adds distinctness and record
+    /// binding, not freshness.
+    pub fn recheck(
+        &self,
+        local: &VerifiedLearningAdmission<'_>,
+    ) -> Result<(), CrossTaskAdmissionError> {
+        local
+            .permit()
+            .verify_cross_task_record(self.cross_task.permit(), self.record)?;
         Ok(())
     }
 
-    /// Owner-bound check: the revalidation record must match the verified
-    /// permit field-for-field. Bare-string records never pass on their own.
-    pub fn matches_permit(&self, verified: &VerifiedLearningAdmission<'_>) -> bool {
-        let permit = verified.permit();
-        self.source_campaign_id == permit.source_campaign_id()
-            && self.target_task_id == permit.target_task_id()
-            && self.scope_ref == permit.scope_ref()
-            && self.authority_ref == permit.authority_ref()
-            && self.retention_ref == permit.retention_ref()
-            && self.evaluator_ref == permit.evaluator_ref()
-            && self.rollback_ref == permit.rollback_ref()
+    /// Re-verify BOTH admissions against live owner state and re-check the
+    /// record, at the delivery choke point. Refuses when the Governor is no
+    /// longer admitting, when either permit's epoch/generation has rotated,
+    /// or when either fence drifted — the refusals the retrieval-time check
+    /// could not see because it runs earlier.
+    pub fn reverify_live(
+        &self,
+        governor: &Governor,
+        local: &VerifiedLearningAdmission<'a>,
+        local_fence: &StateFence,
+        cross_task_fence: &StateFence,
+    ) -> Result<&'a CrossTaskAdmissionRecord, CrossTaskAdmissionError> {
+        local.permit().verify_cross_task_admission(
+            governor,
+            self.cross_task.permit(),
+            self.record,
+            local_fence,
+            cross_task_fence,
+        )
+    }
+
+    /// The five revalidated values, read out of the VERIFIED record.
+    pub fn revalidation(&self) -> CrossTaskRevalidation {
+        CrossTaskRevalidation {
+            scope_ref: self.record.scope_ref.clone(),
+            authority_ref: self.record.authority_ref.clone(),
+            retention_ref: self.record.retention_ref.clone(),
+            evaluator_ref: self.record.evaluator_ref.clone(),
+            rollback_ref: self.record.rollback_ref.clone(),
+        }
+    }
+}
+
+/// The task exactly one compilation may be bound to.
+///
+/// One rule, three call sites: the producer, the retrieval gate and the
+/// admission preflight all have to agree, or a compilation one of them accepts
+/// is refused by another. Without a carryover the compilation must be for the
+/// LOCAL admission's target task. With one, the carryover is re-checked against
+/// the local admission HERE and the compilation must be for the foreign task
+/// that distinct admission names — so no screen can be talked into treating a
+/// foreign compilation as local, and none has to re-derive the rule.
+pub fn bound_compilation_task<'a>(
+    verified: &VerifiedLearningAdmission<'a>,
+    cross_task: Option<&CrossTaskCarryover<'a>>,
+) -> Result<&'a str, BoundsError> {
+    match cross_task {
+        Some(carryover) => {
+            carryover
+                .recheck(verified)
+                .map_err(BoundsError::CrossTaskAdmissionRefused)?;
+            Ok(carryover.cross_task_permit().target_task_id())
+        }
+        None => Ok(verified.permit().target_task_id()),
     }
 }
 
@@ -1641,6 +1783,11 @@ pub struct RetrievalDecision {
     pub reusable_candidate_id: Option<String>,
     pub cross_task: bool,
     pub cross_task_admission_id: Option<String>,
+    /// The revalidated scope, authority, retention, evaluator and rollback the
+    /// distinct admission demonstrated. `Some` exactly when `cross_task` is
+    /// true, `None` otherwise — so the revalidation evidence is part of the
+    /// decision itself and cannot be asserted without the admission behind it.
+    pub cross_task_revalidation: Option<CrossTaskRevalidation>,
 }
 
 /// Retrieval refusal or admission error. Every refusal is fail-closed.
@@ -1685,6 +1832,23 @@ pub enum BoundsError {
     CrossTaskAdmissionMissing,
     #[error("cross-task admission does not cover this carryover")]
     CrossTaskAdmissionMismatch,
+    /// The distinct admission itself was refused. The typed
+    /// [`CrossTaskAdmissionError`] travels as the source, so the exact refusal
+    /// survives: a revalidation identical to the local claim
+    /// (`NotDistinctAdmission`), one that revalidates the local target task
+    /// (`TargetNotForeign`), a hand-built or transplanted record
+    /// (`RecordMismatch`), a dropped or duplicated subject or campaign
+    /// (`InfluenceSubjectMismatch` / `SourceCampaignMismatch`), blank,
+    /// whitespace-only or control-bearing input (`UnusableField`), and a
+    /// re-spelled revalidated value (`RevalidationMismatch` naming the field).
+    #[error("distinct cross-task admission refused: {0}")]
+    CrossTaskAdmissionRefused(#[source] CrossTaskAdmissionError),
+    /// The carryover is a valid distinct admission but does not cover THIS
+    /// retrieval. `field` names the relation that disagrees: the requesting
+    /// task is not the task the cross-task admission was minted for, or the
+    /// record names another source campaign than the local admission.
+    #[error("cross-task carryover does not cover this retrieval: {field}")]
+    CrossTaskScopeMismatch { field: &'static str },
     #[error("campaign identity mismatch without cross-task admission")]
     CrossCampaignLeakage,
     #[error("overlay fence is invalid")]
@@ -1707,25 +1871,35 @@ pub enum BoundsError {
     Candidate(#[from] crate::ImprovementError),
 }
 
-/// Retrieval gate for a compatible attempt.
+/// Registry-level retrieval gate for a compatible attempt.
 ///
-/// UNGOVERNED LEGACY: this function checks caller-presented overlays,
-/// reusables, and cross-task records as bare data — nothing here is bound
-/// to a live Governor issuance. Authority decisions MUST use
-/// [`retrieve_governed`] with an owner-verified permit instead. This
-/// function remains only for registry-level pre-screening and migration;
-/// removal is out of scope for this work unit.
+/// LEGACY, and partly ungoverned by design: this function checks
+/// caller-presented overlays and reusables as bare data, and there is no local
+/// admission for it to bind them to, so it is registry-level pre-screening
+/// only. Every authority decision MUST use [`retrieve_governed`], which binds
+/// the same material to an owner-verified local permit and re-checks the
+/// carryover against it. Removal of this half is out of scope for this work
+/// unit.
+///
+/// Its cross-task half is NOT bare data, and cannot be: a cross-task claim
+/// needs a second, differently-digested, owner-minted admission for a
+/// different task, and the only way to hold one is a [`CrossTaskCarryover`],
+/// which only the Governor owner channel can construct. What this function
+/// cannot do — and therefore does not pretend to do — is re-check that
+/// carryover's distinctness against a local admission, because it has no local
+/// admission. [`retrieve_governed`] does that check, and the composed paths
+/// run it before this one is relevant.
 ///
 /// Enforces, in order: overlay liveness (exact non-expired
 /// `LOCAL_ADMITTED`), draft-delta ineligibility, reusable closure/owner
-/// eligibility, campaign identity, and cross-task admission.
+/// eligibility, campaign identity, and cross-task carryover.
 pub fn retrieve_for_attempt(
     requesting_campaign_id: &str,
     requesting_task_id: &str,
     overlay: &GovernedOverlay,
     reusable: Option<&ReusableCandidateRef>,
     draft_delta_present: bool,
-    cross_task_admission: Option<&CrossTaskAdmission>,
+    cross_task: Option<&CrossTaskCarryover<'_>>,
     now: OffsetDateTime,
 ) -> Result<RetrievalDecision, BoundsError> {
     if requesting_campaign_id.trim().is_empty() {
@@ -1770,35 +1944,36 @@ pub fn retrieve_for_attempt(
         .map(|origin| origin != requesting_campaign_id)
         .unwrap_or(false);
     if overlay_foreign || reusable_foreign {
-        let admission = cross_task_admission.ok_or(BoundsError::CrossTaskAdmissionMissing)?;
-        admission.validate()?;
+        let carryover = cross_task.ok_or(BoundsError::CrossTaskAdmissionMissing)?;
+        let record = carryover.record();
         let expected_source = if overlay_foreign {
             overlay.campaign_id.as_str()
         } else {
             reusable_origin.unwrap_or("")
         };
-        if admission.source_campaign_id != expected_source
-            || admission.target_task_id != requesting_task_id
+        if record.source_campaign_id != expected_source
+            || record.target_task_id != requesting_task_id
         {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
-        if reusable_foreign && reusable_origin.is_some_and(|o| o != admission.source_campaign_id) {
+        if reusable_foreign && reusable_origin.is_some_and(|o| o != record.source_campaign_id) {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
-        if overlay_foreign && overlay.campaign_id != admission.source_campaign_id {
+        if overlay_foreign && overlay.campaign_id != record.source_campaign_id {
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
         return Ok(RetrievalDecision {
             overlay_id: overlay.overlay_id.clone(),
             reusable_candidate_id,
             cross_task: true,
-            cross_task_admission_id: Some(admission.admission_id.clone()),
+            cross_task_admission_id: Some(record.admission_id.clone()),
+            cross_task_revalidation: Some(carryover.revalidation()),
         });
     }
 
     // Same campaign: reusable records must still be closed and owned
-    // (checked above); no cross-task admission is needed or accepted.
-    if cross_task_admission.is_some() {
+    // (checked above); no cross-task carryover is needed or accepted.
+    if cross_task.is_some() {
         return Err(BoundsError::CrossTaskAdmissionMismatch);
     }
     Ok(RetrievalDecision {
@@ -1806,6 +1981,7 @@ pub fn retrieve_for_attempt(
         reusable_candidate_id,
         cross_task: false,
         cross_task_admission_id: None,
+        cross_task_revalidation: None,
     })
 }
 
@@ -1814,20 +1990,23 @@ pub fn retrieve_for_attempt(
 //
 // The round-2 caller-owned evidence sets are removed: every authority and
 // admission relied upon below arrives as an owner-verified permit
-// (`VerifiedLearningAdmission`, constructible only by the Governor owner).
-// Bare strings never authenticate here.
+// (`VerifiedLearningAdmission`, constructible only by the Governor owner), and
+// a cross-task carryover arrives as a `CrossTaskCarryover` — a SECOND
+// owner-verified permit plus the owner-issued record binding the two. Bare
+// strings never authenticate here.
 // ---------------------------------------------------------------------------
 
 /// Governed retrieval request: the consumer-facing gate input.
 ///
-/// `verified` carries the owner-issued permit the retrieval is bound to:
-/// overlay identity + fence and reusable identity must match it exactly,
-/// and cross-task revalidation records must equal its bound refs. A
-/// reusable candidate must additionally resolve to an active backlog
-/// entry — `admit`/`admit_governed` grants retrieval eligibility and
-/// `archive` revokes it. The backlog registry handle is non-optional on
-/// this governed path: pass the production [`BoundedBacklog`] even for
-/// overlay-only retrieval.
+/// `verified` carries the owner-issued LOCAL permit the retrieval is bound to:
+/// overlay identity + fence and reusable identity must match it exactly.
+/// `cross_task` carries the DISTINCT owner-issued admission for a requesting
+/// task that is not that permit's target task, and is required exactly in
+/// that case. A reusable candidate must additionally resolve to an active
+/// backlog entry — `admit`/`admit_governed` grants retrieval eligibility and
+/// `archive` revokes it. The backlog registry handle is non-optional on this
+/// governed path: pass the production [`BoundedBacklog`] even for overlay-only
+/// retrieval.
 ///
 /// `now` MUST be owner/host-sourced live time, never a requester value.
 pub struct GovernedRetrieval<'a> {
@@ -1836,7 +2015,7 @@ pub struct GovernedRetrieval<'a> {
     pub overlay: &'a GovernedOverlay,
     pub reusable: Option<&'a ReusableCandidateRef>,
     pub draft_delta_present: bool,
-    pub cross_task_admission: Option<&'a CrossTaskAdmission>,
+    pub cross_task: Option<&'a CrossTaskCarryover<'a>>,
     pub backlog: &'a BoundedBacklog,
     pub verified: &'a VerifiedLearningAdmission<'a>,
     pub now: OffsetDateTime,
@@ -1844,9 +2023,29 @@ pub struct GovernedRetrieval<'a> {
 
 /// Owner-verified retrieval gate: as [`retrieve_for_attempt`], but every
 /// authority/admission relied upon must arrive inside `verified` (an
-/// owner-verified permit), the overlay fence must exactly match the admitted
-/// fence, and (when a backlog is presented) reusable candidates must be
-/// active backlog entries.
+/// owner-verified local permit), the overlay fence must exactly match the
+/// admitted fence, and (when a backlog is presented) reusable candidates must
+/// be active backlog entries.
+///
+/// The local/cross-task split is decided by the TASK, and only the task:
+///
+/// - `requesting_task_id == permit.target_task_id()` is local influence, and a
+///   presented carryover there is refused rather than ignored — the local
+///   admission already covers it, so accepting a second one would let an
+///   unrelated carryover ride along.
+/// - any other requesting task is a genuine carryover, and becomes eligible
+///   only with a [`CrossTaskCarryover`] whose record re-checks against the
+///   local admission and whose cross-task permit names THAT requesting task.
+///
+/// `requesting_campaign_id` is deliberately not part of the cross-task
+/// relation, because neither permit names a foreign campaign: a distinct
+/// cross-task admission binds the SAME source campaign by construction, so
+/// requiring the requesting campaign to equal it would make a real carryover
+/// from one campaign's task into another's unrepresentable. What IS pinned to
+/// the permit's source campaign is the learning material itself — the overlay's
+/// campaign, the reusable candidate's origin campaign — so no foreign
+/// campaign's learning can reach this gate. A request from the admitted task
+/// under a DIFFERENT campaign label is refused as cross-campaign leakage.
 pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDecision, BoundsError> {
     let now = request.now;
     let permit = request.verified.permit();
@@ -1919,34 +2118,55 @@ pub fn retrieve_governed(request: GovernedRetrieval<'_>) -> Result<RetrievalDeci
     {
         return Err(BoundsError::CrossCampaignLeakage);
     }
-    let local = request.requesting_campaign_id == source && request.requesting_task_id == target;
-    if !local {
-        let admission = request
-            .cross_task_admission
-            .ok_or(BoundsError::CrossTaskAdmissionMissing)?;
-        admission.validate()?;
-        if !admission.matches_permit(request.verified) {
-            return Err(BoundsError::CrossTaskAdmissionMismatch);
+    if request.requesting_task_id == target {
+        if request.requesting_campaign_id != source {
+            // The admitted task, asking under a campaign label that is not the
+            // campaign its learning belongs to. A distinct cross-task
+            // admission cannot rescue this: it binds the SAME source campaign
+            // by construction, so it can never name the other campaign. This
+            // is cross-campaign leakage, and it is refused before the
+            // local/cross-task split.
+            return Err(BoundsError::CrossCampaignLeakage);
         }
-        if request.requesting_task_id != target {
+        if request.cross_task.is_some() {
+            // Local influence is already covered by this admission; a
+            // carryover presented here does not belong to this retrieval.
             return Err(BoundsError::CrossTaskAdmissionMismatch);
         }
         return Ok(RetrievalDecision {
             overlay_id: request.overlay.overlay_id.clone(),
             reusable_candidate_id,
-            cross_task: true,
-            cross_task_admission_id: Some(admission.admission_id.clone()),
+            cross_task: false,
+            cross_task_admission_id: None,
+            cross_task_revalidation: None,
         });
     }
-
-    if request.cross_task_admission.is_some() {
-        return Err(BoundsError::CrossTaskAdmissionMismatch);
+    // Genuinely cross-task: the requesting task is NOT the task this local
+    // admission was issued for. The only way past is a distinct, owner-issued
+    // admission for THAT task plus the owner-issued record that revalidates
+    // scope, authority, retention, evaluator and rollback for it.
+    let carryover = request
+        .cross_task
+        .ok_or(BoundsError::CrossTaskAdmissionMissing)?;
+    carryover
+        .recheck(request.verified)
+        .map_err(BoundsError::CrossTaskAdmissionRefused)?;
+    if carryover.record().source_campaign_id != source {
+        return Err(BoundsError::CrossTaskScopeMismatch {
+            field: "source_campaign_id",
+        });
+    }
+    if carryover.cross_task_permit().target_task_id() != request.requesting_task_id {
+        return Err(BoundsError::CrossTaskScopeMismatch {
+            field: "requesting_task_id",
+        });
     }
     Ok(RetrievalDecision {
         overlay_id: request.overlay.overlay_id.clone(),
         reusable_candidate_id,
-        cross_task: false,
-        cross_task_admission_id: None,
+        cross_task: true,
+        cross_task_admission_id: Some(carryover.record().admission_id.clone()),
+        cross_task_revalidation: Some(carryover.revalidation()),
     })
 }
 
@@ -1987,7 +2207,8 @@ pub fn governed_assemble_campaign_learning_closure(
             reusable.closure_ref.as_deref(),
             gate.requesting_task_id,
             gate.requesting_campaign_id,
-            gate.cross_task_admission.map(|a| a.admission_id.as_str()),
+            gate.cross_task
+                .map(|carryover| carryover.record().admission_id.as_str()),
         )
         .map_err(GovernedClosureError::Bounds)?;
     }
@@ -2161,10 +2382,10 @@ pub fn governed_closure_assembly_admission(
 /// mapping its existing `gate` parameters (`gate.reusable.map(|r|
 /// r.origin_campaign_id)`, `gate.reusable.map(|r| r.closure_ref)`,
 /// `gate.requesting_task_id`, `gate.requesting_campaign_id`,
-/// `gate.cross_task_admission.map(|a| a.admission_id)`) into this helper and
-/// converting `BoundsError` into `GovernedClosureError::Bounds`. The wired
-/// call below follows exactly that mapping when a reusable is presented; a
-/// `None` reusable carries no closure candidate, so the helper is skipped.
+/// `gate.cross_task.map(|carryover| carryover.record().admission_id)`) into this
+/// helper and converting `BoundsError` into `GovernedClosureError::Bounds`. The
+/// wired call below follows exactly that mapping when a reusable is presented;
+/// a `None` reusable carries no closure candidate, so the helper is skipped.
 pub fn closure_candidate_usable_by_task(
     candidate_campaign_id: &str,
     candidate_closure_ref: Option<&str>,

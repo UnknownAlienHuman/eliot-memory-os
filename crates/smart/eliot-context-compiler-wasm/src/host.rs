@@ -10,9 +10,13 @@
 //! 2. Owner rebind: [`verify_learning_admission`] rebinds the presented
 //!    owner-issued permit to the live [`Governor`] and the compilation
 //!    fence. Stale epoch/generation/fence or tampering refuses here.
-//! 3. Host preflight: [`screen_admission_input_learning`] screens every
+//! 3. Compilation binding: the served task must be the task the presented
+//!    admission admits — the local one, or the foreign task a distinct
+//!    owner-issued cross-task carryover names — and the fence must be the
+//!    admitted one.
+//! 4. Host preflight: [`screen_admission_input_learning`] screens every
 //!    learning-marked atom in the input. Any violation refuses here.
-//! 4. Only then the real consumer invocation
+//! 5. Only then the real consumer invocation
 //!    ([`handle_request_typed`]) runs.
 //!
 //! Refusals return a typed [`GuestResponse`] with `native_calls == 0`,
@@ -25,6 +29,7 @@ use eliot_contracts::fences_match_exact;
 use eliot_governor::{
     Governor, LearningAdmissionError, LearningAdmissionPermit, verify_learning_admission,
 };
+use eliot_improvement::candidate_bounds::{CrossTaskCarryover, bound_compilation_task};
 
 use crate::conversion::{
     GuestError, GuestRequest, GuestResponse, check_envelope, handle_request_typed,
@@ -66,33 +71,53 @@ fn refused(request: &GuestRequest, error: GuestError) -> GuestResponse {
 
 /// Host preflight composition: verify, screen, then invoke.
 ///
-/// `permit` is the owner-issued admission presented alongside the request
-/// (opaque to transport; it never crosses the guest ABI). Every refusal
+/// `permit` is the owner-issued LOCAL admission presented alongside the request
+/// (opaque to transport; it never crosses the guest ABI). `cross_task` is the
+/// distinct owner-issued admission when the request compiles for another task,
+/// and must be `None` for a same-task compilation. It shares the local
+/// permit's lifetime because the compilation's expected task is resolved from
+/// the pair: they are one decision, not two independent inputs. Every refusal
 /// returns before the native gate runs.
-pub fn compile_learning_context(
+pub fn compile_learning_context<'a>(
     governor: &Governor,
-    permit: &LearningAdmissionPermit,
+    permit: &'a LearningAdmissionPermit,
+    cross_task: Option<&CrossTaskCarryover<'a>>,
     request: &GuestRequest,
     now_unix_secs: u64,
 ) -> GuestResponse {
     if let Err(error) = check_envelope(request) {
         return refused(request, error);
     }
-    // Compilation-level binding: the served task and fence must be the
-    // admitted ones. Per-atom bindings are re-checked in the screen below;
-    // this catches a foreign compilation embedding correctly-bound atoms.
-    if request.input.binding.task_id.as_str() != permit.target_task_id() {
-        return refused(request, GuestError::IdentityConflict);
-    }
-    if !fences_match_exact(&request.input.binding.state_fence, permit.fence()) {
-        return refused(request, GuestError::InvalidFence);
-    }
+    // Compilation-level binding: the served task must be the task the
+    // presented admission admits — the local one, or the foreign task a
+    // distinct carryover names — and the fence must be the admitted one.
+    // Per-atom bindings are re-checked in the screen below; this catches a
+    // foreign compilation embedding correctly-bound atoms. The carryover is
+    // re-checked against the local admission by the same shared rule the
+    // producer, the retrieval gate and the preflight screen use, so a bare or
+    // stale record cannot buy a foreign compilation here either. The fence
+    // comparison is repeated after the rebind on purpose: the rebind already
+    // refuses a drifted fence, and this keeps the compile-level fence claim
+    // explicit at the place that serves the request.
     let verified =
         match verify_learning_admission(governor, permit, &request.input.binding.state_fence) {
             Ok(verified) => verified,
             Err(error) => return refused(request, admission_error_to_guest(&error)),
         };
-    if let Err(error) = screen_admission_input_learning(&request.input, &verified, now_unix_secs) {
+    match bound_compilation_task(&verified, cross_task) {
+        Ok(bound_task) => {
+            if request.input.binding.task_id.as_str() != bound_task {
+                return refused(request, GuestError::IdentityConflict);
+            }
+        }
+        Err(_) => return refused(request, GuestError::IdentityConflict),
+    }
+    if !fences_match_exact(&request.input.binding.state_fence, permit.fence()) {
+        return refused(request, GuestError::InvalidFence);
+    }
+    if let Err(error) =
+        screen_admission_input_learning(&request.input, &verified, cross_task, now_unix_secs)
+    {
         return refused(request, GuestError::from(&error));
     }
     handle_request_typed(request)
