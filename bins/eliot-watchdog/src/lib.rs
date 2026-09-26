@@ -767,14 +767,20 @@ impl IndependentKernelSensor {
 
     /// Closes an open escalation episode after a live Governor admission.
     ///
-    /// A live admission is the only recovery signal the rule accepts. Spooled
-    /// intents are untouched here: they stay retained until the fenced Kernel
-    /// route acknowledges them.
+    /// A live admission is the only recovery signal the rule accepts. The
+    /// presenting Watchdog generation travels with it so a late success from a
+    /// superseded admission generation is refused instead of closing an episode
+    /// a newer generation is still advancing. Spooled intents are untouched
+    /// here: they stay retained, and unacknowledged, until the fenced Kernel
+    /// route acknowledges them. Closing claims no canonical resolution.
     pub fn observe_governor_recovered(&self) {
         let Ok(observed_at_ms) = current_unix_ms().map(|value| value.max(1)) else {
             return;
         };
-        match self.spool.observe_governor_recovery(observed_at_ms) {
+        match self
+            .spool
+            .observe_governor_recovery(self.watchdog_generation, observed_at_ms)
+        {
             Ok(true) => tracing::debug!(
                 event = "watchdog.intent_episode_closed",
                 observation = "reconciled",
@@ -893,22 +899,23 @@ impl IndependentKernelSensor {
                 return;
             }
         };
-        let outcome =
-            match self
-                .spool
-                .observe_governor_unavailability(proof, digest, lineage, observed_at_ms)
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    tracing::debug!(
-                        event = "watchdog.intent_spool_failed",
-                        observation = "fenced",
-                        detail = error.to_string().as_str(),
-                        "watchdog could not spool an intent; the observation stays an observation"
-                    );
-                    return;
-                }
-            };
+        let outcome = match self.spool.observe_governor_unavailability(
+            proof,
+            digest.as_str(),
+            lineage,
+            observed_at_ms,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.intent_spool_failed",
+                    observation = "fenced",
+                    detail = error.to_string().as_str(),
+                    "watchdog could not spool an intent; the observation stays an observation"
+                );
+                return;
+            }
+        };
         match outcome {
             GovernorIntentOutcome::Counting { consecutive } => {
                 tracing::debug!(

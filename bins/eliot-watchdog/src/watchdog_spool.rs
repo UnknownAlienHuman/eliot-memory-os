@@ -98,7 +98,8 @@ pub(crate) const SPOOL_EXPORT_CURSOR_TABLE: TableDefinition<u64, &[u8]> =
 ///
 /// The rule state lives in the same `watchdog.redb` file as the records it
 /// mints, so a restart cannot reset the threshold and silently skip
-/// escalation: only a live Governor admission closes an open episode.
+/// escalation: only a live Governor admission closes an open episode, and the
+/// episode survives a Problem emission and a Watchdog restart alike.
 pub(crate) const SPOOL_INTENT_RULE_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eliot_watchdog_spool_intent_rule_v1");
 /// Single-key cursor-style key of the rule-state row.
@@ -109,6 +110,11 @@ pub(crate) const SPOOL_INTENT_RULE_KEY: u64 = 0;
 /// is keyed by the retained Watchdog spool sequence, so one spool record can
 /// never acquire two receipts and a retry after a lost acknowledgement observes
 /// the existing receipt instead of submitting again.
+///
+/// Scope, stated exactly: this ledger is per spool **record**. It says nothing
+/// about how many intents an episode mints — an episode reaches each configured
+/// threshold once, which is the rule's own decision, not this ledger's — and a
+/// receipt never claims the Governor performed a canonical transition.
 pub(crate) const SPOOL_INTENT_RECEIPT_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eliot_watchdog_spool_intent_receipt_v1");
 /// Storage revision of one durable submit-once receipt.
@@ -734,10 +740,19 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Database(error.to_string()))
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "bounded spool retention, pressure marking, and high-water updates stay one atomic redb transaction"
-    )]
+    /// Appends one payload to the retained spool in its own bounded write
+    /// transaction.
+    ///
+    /// This is the ordinary record path. A caller that must commit a record
+    /// together with other durable state uses
+    /// [`Self::append_in_transaction`] instead, so the record and that state
+    /// share one owner transaction rather than a nested write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained spool, header, or high-water
+    /// fails validation, the sequence is exhausted or drifts, or the write
+    /// cannot be committed.
     pub(crate) fn append(
         &self,
         observed_at_ms: u64,
@@ -747,6 +762,41 @@ impl WatchdogSpool {
             .database
             .begin_write()
             .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let (outcome, _created) = Self::append_in_transaction(&write, observed_at_ms, payload)?;
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(outcome)
+    }
+
+    /// Appends one payload inside an already-open write transaction and returns
+    /// the exact entry that was created, together with the retention outcome.
+    ///
+    /// The returned entry is the appended payload's own record, not a later read
+    /// of the spool high-water mark and not the retention-pressure gap record
+    /// that may precede it: when retention pressure applies, this writes the
+    /// extra pressure-gap record and then the payload, and returns the payload
+    /// entry. A caller can therefore name the record it just created without an
+    /// interleaved append being able to substitute another entry's identity.
+    ///
+    /// Nothing is committed here. The caller owns the transaction, so a failure
+    /// before its commit leaves the whole retained spool and any other state it
+    /// wrote exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained spool, header, or high-water
+    /// fails validation, the sequence is exhausted or drifts, or the record
+    /// cannot be encoded.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded spool retention, pressure marking, and high-water updates stay one atomic redb transaction"
+    )]
+    fn append_in_transaction(
+        write: &WriteTransaction,
+        observed_at_ms: u64,
+        payload: WatchdogSpoolPayload,
+    ) -> Result<(SpoolAppendOutcome, WatchdogSpoolEntry), SpoolError> {
         let mut table = write
             .open_table(SPOOL_TABLE)
             .map_err(|error| SpoolError::Database(error.to_string()))?;
@@ -792,7 +842,7 @@ impl WatchdogSpool {
         let initial_bytes = encode_entry(&entry)?;
         let pressure = header.record_count >= SPOOL_MAX_RECORDS
             || header.bytes.saturating_add(initial_bytes.len() as u64) > SPOOL_MAX_BYTES;
-        let encoded_entries = if pressure {
+        let (encoded_entries, created_entry) = if pressure {
             let marker = WatchdogSpoolEntry {
                 schema_version: SPOOL_SCHEMA_VERSION,
                 sequence,
@@ -812,12 +862,16 @@ impl WatchdogSpool {
                 observed_at_ms,
                 payload,
             };
-            vec![
-                (sequence, encode_entry(&marker)?),
-                (entry_sequence, encode_entry(&entry)?),
-            ]
+            let created = entry.clone();
+            (
+                vec![
+                    (sequence, encode_entry(&marker)?),
+                    (entry_sequence, encode_entry(&entry)?),
+                ],
+                created,
+            )
         } else {
-            vec![(sequence, initial_bytes)]
+            (vec![(sequence, initial_bytes)], entry)
         };
         let total_bytes = encoded_entries
             .iter()
@@ -876,16 +930,12 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         drop(table);
         drop(high_water_table);
-        write
-            .commit()
-            .map(|()| {
-                if pressure {
-                    SpoolAppendOutcome::Pressure { evicted_records }
-                } else {
-                    SpoolAppendOutcome::Stored
-                }
-            })
-            .map_err(|error| SpoolError::Database(error.to_string()))
+        let outcome = if pressure {
+            SpoolAppendOutcome::Pressure { evicted_records }
+        } else {
+            SpoolAppendOutcome::Stored
+        };
+        Ok((outcome, created_entry))
     }
 
     /// Reads the durable high-water sequence without mutating any spool state.
@@ -906,24 +956,40 @@ impl WatchdogSpool {
             .ok_or_else(|| SpoolError::Corrupt("high-water metadata is missing".to_owned()))
     }
 
-    /// Counts one genuinely observed Governor-unavailability proof and mints a
+    /// Counts one genuinely observed Governor-unavailability proof and commits a
     /// spooled intent when the Watchdog-owned deterministic rule reaches a
     /// configured threshold.
     ///
     /// The proof is the only input: it is minted from a real admission-path or
     /// kernel-supervision rejection, never from a caller-chosen reason, so
     /// retention pressure and host-identity observations can never mint. The
-    /// rule reads and rewrites its durable counter in `watchdog.redb`, so a
-    /// restart cannot reset the threshold, and only
+    /// rule reads and rewrites its durable episode state in `watchdog.redb`, so
+    /// a restart cannot reset the threshold, and only
     /// [`Self::observe_governor_recovery`] closes an open episode.
     ///
-    /// Ordering is fail-closed in the safe direction: the intent record is
-    /// appended first and the closed rule state second. A rule-state write
-    /// that fails after a successful append therefore leaves the previous
-    /// counter in place, and the next observed proof mints again rather than
-    /// dropping an escalation. Every minted record is a distinct spool
-    /// sequence, so the Kernel-side exactly-once ledger still admits each of
-    /// them at most once.
+    /// Rule advancement and emission are one owner transaction. The expected
+    /// rule state is read and validated inside a single write transaction, one
+    /// observation is applied to it, any threshold intent is appended through
+    /// [`Self::append_in_transaction`] — never through a nested write — and the
+    /// advancement, the emission reference naming that exact created entry, and
+    /// the spool's own high-water updates all commit together. A failure before
+    /// that commit therefore leaves the old coherent state with no appended
+    /// record, and the returned identity always names the record this call
+    /// actually created rather than a later read of the global high-water mark.
+    ///
+    /// When the commit outcome is uncertain, the call reconciles the original
+    /// observation by its own preserved identity before deciding: if that
+    /// observation's emission is durable it returns that emission, and if it is
+    /// not, it reports the failure. Neither outcome can mint a second threshold
+    /// record for the same observation, so a retry reconciles rather than
+    /// remints.
+    ///
+    /// A replay of an admitted source observation that already crossed a
+    /// threshold reconciles that episode's existing emission and creates no
+    /// record. Emission is not episode closure: the episode stays open and keeps
+    /// counting toward the next threshold, and after the Incident threshold it
+    /// stays explicitly escalated while further failures produce bounded
+    /// non-emitting outcomes.
     ///
     /// The append is the only write: no ORS, canonical, or `HostStateJournal`
     /// write is reachable from this path.
@@ -931,39 +997,131 @@ impl WatchdogSpool {
     /// # Errors
     ///
     /// Returns [`SpoolError`] when the rule state or the record fails
-    /// validation, the evidence chain is empty or unbounded, or the spool
-    /// cannot be read or written.
+    /// validation, the episode state is not canonical for this observation, the
+    /// threshold evidence would exceed the bounded frame, or the spool cannot be
+    /// read or written.
     pub(crate) fn observe_governor_unavailability(
         &self,
         proof: intent::GovernorUnavailability,
-        observation_digest: String,
+        observation_digest: &str,
         lineage: intent::IntentLineage,
         observed_at_ms: u64,
     ) -> Result<intent::GovernorIntentOutcome, SpoolError> {
-        let mut state = self.read_intent_rule_state()?;
-        let observed = state.observe(observation_digest, proof.reason(), observed_at_ms)?;
-        let intent_class = match observed.decision {
-            intent::GovernorIntentDecision::Counting { consecutive } => {
-                self.write_intent_rule_state(&state)?;
-                return Ok(intent::GovernorIntentOutcome::Counting { consecutive });
+        let producer_generation = lineage.watchdog_generation();
+        let reason = proof.reason();
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let mut state = Self::read_intent_rule_state_in(&write)?;
+        let crossing = match state.classify_observation(observation_digest) {
+            intent::GovernorIntentObservationClass::AlreadyCommitted {
+                intent_class,
+                emission,
+            } => {
+                // The same admitted source observation already crossed this
+                // threshold and its record is durable. Reconcile that exact
+                // record; the transaction wrote nothing, so it is rolled back.
+                drop(write);
+                return Ok(Self::committed_intent_outcome(intent_class, &emission));
             }
-            intent::GovernorIntentDecision::ProblemIntent { .. } => {
-                intent::WatchdogIntentClass::Problem
+            intent::GovernorIntentObservationClass::AlreadyCounted => {
+                // Already counted inside this episode, so it is not a further
+                // failure. Nothing advances and nothing is minted.
+                drop(write);
+                return Ok(intent::GovernorIntentOutcome::Counting {
+                    consecutive: state.threshold_progress_observations,
+                });
             }
-            intent::GovernorIntentDecision::IncidentIntent { .. } => {
-                intent::WatchdogIntentClass::Incident
+            intent::GovernorIntentObservationClass::Observed => None,
+            intent::GovernorIntentObservationClass::ThresholdCrossing { intent_class } => {
+                Some(intent_class)
             }
         };
-        if observed.episode_evidence_refs.is_empty() {
+        let mut emission = None;
+        if let Some(intent_class) = crossing {
+            emission = Some(Self::commit_threshold_intent(
+                &write,
+                &state,
+                intent_class,
+                proof,
+                observation_digest,
+                lineage,
+                observed_at_ms,
+            )?);
+        }
+        state.record_observation(intent::GovernorIntentObservationRecord {
+            observation_digest: observation_digest.to_owned(),
+            reason,
+            observed_at_ms,
+            producer_generation,
+            emission: emission.clone(),
+        })?;
+        Self::write_intent_rule_state_in(&write, &state)?;
+        let emitted = match write.commit() {
+            Ok(()) => emission,
+            Err(error) => {
+                // The commit outcome is uncertain: it may or may not have
+                // applied. Reconcile this observation by its own identity before
+                // deciding, so the caller can never be handed a second threshold
+                // record for an observation that already has one.
+                match self.reconcile_committed_emission(observation_digest) {
+                    Some(reconciled) => Some(reconciled),
+                    None => return Err(SpoolError::Database(error.to_string())),
+                }
+            }
+        };
+        Ok(match emitted {
+            Some((intent_class, emitted)) => {
+                tracing::debug!(
+                    event = "watchdog.intent_spooled",
+                    observation = "committed",
+                    sequence = emitted.sequence,
+                    intent_kind = intent_class.as_str(),
+                    episode_closed = false,
+                    "watchdog committed a non-semantic intent record and its episode reference in one owner transaction; the episode stays open"
+                );
+                Self::committed_intent_outcome(intent_class, &emitted)
+            }
+            None => intent::GovernorIntentOutcome::Counting {
+                consecutive: state.threshold_progress_observations,
+            },
+        })
+    }
+
+    /// Appends the threshold intent this crossing observation committed, inside
+    /// the caller's already-open transaction, and returns the emission bound to
+    /// the exact record it created.
+    ///
+    /// Nothing here commits: the caller owns the single transaction that carries
+    /// rule advancement, the intent record and its high-water together.
+    fn commit_threshold_intent(
+        write: &redb::WriteTransaction,
+        state: &intent::GovernorIntentRuleState,
+        intent_class: intent::WatchdogIntentClass,
+        proof: intent::GovernorUnavailability,
+        observation_digest: &str,
+        lineage: intent::IntentLineage,
+        observed_at_ms: u64,
+    ) -> Result<(intent::WatchdogIntentClass, intent::GovernorIntentEmission), SpoolError> {
+        // The recording generation is the lineage's own, so it is read here
+        // rather than passed alongside it: one source, not two that can disagree.
+        let producer_generation = lineage.watchdog_generation();
+        // The threshold evidence of the episode including this crossing
+        // observation: exactly one digest per unit of threshold progress,
+        // and never more than the bounded evidence frame.
+        let mut evidence_refs = state.episode_evidence_refs();
+        evidence_refs.push(observation_digest.to_owned());
+        if evidence_refs.len() > intent::MAX_INTENT_EVIDENCE_REFS {
             return Err(SpoolError::Corrupt(
-                "watchdog intent episode carries no evidence reference".to_owned(),
+                "watchdog intent episode threshold evidence exceeds the bounded frame".to_owned(),
             ));
         }
-        let record = match intent_class {
+        let payload = match intent_class {
             intent::WatchdogIntentClass::Problem => intent::ProblemIntentRecord::new(
                 proof,
                 SERVICE_NAME.to_owned(),
-                observed.episode_evidence_refs,
+                evidence_refs,
                 lineage,
                 observed_at_ms,
             )?
@@ -971,58 +1129,120 @@ impl WatchdogSpool {
             intent::WatchdogIntentClass::Incident => intent::IncidentIntentRecord::new(
                 proof,
                 SERVICE_NAME.to_owned(),
-                observed.episode_evidence_refs,
+                evidence_refs,
                 lineage,
                 observed_at_ms,
             )?
             .to_payload(),
         };
-        self.append(observed_at_ms, record)?;
-        let sequence = self.high_water_sequence()?;
-        self.write_intent_rule_state(&state)?;
-        let reference = intent::WatchdogIntentRecordRef {
-            sequence,
+        let (_outcome, created) = Self::append_in_transaction(write, observed_at_ms, payload)?;
+        // The identity of the record this transaction just created, bound the
+        // same way an export batch binds it. A retention-pressure gap record
+        // written ahead of it can never be mistaken for the intent, and an
+        // interleaved append can never substitute another entry's sequence.
+        let raw = encode_entry(&created)?;
+        let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
+        Ok((
             intent_class,
-            observed_at_ms,
-            record_digest: self.intent_record_digest(sequence)?,
+            intent::GovernorIntentEmission {
+                sequence: created.sequence,
+                record_digest,
+                observation_digest: observation_digest.to_owned(),
+                observed_at_ms,
+                producer_generation,
+            },
+        ))
+    }
+
+    /// Projects one already-committed threshold emission onto its outcome.
+    fn committed_intent_outcome(
+        intent_class: intent::WatchdogIntentClass,
+        emission: &intent::GovernorIntentEmission,
+    ) -> intent::GovernorIntentOutcome {
+        let reference = intent::WatchdogIntentRecordRef {
+            sequence: emission.sequence,
+            intent_class,
+            observed_at_ms: emission.observed_at_ms,
+            record_digest: emission.record_digest.clone(),
         };
-        tracing::debug!(
-            event = "watchdog.intent_spooled",
-            observation = "stored",
-            sequence = reference.sequence,
-            intent_kind = reference.intent_class.as_str(),
-            "watchdog stored a non-semantic intent record in its own store"
-        );
-        Ok(match intent_class {
+        match intent_class {
             intent::WatchdogIntentClass::Problem => {
                 intent::GovernorIntentOutcome::ProblemIntent(reference)
             }
             intent::WatchdogIntentClass::Incident => {
                 intent::GovernorIntentOutcome::IncidentIntent(reference)
             }
-        })
+        }
+    }
+
+    /// Reconciles the emission a rule row already holds for exactly this
+    /// admitted source observation.
+    fn reconcile_committed_emission(
+        &self,
+        observation_digest: &str,
+    ) -> Option<(intent::WatchdogIntentClass, intent::GovernorIntentEmission)> {
+        self.read_intent_rule_state()
+            .ok()
+            .and_then(|state| state.committed_emission(observation_digest))
     }
 
     /// Closes an open deterministic-rule episode after a live Governor
-    /// admission, and returns whether an episode was actually open.
+    /// admission, and returns whether an episode was actually closed.
     ///
     /// A live admission is the only recovery signal the rule accepts: it never
-    /// resets on a timer, on a restart, or on a caller-chosen reason, and it
-    /// never touches a spooled intent (those stay retained until the fenced
-    /// Kernel route acknowledges them).
+    /// resets on a timer, on a restart, on an export acknowledgement, or on a
+    /// caller-chosen reason. `presenting_generation` is the Watchdog generation
+    /// of that admission, and a recovery presented by a generation older than
+    /// the one that last advanced the episode is refused as obsolete, so a late
+    /// success from a superseded admission generation cannot close it.
+    ///
+    /// Recovery is serialized against observations under the same writer
+    /// discipline: the episode and its revision are re-read and re-validated
+    /// inside one write transaction, and a recovery that predates the newest
+    /// accepted outage observation is refused, so a later recovery can neither
+    /// silently overwrite a concurrently accepted newer observation nor report a
+    /// refusal as a closure.
+    ///
+    /// Closing withdraws nothing. It claims no canonical resolution: the
+    /// episode's spooled intents stay retained and unacknowledged until the
+    /// fenced Kernel route reconciles them, and it never touches their records,
+    /// their submit-once receipts, or the spool itself.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError`] when the rule state is not canonical, the
-    /// timestamp is uninitialized, or the state cannot be written.
+    /// Returns [`SpoolError`] when the rule state is not canonical, the recovery
+    /// identity is uninitialized, or the state cannot be written.
     pub(crate) fn observe_governor_recovery(
         &self,
+        presenting_generation: u64,
         observed_at_ms: u64,
     ) -> Result<bool, SpoolError> {
-        let mut state = self.read_intent_rule_state()?;
-        let was_open = state.close_episode(observed_at_ms)?;
-        self.write_intent_rule_state(&state)?;
-        Ok(was_open)
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let mut state = Self::read_intent_rule_state_in(&write)?;
+        let closed_episode_id = match state.close_episode(presenting_generation, observed_at_ms)? {
+            // Nothing changed in either case, so the uncommitted transaction is
+            // dropped and the caller is told no episode was closed by this call.
+            intent::GovernorEpisodeClosure::AlreadyClosed
+            | intent::GovernorEpisodeClosure::Obsolete => {
+                drop(write);
+                return Ok(false);
+            }
+            intent::GovernorEpisodeClosure::Closed { episode_id } => episode_id,
+        };
+        Self::write_intent_rule_state_in(&write, &state)?;
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        tracing::debug!(
+            event = "watchdog.intent_episode_closed",
+            observation = "reconciled",
+            episode = closed_episode_id.as_str(),
+            "live Governor admission closed one open watchdog intent episode; its unacknowledged intents stay retained"
+        );
+        Ok(true)
     }
 
     /// Returns a bounded window of retained Watchdog intents that have no
@@ -1076,14 +1296,20 @@ impl WatchdogSpool {
 
     /// Persists the durable submit-once receipt for one reconciled intent.
     ///
-    /// This is the exactly-once boundary of fenced-Kernel reconciliation. A
-    /// first call for a retained sequence writes the receipt and reports
+    /// This is the exactly-once boundary of fenced-Kernel reconciliation, and
+    /// its scope is one retained spool record. A first call for a retained
+    /// sequence writes the receipt and reports
     /// [`IntentSubmissionDisposition::Recorded`]. Any later call for the same
     /// sequence observes [`IntentSubmissionDisposition::AlreadySubmitted`]
-    /// without writing, which is exactly what a retry after a lost
-    /// acknowledgement must see. A repeated call that carries a different
-    /// reconciliation key or a different acknowledgement digest is an identity
-    /// conflict and fails closed instead of overwriting the ledger.
+    /// without writing, which is what a retry after a lost acknowledgement must
+    /// see. A repeated call that carries a different reconciliation key or a
+    /// different acknowledgement digest is an identity conflict and fails closed
+    /// instead of overwriting the ledger.
+    ///
+    /// It is not episode-level deduplication and not a canonical-resolution
+    /// claim: how many intents an episode mints is the rule's own decision, and
+    /// a committed receipt says the fenced Kernel accepted this one record, not
+    /// that the Governor transitioned anything.
     ///
     /// # Errors
     ///
@@ -1139,6 +1365,12 @@ impl WatchdogSpool {
 
     /// Reads the durable deterministic-rule state, or the closed state of a
     /// spool that has never observed a Governor-unavailability proof.
+    ///
+    /// Read-only: this opens a read transaction and writes nothing, so it is the
+    /// reconciliation read after an uncertain commit rather than a mutation
+    /// path. A caller that is about to advance the rule uses
+    /// [`Self::read_intent_rule_state_in`] inside its own write transaction
+    /// instead.
     fn read_intent_rule_state(&self) -> Result<intent::GovernorIntentRuleState, SpoolError> {
         let read = self
             .database
@@ -1158,29 +1390,50 @@ impl WatchdogSpool {
         }
     }
 
-    /// Persists one deterministic-rule state inside its own bounded write
+    /// Reads and validates the deterministic-rule state inside a caller's write
     /// transaction.
-    fn write_intent_rule_state(
-        &self,
+    ///
+    /// Reading through the same transaction that will write the row is what
+    /// makes rule advancement and the emission it mints one owner transaction:
+    /// the state this call validates is the state it replaces, with no
+    /// interleaved writer able to move it in between.
+    fn read_intent_rule_state_in(
+        write: &WriteTransaction,
+    ) -> Result<intent::GovernorIntentRuleState, SpoolError> {
+        match write.open_table(SPOOL_INTENT_RULE_TABLE) {
+            Ok(table) => table
+                .get(SPOOL_INTENT_RULE_KEY)
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .map(|value| decode_intent_rule_state(value.value()))
+                .transpose()
+                .map(|state| state.unwrap_or_else(intent::GovernorIntentRuleState::fresh)),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                Ok(intent::GovernorIntentRuleState::fresh())
+            }
+            Err(error) => Err(SpoolError::Database(error.to_string())),
+        }
+    }
+
+    /// Persists one deterministic-rule state inside a caller's write
+    /// transaction.
+    ///
+    /// It never opens a transaction of its own, so a caller can commit the rule
+    /// advancement, the threshold intent it minted, and the spool's own
+    /// high-water update as one atomic change. A failure before the caller's
+    /// commit leaves the previously stored rule state exactly as it was.
+    fn write_intent_rule_state_in(
+        write: &WriteTransaction,
         state: &intent::GovernorIntentRuleState,
     ) -> Result<(), SpoolError> {
         state.validate()?;
         let bytes = encode_intent_rule_state(state)?;
-        let write = self
-            .database
-            .begin_write()
+        let mut table = write
+            .open_table(SPOOL_INTENT_RULE_TABLE)
             .map_err(|error| SpoolError::Database(error.to_string()))?;
-        {
-            let mut table = write
-                .open_table(SPOOL_INTENT_RULE_TABLE)
-                .map_err(|error| SpoolError::Database(error.to_string()))?;
-            table
-                .insert(SPOOL_INTENT_RULE_KEY, bytes.as_slice())
-                .map_err(|error| SpoolError::Database(error.to_string()))?;
-        }
-        write
-            .commit()
-            .map_err(|error| SpoolError::Database(error.to_string()))
+        table
+            .insert(SPOOL_INTENT_RULE_KEY, bytes.as_slice())
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(())
     }
 
     /// Reads every retained sequence that already holds a submit-once receipt.
@@ -1210,23 +1463,6 @@ impl WatchdogSpool {
             sequences.push(receipt.sequence);
         }
         Ok(sequences)
-    }
-
-    /// Recomputes the record digest of one retained sequence, so the returned
-    /// intent reference binds exactly what a later export batch binds.
-    fn intent_record_digest(&self, sequence: u64) -> Result<String, SpoolError> {
-        let entries = self.readback()?;
-        let entry = entries
-            .iter()
-            .find(|entry| entry.sequence == sequence)
-            .ok_or_else(|| {
-                SpoolError::Corrupt(
-                    "watchdog intent record is not retained after its append".to_owned(),
-                )
-            })?;
-        let raw = encode_entry(entry)?;
-        let (_, record_digest) = export_record_digests(entry, &raw);
-        Ok(record_digest)
     }
 
     /// Reads the stored Watchdog-owned export cursor.
@@ -1604,6 +1840,28 @@ struct WatchdogIntentRuleStateRecord {
     state: intent::GovernorIntentRuleState,
 }
 
+/// Storage encoding of one superseded deterministic-rule state row.
+///
+/// It exists so an existing row is read strictly and then explicitly
+/// dispositioned, never reinterpreted as current state and never treated as
+/// fresh empty state.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogIntentRuleStateLegacyRecord {
+    schema_version: u16,
+    state: intent::GovernorIntentRuleStateLegacy,
+}
+
+/// Reads only the storage revision of a stored rule row.
+///
+/// The row also carries the state itself, so this deliberately does not deny
+/// unknown fields: it exists solely to choose the strict decoder for the exact
+/// revision that was written, before any state is interpreted.
+#[derive(serde::Deserialize)]
+struct WatchdogIntentRuleStateRevision {
+    schema_version: u16,
+}
+
 fn encode_intent_rule_state(
     state: &intent::GovernorIntentRuleState,
 ) -> Result<Vec<u8>, SpoolError> {
@@ -1614,19 +1872,51 @@ fn encode_intent_rule_state(
     serde_json::to_vec(&record).map_err(|error| SpoolError::Serialization(error.to_string()))
 }
 
+/// Decodes one stored rule row under the exact revision that wrote it.
+///
+/// A current row is decoded strictly and validated. A superseded row is decoded
+/// strictly as the superseded shape and carried forward with an explicit
+/// incomplete-history disposition. Any other revision, and any row that does not
+/// decode, fails closed as corruption: neither becomes fresh empty state, and a
+/// rule whose history cannot be read never silently restarts its escalation.
 fn decode_intent_rule_state(bytes: &[u8]) -> Result<intent::GovernorIntentRuleState, SpoolError> {
-    let record: WatchdogIntentRuleStateRecord = serde_json::from_slice(bytes).map_err(|error| {
-        SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
-    })?;
-    if record.schema_version != intent::INTENT_RULE_SCHEMA_VERSION
-        || record.state.schema_version != record.schema_version
-    {
-        return Err(SpoolError::Corrupt(
-            "watchdog intent rule state schema is unsupported".to_owned(),
-        ));
+    let revision: WatchdogIntentRuleStateRevision =
+        serde_json::from_slice(bytes).map_err(|error| {
+            SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
+        })?;
+    match revision.schema_version {
+        intent::INTENT_RULE_SCHEMA_VERSION => {
+            let record: WatchdogIntentRuleStateRecord =
+                serde_json::from_slice(bytes).map_err(|error| {
+                    SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
+                })?;
+            if record.state.schema_version != record.schema_version {
+                return Err(SpoolError::Corrupt(
+                    "watchdog intent rule state schema drifted from its storage row".to_owned(),
+                ));
+            }
+            record.state.validate()?;
+            Ok(record.state)
+        }
+        intent::INTENT_RULE_LEGACY_SCHEMA_VERSION => {
+            let record: WatchdogIntentRuleStateLegacyRecord = serde_json::from_slice(bytes)
+                .map_err(|error| {
+                    SpoolError::Corrupt(format!("watchdog intent rule state is invalid: {error}"))
+                })?;
+            if record.state.schema_version != record.schema_version {
+                return Err(SpoolError::Corrupt(
+                    "watchdog intent rule state schema drifted from its storage row".to_owned(),
+                ));
+            }
+            let state = record.state.dispositioned();
+            state.validate()?;
+            Ok(state)
+        }
+        _ => Err(SpoolError::Corrupt(format!(
+            "watchdog intent rule state schema {} is unsupported",
+            revision.schema_version
+        ))),
     }
-    record.state.validate()?;
-    Ok(record.state)
 }
 
 /// Storage encoding of one durable submit-once reconciliation receipt.
