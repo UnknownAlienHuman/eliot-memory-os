@@ -3215,26 +3215,11 @@ pub fn run_ordinary_request_loop() -> Result<OrdinaryOutcome, OrdinaryDriveError
                 // same spent grant as Replay. Preserve the staged identity;
                 // the final projection may reuse an outcome only when this
                 // identity exactly matches the one served in this process.
-                if outcome.is_none() {
-                    // Cross-restart replay with nothing retained in this
-                    // process: drain the exact-identity staged set plus its
-                    // marker so the residue does not repeat every drive.
-                    // Grant-only matches (another operation under the spent
-                    // grant) are not ours to delete — a bounded fixed-name
-                    // residual the owner must retire, still reported
-                    // explicitly below, never as absence.
-                    let exact = served.as_ref() == Some(&identity)
-                        || served_marker
-                            .as_ref()
-                            .is_some_and(|mark| mark.names(&identity));
-                    if exact
-                        && let Some(directory) = crate::dispatch_material::admitted_material_path()
-                            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-                    {
-                        let _ =
-                            crate::dispatch_material::reclaim_claimed_delivery(&claim, &directory);
-                    }
-                }
+                // A replay without a matching in-process outcome has no
+                // durable result or acknowledgement to authorize reclamation.
+                // Keep the claimed set and served marker as local identity
+                // evidence; the projection below reports DeliveryInProgress
+                // with this exact identity until an owner can reconcile it.
                 replayed = Some(identity);
                 break;
             }
