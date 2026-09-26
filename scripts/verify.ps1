@@ -2,9 +2,9 @@
 param(
     # NOTE: $Profile intentionally shadows the automatic PowerShell home-path
     # variable inside this script scope. Here it selects the closed
-    # verification profile (issue #750). No other profile/command/ref input
-    # exists; ValidateSet rejects arbitrary profile text.
-    [ValidateSet('Quick', 'Review')]
+    # verification profile (issues #750, #3004). No other profile/command/ref
+    # input exists; ValidateSet rejects arbitrary profile text.
+    [ValidateSet('Quick', 'Review', 'MergeCompile')]
     [string] $Profile = 'Quick',
     [switch] $List,
     [switch] $SkipCargoCheck
@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 # Retired skip switch (issue #750): -SkipCargoCheck is explicitly rejected.
 # No invocation carrying a skip may emit a passing result under any profile.
 if ($SkipCargoCheck) {
-    [Console]::Error.WriteLine('VERIFY_REJECTED: -SkipCargoCheck is retired and cannot yield a passing result. Run -Profile Quick or -Profile Review without skips.')
+    [Console]::Error.WriteLine('VERIFY_REJECTED: -SkipCargoCheck is retired and cannot yield a passing result. Run -Profile Quick, -Profile Review or -Profile MergeCompile without skips.')
     exit 1
 }
 
@@ -40,39 +40,44 @@ $dependencyPolicyReceiptPath = Join-Path $repoRoot (
     Join-Path '.eliot' ('dependency-policy-run-{0}.json' -f [Guid]::NewGuid().ToString('N'))
 )
 
-# Sole ordered gate-definition owner (issue #750). Wrappers (Justfile, CI)
-# select a closed profile only; they must not duplicate these commands.
-# Quick = every gate this script ran on base, in base order. Review = the same
-# oracle block, then the locked cargo tail in the exact issue order:
-# metadata, fmt, check, clippy, test, deny. Each gate runs once per invocation.
+# Sole ordered gate-definition owner (issues #750, #3004). Wrappers
+# (Justfile, CI) select a closed profile only; they must not duplicate these
+# commands. Quick = every gate this script ran on base, in base order.
+# Review = the same oracle block, then the locked cargo tail in the exact
+# issue order: metadata, fmt, check, clippy, test, deny. MergeCompile = the
+# shared oracle block (with the standalone verifier in compile-only mode),
+# then metadata, fmt, check, denominator, test-compile (no-run), bounded
+# changed-package clippy with normal warning semantics, standalone compile,
+# and locked Operator restore/build with zero test execution. Quick and Review
+# behavior is unchanged. Each gate runs once per invocation.
 $allGates = @(
-    [pscustomobject]@{ Name = 'documentation-shards-self-test'; Profiles = @('Quick', 'Review'); Command = { python $docsShardVerifier self-test } },
-    [pscustomobject]@{ Name = 'documentation-shards'; Profiles = @('Quick', 'Review'); Command = { python $docsShardVerifier verify --root $repoRoot } },
-    [pscustomobject]@{ Name = 'documentation-routes-self-test'; Profiles = @('Quick', 'Review'); Command = { python $docsRouter self-test } },
-    [pscustomobject]@{ Name = 'documentation-routes'; Profiles = @('Quick', 'Review'); Command = { python $docsRouter check --root $repoRoot } },
-    [pscustomobject]@{ Name = 'documentation-read-self-test'; Profiles = @('Quick', 'Review'); Command = { python $docsReader self-test } },
-    [pscustomobject]@{ Name = 'documentation-code-conformance-self-test'; Profiles = @('Quick', 'Review'); Command = { python $docCodeConformanceVerifier --self-test } },
-    [pscustomobject]@{ Name = 'documentation-code-conformance'; Profiles = @('Quick', 'Review'); Command = { python $docCodeConformanceVerifier --root $repoRoot } },
-    [pscustomobject]@{ Name = 'code-navigation-self-test'; Profiles = @('Quick', 'Review'); Command = { python $codeNavigation self-test } },
-    [pscustomobject]@{ Name = 'code-navigation'; Profiles = @('Quick', 'Review'); Command = { python $codeNavigation check --root $repoRoot } },
-    [pscustomobject]@{ Name = 'documentation-closure-audit'; Profiles = @('Quick', 'Review'); Command = { python $docsClosureAudit --root $repoRoot } },
-    [pscustomobject]@{ Name = 'documentation-evidence-check-self-test'; Profiles = @('Quick', 'Review'); Command = { python $docsEvidenceCheck --self-test } },
+    [pscustomobject]@{ Name = 'documentation-shards-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsShardVerifier self-test } },
+    [pscustomobject]@{ Name = 'documentation-shards'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsShardVerifier verify --root $repoRoot } },
+    [pscustomobject]@{ Name = 'documentation-routes-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsRouter self-test } },
+    [pscustomobject]@{ Name = 'documentation-routes'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsRouter check --root $repoRoot } },
+    [pscustomobject]@{ Name = 'documentation-read-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsReader self-test } },
+    [pscustomobject]@{ Name = 'documentation-code-conformance-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docCodeConformanceVerifier --self-test } },
+    [pscustomobject]@{ Name = 'documentation-code-conformance'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docCodeConformanceVerifier --root $repoRoot } },
+    [pscustomobject]@{ Name = 'code-navigation-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $codeNavigation self-test } },
+    [pscustomobject]@{ Name = 'code-navigation'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $codeNavigation check --root $repoRoot } },
+    [pscustomobject]@{ Name = 'documentation-closure-audit'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsClosureAudit --root $repoRoot } },
+    [pscustomobject]@{ Name = 'documentation-evidence-check-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsEvidenceCheck --self-test } },
     [pscustomobject]@{ Name = 'standalone-crates'; Profiles = @('Quick', 'Review'); Command = { python $standaloneCrates --root $repoRoot } },
-    [pscustomobject]@{ Name = 'core-daemon-inventory-self-test'; Profiles = @('Quick', 'Review'); Command = { python $coreDaemonInventoryVerifier --self-test } },
-    [pscustomobject]@{ Name = 'core-daemon-inventory'; Profiles = @('Quick', 'Review'); Command = { python $coreDaemonInventoryVerifier --root $repoRoot } },
-    [pscustomobject]@{ Name = 'normative-pair'; Profiles = @('Quick', 'Review'); Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') } },
-    [pscustomobject]@{ Name = 'dependency-policy-self-test'; Profiles = @('Quick', 'Review'); Command = { python $dependencyPolicyVerifier --self-test } },
-    [pscustomobject]@{ Name = 'dependency-policy-offline'; Profiles = @('Quick', 'Review'); Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source --receipt-out $dependencyPolicyReceiptPath } },
-    [pscustomobject]@{ Name = 'architecture-boundaries-self-test'; Profiles = @('Quick', 'Review'); Command = { python $architectureAudit --self-test } },
-    [pscustomobject]@{ Name = 'architecture-boundaries'; Profiles = @('Quick', 'Review'); Command = { python $architectureAudit --root $repoRoot } },
-    [pscustomobject]@{ Name = 'agent-guardrails-self-test'; Profiles = @('Quick', 'Review'); Command = { python $guardrailVerifier --self-test } },
-    [pscustomobject]@{ Name = 'agent-guardrails'; Profiles = @('Quick', 'Review'); Command = { python $guardrailVerifier --root $repoRoot } },
-    [pscustomobject]@{ Name = 'agent-route-bundles-self-test'; Profiles = @('Quick', 'Review'); Command = { python $agentRouteBundleVerifier --self-test } },
-    [pscustomobject]@{ Name = 'agent-route-bundles'; Profiles = @('Quick', 'Review'); Command = { python $agentRouteBundleVerifier --root $repoRoot } },
-    [pscustomobject]@{ Name = 'runtime-source-hygiene-self-test'; Profiles = @('Quick', 'Review'); Command = { python $runtimeHygieneAudit --self-test } },
-    [pscustomobject]@{ Name = 'runtime-source-hygiene'; Profiles = @('Quick', 'Review'); Command = { python $runtimeHygieneAudit --root $repoRoot } },
-    [pscustomobject]@{ Name = 'agent-bridge-protocol-self-test'; Profiles = @('Quick', 'Review'); Command = { python $agentBridgeProtocolVerifier --self-test } },
-    [pscustomobject]@{ Name = 'agent-bridge-protocol'; Profiles = @('Quick', 'Review'); Command = { python $agentBridgeProtocolVerifier --root $repoRoot } },
+    [pscustomobject]@{ Name = 'core-daemon-inventory-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $coreDaemonInventoryVerifier --self-test } },
+    [pscustomobject]@{ Name = 'core-daemon-inventory'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $coreDaemonInventoryVerifier --root $repoRoot } },
+    [pscustomobject]@{ Name = 'normative-pair'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') } },
+    [pscustomobject]@{ Name = 'dependency-policy-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $dependencyPolicyVerifier --self-test } },
+    [pscustomobject]@{ Name = 'dependency-policy-offline'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source --receipt-out $dependencyPolicyReceiptPath } },
+    [pscustomobject]@{ Name = 'architecture-boundaries-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $architectureAudit --self-test } },
+    [pscustomobject]@{ Name = 'architecture-boundaries'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $architectureAudit --root $repoRoot } },
+    [pscustomobject]@{ Name = 'agent-guardrails-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $guardrailVerifier --self-test } },
+    [pscustomobject]@{ Name = 'agent-guardrails'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $guardrailVerifier --root $repoRoot } },
+    [pscustomobject]@{ Name = 'agent-route-bundles-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $agentRouteBundleVerifier --self-test } },
+    [pscustomobject]@{ Name = 'agent-route-bundles'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $agentRouteBundleVerifier --root $repoRoot } },
+    [pscustomobject]@{ Name = 'runtime-source-hygiene-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $runtimeHygieneAudit --self-test } },
+    [pscustomobject]@{ Name = 'runtime-source-hygiene'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $runtimeHygieneAudit --root $repoRoot } },
+    [pscustomobject]@{ Name = 'agent-bridge-protocol-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $agentBridgeProtocolVerifier --self-test } },
+    [pscustomobject]@{ Name = 'agent-bridge-protocol'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $agentBridgeProtocolVerifier --root $repoRoot } },
     # Deviation note vs issue #750 text (which lists `cargo metadata --locked
     # --format-version 1` without --no-deps): this gate retains the base oracle
     # `cargo metadata --locked --no-deps --format-version 1`, identical to the
@@ -82,13 +87,13 @@ $allGates = @(
     # and I18-27 forbids silently changing an owned oracle definition. Full
     # locked dependency resolution is still enforced by the --locked cargo
     # check/clippy/test gates plus the dependency-policy offline-source gate.
-    [pscustomobject]@{ Name = 'cargo-metadata'; Profiles = @('Quick', 'Review'); Command = { $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String) } },
+    [pscustomobject]@{ Name = 'cargo-metadata'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String) } },
     # To prevent Windows command-line limit failures (os error 206) when
     # cargo fmt passes all workspace files to rustfmt on deep worktree paths,
     # workspace packages are formatted in bounded batches with -p.
     [pscustomobject]@{
         Name = 'cargo-fmt'
-        Profiles = @('Quick', 'Review')
+        Profiles = @('Quick', 'Review', 'MergeCompile')
         Command = {
             if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
                 $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
@@ -119,22 +124,173 @@ $allGates = @(
             }
         }
     },
-    [pscustomobject]@{ Name = 'cargo-check-workspace'; Profiles = @('Quick', 'Review'); Command = { cargo check --locked --workspace --all-targets } },
+    [pscustomobject]@{ Name = 'cargo-check-workspace'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { cargo check --locked --workspace --all-targets } },
     [pscustomobject]@{ Name = 'cargo-clippy-workspace'; Profiles = @('Review'); Command = { cargo clippy --locked --workspace --all-targets -- -D warnings } },
     [pscustomobject]@{ Name = 'cargo-test-workspace'; Profiles = @('Review'); Command = { cargo test --locked --workspace } },
     [pscustomobject]@{ Name = 'cargo-deny'; Profiles = @('Review'); Command = {
         # Review's "cargo deny check" contract is executed by the pinned private-copy runner.
         python $dependencyPolicyVerifier --root $repoRoot --profile current-advisories --receipt-out $dependencyPolicyReceiptPath
-    } }
+    } },
+    # MergeCompile-only tail (accepted issue #3004). Review order above is
+    # unchanged; these gates run only under -Profile MergeCompile.
+    [pscustomobject]@{
+        Name = 'cargo-denominator'
+        Profiles = @('MergeCompile')
+        Command = {
+            # Deterministic denominator receipt derived at runtime from locked
+            # cargo metadata plus the standalone/excluded discovery owner. No
+            # hand-maintained package, target, binary, or standalone counts.
+            if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
+                $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
+            }
+            $denominatorMetadata = $script:verifyMetadataJson | ConvertFrom-Json
+            $denominatorPackages = @($denominatorMetadata.packages | Sort-Object -Property id)
+            Write-Host "VERIFY_DENOMINATOR: workspace_packages=$($denominatorPackages.Count)"
+            foreach ($denominatorPackage in $denominatorPackages) {
+                $denominatorTargets = @($denominatorPackage.targets | Sort-Object -Property name | ForEach-Object { "$($_.kind -join '+'):$($_.name)" })
+                Write-Host "VERIFY_DENOMINATOR_PACKAGE: $($denominatorPackage.id) manifest=$($denominatorPackage.manifest_path) targets=$($denominatorTargets -join ',')"
+            }
+            $denominatorStandalone = (python $standaloneCrates --root $repoRoot --list | Out-String)
+            $denominatorListExit = $LASTEXITCODE
+            if ($denominatorListExit -ne 0) {
+                throw "standalone discovery list failed with exit $denominatorListExit"
+            }
+            foreach ($denominatorLine in ($denominatorStandalone -split "`n")) {
+                $denominatorTrimmed = $denominatorLine.Trim()
+                if (-not [string]::IsNullOrWhiteSpace($denominatorTrimmed)) {
+                    Write-Host "VERIFY_DENOMINATOR_STANDALONE: $denominatorTrimmed"
+                }
+            }
+        }
+    },
+    [pscustomobject]@{ Name = 'cargo-test-compile'; Profiles = @('MergeCompile'); Command = { cargo test --locked --workspace --all-targets --no-run } },
+    [pscustomobject]@{
+        Name = 'cargo-clippy-changed'
+        Profiles = @('MergeCompile')
+        Command = {
+            # Bounded Clippy over directly changed workspace packages with
+            # normal warning semantics: compilation errors block, existing
+            # warnings are reported, and this profile claims no workspace lint
+            # cleanliness and uses no `-D warnings` oracle. Changed files map
+            # to packages by longest manifest-directory prefix from locked
+            # metadata; root-wide inputs (workspace manifest/lock, toolchain,
+            # workflows, scripts, config) or an unmappable candidate widen the
+            # scope to the full workspace, which still covers every changed
+            # package. Every selection carries its path-to-package reason.
+            if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
+                $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
+            }
+            $clippyMetadata = $script:verifyMetadataJson | ConvertFrom-Json
+            $clippyPackageByDir = @{}
+            foreach ($clippyPackage in @($clippyMetadata.packages)) {
+                $clippyPackageByDir[[IO.Path]::GetDirectoryName($clippyPackage.manifest_path)] = $clippyPackage.name
+            }
+            $clippyBase = ''
+            if (-not [string]::IsNullOrWhiteSpace($env:MERGE_COMPILE_BASE_SHA) -and $env:MERGE_COMPILE_BASE_SHA -match '^[0-9a-fA-F]{40}$') {
+                $clippyBase = $env:MERGE_COMPILE_BASE_SHA.Trim()
+            } else {
+                try {
+                    $clippyBase = ((git merge-base HEAD origin/main) | Out-String).Trim()
+                } catch {
+                    $clippyBase = ''
+                }
+            }
+            $clippyRootWide = @()
+            $clippySelected = @{}
+            if ([string]::IsNullOrWhiteSpace($clippyBase)) {
+                $clippyRootWide += 'no base revision for changed-package mapping'
+            } else {
+                $clippyDiffRaw = (git diff --name-only $clippyBase HEAD | Out-String)
+                $clippyDiffExit = $LASTEXITCODE
+                if ($clippyDiffExit -ne 0) {
+                    $clippyRootWide += 'change-set command failed; widened to workspace'
+                } else {
+                    $clippyChanged = @($clippyDiffRaw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+                    if ($clippyChanged.Count -eq 0) {
+                        $clippyRootWide += 'empty change set against base; selection unprovable'
+                    }
+                    foreach ($clippyFile in $clippyChanged) {
+                        $clippyAbsolute = Join-Path $repoRoot $clippyFile
+                        $clippyMatched = $null
+                        $clippyBest = -1
+                        foreach ($clippyDir in $clippyPackageByDir.Keys) {
+                            if ($clippyAbsolute.StartsWith($clippyDir + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and $clippyDir.Length -gt $clippyBest) {
+                                $clippyBest = $clippyDir.Length
+                                $clippyMatched = $clippyDir
+                            }
+                        }
+                        if ($null -eq $clippyMatched) {
+                            $clippyRootWide += "root-wide input: $clippyFile"
+                        } else {
+                            $clippyName = $clippyPackageByDir[$clippyMatched]
+                            if (-not $clippySelected.ContainsKey($clippyName)) {
+                                $clippySelected[$clippyName] = @()
+                            }
+                            $clippySelected[$clippyName] += $clippyFile
+                        }
+                    }
+                }
+            }
+            if ($clippyRootWide.Count -gt 0 -or $clippySelected.Count -eq 0) {
+                foreach ($clippyReason in $clippyRootWide) {
+                    Write-Host "VERIFY_CLIPPY_SELECTION: scope=workspace reason=$clippyReason"
+                }
+                if ($clippySelected.Count -eq 0) {
+                    Write-Host 'VERIFY_CLIPPY_SELECTION: scope=workspace reason=no changed workspace package mapped'
+                }
+                cargo clippy --locked --workspace --all-targets --no-deps
+            } else {
+                $clippyOrdered = @($clippySelected.Keys | Sort-Object)
+                foreach ($clippyName in $clippyOrdered) {
+                    Write-Host "VERIFY_CLIPPY_SELECTION: scope=changed package=$clippyName reasons=$($clippySelected[$clippyName] -join ';')"
+                }
+                $clippyPackageArgs = @()
+                foreach ($clippyName in $clippyOrdered) {
+                    $clippyPackageArgs += '-p'
+                    $clippyPackageArgs += $clippyName
+                }
+                cargo clippy --locked @clippyPackageArgs --all-targets --no-deps
+            }
+        }
+    },
+    [pscustomobject]@{ Name = 'standalone-crates-compile'; Profiles = @('MergeCompile'); Command = { python $standaloneCrates --root $repoRoot --mode compile } },
+    [pscustomobject]@{
+        Name = 'dotnet-restore-operator'
+        Profiles = @('MergeCompile')
+        Command = {
+            dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet restore Eliot.Operator failed'
+            }
+            dotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet restore Eliot.Operator.Tests failed'
+            }
+        }
+    },
+    [pscustomobject]@{
+        Name = 'dotnet-build-operator'
+        Profiles = @('MergeCompile')
+        Command = {
+            dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet build Eliot.Operator failed'
+            }
+            dotnet build tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet build Eliot.Operator.Tests failed'
+            }
+        }
+    }
 )
 
 $profileExplicit = $PSBoundParameters.ContainsKey('Profile')
 
 # List/configuration mode is read-only: it prints gate definitions and never
-# claims execution. Bare -List covers both closed profiles.
+# claims execution. Bare -List covers all closed profiles.
 if ($List) {
-    $listProfiles = if ($profileExplicit) { @($Profile) } else { @('Quick', 'Review') }
-    Write-Host 'VERIFY_PROFILES: Quick, Review'
+    $listProfiles = if ($profileExplicit) { @($Profile) } else { @('Quick', 'Review', 'MergeCompile') }
+    Write-Host 'VERIFY_PROFILES: Quick, Review, MergeCompile'
     foreach ($listed in $listProfiles) {
         $names = @($allGates | Where-Object { $_.Profiles -contains $listed } | ForEach-Object { $_.Name })
         Write-Host "VERIFY_PROFILE: $listed ($($names.Count) gates)"
@@ -330,6 +486,8 @@ $overall = if ($failedCount -eq 0 -and $harnessState -eq 'pass') { 'PASS' } else
 
 if ($Profile -eq 'Quick') {
     $proofCeiling = 'QUICK_ONLY: bounded repository/document/source oracle check. Not Review, not release, not Product-Pulse proof.'
+} elseif ($Profile -eq 'MergeCompile') {
+    $proofCeiling = 'MERGE_COMPILE_SOURCE_ONLY: locked compile-only merge check on this candidate only. Zero test execution, no lint-cleanliness claim. Not Review, not release/source-candidate, not installed-runtime/store/Product-Pulse proof.'
 } else {
     $proofCeiling = 'REVIEW_SOURCE_ONLY: complete locked Review on this candidate only. Not release/source-candidate, not installed-runtime/store/Product-Pulse proof.'
 }
@@ -343,8 +501,8 @@ $summaryLines = @(
     "VERIFY_POLICY_RECEIPT_CLEANUP: $receiptCleanupState",
     'VERIFY_CACHE: workflow-owned only; this script implements no gate cache, so a cache hit cannot skip a gate or supply a pass receipt',
     "VERIFY_PROOF_CEILING: $proofCeiling",
-    'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them',
-    'VERIFY_QUARANTINE: cargo gates (cargo-fmt/cargo-check-workspace/cargo-clippy-workspace/cargo-test-workspace) execute the quarantined legacy lane with no governed profile receipt (issue #1813 W6); thin-invoker migration awaits W4 stage-execution provisions'
+    'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review/MergeCompile profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them',
+    'VERIFY_QUARANTINE: cargo/dotnet gates (cargo-fmt/cargo-check-workspace/cargo-clippy-workspace/cargo-test-workspace/cargo-denominator/cargo-test-compile/cargo-clippy-changed/standalone-crates-compile/dotnet-restore-operator/dotnet-build-operator) execute the quarantined legacy lane with no governed profile receipt (issue #1813 W6); thin-invoker migration awaits W4 stage-execution provisions'
 )
 if ($harnessState -ne 'pass') {
     $summaryLines += "VERIFY_HARNESS: $harnessState $harnessError"

@@ -143,5 +143,11 @@ verify:
 verify-review:
     pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
 
+# Automatic merge compile check (accepted issue #3004); sole definition in
+# scripts/verify.ps1. Compile-only: zero test execution, no lint-cleanliness
+# claim. Same versioned profile the automatic ci.yml check invokes.
+merge-compile:
+    pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile
+
 verify-list:
     pwsh -NoProfile -File scripts/verify.ps1 -List
