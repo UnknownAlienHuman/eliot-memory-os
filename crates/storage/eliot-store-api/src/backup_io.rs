@@ -630,12 +630,27 @@ impl SnapshotPage {
     }
 
     /// Validates this page against the begin request that opened the capture.
+    ///
+    /// The digest alone is a commitment, not the identity: a page can carry a
+    /// recomputed digest while substituting the operation or idempotency
+    /// fields. I05-27 requires the operation identity itself to be compared, so
+    /// a changed operation or idempotency key under an otherwise matching
+    /// digest is [`StoreError::IdentityConflict`] and no transition follows.
+    ///
+    /// This is a structural check only. It cannot reconstruct an
+    /// owner-observed consistency point and it does not authenticate issuance;
+    /// the adapter still has to look the capture up by its retained handle.
     pub fn validate_for_begin(&self, begin: &SnapshotBeginRequest) -> Result<(), StoreError> {
         if self.handle.snapshot_digest != begin.compute_digest()? {
             return Err(StoreError::InvalidField {
                 field: "snapshot.snapshot_digest",
                 reason: "page handle does not match the begin-request digest",
             });
+        }
+        if self.handle.operation_id != begin.operation.operation_id
+            || self.handle.idempotency_key != begin.operation.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict);
         }
         if self.cursor.cumulative_members > begin.bounds.max_members
             || self.cumulative_bytes > begin.bounds.max_bytes
@@ -647,15 +662,31 @@ impl SnapshotPage {
 
     /// Validates continuation against the previous page of the same capture.
     ///
-    /// The handle must stay on one owner-issued consistency point, the page
-    /// index must advance by exactly one, and cumulative bounds must never
-    /// reset.
+    /// Full handle equality is required, not digest equality: the consistency
+    /// point, the digest and the operation identity must all stay on the one
+    /// owner-issued handle. A substituted consistency point or operation field
+    /// is refused before any cursor or cumulative bound is examined, so a
+    /// continuation can never advance a capture it does not belong to.
+    ///
+    /// The cursor/bounds checks below are unchanged and still apply once the
+    /// handle is proven identical.
     pub fn validate_continuation(&self, previous: &SnapshotPage) -> Result<(), StoreError> {
+        if self.handle.consistency_point != previous.handle.consistency_point {
+            return Err(StoreError::InvalidField {
+                field: "snapshot.consistency_point",
+                reason: "continuation left the owner-issued consistency point",
+            });
+        }
         if self.handle.snapshot_digest != previous.handle.snapshot_digest {
             return Err(StoreError::InvalidField {
                 field: "snapshot.snapshot_digest",
                 reason: "continuation crossed to a different snapshot handle",
             });
+        }
+        if self.handle.operation_id != previous.handle.operation_id
+            || self.handle.idempotency_key != previous.handle.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict);
         }
         if self.cursor.page_index != previous.cursor.page_index + 1 {
             return Err(StoreError::InvalidField {
@@ -702,9 +733,19 @@ impl SnapshotEndReceipt {
     }
 
     /// Validates the receipt shape.
+    ///
+    /// The receipt's own operation identity is cross-checked against the
+    /// handle's operation and idempotency fields. The handle binds the capture;
+    /// a receipt that names a different operation cannot close it, so a
+    /// substituted operation field is [`StoreError::IdentityConflict`].
     pub fn validate(&self) -> Result<(), StoreError> {
         self.handle.validate()?;
         self.operation.validate()?;
+        if self.operation.operation_id != self.handle.operation_id
+            || self.operation.idempotency_key != self.handle.idempotency_key
+        {
+            return Err(StoreError::IdentityConflict);
+        }
         if self.validation_revision == 0 {
             return Err(StoreError::InvalidField {
                 field: "snapshot.validation_revision",
