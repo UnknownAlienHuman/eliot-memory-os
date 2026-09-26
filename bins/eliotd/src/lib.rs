@@ -211,7 +211,10 @@ pub use notification_state_emit::{
     emit_blocked_automation_notification, notification_already_recorded,
     read_notification_ordering_head,
 };
-pub use owner_feed::{KernelOwnerPublishPort, OwnerFeedTrigger, maintain_owner_feed};
+pub use owner_feed::{
+    KernelOwnerPublishPort, OwnerFeedPlan, OwnerFeedTrigger, capture_owner_feed_plan,
+    maintain_owner_feed,
+};
 pub use process_origin::{
     CapabilityEvidenceSource, Generation, OperationDisposition, OriginChallenge,
     OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,

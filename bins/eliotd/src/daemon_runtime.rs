@@ -45,9 +45,11 @@
 //! receipt is the attach/onboarding ingress, not this driver. See
 //! `eliotd::task_binding_admission`'s "Measured reachability" section.
 
+use std::cell::RefCell;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -87,11 +89,14 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 /// Shared daemon composition handle for the run loop. Flight futures own any
 /// borrow they need, keeping lock-owning work pollable by the loop. The
 /// owner-feed exchange still holds this guard across bounded IO, and the
-/// heartbeat handler still awaits the same mutex inline; #2559 remains
-/// partial until that selected-handler wait is removed. A poisoned TestD row
-/// never fails the daemon closed; transport failures do, mirroring the
-/// local-read poller.
+/// health and maintenance handlers retain their lock waits in polled flights,
+/// so neither selected handler blocks the loop behind the owner-feed lock
+/// holder. A poisoned TestD row never fails the daemon closed; transport
+/// failures do, mirroring the local-read poller.
 type SharedComposition = Arc<tokio::sync::Mutex<DaemonComposition>>;
+/// The run loop and its polled heartbeat share one current-thread readiness
+/// projection. Callers borrow it only for synchronous observation/adoption.
+type SharedStartupReadiness = Rc<RefCell<StartupReadinessProjection>>;
 
 const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -104,6 +109,60 @@ const SHUTDOWN_ACTIVATION_DRAIN: Duration = Duration::from_secs(2);
 /// owns retry policy; this counter is diagnostic only and introduces no
 /// timer or cache.
 static TRANSIENT_DEFERRAL_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Actual activation activity observed while the one heartbeat flight owns the
+/// supervision producer. Fixed counters keep the event cut bounded regardless
+/// of heartbeat latency.
+#[derive(Default)]
+struct DeferredSupervisionActivity {
+    claims: u64,
+    applied: u64,
+}
+
+impl DeferredSupervisionActivity {
+    fn note_claim(&mut self) {
+        self.claims = self.claims.saturating_add(1);
+    }
+
+    fn note_applied(&mut self) {
+        self.applied = self.applied.saturating_add(1);
+    }
+
+    fn clear(&mut self) {
+        self.claims = 0;
+        self.applied = 0;
+    }
+}
+
+struct HealthHeartbeatCompletion {
+    result: Result<(), String>,
+    supervision_progress: Option<eliotd::SupervisionProgressProducer>,
+}
+
+struct HealthHeartbeatFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = HealthHeartbeatCompletion>>>,
+    owns_supervision_producer: bool,
+}
+
+/// Sole owner of the one heartbeat tick currently in progress. The future
+/// carries the single supervision producer across Kernel awaits and returns it
+/// exactly once at settlement.
+enum HealthHeartbeatFlight {
+    Idle,
+    InFlight(HealthHeartbeatFlightState),
+}
+
+impl HealthHeartbeatFlight {
+    fn owns_supervision_producer(&self) -> bool {
+        matches!(
+            self,
+            Self::InFlight(HealthHeartbeatFlightState {
+                owns_supervision_producer: true,
+                ..
+            })
+        )
+    }
+}
 
 /// Explicit loop exit so a shutdown that races an in-flight submit is never
 /// silently dropped. `ShutdownActivationUnknown` carries the original
@@ -1116,9 +1175,13 @@ async fn run_loop(
     // flight prepares from an immutable snapshot and returns only the bounded
     // delta it actually observed, so there is one authoritative copy and a
     // late completion can never overwrite newer owner observations.
-    mut startup_readiness: StartupReadinessProjection,
+    startup_readiness: StartupReadinessProjection,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
+    // One projection instance is shared with the heartbeat future. Both
+    // heartbeat observation and local-read adoption use short synchronous
+    // borrows and release them before any await.
+    let startup_readiness = Rc::new(RefCell::new(startup_readiness));
     // Sole owner of activation state. No second owner and no second
     // concurrent activation exist: the timer starts work only when idle and
     // the in-flight step is polled only in its own branch below.
@@ -1146,14 +1209,12 @@ async fn run_loop(
     // full read->publish->readback exchange. Degradation never fails the
     // loop: pending grants stay pending until a later pass binds them.
     // Issue #2559: the trigger travels with its own polled flight below, so
-    // the exchange itself is polled independently. A selected heartbeat can
-    // still wait inline for its composition guard; that remains an explicit
-    // #2559 gap.
+    // the exchange is polled independently of health and maintenance waits.
     let mut owner_feed = Some(eliotd::OwnerFeedTrigger::new());
     // Sole owner of owner-feed sync state. One bounded read->publish->readback
-    // exchange is outstanding at most; the health tick starts it when idle
-    // and its completion branch settles it back, exactly like the other
-    // flights. No second owner and no untracked spawn exist.
+    // exchange is outstanding at most; the health completion branch starts it
+    // when idle and its completion branch settles it back, exactly like the
+    // other flights. No second owner and no untracked spawn exist.
     let mut owner_feed_flight = OwnerFeedFlight::Idle;
     // Sole owner of TestD owner drain state (issue #325). The same tick
     // drives it independently of the other flights: one bounded drain step
@@ -1165,12 +1226,15 @@ async fn run_loop(
     // but its wait remains in this independently polled flight. A later tick
     // cannot replace the observation already retained here.
     let mut maintenance_flight = MaintenanceFlight::Idle;
+    // Health is a one-slot polled flight: a busy tick is coalesced and the
+    // sole supervision producer moves into the future until settlement.
+    let mut health_heartbeat_flight = HealthHeartbeatFlight::Idle;
+    let mut deferred_supervision_activity = DeferredSupervisionActivity::default();
     // Recovery re-presentation at loop start: rebind the Kernel P-07 owner
     // from live Governor state before any activation work is claimed. The
     // exchange starts as the owner-feed flight's first bounded step and is
     // polled by the loop below; it is never awaited here, so the loop stays
-    // pollable from its first pass. The heartbeat handler's independent
-    // inline composition wait remains a separate #2559 gap.
+    // pollable from its first pass.
     maybe_start_owner_feed_sync(
         &kernel,
         &composition,
@@ -1201,6 +1265,9 @@ async fn run_loop(
                     &mut owner_feed_flight,
                     &mut owner_feed,
                     &mut maintenance_flight,
+                    &mut health_heartbeat_flight,
+                    &mut supervision_progress,
+                    &mut deferred_supervision_activity,
                 )
                 .await?;
                 // #1862: the campaign-packet flight keeps its own queue, claim,
@@ -1217,10 +1284,11 @@ async fn run_loop(
                 // ordering those comments describe is stated once. The claim
                 // carries the composition handle it needs to read the named
                 // dependency discriminator before the request.
+                let readiness_projection = startup_readiness.borrow();
                 start_tick_work(
                     &kernel,
                     &composition,
-                    &startup_readiness,
+                    &readiness_projection,
                     &mut local_read_flight,
                     &mut observe_flight,
                     &mut testd_owner_flight,
@@ -1254,15 +1322,18 @@ async fn run_loop(
                     &kernel,
                     &composition,
                     &mut supervision_progress,
+                    &health_heartbeat_flight,
+                    &mut deferred_supervision_activity,
                     &mut flight,
                     completion,
                 )?;
             }
             local_read_completion = next_local_read_completion(&mut local_read_flight) => {
+                let mut readiness_projection = startup_readiness.borrow_mut();
                 settle_local_read_completion_updating_readiness(
                     local_read_completion,
                     &mut local_read_flight,
-                    &mut startup_readiness,
+                    &mut readiness_projection,
                 )?;
             }
             observe_completion = next_observe_completion(&mut observe_flight) => {
@@ -1296,17 +1367,31 @@ async fn run_loop(
             () = next_maintenance_completion(&mut maintenance_flight) => {
                 settle_maintenance_completion(&mut maintenance_flight);
             }
-            _ = cadence.health_heartbeat.tick() => {
-                run_health_heartbeat_tick(
+            heartbeat_completion = next_health_heartbeat_completion(&mut health_heartbeat_flight) => {
+                settle_health_heartbeat_completion(
+                    heartbeat_completion,
+                    &mut health_heartbeat_flight,
+                    &mut supervision_progress,
+                    &mut deferred_supervision_activity,
+                    true,
+                )?;
+                // Preserve the existing health-before-owner-feed ordering.
+                maybe_start_owner_feed_sync(
                     &kernel,
                     &composition,
                     &mut owner_feed,
                     &mut owner_feed_flight,
+                );
+            }
+            _ = cadence.health_heartbeat.tick() => {
+                maybe_start_health_heartbeat_tick(
+                    &kernel,
+                    &composition,
+                    &startup_readiness,
                     &mut supervision_progress,
-                    &flight,
-                    &mut startup_readiness,
-                )
-                .await?;
+                    matches!(flight, ActivationFlight::InFlight(_)),
+                    &mut health_heartbeat_flight,
+                );
             }
         }
     }
@@ -1335,6 +1420,9 @@ enum ActivationClaimStep {
 fn settle_activation_claim(
     claim: ActivationClaim,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    health_heartbeat_flight: &HealthHeartbeatFlight,
+    deferred_activity: &mut DeferredSupervisionActivity,
+    buffer_while_heartbeat_in_flight: bool,
 ) -> Result<ActivationClaimStep, String> {
     match claim {
         ActivationClaim::Empty => Ok(ActivationClaimStep::Idle),
@@ -1346,7 +1434,12 @@ fn settle_activation_claim(
             Ok(ActivationClaimStep::Idle)
         }
         ActivationClaim::Valid(ticket) => {
-            note_supervision_claim(supervision_progress.as_mut());
+            note_supervision_claim(
+                supervision_progress.as_mut(),
+                health_heartbeat_flight,
+                deferred_activity,
+                buffer_while_heartbeat_in_flight,
+            );
             Ok(ActivationClaimStep::Valid(Box::new(*ticket)))
         }
     }
@@ -1364,6 +1457,8 @@ fn settle_activation_completion(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    health_heartbeat_flight: &HealthHeartbeatFlight,
+    deferred_activity: &mut DeferredSupervisionActivity,
     flight: &mut ActivationFlight,
     completion: ActivationCompletion,
 ) -> Result<(), String> {
@@ -1371,7 +1466,13 @@ fn settle_activation_completion(
         ActivationCompletion::Claim(claim_outcome) => {
             let claim = claim_outcome?;
             // Issue #202 (owner decision ii), validate-first.
-            match settle_activation_claim(claim, supervision_progress)? {
+            match settle_activation_claim(
+                claim,
+                supervision_progress,
+                health_heartbeat_flight,
+                deferred_activity,
+                true,
+            )? {
                 ActivationClaimStep::Idle => {
                     *flight = ActivationFlight::Idle;
                 }
@@ -1389,12 +1490,19 @@ fn settle_activation_completion(
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
         }
         ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
-            // #1115: a Kernel-owned deadline expiry is a completed step, not a
-            // dispatch this daemon applied. It retires the ticket exactly like
-            // an accepted dispatch — idle, no retry, no reconcile — so both
-            // settle through the same supervision note.
-            Ok(()) | Err(ActivationDispatchError::Expired) => {
-                note_supervision_applied(supervision_progress.as_mut());
+            Ok(()) => {
+                note_supervision_applied(
+                    supervision_progress.as_mut(),
+                    health_heartbeat_flight,
+                    deferred_activity,
+                    true,
+                );
+                *flight = ActivationFlight::Idle;
+                Ok(())
+            }
+            // #1115: Kernel-owned deadline expiry retires this ticket without
+            // retry, but no result was accepted and no Apply progress exists.
+            Err(ActivationDispatchError::Expired) => {
                 *flight = ActivationFlight::Idle;
                 Ok(())
             }
@@ -1442,18 +1550,36 @@ fn start_tick_work(
 /// there is no lineage or lease head to advance. Absence of the producer is an
 /// explicit not-ready state, not a silent drop: the readiness record already
 /// reported the withholding.
-fn note_supervision_claim(producer: Option<&mut eliotd::SupervisionProgressProducer>) {
+fn note_supervision_claim(
+    producer: Option<&mut eliotd::SupervisionProgressProducer>,
+    health_heartbeat_flight: &HealthHeartbeatFlight,
+    deferred_activity: &mut DeferredSupervisionActivity,
+    buffer_while_heartbeat_in_flight: bool,
+) {
     if let Some(producer) = producer {
         producer.note_claim();
+    } else if buffer_while_heartbeat_in_flight
+        && health_heartbeat_flight.owns_supervision_producer()
+    {
+        deferred_activity.note_claim();
     }
 }
 
 /// Notes one Kernel-accepted dispatch on the supervision Dispatch/Apply
 /// channels when a supervision lineage exists. Mirrors
 /// [`note_supervision_claim`].
-fn note_supervision_applied(producer: Option<&mut eliotd::SupervisionProgressProducer>) {
+fn note_supervision_applied(
+    producer: Option<&mut eliotd::SupervisionProgressProducer>,
+    health_heartbeat_flight: &HealthHeartbeatFlight,
+    deferred_activity: &mut DeferredSupervisionActivity,
+    buffer_while_heartbeat_in_flight: bool,
+) {
     if let Some(producer) = producer {
         producer.note_kernel_applied();
+    } else if buffer_while_heartbeat_in_flight
+        && health_heartbeat_flight.owns_supervision_producer()
+    {
+        deferred_activity.note_applied();
     }
 }
 
@@ -1605,14 +1731,85 @@ async fn note_blocked_automation_notification(
     }
 }
 
+/// Starts one health tick when its slot is idle. The activation state is
+/// captured with the timer event, and the sole supervision producer travels
+/// with the future until its ordered acknowledgement sequence completes.
+fn maybe_start_health_heartbeat_tick(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    startup_readiness: &SharedStartupReadiness,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    activation_in_flight: bool,
+    flight: &mut HealthHeartbeatFlight,
+) {
+    if !matches!(flight, HealthHeartbeatFlight::Idle) {
+        return;
+    }
+    let kernel = Arc::clone(kernel);
+    let composition = Arc::clone(composition);
+    let startup_readiness = Rc::clone(startup_readiness);
+    let mut producer = supervision_progress.take();
+    let owns_supervision_producer = producer.is_some();
+    *flight = HealthHeartbeatFlight::InFlight(HealthHeartbeatFlightState {
+        future: Box::pin(async move {
+            let result = run_health_heartbeat_tick(
+                &kernel,
+                &composition,
+                producer.as_mut(),
+                activation_in_flight,
+                &startup_readiness,
+            )
+            .await;
+            HealthHeartbeatCompletion {
+                result,
+                supervision_progress: producer,
+            }
+        }),
+        owns_supervision_producer,
+    });
+}
+
+/// Polls the one health tick, pending forever while its slot is idle.
+async fn next_health_heartbeat_completion(
+    flight: &mut HealthHeartbeatFlight,
+) -> HealthHeartbeatCompletion {
+    match flight {
+        HealthHeartbeatFlight::Idle => std::future::pending::<HealthHeartbeatCompletion>().await,
+        HealthHeartbeatFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Returns the producer after the heartbeat future completes, then places
+/// activity observed during its event cut after the completed tick's ordered
+/// Claim/Dispatch/Apply acknowledgements. Failed ticks do not apply deferred
+/// activity because there will be no next heartbeat in this loop.
+fn settle_health_heartbeat_completion(
+    completion: HealthHeartbeatCompletion,
+    flight: &mut HealthHeartbeatFlight,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    deferred_activity: &mut DeferredSupervisionActivity,
+    apply_deferred_activity: bool,
+) -> Result<(), String> {
+    *flight = HealthHeartbeatFlight::Idle;
+    *supervision_progress = completion.supervision_progress;
+    if apply_deferred_activity
+        && completion.result.is_ok()
+        && let Some(producer) = supervision_progress.as_mut()
+    {
+        producer.note_deferred_activity(deferred_activity.claims, deferred_activity.applied);
+    }
+    deferred_activity.clear();
+    completion.result
+}
+
 /// Runs one health-heartbeat tick (Implements #88, wave 3): the Kernel
 /// health poll stays evidence-only, then the same tick submits supervision
 /// progress built from observed work. The poll's Store dimension is reused as
 /// the observation's `store_dependency` evidence, never as renewal authority.
 ///
-/// Issue #2559: the tick never waits for the owner-feed exchange. The
-/// exchange rides its own polled flight started below when idle, so a
-/// stalled owner-feed step cannot stall health or supervision polling.
+/// Issue #2559: the tick runs in its own polled flight, and the run loop
+/// starts the owner-feed exchange after it settles. A stalled owner-feed
+/// step cannot stall health or supervision polling.
 ///
 /// #18 item A: the health poll runs unconditionally, so liveness stays observed
 /// even for a generation that never reported ready; only the progress renewal
@@ -1620,11 +1817,9 @@ async fn note_blocked_automation_notification(
 async fn run_health_heartbeat_tick(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
-    owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
-    owner_feed_flight: &mut OwnerFeedFlight,
-    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
-    flight: &ActivationFlight,
-    startup_readiness: &mut StartupReadinessProjection,
+    supervision_progress: Option<&mut eliotd::SupervisionProgressProducer>,
+    activation_in_flight: bool,
+    startup_readiness: &SharedStartupReadiness,
 ) -> Result<(), String> {
     let health: StoreHealth = KernelTransitionPort::health(kernel.as_ref())
         .await
@@ -1633,19 +1828,18 @@ async fn run_health_heartbeat_tick(
     // self-observation per heartbeat, so it is the admitted-observation
     // trigger. The evidence identities are the observed health status and the
     // store manifest digest the poll actually returned - never a synthetic
-    // signal. `activation_in_flight` is the same live observation the
-    // supervision submit below uses, so the `idle` gate stays consistent with
-    // what this tick actually did.
-    let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
-    let readiness_verdict;
+    // signal. `activation_in_flight` is the activation state captured when
+    // this timer event started the flight, so maintenance and supervision use
+    // one immutable observation even as the loop continues polling work.
     // Issue #1780 (I11.5): an admitted automation decision that admits no job
     // is an automation failure, and I11.5 requires it to become one persistent
     // canonical notification instead of a log line. The decision and the
     // admission fence are both taken from the composition under this one lock;
     // the canonical write itself happens after the lock is released, so no
     // Kernel exchange ever crosses the composition mutex (issue #18 N3).
-    let blocked_automation = {
+    let (readiness_verdict, readiness_report, blocked_automation) = {
         let guard = composition.lock().await;
+        let mut readiness_projection = startup_readiness.borrow_mut();
         // #2560: re-read the composition's own owner facts once per heartbeat.
         // This performs no capability IO and re-files no slot, so a slow
         // optional attach never blocks here and an unchanged owner does no work.
@@ -1654,18 +1848,19 @@ async fn run_health_heartbeat_tick(
         // as unavailable instead of staying usable because it was retained.
         // #2647: an identical observation retires no in-flight delta basis;
         // only a real owner-context change does.
-        startup_readiness
+        readiness_projection
             .observe_owner(&guard)
             .map_err(|error| format!("startup readiness owner observation: {error}"))?;
-        readiness_verdict = eliotd::startup_readiness::evaluate_startup_readiness(
-            startup_readiness,
+        let readiness_verdict = eliotd::startup_readiness::evaluate_startup_readiness(
+            &readiness_projection,
             &guard.status(),
             false,
         );
+        let readiness_report = readiness_projection.report();
         // Same tolerance as `DaemonComposition::note_maintenance_trigger`: a
         // rejected evaluation is an explicit typed gap, never a daemon-killing
         // error, and the trigger stays durable for the next eligible pass.
-        match guard.evaluate_maintenance_trigger(maintenance_observation(
+        let blocked_automation = match guard.evaluate_maintenance_trigger(maintenance_observation(
             MaintenanceTriggerOrigin::AdmittedObservation,
             vec![
                 format!("store_health={:?}", health.status),
@@ -1688,7 +1883,8 @@ async fn run_health_heartbeat_tick(
                 let _ = eliotd::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
                 None
             }
-        }
+        };
+        (readiness_verdict, readiness_report, blocked_automation)
     };
     if let Some((fence, decision)) = blocked_automation {
         note_blocked_automation_notification(kernel, fence, &decision).await;
@@ -1703,18 +1899,12 @@ async fn run_health_heartbeat_tick(
             target: "eliotd::diagnostics",
             event = "eliotd.startup_readiness_heartbeat",
             core_satisfied = readiness_verdict.core_satisfied(),
-            readiness = %startup_readiness.report(),
+            readiness = %readiness_report,
         );
     }
-    if let Some(producer) = supervision_progress.as_mut() {
+    if let Some(producer) = supervision_progress {
         submit_supervision_heartbeat(kernel, producer, &health, activation_in_flight).await?;
     }
-    // #2100: revision-advance trigger for the Kernel P-07 owner feed.
-    // Unchanged providers perform no IO here; an advanced provider
-    // republishes with readback proof. The exchange starts on its own
-    // polled flight when idle and is never awaited here: its pending
-    // publication may gate dependent grants but never health polling.
-    maybe_start_owner_feed_sync(kernel, composition, owner_feed, owner_feed_flight);
     Ok(())
 }
 
@@ -1914,10 +2104,13 @@ fn start_activation_dispatch(
 }
 
 /// Stage-aware shutdown drain for every already-started flight (issue
-/// #2559). No new claim starts here; already-started claim, resolve-wait,
-/// dispatch, local-read, observe, `TestD` owner, owner-feed and retained
-/// cadence-maintenance steps keep being polled together inside one declared
-/// finite budget.
+/// #2559). No new claim or heartbeat starts here; already-started claim,
+/// resolve-wait, dispatch, local-read, observe, `TestD` owner, owner-feed,
+/// heartbeat and retained cadence-maintenance steps keep being polled
+/// together inside one declared finite budget. `request_shutdown` has already
+/// been published, so an in-flight heartbeat may settle with a Kernel error;
+/// the drain deliberately ignores that result and drops its producer without
+/// applying deferred activity because no later heartbeat will be sent.
 ///
 /// A claimed/waiting ticket carries no result digest yet, so exhausting the
 /// budget while waiting or resolving settles as a clean shutdown: nothing
@@ -1925,16 +2118,17 @@ fn start_activation_dispatch(
 /// submitting result keeps its retained identity instead: an unknown
 /// acknowledgement or a budget exhausted mid-submit settles as a typed
 /// unknown carrying the original ticket/result verbatim, never a fabricated
-/// hash. Local-read, observe, `TestD` owner, owner-feed and maintenance steps always
-/// settle as plain shutdown: an un-submitted pair's attempt capability is
+/// hash. Local-read, observe, `TestD` owner, owner-feed and maintenance steps
+/// always settle as plain shutdown: an un-submitted pair's attempt capability is
 /// revoked on disconnect, an already-persisted `TestD` decision
 /// exact-replays, and a pending owner-feed publication leaves dependent
-/// grants pending. Only a step failure fails closed. Dropping every flight
-/// here also releases all owned composition references before the existing
-/// final shutdown, without leaking detached work.
+/// grants pending. Only non-heartbeat step failures fail closed. Dropping every
+/// flight here also releases all owned composition references before the
+/// existing final shutdown, without leaking detached work.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the shutdown drain polls every flight's own borrowed state in one select; bundling them would hide which flight is outstanding"
+    clippy::too_many_lines,
+    reason = "the shutdown drain polls every flight's borrowed state in one select and retains its bounded deadline"
 )]
 async fn drain_flights_on_shutdown(
     kernel: &Arc<DaemonKernelClient>,
@@ -1946,6 +2140,9 @@ async fn drain_flights_on_shutdown(
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
     maintenance_flight: &mut MaintenanceFlight,
+    health_heartbeat_flight: &mut HealthHeartbeatFlight,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    deferred_activity: &mut DeferredSupervisionActivity,
 ) -> Result<RunLoopExit, String> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
@@ -1960,6 +2157,7 @@ async fn drain_flights_on_shutdown(
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
+            && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -1971,7 +2169,13 @@ async fn drain_flights_on_shutdown(
                             Err(error) => return Err(error),
                             Ok(claim) => claim,
                         };
-                        match settle_activation_claim(claim, &mut no_supervision)? {
+                        match settle_activation_claim(
+                            claim,
+                            &mut no_supervision,
+                            health_heartbeat_flight,
+                            deferred_activity,
+                            false,
+                        )? {
                             ActivationClaimStep::Idle => {
                                 *flight = ActivationFlight::Idle;
                             }
@@ -2036,6 +2240,14 @@ async fn drain_flights_on_shutdown(
             () = next_maintenance_completion(maintenance_flight) => {
                 settle_maintenance_completion(maintenance_flight);
             }
+            heartbeat_completion = next_health_heartbeat_completion(health_heartbeat_flight) => {
+                discard_shutdown_heartbeat_completion(
+                    heartbeat_completion,
+                    health_heartbeat_flight,
+                    supervision_progress,
+                    deferred_activity,
+                );
+            }
             () = tokio::time::sleep_until(deadline) => {
                 // Budget exhausted with work still outstanding: drop every
                 // flight without starting anything new. Classify activation
@@ -2046,10 +2258,31 @@ async fn drain_flights_on_shutdown(
                 *testd_owner_flight = TestdOwnerFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 *maintenance_flight = MaintenanceFlight::Idle;
+                *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
+                *supervision_progress = None;
+                deferred_activity.clear();
                 return Ok(exit);
             }
         }
     }
+}
+
+/// Shutdown was requested before the drain. A heartbeat may return a Kernel
+/// shutdown error, so only its producer is recovered; deferred observations
+/// are discarded because this process will send no later supervision tick.
+fn discard_shutdown_heartbeat_completion(
+    completion: HealthHeartbeatCompletion,
+    flight: &mut HealthHeartbeatFlight,
+    supervision_progress: &mut Option<eliotd::SupervisionProgressProducer>,
+    deferred_activity: &mut DeferredSupervisionActivity,
+) {
+    let _ = settle_health_heartbeat_completion(
+        completion,
+        flight,
+        supervision_progress,
+        deferred_activity,
+        false,
+    );
 }
 
 /// Resolves the activation disposition when the shared shutdown budget ends.
@@ -2167,14 +2400,24 @@ fn settle_owner_feed_completion(
 /// provider stays silent; a degraded pass emits an error record and the loop
 /// continues, retrying on a later tick. The feed never gates readiness and
 /// never fails the daemon: an unbound Kernel owner only leaves grants
-/// pending, exactly like an absent P-07 port.
+/// pending, exactly like an absent P-07 port. Only the synchronous snapshot
+/// capture holds the composition guard; Kernel reads and publication use the
+/// owned plan after that guard is released so activation can claim and resolve
+/// while the feed's sequential transport exchanges are pending.
 async fn run_owner_feed_sync(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut trigger: eliotd::OwnerFeedTrigger,
 ) -> eliotd::OwnerFeedTrigger {
-    let guard = composition.lock().await;
-    match eliotd::maintain_owner_feed(&guard, kernel, &mut trigger).await {
+    let plan = {
+        let guard = composition.lock().await;
+        eliotd::capture_owner_feed_plan(&guard)
+    };
+    let result = match plan {
+        Ok(plan) => eliotd::maintain_owner_feed(plan, kernel, &mut trigger).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(Some(revision)) => {
             tracing::info!(
                 target: "eliotd::diagnostics",
