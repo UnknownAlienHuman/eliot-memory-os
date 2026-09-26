@@ -12,13 +12,14 @@ use std::collections::BTreeSet;
 use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
-    AutomationCapabilityProfile, AutomationExecutionReference, AutomationReconciliationCause,
-    AutomationReconciliationReference, AutomationWorkClass, ProviderFingerprintPolicy,
-    UserAutomationConfigurationState, UserAutomationError, UserAutomationExecutionMode,
-    UserAutomationExecutionProjection, UserAutomationFailureProjection, UserAutomationInvocation,
-    UserAutomationPreflightContext, UserAutomationPreflightDecision,
-    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationRevision,
-    UserAutomationTrigger, UserAutomationTriggerOrigin,
+    AutomationCapabilityProfile, AutomationExecutionReference, AutomationOccurrenceIdentity,
+    AutomationReconciliationCause, AutomationReconciliationReference, AutomationWorkClass,
+    ProviderFingerprintPolicy, UserAutomationConfigurationState, UserAutomationError,
+    UserAutomationExecutionMode, UserAutomationExecutionProjection,
+    UserAutomationFailureProjection, UserAutomationInvocation, UserAutomationPreflightContext,
+    UserAutomationPreflightDecision, UserAutomationPreflightProjection,
+    UserAutomationPreflightReceipt, UserAutomationRevision, UserAutomationTrigger,
+    UserAutomationTriggerOrigin,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
@@ -40,6 +41,24 @@ pub enum UserAutomationRuntimeError {
     /// The existing owner is not available for this operation.
     #[error("UserAutomation runtime owner is unavailable: {0}")]
     Unavailable(String),
+    /// The existing owner read its own authoritative state and definitively
+    /// retains no such record.
+    ///
+    /// This is a COMPLETE negative answer, not an absence of coverage: the owner
+    /// reached the state it is the sole owner of and found nothing there. It is
+    /// therefore never produced for an owner that could not be reached, whose
+    /// state could not be read, or whose answer was lost — those remain
+    /// [`UserAutomationRuntimeError::Unavailable`] and
+    /// [`UserAutomationRuntimeError::UnknownOutcome`].
+    ///
+    /// The distinction is load-bearing. A wake read that finds no retained
+    /// pending record proves there is no unadmitted wake to cancel, while a wake
+    /// read against an unreadable owner proves nothing at all. Reporting both as
+    /// the same value would make a retirement that provably has nothing to cancel
+    /// indistinguishable from one whose target set is unknown, and would leave
+    /// every already-settled automation permanently reconciling.
+    #[error("UserAutomation runtime owner definitively retains no such record: {0}")]
+    NotRetained(String),
     /// The existing owner cannot determine whether the effect was applied.
     #[error("UserAutomation runtime owner returned an unknown outcome: {0}")]
     UnknownOutcome(String),
@@ -2323,17 +2342,6 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         .await
     }
 
-    /// Retires one revision through the canonical Store and then asks the
-    /// existing scheduler owner to cancel only unadmitted future wakes.
-    pub async fn remove_and_cancel<R: UserAutomationRuntimePort + ?Sized>(
-        &self,
-        request: UserAutomationServiceRequest,
-        runtime: &R,
-    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
-        self.remove_and_cancel_with_targets(request, Vec::new(), runtime)
-            .await
-    }
-
     /// Reads the complete owner execution view for one automation through the
     /// same `Status` read every other consumer uses, and refuses when the
     /// declared occurrence denominator is not owner-proven complete.
@@ -2395,6 +2403,21 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
 
     /// Retires one revision and cancels the exact owner-issued pending wake
     /// targets observed for that revision.
+    ///
+    /// This is the production retirement contour of the authenticated
+    /// `Remove` operator route: `KernelStoreGateway::remove_handoff` reads the
+    /// complete fail-closed owner execution view, enumerates the owner-issued
+    /// targets from the wake owner itself, and then calls this method so the
+    /// cancellation and the retirement share one owner view, one admitted
+    /// identity, and one runtime port.
+    ///
+    /// The targets are never empty on this path. An empty list is structurally
+    /// valid for the request but asks the wake owner to cancel nothing while
+    /// reporting that nothing needed cancelling, which is exactly the
+    /// absence-of-evidence-as-success failure this method must not perform; the
+    /// concrete Host owner refuses an empty list for the same reason. A
+    /// retirement whose targets are not owner-proven is reported as an
+    /// unresolved wake phase by the caller instead of reaching this method.
     pub async fn remove_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
@@ -2468,6 +2491,186 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             replayed,
         })
     }
+}
+
+/// Closed outcome of reading the exact owner-issued pending wake targets of one
+/// retired revision from the existing wake owner.
+///
+/// A target is never derived, guessed, reconstructed from a wake reason, or
+/// indexed: every field of one is transcribed from a record the wake owner
+/// itself returned for one exact occurrence of the committed revision's own
+/// normalized occurrence denominator.
+///
+/// `Proven` means the owner answered for every occurrence, so the set is
+/// complete. An empty `targets` under `Proven` is a PROVEN absence: the owner
+/// read its own state for every committed occurrence and definitively retains no
+/// unadmitted wake for any of them. It is not a partial list — a partial list is
+/// `Unproven`, because it is indistinguishable from a complete one at the
+/// cancellation owner (issue #2808, I5.16).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UserAutomationWakeTargetEnumeration {
+    /// The wake owner answered for every committed occurrence: it returned an
+    /// exact retained pending record for the ones it still holds, and a
+    /// definitive "retains no such record" for the rest.
+    Proven {
+        /// Exact owner-issued targets, one per retained pending wake. Empty only
+        /// when the owner proved there is no unadmitted wake to cancel.
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+    },
+    /// No complete exact target list is owner-proven, so no cancellation is
+    /// issued and the wake handoff of this retirement stays unresolved.
+    Unproven {
+        /// Closed reason the enumeration is not owner-proven.
+        reason: String,
+    },
+}
+
+/// Reads the exact owner-issued pending wake targets of one retired revision.
+///
+/// The occurrence set asked about is the committed revision's own normalized
+/// occurrence denominator — the same bounded set the horizon publication owner
+/// compiles from that revision, not a page of execution history and not the
+/// Durable Job history this projection already references. Each member is read
+/// back from the existing wake owner, which resolves it against its own journal
+/// and returns the record it actually retains; only that returned record
+/// supplies the wake identity, journal operation identity, idempotency key,
+/// record checksum and State Fence a cancellation target carries.
+///
+/// Each read has exactly two honest answers, and the walk keeps them apart. A
+/// returned record is a target. A
+/// [`UserAutomationRuntimeError::NotRetained`] is the owner's complete negative
+/// answer for that occurrence — it read its own state and definitively retains
+/// no such record — so the walk continues with that occurrence accounted for and
+/// nothing to cancel there. Every other answer, including
+/// [`UserAutomationRuntimeError::Unavailable`] for an owner that could not be
+/// read, makes the whole walk `Unproven`: an unknown target set is never
+/// reported as a partial one, and "nothing needs cancelling" is never inferred
+/// from an owner that could not answer.
+///
+/// A committed revision that declares no occurrence identity is `Unproven` as
+/// well. The walk asked nobody, so it proved nothing; an empty denominator is
+/// not evidence of an empty wake set. A valid normalized schedule always
+/// declares at least one occurrence, so this is a fail-closed guard rather than
+/// a reachable product state.
+pub async fn read_retirement_wake_targets<R>(
+    revision: &UserAutomationRevision,
+    context: &RequestMetadata,
+    identity: &OperationIdentity,
+    runtime: &R,
+) -> Result<UserAutomationWakeTargetEnumeration, UserAutomationExecutionError>
+where
+    R: UserAutomationWakePort + ?Sized,
+{
+    let identities = revision
+        .compile_occurrence_identities()
+        .map_err(UserAutomationExecutionError::Contract)?;
+    // The read is authenticated as the revision's own owner principal: a
+    // published calendar wake belongs to the revision owner, and the wake read
+    // refuses a request whose principal does not name the invocation it
+    // selects. The carrier identity is the caller's already-admitted remove
+    // identity, so this read mints no canonical operation of its own.
+    let mut targets: Vec<UserAutomationWakeCancellationTarget> = Vec::new();
+    for occurrence in &identities {
+        let request = retirement_wake_read_request(revision, occurrence, context, identity)?;
+        let read_request = request.clone();
+        match UserAutomationWakePort::read_pending_wake(runtime, request).await {
+            Ok(readback) => {
+                readback.validate_for(&read_request)?;
+                targets.push(UserAutomationWakeCancellationTarget {
+                    automation_id: revision.automation_id.clone(),
+                    automation_revision: revision.revision.clone(),
+                    wake_id: readback.intent.wake_id.clone(),
+                    operation_id: readback.operation_id.clone(),
+                    idempotency_key: readback.idempotency_key.clone(),
+                    record_checksum: readback.record_checksum.clone(),
+                    state_fence: readback.intent.state_fence.clone(),
+                });
+            }
+            // The owner is the sole writer of its wake journal and has just read
+            // it, so retaining no record for this exact occurrence is a complete
+            // negative answer: there is no unadmitted wake here to cancel. The
+            // walk continues, and the set stays provable.
+            Err(UserAutomationRuntimeError::NotRetained(_)) => {}
+            Err(error) => {
+                return Ok(UserAutomationWakeTargetEnumeration::Unproven {
+                    reason: format!(
+                        "the wake owner did not answer for occurrence {} of retired revision {}: \
+                         {error}; the exact unadmitted set is unknown, so no cancellation is \
+                         issued from a partial denominator",
+                        occurrence.occurrence_id, revision.revision
+                    ),
+                });
+            }
+        }
+    }
+    if identities.is_empty() {
+        // The walk asked nobody, so it proved nothing. An empty denominator is
+        // not evidence of an empty wake set, and reporting it as a proven
+        // absence would be exactly the failure this function refuses elsewhere.
+        return Ok(UserAutomationWakeTargetEnumeration::Unproven {
+            reason: format!(
+                "retired revision {} of {} declares no committed occurrence identity, so no wake \
+                 owner was asked and the unadmitted wake set is unknown rather than proven empty",
+                revision.revision, revision.automation_id
+            ),
+        });
+    }
+    // Every committed occurrence was answered: a retained record became a target
+    // and a definitive `NotRetained` was accounted for. An empty set here is a
+    // proven absence, not a missing answer.
+    Ok(UserAutomationWakeTargetEnumeration::Proven { targets })
+}
+
+/// Builds the exact wake-owner read request for one committed occurrence of a
+/// retired revision.
+///
+/// Every field is owner-issued. The automation, immutable revision and calendar
+/// trigger come from the committed revision's own occurrence compiler, and the
+/// principal, `WorkScope`, workdir and mode come from that same committed
+/// revision document. Nothing here consults an ambient identity, a clock, a
+/// reason string, or a row index, and the request names no wake: the wake
+/// identity, journal operation identity, idempotency key, record checksum and
+/// State Fence of a cancellation target are all returned by the wake owner.
+fn retirement_wake_read_request(
+    revision: &UserAutomationRevision,
+    occurrence: &AutomationOccurrenceIdentity,
+    context: &RequestMetadata,
+    identity: &OperationIdentity,
+) -> Result<UserAutomationWakeReadRequest, UserAutomationExecutionError> {
+    if occurrence.automation_id != revision.automation_id
+        || occurrence.revision != revision.revision
+        || occurrence.occurrence_id
+            != UserAutomationInvocation::occurrence_identity_for(
+                &revision.automation_id,
+                &revision.revision,
+                &occurrence.trigger,
+            )
+            .map_err(UserAutomationExecutionError::Contract)?
+    {
+        return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+            "retirement wake occurrence is not a member of the committed revision",
+        ));
+    }
+    Ok(UserAutomationWakeReadRequest {
+        context: context.clone(),
+        authenticated_principal: revision.owner_principal.clone(),
+        identity: identity.clone(),
+        invocation: UserAutomationInvocation {
+            automation_id: revision.automation_id.clone(),
+            automation_revision: revision.revision.clone(),
+            trigger: occurrence.trigger.clone(),
+            mode: revision.mode,
+            principal_ref: revision.owner_principal.clone(),
+            work_scope_ref: revision.work_scope.scope_id.clone(),
+            workdir_ref: revision.workdir_ref.clone(),
+            trigger_origin: UserAutomationTriggerOrigin::ScheduledWake,
+            // A published calendar occurrence of this revision is not an
+            // admitted child of another automation, so its own lineage depth is
+            // the root one.
+            child_depth: 0,
+            provenance: None,
+        },
+    })
 }
 
 /// Refuses a runtime boundary whose owner view is not a complete, fail-closed
