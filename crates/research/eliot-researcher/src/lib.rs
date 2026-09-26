@@ -20,13 +20,19 @@ use eliot_research_exchange_api::{
     ResearchQueryRequest, SourceClass,
 };
 
+// The coverage-account vocabulary `R6` publishes on its records: the observed
+// population the account learns, the owner-bound absence preconditions and the
+// verdict they produce. Referenced, never redefined here.
+pub use evidence_portfolio::{
+    AbsencePreconditions, AbsenceVerdict, NoMatchEvaluation, ObservedOutsideScope,
+};
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
 // reaching into a module path for a vocabulary it must match on.
 pub use inquiry_governance::{
     AcquisitionOutcome, BlindedField, CandidateEvidence, ClaimAuditRecord, CounterSearchStatus,
-    CoverageGoal, CoverageReceipt, DenominatorKind, EvidenceFreeze, EvidenceGrade,
-    EvidenceSetPrecision, GovernorInquiryAdmissionRequest, HypothesisPolicy,
+    CoverageGoal, CoverageReceipt, DenominatorKind, EnumerationState, EvidenceFreeze,
+    EvidenceGrade, EvidenceSetPrecision, GovernorInquiryAdmissionRequest, HypothesisPolicy,
     IndependenceBlindingPolicy, IndependenceDimension, IndependenceProfile, InquiryError,
     InquiryGovernance, InquiryHorizon, InquiryLane, InquiryObservation, InquiryOutputContract,
     InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
