@@ -12,11 +12,21 @@ param(
     [switch]$PlanOnly,
     [ValidateSet('legacy', 'agent-bridge')]
     [string]$ClaudeCodeFrontDoor = 'legacy',
+    [switch]$RetireGovernor,
     [Alias('VerifyBundle')]
     [string]$BuilderVerifyBundle
 )
 
 $ErrorActionPreference = 'Stop'
+# Issue #1719 option 1 proof: -RetireGovernor (or ELIOT_RETIRE_GOVERNOR=1)
+# forces the retired governor disposition on a tree that still carries the
+# legacy crate, so the retired path is runnable proof without deleting
+# anything. Default behavior is unchanged: retirement arms on cargo-metadata
+# presence alone (the day the legacy crate leaves the workspace, owned by
+# #18). Test-LegacyGovernorPresent honors this flag, and through it the plan,
+# the stage gate, and the staged payload; verification honors the retired
+# disposition carried by RELEASE.json itself.
+$script:ForceRetireGovernor = [bool]$RetireGovernor -or ([string]$env:ELIOT_RETIRE_GOVERNOR -eq '1')
 $repo = Split-Path -Parent $PSScriptRoot
 $surrealCatalogRelativePath = 'docs/release/SURREALDB_WINDOWS_X64.lock.json'
 $runtimeArtifactDefinitions = @(
@@ -244,6 +254,13 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # are outside this slice. The decision is recorded per plan/bundle in
 # `governor_disposition`, never by silent repository presence.
 function Test-LegacyGovernorPresent([object]$Metadata) {
+    # Forced retirement (proof switch) wins over repository presence: with
+    # -RetireGovernor (or ELIOT_RETIRE_GOVERNOR=1) the retired path runs on
+    # the branch tree without deleting the legacy crate. Otherwise the
+    # disposition stays presence-driven.
+    if ($script:ForceRetireGovernor) {
+        return $false
+    }
     if (-not $Metadata) {
         return $false
     }
@@ -1239,6 +1256,14 @@ function Get-ToolchainBuildReceipt([string]$Repo, [string]$SourceCommit, [object
         Where-Object { $_ -like '*/build.rs' -or $_ -eq 'build.rs' })
     if ($LASTEXITCODE -ne 0) {
         throw 'failed to enumerate pinned cargo build scripts'
+    }
+    if (-not (Test-LegacyGovernorPresent $CargoMetadata)) {
+        # Issue #1719 option 1: the retired release does not take the legacy
+        # crate as an input, so its build script is not a release input. A
+        # forced retirement (-RetireGovernor/ELIOT_RETIRE_GOVERNOR=1) simulates
+        # the post-#18 tree, where crates/eliot-app/build.rs no longer exists;
+        # excluding it keeps the forced plan byte-faithful to that tree.
+        $trackedBuildScripts = @($trackedBuildScripts | Where-Object { $_ -notlike 'crates/eliot-app/*' })
     }
     $dependencyClosure = 'plan-deferred'
     if ($Mode -eq 'stage') {
@@ -2411,8 +2436,10 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
 $frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
 # Issue #1719 option 1: the legacy crate's absence (post-#18 tree) retires
-# the governor artifact instead of failing the plan. Presence keeps today's
-# retained slice byte-identical.
+# the governor artifact instead of failing the plan. -RetireGovernor (or
+# ELIOT_RETIRE_GOVERNOR=1) forces the same retired path on a tree that still
+# carries the crate, as runnable proof. Presence keeps today's retained
+# slice byte-identical.
 $legacyGovernorPresent = Test-LegacyGovernorPresent $cargoMetadata
 $governorPath = Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-governor.exe'
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
@@ -2485,7 +2512,7 @@ $plan = [ordered]@{
         'retained-legacy-entrypoint (step 1-prime: Codex/OpenCode/Desktop plus the flag-absent Claude default still execute this entry; full retire/re-home BLOCKED-BY #18)'
     }
     else {
-        'retired (#1719 option 1: legacy crate absent from cargo metadata; the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge)'
+        'retired (#1719 option 1: legacy crate absent from cargo metadata, or retirement forced via -RetireGovernor/ELIOT_RETIRE_GOVERNOR=1; the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge)'
     }
     claude_code_front_door = [ordered]@{
         selection = $ClaudeCodeFrontDoor
@@ -2498,7 +2525,12 @@ $plan = [ordered]@{
         bridge_argv = @('mcp', '--profile', 'SPINE_FUNCTIONAL', '--transport', 'stdio', '--client-declaration', '<installation-absolute>/agent-bridge/client-declaration-v2.json')
         bridge_path = [string]$frontDoorBridgePlan.path
         bridge_provisioned = [bool]$frontDoorBridgePlan.provisioned
-        other_hosts = 'flag-gated (codex/opencode/claude-desktop refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy entries only while the flag is absent)'
+        other_hosts = if ($legacyGovernorPresent) {
+            'flag-gated (codex/opencode/claude-desktop refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt once ELIOT_CLAUDE_FRONT_DOOR=agent-bridge selects the new stack; legacy entries only while the flag is absent)'
+        }
+        else {
+            'retired (no legacy entrypoint exists on any host and the Claude legacy path is unavailable; canonical route: eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence))'
+        }
     }
     operator_source = if ($BuildOperator) { '<generated-by-locked-winui-publish>' } else { $OperatorSource }
     operator_build = if ($BuildOperator) { 'builder-invoked locked WinUI Publish; receipt emitted by the project AfterTargets=Publish target' } else { 'consume externally supplied receipt-bound publish directory' }
@@ -2552,7 +2584,7 @@ $plan = [ordered]@{
         'antigravity-official-plugin'
         'operations-runbooks'
         'release-catalogue'
-        if ($ClaudeCodeFrontDoor -ceq 'agent-bridge') { 'claude-frontdoor-bridge' } else { 'claude-frontdoor-legacy' }
+        if ($ClaudeCodeFrontDoor -ceq 'agent-bridge') { 'claude-frontdoor-bridge' } elseif ($legacyGovernorPresent) { 'claude-frontdoor-legacy' } else { 'claude-frontdoor-retired' }
     )
     signing_required_before_public_distribution = $true
 }
@@ -2563,7 +2595,7 @@ if ($PlanOnly) {
 }
 
 if (-not $legacyGovernorPresent -and $ClaudeCodeFrontDoor -ceq 'legacy') {
-    throw 'the legacy Claude Code front door is unavailable: the legacy governor crate is absent from cargo metadata (retired per #1719 option 1); re-run with -ClaudeCodeFrontDoor agent-bridge'
+    throw 'the legacy Claude Code front door is unavailable: the governor disposition is retired (legacy crate absent from cargo metadata, or -RetireGovernor/ELIOT_RETIRE_GOVERNOR=1 forced, per #1719 option 1); re-run with -ClaudeCodeFrontDoor agent-bridge'
 }
 
 if ($BuildOperator -and $OperatorSource) {
@@ -2890,7 +2922,7 @@ try {
             else {
                 @(
                     [ordered]@{
-                        disposition = 'retired (#1719 option 1: the legacy crate is absent, so no legacy entrypoint exists on any host and the Claude legacy path is unavailable)'
+                        disposition = 'retired (#1719 option 1: the legacy crate is absent, or retirement is forced, so no legacy entrypoint exists on any host and the Claude legacy path is unavailable)'
                         canonical_route = 'eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)'
                     }
                 )
@@ -2899,7 +2931,7 @@ try {
                 'once the flag selects the new stack, invoking daemon run, service run, hook, or mcp stdio on any host returns a structured ERROR object with the stable cutover code LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER and canonical_route and never auto-launches the daemon, starts a store, or constructs a ControlWal/WriterActor; flag absent preserves the legacy path; no invocation creates an alternate writer'
             }
             else {
-                'the legacy crate is absent: no legacy entrypoint exists on any host and the Claude legacy path is unavailable; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'
+                'the legacy crate is absent, or retirement is forced: no legacy entrypoint exists on any host and the Claude legacy path is unavailable; stage with -ClaudeCodeFrontDoor agent-bridge to provision the new stack'
             }
         }
         operator_schema_version = $verifiedOperator.schema_version
