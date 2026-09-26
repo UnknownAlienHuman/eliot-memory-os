@@ -2658,7 +2658,11 @@ fn serve_next_page(
 enum PageAdmission {
     /// The exact page this owner already constructed for this exact cursor. No
     /// provider I/O, no counter movement and no new capture data.
-    Replay(SnapshotPage),
+    ///
+    /// Boxed because a `SnapshotPage` is far larger than a claim, and this
+    /// value is returned by value from the admission step: without the box the
+    /// whole admission result carries the page's size on every claim path too.
+    Replay(Box<SnapshotPage>),
     /// A private claim over the capture that only this call may settle.
     Claimed(CaptureCallClaim),
 }
@@ -2716,7 +2720,7 @@ fn prepare_page(
     if let Some(page) = state.last_page.as_ref()
         && is_replay_cursor(page, cursor)
     {
-        return Ok(PageAdmission::Replay(page.clone()));
+        return Ok(PageAdmission::Replay(Box::new(page.clone())));
     }
     if state.claim.is_some() {
         // Another call is inside its provider await for this capture. Its result
@@ -2873,7 +2877,7 @@ pub(crate) async fn read_snapshot_page(
     let mut claim = match admission {
         // The retained response answers an exact repeated cursor without any
         // provider read and without touching progress.
-        PageAdmission::Replay(page) => return Ok(page),
+        PageAdmission::Replay(page) => return Ok(*page),
         PageAdmission::Claimed(claim) => claim,
     };
     // No registry lock is held across this provider await (I5.7). The private
