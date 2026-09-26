@@ -52,11 +52,20 @@ pub enum KernelError {
     ForgedReceipt,
 
     /// The presented authority receipt belongs to a fenced (stale) epoch.
-    #[error("authority receipt epoch {observed} does not match active epoch {active}")]
+    ///
+    /// **Same-lineage use only.** Both values are sequences of *one* lineage
+    /// (`epoch-id.contract.toml` `[types.EpochId]`: "sequence is compared only
+    /// when `lineage_id` is exactly equal"). A caller must not produce or read
+    /// this variant from two epochs of different lineages — those are
+    /// unrelated, never merely out of order, and are reported as
+    /// [`Self::StaleEpochTuple`] with both complete tuples instead.
+    #[error(
+        "authority receipt epoch {observed} does not match active epoch {active} in the same lineage"
+    )]
     StaleEpoch {
-        /// Epoch presented by the receipt.
+        /// Sequence presented by the receipt, inside the active lineage.
         observed: u64,
-        /// Epoch the Kernel is currently fencing.
+        /// Sequence the Kernel is currently fencing, in that same lineage.
         active: u64,
     },
 
