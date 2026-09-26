@@ -611,10 +611,11 @@ function Get-AuthenticodeRoleDefinitions {
     # + #1217 (provider/host-integration route) land.  This script never
     # deletes governor/Codex payload; it refuses to finalize a bundle that
     # contains unmanifested/unsigned executables.  A bundle whose RELEASE.json
-    # carries the #1719 retired governor disposition canonically omits the
-    # governor/Codex executables entirely; that absence passes this
-    # denominator, while any stray governor/Codex executable still fails
-    # closed here.
+    # carries an owner-evidenced retired governor disposition (issue #2892:
+    # accepted #18 receipt verified by the Test-ReleaseBundle input readback)
+    # canonically omits the governor/Codex executables entirely; that absence
+    # passes this denominator, while any stray governor/Codex executable
+    # still fails closed here.
     @(
         [ordered]@{ role = 'cli'; path = 'runtime/eliot.exe' }
         [ordered]@{ role = 'host'; path = 'runtime/eliot-host.exe' }
@@ -645,10 +646,12 @@ function Get-CodeBearingExecutableExtensions {
     # are NOT deleted here.  They fail closed in
     # Assert-CompleteCodeBearingDenominator as unmanifested/unsigned
     # executables until their owners land retirement or an explicit signed
-    # role.  The #1719 option-1 retirement is implemented in the builder:
-    # once the legacy crate leaves the workspace, staged bundles carry the
-    # retired governor disposition and canonically omit the governor/Codex
-    # executables (absence passes; stray presence still fails closed).
+    # role.  Owner-proven retirement (issue #2892) is implemented in the
+    # builder: staged bundles carry the retired governor disposition only
+    # from an accepted #18 receipt that verifies for the exact source
+    # commit; source absence alone never retires.  Retired bundles
+    # canonically omit the governor/Codex executables (absence passes;
+    # stray presence still fails closed).
     # Full governor retire/re-home is BLOCKED-BY #18
     # (legacy-deletion owner); the Codex entry re-home additionally awaits
     # the eliot-mcp behavior track per canon.
