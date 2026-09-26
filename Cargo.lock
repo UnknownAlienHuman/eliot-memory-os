@@ -2024,6 +2024,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
  "serde_json",
  "tokio",
 ]
