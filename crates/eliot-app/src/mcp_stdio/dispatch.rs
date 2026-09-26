@@ -150,6 +150,11 @@ pub(super) async fn handle_message(
     let method = request.get("method").and_then(Value::as_str)?;
     let mut correlation = correlation::McpInvocationCorrelation::receive(&request, method);
     correlation.observe_session(&context.session_id.to_string());
+    correlation.observe_route_context(
+        &format!("{:?}", state.profile),
+        &state.runtime_id,
+        &state.auth_generation,
+    );
     let result = if state.profile == McpAccessProfile::HostGovernor {
         let Some(result) = dispatch_host_governor_method(
             state,

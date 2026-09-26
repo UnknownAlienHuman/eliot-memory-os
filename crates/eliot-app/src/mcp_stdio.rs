@@ -214,6 +214,11 @@ struct CognitiveRuntimePaths {
 }
 
 mod autonomy;
+#[allow(
+    dead_code,
+    reason = "owner seam module: the facade owns no bridge instance; the bridge-owning process calls this join with its live bridge (#2899)"
+)]
+mod bridge_join;
 mod cognition;
 mod verification;
 #[allow(clippy::wildcard_imports)]
@@ -227,6 +232,7 @@ mod dispatch;
 mod evaluation;
 mod experiment;
 mod finalization;
+mod host_observation;
 mod input_validation;
 mod memory;
 mod memory_grant;
