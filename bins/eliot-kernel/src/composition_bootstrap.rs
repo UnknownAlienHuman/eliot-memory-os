@@ -57,6 +57,17 @@ use crate::kernel_diagnostics::{
     EntrypointStage, observe_entrypoint, observe_entrypoint_with_detail, observe_terminal_error,
 };
 
+/// The single capability this Kernel's server-owned front-door policy grants to
+/// the daemon/operator front-door session class.
+///
+/// Named here, at the policy declaration itself, so a route that must prove
+/// "this session is the operator front door and not a specialised owner
+/// session" binds the policy's own value instead of restating a capability
+/// literal. The Host `UserAutomation` capability is the policy's only other
+/// entry and is admitted through its own binder with an exact single-value
+/// assertion, so a session carrying it is not an operator session.
+pub(crate) const DAEMON_FRONT_DOOR_CAPABILITY: &str = "daemon";
+
 /// Exact-owner backup channel clients (issue #962, Writer-D).
 ///
 /// Declared here (rather than in `lib.rs`) so the client-injection turn
@@ -1251,7 +1262,7 @@ impl KernelComposition {
             // bypassing live policy while retaining the least-privilege
             // Submit-only check in `front_door_session`/`dreamer_job_dispatch`.
             allowed_capabilities: vec![
-                "daemon".to_owned(),
+                DAEMON_FRONT_DOOR_CAPABILITY.to_owned(),
                 USER_AUTOMATION_KERNEL_CAPABILITY.to_owned(),
             ],
             allowed_privacy_classes: vec!["PUBLIC".to_owned()],
