@@ -1324,7 +1324,8 @@ impl KernelContextReadClient {
         quality: QualityScorecard,
         assembly: &AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-    ) -> Result<ActiveUnderstandingViewResult, PacketCompositionError> {
+    ) -> Result<(ActiveUnderstandingViewResult, MaterialRankTraceDelivery), PacketCompositionError>
+    {
         if seven.scope_id.as_str() != request.binding.scope_id.as_str()
             || seven.state_fence != request.binding.state_fence
         {
@@ -1406,7 +1407,7 @@ impl KernelContextReadClient {
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
         check_delivered_traces(&delivery, &assembled)
             .map_err(PacketCompositionError::TraceDelivery)?;
-        Ok(assembled)
+        Ok((assembled, delivery))
     }
 }
 

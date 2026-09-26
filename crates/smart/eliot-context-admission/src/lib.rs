@@ -301,6 +301,34 @@ pub struct MaterialRankTraceDelivery {
     /// Content-addressed handle (`rank-trace:<sha256>`) resolving to exactly
     /// this delivered trace set.
     pub rank_trace_handle: String,
+    /// Selection-time dependency references, each joined to the material
+    /// trace that recorded it.
+    pub dependency_trace_bindings: Vec<MaterialTraceDependencyBinding>,
+    /// Selection-time invalidation references, each joined to the material
+    /// trace that recorded it.
+    pub invalidation_trace_bindings: Vec<MaterialTraceInvalidationBinding>,
+}
+
+/// Reverse association from one selected material dependency to its trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterialTraceDependencyBinding {
+    /// Material whose selection recorded this dependency.
+    pub atom_id: eliot_contracts::ArtifactId,
+    /// Dependency recorded at selection time.
+    pub dependency_id: eliot_contracts::ArtifactId,
+    /// Per-material trace handle carrying the dependency fact.
+    pub trace_handle: String,
+}
+
+/// Reverse association from one selected material invalidation to its trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterialTraceInvalidationBinding {
+    /// Material whose selection recorded this invalidation.
+    pub atom_id: eliot_contracts::ArtifactId,
+    /// Invalidation handle recorded at selection time.
+    pub invalidation_id: eliot_contracts::ArtifactId,
+    /// Per-material trace handle carrying the invalidation fact.
+    pub trace_handle: String,
 }
 
 impl MaterialRankTraceDelivery {
@@ -313,8 +341,9 @@ impl MaterialRankTraceDelivery {
     /// joined against, so the pair cannot drift.
     pub fn new(
         result: &AdmissionResult,
-        traces: Vec<MaterialRankTrace>,
+        mut traces: Vec<MaterialRankTrace>,
     ) -> Result<Self, ContextError> {
+        traces.sort_by(|left, right| left.atom_id.cmp(&right.atom_id));
         let mut visible = 0_usize;
         let mut suppressed = 0_usize;
         for trace in &traces {
@@ -331,6 +360,8 @@ impl MaterialRankTraceDelivery {
             .iter()
             .map(|trace| trace.trace_handle.clone())
             .collect();
+        let (dependency_trace_bindings, invalidation_trace_bindings) =
+            selection_trace_bindings(&traces)?;
         let delivery = Self {
             decision_id: result.binding.decision_id.clone(),
             traces,
@@ -340,6 +371,8 @@ impl MaterialRankTraceDelivery {
                 "rank-trace:{}",
                 eliot_context_contracts::canonical_digest(&handles)?
             ),
+            dependency_trace_bindings,
+            invalidation_trace_bindings,
         };
         delivery.validate(result)?;
         Ok(delivery)
@@ -359,6 +392,15 @@ impl MaterialRankTraceDelivery {
         }
         if self.traces.len() != result.evidence.decisions.len() {
             return Err(ContextError::DenominatorMismatch);
+        }
+        if self
+            .traces
+            .windows(2)
+            .any(|pair| pair[0].atom_id >= pair[1].atom_id)
+        {
+            return Err(ContextError::InvalidField(
+                "material_trace_delivery.trace_order",
+            ));
         }
         let complete = matches!(result.outcome, ContextOutcome::Complete(_));
         let mut visible = 0_usize;
@@ -419,8 +461,70 @@ impl MaterialRankTraceDelivery {
                 "material_trace_delivery.rank_trace_handle",
             ));
         }
+        let (dependency_trace_bindings, invalidation_trace_bindings) =
+            selection_trace_bindings(&self.traces)?;
+        if self.dependency_trace_bindings != dependency_trace_bindings {
+            return Err(ContextError::InvalidField(
+                "material_trace_delivery.dependency_trace_bindings",
+            ));
+        }
+        if self.invalidation_trace_bindings != invalidation_trace_bindings {
+            return Err(ContextError::InvalidField(
+                "material_trace_delivery.invalidation_trace_bindings",
+            ));
+        }
         Ok(())
     }
+}
+
+fn selection_trace_bindings(
+    traces: &[MaterialRankTrace],
+) -> Result<
+    (
+        Vec<MaterialTraceDependencyBinding>,
+        Vec<MaterialTraceInvalidationBinding>,
+    ),
+    ContextError,
+> {
+    let mut dependencies = Vec::new();
+    let mut invalidations = Vec::new();
+    for trace in traces {
+        let mut seen_dependencies = BTreeSet::new();
+        for dependency in &trace.dependencies {
+            if !seen_dependencies.insert(dependency) {
+                return Err(ContextError::Duplicate("material_trace.dependencies"));
+            }
+        }
+        dependencies.extend(trace.dependencies.iter().cloned().map(|dependency_id| {
+            MaterialTraceDependencyBinding {
+                atom_id: trace.atom_id.clone(),
+                dependency_id,
+                trace_handle: trace.trace_handle.clone(),
+            }
+        }));
+        if let Some(invalidation_id) = &trace.invalidation {
+            invalidations.push(MaterialTraceInvalidationBinding {
+                atom_id: trace.atom_id.clone(),
+                invalidation_id: invalidation_id.clone(),
+                trace_handle: trace.trace_handle.clone(),
+            });
+        }
+    }
+    dependencies.sort_by(|left, right| {
+        (&left.atom_id, &left.dependency_id, &left.trace_handle).cmp(&(
+            &right.atom_id,
+            &right.dependency_id,
+            &right.trace_handle,
+        ))
+    });
+    invalidations.sort_by(|left, right| {
+        (&left.atom_id, &left.invalidation_id, &left.trace_handle).cmp(&(
+            &right.atom_id,
+            &right.invalidation_id,
+            &right.trace_handle,
+        ))
+    });
+    Ok((dependencies, invalidations))
 }
 
 fn build_omissions(
