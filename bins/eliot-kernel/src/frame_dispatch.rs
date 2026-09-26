@@ -18,7 +18,7 @@ use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
-use super::request_dispatch::{dispatch_backup_frame, is_backup_operation};
+use super::request_dispatch::is_backup_operation;
 use super::wasm_runtime_port_grant::{
     HandlerSession, HostBinaryFacts, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
     WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
@@ -992,7 +992,7 @@ impl KernelComposition {
                 if frame.request_id.is_none() || frame.request_identity.is_none() {
                     return Err(TransportError::SessionFenced);
                 }
-                return dispatch_backup_frame(session, frame);
+                return self.dispatch_backup_frame(session, frame);
             }
             // I1.5 (#1750): the blanket `Ready` gate that used to sit here is
             // replaced by per-route gates, each of which is at least as strict

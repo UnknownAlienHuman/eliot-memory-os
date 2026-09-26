@@ -345,13 +345,44 @@ impl KernelBackupCapture {
     }
 }
 
-/// Stable class name for capability refusals.
-fn class_name(class: BackupClass) -> &'static str {
+/// Stable class name for capability refusals and the front-door projection.
+///
+/// The front-door backup route reports the owner's evidenced class under this
+/// exact spelling, so the closed operator/wire vocabulary stays bound in one
+/// place instead of being restated in a caller.
+pub(crate) fn class_name(class: BackupClass) -> &'static str {
     match class {
         BackupClass::FullRecovery => "full_recovery",
         BackupClass::CanonicalOnlyDegraded => "canonical_only_degraded",
         BackupClass::ScopeExport => "scope_export",
     }
+}
+
+/// Closed obligation-domain prefixes carried by every member disposition.
+///
+/// The front-door verify projection counts these domains for the operator, so
+/// the prefixes are named here, beside the dispositions that emit them, rather
+/// than restated as string literals in a caller. Renaming a prefix therefore
+/// changes exactly one place.
+pub(crate) const MEMBER_DOMAIN_CANONICAL: &str = "canonical:";
+/// Receipt obligation domain prefix (see [`MEMBER_DOMAIN_CANONICAL`]).
+pub(crate) const MEMBER_DOMAIN_RECEIPT: &str = "receipt:";
+/// Sealed-blob obligation domain prefix (see [`MEMBER_DOMAIN_CANONICAL`]).
+pub(crate) const MEMBER_DOMAIN_BLOB: &str = "blob:";
+
+/// Counts one obligation domain inside this owner's own member dispositions.
+///
+/// This reads the owner's report; it never re-decodes the archive and never
+/// re-derives the capture-path denominator.
+pub(crate) fn member_domain_count(report: &CaptureReport, domain: &str) -> u64 {
+    u64::try_from(
+        report
+            .member_dispositions
+            .iter()
+            .filter(|(member, _)| member.starts_with(domain))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Enforces the class capability gate: `full_recovery` requires the ORS
@@ -495,7 +526,7 @@ fn member_disposition_list(
     let mut dispositions = Vec::new();
     for event in events {
         dispositions.push((
-            format!("canonical:{}", event.record_id),
+            format!("{}{}", MEMBER_DOMAIN_CANONICAL, event.record_id),
             "captured".to_owned(),
         ));
     }
@@ -507,13 +538,13 @@ fn member_disposition_list(
     }
     for receipt in receipts {
         dispositions.push((
-            format!("receipt:{}", receipt.operation_id),
+            format!("{}{}", MEMBER_DOMAIN_RECEIPT, receipt.operation_id),
             "captured".to_owned(),
         ));
     }
     for blob in blobs {
         dispositions.push((
-            format!("blob:{}", blob.locator.hash.as_str()),
+            format!("{}{}", MEMBER_DOMAIN_BLOB, blob.locator.hash.as_str()),
             "captured".to_owned(),
         ));
     }
