@@ -4572,6 +4572,233 @@ impl RedbRecoveryStore {
         Ok(outcome)
     }
 
+    /// Atomically binds immutable request identities with one host-request
+    /// operation and its logical-key claim (issue #74 W7).
+    ///
+    /// A valid logical replay is resolved first so its semantic identity can
+    /// survive transport changes. Existing identity rows are then checked:
+    /// keyed operations compare semantic commitment, while unkeyed operations
+    /// require an exact binding. A replay returns its durable winner and does
+    /// not stage missing identity rows. For a fresh operation, all identity
+    /// rows, the operation row, and any logical link commit in one transaction;
+    /// any conflict aborts the entire write.
+    pub fn resolve_or_stage_host_request_with_identity_bindings(
+        &self,
+        record: &crate::HostRequestRecord,
+        identity_bindings: &[crate::HostRequestRecord],
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        Self::validate_host_request_identity_bindings(record, identity_bindings)?;
+        let logical_key = Self::host_request_logical_key_for_record(record)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let logical_winner =
+            Self::host_request_logical_winner_in(&write, logical_key.as_deref(), record)?;
+        let missing_bindings = Self::check_host_request_identity_bindings_in(
+            &write,
+            identity_bindings,
+            logical_key.is_some(),
+        )?;
+        let outcome = match logical_winner {
+            Some(winner) => winner,
+            None => Self::stage_host_request_with_bindings_in(
+                &write,
+                record,
+                logical_key.as_deref(),
+                &missing_bindings,
+            )?,
+        };
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    fn validate_requested_host_request(
+        record: &crate::HostRequestRecord,
+        action: &'static str,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        if record.state != crate::HostRequestState::Requested {
+            return Err(OrsError::InvalidField {
+                field: "host_request_state",
+                reason: action,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_host_request_identity_bindings(
+        record: &crate::HostRequestRecord,
+        identity_bindings: &[crate::HostRequestRecord],
+    ) -> Result<(), OrsError> {
+        Self::validate_requested_host_request(record, "logical resolution stages requested state")?;
+        if identity_bindings.len() != 3 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_identity_bindings",
+                reason: "exactly three identity binding rows are required",
+            });
+        }
+        let required_namespaces = [
+            format!("hostreq-identity:{}", record.idempotency_key.as_str()),
+            format!("hostreq-request-id:{}", record.request_id.as_str()),
+            format!(
+                "hostreq-cancellation-id:{}",
+                record.cancellation_id.as_str()
+            ),
+        ];
+        let binding_digest = "4c34aefb3b4c7f374a9e216800835ff70f67e3f1f44672d3d6297da86aaf7c79";
+        let mut identity_keys = BTreeSet::new();
+        let mut observed_namespaces = BTreeSet::new();
+        for binding in identity_bindings {
+            binding.validate()?;
+            let binding_key = binding.record_key();
+            if binding.state != crate::HostRequestState::Requested
+                || binding.result_digest.is_some()
+                || binding.result_response.is_some()
+                || binding.commit_order != 0
+                || binding.operation_id == record.operation_id
+                || binding_key == record.record_key()
+                || binding.request_digest != binding_digest
+                || binding.payload_digest != record.payload_digest
+                || !identity_keys.insert(binding_key)
+                || !required_namespaces
+                    .iter()
+                    .any(|namespace| namespace == binding.operation_id.as_str())
+                || !observed_namespaces.insert(binding.operation_id.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_identity_binding",
+                    reason: "identity bindings must be the three distinct immutable namespace rows",
+                });
+            }
+            let mut expected = record.clone();
+            expected.operation_id.clone_from(&binding.operation_id);
+            expected.request_digest.clone_from(&binding.request_digest);
+            if !expected.same_binding(binding) {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_identity_binding",
+                    reason: "identity binding row must preserve the requested operation fields",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn host_request_logical_winner_in(
+        write: &redb::WriteTransaction,
+        logical_key: Option<&str>,
+        record: &crate::HostRequestRecord,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let Some(logical_key) = logical_key else {
+            return Ok(None);
+        };
+        let link = {
+            let links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            links
+                .get(logical_key)
+                .map_err(storage)?
+                .map(|value| decode::<HostRequestLogicalLink>(value.value()))
+                .transpose()?
+        };
+        let Some(link) = link else {
+            return Ok(None);
+        };
+        let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+        let row_key = format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+        let winner: crate::HostRequestRecord = operations
+            .get(row_key.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "logical link points at a missing host-request row".to_owned(),
+            })?;
+        winner.validate()?;
+        let winner_key = Self::host_request_logical_key_for_record(&winner)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "host_request_logical_link",
+                reason: "linked host-request row carries no logical key".to_owned(),
+            }
+        })?;
+        if winner_key != logical_key
+            || !Self::host_requests_share_logical_commitment(&winner, record)
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: winner.operation_id.as_str().to_owned(),
+                request_digest: winner.request_digest.clone(),
+            });
+        }
+        Ok(Some(winner))
+    }
+
+    fn check_host_request_identity_bindings_in<'a>(
+        write: &redb::WriteTransaction,
+        identity_bindings: &'a [crate::HostRequestRecord],
+        compare_semantic_commitment: bool,
+    ) -> Result<Vec<&'a crate::HostRequestRecord>, OrsError> {
+        let mut missing = Vec::new();
+        for binding in identity_bindings {
+            let existing = {
+                let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                operations
+                    .get(binding.record_key().as_str())
+                    .map_err(storage)?
+                    .map(|value| {
+                        let existing: crate::HostRequestRecord = decode(value.value())?;
+                        existing.validate()?;
+                        Ok::<_, OrsError>(existing)
+                    })
+                    .transpose()?
+            };
+            if let Some(existing) = existing {
+                let immutable = existing.state == crate::HostRequestState::Requested
+                    && existing.result_digest.is_none()
+                    && existing.result_response.is_none()
+                    && existing.commit_order == 0;
+                let same_binding = if compare_semantic_commitment {
+                    Self::host_requests_share_logical_commitment(&existing, binding)
+                } else {
+                    existing.same_binding(binding)
+                };
+                if !immutable || !same_binding {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: binding.operation_id.as_str().to_owned(),
+                        request_digest: binding.request_digest.clone(),
+                    });
+                }
+            } else {
+                missing.push(binding);
+            }
+        }
+        Ok(missing)
+    }
+
+    fn stage_host_request_with_bindings_in(
+        write: &redb::WriteTransaction,
+        record: &crate::HostRequestRecord,
+        logical_key: Option<&str>,
+        missing_bindings: &[&crate::HostRequestRecord],
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        for binding in missing_bindings {
+            Self::stage_host_request_in(write, binding)?;
+        }
+        let staged = Self::stage_host_request_in(write, record)?;
+        if let Some(logical_key) = logical_key {
+            let link = HostRequestLogicalLink {
+                operation_id: staged.operation_id.clone(),
+                request_digest: staged.request_digest.clone(),
+            };
+            let payload = encode(&link)?;
+            let mut links = write
+                .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                .map_err(storage)?;
+            links
+                .insert(logical_key, payload.as_str())
+                .map_err(storage)?;
+        }
+        Ok(staged)
+    }
+
     /// Loads one host-request operation by logical key (issue #2571).
     ///
     /// `Ok(None)` is authoritatively absent: no operation was ever staged
