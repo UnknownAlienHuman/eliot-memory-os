@@ -629,7 +629,7 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 21] = [
 /// Validates the top-level operation envelope before typed construction.
 ///
 /// Serde unit variants (`status`, `stop`, `reconcile_external`,
-/// `reactive_snapshot`) would silently
+/// `recover_next_page`, `reactive_snapshot`) would silently
 /// ignore extra members, so the exact key set is enforced here per operation:
 /// attach/invoke/cancel carry exactly `request`; forward_hook/forward_event
 /// carry exactly `event`; reconnect carries exactly its seven authority-claim
@@ -740,7 +740,9 @@ fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeR
         "attach" | "invoke" | "cancel" => &["op", "request"],
         "dry_run_invoke" | "dry_run_cancel" => &["op", "request"],
         "forward_hook" | "forward_event" => &["op", "event"],
-        "reconcile_external" | "status" | "stop" | "reactive_snapshot" => &["op"],
+        "reconcile_external" | "recover_next_page" | "status" | "stop" | "reactive_snapshot" => {
+            &["op"]
+        }
         "reactive_admit" => &[
             "op",
             "cue",
