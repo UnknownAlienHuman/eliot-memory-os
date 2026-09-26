@@ -1336,6 +1336,9 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
                 eliot_contracts::BridgeEventCapacityDimension::EventRecords => {
                     "bridge event-record capacity pressure"
                 }
+                eliot_contracts::BridgeEventCapacityDimension::EnvelopeBytes => {
+                    "bridge envelope-byte capacity pressure"
+                }
                 eliot_contracts::BridgeEventCapacityDimension::PendingHandoffs => {
                     "bridge pending-handoff capacity pressure"
                 }
