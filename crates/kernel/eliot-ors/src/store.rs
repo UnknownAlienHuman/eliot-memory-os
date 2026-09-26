@@ -321,14 +321,47 @@ const MAX_BRIDGE_ACK_BATCH: usize = 1024;
 /// stream position binding that position to exactly one logical event.
 /// Keyed by `{owner_namespace}::{sequence:020}` (zero-padded so the byte
 /// order is the numeric order); the value is the bound `event_id`. Written
-/// atomically in the same ORS transaction as the event row, never updated,
-/// never deleted: a compacted position keeps its binding forever, so one
-/// admitted position identifies exactly one logical event for the life of
-/// the stream incarnation. Only owner-checked rows are indexed; legacy
+/// atomically in the same ORS transaction as the event row, never updated.
+/// A retired prefix compacts into the per-namespace position range (issue
+/// #2885) instead of keeping one row per event forever, so one admitted
+/// position still identifies exactly one logical event for the life of the
+/// stream incarnation — by exact row while recent, by certified range below
+/// the retired frontier. Only owner-checked rows are indexed; legacy
 /// ownerless rows keep their existing scan-checked invariant and are never
 /// inferred into this index.
 const BRIDGE_EVENT_POSITIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_positions_v1");
+/// Certified compacted position ranges (issue #2885): one row per owner
+/// namespace at most, keyed by the namespace digest. Each row retires a
+/// contiguous prefix of positions whose per-event rows were deleted after
+/// the retired boundary covered them, binding the prefix to its owner
+/// revision/incarnation, predecessor chain, and position-segment commitment,
+/// so an old sequence can never become fresh and a changed range conflicts.
+const BRIDGE_EVENT_POSITION_RANGES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_position_ranges_v1");
+/// Maximum position rows compacted into the certified range by one recovery
+/// entry (issue #2885, item 7). Covers the per-entry arrival rate (one
+/// acknowledgement batch presents at most [`MAX_BRIDGE_ACK_BATCH`]
+/// sequences per namespace) with headroom; each step is key-ordered
+/// point lookups plus at most one row delete, and the persisted range end
+/// plus continuation resume the next legitimate entry.
+const MAX_BRIDGE_POSITION_COMPACT_PER_RECOVERY: usize = 1024;
+/// Version of the bridge position-range row carried by every range.
+const BRIDGE_POSITION_RANGE_VERSION: u16 = 1;
+/// Retention-policy revision bound into every position range (issue #2885,
+/// item 5): a policy change mints a new revision, so old ranges never
+/// silently acquire new retention meaning.
+const BRIDGE_POSITION_RETENTION_POLICY_REVISION: u16 = 1;
+/// `META` marker recording the completed bridge position-range schema
+/// (issue #2885, item 9): the ranges table exists and its rows validate.
+const BRIDGE_POSITION_RANGE_SCHEMA_KEY: &str = "bridge_position_range_schema";
+/// Expected value of [`BRIDGE_POSITION_RANGE_SCHEMA_KEY`].
+const BRIDGE_POSITION_RANGE_SCHEMA_V1: &str = "eliot.ors.bridge-position-range.v1";
+/// Domain separator of the owner-local position-segment commitment chain
+/// (issue #2885, item 5): the same labeled-digest encoding as the owner
+/// namespace digest, so a segment commitment can never collide with an
+/// owner digest or another chain.
+const BRIDGE_POSITION_RANGE_COMMITMENT_DOMAIN: &str = "eliot.ors.bridge-position-range.v1";
 /// Retained bridge-event replay commitments (issue #2730): the original
 /// admitted identity and content commitment of compacted events. Keyed by
 /// `{owner_namespace}::{event_id}`; written atomically in the same ORS
@@ -1022,8 +1055,10 @@ impl persistence_codec::PersistedValue for BridgeEventReplayCommitment {
 ///
 /// The value names the exactly one logical event admitted at
 /// `{owner_namespace}::{sequence:020}`. Written once with its event row,
-/// never updated, never deleted — including across compaction — so a
-/// position can never be reused by another event.
+/// never updated. Deleted only when its retired prefix compacts into the
+/// certified per-namespace position range (issue #2885) — never to free
+/// unresolved identity evidence — so a position can never be reused by
+/// another event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventPosition {
@@ -1042,6 +1077,145 @@ impl persistence_codec::PersistedValue for BridgeEventPosition {
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
     }
+}
+
+/// One certified compacted position range (issue #2885): the retired
+/// contiguous prefix `[range_start, range_end]` of one owner namespace
+/// whose per-event position rows were deleted after the retained compacted
+/// boundary covered them. At most one row per namespace exists, keyed by
+/// the namespace digest, so retained identity is O(streams), never
+/// O(lifetime events). The row binds the owner revision/incarnation that
+/// retired it (never extended across a changed binding), the predecessor
+/// chain, a position-segment commitment over compacted `(sequence, event_id)`
+/// pairs, the acked frontier and boundary that certified it, the schema and retention
+/// policy revisions, and the persisted compaction continuation for the next
+/// legitimate recovery entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventPositionRange {
+    contract_version: u16,
+    range_version: u16,
+    owner_namespace: String,
+    stream_id: String,
+    owner_revision: u64,
+    owner_incarnation: u64,
+    range_start: u64,
+    range_end: u64,
+    predecessor_commitment: String,
+    segment_commitment: String,
+    acked_at_compaction: u64,
+    compacted_boundary_at_compaction: u64,
+    compacted_at_ms: u64,
+    compaction_continuation: bool,
+    retention_policy_revision: u16,
+}
+
+impl BridgeEventPositionRange {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if self.range_version != BRIDGE_POSITION_RANGE_VERSION {
+            return Err(OrsError::InvalidField {
+                field: "range_version",
+                reason: "bridge position range carries the current range version",
+            });
+        }
+        crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        if self.owner_revision == 0 || self.owner_incarnation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "owner_revision",
+                reason: "bridge position range binds a nonzero owner revision and incarnation",
+            });
+        }
+        if self.range_start == 0 || self.range_end < self.range_start {
+            return Err(OrsError::InvalidField {
+                field: "range_end",
+                reason: "bridge position range covers a nonempty sequence prefix",
+            });
+        }
+        if !self.predecessor_commitment.is_empty() {
+            crate::model::validate_digest(&self.predecessor_commitment, "predecessor_commitment")?;
+        }
+        crate::model::validate_digest(&self.segment_commitment, "segment_commitment")?;
+        if self.range_end > self.acked_at_compaction {
+            return Err(OrsError::InvalidField {
+                field: "acked_at_compaction",
+                reason: "a retired position prefix never passes its certifying acked frontier",
+            });
+        }
+        if self.range_end > self.compacted_boundary_at_compaction {
+            return Err(OrsError::InvalidField {
+                field: "compacted_boundary_at_compaction",
+                reason: "a retired position prefix never passes its certifying compacted boundary",
+            });
+        }
+        if self.compacted_boundary_at_compaction > self.acked_at_compaction {
+            return Err(OrsError::InvalidField {
+                field: "compacted_boundary_at_compaction",
+                reason: "the certifying compacted boundary never passes the acked frontier",
+            });
+        }
+        if self.retention_policy_revision != BRIDGE_POSITION_RETENTION_POLICY_REVISION {
+            return Err(OrsError::InvalidField {
+                field: "retention_policy_revision",
+                reason: "bridge position range carries the current retention policy revision",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventPositionRange {
+    const RECORD_TYPE: &str = "bridge_event_position_range";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Inputs hashed into one position-segment commitment (issue #2885, item
+/// 5): the range identity plus the compacted `(sequence, event_id)` pairs.
+/// Passed as one unit so the commitment helper keeps a bounded signature;
+/// built by `RedbRecoveryStore::compact_bridge_positions_in`, consumed by
+/// `RedbRecoveryStore::bridge_position_segment_commitment`.
+struct BridgePositionSegment<'a> {
+    namespace: &'a str,
+    start: u64,
+    end: u64,
+    predecessor: &'a str,
+    revision: u64,
+    incarnation: u64,
+    acked: u64,
+    compacted: u64,
+    pairs: &'a [(u64, &'a str)],
+}
+
+/// Stored certified-range state for one namespace (issue #2885, item 8):
+/// the validated row (if any), its retired end, and whether the owner
+/// binding moved since certification. Built by
+/// `RedbRecoveryStore::bridge_position_range_state_in` and consumed by
+/// `RedbRecoveryStore::compact_bridge_positions_in`.
+struct BridgePositionRangeState {
+    range: Option<BridgeEventPositionRange>,
+    range_end: u64,
+    generation_changed: bool,
+}
+
+/// One namespace's planned position-prefix compaction (issue #2885, item
+/// 7): position keys to delete with their bound pairs, the new certified
+/// prefix end, and why the walk stopped. Built by
+/// `RedbRecoveryStore::bridge_position_compact_plan_in` and applied by
+/// `RedbRecoveryStore::compact_bridge_positions_in`.
+#[derive(Default)]
+struct BridgePositionCompactPlan {
+    delete_keys: Vec<String>,
+    pairs: Vec<(u64, String)>,
+    compacted_to: u64,
+    stopped_transient: bool,
+    budget_exhausted: bool,
+    torn: bool,
 }
 
 /// Validates one owner-namespace key component (issue #2729).
@@ -8800,6 +8974,47 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Ensures the bridge position-range schema (issue #2885, item 9): the
+    /// `META` marker must be absent (first open, set below) or exactly
+    /// [`BRIDGE_POSITION_RANGE_SCHEMA_V1`]; any other value fails open
+    /// closed with [`OrsError::MigrationRequired`]. Runs inside the
+    /// store-open transaction owned by [`Self::initialize`] beside the
+    /// replay-index migration, so restart preserves the certified ranges.
+    /// Existing position rows are never selected, rewritten, or deleted
+    /// here: contradictions surface transactionally at maintenance time
+    /// (the compaction walk stops on torn mappings and preserves them) and
+    /// through the live-row backfill, never by open-time guessing.
+    fn ensure_bridge_position_range_schema(write: &redb::WriteTransaction) -> Result<(), OrsError> {
+        let marker: Option<String> = {
+            let meta = write.open_table(META).map_err(storage)?;
+            match meta
+                .get(BRIDGE_POSITION_RANGE_SCHEMA_KEY)
+                .map_err(storage)?
+            {
+                Some(value) if value.value().len() > MAX_ORS_MARKER_BYTES => {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                Some(value) => Some(value.value().to_owned()),
+                None => None,
+            }
+        };
+        match marker.as_deref() {
+            None => {
+                let mut meta = write.open_table(META).map_err(storage)?;
+                meta.insert(
+                    BRIDGE_POSITION_RANGE_SCHEMA_KEY,
+                    BRIDGE_POSITION_RANGE_SCHEMA_V1,
+                )
+                .map_err(storage)?;
+                Ok(())
+            }
+            Some(marker) if marker == BRIDGE_POSITION_RANGE_SCHEMA_V1 => Ok(()),
+            Some(_) => Err(OrsError::MigrationRequired {
+                reason: "bridge position range schema marker is not the current version".to_owned(),
+            }),
+        }
+    }
+
     /// Backfills position entries missing for live owner-bound rows
     /// (issue #2730, item 6): the idempotent steady-state half of the
     /// migration. Never deletes, never overwrites, never guesses — an
@@ -9599,6 +9814,16 @@ impl RedbRecoveryStore {
     /// If no safe retirement exists the table stays full and admission keeps
     /// answering backpressure — cursors are never reset and missing evidence
     /// is never declared complete.
+    ///
+    /// Issue #2885 chains the position-prefix compaction after the handoff
+    /// retirement in dependency order (retire first so already-retired live
+    /// handoffs never block the prefix): the same entry then compacts up to
+    /// [`MAX_BRIDGE_POSITION_COMPACT_PER_RECOVERY`] retired positions into
+    /// the certified per-namespace range in its own short transaction and
+    /// reports the additive `positions_compacted`, `position_range_end`,
+    /// `position_compaction_continuation`, and `position_compaction_torn`
+    /// legs beside the unchanged handoff outcome. Position work never
+    /// alters the handoff budget or continuation above.
     pub fn retire_bridge_event_handoffs_checked(
         &self,
         request: &serde_json::Value,
@@ -9646,7 +9871,7 @@ impl RedbRecoveryStore {
             reason: "handoff retirement budget must fit the platform word",
         })?;
         let write = self.database.begin_write().map_err(storage)?;
-        let outcome = Self::retire_bridge_handoffs_in(
+        let mut outcome = Self::retire_bridge_handoffs_in(
             &write,
             &namespace,
             expected_revision,
@@ -9654,6 +9879,29 @@ impl RedbRecoveryStore {
             budget,
         )?;
         write.commit().map_err(storage)?;
+        let position_write = self.database.begin_write().map_err(storage)?;
+        let positions_outcome = Self::compact_bridge_positions_in(
+            &position_write,
+            &namespace,
+            expected_revision,
+            expected_incarnation,
+            MAX_BRIDGE_POSITION_COMPACT_PER_RECOVERY,
+        )?;
+        position_write.commit().map_err(storage)?;
+        if let (Some(object), Some(positions)) =
+            (outcome.as_object_mut(), positions_outcome.as_object())
+        {
+            for key in [
+                "positions_compacted",
+                "position_range_end",
+                "position_compaction_continuation",
+                "position_compaction_torn",
+            ] {
+                if let Some(value) = positions.get(key) {
+                    object.insert(key.to_owned(), value.clone());
+                }
+            }
+        }
         Ok(outcome)
     }
 
@@ -9847,6 +10095,446 @@ impl RedbRecoveryStore {
         }))
     }
 
+    /// Computes one position-segment commitment (issue #2885, item 5): the
+    /// owner-local integrity chain over the compacted `(sequence, event_id)`
+    /// pairs plus the range identity (namespace, new prefix, predecessor,
+    /// owner binding, certifying frontiers). Pair fields use fixed-width
+    /// sequence and byte-length prefixes, so allowed event-ID punctuation
+    /// cannot make distinct position mappings serialize identically.
+    fn bridge_position_segment_commitment(
+        segment: &BridgePositionSegment<'_>,
+    ) -> Result<String, OrsError> {
+        let mut bytes = format!(
+            "{BRIDGE_POSITION_RANGE_COMMITMENT_DOMAIN}\x1fnamespace={}\x1fstart={}\x1fend={}\x1fpredecessor={}\x1frevision={}\x1fincarnation={}\x1facked={}\x1fcompacted={}\x1fpairs=",
+            segment.namespace,
+            segment.start,
+            segment.end,
+            segment.predecessor,
+            segment.revision,
+            segment.incarnation,
+            segment.acked,
+            segment.compacted,
+        )
+        .into_bytes();
+        for (sequence, event_id) in segment.pairs {
+            let event_id_bytes = event_id.as_bytes();
+            let event_id_length =
+                u64::try_from(event_id_bytes.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+            bytes.extend_from_slice(&sequence.to_be_bytes());
+            bytes.extend_from_slice(&event_id_length.to_be_bytes());
+            bytes.extend_from_slice(event_id_bytes);
+        }
+        Ok(crate::model::sha256_hex(&bytes))
+    }
+
+    /// Collects one namespace's contiguous position prefix above `range_end`
+    /// (issue #2885, item 7): key-ordered point lookups only, no table
+    /// scan, stopping at the first hole, past the retired boundary, or at
+    /// `budget` candidates. Called by
+    /// [`Self::bridge_position_compact_plan_in`]; kept separate so each
+    /// recovery phase holds at most one table handle and the walk stays
+    /// within its line budget.
+    fn bridge_position_prefix_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        compacted: u64,
+        range_end: u64,
+        budget: usize,
+    ) -> Result<(Vec<(u64, String)>, bool), OrsError> {
+        let mut pairs: Vec<(u64, String)> = Vec::new();
+        let mut stopped_transient = false;
+        let Some(mut sequence) = range_end.checked_add(1) else {
+            return Ok((pairs, false));
+        };
+        let positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+        while pairs.len() < budget {
+            if sequence > compacted {
+                stopped_transient = true;
+                break;
+            }
+            let key = Self::bridge_position_key(&access.namespace, sequence);
+            let occupant: Option<BridgeEventPosition> = positions
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?;
+            let Some(occupant) = occupant else {
+                stopped_transient = true;
+                break;
+            };
+            occupant.validate()?;
+            pairs.push((sequence, occupant.event_id));
+            let Some(next) = sequence.checked_add(1) else {
+                break;
+            };
+            sequence = next;
+        }
+        Ok((pairs, stopped_transient))
+    }
+
+    /// Trims a collected position prefix at the first sequence with live
+    /// evidence left (issue #2885, item 6): a live record (nonterminal
+    /// event) or a live handoff (unresolved receiver outcome) stops the
+    /// prefix as possibly-transient, while live evidence binding a
+    /// different sequence or event stops it as torn and preserved. Reads
+    /// one table only; called by
+    /// [`Self::bridge_position_compact_plan_in`] for records, then
+    /// handoffs, so the walk never holds two table handles at once.
+    fn bridge_position_trim_live_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        table: redb::TableDefinition<'_, &str, &str>,
+        live_records: bool,
+        pairs: &[(u64, String)],
+    ) -> Result<(usize, bool, bool), OrsError> {
+        let stored = write.open_table(table).map_err(storage)?;
+        let mut kept = 0_usize;
+        for (sequence, event_id) in pairs {
+            let key = format!("{}::{event_id}", access.namespace);
+            let Some(value) = stored.get(key.as_str()).map_err(storage)? else {
+                kept += 1;
+                continue;
+            };
+            if live_records {
+                let row: BridgeEventRow = decode(value.value())?;
+                row.validate()?;
+                if row.owner_namespace != access.namespace {
+                    return Ok((kept, true, false));
+                }
+                if row.sequence != *sequence || row.event_id != *event_id {
+                    return Ok((kept, false, true));
+                }
+                return Ok((kept, true, false));
+            }
+            let handoff: BridgeEventHandoffRow = decode(value.value())?;
+            handoff.validate()?;
+            if handoff.owner_namespace != access.namespace {
+                return Ok((kept, true, false));
+            }
+            if handoff.sequence != *sequence || handoff.event_id != *event_id {
+                return Ok((kept, false, true));
+            }
+            return Ok((kept, true, false));
+        }
+        Ok((kept, false, false))
+    }
+
+    /// Trims a candidate position prefix at the first admitted scoped gap
+    /// (issue #2885, item 6). Reads only this namespace's physical key range
+    /// and at most [`MAX_BRIDGE_EVENT_GAPS_PER_STREAM`] rows; an over-limit,
+    /// malformed, or mis-keyed set stops as preserved conflict. Gap
+    /// intervals are inclusive, and a matching gap leaves the gap and all
+    /// later position rows untouched for recovery.
+    fn bridge_position_trim_gaps_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        stream_id: &str,
+        pairs: &[(u64, String)],
+    ) -> Result<(usize, bool, bool), OrsError> {
+        let prefix = format!("{}::", access.namespace);
+        let prefix_end = format!("{prefix}\u{10ffff}");
+        let mut intervals = Vec::new();
+        {
+            let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+            for entry in gaps
+                .range(prefix.as_str()..=prefix_end.as_str())
+                .map_err(storage)?
+            {
+                let (key, value) = entry.map_err(storage)?;
+                let key = key.value();
+                if !key.starts_with(prefix.as_str()) {
+                    break;
+                }
+                if intervals.len() >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
+                    return Ok((0, false, true));
+                }
+                let gap: BridgeEventGapRow = match decode(value.value()) {
+                    Ok(gap) => gap,
+                    Err(_) => return Ok((0, false, true)),
+                };
+                if gap.validate().is_err() {
+                    return Ok((0, false, true));
+                }
+                let canonical_key = format!("{}::{}", gap.owner_namespace, gap.gap_id);
+                if gap.owner_namespace != access.namespace
+                    || gap.stream_id != stream_id
+                    || key != canonical_key
+                {
+                    return Ok((0, false, true));
+                }
+                intervals.push((gap.start_sequence, gap.end_sequence));
+            }
+        }
+        intervals.sort_unstable();
+        let mut gap_index = 0;
+        for (index, (sequence, _)) in pairs.iter().enumerate() {
+            while gap_index < intervals.len() && intervals[gap_index].1 < *sequence {
+                gap_index += 1;
+            }
+            if gap_index < intervals.len() && intervals[gap_index].0 <= *sequence {
+                return Ok((index, true, false));
+            }
+        }
+        Ok((pairs.len(), false, false))
+    }
+
+    /// Walks one namespace's eligible position prefix (issue #2885, items
+    /// 6 and 7): collects the contiguous candidates above the stored range
+    /// end, then trims the prefix at the first sequence with live evidence
+    /// left. A hole, a live record (nonterminal event), or a live handoff
+    /// (unresolved receiver outcome) stops the walk as possibly-transient:
+    /// a later gap-fill, compaction, or retirement may unblock it. A torn
+    /// mapping (live evidence binding a different sequence or event) stops
+    /// the walk as torn: the rows are preserved for recovery, never skipped
+    /// to free space. At most `budget` positions plan per call; exhaustion
+    /// reports for the next legitimate entry. Called by
+    /// [`Self::compact_bridge_positions_in`].
+    fn bridge_position_compact_plan_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        stream_id: &str,
+        compacted: u64,
+        range_end: u64,
+        budget: usize,
+    ) -> Result<BridgePositionCompactPlan, OrsError> {
+        let mut plan = BridgePositionCompactPlan {
+            compacted_to: range_end,
+            ..BridgePositionCompactPlan::default()
+        };
+        let (pairs, prefix_transient) =
+            Self::bridge_position_prefix_in(write, access, compacted, range_end, budget)?;
+        if pairs.is_empty() {
+            plan.stopped_transient = prefix_transient;
+            return Ok(plan);
+        }
+        let (kept, records_transient, records_torn) =
+            Self::bridge_position_trim_live_in(write, access, BRIDGE_EVENT_RECORDS, true, &pairs)?;
+        if records_torn {
+            plan.torn = true;
+            return Ok(plan);
+        }
+        let (kept, handoffs_transient, handoffs_torn) = Self::bridge_position_trim_live_in(
+            write,
+            access,
+            BRIDGE_EVENT_HANDOFFS,
+            false,
+            &pairs[..kept],
+        )?;
+        if handoffs_torn {
+            plan.torn = true;
+            return Ok(plan);
+        }
+        let (kept, gaps_transient, gaps_torn) =
+            Self::bridge_position_trim_gaps_in(write, access, stream_id, &pairs[..kept])?;
+        if gaps_torn {
+            plan.torn = true;
+            return Ok(plan);
+        }
+        for (sequence, event_id) in pairs.into_iter().take(kept) {
+            plan.delete_keys
+                .push(Self::bridge_position_key(&access.namespace, sequence));
+            plan.compacted_to = sequence;
+            plan.pairs.push((sequence, event_id));
+        }
+        plan.stopped_transient =
+            prefix_transient || records_transient || handoffs_transient || gaps_transient;
+        plan.budget_exhausted = plan.pairs.len() >= budget;
+        Ok(plan)
+    }
+
+    /// Loads and validates one namespace's stored certified range
+    /// (issue #2885, items 5 and 8): the row must match its key, and its
+    /// owner revision/incarnation must still equal the current owner
+    /// binding — a moved binding stops extension (the stored range is
+    /// preserved, never adopted into another generation). Called by
+    /// [`Self::compact_bridge_positions_in`]; kept separate so the
+    /// recovery transaction stays within its line budget.
+    fn bridge_position_range_state_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        owner: &BridgeStreamOwnerRow,
+        access: &BridgeStreamAccess,
+    ) -> Result<BridgePositionRangeState, OrsError> {
+        let stored: Option<BridgeEventPositionRange> = {
+            let ranges = write
+                .open_table(BRIDGE_EVENT_POSITION_RANGES)
+                .map_err(storage)?;
+            ranges
+                .get(namespace)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(stored) = &stored {
+            stored.validate()?;
+            if stored.owner_namespace != access.namespace {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position_range",
+                    reason: "position range identity does not match its key".to_owned(),
+                });
+            }
+        }
+        let range_end = stored.as_ref().map_or(0, |stored| stored.range_end);
+        let generation_changed = stored.as_ref().is_some_and(|stored| {
+            stored.owner_revision != owner.revision || stored.owner_incarnation != owner.incarnation
+        });
+        Ok(BridgePositionRangeState {
+            range: stored,
+            range_end,
+            generation_changed,
+        })
+    }
+
+    /// Applies one namespace's planned position-prefix compaction
+    /// (issue #2885, items 3 and 5): extends the certified range with the
+    /// predecessor chain and segment commitment, then deletes the compacted
+    /// rows in the same transaction. Called by
+    /// [`Self::compact_bridge_positions_in`].
+    fn apply_bridge_position_compact_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        acked: u64,
+        compacted: u64,
+        stored: Option<&BridgeEventPositionRange>,
+        plan: &BridgePositionCompactPlan,
+    ) -> Result<serde_json::Value, OrsError> {
+        let range_end = stored.map_or(0, |stored| stored.range_end);
+        let predecessor = stored.map_or(String::new(), |stored| stored.segment_commitment.clone());
+        let pair_refs: Vec<(u64, &str)> = plan
+            .pairs
+            .iter()
+            .map(|(sequence, event_id)| (*sequence, event_id.as_str()))
+            .collect();
+        let segment = BridgePositionSegment {
+            namespace: &access.namespace,
+            start: range_end.saturating_add(1),
+            end: plan.compacted_to,
+            predecessor: &predecessor,
+            revision: owner.revision,
+            incarnation: owner.incarnation,
+            acked,
+            compacted,
+            pairs: &pair_refs,
+        };
+        let segment = Self::bridge_position_segment_commitment(&segment)?;
+        let range = BridgeEventPositionRange {
+            contract_version: crate::CONTRACT_VERSION,
+            range_version: BRIDGE_POSITION_RANGE_VERSION,
+            owner_namespace: access.namespace.clone(),
+            stream_id: owner.local_stream.clone(),
+            owner_revision: owner.revision,
+            owner_incarnation: owner.incarnation,
+            range_start: 1,
+            range_end: plan.compacted_to,
+            predecessor_commitment: predecessor,
+            segment_commitment: segment,
+            acked_at_compaction: acked,
+            compacted_boundary_at_compaction: compacted,
+            compacted_at_ms: current_unix_ms_u64()?,
+            compaction_continuation: plan.stopped_transient || plan.budget_exhausted,
+            retention_policy_revision: BRIDGE_POSITION_RETENTION_POLICY_REVISION,
+        };
+        range.validate()?;
+        {
+            let mut ranges = write
+                .open_table(BRIDGE_EVENT_POSITION_RANGES)
+                .map_err(storage)?;
+            ranges
+                .insert(access.namespace.as_str(), encode(&range)?.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let mut positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+            for key in &plan.delete_keys {
+                positions.remove(key.as_str()).map_err(storage)?;
+            }
+        }
+        Ok(json!({
+            "namespace": access.namespace,
+            "positions_compacted": plan.delete_keys.len() as u64,
+            "position_range_end": plan.compacted_to,
+            "position_compaction_continuation": plan.stopped_transient || plan.budget_exhausted,
+            "position_compaction_torn": plan.torn,
+        }))
+    }
+
+    /// Compacts one namespace's retired position prefix into its certified
+    /// range inside the recovery transaction (issue #2885, items 3, 5-7).
+    /// The walk covers only the contiguous eligible prefix above the
+    /// stored range end: every sequence must sit at or below the retained
+    /// compacted boundary, bind a valid position, and have no live record
+    /// or handoff left. A hole, a nonterminal event, or an unresolved
+    /// handoff stops the walk as resumable; a torn mapping stops it as
+    /// preserved conflict. At most `budget` positions compact per call; the
+    /// new range end, predecessor chain, segment commitment, owner binding,
+    /// and continuation persist in the single per-namespace range row, and
+    /// the compacted position rows delete in the same transaction, so the
+    /// range and the deleted prefix always agree. A changed owner
+    /// revision/incarnation never extends a certified range (issue #2885,
+    /// item 8): the stored range is preserved and the call stops. Called
+    /// by [`Self::retire_bridge_event_handoffs_checked`] after handoff
+    /// retirement, so live handoffs already retired never block the prefix.
+    fn compact_bridge_positions_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        budget: usize,
+    ) -> Result<serde_json::Value, OrsError> {
+        let owner = Self::load_bridge_owner_row_in(write, namespace)?;
+        if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            expected_revision,
+            expected_incarnation,
+            BridgeStreamRight::Acknowledge,
+        )?;
+        let cursor = Self::load_bridge_cursor_row_in(write, namespace)?;
+        let (acked, compacted) = cursor.as_ref().map_or((0, 0), |row| {
+            (row.last_acked_sequence, row.last_compacted_sequence)
+        });
+        let state = Self::bridge_position_range_state_in(write, namespace, &owner, &access)?;
+        if state.generation_changed {
+            return Ok(json!({
+                "namespace": access.namespace,
+                "positions_compacted": 0_u64,
+                "position_range_end": state.range_end,
+                "position_compaction_continuation": false,
+            }));
+        }
+        let stored = state.range;
+        let range_end = state.range_end;
+        let plan = Self::bridge_position_compact_plan_in(
+            write,
+            &access,
+            &owner.local_stream,
+            compacted,
+            range_end,
+            budget,
+        )?;
+        if plan.pairs.is_empty() {
+            return Ok(json!({
+                "namespace": access.namespace,
+                "positions_compacted": 0_u64,
+                "position_range_end": range_end,
+                "position_compaction_continuation": plan.stopped_transient || plan.budget_exhausted,
+                "position_compaction_torn": plan.torn,
+            }));
+        }
+        Self::apply_bridge_position_compact_in(
+            write,
+            &access,
+            &owner,
+            acked,
+            compacted,
+            stored.as_ref(),
+            &plan,
+        )
+    }
+
     /// Reconciles event ownership and cursors for one proven presenter
     /// (issue #2729, items 2, 4-6).
     ///
@@ -9933,82 +10621,105 @@ impl RedbRecoveryStore {
         }))
     }
 
+    /// Sums one bridge-event table's per-namespace footprint (issues #2731
+    /// item 4 and #2885 item 2): the count of rows admitted by `matches`
+    /// plus their key and serialized-record bytes — the accountable
+    /// persisted size, never the source payload length. Called by
+    /// [`Self::bridge_capacity_accounting_for`] once per lifecycle table
+    /// so the denominator stays one auditable scan per table.
+    fn bridge_table_usage_in(
+        read: &redb::ReadTransaction,
+        table: redb::TableDefinition<'_, &str, &str>,
+        mut matches: impl FnMut(&str, &str) -> Result<bool, OrsError>,
+    ) -> Result<(u64, u64), OrsError> {
+        let stored = read.open_table(table).map_err(storage)?;
+        let mut count = 0_u64;
+        let mut bytes = 0_u64;
+        for entry in stored.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            if matches(key.value(), value.value())? {
+                count += 1;
+                bytes += (key.value().len() + value.value().len()) as u64;
+            }
+        }
+        Ok((count, bytes))
+    }
+
     /// Accounts one namespace's bridge-event capacity under its owner
-    /// (issue #2731, item 4): pending live events, handoffs, retained replay
-    /// commitments, stream/cursor metadata, and scoped gaps with their total
-    /// encoded bytes. Every byte count sums key bytes plus serialized-record
-    /// bytes — the accountable persisted size, never the source payload
-    /// length (which is not exact persisted size or heap use). Engine index
-    /// structure and in-memory heap stay outside this measure; the global
-    /// admission caps absorb them. The #2730 position index is owned and
-    /// capped by #2730, so it is not double-counted here: this view covers
-    /// exactly the #2561/#2729 lifecycle rows this owner retires. Served
-    /// inside the owner recovery inventory, where the receiver sizes
-    /// backpressure against pending versus retained evidence.
+    /// (issues #2731 item 4 and #2885 item 2): pending live events,
+    /// handoffs, the ordered position index rows, the certified position
+    /// range, retained replay commitments, stream/cursor metadata, and
+    /// scoped gaps with their total encoded bytes. Every byte count sums
+    /// key bytes plus serialized-record bytes — the accountable persisted
+    /// size, never the source payload length (which is not exact persisted
+    /// size or heap use). Engine index structure and in-memory heap stay
+    /// outside this measure; the global admission caps absorb them.
+    /// Pending positions ride the same delivery budget as their live event
+    /// rows and handoffs (one position exists only with its staged event),
+    /// so unresolved identity evidence consumes the already-capped
+    /// record/handoff budget; retained positions drain through the
+    /// position-prefix compaction. Served inside the owner recovery
+    /// inventory, where the receiver sizes backpressure against pending
+    /// versus retained evidence.
     fn bridge_capacity_accounting_for(
         database: &Database,
         namespace: &str,
     ) -> Result<serde_json::Value, OrsError> {
         crate::model::validate_digest(namespace, "owner_namespace")?;
+        let prefix = format!("{namespace}::");
         let read = database.begin_read().map_err(storage)?;
-        let mut pending_events = 0_u64;
-        let mut pending_event_bytes = 0_u64;
-        {
-            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-            for entry in records.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventRow = decode(value.value())?;
+        let (pending_events, pending_event_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_RECORDS, |_, value| {
+                let row: BridgeEventRow = decode(value)?;
                 row.validate()?;
-                if row.owner_namespace == namespace {
-                    pending_events += 1;
-                    pending_event_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut handoffs_count = 0_u64;
-        let mut handoff_bytes = 0_u64;
-        {
-            let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            for entry in handoffs.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventHandoffRow = decode(value.value())?;
+                Ok(row.owner_namespace == namespace)
+            })?;
+        let (handoffs_count, handoff_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_HANDOFFS, |_, value| {
+                let row: BridgeEventHandoffRow = decode(value)?;
                 row.validate()?;
-                if row.owner_namespace == namespace {
-                    handoffs_count += 1;
-                    handoff_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut commitments = 0_u64;
-        let mut commitment_bytes = 0_u64;
-        {
-            let retained = read
-                .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
-                .map_err(storage)?;
-            for entry in retained.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let commitment: BridgeEventReplayCommitment = decode(value.value())?;
+                Ok(row.owner_namespace == namespace)
+            })?;
+        let (commitments, commitment_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_REPLAY_COMMITMENTS, |_, value| {
+                let commitment: BridgeEventReplayCommitment = decode(value)?;
                 commitment.validate()?;
-                if commitment.owner_namespace == namespace {
-                    commitments += 1;
-                    commitment_bytes += (key.value().len() + value.value().len()) as u64;
-                }
-            }
-        }
-        let mut gaps = 0_u64;
-        let mut gap_bytes = 0_u64;
-        {
-            let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
-            for entry in stored.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let row: BridgeEventGapRow = decode(value.value())?;
+                Ok(commitment.owner_namespace == namespace)
+            })?;
+        let (gaps, gap_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_GAPS, |_, value| {
+                let row: BridgeEventGapRow = decode(value)?;
                 row.validate()?;
-                if row.owner_namespace == namespace {
-                    gaps += 1;
-                    gap_bytes += (key.value().len() + value.value().len()) as u64;
+                Ok(row.owner_namespace == namespace)
+            })?;
+        let (positions, position_bytes) =
+            Self::bridge_table_usage_in(&read, BRIDGE_EVENT_POSITIONS, |key, value| {
+                if !key.starts_with(prefix.as_str()) {
+                    return Ok(false);
+                }
+                let position: BridgeEventPosition = decode(value)?;
+                position.validate()?;
+                Ok(true)
+            })?;
+        let (position_ranges, position_range_bytes) = {
+            let ranges = read
+                .open_table(BRIDGE_EVENT_POSITION_RANGES)
+                .map_err(storage)?;
+            match ranges.get(namespace).map_err(storage)? {
+                None => (0_u64, 0_u64),
+                Some(value) => {
+                    let range: BridgeEventPositionRange = decode(value.value())?;
+                    range.validate()?;
+                    if range.owner_namespace != namespace {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_event_position_range",
+                            reason: "position range identity does not match its key".to_owned(),
+                        });
+                    }
+                    (1_u64, (namespace.len() + value.value().len()) as u64)
                 }
             }
-        }
+        };
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
             cursors
@@ -10025,6 +10736,8 @@ impl RedbRecoveryStore {
         };
         let total_bytes = pending_event_bytes
             .saturating_add(handoff_bytes)
+            .saturating_add(position_bytes)
+            .saturating_add(position_range_bytes)
             .saturating_add(commitment_bytes)
             .saturating_add(gap_bytes)
             .saturating_add(cursor_bytes)
@@ -10034,6 +10747,10 @@ impl RedbRecoveryStore {
             "pending_event_bytes": pending_event_bytes,
             "handoffs": handoffs_count,
             "handoff_bytes": handoff_bytes,
+            "positions": positions,
+            "position_bytes": position_bytes,
+            "position_ranges": position_ranges,
+            "position_range_bytes": position_range_bytes,
             "replay_commitments": commitments,
             "replay_commitment_bytes": commitment_bytes,
             "gaps": gaps,
@@ -13713,6 +14430,10 @@ impl RedbRecoveryStore {
         // Contradictory mappings fail open closed; missing index entries
         // are rebuilt from the records — never inferred, never deleted.
         Self::rebuild_bridge_replay_index(&write)?;
+        // #2885: adopt the position-range schema marker beside the
+        // replay-index contract. Certified ranges validate on every
+        // access; existing position rows are untouched here.
+        Self::ensure_bridge_position_range_schema(&write)?;
         write.commit().map_err(storage)
     }
 
@@ -13729,6 +14450,35 @@ impl RedbRecoveryStore {
         drop(
             write
                 .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?,
+        );
+        Ok(())
+    }
+
+    /// Materializes the bridge-event base table family (issues #2729,
+    /// #2730, #2885): records, cursors, gaps, handoffs, stream owners, the
+    /// position index, the certified position-range table, and replay
+    /// commitments. Materialized empty on every open like every other base
+    /// table, so an owner-scoped lookup on a store that never staged bridge
+    /// events reads authoritatively absent instead of failing on a missing
+    /// table. Legacy rows are never backfilled here. Called by
+    /// [`Self::initialize_ors_tables`]; kept separate so the base-family
+    /// materialization stays within its line budget.
+    fn materialize_bridge_event_tables(write: &redb::WriteTransaction) -> Result<(), OrsError> {
+        drop(write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?);
+        drop(write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?);
+        drop(
+            write
+                .open_table(BRIDGE_EVENT_POSITION_RANGES)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
                 .map_err(storage)?,
         );
         Ok(())
@@ -13827,27 +14577,7 @@ impl RedbRecoveryStore {
                 .open_table(HOST_REQUEST_LOGICAL_KEYS)
                 .map_err(storage)?,
         );
-        // #2729: the bridge-event family (records, cursors, gaps,
-        // handoffs) plus the stream-owner index are part of the base
-        // family, materialized empty on every open like every other base
-        // table, so an owner-scoped lookup on a store that never staged
-        // bridge events reads authoritatively absent instead of failing on
-        // a missing table. Legacy rows are never backfilled here.
-        drop(write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?);
-        drop(write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?);
-        drop(write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?);
-        drop(write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?);
-        drop(write.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?);
-        // #2730: the bridge position index and the replay-commitment table
-        // are part of the base family, materialized empty on every open
-        // like every other base table. The migration below reconciles
-        // their contents with the retained owner-bound records.
-        drop(write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?);
-        drop(
-            write
-                .open_table(BRIDGE_EVENT_REPLAY_COMMITMENTS)
-                .map_err(storage)?,
-        );
+        Self::materialize_bridge_event_tables(write)?;
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write
