@@ -606,6 +606,13 @@ struct IntroductionRevocationOperation {
 /// same way `bind_notify_launch_grant` pins its own canonical image name.
 const WASM_HOST_IMAGE_FILE_NAME: &str = "eliot-wasm-host.exe";
 
+/// Stable module identity the demanded `eliot-wasm-host.exe` parent runs
+/// under. Mirrors the `front_door_session` worker spellings
+/// (`eliot-doctor`, `eliot-testd`, `eliot-native-worker`): the binary's own
+/// name, bound by the Kernel at spawn through the admitted process owner,
+/// never self-asserted by the child.
+const WASM_HOST_MODULE_ID: &str = "eliot-wasm-host";
+
 /// Closed owner-side WASM dispatch publication (`#1780` D4a, `#1955`).
 ///
 /// Carries the installation-observed host binding (path + digest, re-hashed
@@ -2484,6 +2491,7 @@ impl KernelComposition {
             }
             "publish_wasm_dispatch_bundle" => {
                 self.wasm_dispatch_bundle_operation(session, payload.clone())
+                    .await
             }
             "bind_notify_launch_grant" => {
                 self.notify_launch_grant_operation(session, payload.clone())
@@ -5230,8 +5238,10 @@ impl KernelComposition {
     }
 
     /// Publishes one owner-side WASM dispatch bundle on the admitted path
-    /// (`#1780` D4a, `#1955`): the production caller of
-    /// `eliot_kernel_service::publish_wasm_dispatch_bundle`.
+    /// (`#1780` D4a, `#1955`) and demand-starts its installation-approved
+    /// host parent (`#2568` A1): the production caller of
+    /// `eliot_kernel_service::publish_wasm_dispatch_bundle` and of
+    /// [`Self::start_wasm_host_parent`].
     ///
     /// The `WasmOwnerClaim` is built from admitted owner material carried in
     /// the closed payload; guest/input digests re-hash against those exact
@@ -5246,14 +5256,19 @@ impl KernelComposition {
     /// the host path's parent, never a caller string. Publication requires
     /// a fence-bound session on a Ready, unfenced Kernel; the claim and its
     /// snapshot must speak for this session's authority at this generation.
-    /// The computed one-shot join gate is projected into the receipt so the
-    /// live join table can close over it; no second registry is retained
-    /// here.
+    /// After staging, the re-hashed host image is started through the
+    /// admitted process gateway with argv from the validated material, so a
+    /// real ordinary request reaches the host request loop; a refused start
+    /// fails the operation closed (the staged set stays for the delivery
+    /// owner — cleanup is `#2786` territory, never an invented delete
+    /// here). The computed one-shot join gate is projected into the receipt
+    /// so the live join table can close over it; no second registry is
+    /// retained here.
     #[allow(
         clippy::too_many_lines,
-        reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, and receipt projection in one audited order"
+        reason = "the admitted-path bundle publication keeps decode, fence/ready/claim/snapshot gates, host re-hash, publish, demand-start, and receipt projection in one audited order"
     )]
-    fn wasm_dispatch_bundle_operation(
+    async fn wasm_dispatch_bundle_operation(
         &self,
         session: &Session,
         payload: serde_json::Value,
@@ -5362,6 +5377,14 @@ impl KernelComposition {
             &eliot_kernel_service::material_bytes(&bundle.material)
                 .map_err(|_| TransportError::SessionFenced)?,
         );
+        let launch = self
+            .start_wasm_host_parent(
+                &bundle,
+                host_executable_path.as_str(),
+                host_artifact_digest.as_str(),
+                install_dir,
+            )
+            .await?;
         Ok(serde_json::json!({
             "kind": "wasm_dispatch_bundle_receipt",
             "value": {
@@ -5374,8 +5397,131 @@ impl KernelComposition {
                 "material_path": bundle.material_path.to_string_lossy(),
                 "artifact_path": bundle.artifact_path.to_string_lossy(),
                 "input_path": bundle.input_path.to_string_lossy(),
+                "launch": "started",
+                "launch_request_digest": launch.request_digest(),
+                "launch_permit_digest": launch.permit_digest(),
             },
         }))
+    }
+
+    /// Demand-starts the installation-approved `eliot-wasm-host.exe` parent
+    /// for one published dispatch bundle through the admitted process
+    /// gateway (`#2568` A1): the governed demand-start half of bundle
+    /// publication (I1.5 startup: start only the remaining capabilities
+    /// required by the admitted request).
+    ///
+    /// The P-03 intent carries the re-hashed host image, the install
+    /// directory as its working directory, and argv assembled from the
+    /// validated material only (`--profile <profile>` — the closed
+    /// publisher-checked spelling the host CLI requires before it reaches
+    /// `run_ordinary_request_loop`; no nonce, handle, or path travels on
+    /// the command line). The intent operation is the admitted claim
+    /// operation, so the receipt's `operation_id` is exactly the supervised
+    /// process's operation; tree/job/image/session, fence, and lease derive
+    /// from it under the `wasm-host-launch` prefix, mirroring the
+    /// Doctor/testd/native-worker dispatch contour (`spawn_ready_child`).
+    /// Environment is secret-free, limits are the same bounded contour, and
+    /// supervision stays with the gateway owner (replay begin for exact
+    /// resubmits, path-lease re-proof at launch, inspect/cancel by
+    /// operation). Every refusal — no gateway, stale snapshot, an image
+    /// outside the retained root, or an unknown spawn outcome — fails
+    /// closed; the staged set is left for the delivery owner (`#2786`), and
+    /// no launch table or reconciler is kept here.
+    #[cfg(windows)]
+    async fn start_wasm_host_parent(
+        &self,
+        bundle: &eliot_kernel_service::WasmPublishedBundle,
+        host_executable_path: &str,
+        host_artifact_digest: &str,
+        install_dir: &std::path::Path,
+    ) -> Result<ProcessStartReceipt, TransportError> {
+        let material = &bundle.material;
+        let operation_id = OperationId::new(material.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let short: String = operation_id.as_str().chars().take(16).collect();
+        let generation =
+            Generation::new(material.generation).map_err(|_| TransportError::SessionFenced)?;
+        let working_directory = install_dir.to_str().ok_or(TransportError::SessionFenced)?;
+        let intent = ProcessIntent::new(
+            operation_id,
+            ProcessTreeId::new(format!("wasm-host-launch-tree-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            JobId::new(format!("wasm-host-launch-job-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            ImageId::new(format!("wasm-host-launch-image-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            SessionId::new(format!("wasm-host-launch-session-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            generation,
+            host_executable_path.to_owned(),
+            host_artifact_digest.to_owned(),
+            vec!["--profile".to_owned(), material.profile.clone()],
+            working_directory.to_owned(),
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .map_err(|_| TransportError::SessionFenced)?,
+            ResourceLimits::new(86_400_000, None, None, 64 * 1024, 64 * 1024, 4)
+                .map_err(|_| TransportError::SessionFenced)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let fence = FencingToken::new(
+            material.authority_epoch.clone(),
+            generation,
+            format!("wasm-host-launch-fence-{short}"),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let admission = ProcessExecutionAdmissionRequest::new(
+            WASM_HOST_MODULE_ID,
+            intent,
+            ActionLeaseRef::new(format!("wasm-host-launch-kernel-launch-{short}"))
+                .map_err(|_| TransportError::SessionFenced)?,
+            fence,
+            unix_ms().saturating_add(60_000),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        admission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let expectation = super::current_process_named_pipe_expectation()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let owner = ProcessOwnerBinding::new(
+            WASM_HOST_MODULE_ID,
+            super::runtime_identity::stable_owner_principal_digest(
+                expectation.expected_sid(),
+                WASM_HOST_MODULE_ID,
+                &material.authority_epoch,
+                generation,
+            ),
+            material.authority_epoch.clone(),
+            generation,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        self.admit_material_process_start(&admission)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let proof = self
+            .retain_process_path_proof(&admission)
+            .map_err(|_| TransportError::SessionFenced)?;
+        gateway
+            .start(&owner, admission, proof)
+            .await
+            .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Demand-start fails closed off the Windows process contour: the
+    /// installer-pinned `.exe` image cannot run there, so no silent
+    /// publish-only success is reported.
+    #[cfg(not(windows))]
+    async fn start_wasm_host_parent(
+        &self,
+        _bundle: &eliot_kernel_service::WasmPublishedBundle,
+        _host_executable_path: &str,
+        _host_artifact_digest: &str,
+        _install_dir: &std::path::Path,
+    ) -> Result<ProcessStartReceipt, TransportError> {
+        Err(TransportError::SessionFenced)
     }
 
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
