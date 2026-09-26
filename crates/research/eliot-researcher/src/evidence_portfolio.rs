@@ -900,7 +900,13 @@ impl FrozenInquiry {
         text(&params.replay_id, "inquiry.replay_id")?;
         params.roles.sort_by(|a, b| a.role.cmp(&b.role));
         params.routes.sort();
-        let mut preimage = String::from("frozen-inquiry/v1;");
+        // Domain bumped v1 -> v2 with the State Fence added to the preimage.
+        // The fence was validated and stored but never hashed, so two inquiries
+        // differing only in fence shared a v1 digest; a silent field addition
+        // under an unchanged domain would have changed historical identities
+        // without saying so. Nothing consumes this digest outside this crate and
+        // its test, so the bump is a declaration, not a migration.
+        let mut preimage = String::from("frozen-inquiry/v2;");
         push_field(&mut preimage, "schema", &params.schema);
         push_field(&mut preimage, "protocol", &params.protocol);
         push_field(&mut preimage, "policy", &params.policy);
@@ -2203,6 +2209,61 @@ pub enum ClaimOutcome {
     IncompleteAccounting,
 }
 
+/// Why one attached counterclaim identity did or did not contradict the claim.
+///
+/// The audit records this per identity rather than only a verdict, so a consumer
+/// never has to recover the reason by matching rendered residue text. Every
+/// variant except [`Self::Contradicts`] leaves the identity preserved but
+/// unverified in scope: absence of contradiction is never read as support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterclaimDisposition {
+    /// Resolved to relevant counterevidence under compatible conditions.
+    Contradicts,
+    /// The handle is allowlisted but explicitly revoked, so it cannot be
+    /// verified as counterevidence and is not merely absent.
+    Revoked,
+    /// The handle is outside the frozen manifest.
+    OutsideManifest,
+    /// No authoritative lineage stands behind the handle.
+    UnresolvedLineage,
+    /// The record does not cover the claim's authority domain.
+    OutsideDomain,
+    /// The record is past its frozen freshness boundary at the audit instant, so
+    /// it cannot contradict under compatible conditions.
+    Stale,
+    /// The record's acquisition disposition carries no evidentiary weight.
+    CarriesNoWeight,
+    /// The same handle is also a material citation of this claim, so it cannot
+    /// contest it. The input asserts the source both supports and contests the
+    /// claim, which this cell does not resolve in either direction.
+    AlsoACitation,
+}
+
+impl CounterclaimDisposition {
+    /// Stable wire spelling of this disposition.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Contradicts => "CONTRADICTS",
+            Self::Revoked => "REVOKED",
+            Self::OutsideManifest => "OUTSIDE_MANIFEST",
+            Self::UnresolvedLineage => "UNRESOLVED_LINEAGE",
+            Self::OutsideDomain => "OUTSIDE_DOMAIN",
+            Self::Stale => "STALE",
+            Self::CarriesNoWeight => "CARRIES_NO_WEIGHT",
+            Self::AlsoACitation => "ALSO_A_CITATION",
+        }
+    }
+}
+
+/// One attached counterclaim identity with the disposition the audit gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterclaimResolution {
+    /// The attached counterclaim identity, preserved verbatim.
+    pub counterclaim_id: String,
+    /// Disposition this audit assigned to the identity.
+    pub disposition: CounterclaimDisposition,
+}
+
 impl ClaimOutcome {
     /// Stable wire spelling of this outcome.
     pub const fn wire_name(self) -> &'static str {
@@ -2240,6 +2301,9 @@ pub struct ClaimVerdict {
     pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
     /// Preserved counterevidence identities.
     pub counterevidence: Vec<String>,
+    /// Per-identity disposition of every attached counterclaim, in sorted-id
+    /// order. This is the typed partition the outcome is derived from.
+    pub counterclaim_resolutions: Vec<CounterclaimResolution>,
     /// Preserved unknown references.
     pub unknowns: Vec<String>,
     /// Grade ceiling over the supporting records, when computable.
@@ -2584,6 +2648,76 @@ fn authorized_manifest_preimage(manifest: &AuthorizedManifest) -> String {
     preimage
 }
 
+/// Classifies one attached counterclaim identity against this claim.
+///
+/// The checks run most-specific first, and each records its own typed residue
+/// line, so the reason an identity did not contradict is never lost:
+///
+/// * a handle that is also a material citation of this claim asserts both
+///   support and opposition at once, which this cell does not resolve;
+/// * a revoked handle is stronger than an absent one — the evidence was
+///   authorized and then withdrawn, so it cannot be verified either way;
+/// * a record past its frozen freshness boundary cannot contradict under
+///   compatible conditions, even though a time-stale record may still support.
+fn resolve_counterclaim(
+    counterclaim_id: &str,
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+    manifest: &AuthorizedManifest,
+    now_ms: i64,
+    residue: &mut Vec<String>,
+) -> CounterclaimDisposition {
+    if claim.citations.iter().any(|cited| cited == counterclaim_id) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is also a citation and cannot contest the claim"
+        ));
+        return CounterclaimDisposition::AlsoACitation;
+    }
+    if manifest
+        .revoked
+        .iter()
+        .any(|handle| handle == counterclaim_id)
+    {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is revoked and cannot be verified"
+        ));
+        return CounterclaimDisposition::Revoked;
+    }
+    if !manifest.allows(counterclaim_id) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} outside frozen manifest"
+        ));
+        return CounterclaimDisposition::OutsideManifest;
+    }
+    let Some(record) = portfolio.records.get(counterclaim_id) else {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} has no authoritative lineage"
+        ));
+        return CounterclaimDisposition::UnresolvedLineage;
+    };
+    if !record.covers_domain(&claim.domain) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} outside claim domain {}",
+            claim.domain
+        ));
+        return CounterclaimDisposition::OutsideDomain;
+    }
+    if record.is_stale_at(now_ms) {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} is stale and cannot contradict"
+        ));
+        return CounterclaimDisposition::Stale;
+    }
+    if !record.acquisition.may_support() {
+        residue.push(format!(
+            "claim: counterclaim {counterclaim_id} disposition {} carries no weight",
+            record.acquisition.wire_name()
+        ));
+        return CounterclaimDisposition::CarriesNoWeight;
+    }
+    CounterclaimDisposition::Contradicts
+}
+
 /// Audits one already-structured claim against the frozen portfolio and
 /// manifest: exact membership, authoritative lineage, scope/time/version/
 /// quantity/causal/absence compatibility and complete material-claim
@@ -2644,6 +2778,12 @@ pub fn audit_claim(
             }
             SourceDisposition::Stale => {
                 stale_hit = true;
+                // A stale source is an accounted gap, exactly as before this
+                // function stopped matching rendered residue prose: the previous
+                // `contains("carries no weight")` scan fired on this line too, so
+                // omitting the flag here would silently reclassify a stale
+                // citation from PartiallySupported to StaleLimited.
+                support_gap = true;
                 residue.push(format!("claim: source {handle} stale carries no weight"));
             }
             _ => {
@@ -2669,46 +2809,36 @@ pub fn audit_claim(
     }
     // Contradiction is determined from RELEVANT counterevidence under compatible
     // conditions, never from the mere presence of an attached counterclaim
-    // identity. An attached identity is preserved either way; it contradicts only
-    // when it resolves to an in-manifest record that covers this claim's domain
-    // and carries evidentiary weight. One that cannot be resolved that way stays
-    // explicit as `NotVerifiableInScope` instead of being silently smoothed into
-    // support or silently dropped.
-    let mut contradicting: Vec<String> = Vec::new();
-    let mut unverifiable: Vec<String> = Vec::new();
+    // identity. An identity is preserved either way, with a typed disposition
+    // naming why it did or did not contradict; it contradicts only when it
+    // contests this claim, is authorized, resolves to an authoritative record,
+    // covers the claim's domain, is inside its frozen freshness boundary at the
+    // audit instant, and carries evidentiary weight. Anything else stays explicit
+    // as `NotVerifiableInScope` rather than being smoothed into support or
+    // silently dropped. Absence of contradiction is never read as support.
+    let mut resolutions: Vec<CounterclaimResolution> = Vec::new();
     for counterclaim_id in &claim.counterclaim_ids {
-        if !manifest.allows(counterclaim_id) {
-            unverifiable.push(counterclaim_id.clone());
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} outside frozen manifest"
-            ));
-            continue;
-        }
-        let Some(record) = portfolio.records.get(counterclaim_id) else {
-            unverifiable.push(counterclaim_id.clone());
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} has no authoritative lineage"
-            ));
-            continue;
-        };
-        if !record.covers_domain(&claim.domain) {
-            unverifiable.push(counterclaim_id.clone());
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} outside claim domain {}",
-                claim.domain
-            ));
-            continue;
-        }
-        if !record.acquisition.may_support() {
-            unverifiable.push(counterclaim_id.clone());
-            residue.push(format!(
-                "claim: counterclaim {counterclaim_id} disposition {} carries no weight",
-                record.acquisition.wire_name()
-            ));
-            continue;
-        }
-        contradicting.push(counterclaim_id.clone());
+        let disposition = resolve_counterclaim(
+            counterclaim_id,
+            claim,
+            portfolio,
+            manifest,
+            now_ms,
+            &mut residue,
+        );
+        resolutions.push(CounterclaimResolution {
+            counterclaim_id: counterclaim_id.clone(),
+            disposition,
+        });
     }
+    let contradicting: Vec<&CounterclaimResolution> = resolutions
+        .iter()
+        .filter(|entry| entry.disposition == CounterclaimDisposition::Contradicts)
+        .collect();
+    let unverifiable: Vec<&CounterclaimResolution> = resolutions
+        .iter()
+        .filter(|entry| entry.disposition != CounterclaimDisposition::Contradicts)
+        .collect();
     let counterevidence: Vec<String> = claim.counterclaim_ids.clone();
     let unknowns: Vec<String> = claim.unknown_refs.clone();
     let precision_gap = !unsupported_precision.is_empty();
@@ -2742,12 +2872,23 @@ pub fn audit_claim(
     counter_sorted.sort();
     let mut unknowns_sorted = unknowns;
     unknowns_sorted.sort();
+    let mut sorted_resolutions = resolutions;
+    sorted_resolutions.sort_by(|left, right| {
+        left.counterclaim_id
+            .cmp(&right.counterclaim_id)
+            .then_with(|| {
+                left.disposition
+                    .wire_name()
+                    .cmp(right.disposition.wire_name())
+            })
+    });
     ClaimVerdict {
         claim_id: claim.claim_id.clone(),
         outcome,
         residue,
         unsupported_precision,
         counterevidence: counter_sorted,
+        counterclaim_resolutions: sorted_resolutions,
         unknowns: unknowns_sorted,
         grade_ceiling,
         evidence_map,
