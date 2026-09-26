@@ -1338,6 +1338,10 @@ fn new_epoch_retains_prior_evidence_until_explicit_retirement() -> TestResult {
         retired_host: old_host.clone(),
         retirement_evidence_refs: vec![h("retirement-proof")],
         retired_at: h("t-retired"),
+        // Legacy shape: written before the predecessor-generation relation
+        // existed (#2868). The owner accepts it as historical evidence and the
+        // status binder treats it as a lower proof ceiling.
+        predecessor_relation: None,
     }))?;
     assert!(
         new.snapshot()?
@@ -1456,6 +1460,7 @@ fn corruption_recovery_preserves_raw_epoch_evidence_until_explicit_retirement() 
         retired_host: old_host,
         retirement_evidence_refs: vec![h("manual-retirement-evidence")],
         retired_at: h("t-corrupt-retired"),
+        predecessor_relation: None,
     }))?;
     let backend = recovered.into_backend()?;
     assert_eq!(backend.durable_image().epochs[0].bytes, corrupt_bytes);

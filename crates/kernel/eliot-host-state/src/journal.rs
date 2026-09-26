@@ -8,10 +8,10 @@ use thiserror::Error;
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
     AppliedOperation, CutoverIntentState, DrainState, EpochEvidence, EpochRetirementRecord,
-    HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity, RecordFence,
-    RecoveryLineageReason, activation_transition, dependency_transition, drain_transition,
-    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
-    wake_transition,
+    HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
+    PredecessorRetirementRelation, RecordFence, RecoveryLineageReason, activation_transition,
+    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
+    kernel_transition, store_rebind_transition, wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -106,6 +106,17 @@ impl EpochRetirementObservation {
     /// Retired Host installation/activation epoch.
     pub const fn retired_host(&self) -> &HostInstallationEpoch {
         &self.record.retired_host
+    }
+
+    /// Owner-issued predecessor-generation-to-Host-epoch relation this record
+    /// was written with, or `None` for a legacy record written before the
+    /// relation existed (#2868).
+    ///
+    /// `None` is a strictly weaker proof, not a variant of the same one: the
+    /// status binder requires a relation for exact completion, so an absent one
+    /// can never close predecessor retirement.
+    pub const fn predecessor_relation(&self) -> Option<&PredecessorRetirementRelation> {
+        self.record.predecessor_relation.as_ref()
     }
 
     /// Owner-supplied evidence digests bound to the retirement.
@@ -744,6 +755,47 @@ fn apply(
                     .any(|item| item.host == next.retired_host && !item.retired)
             {
                 return Err(JournalError::StaleFence);
+            }
+            // The owner binds the stored predecessor relation itself, so a
+            // record cannot be persisted claiming a mapping the single writer
+            // does not accept (#2868). `EpochRetirementRecord::validate` already
+            // proved the relation is internally consistent, carries a re-derived
+            // canonical digest, and names THIS record's `retired_host`. What this
+            // owner adds is the join to the installation and to the cutover
+            // operation that authorizes the retirement:
+            //
+            //  * `installation` must be this installation - the same owner fact
+            //    the arm above already binds for `retired_host`;
+            //  * the whole `cutover_operation` identity must equal the record's
+            //    own `operation`, so a relation issued for one operation - a
+            //    different operation id OR a different canonical request digest -
+            //    cannot authorize another;
+            //  * `predecessor_generation` must equal the expected predecessor
+            //    the retained cutover intent committed to, whenever that intent
+            //    is still retained. The slot holds one operation, so this join is
+            //    made only when the slot names THIS record's operation; a later
+            //    operation's intent is current applicability, not evidence about
+            //    this one, and refusing on it would erase authentic history.
+            if let Some(relation) = &next.predecessor_relation {
+                if relation.installation != state.host.installation {
+                    return Err(JournalError::StaleFence);
+                }
+                if relation.cutover_operation != next.operation {
+                    return Err(JournalError::Invalid(
+                        "predecessor_relation was issued for a different cutover operation"
+                            .to_owned(),
+                    ));
+                }
+                if let Some(intent) = state.pending_cutover.as_ref()
+                    && intent.cutover_operation == next.operation.operation_id
+                    && relation.predecessor_generation != intent.expected_predecessor
+                {
+                    return Err(JournalError::Invalid(
+                        "predecessor_relation names a different predecessor generation than the \
+                         retained cutover intent"
+                            .to_owned(),
+                    ));
+                }
             }
             for evidence in &mut state.retained_epochs {
                 if evidence.host == next.retired_host {

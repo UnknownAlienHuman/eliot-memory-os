@@ -124,9 +124,11 @@
 //!   `pub(super)` choke for every `ProductionHostStateJournal` write, with
 //!   `OutcomeUnknown` fail-closed reconciliation): persists the
 //!   `HostStateRecord::EpochRetirement(EpochRetirementRecord)`
-//!   (`eliot-host-state/src/model.rs:1667,1493`) carrying the cutover
-//!   operation identity, barrier-bound fence, and bounded evidence refs, and
-//!   returns the real `AppendReceipt`
+//!   (`eliot-host-state/src/model.rs`, `EpochRetirementRecord` and
+//!   `PredecessorRetirementRelation`) carrying the cutover operation identity,
+//!   barrier-bound fence, bounded evidence refs, and the owner-issued
+//!   predecessor-generation-to-Host-epoch relation, and returns the real
+//!   `AppendReceipt`
 //!   (`eliot-host-state/src/journal.rs:41`, `sequence()`/`disposition()`/
 //!   `transaction_id()`). Intent is bound inside this record before any
 //!   route/SCM effect; this path performs no process/SCM effects itself.
@@ -136,7 +138,8 @@
 //! - Retirement readback (#2739) goes back through the SAME journal owner
 //!   through `HostComposition::journal::query_epoch_retirement`
 //!   (`eliot-host-state/src/service.rs:97` delegating to
-//!   `HostStateJournal::query_epoch_retirement`, `journal.rs:1292`) under the
+//!   `HostStateJournal::query_epoch_retirement`, `journal.rs`, the
+//!   `query_epoch_retirement` method) under the
 //!   exact `IdempotencyIdentity` `retire_prior_generation` wrote into the
 //!   record — the cutover operation id with the retained request digest. The
 //!   owner selects the record from the log it replayed, recomputes the record's
@@ -148,8 +151,12 @@
 //!   The owner-resolved `EpochRetirementObservation` is then re-proved here
 //!   against the request from the record's OWN durable fields: the exact
 //!   operation identity it was applied under, the installation/Host lineage, a
-//!   genuinely prior epoch, the Host epoch that retained it, and the target and
-//!   approved facts the retirement recorded. The single cutover-intent slot is
+//!   genuinely prior epoch, the Host epoch that retained it, the target and
+//!   approved facts the retirement recorded, and — since #2868 — the stored
+//!   `PredecessorRetirementRelation`, which must map this request's exact
+//!   `expected_predecessor` onto the exact retired epoch. A record carrying no
+//!   relation is reported as `RelationUnproven` rather than as this operation's
+//!   effect. The single cutover-intent slot is
 //!   current applicability, not history: it corroborates the retirement when it
 //!   still holds this operation's own intent, and a later legitimate operation
 //!   replacing that slot neither erases the retained retirement record nor is
@@ -180,7 +187,7 @@ use eliot_contracts::{StateFence, fences_match_exact};
 use eliot_host_state::{
     AppendReceipt, CutoverIntentRecord, CutoverIntentState, EpochRetirementObservation,
     EpochRetirementQuery, EpochRetirementQueryError, EpochRetirementRecord, EpochTransition,
-    HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity, JournalError,
+    HostState, HostStateRecord, IdempotencyIdentity, JournalError, PredecessorRetirementRelation,
     RecordFence,
 };
 use eliot_installation::{
@@ -569,6 +576,35 @@ pub enum CutoverResidual {
     /// coherent pair. A failed journal READ is a different thing and is
     /// propagated as an error, never reported as movement.
     ConcurrentOwnerMovement,
+    /// No owner can state which Host epoch carried this cutover's exact
+    /// expected predecessor generation, so the epoch to retire is not
+    /// determined by the request (#2868).
+    ///
+    /// The installation registry's approved-generation/Host-activation handoff
+    /// relates a generation to a Host epoch for the activation being COMMITTED,
+    /// but the registry retains one such fence - and staging the cutover's target
+    /// generation, a prerequisite of its registry CAS, clears it - and the fence
+    /// carries no activation identity, issuer or issuance instant for the epoch
+    /// being retired. The Host journal's `CutoverIntentRecord` names
+    /// installation generations, but binds them to the epoch that performed the
+    /// cutover rather than the epoch that carried the predecessor.
+    ///
+    /// The retirement effect is therefore refused before any record is appended:
+    /// no outstanding epoch is retired and no journal or registry state changes.
+    /// What is retained is the PRE-RETIREMENT state - the cutover itself has
+    /// already committed and activated the target, which is the separately
+    /// authorized step that happened earlier. Naming an arbitrary outstanding
+    /// epoch instead would report a completed retirement of authority this
+    /// cutover never consumed.
+    PredecessorEpochUnknown,
+    /// A retirement record for this operation exists and is otherwise bound to
+    /// this request, but it was written without the predecessor-generation
+    /// relation (#2868).
+    ///
+    /// Legacy history stays visible and is never erased; it simply cannot close
+    /// predecessor retirement, so the disposition is `Unknown` rather than
+    /// `Reconciled` even though every other binding agrees.
+    RetirementWithoutPredecessorRelation,
 }
 
 /// Coherence of one status read's two cross-store owner observations.
@@ -687,7 +723,9 @@ impl BoundRetirementEvidence {
 /// reached without the journal owner's own lookup. `Absent` and `Contradictory`
 /// are deliberately distinct from `Unbound` so "there is no retirement" and
 /// "the owner found a retirement that is not this cutover's" never collapse
-/// into the same claim.
+/// into the same claim, and `RelationUnproven` is distinct from both because
+/// "the right record with the predecessor-relation binding missing" is a third
+/// fact again (#2868).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CutoverRetirementEvidence {
     /// This Host journal applied no `EpochRetirement` under this exact
@@ -705,6 +743,15 @@ pub enum CutoverRetirementEvidence {
     /// of the record.
     Unbound,
     /// The journal owner resolved exactly one `EpochRetirement` for this exact
+    /// operation identity and every other binding agrees, but the record was
+    /// written without the predecessor-generation relation (#2868).
+    ///
+    /// Deliberately distinct from both `Unbound` and `Resolved`. Collapsing it
+    /// into `Unbound` would report a substitution that did not happen, and
+    /// reading it as `Resolved` would report an exact completion of a retirement
+    /// whose retired epoch was never shown to be the one the cutover consumed.
+    RelationUnproven,
+    /// The journal owner resolved exactly one `EpochRetirement` for this exact
     /// operation identity and the read wrapper proved its bindings against
     /// this request.
     Resolved(BoundRetirementEvidence),
@@ -720,9 +767,9 @@ impl CutoverRetirementEvidence {
     ) -> Option<&BoundRetirementEvidence> {
         match self {
             Self::Resolved(evidence) if evidence.operation() == operation => Some(evidence),
-            // Absent, contradictory, unbound, and a resolution bound to a
-            // different operation are all "no retirement this operation can
-            // read as its own effect".
+            // Absent, contradictory, relation-unproven, unbound, and a
+            // resolution bound to a different operation are all "no retirement
+            // this operation can read as its own effect".
             _ => None,
         }
     }
@@ -735,6 +782,10 @@ impl CutoverRetirementEvidence {
             Self::Absent | Self::Resolved(_) => None,
             Self::Contradictory => Some(CutoverResidual::ContradictoryRetirement),
             Self::Unbound => Some(CutoverResidual::UnboundRetirement),
+            // The record agrees on everything except the one binding that makes
+            // the retirement THIS cutover's, so it is reported as a weaker proof
+            // with its own name rather than as a substitution.
+            Self::RelationUnproven => Some(CutoverResidual::RetirementWithoutPredecessorRelation),
         }
     }
 }
@@ -2366,13 +2417,20 @@ pub fn read_cutover_disposition(
 /// The resolved record is then re-proved here against this request, from the
 /// record's OWN durable fields: the exact operation it was applied under, the
 /// installation/Host lineage, a genuinely prior epoch, the Host epoch whose
-/// projection retained it, and the target and approved facts the retirement
-/// recorded. The single cutover-intent slot is a current-applicability pointer,
-/// so it corroborates the retirement when it still holds this operation's own
+/// projection retained it, the target and approved facts the retirement
+/// recorded, and — since #2868 — the stored predecessor-generation relation that
+/// must map this request's exact `expected_predecessor` onto the exact retired
+/// epoch. The single cutover-intent slot is a current-applicability pointer, so
+/// it corroborates the retirement when it still holds this operation's own
 /// intent and is otherwise ignored — it can never be the reason an authentic
-/// past retirement is reported as somebody else's. A record that fails any of
-/// the re-proofs is `Unbound` — a rejected substitution, reported explicitly
-/// rather than read as this cutover's effect.
+/// past retirement is reported as somebody else's.
+///
+/// A record that fails any of those re-proofs is `Unbound` — a rejected
+/// substitution, reported explicitly rather than read as this cutover's effect.
+/// A record that passes every one of them but carries no predecessor relation is
+/// the separate `RelationUnproven` state: not a substitution, and not an exact
+/// completion either, because the retired epoch was never shown to be the one
+/// the cutover consumed.
 ///
 /// # Errors
 ///
@@ -2415,16 +2473,22 @@ pub(crate) fn resolve_cutover_retirement(
     {
         return Ok(CutoverRetirementEvidence::Absent);
     }
-    if !retirement_binds_request(state, request, &operation, &observation) {
-        return Ok(CutoverRetirementEvidence::Unbound);
+    match retirement_binds_request(state, request, &operation, &observation) {
+        RetirementBinding::Exact => Ok(CutoverRetirementEvidence::Resolved(
+            BoundRetirementEvidence::bind(
+                &request.operation,
+                observation.transaction_id(),
+                observation.retirement_evidence_refs(),
+            ),
+        )),
+        // A legacy record with every other binding in agreement is neither a
+        // substitution nor an exact completion, and reporting it as either would
+        // be a false claim in one direction or the other (#2868).
+        RetirementBinding::WithoutPredecessorRelation => {
+            Ok(CutoverRetirementEvidence::RelationUnproven)
+        }
+        RetirementBinding::NotThisRequestsRetirement => Ok(CutoverRetirementEvidence::Unbound),
     }
-    Ok(CutoverRetirementEvidence::Resolved(
-        BoundRetirementEvidence::bind(
-            &request.operation,
-            observation.transaction_id(),
-            observation.retirement_evidence_refs(),
-        ),
-    ))
 }
 
 /// Re-proves one owner-resolved retirement against the request it is reported
@@ -2458,13 +2522,18 @@ pub(crate) fn resolve_cutover_retirement(
 /// * the target generation, `UserBroker` identity, and the approved build and
 ///   configuration digests the retirement was authorized with, so a record
 ///   applied under a reused operation identity but for different approved facts
-///   is rejected.
+///   is rejected;
+/// * the stored predecessor-generation relation, which must map this request's
+///   exact `expected_predecessor` onto the exact retired epoch (#2868).
 ///
-/// What the record does NOT carry, stated so the proof ceiling is not
-/// overstated: the expected predecessor GENERATION. No owner exposes a
-/// generation-to-Host-epoch mapping, so the retired epoch is proved to be a
-/// genuinely prior outstanding epoch of this installation and nothing more.
-/// Neither the retired record nor this function ever claimed more.
+/// A record written before that relation existed reports
+/// [`RetirementBinding::WithoutPredecessorRelation`], never
+/// [`RetirementBinding::Exact`]. Such a record is genuine history and is never
+/// erased, but its proof ceiling is lower: it establishes that the retired
+/// epoch was a prior outstanding epoch of this installation, and never that the
+/// epoch was the one which carried the predecessor generation. Before #2868 the
+/// relation had no representation at all, so this comparison simply did not
+/// exist and every such record was read as exact.
 ///
 /// The intent projection is consulted for two things, and never as proof that
 /// THIS operation is foreign:
@@ -2481,39 +2550,45 @@ pub(crate) fn resolve_cutover_retirement(
 /// this operation's history: it is neither corroboration nor refutation, and it
 /// cannot erase the record. The mapper reports that the intent is no longer
 /// retained through [`CutoverResidual::RetirementWithoutRetainedIntent`].
+///
+/// # Errors
+///
+/// This function cannot fail. Every answer it returns is a decision about
+/// already-durable owner facts, so a storage failure is not something it can
+/// observe and must not be modelled as one of its three states.
 fn retirement_binds_request(
     state: &HostState,
     request: &CutoverRequest,
     operation: &IdempotencyIdentity,
     observation: &EpochRetirementObservation,
-) -> bool {
+) -> RetirementBinding {
     // The record must name the exact identity it was looked up under: a
     // comparison between two different records, not a self-comparison. That
     // identity carries the cutover operation id AND the canonical request
     // digest, so this one comparison binds the operation and its body.
     if observation.operation() != operation {
-        return false;
+        return RetirementBinding::NotThisRequestsRetirement;
     }
     let retired = observation.retired_host();
     if retired.installation != request.operation.installation
         || retired.installation != state.host.installation
         || retired.epoch == state.host.epoch
     {
-        return false;
+        return RetirementBinding::NotThisRequestsRetirement;
     }
     if !state
         .retained_epochs
         .iter()
         .any(|retained| retained.host == *retired)
     {
-        return false;
+        return RetirementBinding::NotThisRequestsRetirement;
     }
     // The fence the owner accepted the record under must belong to the Host
     // epoch that replayed this log. The owner's reducer already refuses any
     // record whose fence host is not the replaying epoch, so this re-reads the
     // same owner fact instead of introducing a second source of truth.
     if observation.fence().host != state.host {
-        return false;
+        return RetirementBinding::NotThisRequestsRetirement;
     }
     if let Some(intent) = state.pending_cutover.as_ref() {
         if is_own_cutover_intent(
@@ -2525,26 +2600,76 @@ fn retirement_binds_request(
             // Two records written under the same operation identity must name
             // the same activation, or one of them is not this cutover's.
             if intent.fence != *observation.fence() {
-                return false;
+                return RetirementBinding::NotThisRequestsRetirement;
             }
         } else if intent.cutover_operation == request.operation.operation_id {
             // The retained intent names this operation id with different
             // content: an identity conflict, never this request's retirement.
-            return false;
+            return RetirementBinding::NotThisRequestsRetirement;
         }
     }
-    observation
+    if !observation
         .retirement_evidence_refs()
         .contains(&request.target_generation)
-        && observation
+        || !observation
             .retirement_evidence_refs()
             .contains(&request.user_broker_ref)
-        && observation
+        || !observation
             .retirement_evidence_refs()
             .contains(&request.target_build_digest)
-        && observation
+        || !observation
             .retirement_evidence_refs()
             .contains(&request.target_config_digest)
+    {
+        return RetirementBinding::NotThisRequestsRetirement;
+    }
+    // Every binding above is a property of the record's own fields and of this
+    // Host journal. The one remaining question is the relation the effect itself
+    // could not prove at write time: does the durable record state which
+    // generation the retired epoch carried?
+    //
+    // Without it, the record proves the retired epoch was a genuinely prior
+    // outstanding epoch of this installation - and nothing about which
+    // generation it carried. That is exactly the reduced proof the retirement
+    // effect itself documented, so reporting it as `Reconciled` would promote a
+    // weaker fact to an exact completion. It is therefore a distinct,
+    // lower-ceiling answer: history stays visible, and the disposition stays
+    // `Unknown` (I5.13, I14.21, #2868).
+    match observation.predecessor_relation() {
+        Some(relation)
+            if relation.maps_generation(
+                &request.operation.installation,
+                &request.expected_predecessor,
+            ) && relation.retired_host == *retired =>
+        {
+            RetirementBinding::Exact
+        }
+        Some(_) => RetirementBinding::NotThisRequestsRetirement,
+        None => RetirementBinding::WithoutPredecessorRelation,
+    }
+}
+
+/// How far one owner-resolved retirement binds to the request it is reported for.
+///
+/// Three states, because "this is a substitution" and "this is the right record
+/// with one binding missing" are different facts and must not share an answer
+/// (#2868). A single boolean cannot express them: it would either report a
+/// substitution that did not happen, or read a record whose retired epoch was
+/// never shown to be the consumed predecessor as an exact completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementBinding {
+    /// Every binding agrees and the stored relation maps this request's exact
+    /// expected predecessor generation onto the exact retired epoch.
+    Exact,
+    /// Every binding agrees except the predecessor-generation relation, which
+    /// the durable record does not carry. Legacy history, lower proof ceiling.
+    WithoutPredecessorRelation,
+    /// The record is not this request's retirement: a substituted installation,
+    /// epoch, fence, operation identity or evidence set. A journal holding MORE
+    /// THAN ONE retirement for one operation identity is decided earlier, as
+    /// [`CutoverRetirementEvidence::Contradictory`], because that is a
+    /// contradiction about durable state rather than a substitution.
+    NotThisRequestsRetirement,
 }
 
 /// Whether one durable cutover intent is this exact request's retained
@@ -2599,23 +2724,114 @@ fn registry_activation_binds_this_operation(
     })
 }
 
+/// What the current durable owners can prove about which Host epoch carried one
+/// cutover's exact expected predecessor generation (#2868).
+///
+/// The installation registry owns generations; the Host journal owns epochs.
+/// Neither durable owner carries both, so this is a two-state answer and the
+/// negative case is a first-class outcome rather than a fallback.
+///
+/// The relation is boxed because it is a full durable record and the other arm
+/// carries nothing; keeping it inline would make every value of this enum as
+/// large as the record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PredecessorRelationResolution {
+    /// An owner-issued relation maps this cutover's exact expected predecessor
+    /// generation onto one exact outstanding Host epoch of this installation.
+    Bound(Box<PredecessorRetirementRelation>),
+    /// No owner establishes the relation.
+    Unavailable,
+}
+
+/// Resolves the predecessor-generation-to-Host-epoch relation for one cutover
+/// from the durable owners, before any retirement record is written.
+///
+/// The epoch to retire is **derived here, never presented**. Before #2868 the
+/// effect accepted a caller-selected `prior_host` and proved only that it was
+/// *some* unretired prior epoch of the same installation, so with two
+/// outstanding prior epochs the cutover could retire one and later report the
+/// other as the consumed predecessor's completion. Nothing may be selected
+/// independently, so the retired epoch is whatever the owners name and nothing
+/// else.
+///
+/// # Why the answer is currently `Unavailable`
+///
+/// The owner that relates a generation to a Host epoch **does exist**, and it
+/// is the approved-generation/Host-activation handoff #2868 item 1 asks to
+/// reuse. In `crates/kernel/eliot-installation/src/approved_generation_registry.rs`:
+///
+/// * `ActivationCommitFence.generation` is the approved installation generation
+///   as a `PlatformHandle` - the same handle a cutover presents;
+/// * its `phase_b_live_binding: Option<PhaseBLiveBinding>` is **mandatory on
+///   every committed activation** (`ActivationCommitFence::validate` returns
+///   `IncompleteObservation` without it), and `PhaseBLiveBinding` carries
+///   `host_owner_epoch`, `host_epoch_lineage`, `host_epoch_sequence` and
+///   `host_process_nonce_digest`;
+/// * `validate()` already proves the join internally:
+///   `provisioned_supervision_authority.candidate_generation == generation`.
+///
+/// So the join is constructed and owner-checked - for the generation of the
+/// activation being committed. It cannot answer a PREDECESSOR retirement, for
+/// two reasons that are properties of the current owners rather than of this
+/// function:
+///
+/// 1. **Retention.** The registry keeps exactly one such fence -
+///    `last_terminal_activation.commit_fence`, read through
+///    `last_committed_activation_fence()`, the only public reader of that slot.
+///    Staging a new approved generation clears the slot, and staging the target
+///    is a prerequisite of the cutover's registry CAS, so by the time
+///    retirement is authorized the predecessor's generation-to-epoch join is no
+///    longer retained anywhere. (`activate`, which performs the flip, does not
+///    clear it - staging does, earlier.)
+/// 2. **Shape.** The fence describes the activation being COMMITTED, so it
+///    carries no activation id, activation lineage, issuer, or issuance instant
+///    for the epoch being RETIRED. Filling those in would mean inventing values,
+///    which is exactly what a proof-of-mapping record must never do.
+///
+/// The Host journal cannot supply the missing side either. Its one record that
+/// names installation generations is `CutoverIntentRecord`
+/// (`expected_predecessor`, `target_generation`), and that binding runs the
+/// wrong way: its `RecordFence` ties those generations to the epoch that
+/// PERFORMED the cutover, never to the epoch that CARRIED the predecessor
+/// generation. `EpochEvidence` is rebuilt from replayed log bytes and reducer
+/// state without access to any record body, so it cannot carry a generation
+/// either.
+///
+/// The join therefore has no owner for this question, and this returns
+/// [`PredecessorRelationResolution::Unavailable`]. That is #2868 item 6's
+/// prescribed outcome, not a guess and not a storage error: the caller refuses
+/// the effect, reports a typed residual and appends nothing (I5.13, A13.7,
+/// I14.21). The `Bound` arm is the seam an owner correction fills - it needs a
+/// per-generation activation fence (or a predecessor-retaining one), and no
+/// further change to the effect.
+///
+/// The parameters are intentionally unused: reading an owner whose answer
+/// cannot change the result, and calling that a measurement, would be exactly
+/// the kind of claim this repository rejects.
+pub fn resolve_predecessor_retirement_relation(
+    _host: &HostComposition,
+    _request: &CutoverRequest,
+) -> PredecessorRelationResolution {
+    PredecessorRelationResolution::Unavailable
+}
+
 /// Runs the separately authorized prior-generation retirement that completes
 /// one committed cutover.
 ///
 /// This is the implementation behind
 /// [`crate::HostComposition::backup_dispatch_cutover_retire`]; it owns no
 /// algorithm. Retirement is never automatic cleanup: the caller must present
-/// the barrier returned by the cutover dispatch for the same operation, the
-/// exact prior epoch still retained by the journal, and an explicit non-empty
-/// retirement authorization.
+/// the barrier returned by the cutover dispatch for the same operation and an
+/// explicit non-empty retirement authorization. The epoch to retire is **not** a
+/// parameter - it is derived from the owners by
+/// [`resolve_predecessor_retirement_relation`].
 ///
 /// The gate is the **durable committed cutover intent**, not the pre-activation
 /// owner gate set: for a genuinely fresh activation
 /// `validate_cutover_request` requires the active generation to still equal the
 /// expected predecessor, which is by construction false once the activation
 /// committed, so re-running it here could never succeed. The committed intent
-/// is the owner's own record that the exact new state was applied, and the
-/// named prior epoch must still be outstanding in this Host journal.
+/// is the owner's own record that the exact new state was applied.
 ///
 /// The gate is therefore live only inside the Host epoch that performed the
 /// cutover, because the intent record lives in that epoch's log. After a
@@ -2633,6 +2849,19 @@ fn registry_activation_binds_this_operation(
 /// before the retirement record is read or appended, and no `ValidatedCutover`
 /// can be built here or anywhere else without that check having succeeded.
 ///
+/// # Relation unavailable
+///
+/// When the owners cannot relate the predecessor generation to a Host epoch, the
+/// retirement effect is **refused before any record is appended** and a typed
+/// `Unknown` + [`CutoverResidual::PredecessorEpochUnknown`] outcome is returned.
+/// No outstanding epoch is retired and no journal or registry state changes, so
+/// the pre-RETIREMENT state stays as it was; the cutover's own activation has
+/// already committed, which is the earlier, separately authorized step (I5.13,
+/// A13.7). This is the only honest outcome available while no owner retains
+/// the relation: the previous gate accepted a caller-selected epoch and
+/// reported `Reconciled` for a retirement whose retired epoch was never shown
+/// to be the consumed predecessor's.
+///
 /// # Errors
 ///
 /// Returns [`CutoverError`] when the presented body is not the body the
@@ -2645,7 +2874,6 @@ pub fn retire_authorized_generation(
     request: &CutoverRequest,
     evidence: &IsolatedRecoveryEvidence,
     barrier: &GenerationRetirementBarrier,
-    prior_host: &HostInstallationEpoch,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
     // Retirement is a protected transition, so it runs against a sealed body,
@@ -2709,16 +2937,34 @@ pub fn retire_authorized_generation(
             CutoverError::BindingMismatch,
         ));
     }
-    // The prior epoch must be one this Host journal still retains, unretired,
-    // and different from the epoch performing the cutover. Stated precisely:
-    // the cutover determines the predecessor *generation* (the registry owns
-    // that), while the journal owns the *epochs*, so the gate proves the named
-    // epoch is genuinely outstanding — it does not claim to know which of the
-    // retained epochs the predecessor generation maps to, because no owner
-    // exposes that mapping. The journal reducer re-checks the same condition
-    // on append.
+    // The epoch to retire is derived from the durable owners, never presented.
+    // This runs BEFORE the outstanding-epoch scan below and before any record is
+    // appended, because a scan cannot tell the owners apart: with two outstanding
+    // prior epochs it is satisfied by either one, and picking the first match is
+    // exactly the arbitrary retirement #2868 removes.
+    let PredecessorRelationResolution::Bound(relation) =
+        resolve_predecessor_retirement_relation(host, request)
+    else {
+        observe_cutover_progress("retire_authorize", "relation_unavailable", "unknown", 0);
+        return Ok(CutoverOutcome {
+            disposition: CutoverDisposition::Unknown,
+            residual: CutoverResidual::PredecessorEpochUnknown,
+            operation,
+            evidence_refs: bounded_evidence(vec![
+                intent.cutover_operation.clone(),
+                request.expected_predecessor.clone(),
+                request.target_generation.clone(),
+            ]),
+        });
+    };
+    let prior_host = relation.retired_host.clone();
+    // The relation's epoch must still be one this Host journal retains,
+    // unretired, and different from the epoch performing the cutover. The
+    // relation establishes WHICH epoch carried the predecessor generation; this
+    // re-reads the owner's own current retention state, and the journal reducer
+    // re-checks the same condition on append.
     let outstanding = journal.retained_epochs.iter().any(|retained| {
-        retained.host == *prior_host
+        retained.host == prior_host
             && !retained.retired
             && prior_host.installation == host.host.installation
             && prior_host.epoch != host.host.epoch
@@ -2735,7 +2981,7 @@ pub fn retire_authorized_generation(
         host,
         &validated,
         barrier,
-        prior_host,
+        &relation,
         retirement_authorization,
     )
     .map_err(|error| note_cutover_error("retire_authorize", error))
@@ -2839,20 +3085,31 @@ fn append_cutover_intent(
 /// Requires: the exact new state already committed and accepted, all source
 /// drain/retirement decisions explicitly authorized
 /// (`retirement_authorization` is bound into the record; empty values are
-/// rejected, never defaulted), the prior epoch from the same installation,
-/// and a live barrier. The source installation is retained until accepted
+/// rejected, never defaulted), an owner-issued
+/// [`PredecessorRetirementRelation`] naming the epoch to retire, and a live
+/// barrier. The retired epoch is read from the relation, never from a parameter,
+/// and the relation itself is persisted on the record so a later status read can
+/// re-prove the same mapping. The source installation is retained until accepted
 /// authorized retirement; source data destruction is a separate explicitly
 /// authorized retention/erasure action, never automatic cleanup here.
 ///
 /// # Errors
 ///
-/// Fails closed on authorization, prior-epoch binding, or journal outcome;
-/// `OutcomeUnknown` reconciles through the choke and never forges success.
-pub fn retire_prior_generation(
+/// Fails closed on authorization, relation/prior-epoch binding, or journal
+/// outcome; `OutcomeUnknown` reconciles through the choke and never forges
+/// success.
+///
+/// Private on purpose. `PredecessorRetirementRelation` has public fields and no
+/// restricted constructor, so a `pub` effect taking one would let any dependent
+/// crate mint a relation naming any outstanding epoch and obtain a `Reconciled`
+/// retirement of it - the same arbitrary selection #2868 removes, one level up.
+/// Only [`retire_authorized_generation`], which receives the relation solely
+/// from [`resolve_predecessor_retirement_relation`], can call this.
+fn retire_prior_generation(
     host: &HostComposition,
     validated: &ValidatedCutover,
     barrier: &GenerationRetirementBarrier,
-    prior_host: &HostInstallationEpoch,
+    relation: &PredecessorRetirementRelation,
     retirement_authorization: &PlatformHandle,
 ) -> Result<CutoverOutcome, CutoverError> {
     // Effect boundary: re-prove the retained body against the admitted envelope
@@ -2869,6 +3126,7 @@ pub fn retire_prior_generation(
             CutoverError::AuthorityOrReadinessMissing,
         ));
     }
+    let prior_host = &relation.retired_host;
     if prior_host.installation != host.host.installation {
         return Err(note_cutover_error("retire", CutoverError::BindingMismatch));
     }
@@ -2880,6 +3138,20 @@ pub fn retire_prior_generation(
         operation_id: cutover_operation.operation_id.clone(),
         idempotency_key: cutover_operation.request_digest.clone(),
     };
+    // The relation must be issued for exactly this cutover operation and must
+    // map this body's expected predecessor generation onto the epoch being
+    // retired. Without both, the record would again prove only "some prior epoch"
+    // and the status binder would have to refuse to call it this cutover's
+    // retirement.
+    if relation.cutover_operation != operation
+        || relation.installation != cutover_operation.installation
+        || !relation.maps_generation(
+            &cutover_operation.installation,
+            &validated.request().expected_predecessor,
+        )
+    {
+        return Err(note_cutover_error("retire", CutoverError::BindingMismatch));
+    }
     // Deterministic per cutover operation and prior epoch: the journal
     // transaction id binds operation identity, Host epoch, and the full
     // record checksum (`journal.rs:126-145`), so a retry after
@@ -2926,6 +3198,11 @@ pub fn retire_prior_generation(
             validated.request().user_broker_ref.clone(),
             validated.request().target_build_digest.clone(),
             validated.request().target_config_digest.clone(),
+            // The predecessor generation this retirement consumed. It belongs in
+            // the durable evidence set as well as in the typed relation: the
+            // relation is the binding, and this makes the consumed generation
+            // readable from the evidence list without parsing the relation.
+            validated.request().expected_predecessor.clone(),
             receipt_handle(&validated.evidence().restore_receipt.receipt_id)
                 .map_err(|error| note_cutover_error("retire", error))?,
             receipt_handle(&validated.evidence().restore_receipt.effect_receipt_sha256)
@@ -2940,6 +3217,10 @@ pub fn retire_prior_generation(
             retirement_authorization.clone(),
         ]),
         retired_at,
+        // The owner-issued mapping itself, so a later status read can require
+        // the exact predecessor-generation-to-Host-epoch relation instead of
+        // accepting "some prior outstanding epoch" as this cutover's completion.
+        predecessor_relation: Some(relation.clone()),
     });
     let receipt = super::journal_append::append_reconciled(&host.journal, record)
         .map_err(|error| note_cutover_error("retire", CutoverError::from(error)))?;
@@ -3058,6 +3339,18 @@ pub fn retire_prior_generation(
 /// `RetirementPending` until the owner resolves its retirement.
 /// Cancellation/cleanup/diagnostic failure preserves the primary result and its
 /// reconciliation path.
+///
+/// # Reachability of `Reconciled` on current source
+///
+/// The `Reconciled` arm is reachable in this mapper whenever
+/// `retirement_binds_request` returns `Exact`, which requires the resolved
+/// durable record to carry a `PredecessorRetirementRelation` naming this
+/// request's `expected_predecessor` (#2868). No owner issues that relation
+/// today - see [`resolve_predecessor_retirement_relation`] - so on current
+/// source no record can carry one and this arm is not entered in production. It
+/// is stated rather than left implicit, exactly as `Validated` is above. The
+/// arm is retained because the durable record shape and the re-proof exist, and
+/// an owner correction fills this without touching the mapper.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -3098,7 +3391,11 @@ pub fn reconcile_cutover_outcome(
         // refusal arm below, which is the same "choose the branch that appears
         // first" flattening this arm exists to stop, and it would have been a
         // false claim: `Contradictory` means the journal owner holds MORE than
-        // one retirement for this exact operation.
+        // one retirement for this exact operation. `RelationUnproven` is
+        // included for the same reason - a legacy retirement record under a
+        // refused operation is still a durable fact about that operation, and
+        // `!matches!(retirement, Absent)` is what keeps it from being read as
+        // "nothing happened".
         (
             CutoverDisposition::Unknown,
             CutoverResidual::FailedIntentWithResolvedRetirement,
