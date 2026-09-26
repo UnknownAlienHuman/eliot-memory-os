@@ -1,12 +1,65 @@
 use crate::{LegacyCueKindV1, MemoryInfluenceClass, SessionId, TaskId};
 use schemars::JsonSchema;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ObservedCue {
     pub kind: LegacyCueKindV1,
     pub value: String,
+}
+
+// The direct legacy cue decoder preserves two inert metadata keys; injection
+// records use a stricter adapter for cues nested inside protected records.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservedCueLegacyInput {
+    kind: LegacyCueKindV1,
+    value: String,
+    #[serde(default)]
+    #[serde(rename = "version")]
+    _version: Option<IgnoredAny>,
+    #[serde(default)]
+    #[serde(rename = "schema_version")]
+    _schema_version: Option<IgnoredAny>,
+}
+
+impl<'de> Deserialize<'de> for ObservedCue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ObservedCueLegacyInput {
+            kind,
+            value,
+            _version: _,
+            _schema_version: _,
+        } = ObservedCueLegacyInput::deserialize(deserializer)?;
+
+        Ok(Self { kind, value })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictObservedCueInput {
+    kind: LegacyCueKindV1,
+    value: String,
+}
+
+fn deserialize_strict_observed_cues<'de, D>(deserializer: D) -> Result<Vec<ObservedCue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let cues = Vec::<StrictObservedCueInput>::deserialize(deserializer)?;
+    Ok(cues
+        .into_iter()
+        .map(|cue| ObservedCue {
+            kind: cue.kind,
+            value: cue.value,
+        })
+        .collect())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17,6 +70,7 @@ pub struct PendingInjectionItem {
     pub preview: String,
     pub payload: Option<Value>,
     pub source_fingerprint: String,
+    #[serde(deserialize_with = "deserialize_strict_observed_cues")]
     pub fired_cues: Vec<ObservedCue>,
     pub negative_memory: bool,
     pub invariant: bool,
@@ -57,6 +111,7 @@ pub struct InjectionReceipt {
     pub surface: String,
     pub item_ref: String,
     pub render_form: String,
+    #[serde(deserialize_with = "deserialize_strict_observed_cues")]
     pub fired_cues: Vec<ObservedCue>,
     pub token_cost: u32,
     pub source_fingerprint: String,
