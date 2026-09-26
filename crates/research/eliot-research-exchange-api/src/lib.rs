@@ -605,12 +605,6 @@ impl ExchangeProgress {
     pub const fn is_exhausted(&self) -> bool {
         self.spent_units >= self.budget_units
     }
-
-    /// Whether the job has spent any progress yet.
-    #[must_use]
-    pub const fn is_started(&self) -> bool {
-        self.spent_units > 0
-    }
 }
 
 /// Declared coverage denominator and the limits measured against it.
@@ -1471,13 +1465,6 @@ impl ExchangeJobLifecycleRecord {
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         self.terminal.is_some()
-    }
-
-    /// Whether this record reports prior progress: spent budget or already
-    /// transferred partial evidence.
-    #[must_use]
-    pub fn has_prior_progress(&self) -> bool {
-        self.progress.is_started() || !self.partial_bundles.is_empty()
     }
 
     /// Spends progress against the admitted budget. A job that already reached

@@ -6,23 +6,22 @@
 //! partial bundles already transferred, the coverage and failed-acquisition
 //! detail, the disclosure and invalidation state, and the terminal typed
 //! outcome. The live `ExchangeSnapshot` is only the process-local projection of
-//! that record; `lifecycle` is the owner's durable seam over the store-neutral
-//! ledger, so a retry resumes the same exchange by idempotency identity instead
-//! of duplicating a transfer.
+//! that record: a resumed key is served only from a record that still
+//! validates, so a retry resumes the same exchange by idempotency identity
+//! instead of duplicating a transfer. Persisting one record durably is the
+//! owning ELIOT store's call through the store-neutral `ExchangeJobLedger`
+//! contract; this crate owns no database, remote-store fallback or scheduler.
 
 #![forbid(unsafe_code)]
 
 pub mod handoff;
-mod lifecycle;
-
-pub use lifecycle::DurableExchangeError;
 
 use std::collections::BTreeMap;
 
 use eliot_contracts::{ContractVersion, StateFence};
 use eliot_research_exchange_api::{
     ExchangeJobLifecycleRecord, GapContinuation, ResearchContractError, ResearchEvidenceBundle,
-    ResearchExportBundle, ResearchQueryRequest,
+    ResearchExportBundle, ResearchHeldSourceGap, ResearchQueryRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -131,6 +130,10 @@ impl<B> GovernedExchange<B> {
     /// request, otherwise the key is bound to different content. Partial
     /// progress (`status`, `progress_units`, delivered `result`) is preserved
     /// exactly as captured in the snapshot.
+    ///
+    /// The durable record is re-validated here, so a restored snapshot is
+    /// served only from a record that still binds this request's canonical
+    /// content digest and still satisfies its own lifecycle invariants.
     pub fn resume(
         &self,
         idempotency_key: &str,
@@ -140,10 +143,37 @@ impl<B> GovernedExchange<B> {
         let job = self
             .job_by_idempotency(idempotency_key)
             .ok_or(ExchangeError::NotFound)?;
-        if job.request != *request {
+        if job.request != *request
+            || job.lifecycle.request_digest != ExchangeJobLifecycleRecord::request_digest(request)?
+        {
             return Err(ExchangeError::IdempotencyConflict);
         }
+        job.lifecycle.validate()?;
         Ok(job)
+    }
+
+    /// The typed dependent-inquiry gap this job's degradation opens for one
+    /// dependent current task.
+    ///
+    /// I21.11: "If the required bundle cannot be fetched or its
+    /// disclosure/source generation cannot be verified, the dependent inquiry
+    /// returns `RESEARCH_SOURCE_UNAVAILABLE` or `INCOMPLETE_COVERAGE`, while
+    /// unrelated local cognitive work continues." `None` means this job declares
+    /// no such gap for the named inquiry, so that inquiry continues on its own
+    /// evidence. The call is a pure projection over the durable record: it
+    /// changes nothing, which keeps the failure localized to the dependent
+    /// external-knowledge dependency (I21.13).
+    pub fn dependent_inquiry_gap(
+        &self,
+        job_id: &str,
+        inquiry_id: &str,
+    ) -> Result<Option<ResearchHeldSourceGap>, ExchangeError> {
+        let job = self
+            .snapshot
+            .jobs
+            .get(job_id)
+            .ok_or(ExchangeError::NotFound)?;
+        Ok(job.lifecycle.dependent_inquiry_gap(inquiry_id)?)
     }
 }
 
@@ -151,7 +181,9 @@ impl<B: ResearchBridge> GovernedExchange<B> {
     /// Accepts one query, or resumes the interrupted exchange already bound
     /// to its idempotency key with partial progress preserved. A resumed
     /// key never re-contacts the bridge, so at most one provider job exists
-    /// per identity.
+    /// per identity. A resumed job is served only from a durable record that
+    /// still validates, so a restored snapshot can never decode a drifted
+    /// record as a live job.
     pub fn submit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeJob, ExchangeError> {
         request.validate()?;
         if let Some(job_id) = self.snapshot.idempotency.get(&request.idempotency_key) {
@@ -163,6 +195,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             if existing.request != request {
                 return Err(ExchangeError::IdempotencyConflict);
             }
+            existing.lifecycle.validate()?;
             return Ok(existing.clone());
         }
         let job_id = self
