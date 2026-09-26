@@ -106,6 +106,22 @@ pub const BACKUP_STATE_BLOCKED: &str = "blocked";
 /// same-operation reconciliation.
 pub const BACKUP_STATE_UNKNOWN: &str = "unknown";
 
+/// The capture owner a create refusal names while admitted capture is missing.
+///
+/// A create is refused with `plan_gap` while admitted capture is owned by
+/// #959, and the Kernel's create route writes that owner into the refusal
+/// verbatim. This constant mirrors that literal so the create reply's one
+/// domain identity is checkable instead of merely readable: a refusal naming
+/// any other owner is a domain-identity mismatch, not this operation's answer.
+///
+/// The two literals are separate owners of the same spelling, not a shared
+/// contract: the Kernel route states it in its refusal and this surface
+/// states it here. When #959 lands and the create reply becomes a real
+/// capture answer, both sides must change together; until then a drift
+/// between them is refused here rather than silently accepted. This surface
+/// must not mint an owner, a receipt or a class to keep the check passing.
+pub const BACKUP_CREATE_MISSING_OWNER: &str = "backup-capture-owner (#959)";
+
 /// Failure of one thin backup delegation: transport problems stay
 /// transport errors (with their operation identity for same-operation
 /// reconciliation); client-side problems reuse the catalogue [`CliError`].
@@ -613,6 +629,26 @@ fn envelope_status(response: &Value) -> Result<&str, BackupClientError> {
     Ok(status)
 }
 
+/// Closed reply field set one operation admits.
+///
+/// The Kernel builds a reply from the base envelope plus exactly the fields
+/// that operation answers, so a reply carrying any other key is a reply this
+/// operation's contract does not describe. Reading only the named fields would
+/// drop such a key silently, and that key may be a domain receipt, class,
+/// source or destination the operation never claims to answer. It may also be
+/// a shape diagnostic from a different reply kind entirely, which is refused
+/// for the same reason: this operation has one answer shape, and a reply of
+/// another shape is not this operation's answer.
+fn envelope_keys(response: &Value, allowed: &[&str]) -> Result<(), BackupClientError> {
+    let Some(object) = response.as_object() else {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    Ok(())
+}
+
 fn envelope_text<'a>(
     response: &'a Value,
     field: &'static str,
@@ -774,8 +810,13 @@ fn restore_test_params(
 /// catalogue's reversible-mutation request bound at the candidate-artifact
 /// ceiling — never a read. The only honest outcome today is the typed
 /// capture-owner refusal, decoded strictly: a reply that claims a capture
-/// happened, or that names a different command, correlation, or status, is
-/// a typed result mismatch rather than a success.
+/// happened, that names a different command, correlation, or status, that
+/// carries a field this operation never answers, or that names a different
+/// missing owner, is a typed result mismatch rather than a success. The
+/// create reply carries no domain receipt, class, source or destination, so
+/// those identities stay explicitly absent here instead of being read from the
+/// reply. The requested class and scope this outcome does report are echoes of
+/// what the operator asked for, never an identity the owner proved.
 pub fn backup_create(
     client: &mut KernelClient,
     request: &CommandRequest,
@@ -801,13 +842,35 @@ pub fn backup_create(
         .map_err(BackupClientError::Transport)?;
     envelope_command(&response, BACKUP_CREATE_OPERATION)?;
     envelope_idempotency(&response, &request.request)?;
+    // A create refusal answers with the base envelope plus `code`,
+    // `missing_owner` and `reason` and nothing else. Any other key is a domain
+    // identity the create owner does not send, and a reply that carries one
+    // must not project as this operation's own typed outcome.
+    envelope_keys(
+        &response,
+        &[
+            "command",
+            "status",
+            "idempotency_key",
+            "code",
+            "missing_owner",
+            "reason",
+        ],
+    )?;
     if envelope_status(&response)? != BACKUP_STATE_REFUSED {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
     if envelope_text(&response, "code")? != "plan_gap" {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
+    // `missing_owner` is the one domain identity a create refusal actually
+    // carries, so its value is the one domain check this path can make. A
+    // refusal naming any other owner is a mismatch, not this operation's
+    // answer; it is refused instead of being reported as a missing capture.
     let missing_owner = envelope_text(&response, "missing_owner")?.to_owned();
+    if missing_owner != BACKUP_CREATE_MISSING_OWNER {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
     let reason = envelope_text(&response, "reason")?.to_owned();
     // Admitted capture is not implemented: the request proved its shape and
     // nothing else, so the proven level never leaves `Requested` and the
