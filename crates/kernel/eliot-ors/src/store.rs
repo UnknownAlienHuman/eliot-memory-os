@@ -1506,6 +1506,17 @@ const GRANT_CLOSURE_MIGRATION_KEY_PREFIX: &str = "grant_closure_migration:v1:";
 const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
     TableDefinition::new("ors_grant_graph_revision_current_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
+/// Durable monotone revision of the process-stream recovery family (issue
+/// #2884).
+///
+/// Advanced inside the same write transaction as every durable insert, evidence
+/// advance and retirement of that family, so any movement of the family moves
+/// this counter. An in-progress backup compares it against the revision it
+/// froze and refuses a continued export with a typed movement disposition
+/// instead of tearing the snapshot. An absent key is revision `0`, the legacy
+/// state of a store written before this counter existed; the family's streamed
+/// content root is what additionally binds that state.
+const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_family_revision";
 
 struct ClosureRowPlan {
     key: String,
@@ -2309,6 +2320,28 @@ impl RedbRecoveryStore {
         request: &crate::backup_snapshot::OrsBackupRequest,
     ) -> Result<crate::backup_snapshot::OrsBackupSnapshot, OrsError> {
         backup_snapshot::export_snapshot(&self.database, request)
+    }
+
+    /// Opens the typed process-stream recovery family cursor for a backup
+    /// (issue #2884).
+    ///
+    /// This is the only producer of a family cursor: it reads the durable family
+    /// revision and the family's streamed content root under one read
+    /// transaction, so the frozen snapshot identity can never mix two moments.
+    /// The returned cursor names the start of the family; attach it with
+    /// [`crate::backup_snapshot::OrsBackupRequest::with_process_stream_recovery_cursor`]
+    /// so the family is paged under its own total order instead of being
+    /// materialised whole and carried on the final operational page.
+    ///
+    /// Reading the family is not authority: the cursor carries no process,
+    /// session or authority state and grants no restore path. Paging the family
+    /// through more pages raises no authority either; every exported row still
+    /// restores only through
+    /// [`Self::import_process_stream_recovery_suspended`].
+    pub fn open_backup_process_stream_recovery_family(
+        &self,
+    ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
+        backup_snapshot::open_process_stream_recovery_family(&self.database)
     }
 
     /// Triages one backup page as quarantined import outcomes without writing.
@@ -11723,6 +11756,13 @@ impl RedbRecoveryStore {
     /// transition is permitted. A conflicting evidence rewrite is rejected
     /// rather than overwriting retained history, so no revalidation path can
     /// rewrite typed transport or persistence state.
+    ///
+    /// This is the family's only durable writer, so it is also where the family
+    /// revision advances (issue #2884): an inserted or advanced row moves the
+    /// revision in the same transaction, which is what lets a backup
+    /// continuation holding the family frozen detect the movement. An exact
+    /// re-presentation that wrote nothing leaves the revision alone, so a
+    /// replayed observation never looks like movement.
     pub fn put_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
@@ -11773,6 +11813,9 @@ impl RedbRecoveryStore {
                 }
             }
         };
+        if outcome != ProcessStreamRecoveryWriteOutcome::Unchanged {
+            Self::advance_process_stream_recovery_family_revision(&write)?;
+        }
         write.commit().map_err(storage)?;
         Ok(outcome)
     }
@@ -11879,6 +11922,12 @@ impl RedbRecoveryStore {
     /// forbids destroying it outright. Nothing here infers terminality from the
     /// projection; the terminal reservation state, its named recovery owner,
     /// its terminal receipt and the proven handoff digest must all agree.
+    ///
+    /// Because the retired row is written through the family's one write path,
+    /// retirement advances the durable family revision in the same transaction
+    /// (issue #2884). A backup that froze the family before this call therefore
+    /// observes the movement and refuses to continue, instead of emitting a
+    /// snapshot that silently mixes pre- and post-retirement evidence.
     pub fn retire_process_stream_recovery(
         &self,
         projection: &ProcessStreamRecoveryProjection,
@@ -11952,6 +12001,13 @@ impl RedbRecoveryStore {
     /// state through this record. Only the recovery projection row is written;
     /// no reservation, session or authority row is created, reactivated or
     /// otherwise revived.
+    ///
+    /// This stays the only durable restore route for the family (issue #2884):
+    /// paging the family into more backup pages raises no authority, and every
+    /// exported row still lands here as suspended evidence. The write advances
+    /// the destination's family revision, so a backup taken of the destination
+    /// while the restore is in flight observes the movement rather than
+    /// certifying a half-restored family.
     pub fn import_process_stream_recovery_suspended(
         &self,
         projection: &ProcessStreamRecoveryProjection,
@@ -14193,6 +14249,67 @@ impl RedbRecoveryStore {
             })?;
         meta.insert(NEXT_GLOBAL_ORDER, next.to_string().as_str())
             .map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Reads the durable monotone revision of the process-stream recovery
+    /// family (issue #2884).
+    ///
+    /// The single owner of the counter: the family's one write path advances it
+    /// and the backup family cursor observes it. A store written before the
+    /// counter existed reads as revision `0`, which is a real frozen value and
+    /// not an error - the family's streamed content root binds that state.
+    pub(super) fn process_stream_recovery_family_revision(
+        read: &redb::ReadTransaction,
+    ) -> Result<u64, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let revision = meta
+            .get(PROCESS_STREAM_RECOVERY_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        Ok(revision)
+    }
+
+    /// Advances the process-stream recovery family revision in the caller's
+    /// open write transaction (issue #2884).
+    ///
+    /// Called only when a family row was actually inserted or advanced, in the
+    /// same transaction as that write: an exact re-presentation that changed
+    /// nothing must not look like movement to an in-progress backup. Because
+    /// the counter is monotone and transaction-bound, retiring a row - which
+    /// rewrites the row as terminal evidence rather than deleting it - moves it
+    /// exactly like any other change.
+    fn advance_process_stream_recovery_family_revision(
+        write: &redb::WriteTransaction,
+    ) -> Result<u64, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(PROCESS_STREAM_RECOVERY_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        let next = prior
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: "process-stream recovery family revision counter exhausted".to_owned(),
+            })?;
+        meta.insert(
+            PROCESS_STREAM_RECOVERY_FAMILY_REVISION,
+            next.to_string().as_str(),
+        )
+        .map_err(storage)?;
         Ok(next)
     }
 

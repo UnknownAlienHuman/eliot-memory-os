@@ -3221,6 +3221,52 @@ pub enum OrsError {
     AuthoritySnapshotUnavailable,
     #[error("operational projection exceeds its declared bound")]
     ProjectionLimitExceeded,
+    /// The process-stream recovery family moved while a backup continuation
+    /// held it frozen (issue #2884).
+    ///
+    /// This is the movement/restart disposition, never a truncation: a family
+    /// row was inserted, advanced or retired after the backup froze the family,
+    /// so the pages already emitted and the pages still owed can no longer be
+    /// one snapshot. The disposition is to restart the family export from a
+    /// freshly opened family snapshot; the exact frozen and observed revisions,
+    /// both content roots and the last emitted key are carried so the operator
+    /// sees which window moved. It never grants authority and never retires
+    /// anything.
+    #[error(
+        "process-stream recovery family moved under the frozen backup snapshot: revision {observed_revision} root {observed_root_digest} observed, revision {frozen_revision} root {frozen_root_digest} frozen, after key {after_key:?}; restart the family export from a freshly opened family snapshot"
+    )]
+    ProcessStreamRecoveryFamilyMoved {
+        /// Durable family revision the backup froze.
+        frozen_revision: u64,
+        /// Durable family revision observed when the page was read.
+        observed_revision: u64,
+        /// Streamed family content root the backup froze.
+        frozen_root_digest: String,
+        /// Streamed family content root observed when the page was read.
+        observed_root_digest: String,
+        /// Last durable key the backup had already emitted.
+        after_key: String,
+    },
+    /// A presented process-stream recovery family cursor does not name the
+    /// durable-key prefix the owner already emitted (issue #2884).
+    ///
+    /// The boundary is re-derived from durable state, so a caller cannot choose
+    /// which family rows a page covers: presenting a different key or a
+    /// different offset than the owner's own prefix is refused here instead of
+    /// letting a row leave the denominator silently.
+    #[error(
+        "process-stream recovery family cursor does not name the owner-emitted prefix: presented key {presented_after_key:?} at row {presented_emitted_rows}, durable key {expected_after_key:?} at row {expected_emitted_rows}"
+    )]
+    ProcessStreamRecoveryFamilyCursorMismatch {
+        /// Key the caller presented as the boundary.
+        presented_after_key: String,
+        /// Emitted row count the caller presented.
+        presented_emitted_rows: u64,
+        /// Key durable state actually holds at that offset.
+        expected_after_key: String,
+        /// Emitted row count durable state actually holds.
+        expected_emitted_rows: u64,
+    },
     #[error("supervision-lease revision is stale or does not match the current ORS head")]
     SupervisionLeaseStaleRevision,
     #[error("supervision-lease ticket or commit artifact conflicts with durable ORS state")]
