@@ -4929,40 +4929,7 @@ impl HostRequestRecord {
         }
         validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
         validate_text(self.request_id.as_str(), "host_request_request_id")?;
-        if let Some(projection) = &self.correlation_projection {
-            projection.validate().map_err(|_| OrsError::InvalidField {
-                field: "host_request_correlation_projection",
-                reason: "must be a bounded explicit correlation projection",
-            })?;
-            if projection.occurrence_text() != self.request_id.as_str() {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_correlation_projection",
-                    reason: "must encode the exact request_id text",
-                });
-            }
-            if self.request_id.as_str().len() > 512 {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_request_id",
-                    reason: "marked correlation must fit the bounded host-correlation text limit",
-                });
-            }
-            let domain_matches = matches!(
-                (self.kind, projection.domain()),
-                (
-                    HostRequestKind::Invocation,
-                    eliot_contracts::HostCorrelationDomain::Request
-                ) | (
-                    HostRequestKind::Cancellation,
-                    eliot_contracts::HostCorrelationDomain::Cancellation
-                )
-            );
-            if !domain_matches {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_correlation_projection",
-                    reason: "must match the host-request kind domain",
-                });
-            }
-        }
+        self.validate_correlation_projection()?;
         validate_text(
             self.idempotency_key.as_str(),
             "host_request_idempotency_key",
@@ -5035,6 +5002,45 @@ impl HostRequestRecord {
             return Err(OrsError::InvalidField {
                 field: "host_request_commit_order",
                 reason: "non-terminal states must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_correlation_projection(&self) -> Result<(), OrsError> {
+        let Some(projection) = &self.correlation_projection else {
+            return Ok(());
+        };
+        projection.validate().map_err(|_| OrsError::InvalidField {
+            field: "host_request_correlation_projection",
+            reason: "must be a bounded explicit correlation projection",
+        })?;
+        if projection.occurrence_text() != self.request_id.as_str() {
+            return Err(OrsError::InvalidField {
+                field: "host_request_correlation_projection",
+                reason: "must encode the exact request_id text",
+            });
+        }
+        if self.request_id.as_str().len() > 512 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_request_id",
+                reason: "marked correlation must fit the bounded host-correlation text limit",
+            });
+        }
+        let domain_matches = matches!(
+            (self.kind, projection.domain()),
+            (
+                HostRequestKind::Invocation,
+                eliot_contracts::HostCorrelationDomain::Request
+            ) | (
+                HostRequestKind::Cancellation,
+                eliot_contracts::HostCorrelationDomain::Cancellation
+            )
+        );
+        if !domain_matches {
+            return Err(OrsError::InvalidField {
+                field: "host_request_correlation_projection",
+                reason: "must match the host-request kind domain",
             });
         }
         Ok(())

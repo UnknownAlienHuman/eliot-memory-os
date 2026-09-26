@@ -43,8 +43,9 @@ pub enum HostCorrelationDomain {
 ///
 /// `None` on the durable protocol carriers is reserved for historical rows.
 /// New MCP adapters carry the original JSON-RPC type; non-MCP adapters must
-/// deliberately select the opaque profile. The projection is data, never
-/// operation authority.
+/// deliberately select the opaque profile. Kernel-owned operational rows use
+/// a separate profile unavailable to host request envelopes. The projection
+/// is data, never operation authority.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "profile", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostCorrelationProjection {
@@ -53,6 +54,13 @@ pub enum HostCorrelationProjection {
         /// Request or cancellation identity domain.
         domain: HostCorrelationDomain,
         /// Exact opaque host occurrence.
+        occurrence: String,
+    },
+    /// An internal Kernel operational occurrence, unavailable to host clients.
+    KernelOperational {
+        /// Request or cancellation identity domain.
+        domain: HostCorrelationDomain,
+        /// Exact Kernel-owned operational occurrence.
         occurrence: String,
     },
     /// A typed JSON-RPC id supplied by the MCP adapter, never parsed from text.
@@ -79,14 +87,16 @@ impl HostCorrelationProjection {
     #[must_use]
     pub const fn domain(&self) -> HostCorrelationDomain {
         match self {
-            Self::Opaque { domain, .. } | Self::McpJsonRpc { domain, .. } => *domain,
+            Self::Opaque { domain, .. }
+            | Self::KernelOperational { domain, .. }
+            | Self::McpJsonRpc { domain, .. } => *domain,
         }
     }
 
     /// Validates the closed projection's bounded text and typed value.
     pub fn validate(&self) -> Result<(), ContractError> {
         match self {
-            Self::Opaque { occurrence, .. } => {
+            Self::Opaque { occurrence, .. } | Self::KernelOperational { occurrence, .. } => {
                 validate_text(occurrence, "host_correlation.occurrence")?;
                 if occurrence.len() > MAX_HOST_CORRELATION_PROJECTION_BYTES {
                     return Err(ContractError::TooLong {
@@ -130,7 +140,9 @@ impl HostCorrelationProjection {
             HostCorrelationDomain::Cancellation => "cancellation",
         };
         match self {
-            Self::Opaque { occurrence, .. } => occurrence.clone(),
+            Self::Opaque { occurrence, .. } | Self::KernelOperational { occurrence, .. } => {
+                occurrence.clone()
+            }
             Self::McpJsonRpc {
                 id: HostJsonRpcCorrelationId::String(value),
                 ..

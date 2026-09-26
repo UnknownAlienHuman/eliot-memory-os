@@ -2799,6 +2799,15 @@ impl HostRequestIdentity {
     /// Validates per-kind identity presence rules.
     pub fn validate_for_kind(&self, kind: HostRequestKind) -> Result<(), ProtocolError> {
         self.validate()?;
+        if matches!(
+            self.correlation_projection.as_ref(),
+            Some(eliot_contracts::HostCorrelationProjection::KernelOperational { .. })
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.correlation_projection",
+                reason: "Kernel operational correlation is not admitted from a host envelope",
+            });
+        }
         let semantic_selected =
             self.session_id.is_some() || self.task_id.is_some() || self.work_scope_id.is_some();
         match kind {
