@@ -579,12 +579,19 @@ impl CompatibilityRelation {
 }
 
 /// One position's exact compatibility mapping against another position.
+///
+/// [`Self::outcomes`] carries the caller's canonical values for every dimension
+/// in [`COMPARISON_DIMENSIONS`] order, so the mapping is exact rather than a bare
+/// verdict: a reader can see which value each position asserted and why a field
+/// was unnormalizable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionCompatibility {
     /// Source handle of the other position.
     pub other_source: String,
     /// Typed relation derived from the canonical dimensions.
     pub relation: CompatibilityRelation,
+    /// Every dimension outcome in canonical order, values preserved.
+    pub outcomes: Vec<DimensionComparison>,
     /// Dimensions that differ, in canonical order.
     pub differing_dimensions: Vec<ComparisonDimension>,
     /// Dimensions that remain ambiguous, in canonical order.
@@ -627,8 +634,16 @@ impl CausalClaimState {
     }
 }
 
-/// One caller-supplied causal or predictive claim with the evidence algorithm
-/// step 7 requires before the effective state may exceed `Correlational`.
+/// One caller-supplied causal or predictive claim.
+///
+/// Algorithm step 7 requires exact mechanism, falsifier, matched control or
+/// evaluator evidence, and rival or confounder status for a **causal** claim.
+/// A claim declaring [`CausalClaimState::CausalHypothesis`] or
+/// [`CausalClaimState::Intervention`] is reduced to [`CausalClaimState::Unknown`]
+/// unless all four are supplied. The four evidence fields may be left empty —
+/// that absence is what makes the reduction fire, so it is admitted here and
+/// bounded rather than rejected as a malformed shape. A `Prediction` is not a
+/// causal claim and is carried at its declared state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppliedCausalClaim {
     /// Source handle holding the claim.
@@ -1015,6 +1030,30 @@ fn check_bounded_text(value: &str, field: &str, max: usize) -> Result<(), Confli
     Ok(())
 }
 
+/// Checks one optional evidence field for control characters and byte ceiling,
+/// permitting an empty value.
+///
+/// An absent piece of evidence is a legitimate thing for a caller to declare:
+/// it is exactly what makes a causal claim unsupported, and the algorithm step 7
+/// reduction turns it into an inert `Unknown` state. Rejecting it as a malformed
+/// shape here would make that reduction unreachable and turn a semantic shortfall
+/// into a request error, which is the opposite of this cell's design.
+fn check_optional_text(value: &str, field: &str, max: usize) -> Result<(), ConflictAnalysisError> {
+    if has_control(value) {
+        return Err(ConflictAnalysisError::Shape {
+            field: field.to_owned(),
+            detail: "control characters are not admitted".to_owned(),
+        });
+    }
+    if value.len() > max {
+        return Err(ConflictAnalysisError::Shape {
+            field: field.to_owned(),
+            detail: "text exceeds its byte bound".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Checks one handle field for blank, control, and byte ceiling.
 fn check_handle(value: &str, field: &str) -> Result<(), ConflictAnalysisError> {
     if value.is_empty() || value.len() > MAX_HANDLE_BYTES {
@@ -1337,6 +1376,23 @@ fn position_source_handles(conflict_set: &ConflictSet) -> Vec<String> {
     handles
 }
 
+/// Returns the order-independent identity of one position pair.
+///
+/// Each element is length-prefixed, so no source handle can forge another pair's
+/// key by containing the separator: the pairs `("a->b", "c")` and `("a", "b->c")`
+/// are distinct, and a list may legitimately carry both.
+fn comparison_pair_key(left: &str, right: &str) -> String {
+    let mut pair = [left, right];
+    pair.sort_unstable();
+    format!(
+        "{}:{}|{}:{}",
+        pair[0].len(),
+        pair[0],
+        pair[1].len(),
+        pair[1]
+    )
+}
+
 /// Validates supplied canonical comparisons before any interpretation.
 ///
 /// Every comparison must name two distinct positions that exist in the set and
@@ -1394,18 +1450,21 @@ fn validate_comparisons(
                 DimensionOutcome::Differing { left, right } => {
                     check_bounded_text(left, "comparison.left_value", MAX_TEXT_BYTES)?;
                     check_bounded_text(right, "comparison.right_value", MAX_TEXT_BYTES)?;
+                    if left == right {
+                        return Err(ConflictAnalysisError::Denominator {
+                            detail: format!(
+                                "a differing dimension must state two distinct values, not {} twice",
+                                entry.dimension.as_str()
+                            ),
+                        });
+                    }
                 }
                 DimensionOutcome::Unnormalizable { reason } => {
                     check_bounded_text(reason, "comparison.unnormalizable", MAX_NOTE_BYTES)?;
                 }
             }
         }
-        let mut pair = [
-            comparison.left_source.clone(),
-            comparison.right_source.clone(),
-        ];
-        pair.sort();
-        let key = pair.join("->");
+        let key = comparison_pair_key(&comparison.left_source, &comparison.right_source);
         if seen_pairs.contains(&key) {
             return Err(ConflictAnalysisError::Denominator {
                 detail: "duplicate comparison pair".to_owned(),
@@ -1434,10 +1493,10 @@ fn validate_causal_claims(
                 ),
             });
         }
-        check_bounded_text(&claim.mechanism, "causal.mechanism", MAX_NOTE_BYTES)?;
-        check_bounded_text(&claim.falsifier, "causal.falsifier", MAX_NOTE_BYTES)?;
-        check_bounded_text(&claim.control_evaluator, "causal.control", MAX_NOTE_BYTES)?;
-        check_bounded_text(
+        check_optional_text(&claim.mechanism, "causal.mechanism", MAX_NOTE_BYTES)?;
+        check_optional_text(&claim.falsifier, "causal.falsifier", MAX_NOTE_BYTES)?;
+        check_optional_text(&claim.control_evaluator, "causal.control", MAX_NOTE_BYTES)?;
+        check_optional_text(
             &claim.rivals_or_confounders,
             "causal.rivals",
             MAX_NOTE_BYTES,
@@ -1863,11 +1922,29 @@ fn spell_dimensions(dimensions: &[ComparisonDimension]) -> String {
 }
 
 /// Returns a deterministic spelling of one dimension outcome for the digest.
+///
+/// The two values of a `Differing` are spelled in sorted order because the
+/// analysis never reads them in an orientation-dependent way: without this the
+/// digest would be strictly more sensitive than the analysis it hashes, and the
+/// same comparison supplied from either side would produce two digests for one
+/// result.
 fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
     match outcome {
-        DimensionOutcome::Equal { value } => format!("equal:{value}"),
-        DimensionOutcome::Differing { left, right } => format!("differing:{left}|{right}"),
-        DimensionOutcome::Unnormalizable { reason } => format!("unnormalizable:{reason}"),
+        DimensionOutcome::Equal { value } => format!("equal:{}:{}", value.len(), value),
+        DimensionOutcome::Differing { left, right } => {
+            let mut values = [left.as_str(), right.as_str()];
+            values.sort_unstable();
+            format!(
+                "differing:{}:{}{}:{}",
+                values[0].len(),
+                values[0],
+                values[1].len(),
+                values[1]
+            )
+        }
+        DimensionOutcome::Unnormalizable { reason } => {
+            format!("unnormalizable:{}:{}", reason.len(), reason)
+        }
     }
 }
 
@@ -1893,14 +1970,32 @@ fn build_compatibility(
         let Some(other) = other else {
             continue;
         };
+        // Canonical order comes from the dimension table, not from the order the
+        // caller happened to supply the entries in. Sorting here as well as in
+        // the digest is what keeps the two in step: otherwise two supplements
+        // differing only in entry order would share a digest while emitting
+        // byte-different analyses.
+        let mut outcomes: Vec<DimensionComparison> =
+            Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
         let mut differing: Vec<ComparisonDimension> = Vec::new();
         let mut unnormalizable: Vec<ComparisonDimension> = Vec::new();
-        for entry in &comparison.dimensions {
+        for dimension in COMPARISON_DIMENSIONS {
+            let Some(entry) = comparison
+                .dimensions
+                .iter()
+                .find(|entry| entry.dimension == dimension)
+            else {
+                continue;
+            };
             match &entry.outcome {
-                DimensionOutcome::Differing { .. } => differing.push(entry.dimension),
-                DimensionOutcome::Unnormalizable { .. } => unnormalizable.push(entry.dimension),
+                DimensionOutcome::Differing { .. } => differing.push(dimension),
+                DimensionOutcome::Unnormalizable { .. } => unnormalizable.push(dimension),
                 DimensionOutcome::Equal { .. } => {}
             }
+            outcomes.push(DimensionComparison {
+                dimension,
+                outcome: entry.outcome.clone(),
+            });
         }
         let relation = if unnormalizable.is_empty() {
             if differing.is_empty() {
@@ -1914,16 +2009,21 @@ fn build_compatibility(
         out.push(PositionCompatibility {
             other_source: other.to_owned(),
             relation,
+            outcomes,
             differing_dimensions: differing,
             unnormalizable_dimensions: unnormalizable,
         });
     }
     out.sort_by(|left, right| left.other_source.cmp(&right.other_source));
-    out.dedup_by(|left, right| left.other_source == right.other_source);
     out
 }
 
-/// Renders the typed dimension mapping as a bounded, deterministic note clause.
+/// Renders the typed dimension mapping as a deterministic note clause.
+///
+/// The subject is the position that owns the note, so the clause names only the
+/// other position; printing both would read as a source being in equal
+/// conditions with itself. Growth is bounded by the input ceilings rather than
+/// by a separate output ceiling.
 fn compatibility_clause(mapping: &[PositionCompatibility]) -> String {
     let mut clauses: Vec<String> = Vec::with_capacity(mapping.len());
     for entry in mapping {
@@ -1944,10 +2044,9 @@ fn compatibility_clause(mapping: &[PositionCompatibility]) -> String {
             )
         };
         clauses.push(format!(
-            "{} is {} against {}{}{}",
+            "against {}: {}{}{}",
             entry.other_source,
             entry.relation.as_str(),
-            entry.other_source,
             differing,
             unnormalizable
         ));
@@ -2490,11 +2589,6 @@ fn check_preservation(
 fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for comparison in &supplements.comparisons {
-        let mut pair = [
-            comparison.left_source.clone(),
-            comparison.right_source.clone(),
-        ];
-        pair.sort();
         let mut dimensions: Vec<String> = comparison
             .dimensions
             .iter()
@@ -2509,7 +2603,7 @@ fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<
         dimensions.sort();
         parts.push(format!(
             "comparison:{}:{}",
-            pair.join("->"),
+            comparison_pair_key(&comparison.left_source, &comparison.right_source),
             dimensions.join(",")
         ));
     }
