@@ -189,7 +189,7 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// 3. Call exactly once per changed supplier bundle and bind the returned
 ///    pair verbatim: the result and selection digests, the decision
 ///    anchor, and every trace handle with its staleness obligation.
-/// 4. Map `Err(`[`ContextError::InvalidFence`])` to the packet-refresh arm
+/// 4. Map an [`ContextError::InvalidFence`] return to the packet-refresh arm
 ///    ([`RetrievalStaleness::PacketRefreshRequired`]); it names a closure
 ///    compiled under another fence and can never admit. Every other
 ///    boundary refusal is named by its refusing stage, never coerced into
@@ -213,13 +213,36 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// trichotomy gate in [`check_retrieval_freshness`], the plan revision
 /// comparison in [`check_plan_revisions`], the total classifier in
 /// [`classify_admission`], and the trace joins in [`trace_material`] and
-/// [`trace_material_with_warnings`]. No daemon retrieval drive exists in
-/// this candidate. Consumption (`bins/eliotd` drive, tick, supplier
-/// injection) is M2/O1-owned through root; the O1 caller record is
-/// `532a2b4e` (`bins/eliotd/src/attempt_execution_chain.rs` poll docs).
+/// [`trace_material_with_warnings`].
 /// Decided contract: unresolved revision compares reject
 /// (`StaleProjection` floor, `ProbeRequired` optional) with fence-mismatch
-/// priority to the refresh arm; the runtime consumer is pending.
+/// priority to the refresh arm.
+///
+/// # Runtime consumer status (measured, not inherited)
+///
+/// Measured on `origin/main@0488753d` (2026-09-26) by walking every call
+/// site upward, because an earlier revision of this note asserted a consumer
+/// that does not exist. The state of this join is:
+///
+/// - The production call site of the traced join is
+///   `bins/eliotd/src/kernel_context_read_client.rs::admit_packet_candidates`,
+///   which joins [`admit_context`] with this join and hands the closed
+///   [`MaterialRankTraceDelivery`] to the packet composition.
+/// - That call site is not itself reachable from `fn main` yet:
+///   `KernelContextReadClient::compile_context_packet` has no call site in
+///   the tree, and the live `eliot.packet` daemon poller
+///   (`daemon_runtime::run_campaign_packet_poll` ->
+///   `campaign_packet::serve_campaign_packet_pair` ->
+///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`)
+///   compiles through the `#40`-frozen `eliot-context` facade, which does not
+///   depend on this crate at all.
+/// - `bins/eliot-wasm-host`'s `admit_governed_host` reaches
+///   `admit_context_with_learning` but has no call site either.
+///
+/// So the join is owned and reachable from a production composition that
+/// itself awaits its runtime edge; the missing link is the daemon packet edge
+/// above, not a supplier here. Read this as a measured absence, not as a
+/// scheduled M2/O1 tick.
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
@@ -243,6 +266,161 @@ pub fn admit_context_traced_with_warnings(
     let result = admit_context(input)?;
     let traces = trace_material_with_warnings(input, &result, warnings)?;
     Ok((result, traces))
+}
+
+/// The I12.26 rank-trace delivery record bound to one admission result.
+///
+/// I12.26 requires the recall result to report visible and suppressed counts
+/// and a full rank-trace handle beside the per-material traces. This closed
+/// record is exactly that summary, derived only from the admission owner's own
+/// per-material [`MaterialRankTrace`] set: it counts each evaluated material by
+/// the disposition the decision actually reached, requires every suppressed
+/// material of a complete decision to carry its owner-authored reason
+/// explicitly (suppression is never inferred from absence), and binds a
+/// content-addressed handle over the delivered per-material handles, so a
+/// swapped trace, count or decision anchor invalidates it exactly like a
+/// swapped per-material fact.
+///
+/// The handle is transitively content-addressed: each per-material
+/// `material-trace:<sha256>` already commits to the whole delivered record for
+/// that material, so the canonical digest over the ordered handle list commits
+/// to the delivered trace set. No provider reasoning is stored here or in the
+/// traces it carries: only the permitted selection evidence and reasons the
+/// admission owner already bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterialRankTraceDelivery {
+    /// Decision anchor every delivered trace is bound to.
+    pub decision_id: eliot_contracts::DecisionId,
+    /// One trace per evaluated material, ordered by material identity.
+    pub traces: Vec<MaterialRankTrace>,
+    /// Count of materials the decision delivered into the packet.
+    pub visible: usize,
+    /// Count of materials the decision withheld; each carries its explicit
+    /// owner-authored suppression reason in its own trace.
+    pub suppressed: usize,
+    /// Content-addressed handle (`rank-trace:<sha256>`) resolving to exactly
+    /// this delivered trace set.
+    pub rank_trace_handle: String,
+}
+
+impl MaterialRankTraceDelivery {
+    /// Derive the delivery record from one admission result and its traces.
+    ///
+    /// Counts each material by the disposition the decision reached, requires
+    /// every suppressed material of a complete decision to name its explicit
+    /// reason, and mints the full rank-trace handle over the ordered
+    /// per-material handles. The result must already be the one the traces were
+    /// joined against, so the pair cannot drift.
+    pub fn new(
+        result: &AdmissionResult,
+        traces: Vec<MaterialRankTrace>,
+    ) -> Result<Self, ContextError> {
+        let mut visible = 0_usize;
+        let mut suppressed = 0_usize;
+        for trace in &traces {
+            if matches!(
+                trace.disposition,
+                AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+            ) {
+                visible = visible.checked_add(1).ok_or(ContextError::Overflow)?;
+            } else {
+                suppressed = suppressed.checked_add(1).ok_or(ContextError::Overflow)?;
+            }
+        }
+        let handles: Vec<String> = traces
+            .iter()
+            .map(|trace| trace.trace_handle.clone())
+            .collect();
+        let delivery = Self {
+            decision_id: result.binding.decision_id.clone(),
+            traces,
+            visible,
+            suppressed,
+            rank_trace_handle: format!(
+                "rank-trace:{}",
+                eliot_context_contracts::canonical_digest(&handles)?
+            ),
+        };
+        delivery.validate(result)?;
+        Ok(delivery)
+    }
+
+    /// Conserve the evaluated materials and re-resolve every bound handle.
+    ///
+    /// Fails closed when the delivered set does not cover exactly the decided
+    /// materials, when a per-material trace handle no longer resolves, when the
+    /// reported counts do not add up, or when a suppressed material of a
+    /// complete decision carries no explicit reason.
+    pub fn validate(&self, result: &AdmissionResult) -> Result<(), ContextError> {
+        if self.decision_id != result.binding.decision_id {
+            return Err(ContextError::InvalidField(
+                "material_trace_delivery.decision_id",
+            ));
+        }
+        if self.traces.len() != result.evidence.decisions.len() {
+            return Err(ContextError::DenominatorMismatch);
+        }
+        let complete = matches!(result.outcome, ContextOutcome::Complete(_));
+        let mut visible = 0_usize;
+        let mut suppressed = 0_usize;
+        let mut seen = BTreeSet::new();
+        for trace in &self.traces {
+            trace.validate()?;
+            if trace.decision_id != self.decision_id {
+                return Err(ContextError::InvalidField(
+                    "material_trace_delivery.trace_decision_id",
+                ));
+            }
+            if !seen.insert(trace.atom_id.clone()) {
+                return Err(ContextError::Duplicate("material_trace_delivery.atom_id"));
+            }
+            if !result
+                .evidence
+                .decisions
+                .iter()
+                .any(|decision| decision.atom_id == trace.atom_id)
+            {
+                return Err(ContextError::DenominatorMismatch);
+            }
+            if matches!(
+                trace.disposition,
+                AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+            ) {
+                visible = visible.checked_add(1).ok_or(ContextError::Overflow)?;
+            } else {
+                suppressed = suppressed.checked_add(1).ok_or(ContextError::Overflow)?;
+                if complete
+                    && trace
+                        .suppression_reason
+                        .as_deref()
+                        .is_none_or(|reason| reason.trim().is_empty())
+                {
+                    return Err(ContextError::InvalidField(
+                        "material_trace_delivery.suppression_reason",
+                    ));
+                }
+            }
+        }
+        if self.visible != visible || self.suppressed != suppressed {
+            return Err(ContextError::DenominatorMismatch);
+        }
+        let handles: Vec<String> = self
+            .traces
+            .iter()
+            .map(|trace| trace.trace_handle.clone())
+            .collect();
+        if self.rank_trace_handle
+            != format!(
+                "rank-trace:{}",
+                eliot_context_contracts::canonical_digest(&handles)?
+            )
+        {
+            return Err(ContextError::InvalidField(
+                "material_trace_delivery.rank_trace_handle",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn build_omissions(
