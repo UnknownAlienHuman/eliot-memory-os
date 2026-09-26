@@ -3,7 +3,7 @@ use crate::{
     context::CompletionGate, guard_work_lease_for_files, work::WorkLeaseGuardError,
 };
 use eliot_instrument_api::InstrumentKind;
-use eliot_instrument_runner::profile::{InstrumentRegistry, ProfileCompiler};
+use eliot_instrument_runner::profile::{AdmittedProfile, InstrumentRegistry, ProfileCompiler};
 use eliot_store::BlobStore;
 use eliot_types::{
     ActionLease, ActionScope, CodeCortexReport, CommandContext, CompletionGateDecision,
@@ -22,6 +22,12 @@ use tokio::process::Command;
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 const MAX_OUTPUT_SUMMARY_BYTES: usize = 512;
+/// Visible quarantine attribution carried by every verifier run executed
+/// through the legacy command lane (issue #1813 W6): the run executed the
+/// quarantined private command map, so no governed profile revision, stage
+/// graph, or receipt may rest on it.
+const QUARANTINED_LEGACY_LANE: &str =
+    "[quarantined legacy verifier lane: no governed profile receipt; issue #1813 W6]";
 
 pub struct PatchRunner<'a> {
     repo_root: PathBuf,
@@ -430,10 +436,14 @@ impl<'a> VerifierHarness<'a> {
         agent_id: eliot_types::AgentId,
         plan: &VerifierPlan,
     ) -> Result<Vec<VerifierRun>, EngineError> {
-        // Route every requirement through the single profile compiler (#1813):
-        // a requirement that claims a governed instrument name must execute
-        // an invocation of an admitted class. Quarantined legacy names keep
-        // their current behavior with no governed claim.
+        // Route every requirement through the single profile compiler (#1813
+        // W6): a requirement that claims a governed instrument name must
+        // execute its admitted stage DAG, which this composition root cannot
+        // provision yet, so it fails closed with an explicit missing proof
+        // instead of executing the quarantined command map under a governed
+        // name. Quarantined legacy names keep their current behavior with no
+        // governed claim, and every such run is visibly attributed as
+        // quarantined in its summary.
         let instrument_registry =
             InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
                 EngineError::ServiceNotReady {
@@ -443,13 +453,13 @@ impl<'a> VerifierHarness<'a> {
             })?;
         let mut runs = Vec::new();
         for requirement in plan.required.iter().chain(plan.optional.iter()) {
-            gate_requirement_profile(
+            let gate = gate_requirement_profile(
                 &instrument_registry,
                 &requirement.name,
                 requirement.command_kind,
             )?;
             runs.push(
-                self.run_requirement(project_id, task_id, agent_id, requirement)
+                self.run_requirement(project_id, task_id, agent_id, requirement, gate)
                     .await?,
             );
         }
@@ -462,8 +472,34 @@ impl<'a> VerifierHarness<'a> {
         task_id: eliot_types::TaskId,
         agent_id: eliot_types::AgentId,
         requirement: &VerifierRequirement,
+        gate: Option<AdmittedProfile>,
     ) -> Result<VerifierRun, EngineError> {
         let started_at = OffsetDateTime::now_utc();
+        if let Some(admitted) = gate {
+            // A governed name is never executed through the quarantined
+            // command map: that would forge a governed claim over legacy
+            // execution. Stage-DAG execution awaits the W4 execution lane,
+            // so the failure localizes here with an explicit missing proof
+            // (I10.8.11) and can never become a pass.
+            return Ok(verifier_run(
+                project_id,
+                task_id,
+                agent_id,
+                requirement,
+                VerifierStatus::Failed,
+                None,
+                0,
+                None,
+                None,
+                format!(
+                    "governed profile '{}' revision {} requires stage-DAG execution; \
+                     this composition root has no stage execution provisions \
+                     (issue #1813 W4), so the requirement fails closed",
+                    admitted.name, admitted.revision,
+                ),
+                started_at,
+            ));
+        }
         let Some(command) = fixed_verifier_command(requirement.command_kind) else {
             return Ok(verifier_run(
                 project_id,
@@ -494,7 +530,7 @@ impl<'a> VerifierHarness<'a> {
         } else {
             VerifierStatus::Failed
         };
-        let summary = command_summary(&output);
+        let summary = format!("{QUARANTINED_LEGACY_LANE} {}", command_summary(&output));
         Ok(verifier_run(
             project_id,
             task_id,
@@ -695,18 +731,20 @@ fn instrument_kind_for_command(kind: VerifierCommandKind) -> Option<InstrumentKi
 
 /// Gates one claimed profile name through the single profile compiler.
 ///
-/// Quarantined legacy names pass through with no governed claim. Governed
-/// names require a mappable command class admitted by the profile; anything
-/// else fails closed so a forged governed claim can never execute or satisfy
-/// a finish gate.
+/// Quarantined legacy names pass through with no governed claim (`None`).
+/// Governed names require a mappable command class admitted by the profile
+/// and return the admission (`Some`), so the caller executes the admitted
+/// stage DAG instead of the quarantined command map; anything else fails
+/// closed so a forged governed claim can never execute or satisfy a finish
+/// gate.
 fn gate_requirement_profile(
     registry: &InstrumentRegistry,
     name: &str,
     command_kind: VerifierCommandKind,
-) -> Result<(), EngineError> {
+) -> Result<Option<AdmittedProfile>, EngineError> {
     let compiled = ProfileCompiler::new(registry).compile(name);
     if !compiled.is_governed() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(kind) = instrument_kind_for_command(command_kind) else {
         return Err(EngineError::ServiceNotReady {
@@ -716,13 +754,13 @@ fn gate_requirement_profile(
             ),
         });
     };
-    let _admitted = compiled
+    let admitted = compiled
         .require_kind(kind)
         .map_err(|error| EngineError::ServiceNotReady {
             service: "instrument-profile".to_owned(),
             reason: format!("profile compiler rejected the verifier claim: {error}"),
         })?;
-    Ok(())
+    Ok(admitted.cloned())
 }
 
 fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {

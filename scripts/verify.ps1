@@ -343,7 +343,8 @@ $summaryLines = @(
     "VERIFY_POLICY_RECEIPT_CLEANUP: $receiptCleanupState",
     'VERIFY_CACHE: workflow-owned only; this script implements no gate cache, so a cache hit cannot skip a gate or supply a pass receipt',
     "VERIFY_PROOF_CEILING: $proofCeiling",
-    'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them'
+    'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them',
+    'VERIFY_QUARANTINE: cargo gates (cargo-fmt/cargo-check-workspace/cargo-clippy-workspace/cargo-test-workspace) execute the quarantined legacy lane with no governed profile receipt (issue #1813 W6); thin-invoker migration awaits W4 stage-execution provisions'
 )
 if ($harnessState -ne 'pass') {
     $summaryLines += "VERIFY_HARNESS: $harnessState $harnessError"

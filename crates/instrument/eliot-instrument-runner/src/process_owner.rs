@@ -115,6 +115,32 @@ pub trait KernelInstrumentAdmission: Send + Sync {
     ) -> Result<KernelAdmittedProcess, KernelAdmissionError>;
 }
 
+/// Fail-closed [`KernelInstrumentAdmission`] for composition roots that bind
+/// no live process-authority provider (issue #1813 W4).
+///
+/// This is the production default where no Kernel/testd admission owner is
+/// reachable: every invocation is refused with a typed
+/// [`KernelAdmissionError::Rejected`] naming the missing provider, so a stage
+/// can never launch on invented authority.  Composition roots that own a real
+/// provider (the Kernel dispatch authority, the testd dispatch authority)
+/// must implement [`KernelInstrumentAdmission`] over that same authority
+/// instead of using this refusal; test-only fixtures belong behind
+/// `#[cfg(test)]`, never here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UnprovisionedKernelAdmission;
+
+impl KernelInstrumentAdmission for UnprovisionedKernelAdmission {
+    fn admit(
+        &self,
+        _invocation: &InstrumentInvocation,
+    ) -> Result<KernelAdmittedProcess, KernelAdmissionError> {
+        Err(KernelAdmissionError::Rejected(
+            "no Kernel/testd process-admission provider is bound in this composition root; stage execution awaits the admitted provider (issue #1813 W4)"
+                .to_owned(),
+        ))
+    }
+}
+
 /// Concrete `InstrumentRequestPort` backed by the Kernel admission hook.
 ///
 /// This is the production bridge used by an application caller.  It does not

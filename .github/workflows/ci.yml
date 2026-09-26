@@ -53,6 +53,9 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-profile-review-${{ hashFiles('Cargo.lock') }}
 
+      # Quarantined legacy lane (issue #1813 W6): the Review gates execute cargo
+      # directly with no governed profile receipt. Thin-invoker migration awaits W4
+      # stage-execution provisions.
       - name: Run current bounded repository verification
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
@@ -84,6 +87,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: documentation-shards-self-test, documentation-shards, documentation-routes-self-test, documentation-routes, documentation-read-self-test, documentation-code-conformance-self-test, documentation-code-conformance, code-navigation-self-test, code-navigation, documentation-closure-audit, standalone-crates, core-daemon-inventory-self-test, core-daemon-inventory, normative-pair, dependency-policy-self-test, dependency-policy-offline, architecture-boundaries-self-test, architecture-boundaries, agent-guardrails-self-test, agent-guardrails, agent-route-bundles-self-test, agent-route-bundles, runtime-source-hygiene-self-test, runtime-source-hygiene, agent-bridge-protocol-self-test, agent-bridge-protocol, cargo-metadata, cargo-fmt, cargo-check-workspace, cargo-clippy-workspace, cargo-test-workspace, cargo-deny"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Proof ceiling: REVIEW_SOURCE_ONLY (not release/source-candidate, not installed-runtime/store/Product-Pulse proof)"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- D-INT ceiling: ignored/stateful/live-provider tests are outside normal Review"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Quarantine: cargo gates execute the quarantined legacy lane with no governed profile receipt (issue #1813 W6)"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cache: key binds OS+lockfile+profile; hit/miss run the same gates; no pass receipt from cache"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "PR_INTEGRATION_SOURCE_CHECK_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
