@@ -30,8 +30,8 @@ use eliot_kernel_service::{
     advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_process::{
-    OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
-    ProcessExecutionView, ProcessLifecycle,
+    OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
@@ -4873,17 +4873,58 @@ impl KernelComposition {
         let grant = gateway
             .decide_origin_control(&presentation)
             .map_err(|_| TransportError::SessionFenced)?;
+        // Graceful WASM half (`#2896`): when the decided operation is a
+        // supervised WASM-host parent, the owner first offers a versioned
+        // Shutdown delivery through its replayable control spool, so the
+        // host loop can close admission before the gateway kill lands. A
+        // foreign image skips this half with the response unchanged; a
+        // proven WASM operation that cannot stage or retain its control
+        // fails closed before the kill.
+        let wasm_control = Self::publish_wasm_host_control(
+            session,
+            &owner,
+            &operation.operation_id,
+            presentation.request(),
+            &grant,
+            eliot_kernel_service::WasmControlKind::Shutdown,
+        )?;
         let cancelled = gateway
             .cancel_with_origin_grant(&owner, operation.operation_id, &grant)
             .await
             .map_err(|_| TransportError::SessionFenced)?;
+        let mut value = serde_json::json!({
+            "kind": "origin_control_kill",
+            "grant": grant,
+            "cancelled": cancelled,
+        });
+        // Post-kill control projection is honest-degraded, never fatal:
+        // the kill receipt is authoritative, so a spool fault here marks
+        // the control unrecorded instead of losing the receipt.
+        match wasm_control {
+            WasmHostControlOutcome::Foreign => {}
+            WasmHostControlOutcome::NotStaged { reason } => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "control".to_owned(),
+                        serde_json::json!({"staged": false, "reason": reason}),
+                    );
+                }
+            }
+            WasmHostControlOutcome::Published {
+                receipt,
+                install_dir,
+            } => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "control".to_owned(),
+                        wasm_host_control_projection(&install_dir, &receipt),
+                    );
+                }
+            }
+        }
         Ok(serde_json::json!({
             "status": "known",
-            "value": {
-                "kind": "origin_control_kill",
-                "grant": grant,
-                "cancelled": cancelled,
-            },
+            "value": value,
             "recovery": null,
         }))
     }
@@ -6427,6 +6468,128 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
+    /// Publishes one graceful owner control for a decided WASM-host
+    /// operation (`#2896`): the production Kernel call behind external
+    /// Cancel/Reconcile/Shutdown delivery, reached from
+    /// [`Self::origin_control_decide_operation`] after the origin grant
+    /// issues and before the gateway kill lands.
+    ///
+    /// The publisher authenticates through the existing process/control
+    /// owner contract, never through path correlation alone: the image
+    /// path is the executor-observed physical binding already matched
+    /// against the inspected running process, the install directory is
+    /// that path's parent, and every delivery identity re-binds the
+    /// staged dispatch material this daemon published (claim, operation,
+    /// generation, grant, work scope), the live session (epoch, fence,
+    /// principal, connection), and the origin grant funding the decision
+    /// (challenge, operation class, decision time). The running image
+    /// bytes re-hash to the staged grant digest — the same fail-closed
+    /// contour as launch — and the child-sealed request digest is never
+    /// minted here; the child cross-checks the operation/invocation/grant
+    /// triple against its own sealed binding.
+    ///
+    /// A foreign image answers `Foreign` with the decide response
+    /// unchanged. A WASM-host image whose delivery set is absent,
+    /// oversize, malformed, or disagreeing answers `NotStaged` with an
+    /// honest reason while the kill proceeds. A bound operation stages
+    /// through [`eliot_kernel_service::publish_wasm_control_delivery`]:
+    /// same-kind retries re-offer the retained identity, and any staging
+    /// or retention fault fails the decision closed before the kill.
+    fn publish_wasm_host_control(
+        session: &Session,
+        owner: &ProcessOwnerBinding,
+        operation_id: &OperationId,
+        request: &OriginChallengeRequest,
+        grant: &OriginControlGrant,
+        control_kind: eliot_kernel_service::WasmControlKind,
+    ) -> Result<WasmHostControlOutcome, TransportError> {
+        let image_path = std::path::Path::new(request.physical().image_path());
+        if !image_path.is_absolute()
+            || image_path.file_name().and_then(|name| name.to_str())
+                != Some(WASM_HOST_IMAGE_FILE_NAME)
+        {
+            return Ok(WasmHostControlOutcome::Foreign);
+        }
+        let install_dir = image_path.parent().ok_or(TransportError::SessionFenced)?;
+        // Owner readback of the staged dispatch material: the delivery
+        // set is consumed only at loop end, so a running operation still
+        // stages it. Anything else marks not-staged honestly; no binding
+        // is ever inferred from the image path alone.
+        let material_path = install_dir.join(eliot_kernel_service::WASM_HOST_MATERIAL_FILE_NAME);
+        let Ok(material_bytes) = std::fs::read(&material_path) else {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "delivery-set-absent",
+            });
+        };
+        if material_bytes.len() > eliot_protocol::MAX_FRAME_BYTES {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "delivery-set-oversize",
+            });
+        }
+        let material: eliot_kernel_service::WasmDispatchMaterial =
+            match serde_json::from_slice(&material_bytes) {
+                Ok(material) => material,
+                Err(_) => {
+                    return Ok(WasmHostControlOutcome::NotStaged {
+                        reason: "delivery-set-malformed",
+                    });
+                }
+            };
+        if material.operation_id != operation_id.as_str() {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "operation-mismatch",
+            });
+        }
+        if material.generation != request.generation().get() {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "generation-mismatch",
+            });
+        }
+        if !material
+            .authority_epoch
+            .is_same_authority(&session.authority_epoch)
+        {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "epoch-mismatch",
+            });
+        }
+        let Ok(observed_image) = std::fs::read(image_path) else {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "image-unreadable",
+            });
+        };
+        if sha256_hex(&observed_image) != material.grant.host_artifact_digest {
+            return Ok(WasmHostControlOutcome::NotStaged {
+                reason: "image-diverged",
+            });
+        }
+        let inputs = eliot_kernel_service::WasmControlPublishInputs {
+            install_dir: install_dir.to_path_buf(),
+            operation_id: operation_id.as_str().to_owned(),
+            claim_id: material.claim_id.clone(),
+            generation: material.generation,
+            control_kind,
+            authority_epoch: session.authority_epoch.clone(),
+            state_fence: session.module_generation.state_fence.clone(),
+            work_scope: material.work.work_scope.clone(),
+            principal_digest: owner.principal_digest().to_owned(),
+            session_connection: session.connection_id.clone(),
+            session_epoch: session.session_epoch,
+            dispatch_grant_digest: material.grant.grant_digest.clone(),
+            publisher_challenge_id: grant.challenge_id().to_owned(),
+            publisher_operation: grant.operation().operation_label().to_owned(),
+            publisher_grant_digest: grant.grant_digest().to_owned(),
+            decided_at_unix_ms: grant.decided_at_unix_ms(),
+            now_unix_ms: unix_ms(),
+        };
+        let receipt = eliot_kernel_service::publish_wasm_control_delivery(&inputs)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(WasmHostControlOutcome::Published {
+            receipt,
+            install_dir: install_dir.to_path_buf(),
+        })
+    }
+
     /// Binds one normal Notify launch grant on the admitted path (`#1780`
     /// D4b): the production caller of
     /// `eliot_kernel_service::bind_notify_launch_grant`, the
@@ -6701,6 +6864,84 @@ impl KernelComposition {
             "recovery": null,
         })
     }
+}
+
+/// Closed outcome of the graceful WASM control half of one
+/// origin-control decision (`#2896`).
+enum WasmHostControlOutcome {
+    /// The decided image is not a WASM host: plain gateway kill with
+    /// the decide response unchanged.
+    Foreign,
+    /// A WASM-host image whose delivery set cannot bind a control.
+    /// The kill proceeds; the response carries the honest marker.
+    NotStaged {
+        /// Stable reason code (never a path or digest).
+        reason: &'static str,
+    },
+    /// A versioned control was offered through the owner spool.
+    Published {
+        /// Staged delivery receipt.
+        receipt: eliot_kernel_service::WasmControlPublishReceipt,
+        /// Spool root the delivery staged into.
+        install_dir: std::path::PathBuf,
+    },
+}
+
+/// Projects the post-kill control status for one published WASM
+/// control (`#2896` item 12): the supervised-termination note lands
+/// first (a decisive ack still wins over `Unknown`), then a fresh
+/// spool reconcile reports every retained delivery and its
+/// terminal-or-open disposition.
+///
+/// Never fails the decide response: the kill receipt is authoritative,
+/// so a spool fault degrades to an honest `unrecorded` marker instead
+/// of losing the receipt.
+fn wasm_host_control_projection(
+    install_dir: &std::path::Path,
+    receipt: &eliot_kernel_service::WasmControlPublishReceipt,
+) -> serde_json::Value {
+    let now = unix_ms();
+    let noted = eliot_kernel_service::note_wasm_control_supervised_end(
+        install_dir,
+        receipt.operation_id.as_str(),
+        receipt.generation,
+        receipt.owner_sequence,
+        "origin-kill-acknowledged",
+        now,
+    )
+    .is_ok();
+    let spool = eliot_kernel_service::reconcile_wasm_control_spool(
+        install_dir,
+        receipt.operation_id.as_str(),
+        receipt.generation,
+        now,
+    );
+    let (spool_value, spool_ok) = match spool {
+        Ok(status) => (
+            serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+            true,
+        ),
+        Err(_) => (serde_json::Value::Null, false),
+    };
+    let mut control = serde_json::json!({
+        "staged": true,
+        "publish": receipt,
+        "spool": spool_value,
+    });
+    if (!noted || !spool_ok)
+        && let Some(object) = control.as_object_mut()
+    {
+        if !noted {
+            object.insert(
+                "termination_note".to_owned(),
+                serde_json::json!("unrecorded"),
+            );
+        }
+        if !spool_ok {
+            object.insert("spool_note".to_owned(), serde_json::json!("unrecorded"));
+        }
+    }
+    control
 }
 
 #[cfg(windows)]
