@@ -170,7 +170,11 @@ impl std::fmt::Display for PortfolioError {
 
 impl std::error::Error for PortfolioError {}
 
-fn text(value: &str, field: &'static str) -> Result<(), PortfolioError> {
+/// Bounded-text validator shared by the acquisition-side discipline in this
+/// crate. The R6 inquiry-governance domain in [`crate::inquiry_governance`]
+/// reuses it rather than declaring a second field-validator recipe, so a
+/// "blank or control-bearing" definition exists once per crate.
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), PortfolioError> {
     if value.trim().is_empty() {
         return Err(PortfolioError::Blank { field });
     }
@@ -180,7 +184,9 @@ fn text(value: &str, field: &'static str) -> Result<(), PortfolioError> {
     Ok(())
 }
 
-fn digest(value: &str, field: &'static str) -> Result<(), PortfolioError> {
+/// Lowercase SHA-256 validator shared inside this crate; see [`text`] for the
+/// single-owner rationale.
+pub(crate) fn digest(value: &str, field: &'static str) -> Result<(), PortfolioError> {
     if value.len() != 64
         || value
             .bytes()
@@ -203,14 +209,19 @@ const VAGUE_SCOPE_TEXTS: [&str; 7] = [
     "unknown",
 ];
 
-fn reject_vague(value: &str, field: &'static str) -> Result<(), PortfolioError> {
+/// Rejects scope/denominator spellings that claim coverage without declaring
+/// it. Shared inside this crate; see [`text`].
+pub(crate) fn reject_vague(value: &str, field: &'static str) -> Result<(), PortfolioError> {
     if VAGUE_SCOPE_TEXTS.contains(&value.trim().to_lowercase().as_str()) {
         return Err(PortfolioError::VagueScope { field });
     }
     Ok(())
 }
 
-fn push_field(preimage: &mut String, tag: &str, value: &str) {
+/// Appends one length-prefixed field to a canonical preimage. Shared inside
+/// this crate so every digest recipe is length-delimited identically; see
+/// [`text`].
+pub(crate) fn push_field(preimage: &mut String, tag: &str, value: &str) {
     preimage.push_str(tag);
     preimage.push('=');
     preimage.push_str(&value.len().to_string());
@@ -219,12 +230,16 @@ fn push_field(preimage: &mut String, tag: &str, value: &str) {
     preimage.push(';');
 }
 
-fn push_count(preimage: &mut String, tag: &str, count: usize) {
+/// Appends one element count to a canonical preimage. Shared inside this
+/// crate; see [`text`].
+pub(crate) fn push_count(preimage: &mut String, tag: &str, count: usize) {
     use std::fmt::Write as _;
     let _ = write!(preimage, "{tag}={count};");
 }
 
-fn freeze(preimage: &str) -> String {
+/// Freezes a canonical preimage into its lowercase SHA-256 digest. Shared
+/// inside this crate; see [`text`].
+pub(crate) fn freeze(preimage: &str) -> String {
     sha256_hex(preimage.as_bytes())
 }
 
@@ -1351,6 +1366,30 @@ impl CoverageAccount {
             }
         }
         lineage.independent_support(&handles)
+    }
+
+    /// Number of expected denominator members.
+    #[must_use]
+    pub fn denominator_size(&self) -> usize {
+        self.expected.len()
+    }
+
+    /// Expected members that carry neither a recorded disposition nor an
+    /// explicit exclusion, in canonical order.
+    ///
+    /// An open member is not an accounted one: the exact accounting is what
+    /// keeps "no result" from decoding as completeness, so callers that need
+    /// the unclosed remainder (the R6 inquiry boundary) read it here instead
+    /// of inferring it.
+    #[must_use]
+    pub fn open_members(&self) -> Vec<String> {
+        self.expected
+            .iter()
+            .filter(|member| {
+                !self.outcomes.contains_key(*member) && !self.exclusions.contains_key(*member)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Whether every accounted member closed intact. Complete accounting with
