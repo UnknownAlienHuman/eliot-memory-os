@@ -27,11 +27,14 @@ pub use effects::{
     ProposedEffect,
 };
 pub use grants::{
-    AuthoritySet, CapabilityGrant, CapabilityIntroduction, EffectiveCapabilityPath,
-    EffectiveCapabilitySnapshot, GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION,
-    GrantClosureDelegation, GrantClosureMemberRef, GrantGraph, GrantGraphRecoverySnapshot, GrantId,
-    GrantRecoveryRecord, GrantStatus, IntroductionId, IntroductionStatus, LogicalTime,
-    PrincipalRef, ReceiptObligation, SnapshotId,
+    AuthoritySet, AuthorizedCrossRootMember, CapabilityGrant, CapabilityIntroduction,
+    CrossRootRelationDisposition, EffectiveCapabilityPath, EffectiveCapabilitySnapshot,
+    GRANT_GRAPH_RECOVERY_SCHEMA, GRANT_GRAPH_RECOVERY_VERSION, GrantClosureDelegation,
+    GrantClosureMemberRef, GrantGraph, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord,
+    GrantStatus, IntroductionId, IntroductionStatus, LogicalTime, PrincipalRef,
+    QuarantinedCrossRootRecord, QuarantinedCrossRootRelation, QuarantinedFrontierMember,
+    ReceiptObligation, RevocationClosureState, RevocationClosureVerdict, RootTransitionReceipt,
+    SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
 pub use revocation_history::{

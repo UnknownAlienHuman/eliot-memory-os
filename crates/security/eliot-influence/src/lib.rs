@@ -442,6 +442,27 @@ pub struct QualifiedInfluenceEdge {
     pub disposition: InfluenceEdgeDisposition,
 }
 
+impl QualifiedInfluenceEdge {
+    /// Dedicated cross-scope influence relation (#2875 item 11).
+    ///
+    /// The only supported way to exercise `OmissionCause::CrossScope`:
+    /// an explicitly declared cross-scope edge between two influence
+    /// identities, with no grant lineage involved. The pure evaluator
+    /// records the omission and never traverses the edge; reconciling
+    /// the omission (binding a separate-quarantine receipt or reporting
+    /// partial/unknown) belongs to the authority caller, never here.
+    /// This constructor keeps the evaluator pure: reaching the typed
+    /// cross-scope cause must not require admitting malformed or
+    /// unauthorized capability lineage.
+    pub fn cross_scope(source_ref: String, dependent_ref: String) -> Self {
+        Self {
+            source_ref,
+            dependent_ref,
+            disposition: InfluenceEdgeDisposition::CrossScope,
+        }
+    }
+}
+
 /// Independent traversal limits for [`revoke_bounded`].
 ///
 /// Each bound gates a distinct resource, and no two of them are compared
@@ -566,11 +587,15 @@ impl BoundedRevocationPageLimits {
 /// evaluator itself observes or derives: `Quarantined`, `NonPropagating`,
 /// `Stale` and `Invalidated` from an edge the caller declared with that
 /// disposition, `BoundsExhausted` from a bound this engine enforced, and
-/// `CrossScope` from an edge whose dependent is outside the revoked origin's
-/// authority root. `GrantGraph::transitive_revocation_closure` in
-/// `eliot-authority` derives that cross-scope disposition from the live grant
-/// graph and is reached by authority recovery, so a cross-root dependent is
-/// quarantined and reported rather than dropped.
+/// `CrossScope` from an edge the caller declared with the dedicated
+/// cross-scope influence relation
+/// ([`QualifiedInfluenceEdge::cross_scope`]). The evaluator never derives
+/// a cross-scope cause from grant lineage itself: authority callers
+/// declare that relation for refused crossings (for example the
+/// authority layer's declaration of a typed quarantined cross-root
+/// lineage record), so a cross-root dependent is reported with its exact
+/// edge position rather than dropped, and no omission cause requires
+/// admitting malformed or unauthorized capability lineage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OmissionCause {
@@ -734,6 +759,12 @@ impl BoundedRevocationContinuationToken {
 ///
 /// `affected_refs` always contains the root. `complete` is false whenever any
 /// bound was exhausted; non-bound omissions never clear completeness.
+/// `complete` therefore means only that the traversal finished within
+/// bounds: a non-bound omission is recorded evidence the authority caller
+/// must reconcile — by binding owner evidence that the omitted dependent
+/// is separately quarantined or fenced, or by reporting a partial/unknown
+/// state with the exact frontier and omission — and never a success the
+/// caller may present as a clear closure on its own (#2875 item 6).
 /// `frontier` is the current unresolved source-bound frontier (empty after a
 /// complete resume), and `omissions` records every cumulative omitted edge.
 /// `work_spent` accumulates edge
