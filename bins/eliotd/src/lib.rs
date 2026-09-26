@@ -872,6 +872,17 @@ impl DaemonComposition {
         // another task, `WorkScope`, or a moved fence with
         // `TASK_SCOPE_INCOMPATIBLE`. Neither rejection changes a task or
         // reaches the store, and no task is ever silently selected.
+        //
+        // This method has zero production call sites, so the typed evidence
+        // leg is not yet on a live path: the daemon runtime driver never calls
+        // it. The blocking symbol is the compiled receipt — the repository's
+        // only production constructor of it,
+        // `eliot_workscope::ColdStartController::compile`, is reached only
+        // through `eliot_workscope::OnboardingSingleFlight::compile_and_publish`
+        // and therefore only through
+        // `eliot_governor::GovernorComposition::compile_cold_start_at_trigger`,
+        // which also has zero call sites. See `task_binding_admission`'s
+        // "Measured reachability" section for the full measurement.
         let admission = crate::task_binding_admission::admit_canonical_write(
             envelope.operation_id.as_str().to_owned(),
             &identity.request.metadata,
@@ -879,18 +890,26 @@ impl DaemonComposition {
             readiness.receipt,
             readiness.fence,
         )?;
-        // Issue #1929: a capture admitted cold is still durably retained. The
-        // decision is projected here so operators can see which submissions
-        // carry no task binding and are therefore inert for task memory,
-        // support, influence, and finish until a later governed binding
-        // transition.
+        // Issue #1929: the durable retention of a cold unbound capture is NOT
+        // this log line, and not this daemon. `ColdUnbound` here records only
+        // the admission decision. The retention owner is the store, which
+        // admits the same capture as `GateDisposition::ColdUnbound` in
+        // `eliot_store_surreal::task_binding_gate::gate_apply` so the write
+        // proceeds instead of being rejected, and whose adapter builds one
+        // `EvidenceRecord` per `CaptureObservation` regardless of task binding
+        // (`eliot_store_surreal_adapter` `plan::evidence_records`, bound into
+        // the `write_receipt` row by `apply::atomic_write`). A later governed
+        // binding transition reads those bytes back through the `GetEvidencePack`
+        // named read. Until then they are inert for task memory, support,
+        // influence, and finish, and this line is only the operator-visible
+        // projection of that fact.
         if let crate::task_binding_admission::TaskBindingAdmission::ColdUnbound(candidate) =
             &admission
         {
             tracing::info!(
                 candidate_id = %crate::diagnostics::sanitize_identity(&candidate.candidate_id),
                 reason_ref = %candidate.reason_ref,
-                "cold unbound observation candidate admitted at the daemon edge: no task activation, support/influence promotion, or finish relevance"
+                "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
         }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
@@ -2442,6 +2461,28 @@ impl DaemonComposition {
     /// never mints a receipt of its own: `ScopeAttachIngress` is the only
     /// accepted input and its `receipt_ref` is a reference the Governor binds,
     /// not an authority the daemon asserts.
+    ///
+    /// # Not yet reached (issue #1929)
+    ///
+    /// This method currently has zero call sites, and it cannot acquire one
+    /// without inventing authority, so it is reported here rather than wired to
+    /// a synthetic caller. Three measured reasons:
+    ///
+    /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
+    ///   fails closed unless a `WorkScope` owner is already retained, and this
+    ///   method is the only daemon path that installs one;
+    /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
+    ///   no authenticated authorization reference, so three of the nine
+    ///   `ScopeAttachIngress` fields would have to be fabricated;
+    /// - the daemon knows only its own config and state directories, which are
+    ///   not a user `WorkScope`. Attaching one of them as a scope would create
+    ///   a `WorkScope` binding the user never declared.
+    ///
+    /// The legitimate owner is the attach-transport ingress
+    /// `eliot_governor::GovernorComposition` already documents as blocked
+    /// ("attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
+    /// discovery or onboarding lease"). A startup attach was deliberately not
+    /// added to manufacture a caller.
     pub fn admit_scope_attach(
         &mut self,
         ingress: &task_binding_admission::ScopeAttachIngress,
