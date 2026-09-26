@@ -188,6 +188,8 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any], expected: dic
             raise AssertionError(f"{host}: receipt identity field is malformed: {key}")
     if receipt.get("source_pins") != "verified":
         raise AssertionError(f"{host}: source-pin verification status is not verified")
+    if receipt.get("origin_authentication") != "not_authenticated_hash_pins_only":
+        raise AssertionError(f"{host}: receipt overclaims source origin authentication")
     # Independent expected-input check: staged membership and per-file bytes are
     # compared against the manifest commitments loaded in `_load_expected_inputs`,
     # never against the materializer's returned list. A self-consistent receipt
