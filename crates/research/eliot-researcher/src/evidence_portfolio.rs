@@ -5463,41 +5463,49 @@ pub struct ManifestSource {
 /// set in meaning and is frozen sorted by [`Self::freeze`], so the manifest bytes
 /// are stable under arrival order while meaningful sequence stays
 /// identity-visible.
+///
+/// Every field is private, so the only way to obtain a value outside this
+/// module is [`Self::freeze`]: a past constructor call is not provenance, and
+/// neither is a struct literal. A literal could name an allowlist the freeze
+/// would refuse, and writable fields would let a caller mutate a frozen value
+/// and re-stamp its digest with [`Self::canonical_digest`]; neither is
+/// expressible from outside this module. Readback still re-proves the value
+/// through [`Self::verify_integrity`] at every consume site.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AuthorizedManifest {
     /// Digest of the frozen inquiry.
-    pub inquiry_digest: String,
+    inquiry_digest: String,
     /// Digest of the exact denominator.
-    pub denominator_digest: String,
+    denominator_digest: String,
     /// Exact source identity commitments by canonical handle.
-    pub sources: BTreeMap<String, ManifestSource>,
+    sources: BTreeMap<String, ManifestSource>,
     /// Dependence edges `(from, to)` in frozen order.
-    pub dependence_edges: BTreeSet<(String, String)>,
+    dependence_edges: BTreeSet<(String, String)>,
     /// Digest of the frozen coverage accounting.
-    pub coverage_digest: String,
+    coverage_digest: String,
     /// Grade limit explanations in frozen order.
-    pub grade_limits: Vec<String>,
+    grade_limits: Vec<String>,
     /// Preserved counterevidence identities in frozen order.
-    pub counterevidence: Vec<String>,
+    counterevidence: Vec<String>,
     /// Preserved conflict notes in frozen order.
-    pub conflicts: Vec<String>,
+    conflicts: Vec<String>,
     /// Preserved unknown references in frozen order.
-    pub unknowns: Vec<String>,
+    unknowns: Vec<String>,
     /// Reference allowlist in frozen order.
-    pub allowlist: Vec<String>,
+    allowlist: Vec<String>,
     /// Revoked or stale handles excluded from the allowlist.
-    pub revoked: Vec<String>,
+    revoked: Vec<String>,
     /// Privacy class carried into any handoff.
-    pub disclosure: DisclosureClass,
+    disclosure: DisclosureClass,
     /// Expiry in Unix milliseconds; audits past it fail closed.
-    pub expires_ms: i64,
+    expires_ms: i64,
     /// Manifest revision; a revision invalidates older audits.
-    pub revision: u64,
+    revision: u64,
     /// Frozen digest over the whole manifest shape.
     ///
     /// Excluded from its own preimage by `#[serde(skip)]`.
     #[serde(skip)]
-    pub digest: String,
+    digest: String,
 }
 
 /// Declared identity domain of [`AuthorizedManifest`].
