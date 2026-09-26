@@ -111,7 +111,7 @@ const GRANT_CLOSURE_LINKS_KIND: &str = "grant_closure_canonical_receipts";
 /// Typed refusal kind answered by the same arm, carrying the durable reason a
 /// read could not be served. A refusal is never an empty link set.
 const GRANT_CLOSURE_LINKS_REFUSAL_KIND: &str = "grant_closure_canonical_receipts_refused";
-/// Authenticated operator selector for the UserAutomation CLI/MCP route.
+/// Authenticated operator selector for the `UserAutomation` CLI/MCP route.
 ///
 /// This is the exact string published as `USER_AUTOMATION_ROUTE` in
 /// `crates/surfaces/eliot-mcp/src/contract.rs` and used by
