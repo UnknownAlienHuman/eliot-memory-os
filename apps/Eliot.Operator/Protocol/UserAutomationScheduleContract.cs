@@ -897,6 +897,13 @@ public static class UserAutomationOutcomeClassifier
     private const int MaxIdentityChars = 256;
     // The Kernel's bounded idempotency key is prefixed in operation_id.
     private const int MaxOperationIdChars = 320;
+    // The owner-minted members the Operator reads for shape only. A typed
+    // refusal projects the route's correlation handle; a transition carries the
+    // Store's canonical request hash.
+    private const string RequestIdMember = "request_id";
+    private const string CanonicalRequestHashMember = "canonical_request_hash";
+    // The one optional member of the closed transition value.
+    private const string OptionalOrchestrationMember = "orchestration";
     private const int MaxRefusalFieldChars = 256;
     private const int MaxRecoveryReasonChars = 1_024;
     private const int MaxScheduleScanDepth = 6;
@@ -937,8 +944,11 @@ public static class UserAutomationOutcomeClassifier
             {
                 // Known owner transitions can carry a full bounded schedule
                 // projection. Do not apply the much smaller refusal-envelope
-                // size limit to this successful result.
-                return ReadKnownEnvelope(action, answer);
+                // size limit to this successful result. The expected identity
+                // travels with it: a JSON-RPC-correlated body is transport
+                // evidence, not the Store operation identity it must answer
+                // (#2972).
+                return ReadKnownEnvelope(action, answer, expectedIdempotencyKey);
             }
 
             return UnverifiedOwnerAnswer(
@@ -979,7 +989,10 @@ public static class UserAutomationOutcomeClassifier
             Receipt: null);
     }
 
-    private static UserAutomationOutcome ReadKnownEnvelope(string action, JsonElement answer)
+    private static UserAutomationOutcome ReadKnownEnvelope(
+        string action,
+        JsonElement answer,
+        string expectedIdempotencyKey)
     {
         if (!HasExactProperties(answer, "status", "value", "recovery")
             || !TryReadBoundedText(answer, "status", 32, out var status)
@@ -1027,6 +1040,35 @@ public static class UserAutomationOutcomeClassifier
                 "identity_conflict",
                 RefusalText: null,
                 Receipt: null);
+        }
+
+        // Identity first (#2972). A stale cache, a substituted fixture, a
+        // transport-correlation bug or a server defect can present a
+        // structurally familiar transition belonging to ANOTHER operation. The
+        // exact Store operation identity is therefore compared against the
+        // submitted request before any schedule projection is scanned or any
+        // answer is described, and a nested projection never compensates for a
+        // foreign parent result.
+        if (!TryGetObject(value, "identity", out var identity)
+            || !MatchesOperationIdentity(
+                identity,
+                expectedIdempotencyKey,
+                CanonicalRequestHashMember))
+        {
+            return UnverifiedOwnerAnswer(
+                action,
+                "the known owner transition does not carry the exact operation identity of this request");
+        }
+
+        // The State Fence context is read through the same closed helper the
+        // typed refusal path uses, so both result paths accept one fence shape
+        // and neither infers a lineage, generation or revision from names.
+        if (!TryGetObject(value, "state_fence", out var stateFence)
+            || !IsClosedStateFence(stateFence))
+        {
+            return UnverifiedOwnerAnswer(
+                action,
+                "the known owner transition does not carry a closed State Fence for this request");
         }
 
         if (!HasUserAutomationTransitionProperties(value))
@@ -1148,16 +1190,58 @@ public static class UserAutomationOutcomeClassifier
         return UnverifiedOwnerAnswer(action, "the unknown-outcome envelope has an unsupported value or recovery shape");
     }
 
+    /// <summary>
+    /// The closed current UserAutomation transition value members, in owner
+    /// order. <c>orchestration</c> is the one post-commit runtime-obligation
+    /// record the owner began projecting when the durable runtime handoff
+    /// landed (#2806/#2969); a current transition carries it.
+    /// </summary>
+    private static readonly string[] UserAutomationTransitionMembers =
+    [
+        "identity",
+        "state_fence",
+        "configuration",
+        "wake",
+        "horizon",
+        OptionalOrchestrationMember,
+        "execution",
+        "occurrences",
+    ];
+
+    /// <summary>
+    /// The same closed set as an answer from before that record existed. It
+    /// stays readable as bounded diagnostic evidence for an older owner, and
+    /// nothing here infers a current owner version from its property names
+    /// (#2972).
+    /// </summary>
+    private static readonly string[] LegacyUserAutomationTransitionMembers =
+    [
+        "identity",
+        "state_fence",
+        "configuration",
+        "wake",
+        "horizon",
+        "execution",
+        "occurrences",
+    ];
+
+    /// <summary>
+    /// Admits the closed transition shape and its exact optional semantics: the
+    /// owner projects the orchestration record as <c>null</c> exactly when the
+    /// operation owns no runtime obligation, and an answer from before that
+    /// record existed omits it and is admitted by the legacy census instead. A
+    /// missing record is therefore a complete answer about an obligation that
+    /// never existed rather than a corrupt shape, while any other value kind is
+    /// neither and is refused.
+    /// </summary>
     private static bool HasUserAutomationTransitionProperties(JsonElement value) =>
-        HasExactProperties(
-            value,
-            "identity",
-            "state_fence",
-            "configuration",
-            "wake",
-            "horizon",
-            "execution",
-            "occurrences");
+        (HasExactProperties(value, UserAutomationTransitionMembers)
+            && HasCurrentOrchestrationRecord(value))
+        || HasExactProperties(value, LegacyUserAutomationTransitionMembers);
+
+    private static bool HasCurrentOrchestrationRecord(JsonElement value) =>
+        value.TryGetProperty(OptionalOrchestrationMember, out var orchestration)
+        && orchestration.ValueKind is JsonValueKind.Null or JsonValueKind.Object;
 
     private static UserAutomationOutcome ReadAttemptRefusal(
         string action,
@@ -1180,7 +1264,7 @@ public static class UserAutomationOutcomeClassifier
             || !schemaVersion.TryGetInt32(out var version)
             || version != 1
             || !TryGetObject(value, "operation", out var operation)
-            || !MatchesOperationIdentity(operation, expectedIdempotencyKey)
+            || !MatchesOperationIdentity(operation, expectedIdempotencyKey, RequestIdMember)
             || !TryGetObject(value, "state_fence", out var stateFence)
             || !IsClosedStateFence(stateFence)
             || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
@@ -1236,21 +1320,36 @@ public static class UserAutomationOutcomeClassifier
             Receipt: null);
     }
 
-    private static bool MatchesOperationIdentity(JsonElement operation, string expectedIdempotencyKey)
+    /// <summary>
+    /// The one operation-correlation parser of this classifier. The typed
+    /// refusal projects the authenticated route's correlation handle beside
+    /// the operation identity, and a known transition carries the Store
+    /// identity itself, whose third member is the canonical request hash. The
+    /// two owner projections therefore name a different owner-minted member,
+    /// so that name is passed in once per envelope, but every identity the
+    /// Operator can derive is compared by the single rule below. The known and
+    /// the unknown/refusal paths cannot drift apart (#2972).
+    /// </summary>
+    private static bool MatchesOperationIdentity(
+        JsonElement operation,
+        string expectedIdempotencyKey,
+        string ownerMintedMemberName)
     {
-        if (!HasExactProperties(operation, "operation_id", "request_id", "idempotency_key")
+        if (!HasExactProperties(operation, "operation_id", ownerMintedMemberName, "idempotency_key")
             || !TryReadBoundedText(operation, "operation_id", MaxOperationIdChars, out var operationId)
-            || !TryReadBoundedText(operation, "request_id", MaxIdentityChars, out _)
+            || !TryReadBoundedText(operation, ownerMintedMemberName, MaxIdentityChars, out _)
             || !TryReadBoundedText(operation, "idempotency_key", MaxIdentityChars, out var idempotencyKey))
         {
             return false;
         }
 
-        // RequestId is minted inside the authenticated Kernel route and is
-        // correlated by the pipe response; the Operator cannot independently
-        // derive it. The two identities it does hold are exact: the pending
-        // operation ID is the request idempotency key, and Kernel prefixes that
-        // key when it returns its operation ID.
+        // The owner-minted member is the route's RequestId for a typed refusal
+        // and the Store's canonical request hash for a transition. Each is
+        // sealed inside the authenticated owner and neither can be recomputed
+        // here, so each is read for its closed bounded shape only. The two
+        // identities the Operator does hold are exact: the pending operation ID
+        // is the request idempotency key, and Kernel prefixes that key when it
+        // returns its operation ID.
         return string.Equals(idempotencyKey, expectedIdempotencyKey, StringComparison.Ordinal)
             && string.Equals(
                 operationId,
