@@ -4423,6 +4423,16 @@ pub enum ClaimOutcome {
     NotVerifiableInScope,
     /// A citation falls outside the frozen manifest.
     OutsideManifest,
+    /// A material citation is a handle the frozen manifest revoked.
+    ///
+    /// Distinct from [`Self::OutsideManifest`] because the two findings are: a
+    /// revoked handle was authorized and then withdrawn, while an outside
+    /// handle was never admitted at all. Reporting a revocation as "outside"
+    /// loses the only fact that distinguishes "we withdrew this" from "you
+    /// invented this", and it is the same conflation that let the citation and
+    /// opposition partitions disagree about one handle. Both project onto the
+    /// same public class, because a release consumer may do nothing with either.
+    RevokedEvidence,
     /// Stale material limits the claim without closing it.
     StaleLimited,
     /// Material-claim accounting is incomplete.
@@ -4539,6 +4549,62 @@ impl CounterclaimDisposition {
     }
 }
 
+/// The standing one handle holds inside one claim audit, decided once.
+///
+/// `classify_handle` is the only place this is derived, and both partitions
+/// read its answer: the citation loop that decides whether a handle may support
+/// the claim, and the opposition loop that decides whether it may contest it.
+/// The two used to decide separately, over their own `if` chains, so a handle
+/// that was both a citation and revoked came out `OutsideManifest` on the
+/// citation side and `AlsoACitation` on the opposition side — one handle, two
+/// contradictory typed verdicts, and the revocation reported by neither.
+///
+/// The order of the arms below is the order of the derivation, and it is
+/// load-bearing rather than incidental: revocation is decided **first**, before
+/// allowlist membership and before the claim's own citation list, because a
+/// withdrawn handle can be neither a citation nor counterevidence whatever else
+/// is true of it. [`AuthorizedManifest::freeze`] keeps `allowlist` and `revoked`
+/// disjoint, so the first two arms between them reproduce exactly what
+/// [`AuthorizedManifest::allows`] answered while keeping the two reasons apart
+/// instead of merging them into one boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleStanding {
+    /// The manifest admitted this handle and then revoked it.
+    Revoked,
+    /// The manifest never admitted this handle.
+    OutsideManifest,
+    /// The manifest admits this handle, but the portfolio holds no record for it.
+    Unresolved,
+    /// The portfolio holds a record for this handle that no longer matches the
+    /// commitment the manifest froze for it.
+    SubstitutedRecord,
+    /// Admitted with a bound record, and also a citation of this same claim.
+    ///
+    /// The opposition partition reads this as one input asserting both support
+    /// and opposition. The citation partition reads it as the ordinary admitted
+    /// case, because a handle it is looking at is by construction one of the
+    /// claim's citations — which is exactly why the two can no longer answer
+    /// differently about it.
+    AdmittedCitation,
+    /// Admitted with a bound record, and not a citation of this claim.
+    Admitted,
+}
+
+/// One handle this audit examined, with the one standing both partitions read.
+///
+/// This is the citation partition's typed record, and it holds the same value
+/// the opposition partition derived for the same handle. Reading a handle's
+/// standing from a typed field rather than from residue prose is what makes the
+/// two partitions comparable: while each decided for itself, both looked
+/// internally consistent and still disagreed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandleResolution {
+    /// The handle examined.
+    pub handle: String,
+    /// The single standing derived for it by `classify_handle`.
+    pub standing: HandleStanding,
+}
+
 /// One attached counterclaim identity with the disposition the audit gave it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CounterclaimResolution {
@@ -4558,6 +4624,7 @@ impl ClaimOutcome {
             Self::Contradicted => "CONTRADICTED",
             Self::NotVerifiableInScope => "NOT_VERIFIABLE_IN_SCOPE",
             Self::OutsideManifest => "OUTSIDE_MANIFEST",
+            Self::RevokedEvidence => "REVOKED_EVIDENCE",
             Self::StaleLimited => "STALE_LIMITED",
             Self::IncompleteAccounting => "INCOMPLETE_ACCOUNTING",
         }
@@ -4588,6 +4655,15 @@ pub struct ClaimVerdict {
     /// Per-identity disposition of every attached counterclaim, in sorted-id
     /// order. This is the typed partition the outcome is derived from.
     pub counterclaim_resolutions: Vec<CounterclaimResolution>,
+    /// The one standing derived for every distinct handle this audit examined,
+    /// in sorted handle order.
+    ///
+    /// One entry per handle across `citations` and `counterclaim_ids`, holding
+    /// the single value `classify_handle` returns for it. Both partitions read
+    /// that value, so a handle cannot be reported as outside the manifest on one
+    /// side and as also a citation on the other, and a revocation cannot be
+    /// dropped by whichever partition happens to test its own condition first.
+    pub handle_resolutions: Vec<HandleResolution>,
     /// Preserved unknown references.
     pub unknowns: Vec<String>,
     /// Grade ceiling over the supporting records, when computable.
@@ -4632,13 +4708,16 @@ pub enum AuditDimension {
     CounterevidenceExamined,
     /// Material-claim accounting is complete.
     AccountingComplete,
-    /// Every attached counterclaim resolved to exactly one disposition.
+    /// Every attached counterclaim resolved to exactly one disposition, and the
+    /// two partitions agree about the handle it names.
     ///
-    /// The premise of this dimension is that the partitions agree: a handle cannot
-    /// be simultaneously "outside the manifest" on the citation side and "also a
-    /// citation" on the counterclaim side. `audit_claim` classifies each handle
-    /// once and both partitions read that one answer, so this dimension is the
-    /// record that the two did not diverge.
+    /// The premise of this dimension is that the partitions agree: a handle
+    /// cannot be simultaneously "outside the manifest" on the citation side and
+    /// "also a citation" on the counterclaim side. `audit_claim` classifies
+    /// every handle once through `classify_handle` and both partitions read
+    /// that one answer, so this dimension is the record that the two did not
+    /// diverge — and it is checkable, because a standing that forces a
+    /// disposition can be compared against the disposition actually reported.
     PartitionCoherence,
 }
 
@@ -4691,6 +4770,7 @@ impl ClaimVerdict {
             ClaimOutcome::PartiallySupported => PublicAuditClass::PartiallySupported,
             ClaimOutcome::Unsupported | ClaimOutcome::StaleLimited => PublicAuditClass::Unsupported,
             ClaimOutcome::OutsideManifest
+            | ClaimOutcome::RevokedEvidence
             | ClaimOutcome::NotVerifiableInScope
             | ClaimOutcome::IncompleteAccounting => PublicAuditClass::NotVerifiableInScope,
         }
@@ -4714,7 +4794,9 @@ impl ClaimVerdict {
     fn dimension_passed(&self, dimension: AuditDimension) -> bool {
         let failed = match dimension {
             AuditDimension::ReferenceVerification => {
-                self.outcome == ClaimOutcome::OutsideManifest || self.evidence_map.is_empty()
+                self.outcome == ClaimOutcome::OutsideManifest
+                    || self.outcome == ClaimOutcome::RevokedEvidence
+                    || self.evidence_map.is_empty()
             }
             AuditDimension::ValueVerification => {
                 self.outcome == ClaimOutcome::Unsupported
@@ -4756,17 +4838,25 @@ impl ClaimVerdict {
             AuditDimension::AccountingComplete => {
                 self.outcome == ClaimOutcome::IncompleteAccounting || !self.unknowns.is_empty()
             }
-            // Coherence is a property of how this verdict was built rather than of
-            // what it found: every handle in `counterclaim_resolutions` carries
-            // exactly one disposition, and a handle cannot appear twice with
-            // different answers. It fails only if the resolution list contradicts
-            // itself, which no current path can produce — which is the point of
-            // recording it.
+            // Coherence is the property that the two partitions read one
+            // classification instead of deciding their own. It is checked, not
+            // asserted: a standing that forces a disposition must be reported
+            // under that disposition on the opposition side, and a handle cannot
+            // appear twice in the resolution list. The two-partition code this
+            // replaced could fail neither half — a revoked citation was
+            // `OutsideManifest` on one side and `AlsoACitation` on the other —
+            // because the two sides never compared anything.
             AuditDimension::PartitionCoherence => {
                 let mut seen: BTreeSet<&str> = BTreeSet::new();
-                self.counterclaim_resolutions
-                    .iter()
-                    .any(|entry| !seen.insert(entry.counterclaim_id.as_str()))
+                self.counterclaim_resolutions.iter().any(|entry| {
+                    !seen.insert(entry.counterclaim_id.as_str())
+                        || self
+                            .handle_resolutions
+                            .iter()
+                            .find(|resolution| resolution.handle == entry.counterclaim_id)
+                            .and_then(|resolution| forced_disposition(resolution.standing))
+                            .is_some_and(|forced| forced != entry.disposition)
+                })
             }
         };
         !failed
@@ -5119,15 +5209,85 @@ struct AuthorizedManifestDigestInput<'a> {
     manifest: &'a AuthorizedManifest,
 }
 
+/// Derives the one standing `handle` holds inside `claim`'s audit.
+///
+/// The inputs are exactly the four facts the two partitions used to read
+/// separately, which is why they could disagree: whether the frozen manifest
+/// revoked the handle, whether its allowlist admits it, whether the portfolio
+/// resolves it to a record the manifest still commits, and whether the claim
+/// itself lists it as a citation. Nothing here reads freshness, grade,
+/// authority domain, evidence weight or the caller's counterclaim list: those
+/// are eligibility and evidence questions, they belong to the partition that
+/// raises them, and treating any of them as opposition is the inference
+/// `#2874` forbids.
+///
+/// The function is pure, so the citation loop and the opposition loop can each
+/// call it and get the same value; that is the whole repair. Revocation is
+/// tested before anything else, so a handle the manifest withdrew is reported as
+/// revoked by both partitions instead of being "outside" on one side and "also
+/// a citation" on the other.
+fn classify_handle(
+    handle: &str,
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+    manifest: &AuthorizedManifest,
+) -> HandleStanding {
+    if manifest.revoked.iter().any(|revoked| revoked == handle) {
+        return HandleStanding::Revoked;
+    }
+    if !manifest.allowlist.iter().any(|allowed| allowed == handle) {
+        return HandleStanding::OutsideManifest;
+    }
+    let Some(record) = portfolio.records.get(handle) else {
+        return HandleStanding::Unresolved;
+    };
+    // A record that no longer hashes to the commitment this manifest froze is
+    // not the source the manifest admitted, so its handle is not provable even
+    // though a record of that name exists.
+    if !manifest.binds_source_record(record) {
+        return HandleStanding::SubstitutedRecord;
+    }
+    if claim.citations.iter().any(|cited| cited == handle) {
+        return HandleStanding::AdmittedCitation;
+    }
+    HandleStanding::Admitted
+}
+
+/// The disposition a standing forces, for the standings that force one.
+///
+/// Four of the six standings are decided from the manifest and the record
+/// alone, so what the opposition partition reports for them is not a judgement
+/// it is free to make: a revoked handle reports `Revoked` whether or not it is
+/// also a citation, and a handle with no provable record reports
+/// `UnresolvedLineage` whether the record is absent or merely substituted. The
+/// two admitted standings force nothing, because whether an admitted handle
+/// contradicts is a question about the evidence attached to it, and answering it
+/// is what the remaining dispositions are for.
+fn forced_disposition(standing: HandleStanding) -> Option<CounterclaimDisposition> {
+    match standing {
+        HandleStanding::Revoked => Some(CounterclaimDisposition::Revoked),
+        HandleStanding::OutsideManifest => Some(CounterclaimDisposition::OutsideManifest),
+        HandleStanding::Unresolved | HandleStanding::SubstitutedRecord => {
+            Some(CounterclaimDisposition::UnresolvedLineage)
+        }
+        HandleStanding::Admitted | HandleStanding::AdmittedCitation => None,
+    }
+}
+
 /// Classifies one attached counterclaim identity against this claim.
 ///
-/// The checks run most-specific first, and each records its own typed residue
-/// line, so the reason an identity did not contradict is never lost:
+/// The standing is read from [`classify_handle`] first, and the same function
+/// answers for the citation loop, so revocation and unavailable evidence are
+/// decided in exactly one place before any opposition-specific question is
+/// asked. The remaining checks are eligibility plus one verified relation, and
+/// each records its own typed residue line, so the reason an identity did not
+/// contradict is never lost:
 ///
-/// * a handle that is also a material citation of this claim asserts both
-///   support and opposition at once, which this cell does not resolve;
-/// * a revoked handle is stronger than an absent one — the evidence was
-///   authorized and then withdrawn, so it cannot be verified either way;
+/// * a handle the manifest revoked is withdrawn evidence and can be neither
+///   citable nor opposable, whatever else is true of it;
+/// * a handle outside the manifest was never admitted;
+/// * an admitted handle that is also a citation of this claim asserts both
+///   support and opposition at once, which this function does not resolve;
 /// * a record past its frozen freshness boundary cannot contradict under
 ///   compatible conditions, even though a time-stale record may still support.
 fn resolve_counterclaim(
@@ -5138,27 +5298,39 @@ fn resolve_counterclaim(
     now_ms: i64,
     residue: &mut Vec<String>,
 ) -> CounterclaimDisposition {
-    if claim.citations.iter().any(|cited| cited == counterclaim_id) {
-        residue.push(format!(
-            "claim: counterclaim {counterclaim_id} is also a citation and cannot contest the claim"
-        ));
-        return CounterclaimDisposition::AlsoACitation;
-    }
-    if manifest
-        .revoked
-        .iter()
-        .any(|handle| handle == counterclaim_id)
-    {
-        residue.push(format!(
-            "claim: counterclaim {counterclaim_id} is revoked and cannot be verified"
-        ));
-        return CounterclaimDisposition::Revoked;
-    }
-    if !manifest.allows(counterclaim_id) {
-        residue.push(format!(
-            "claim: counterclaim {counterclaim_id} outside frozen manifest"
-        ));
-        return CounterclaimDisposition::OutsideManifest;
+    match classify_handle(counterclaim_id, claim, portfolio, manifest) {
+        HandleStanding::Revoked => {
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} is revoked and cannot be verified"
+            ));
+            return CounterclaimDisposition::Revoked;
+        }
+        HandleStanding::OutsideManifest => {
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} outside frozen manifest"
+            ));
+            return CounterclaimDisposition::OutsideManifest;
+        }
+        HandleStanding::Unresolved | HandleStanding::SubstitutedRecord => {
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} has no authoritative lineage"
+            ));
+            return CounterclaimDisposition::UnresolvedLineage;
+        }
+        HandleStanding::AdmittedCitation => {
+            residue.push(format!(
+                "claim: counterclaim {counterclaim_id} is also a citation and cannot contest the claim"
+            ));
+            return CounterclaimDisposition::AlsoACitation;
+        }
+        // The two standing values that reach the eligibility checks below. The
+        // record is re-read here rather than carried out of `classify_handle` so
+        // that the classification stays a single closed enum rather than an enum
+        // plus a record; `Admitted` is only returned when a bound record exists,
+        // so this lookup cannot fail on this path, and it is written as a typed
+        // refusal rather than an unwrap so that a future change to the standing
+        // degrades to `UnresolvedLineage` instead of panicking.
+        HandleStanding::Admitted => {}
     }
     let Some(record) = portfolio.records.get(counterclaim_id) else {
         residue.push(format!(
@@ -5166,16 +5338,6 @@ fn resolve_counterclaim(
         ));
         return CounterclaimDisposition::UnresolvedLineage;
     };
-    // The manifest froze this handle's complete record commitment, so a record
-    // that no longer hashes to it was substituted after the freeze. It is
-    // reported as unresolved lineage rather than silently audited as the source
-    // the manifest admitted.
-    if !manifest.binds_source_record(record) {
-        residue.push(format!(
-            "claim: counterclaim {counterclaim_id} does not match the frozen source commitment"
-        ));
-        return CounterclaimDisposition::UnresolvedLineage;
-    }
     if !record.covers_domain(&claim.domain) {
         residue.push(format!(
             "claim: counterclaim {counterclaim_id} outside claim domain {}",
@@ -5383,6 +5545,13 @@ fn verified_opposition(
 /// accounting. Unsupported precision, outside-manifest references and
 /// insufficient coverage remain typed residue. Counterevidence and unknowns
 /// are preserved, never smoothed.
+///
+/// Every handle this claim names — cited or alleged counterevidence alike — is
+/// classified once by `classify_handle`, and the citation loop below and
+/// [`resolve_counterclaim`] both read that one value. Revocation, non-admission
+/// and unavailable evidence are therefore decided in exactly one place and
+/// reported the same way on both sides, and the de-duplicated record of it is
+/// [`ClaimVerdict::handle_resolutions`].
 #[allow(clippy::too_many_lines)]
 pub fn audit_claim(
     claim: &AuditedClaim,
@@ -5410,6 +5579,11 @@ pub fn audit_claim(
     // diagnostic text, and matching a substring of it let an unrelated line
     // (a counterclaim outside the manifest, say) flip a citation verdict.
     let mut outside_citation = false;
+    // Revocation is a distinct finding from non-admission and is recorded as
+    // one. The two were merged into a single `manifest.allows` boolean, which
+    // reported every revoked citation as "outside frozen manifest" and let the
+    // opposition partition report the same handle as "also a citation".
+    let mut revoked_citation = false;
     // A manifest that fails its own integrity check is the authorization this
     // claim was judged under, so the gap is seeded here rather than per handle:
     // with the manifest unproven, no handle it admits is proven either, and the
@@ -5419,11 +5593,53 @@ pub fn audit_claim(
     if claim.material && claim.citations.is_empty() {
         residue.push("claim: material claim records no citations".to_owned());
     }
+    // One standing per distinct handle, derived once through the same function
+    // the opposition partition calls. This is the de-duplicated record of it in
+    // sorted handle order, so a consumer reads each handle's standing from a
+    // typed field rather than from the residue prose of whichever partition
+    // happened to look at it first.
+    let handle_resolutions: Vec<HandleResolution> = claim
+        .citations
+        .iter()
+        .chain(claim.counterclaim_ids.iter())
+        .map(String::as_str)
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .map(|handle| HandleResolution {
+            handle: handle.to_owned(),
+            standing: classify_handle(handle, claim, portfolio, manifest),
+        })
+        .collect();
     for handle in &claim.citations {
-        if !manifest.allows(handle) {
-            outside_citation = true;
-            residue.push(format!("claim: citation {handle} outside frozen manifest"));
-            continue;
+        match classify_handle(handle, claim, portfolio, manifest) {
+            HandleStanding::Revoked => {
+                revoked_citation = true;
+                residue.push(format!(
+                    "claim: citation {handle} is revoked by the frozen manifest and cannot support the claim"
+                ));
+                continue;
+            }
+            HandleStanding::OutsideManifest => {
+                outside_citation = true;
+                residue.push(format!("claim: citation {handle} outside frozen manifest"));
+                continue;
+            }
+            HandleStanding::Unresolved => {
+                lineage_gap = true;
+                residue.push(format!("claim: citation {handle} has no authoritative lineage"));
+                continue;
+            }
+            HandleStanding::SubstitutedRecord => {
+                lineage_gap = true;
+                residue.push(format!(
+                    "claim: citation {handle} does not match the frozen source commitment"
+                ));
+                continue;
+            }
+            // A handle the citation loop is looking at is by construction one of
+            // the claim's citations, so the standing the opposition partition
+            // reads as "also a citation" is the ordinary admitted case here.
+            HandleStanding::Admitted | HandleStanding::AdmittedCitation => {}
         }
         let Some(record) = portfolio.records.get(handle) else {
             lineage_gap = true;
@@ -5432,17 +5648,6 @@ pub fn audit_claim(
             ));
             continue;
         };
-        // A record that no longer hashes to the commitment this manifest froze
-        // is not the source the manifest admitted. Treating it as a lineage gap
-        // keeps the verdict non-supporting without introducing a second
-        // terminal class for what is, exactly, an unproven lineage.
-        if !manifest.binds_source_record(record) {
-            lineage_gap = true;
-            residue.push(format!(
-                "claim: citation {handle} does not match the frozen source commitment"
-            ));
-            continue;
-        }
         if !record.covers_domain(&claim.domain) {
             lineage_gap = true;
             residue.push(format!(
@@ -5568,7 +5773,15 @@ pub fn audit_claim(
     } else {
         String::new()
     };
-    let unfrozen_material_claim = claim.material && !claim_identity_verified && !outside_citation;
+    // A revoked citation is a separate finding from a non-admitted one, and it
+    // sits where a revoked citation used to land: immediately after the
+    // identity check and beside the outside-manifest arm, so the precedence
+    // order of every other arm is untouched. It reports its own terminal class
+    // rather than `OutsideManifest`, because "the manifest withdrew this" and
+    // "the manifest never admitted this" are different facts about the same
+    // release, and both still project onto `NOT_VERIFIABLE_IN_SCOPE`.
+    let unfrozen_material_claim =
+        claim.material && !claim_identity_verified && !outside_citation && !revoked_citation;
     let mut dimensions = vec![
         AuditDimension::ReferenceVerification,
         AuditDimension::ValueVerification,
@@ -5587,6 +5800,11 @@ pub fn audit_claim(
         // identity is not a verdict about this claim at all. Checked before the
         // citation partition for that reason.
         ClaimOutcome::NotVerifiableInScope
+    } else if revoked_citation {
+        // Withdrawn evidence. A handle the manifest revoked is not "outside" it —
+        // it was inside and then removed — and the residue above names the
+        // revocation, so the reason survives the terminal class.
+        ClaimOutcome::RevokedEvidence
     } else if outside_citation {
         ClaimOutcome::OutsideManifest
     } else if !contradicting.is_empty() {
@@ -5646,6 +5864,7 @@ pub fn audit_claim(
         unsupported_precision,
         counterevidence: counter_sorted,
         counterclaim_resolutions: sorted_resolutions,
+        handle_resolutions,
         unknowns: unknowns_sorted,
         grade_ceiling,
         evidence_map,
