@@ -2461,6 +2461,43 @@ impl OnboardingSingleFlight {
             lease_ref: lease_ref.to_owned(),
         })
     }
+
+    /// Returns the retained lease and its terminal receipt for one exact
+    /// single-flight key.
+    ///
+    /// This is the Governor-owned read seam over the registry (I4.4.1): the
+    /// caller names the exact workspace filesystem/VCS identity
+    /// (`lineage_candidate_ref` + `workspace_instance_candidate_ref`), privacy
+    /// boundary and governing-source generation, and receives the cloned
+    /// retained lease with the terminal receipt the lease published — or
+    /// `None` when no lease owns the key or no terminal was published yet. It
+    /// never joins, compiles, or mutates; joining stays with
+    /// [`OnboardingSingleFlight::join`] and
+    /// [`OnboardingSingleFlight::join_with_evidence`].
+    #[must_use]
+    pub fn terminal_for_key(
+        &self,
+        lineage_candidate_ref: &str,
+        workspace_instance_candidate_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+    ) -> Option<(OnboardingLease, OnboardingReadinessReceipt)> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.lease.lineage_candidate_ref == lineage_candidate_ref
+                    && entry.lease.workspace_instance_candidate_ref
+                        == workspace_instance_candidate_ref
+                    && entry.lease.privacy_class == privacy_class
+                    && entry.lease.governing_source_generation == governing_source_generation
+            })
+            .and_then(|entry| {
+                entry
+                    .terminal
+                    .clone()
+                    .map(|terminal| (entry.lease.clone(), terminal))
+            })
+    }
 }
 
 /// Failure of one trigger-driven cold-start compilation.

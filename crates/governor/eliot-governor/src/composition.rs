@@ -89,17 +89,21 @@ use eliot_testd_core::{
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{
-    AuthorityBasis, BootstrapScanner, GenerationEvidence, GoverningSourceAdmission,
-    GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence, IdentityLegOutcome,
-    MaterialAdmission, MaterialReadinessInputs, ObservedScopeResources, PrivacyProfile,
-    RequestedEffect, ResolutionAuthentication, ResolutionRequest, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeRelocationOrAttachReceipt,
-    ScopeResolution, SourceAdmissionRequest, TaskBindingInput, TaskBindingState,
-    TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidateSet, WorkScopeDescriptor,
-    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, admit_at_trigger,
-    admit_initial_binding, check_at_trigger, evaluate_material_request, issue_resolution_receipt,
-    produce_attach_receipt, rebind_with_receipt,
+    AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
+    ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
+    GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
+    IdentityEvidence, IdentityLegOutcome, LeaseJoin, MaterialAdmission, MaterialReadinessInputs,
+    ObservedScopeResources, OnboardingLease, OnboardingSingleFlight, PrivacyBoundary,
+    PrivacyProfile, ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect,
+    ResolutionAuthentication, ResolutionRequest, ScanDisclosureStore, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
+    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
+    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
+    WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
+    evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
+    rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -3485,6 +3489,15 @@ pub struct GovernorComposition<P: ?Sized> {
     /// Exact P-07 presentations retained with their owner snapshots until
     /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
     authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
+    /// Governor-owned cold-start single-flight registry (issue #1790, I4.4.1).
+    ///
+    /// Compatible concurrent attaches join the same [`OnboardingSingleFlight`]
+    /// lease here instead of keeping caller-owned registries: the registry
+    /// holds no filesystem, process, credential or store state, only lease
+    /// keys with their terminal receipts, so every trigger that reaches the
+    /// cold-start legs below coalesces on exact workspace identity, privacy
+    /// boundary and governing-source generation.
+    cold_start: OnboardingSingleFlight,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -3986,6 +3999,55 @@ pub struct AuthorityRevocationReconciliation {
     pub closure_projection: eliot_ors::GrantClosureProjection,
 }
 
+/// Agent- and Human-facing projection of one retained terminal cold-start
+/// receipt (issue #1790, cold-start surface production type).
+///
+/// This carries only the values
+/// [`GovernorComposition::cold_start_surface_for_lease`] reads off the
+/// retained terminal [`eliot_workscope::OnboardingReadinessReceipt`] and its
+/// [`eliot_workscope::ReadinessSurface`]: the receipt reference, the canonical
+/// readiness token, the smallest missing question, the lease deadline, the
+/// receipt revision, and the workspace-instance and projection identity the
+/// receipt was compiled for. `readiness` is the `SCREAMING_SNAKE_CASE`
+/// [`eliot_workscope::ReadinessLifecycle`] token (`UNSEEN`, `SCANNING`,
+/// `NEEDS_SCOPE`, `NEEDS_TASK`, `NEEDS_SOURCES`, `READY_READ_ONLY`,
+/// `READY_MATERIAL`, `DEGRADED`, `CONFLICTED`), so the bridge transport parses
+/// it fail-closed without naming workscope types. The Governor never invents
+/// these values: every field is copied off a compiled receipt the retained
+/// single-flight registry published.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartSurfaceView {
+    pub receipt_ref: String,
+    pub readiness: String,
+    pub smallest_missing_question: Option<String>,
+    pub lease_deadline: u64,
+    pub receipt_revision: u64,
+    pub workspace_instance_ref: String,
+    pub projection_source_ref: String,
+    pub projection_generation: u64,
+}
+
+/// Maps one compiled readiness lifecycle to its canonical transport token.
+///
+/// The token matches the `SCREAMING_SNAKE_CASE` serialization of
+/// [`eliot_workscope::ReadinessLifecycle`], which is also the token set the
+/// bridge intake parses. A single explicit match keeps the wire contract in
+/// one place instead of spreading string conversions across callers.
+fn cold_start_readiness_token(lifecycle: ReadinessLifecycle) -> &'static str {
+    match lifecycle {
+        ReadinessLifecycle::Unseen => "UNSEEN",
+        ReadinessLifecycle::Scanning => "SCANNING",
+        ReadinessLifecycle::NeedsScope => "NEEDS_SCOPE",
+        ReadinessLifecycle::NeedsTask => "NEEDS_TASK",
+        ReadinessLifecycle::NeedsSources => "NEEDS_SOURCES",
+        ReadinessLifecycle::ReadyReadOnly => "READY_READ_ONLY",
+        ReadinessLifecycle::ReadyMaterial => "READY_MATERIAL",
+        ReadinessLifecycle::Degraded => "DEGRADED",
+        ReadinessLifecycle::Conflicted => "CONFLICTED",
+    }
+}
+
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
@@ -4055,6 +4117,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             service_observations,
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
+            cold_start: OnboardingSingleFlight::new(),
         })
     }
 
@@ -5021,6 +5084,249 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         candidate
             .admit_exploratory()
             .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Runs one I4.4.1 cold-start trigger's discovery pass through the
+    /// privacy-bounded scanner (issue #1790, cold-start trigger production
+    /// caller).
+    ///
+    /// Owning thin entry for attach/onboarding ingress: the caller names the
+    /// trigger (first project open, attach/launch, unknown workspace,
+    /// onboarding request, stale generation, or resume without a current
+    /// task) and supplies the discovery lease, lease key, disclosure store,
+    /// privacy boundary, scan evidence and identity inputs the trigger's
+    /// scanner pass requires. The pass runs
+    /// [`ColdStartController::run_trigger_scan`]: the trigger's read set is
+    /// authorized against the discovery lease and bound to the scan evidence
+    /// first, and only then does [`BootstrapScanner::scan`] run. No trigger
+    /// reaches the scanner past an unadmitted or unattested read.
+    /// Live status: owning thin entry for attach/onboarding ingress; no live
+    /// attach ingress builds the scanner inputs yet (BLOCKED-BY
+    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
+    /// discovery lease).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "trigger scan carries the trigger, lease, key, store, privacy, evidence, and identity inputs in one fail-closed entry"
+    )]
+    pub fn run_cold_start_trigger_scan(
+        trigger: ColdStartTrigger,
+        discovery_lease: &mut DiscoveryReadLease,
+        lease_key: &DiscoveryLeaseKey,
+        store: &mut impl ScanDisclosureStore,
+        candidate_privacy: PrivacyClass,
+        privacy_boundary: Option<&PrivacyBoundary>,
+        evidence: &BootstrapScanEvidence,
+        proposed_kind: ScopeKind,
+        identity_fingerprint: &str,
+        verifier_candidates: &[String],
+        governing_source_refs: Vec<String>,
+        now: u64,
+    ) -> Result<BootstrapScanOutcome, CompositionError> {
+        ColdStartController::run_trigger_scan(
+            trigger,
+            discovery_lease,
+            lease_key,
+            store,
+            candidate_privacy,
+            privacy_boundary,
+            evidence,
+            proposed_kind,
+            identity_fingerprint,
+            verifier_candidates,
+            governing_source_refs,
+            now,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Joins one I4.4.1 trigger to the retained cold-start single-flight
+    /// lease (issue #1790, single-flight join production caller).
+    ///
+    /// The join runs against the retained [`OnboardingSingleFlight`] registry,
+    /// so compatible concurrent attaches coalesce on exact workspace
+    /// filesystem/VCS identity plus privacy boundary plus governing-source
+    /// generation, and a changed governing-source digest or dirty-base summary
+    /// at the same generation splits the lease instead of reusing the first
+    /// lease's scope/task decision. The candidate and scanner evidence are
+    /// mandatory: the lease key is verified against the exact candidate and
+    /// the scan evidence before [`ColdStartController::check_discovery`]
+    /// authorizes the trigger's scanner pass, so a trigger can never ride on
+    /// unattested reads. Joining never creates a `WorkScope` and never infers
+    /// a latest task; `JoinedTerminal` carries the shared terminal surface
+    /// every waiter of the lease receives.
+    /// Live status: owning thin entry for attach/onboarding ingress; no live
+    /// attach ingress builds the lease inputs yet (BLOCKED-BY
+    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
+    /// discovery or onboarding lease).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "evidence-bound join carries trigger, leases, candidate, sources, and scan evidence in one fail-closed entry"
+    )]
+    pub fn join_cold_start_lease(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        scan: &BootstrapScanEvidence,
+        now: u64,
+    ) -> Result<LeaseJoin, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.cold_start
+            .join_with_evidence(
+                trigger,
+                discovery_lease,
+                proposed,
+                candidate,
+                sources,
+                scan,
+                now,
+            )
+            .map_err(|error| {
+                CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
+            })
+    }
+
+    /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
+    /// the retained registry (issue #1790, cold-start compilation production
+    /// caller).
+    ///
+    /// The trigger that creates the lease compiles exactly one
+    /// [`eliot_workscope::OnboardingReadinessReceipt`] through
+    /// [`ColdStartController::compile`] before the first scope-sensitive work
+    /// and publishes it as the lease terminal, so compatible concurrent
+    /// attaches receive the same receipt and no worker independently creates
+    /// a second `WorkScope` or "latest task" while the lease is active. An
+    /// already-terminal lease returns its `JoinedTerminal` surface without
+    /// recompiling; a lease owned by an in-flight trigger returns `Joined`
+    /// without a second compilation.
+    /// Live status: owning thin entry for attach/onboarding ingress; no live
+    /// attach ingress builds the compilation inputs yet (BLOCKED-BY
+    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
+    /// discovery or onboarding lease).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cold-start compilation joins every frozen receipt field in one owner-checked entry"
+    )]
+    pub fn compile_cold_start_at_trigger(
+        &mut self,
+        trigger: ColdStartTrigger,
+        discovery_lease: &DiscoveryReadLease,
+        proposed: OnboardingLease,
+        receipt_ref: &str,
+        principal_ref: &str,
+        session_ref: &str,
+        scope: &ScopeIdentity,
+        instance: &WorkspaceInstanceIdentity,
+        lineage: Option<&RepositoryLineageIdentity>,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        state_fence: &StateFence,
+        governance_profile_ref: &str,
+        limiting_integration_evidence: Vec<String>,
+        route_profile_ref: &str,
+        serializer_id: &str,
+        serializer_version: &str,
+        serializer_options_digest: &str,
+        tokenizer_id: &str,
+        tokenizer_version: &str,
+        tokenizer_hash: &str,
+        projection_source_ref: &str,
+        projection_generation: u64,
+        privacy: &PrivacyProfile,
+        task: TaskBindingInput,
+        now: u64,
+    ) -> Result<LeaseJoin, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.cold_start
+            .compile_and_publish(
+                trigger,
+                discovery_lease,
+                proposed,
+                receipt_ref,
+                principal_ref,
+                session_ref,
+                scope,
+                instance,
+                lineage,
+                candidate,
+                sources,
+                state_fence,
+                governance_profile_ref,
+                limiting_integration_evidence,
+                route_profile_ref,
+                serializer_id,
+                serializer_version,
+                serializer_options_digest,
+                tokenizer_id,
+                tokenizer_version,
+                tokenizer_hash,
+                projection_source_ref,
+                projection_generation,
+                privacy,
+                task,
+                now,
+            )
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Projects the retained terminal cold-start surface for one exact lease
+    /// key (issue #1790, readiness-surface production caller).
+    ///
+    /// Reads the terminal receipt the retained single-flight registry
+    /// published for the exact workspace filesystem/VCS identity, privacy
+    /// boundary and governing-source generation, and returns its
+    /// [`ColdStartSurfaceView`]: receipt reference, readiness token, smallest
+    /// missing question, lease deadline, receipt revision, and the instance
+    /// and projection identity the receipt was compiled for. Agent and Human
+    /// callers receive this compiled surface instead of a buried setup state;
+    /// a key with no published terminal fails closed here instead of
+    /// projecting an uncompiled disposition.
+    /// Live status: owning thin entry for the bridge delivery path; the live
+    /// bridge note path consumes no governor surface yet (BLOCKED-BY
+    /// bridge-transport: `bins/eliot-agent-bridge` `BootstrapContext`
+    /// intake).
+    pub fn cold_start_surface_for_lease(
+        &self,
+        lineage_candidate_ref: &str,
+        workspace_instance_candidate_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+    ) -> Result<ColdStartSurfaceView, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let (lease, receipt) = self
+            .cold_start
+            .terminal_for_key(
+                lineage_candidate_ref,
+                workspace_instance_candidate_ref,
+                privacy_class,
+                governing_source_generation,
+            )
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "no terminal cold-start receipt for lease key".to_owned(),
+                )
+            })?;
+        let surface = receipt
+            .surface(&lease)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(ColdStartSurfaceView {
+            receipt_ref: surface.receipt_ref,
+            readiness: cold_start_readiness_token(surface.readiness).to_owned(),
+            smallest_missing_question: surface.smallest_missing_question,
+            lease_deadline: surface.lease_deadline,
+            receipt_revision: receipt.receipt_revision,
+            workspace_instance_ref: receipt.instance.instance_ref.clone(),
+            projection_source_ref: receipt.projection_source_ref.clone(),
+            projection_generation: receipt.projection_generation,
+        })
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
