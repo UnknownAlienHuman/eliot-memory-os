@@ -9,7 +9,9 @@
 //! There is no second staffing, selection, or admission path: slot identity,
 //! selection digests, catalogue/policy pins, attempt/lease/fence identities,
 //! and admitted routes stay owned by their exact owners; this module only
-//! admits exact current values and records the resulting binding.
+//! admits exact values present in the supplied envelope and records the
+//! resulting binding. The current external receipt contracts expose no
+//! expiry field, so this module cannot establish their time currency.
 //!
 //! Fail-closed binding, in deterministic precedence:
 //!
@@ -22,9 +24,9 @@
 //! 3. admission-envelope structural validation (blank receipt refs, an invalid
 //!    [`StateFence`], an unvalidated provider identity, or an empty lane
 //!    denominator is rejected);
-//! 4. exact one-to-one denominator: the binding count must equal the staffed
-//!    slot count, every staffed slot resolves to exactly one binding, and
-//!    duplicate or extra slot bindings fail closed;
+//! 4. exact one-to-one denominator: binding and admitted-lane counts must
+//!    equal the staffed slot count, every staffed slot resolves to exactly
+//!    one binding/lane, and duplicate or extra identities fail closed;
 //! 5. per-slot identity survival: the caller-presented slot, selection,
 //!    catalogue, and policy pins must equal the staffed slot byte-for-byte,
 //!    so selection/catalogue/policy identity survives unchanged into the
@@ -45,9 +47,9 @@
 //!    ([`EpochId::is_same_authority`]); a stale epoch fails closed;
 //! 10. lane currency: the bound work-unit/attempt/lease triple must appear in
 //!     the current envelope lanes, and the matched lane must carry the same
-//!     external route receipt. Lease and attempt currency is exact-identity
-//!     match against the current envelope: a rotated, expired, or foreign
-//!     identity no longer appears there and fails closed instead of binding.
+//!     external route receipt. Lease and attempt identity must match the
+//!     route receipt and supplied envelope exactly. Expiry cannot be checked
+//!     without a time-bound field from the external receipt owner.
 //!
 //! The output is structurally candidate-only: `candidate_only` is true,
 //! `dispatch_authority` is false, execution counters are zero, and the value
@@ -139,7 +141,9 @@ pub struct SwarmSlotAdmission {
 
 /// Exact binding input: the complete staffing candidate, the current external
 /// admission envelope, one [`SwarmSlotAdmission`] per staffed slot, and the
-/// observation instant the binding is recorded against.
+/// non-zero observation instant the binding is recorded against. Current
+/// external admission contracts have no expiry field, so the instant cannot
+/// establish receipt freshness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmAdmissionBindRequest {
@@ -147,6 +151,8 @@ pub struct SwarmAdmissionBindRequest {
     pub staffing: SwarmStaffingCandidate,
     pub admission: ProviderAdmissionReceipt,
     pub bindings: Vec<SwarmSlotAdmission>,
+    /// Must be non-zero. The supplied external receipt has no expiry field,
+    /// so this timestamp cannot establish its time currency.
     pub now_unix_ms: u64,
 }
 
@@ -406,7 +412,21 @@ impl SwarmAdmissionPlanCandidate {
                 "admission.denominator",
             ));
         }
+        validate_lane_denominator(&self.admission, self.staffing.slots.len())?;
+        let mut work_unit_ids = BTreeSet::new();
+        let mut attempt_ids = BTreeSet::new();
+        let mut lease_ids = BTreeSet::new();
+        let mut route_receipt_digests = BTreeSet::new();
         for bound in &self.slots {
+            if !work_unit_ids.insert(&bound.work_unit_id)
+                || !attempt_ids.insert(&bound.attempt_id)
+                || !lease_ids.insert(&bound.lease_id)
+                || !route_receipt_digests.insert(bound.admitted_route.self_digest.as_str())
+            {
+                return Err(SwarmAdmissionBindError::InvalidField(
+                    "admission.denominator",
+                ));
+            }
             let Some(staffed) = self
                 .staffing
                 .slots
@@ -478,10 +498,9 @@ fn has_duplicate_slot_ids(slots: &[SwarmBoundSlot]) -> bool {
 /// Structural validation of the external admission envelope: receipt refs are
 /// non-blank, the envelope fence validates, the provider identity validates
 /// through its exact owner, and the lane denominator is non-empty and
-/// bounded. Currency of the envelope itself (whether this receipt is still
-/// the current admission) is the caller's responsibility: the compiler pins
-/// these exact bytes into the plan digest, so a superseded envelope yields a
-/// different plan rather than a silent rebinding.
+/// bounded. The external contract has no expiry/currentness field, so this
+/// function cannot establish time currency; the compiler pins these exact
+/// bytes into the plan digest and never mints a newer admission.
 fn validate_envelope(admission: &ProviderAdmissionReceipt) -> Result<(), SwarmAdmissionBindError> {
     validate_text(&admission.task_revision, "admission.task_revision")?;
     validate_text(
@@ -495,6 +514,34 @@ fn validate_envelope(admission: &ProviderAdmissionReceipt) -> Result<(), SwarmAd
     admission.provider_identity.validate()?;
     if admission.admitted_lanes.is_empty() || admission.admitted_lanes.len() > MAX_STAFFING_SLOTS {
         return Err(SwarmAdmissionBindError::InvalidField("admission.lanes"));
+    }
+    Ok(())
+}
+
+/// The external envelope must contain exactly one distinct admitted lane for
+/// every staffed slot. A shared lane cannot satisfy multiple slots, and an
+/// unrelated extra lane cannot be smuggled into this candidate's denominator.
+fn validate_lane_denominator(
+    admission: &ProviderAdmissionReceipt,
+    expected_slots: usize,
+) -> Result<(), SwarmAdmissionBindError> {
+    if admission.admitted_lanes.len() != expected_slots {
+        return Err(SwarmAdmissionBindError::InvalidField(
+            "admission.lanes.denominator",
+        ));
+    }
+    let mut work_unit_ids = BTreeSet::new();
+    let mut attempt_ids = BTreeSet::new();
+    let mut lease_ids = BTreeSet::new();
+    for lane in &admission.admitted_lanes {
+        if !work_unit_ids.insert(&lane.work_unit_id)
+            || !attempt_ids.insert(&lane.attempt_id)
+            || !lease_ids.insert(&lane.lease_id)
+        {
+            return Err(SwarmAdmissionBindError::DuplicateIdentity(
+                "admission.lanes",
+            ));
+        }
     }
     Ok(())
 }
@@ -516,8 +563,21 @@ fn check_bound_slot(
     {
         return Err(SwarmAdmissionBindError::InvalidField("admission.route"));
     }
+    if bound.admitted_route.attempt_id != bound.attempt_id
+        || bound.admitted_route.lease_id != bound.lease_id
+        || bound.admitted_route.runtime_generation != bound.fence.resource_generation
+    {
+        return Err(SwarmAdmissionBindError::InvalidField(
+            "admission.route_identity",
+        ));
+    }
     if bound.fence != bound.admitted_route.state_fence {
         return Err(SwarmAdmissionBindError::InvalidField("admission.fence"));
+    }
+    if bound.fence != admission.state_fence {
+        return Err(SwarmAdmissionBindError::InvalidField(
+            "admission.envelope_fence",
+        ));
     }
     if bound.fence.validate().is_err() {
         return Err(SwarmAdmissionBindError::InvalidField("admission.fence"));
@@ -538,12 +598,11 @@ fn check_bound_slot(
     Ok(())
 }
 
-/// The bound work-unit/attempt/lease triple must appear in the current
-/// envelope lanes, the matched lane must carry the same external route
+/// The bound work-unit/attempt/lease triple must appear in the supplied
+/// envelope lanes, the matched lane must carry the exact external route
 /// receipt, and the lane route must equal the bound route. A triple the
-/// current envelope does not admit — rotated, expired, or foreign — fails
-/// closed here; the compiler cannot distinguish those cases and must not
-/// mint replacements.
+/// supplied envelope does not admit — rotated or foreign — fails closed;
+/// this compiler does not mint replacements or establish envelope freshness.
 fn check_lane_currency(
     bound: &SwarmBoundSlot,
     admission: &ProviderAdmissionReceipt,
@@ -558,7 +617,7 @@ fn check_lane_currency(
     let Some(lane_route) = lane.admitted_route.as_ref() else {
         return Err(SwarmAdmissionBindError::StaleGeneration);
     };
-    if lane_route.self_digest != bound.admitted_route.self_digest {
+    if lane_route != &bound.admitted_route {
         return Err(SwarmAdmissionBindError::StaleGeneration);
     }
     if lane.route != bound.route {
@@ -571,8 +630,10 @@ fn check_lane_currency(
 ///
 /// Pure and deterministic: no provider/model call, no process launch or
 /// cancel, no lease/fence/attempt/route issuance, no Task write, no mailbox
-/// mutation, no fallback. Any missing, extra, duplicate, stale, expired,
-/// mismatched, or tampered binding fails closed.
+/// mutation, no fallback. Any missing, extra, duplicate, stale, mismatched,
+/// or tampered binding fails closed. The external receipt owner currently
+/// exposes no expiry field, so this candidate compiler cannot reject solely
+/// on receipt age.
 pub fn compile_swarm_admission_plan(
     request: &SwarmAdmissionBindRequest,
 ) -> Result<SwarmAdmissionPlanCandidate, SwarmAdmissionBindError> {
