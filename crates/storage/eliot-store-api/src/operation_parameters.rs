@@ -155,6 +155,8 @@ pub enum ParameterShape {
     CampaignSourcePublications,
     /// Closed content-addressed campaign view selector for issue #1862.
     CampaignViewLookup,
+    /// Closed owner-separated swarm revision record and complete canonical bytes.
+    SwarmOwnerRevision,
 }
 
 impl ParameterShape {
@@ -169,6 +171,7 @@ impl ParameterShape {
             Self::CampaignSourceLookup => "eliot.learning.campaign-source-lookup.v1",
             Self::CampaignSourcePublications => "eliot.learning.campaign-source-publications.v1",
             Self::CampaignViewLookup => "eliot.learning.campaign-view-lookup.v1",
+            Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
         }
     }
 }
@@ -914,6 +917,13 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 9] = [
     },
 ];
 
+/// One bounded immutable swarm owner revision.
+static APPLY_SWARM_OWNER_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "record",
+    shape: ParameterShape::SwarmOwnerRevision,
+    required: true,
+}];
+
 /// Returns the canonical operation name bound into manifests and digests.
 ///
 /// The spelling matches the `PascalCase` serde wire form of each variant, so
@@ -989,6 +999,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::CaptureObservation => "CaptureObservation",
         NamedMutationOperation::ApplyEpistemicRevision => "ApplyEpistemicRevision",
         NamedMutationOperation::UpdateTaskState => "UpdateTaskState",
+        NamedMutationOperation::ApplySwarmOwnerRevisions => "ApplySwarmOwnerRevisions",
         NamedMutationOperation::ApplyLifecyclePolicy => "ApplyLifecyclePolicy",
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
@@ -1012,6 +1023,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"CaptureObservation" => Some(NamedMutationOperation::CaptureObservation),
         b"ApplyEpistemicRevision" => Some(NamedMutationOperation::ApplyEpistemicRevision),
         b"UpdateTaskState" => Some(NamedMutationOperation::UpdateTaskState),
+        b"ApplySwarmOwnerRevisions" => Some(NamedMutationOperation::ApplySwarmOwnerRevisions),
         b"ApplyLifecyclePolicy" => Some(NamedMutationOperation::ApplyLifecyclePolicy),
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
@@ -1154,6 +1166,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
+        NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
@@ -1245,7 +1258,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
         | ParameterShape::CampaignSourcePublications
-        | ParameterShape::CampaignViewLookup => true,
+        | ParameterShape::CampaignViewLookup
+        | ParameterShape::SwarmOwnerRevision => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1418,6 +1432,11 @@ fn check_declared_shape(
                 serde_json::from_value(value.clone())
                     .map_err(|error| StoreError::Serialization(error.to_string()))?;
             lookup.validate()
+        }
+        ParameterShape::SwarmOwnerRevision => {
+            let record: crate::SwarmOwnerRevision = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            record.validate()
         }
     }
 }

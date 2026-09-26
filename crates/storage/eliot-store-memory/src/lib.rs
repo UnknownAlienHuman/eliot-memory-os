@@ -303,6 +303,16 @@ impl MemoryStore {
             expected_revision_heads,
             expected_ordering_heads,
         )?;
+        if transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplySwarmOwnerRevisions)
+        {
+            // This backend is an in-memory reference model, not the durable
+            // owner-history implementation. Fail closed instead of returning
+            // a committed receipt for rows it cannot durably retain.
+            return Err(StoreError::Unavailable);
+        }
         let epistemic = EpistemicCommit::from_prepared(ctx, &transition)?;
         let epistemic_key = epistemic
             .as_ref()
@@ -3036,6 +3046,7 @@ fn validate_transaction_state(
                 command.operation,
                 NamedMutationOperation::RecordFinishDecision
                     | NamedMutationOperation::RecordFinishEvidence
+                    | NamedMutationOperation::ApplySwarmOwnerRevisions
             )
         })
     {

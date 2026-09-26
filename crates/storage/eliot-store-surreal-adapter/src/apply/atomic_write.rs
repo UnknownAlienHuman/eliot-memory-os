@@ -104,6 +104,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "finish_owner_create_conflict",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
+    "swarm_owner_revision_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation
@@ -505,6 +506,7 @@ fn build_apply_statements(
     // #223 experience writes and #325 finish owner snapshots commit atomically
     // with the canonical receipt.
     append_experience_statements(&mut sql, &mut bindings, experience)?;
+    append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -811,6 +813,30 @@ fn append_experience_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "experience binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends owner-separated swarm records and revision heads when the named
+/// operation is activated after its semantic-owner gate is available (#1702).
+///
+/// Immutable record bytes, owner-head CAS and the canonical receipt commit in
+/// this one transaction. The operation remains unactivated by the catalogue,
+/// so normal transition validation rejects it before this writer is reached.
+fn append_swarm_owner_revision_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_swarm::swarm_owner_revision_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "swarm binding collided with a canonical binding".to_owned(),
             ));
         }
     }
