@@ -858,9 +858,14 @@ impl EvalRunnerService {
             } else {
                 Vec::new()
             };
+        // Only observed failure fails a run (issue #1922 reachability):
+        // `NotYetImplemented` (and `Skipped`/`Blocked`) is non-evidence,
+        // not failure. A run whose cases all executed without an observed
+        // failure is `Completed`; measured validity stays with the verdict
+        // and the integrity receipt, which still gate every promotion.
         let failed_required = case_results
             .iter()
-            .any(|result| result.status != EvalCaseStatus::Passed);
+            .any(|result| result.status == EvalCaseStatus::Failed);
         let (status, blocked_reason) = if !integrity.valid {
             (
                 EvalRunStatus::BlockedInvalidDataset,
@@ -1477,9 +1482,24 @@ impl EvalBaselineService {
                 "eval baseline requires passing benchmark integrity receipt".to_owned(),
             ));
         }
-        if run.status != EvalRunStatus::Completed || verdict.status != EvalVerdictStatus::Pass {
+        // A baseline records the observed reference outcome of a real
+        // completed run; it is not a validity claim (issue #1922
+        // reachability). `Inconclusive` verdicts (NYI-gated runs) are
+        // retained honestly with `overall_status: Inconclusive`: downstream
+        // gates still block them via family thresholds, and drift still
+        // marks them `Stale`. Observed failure can never anchor a baseline.
+        if run.status != EvalRunStatus::Completed {
             return Err(EngineError::WriteRejected(
-                "normal eval baseline requires passing eval run".to_owned(),
+                "eval baseline requires completed eval run".to_owned(),
+            ));
+        }
+        if !matches!(
+            verdict.status,
+            EvalVerdictStatus::Pass | EvalVerdictStatus::Inconclusive
+        ) {
+            return Err(EngineError::WriteRejected(
+                "eval baseline requires passing or inconclusive eval verdict; a failed run cannot anchor a baseline"
+                    .to_owned(),
             ));
         }
         Ok(Self::baseline(
