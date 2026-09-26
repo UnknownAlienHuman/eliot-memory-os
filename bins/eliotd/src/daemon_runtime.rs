@@ -1167,6 +1167,13 @@ async fn run_loop(
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
+                // #791 (W4/W17): publish the shutdown request to the Kernel
+                // client before the drain. Every pending front-door send
+                // observes it and settles as `UnknownOutcome` instead of
+                // holding this process open until the transport's own
+                // per-operation timeout, while the flight drain below keeps
+                // its exact existing budget, identity retention and outcomes.
+                kernel.request_shutdown();
                 // Issue #2559: already-started flights drain together inside
                 // one finite budget while every one of them stays polled; no
                 // new claim starts here.
