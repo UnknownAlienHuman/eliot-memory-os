@@ -230,6 +230,17 @@ impl AnalyzerConfig {
         hex_bytes(Sha256::digest(canonical.as_bytes()).as_slice())
     }
 
+    /// Reports whether this configuration narrows analyzed coverage past what
+    /// the receipt records. Disabled build scripts leave build-generated cfg
+    /// unevaluated and disabled proc macros leave macro-generated code
+    /// unobserved, so an empty lookup under either flag cannot prove absence
+    /// for the affected scope (I10.8.6
+    /// `unknown_due_to_cfg_or_macro_coverage`).
+    #[must_use]
+    pub const fn cfg_or_macro_coverage_limited(&self) -> bool {
+        self.disable_build_scripts || self.disable_proc_macros
+    }
+
     fn diagnostic_flags(&self) -> Vec<String> {
         let mut flags = Vec::new();
         if self.disable_build_scripts {
@@ -658,16 +669,20 @@ impl NormalizedResult {
 
     /// Classifies this result's lookup through the I10.8.6 absence gate.
     ///
-    /// `scope_complete_for_query` attests that the receipt's declared scope
-    /// covers the query (a subset listing answers only its own scope, never
-    /// the workspace). `exact_candidate_binding` attests that the analyzed
-    /// index is bound to the exact candidate and scope under evaluation; the
-    /// receipt alone never proves that binding. The bridge tracks no
-    /// counterevidence, so contradiction is always unattested here and
-    /// downstream disagreement handling (I10.8.19) owns it instead.
+    /// `config` is the analyzer configuration that produced this result; its
+    /// build-script and proc-macro flags are read here because they narrow
+    /// analyzed coverage past what the receipt records. `scope_complete_for_query`
+    /// attests that the receipt's declared scope covers the query (a subset
+    /// listing answers only its own scope, never the workspace).
+    /// `exact_candidate_binding` attests that the analyzed index is bound to
+    /// the exact candidate and scope under evaluation; the receipt alone never
+    /// proves that binding. The bridge tracks no counterevidence, so
+    /// contradiction is always unattested here and downstream disagreement
+    /// handling (I10.8.19) owns it instead.
     #[must_use]
     pub fn lookup_outcome(
         &self,
+        config: &AnalyzerConfig,
         scope_complete_for_query: bool,
         exact_candidate_binding: bool,
     ) -> LookupOutcome {
@@ -685,6 +700,7 @@ impl NormalizedResult {
                 scope_complete_for_query,
                 found_any,
                 exact_candidate_binding,
+                cfg_or_macro_coverage_limited: config.cfg_or_macro_coverage_limited(),
                 contradicted_by_higher_authority: false,
             },
         )
@@ -717,11 +733,12 @@ pub enum LookupOutcome {
 /// The receipt records what the run observed; these flags record what the
 /// caller has established about the query: whether the receipt's declared
 /// scope covers it, whether the lookup returned anything, whether the
-/// analyzed index is bound to the exact candidate and scope, and whether
+/// analyzed index is bound to the exact candidate and scope, whether the
+/// analyzer configuration narrowed cfg/macro coverage, and whether
 /// higher-authority evidence contradicts the absence.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "four independent caller attestations; an enum per flag would quadruple the vocabulary for one call"
+    reason = "five independent caller attestations; an enum per flag would quintuple the vocabulary for one call"
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LookupClassification {
@@ -731,6 +748,8 @@ pub struct LookupClassification {
     pub found_any: bool,
     /// The analyzed index is bound to the exact candidate and scope.
     pub exact_candidate_binding: bool,
+    /// Disabled build scripts or proc macros narrowed cfg/macro coverage.
+    pub cfg_or_macro_coverage_limited: bool,
     /// Higher-authority evidence contradicts the absence.
     pub contradicted_by_higher_authority: bool,
 }
@@ -740,9 +759,13 @@ pub struct LookupClassification {
 /// A run that failed, truncated, or did not normalize reports
 /// [`UnknownOutcome::UnknownDueToTruncationOrToolFailure`] even though the
 /// receipt also records stale freshness: the disposition names the root
-/// cause while staleness is its derived symptom. A merely current run is
-/// still freshness-unknown for absence until the caller attests the exact
-/// candidate binding, because run currency never proves candidate identity.
+/// cause while staleness is its derived symptom. A successful run under a
+/// cfg/macro-narrowed configuration reports
+/// [`UnknownOutcome::UnknownDueToCfgOrMacroCoverage`] before freshness and
+/// coverage are consulted, because the narrowed view bounds what the run
+/// could have observed. A merely current run is still freshness-unknown for
+/// absence until the caller attests the exact candidate binding, because run
+/// currency never proves candidate identity.
 #[must_use]
 pub fn classify_lookup(
     receipt: &ObservationReceipt,
@@ -752,7 +775,13 @@ pub fn classify_lookup(
         return LookupOutcome::Found;
     }
     let absence_capability = match receipt.disposition {
-        FailureDisposition::Success => Ok(()),
+        FailureDisposition::Success => {
+            if classification.cfg_or_macro_coverage_limited {
+                Err(UnknownOutcome::UnknownDueToCfgOrMacroCoverage)
+            } else {
+                Ok(())
+            }
+        }
         FailureDisposition::ToolFailed { .. }
         | FailureDisposition::OutputTruncated
         | FailureDisposition::ParseFailed { .. }

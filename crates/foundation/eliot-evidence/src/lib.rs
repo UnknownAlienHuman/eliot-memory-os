@@ -319,28 +319,6 @@ pub struct EvidenceEnvelope {
 }
 
 impl EvidenceEnvelope {
-    /// I10.8.6 absence gate over this envelope's recorded dimensions.
-    ///
-    /// `absence_capability` is the instrument contract's own absence verdict:
-    /// `Ok(())` when the contract can prove absence, or the typed unknown
-    /// naming why it cannot. `higher_authority_contradiction` carries the
-    /// contradicting envelope when the caller has established higher
-    /// authority for the queried property; authority is property-relative
-    /// (I10.8.5), so this gate never ranks authorities itself.
-    #[must_use]
-    pub fn check_absence_claim(
-        &self,
-        absence_capability: Result<(), UnknownOutcome>,
-        higher_authority_contradiction: Option<&EvidenceEnvelope>,
-    ) -> AbsenceVerdict {
-        check_absence_preconditions(
-            self.freshness,
-            self.coverage,
-            absence_capability,
-            higher_authority_contradiction.is_some(),
-        )
-    }
-
     /// Validates provenance, fence and status/epistemic safety invariants.
     pub fn validate(&self) -> Result<(), EvidenceError> {
         self.provenance.validate()?;
