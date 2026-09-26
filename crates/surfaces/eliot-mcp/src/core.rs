@@ -1941,21 +1941,32 @@ impl JsonRpcId {
     /// wire presentation must not stage a second operation for it either.
     /// The wire correlation is the durable logical-key occurrence and the
     /// durable record's `request_id` (issue #2571), so the invocation replay
-    /// path consults the bounded legacy alias
+    /// path consults the bounded legacy lookup
     /// ([`legacy_bare_occurrence`]) before treating an authoritative
-    /// `Absent` as permission to submit: a repeated admitted logical
-    /// request returns the original operation/result with no second
-    /// dispatch, and no pre-upgrade row is orphaned. A legacy bare row is
-    /// a shared ancestor — both `int:7` and `str:7` alias the same bare
-    /// row, preserving the pre-upgrade sharing exactly — while every row
-    /// staged under the qualified encoding stays distinct. Cancellation
-    /// needs no alias: an absent qualified intent falls back to the
-    /// observation-only parent probe, which never issues execution. The
-    /// legacy form is computed, never stored: stripping one 4-byte type
-    /// tag from an admitted correlation (at most
-    /// `MAX_HOST_CORRELATION_BYTES` per `HostCorrelationId::new`) always
-    /// fits the same bound, so the probe is one extra bounded lookup with
-    /// no alias tables and no new byte-limit surface.
+    /// `Absent` as permission to submit. Within one admitted application
+    /// scope (same kernel-admitted session, capability, and payload
+    /// commitment — the scope the owner binds, restarted transports reuse
+    /// the explicit session/task binding per I7.7), a repeated admitted
+    /// logical request returns the original operation/result with no
+    /// second dispatch, and no pre-upgrade row is orphaned; the stored
+    /// result is verified against the record's own staged occurrence. A
+    /// legacy bare row is a shared ancestor — both `int:7` and `str:7`
+    /// resolve the same bare row, preserving the pre-upgrade sharing
+    /// exactly — while every row staged under the qualified encoding
+    /// stays distinct. A fresh kernel session is a new logical scope by
+    /// the owner's session binding: its authoritative `Absent` submits
+    /// exactly as a pre-upgrade generation did on the same miss, with no
+    /// reinterpretation and no eviction; cross-scope continuity is owned
+    /// by #2571's application-continuity keying, not by this projection.
+    /// Cancellation needs no legacy lookup: an absent qualified intent
+    /// falls back to the observation-only parent probe, which never
+    /// issues execution. Byte accounting: the qualifier reserves 4 bytes
+    /// of `MAX_HOST_CORRELATION_BYTES`, so at most 508 wire bytes cross
+    /// as invocation correlation (fewer under longer intent prefixes);
+    /// over-long wire strings fail closed at `HostCorrelationId::new`
+    /// instead of truncating. The legacy form is computed, never stored:
+    /// the probe is one extra bounded lookup with no lookup tables and
+    /// no new byte-limit surface.
     #[must_use]
     pub fn correlation_text(&self) -> String {
         match self {
@@ -1975,8 +1986,8 @@ impl JsonRpcId {
 }
 
 /// Projects one qualified correlation back to the previous transport
-/// generation's bare occurrence (issue #2765 W4: the durable-compat alias
-/// consulted by invocation replay before any fresh submit).
+/// generation's bare occurrence (issue #2765 W4: the durable-compat
+/// lookup consulted by invocation replay before any fresh submit).
 ///
 /// The pre-`int:`/`str:` projection carried the wire identity verbatim —
 /// integers as decimal text, strings verbatim — so the bare occurrence of
@@ -1985,9 +1996,13 @@ impl JsonRpcId {
 /// is stripped; input without a tag, with an empty or blank remainder,
 /// with control characters, or in the `cancel:` intent domain has no
 /// legacy invocation occurrence and yields `None`. The result borrows the
-/// input: no allocation, no table, at most one alias probe per replay
-/// miss. Byte accounting: the bare form is the qualified form minus the
-/// 4-byte tag, so every admitted qualified correlation (bounded by
+/// input: no allocation, no table, at most one compat probe per replay
+/// miss. This is production lookup input for one bounded owner resolve
+/// exchange, not a test-only stub and not a behavior shim: the owner
+/// recomputes the durable key from the presented selectors and echoes it,
+/// and the hit is verified exactly like the primary lookup. Byte
+/// accounting: the bare form is the qualified form minus the 4-byte tag,
+/// so every admitted qualified correlation (bounded by
 /// `MAX_HOST_CORRELATION_BYTES` at `HostCorrelationId::new`, blank and
 /// control characters already rejected there) projects inside the same
 /// bound with room to spare.
