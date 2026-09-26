@@ -17,7 +17,9 @@ use super::daemon_request_dispatch::{
 };
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
-use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
+use super::generation_control::{
+    ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, GENERATION_CUTOVER_OPERATION,
+};
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::request_dispatch::is_backup_operation;
 use super::wasm_runtime_port_grant::{
@@ -1183,6 +1185,18 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "origin_challenge_issue"
             | "origin_control_decide"
             | ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
+            // The write half of the same generation control plane as the
+            // projection read above. The marker is the one string the admitted
+            // daemon dispatch at `daemon_request_dispatch.rs` already serves
+            // (`GENERATION_CUTOVER_OPERATION`); it was absent here, so the frame
+            // fell through every predicate, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session before
+            // the cutover arm was ever entered. This entry only lets the frame
+            // reach it: the arm still proves the module binding, the peer
+            // principal, and the exact session State Fence, and the generation,
+            // epoch, route scope, and cutover state still come from the owner's
+            // committed ORS cutover-ownership record rather than the payload.
+            | GENERATION_CUTOVER_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
             // Issue #1779: the authenticated `UserAutomation` runtime route.
             // The marker is the closed daemon operation name the retained
