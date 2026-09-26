@@ -102,6 +102,158 @@ def load_fixture_json(name: str) -> tuple[str, object | None]:
     return raw, json.loads(raw)
 
 
+def require_fixture_json(case: int, name: str) -> tuple[str, object]:
+    """Load a frozen JSON fixture and fail the case when it is absent.
+
+    The frozen bundle is the evidence this gate reasons about, so a missing
+    or unreadable fixture must block dispatch instead of degrading the case
+    to a live-only probe. Returning ``None`` here and branching on it would
+    let the whole denominator report OK with zero dependency evidence, which
+    is the exact false-ready state acceptance item 14 forbids.
+    """
+    raw, parsed = load_fixture_json(name)
+    if parsed is None:
+        raise AssertionError(
+            f"974/{case}: frozen evidence {name} is missing or unreadable under "
+            f"{FIXTURE_DIR.name}/; stale or absent evidence blocks dispatch",
+        )
+    return raw, parsed
+
+
+def require_fixture_base(case: int, name: str, field: str, parsed: object) -> None:
+    """Fail the case when a frozen fixture is not pinned to the declared base.
+
+    Freshness is recorded by the fixtures themselves: the denominator pins
+    ``frozen_base`` and the lock delta pins ``base``, both at
+    :data:`BASE_COMMIT`. A fixture that names a different base describes a
+    different frozen state and therefore stale evidence, so it blocks rather
+    than passing silently.
+    """
+    assert isinstance(parsed, dict), f"974/{case}: {name} must be a JSON object"
+    pinned = parsed.get(field)
+    if pinned != BASE_COMMIT:
+        raise AssertionError(
+            f"974/{case}: {name} is pinned to {pinned!r}, not the declared base "
+            f"{BASE_COMMIT}; stale dependency evidence blocks dispatch",
+        )
+
+
+def require_frozen_manifests(case: int, fixture: object) -> None:
+    """Fail the case when a frozen affected manifest no longer exists.
+
+    A denominator that names a path the tree does not contain describes a
+    repository state that is gone, so the evidence is stale.
+    """
+    assert isinstance(fixture, dict), f"974/{case}: denominator must be a JSON object"
+    manifests = fixture.get("affected_manifests")
+    assert isinstance(manifests, list)
+    for relative in manifests:
+        if not (REPO_ROOT / str(relative)).is_file():
+            raise AssertionError(
+                f"974/{case}: frozen affected manifest {relative!r} is absent from "
+                "the tree; stale dependency evidence blocks dispatch",
+            )
+
+
+def require_frozen_edges(case: int, fixture: object) -> None:
+    """Fail the case when a frozen edge no longer holds in the live manifests.
+
+    This is the content half of the staleness check. The base pin says which
+    state the evidence was frozen at; this says the edge is still declared
+    where the evidence says it is. Line numbers are deliberately NOT compared:
+    they move on every unrelated edit, and the repository's own delivery
+    doctrine anchors evidence on ``path::symbol`` precisely because a line
+    number is not a stable identity. Checking one would make this case fail on
+    a rename instead of on real drift.
+    """
+    assert isinstance(fixture, dict), f"974/{case}: denominator must be a JSON object"
+    edges = fixture.get("dependency_edges")
+    assert isinstance(edges, list) and edges
+    for edge in edges:
+        assert isinstance(edge, dict)
+        relative = str(edge.get("manifest", ""))
+        dependency = str(edge.get("dependency", ""))
+        manifest_path = REPO_ROOT / relative
+        if not manifest_path.is_file():
+            raise AssertionError(
+                f"974/{case}: frozen edge names manifest {relative!r}, which is "
+                "absent; stale dependency evidence blocks dispatch",
+            )
+        if dependency not in manifest_dependencies(manifest_path):
+            raise AssertionError(
+                f"974/{case}: frozen edge claims {relative!r} declares "
+                f"{dependency!r}, and it no longer does; stale dependency "
+                "evidence blocks dispatch",
+            )
+
+
+def require_frozen_symbols(case: int, fixture: object) -> None:
+    """Fail the case when a frozen edge justification no longer exists.
+
+    Case 2 exists to prove that every declared edge is justified by an
+    accepted public symbol. Comparing the frozen bundle's raw text against two
+    substrings proves nothing about that, so the parsed edge list is resolved
+    against the live tree instead: the named symbol must still be declared in
+    the file the evidence names, and the consumer must still import the crate.
+    """
+    assert isinstance(fixture, dict), f"974/{case}: edge symbols must be an object"
+    edges = fixture.get("edges")
+    assert isinstance(edges, list) and edges, "frozen edge list is empty"
+    for edge in edges:
+        assert isinstance(edge, dict)
+        symbol = str(edge.get("imported_public_symbol", ""))
+        symbol_file = str(edge.get("symbol_file", ""))
+        consumer_file = str(edge.get("consumer_file", ""))
+        dependency = str(edge.get("dependency", ""))
+        for relative in (symbol_file, consumer_file):
+            if not (REPO_ROOT / relative).is_file():
+                raise AssertionError(
+                    f"974/{case}: frozen edge names source {relative!r}, which is "
+                    "absent; stale dependency evidence blocks dispatch",
+                )
+        if symbol not in read_text(REPO_ROOT / symbol_file):
+            raise AssertionError(
+                f"974/{case}: frozen edge claims {symbol!r} in {symbol_file!r} and "
+                "it is no longer declared there; stale dependency evidence blocks "
+                "dispatch",
+            )
+        crate = dependency.replace("-", "_")
+        if not uses_crate(read_text(REPO_ROOT / consumer_file), crate):
+            raise AssertionError(
+                f"974/{case}: frozen edge claims {consumer_file!r} imports "
+                f"{crate!r} and it no longer does; stale dependency evidence "
+                "blocks dispatch",
+            )
+
+
+def require_frozen_lock_delta(case: int, fixture: object) -> None:
+    """Fail the case when the frozen lock delta no longer holds in Cargo.lock.
+
+    ``kernel_lock_includes`` names the packages the prepared edges added to the
+    lock; each must still resolve there. ``forbidden`` is a vocabulary of
+    change kinds rather than package names, so it is not matched against the
+    lock; what is checked instead is the property those kinds deny, namely that
+    a frozen package did not acquire a registry source or checksum and become
+    an upgrade.
+    """
+    assert isinstance(fixture, dict), f"974/{case}: lock delta must be an object"
+    includes = fixture.get("kernel_lock_includes")
+    assert isinstance(includes, list) and includes
+    packages = lock_packages()
+    for name in includes:
+        entry = packages.get(str(name))
+        if entry is None:
+            raise AssertionError(
+                f"974/{case}: frozen lock delta includes {name!r}, which the lock "
+                "no longer resolves; stale dependency evidence blocks dispatch",
+            )
+        if "source" in entry or "checksum" in entry:
+            raise AssertionError(
+                f"974/{case}: frozen package {name!r} now carries a registry "
+                "source, which is the upgrade the frozen delta forbids",
+            )
+
+
 def sha256_hex(data: bytes) -> str:
     """Return the hex SHA-256 digest of ``data``."""
     return hashlib.sha256(data).hexdigest()
@@ -132,6 +284,21 @@ def validate_denominator(obj: object) -> list[str]:
     if obj.get("cases") != DENOMINATOR_CASES:
         errors.append(f"cases must be exactly 1..14, got {obj.get('cases')!r}")
     return errors
+
+
+def validate_denominator_text(raw: str) -> list[str]:
+    """Validate denominator evidence that is still in its serialized form.
+
+    Frozen evidence arrives as text, and evidence that cannot be read is not a
+    denominator. Text that does not parse is therefore itself the validator's
+    error list, so a caller can ask the same question of bytes and of a parsed
+    value without special-casing the failure.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return [f"denominator is not valid JSON: {error}"]
+    return validate_denominator(parsed)
 
 
 def live_denominator() -> dict:
@@ -187,12 +354,23 @@ class BackupDependencyLinkTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        # Frozen fixtures are owned by a separate writer. Record availability;
-        # every case validates the live repository unconditionally and
-        # cross-checks fixture content when the frozen bundle is present.
-        cls.fixtures_available = all(
-            (FIXTURE_DIR / name).is_file() for name in FROZEN_FIXTURES
-        )
+        # The frozen bundle IS the dependency evidence for this gate. Its
+        # absence must fail the whole class rather than be recorded and
+        # ignored: every case below is a claim about a frozen denominator, and
+        # a claim with no evidence behind it is a false readiness report. The
+        # flag stays a real, asserted invariant that each evidence case reads
+        # before it compares fixture content, so it can never become a
+        # write-only field again.
+        missing = [
+            name for name in FROZEN_FIXTURES if not (FIXTURE_DIR / name).is_file()
+        ]
+        if missing:
+            raise AssertionError(
+                "frozen dependency evidence is missing: "
+                f"{sorted(missing)} under {FIXTURE_DIR.name}/; "
+                "stale or absent evidence blocks dispatch",
+            )
+        cls.fixtures_available = True
 
     # WORK_UNIT_CASE: 974/1
     def test_01_denominator(self) -> None:
@@ -209,13 +387,39 @@ class BackupDependencyLinkTests(unittest.TestCase):
         module_doc = read_text(Path(__file__).resolve())
         self.assertIn("14 cases", module_doc)
         self.assertIn(BASE_COMMIT, module_doc)
-        raw, fixture = load_fixture_json("denominator.json")
-        if fixture is not None:
-            self.assertIn("974", raw, "denominator fixture is not bound to #974")
-            if isinstance(fixture, dict) and "cases" in fixture:
-                cases = fixture["cases"]
-                self.assertEqual(sorted(cases), DENOMINATOR_CASES)
-                self.assertEqual(len(cases), 14)
+        raw, fixture = require_fixture_json(1, "denominator.json")
+        self.assertTrue(self.fixtures_available)
+        require_fixture_base(1, "denominator.json", "frozen_base", fixture)
+        require_frozen_manifests(1, fixture)
+        require_frozen_edges(1, fixture)
+        self.assertIn("974", raw, "denominator fixture is not bound to #974")
+        # The frozen denominator is the exact finite set of affected manifests
+        # and dependency edges, not a copy of the case list: the 14-case
+        # denominator is this module's own invariant, checked above against
+        # `live_denominator()`. Both sets must be present, finite and fully
+        # named, and the recorded digest must have the shape of a digest.
+        manifests = fixture.get("affected_manifests")
+        self.assertIsInstance(manifests, list, "affected_manifests must be frozen")
+        self.assertTrue(manifests, "affected_manifests is empty: no denominator frozen")
+        for entry in manifests:
+            self.assertIsInstance(entry, str)
+            self.assertTrue(entry.strip(), "affected_manifests contains a blank entry")
+        edges = fixture.get("dependency_edges")
+        self.assertIsInstance(edges, list, "dependency_edges must be frozen")
+        self.assertTrue(edges, "dependency_edges is empty: no denominator was frozen")
+        for entry in edges:
+            self.assertIsInstance(entry, dict, "a frozen edge is not a named edge")
+            for field in ("consumer", "dependency", "manifest", "symbol"):
+                self.assertTrue(
+                    str(entry.get(field, "")).strip(),
+                    f"frozen edge omits {field}: an unnamed edge is not evidence",
+                )
+            self.assertIsInstance(entry.get("line"), int)
+        self.assertRegex(
+            str(fixture.get("denominator_digest", "")),
+            re.compile(r"^[0-9a-f]{64}$"),
+            "frozen denominator records no digest",
+        )
 
     # WORK_UNIT_CASE: 974/2
     def test_02_edge_symbols(self) -> None:
@@ -247,10 +451,13 @@ class BackupDependencyLinkTests(unittest.TestCase):
         # Negative: kernel must not claim a direct blob-api edge.
         self.assertNotIn("eliot-blob-api", kernel_deps)
         self.assertNotIn("eliot_blob_api", read_text(KERNEL_BACKUP_RS))
-        raw, fixture = load_fixture_json("edge-symbols.json")
-        if fixture is not None:
-            self.assertIn("eliot-backup", raw)
-            self.assertIn("eliot-blob-api", raw)
+        raw, fixture = require_fixture_json(2, "edge-symbols.json")
+        self.assertTrue(self.fixtures_available)
+        self.assertIn("eliot-backup", raw)
+        self.assertIn("eliot-blob-api", raw)
+        # Resolved against the live tree rather than matched as text: a
+        # substring check would stay green for a bundle that names no edge.
+        require_frozen_symbols(2, fixture)
 
     # WORK_UNIT_CASE: 974/3
     def test_03_noop(self) -> None:
@@ -291,21 +498,39 @@ class BackupDependencyLinkTests(unittest.TestCase):
                     uses_crate(combined, crate),
                     f"{dep} has no `use` justification in {[s.name for s in sources]}",
                 )
-        # Negative: watchdog admits none of these edges and uses none of them.
+        # Negative: the watchdog binary must not claim a backup orchestration
+        # or provider edge. `eliot-protocol` is deliberately NOT in this list:
+        # it is an owner-neutral IPC/protocol contract edge accepted for the
+        # watchdog by #1754 (PR #2620) and used by
+        # `src/watchdog_spool/intent.rs`, and #974 prepares only the missing
+        # backup edges. Its declaration form is asserted positively below
+        # instead, which is a stronger check than a blanket absence.
         watchdog_deps = manifest_dependencies(WATCHDOG_MANIFEST)
         for forbidden in (
             "eliot-backup",
             "eliot-blob-api",
             "eliot-blob",
             "eliot-ipc",
-            "eliot-protocol",
         ):
             self.assertNotIn(forbidden, watchdog_deps)
+        # The one admitted protocol edge must stay a bare workspace alias: no
+        # path pin, no version pin, no provider source, no feature or
+        # default-features edit. That is the "version/source/features
+        # preserved, only admitted canonical packages linked" rule stated as
+        # a live assertion on the edge instead of an absence.
+        self.assertEqual(
+            watchdog_deps.get("eliot-protocol"),
+            {"workspace": True},
+            "the watchdog protocol edge must remain an unmodified workspace alias",
+        )
+        # The symbol scan must be recursive. A non-recursive glob sees only the
+        # direct children of `src/` and would pass vacuously while a nested
+        # module used one of the forbidden crates.
         watchdog_text = "".join(
-            read_text(src) for src in sorted(WATCHDOG_SRC_DIR.glob("*.rs"))
+            read_text(src) for src in sorted(WATCHDOG_SRC_DIR.rglob("*.rs"))
         )
         self.assertTrue(watchdog_text, "watchdog has no Rust sources to inspect")
-        for symbol in ("eliot_backup", "eliot_blob", "eliot_ipc", "eliot_protocol"):
+        for symbol in ("eliot_backup", "eliot_blob", "eliot_ipc"):
             self.assertNotIn(symbol, watchdog_text)
 
     # WORK_UNIT_CASE: 974/5
@@ -316,7 +541,10 @@ class BackupDependencyLinkTests(unittest.TestCase):
         self.assertNotIn("eliot-blob ", kernel_text)
         self.assertNotIn("eliot-blob =", kernel_text)
         kernel_src = "".join(
-            read_text(src) for src in sorted(KERNEL_SRC_DIR.glob("*.rs"))
+            # Recursive for the same reason the watchdog scan is: a
+            # non-recursive glob reads only the direct children of `src/` and
+            # would pass vacuously while a nested module used the crate.
+            read_text(src) for src in sorted(KERNEL_SRC_DIR.rglob("*.rs"))
         )
         self.assertNotIn("eliot_blob_api", kernel_src)
         backup_deps = manifest_dependencies(BACKUP_MANIFEST)
@@ -428,10 +656,12 @@ class BackupDependencyLinkTests(unittest.TestCase):
             d for d in kernel["dependencies"] if d != "eliot-backup"
         ]
         self.assertNotIn("eliot-backup", tampered["dependencies"])
-        raw, fixture = load_fixture_json("lock-delta.json")
-        if fixture is not None:
-            self.assertIn("eliot-backup", raw)
-            self.assertIn("kernel", raw.lower())
+        raw, fixture = require_fixture_json(9, "lock-delta.json")
+        self.assertTrue(self.fixtures_available)
+        require_fixture_base(9, "lock-delta.json", "base", fixture)
+        require_frozen_lock_delta(9, fixture)
+        self.assertIn("eliot-backup", raw)
+        self.assertIn("kernel", raw.lower())
 
     # WORK_UNIT_CASE: 974/10
     def test_10_locked_metadata(self) -> None:
@@ -543,22 +773,37 @@ class BackupDependencyLinkTests(unittest.TestCase):
         digest_before = sha256_hex(before)
         self.assertRegex(digest_before, re.compile(r"^[0-9a-f]{64}$"))
         fixture_path = FIXTURE_DIR / "malformed.raw.json"
-        if fixture_path.is_file():
-            raw = fixture_path.read_text(encoding="utf-8")
-            try:
-                parsed: object | None = json.loads(raw)
-            except json.JSONDecodeError:
-                parsed = None
-            if parsed is None:
-                self.assertIsNone(parsed)
-            else:
-                self.assertTrue(
-                    validate_denominator(parsed),
-                    "malformed fixture validated as a denominator",
-                )
-        else:
-            probe = '{"issue": 974, "cases": [1, 2]}'
-            self.assertTrue(validate_denominator(json.loads(probe)))
+        self.assertTrue(
+            self.fixtures_available,
+            "frozen malformed evidence is absent, so the case proves nothing",
+        )
+        self.assertTrue(
+            fixture_path.is_file(),
+            f"frozen malformed evidence {fixture_path.name} is missing; "
+            "absent evidence blocks dispatch",
+        )
+        raw = fixture_path.read_text(encoding="utf-8")
+        # The frozen malformed evidence is fed to the real validator, not to an
+        # identity check on a local variable. Asserting that a failed parse
+        # produced `None` proves nothing about the gate; what must be proven is
+        # that this text can never be accepted as a denominator, whether it
+        # fails to parse or parses into something the validator rejects. The
+        # validator returns its error list, so acceptance is the empty list.
+        self.assertNotEqual(
+            [],
+            validate_denominator_text(raw),
+            "malformed fixture was accepted as a denominator",
+        )
+        try:
+            parsed: object | None = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if parsed is not None:
+            self.assertNotEqual(
+                [],
+                validate_denominator(parsed),
+                "malformed fixture validated as a denominator",
+            )
         after = (ROOT_MANIFEST).read_bytes()
         self.assertEqual(sha256_hex(after), digest_before)
         tampered = before + b"\n# tamper\n"
