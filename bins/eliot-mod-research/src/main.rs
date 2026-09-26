@@ -165,7 +165,7 @@ fn run() -> Result<String, Failure> {
             eliot_kernel_service::REASON_RUNTIME_FAILED,
             records,
         );
-        report_admitted_inquiry(&admitted.request, &receipt);
+        report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
         return Ok(receipt.to_string());
     }
     // The bridge retains the typed terminal classification, the raw evidence
@@ -190,7 +190,7 @@ fn run() -> Result<String, Failure> {
         }),
         records,
     );
-    report_admitted_inquiry(&admitted.request, &receipt);
+    report_admitted_inquiry(&admitted.request, &receipt, bridge.last_failure());
     Err(Failure::Degraded(Box::new(receipt)))
 }
 
@@ -211,11 +211,18 @@ fn run() -> Result<String, Failure> {
 /// stream. It never becomes a closed inquiry, never rewrites the receipt, and
 /// never changes this process's exit code: the operation's own truth is the
 /// provider receipt, and the governance view is a projection of it.
+///
+/// `failure` is the bridge's retained typed terminal classification. It carries
+/// the acquisition coverage gap this run suffered, so the dependent inquiry
+/// records the named `I21.11` outcome (`RESEARCH_SOURCE_UNAVAILABLE` or
+/// `INCOMPLETE_COVERAGE`) and keeps its preserved explicit unknown and next
+/// probe instead of reporting a generic acquisition code.
 fn report_admitted_inquiry(
     request: &eliot_research_exchange_api::ResearchQueryRequest,
     receipt: &ProviderExecutionReceipt,
+    failure: Option<&eliot_mod_research::TerminalFailure>,
 ) {
-    match project_admitted_inquiry(request, receipt) {
+    match project_admitted_inquiry(request, receipt, failure) {
         Ok(inquiry) => {
             let _ = writeln!(
                 io::stderr(),

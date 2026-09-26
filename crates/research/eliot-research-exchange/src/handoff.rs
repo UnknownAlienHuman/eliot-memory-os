@@ -146,14 +146,32 @@ pub const fn terminal_of(
     }
 }
 
-/// One journal entry binding a receipt identity to its original operation and
-/// payload digest.
+/// One journal entry binding a receipt identity to the exact source, admitted
+/// request, original operation and payload it was accepted for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalEntry {
+    /// The exchanged source handle this receipt reports on.
+    pub source_handle: String,
+    /// The admitted request identity this receipt was issued for.
+    pub request_id: String,
     /// Original acquisition operation this receipt reports on.
     pub operation_id: String,
     /// Digest of the payload accepted under this receipt identity.
     pub payload_digest: String,
+}
+
+/// A receipt identity part is usable only when it is non-blank and free of
+/// control characters.
+fn valid_identity(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+/// The accepted payload digest must be a lowercase SHA-256 digest.
+fn is_payload_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Outcome of ingesting one owner receipt.
@@ -211,31 +229,38 @@ pub struct ReceiptJournal {
 }
 
 impl ReceiptJournal {
-    /// Ingests one owner receipt. The same identity with the same payload
-    /// digest is a replay duplicate without state change; the same identity
-    /// with a changed payload digest is an idempotency conflict.
+    /// Ingests one owner receipt under its complete identity.
+    ///
+    /// Replay is only a duplicate when the same receipt identity is presented
+    /// again with the same exchanged source handle, the same admitted request
+    /// identity, the same original operation and the same exact payload digest.
+    /// A divergence in any of them is an idempotency conflict: a receipt
+    /// identity may never replay different content, and different content may
+    /// never replay under a known identity's operation. Comparing the payload
+    /// alone would let one identity replay against another operation, so the
+    /// operation identity is part of the replay comparison.
     pub fn ingest(
         &mut self,
         receipt_id: &str,
+        source_handle: &str,
+        request_id: &str,
         operation_id: &str,
         payload_digest: &str,
     ) -> Result<IngestOutcome, crate::ExchangeError> {
-        if receipt_id.trim().is_empty()
-            || operation_id.trim().is_empty()
-            || receipt_id.chars().any(char::is_control)
-            || operation_id.chars().any(char::is_control)
-        {
-            return Err(crate::ExchangeError::InvalidTransition);
-        }
-        if payload_digest.len() != 64
-            || payload_digest
-                .bytes()
-                .any(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        if [receipt_id, source_handle, request_id, operation_id]
+            .into_iter()
+            .any(|part| !valid_identity(part))
+            || !is_payload_digest(payload_digest)
         {
             return Err(crate::ExchangeError::InvalidTransition);
         }
         match self.entries.get(receipt_id) {
-            Some(current) if current.payload_digest == payload_digest => {
+            Some(current)
+                if current.source_handle == source_handle
+                    && current.request_id == request_id
+                    && current.operation_id == operation_id
+                    && current.payload_digest == payload_digest =>
+            {
                 Ok(IngestOutcome::ReplayDuplicate)
             }
             Some(_) => Err(crate::ExchangeError::IdempotencyConflict),
@@ -243,6 +268,8 @@ impl ReceiptJournal {
                 self.entries.insert(
                     receipt_id.to_owned(),
                     JournalEntry {
+                        source_handle: source_handle.to_owned(),
+                        request_id: request_id.to_owned(),
                         operation_id: operation_id.to_owned(),
                         payload_digest: payload_digest.to_owned(),
                     },
@@ -355,20 +382,6 @@ fn gap_kind_wire(kind: CoverageGapKind) -> &'static str {
     }
 }
 
-fn disposition_wire(disposition: CompletionDisposition) -> &'static str {
-    match disposition {
-        CompletionDisposition::AnsweredWithSupportedResult => "answered_with_supported_result",
-        CompletionDisposition::NoMatchInCompleteScope => "no_match_in_complete_scope",
-        CompletionDisposition::NoNewUsefulEvidence => "no_new_useful_evidence",
-        CompletionDisposition::SourceUnavailable => "source_unavailable",
-        CompletionDisposition::StaleSourceOrIndex => "stale_source_or_index",
-        CompletionDisposition::PolicyOrDisclosureDenied => "policy_or_disclosure_denied",
-        CompletionDisposition::IncompleteCoverage => "incomplete_coverage",
-        CompletionDisposition::Inconclusive => "inconclusive",
-        CompletionDisposition::Cancelled => "cancelled",
-    }
-}
-
 fn seal_preimage(
     bundle: &ResearchEvidenceBundle,
     request: &ResearchQueryRequest,
@@ -402,11 +415,7 @@ fn seal_preimage(
         "bundle_digest",
         &bundle.immutable_bundle_digest,
     );
-    push_field(
-        &mut preimage,
-        "disposition",
-        disposition_wire(bundle.disposition),
-    );
+    push_field(&mut preimage, "disposition", bundle.disposition.wire_name());
     push_field(
         &mut preimage,
         "disclosure",
@@ -515,7 +524,7 @@ pub fn seal_handoff(
         exchange_id: bundle.exchange_id.clone(),
         job_id: bundle.job_id.clone(),
         bundle_digest: bundle.immutable_bundle_digest.clone(),
-        disposition: disposition_wire(bundle.disposition).to_owned(),
+        disposition: bundle.disposition.wire_name().to_owned(),
         disclosure: disclosure_wire(bundle.disclosure).to_owned(),
         manifest_digest: request.allowed_references.digest.clone(),
         manifest_revision: manifest_revision.to_owned(),

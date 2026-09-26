@@ -23,7 +23,9 @@ pub mod protocol;
 use eliot_contracts::StateFence;
 use eliot_process::ExitDisposition;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
-use eliot_research_exchange_api::{CoverageGapKind, ResearchQueryRequest, SourceClass};
+use eliot_research_exchange_api::{
+    CoverageGapKind, ResearchQueryRequest, ResearchSourceGapOutcome, SourceClass,
+};
 use eliot_researcher::{
     AcquisitionOutcome, CandidateEvidence, InquiryGovernance, InquiryHorizon, InquiryObservation,
     InquiryRisk, InquirySelectionFeatures, InquiryUncertainty, Researcher,
@@ -693,6 +695,13 @@ pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
 /// carry, and never promotes the result: the record stays candidate-only and the
 /// Governor applies any transition.
 ///
+/// `failure` is the bridge's retained typed terminal classification. It is what
+/// carries the acquisition coverage gap this run actually suffered, so the
+/// dependent inquiry records the two named `I21.11` outcomes
+/// (`RESEARCH_SOURCE_UNAVAILABLE`, `INCOMPLETE_COVERAGE`) instead of a generic
+/// acquisition code, and the `R6` domain keeps that inquiry open with its
+/// preserved explicit unknown and next probe.
+///
 /// # Errors
 ///
 /// Returns [`R6ProjectionError::UnboundAdmission`] when the admitted request and
@@ -703,6 +712,7 @@ pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
 pub fn project_admitted_inquiry(
     request: &ResearchQueryRequest,
     receipt: &ProviderExecutionReceipt,
+    failure: Option<&TerminalFailure>,
 ) -> Result<InquiryGovernance, crate::R6ProjectionError> {
     if receipt.operation_id.is_empty()
         || receipt.exchange_id != request.exchange_id
@@ -749,10 +759,46 @@ pub fn project_admitted_inquiry(
         features: admitted_selection_features(request),
         candidates: vec![retained_provider_material(request, receipt, &route)],
         outcome: acquisition_outcome(receipt),
-        reason_code: receipt.reason_code.to_owned(),
+        reason_code: dependent_inquiry_reason_code(failure, receipt),
         assessment_time_ms,
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
+}
+
+/// The reason code one dependent inquiry records for this run.
+///
+/// I21.11 and I21.13 name two distinct typed outcomes for a Research-held source
+/// this operation could not obtain, and the `R6` domain binds that code into
+/// the terminal inquiry record together with the preserved explicit unknown and
+/// the preserved next probe:
+///
+/// ```text
+/// source that cannot be fetched      -> RESEARCH_SOURCE_UNAVAILABLE
+/// source generation/index not verified -> INCOMPLETE_COVERAGE
+/// ```
+///
+/// The spelling comes from the exchange contract's own typed outcomes rather
+/// than from a second local vocabulary. Every other acquisition reason keeps the
+/// receipt's own classification: a timeout is not an unfetchable source, a
+/// policy denial is not incomplete coverage, and an exhausted budget is
+/// neither, so none of them is coerced into one of the two named gaps. The
+/// acquisition outcome itself stays the receipt's: this process reports what the
+/// provider run did, and the inquiry records why its coverage narrowed.
+fn dependent_inquiry_reason_code(
+    failure: Option<&TerminalFailure>,
+    receipt: &ProviderExecutionReceipt,
+) -> String {
+    match failure.map(|terminal| terminal.coverage_gap) {
+        Some(CoverageGapKind::SourceUnavailable) => {
+            ResearchSourceGapOutcome::ResearchSourceUnavailable
+                .wire_name()
+                .to_owned()
+        }
+        Some(CoverageGapKind::StaleSourceOrIndex) => ResearchSourceGapOutcome::IncompleteCoverage
+            .wire_name()
+            .to_owned(),
+        _ => receipt.reason_code.to_owned(),
+    }
 }
 
 /// The structural selection features this boundary can prove from admitted
