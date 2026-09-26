@@ -1226,7 +1226,7 @@ pub struct LaneRegistrationParams {
 /// fields, the permitted deviations, the intended evidence partition, the
 /// registration identity/revision/time/fence and the owner receipt. What I21.4
 /// spells `registered_before_outcome_exposure` is **not** a field here: it is
-/// derived by [`LaneRegistration::is_committed_before`] from the owner-issued
+/// derived by [`LaneRegistration::require_commit_precedes`] from the owner-issued
 /// receipt chain, so no caller can assert it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneRegistration {
