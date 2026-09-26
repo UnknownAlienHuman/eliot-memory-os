@@ -3,13 +3,15 @@ use std::sync::Mutex;
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, CutoverIntentState, DrainState, EpochEvidence, HostInstallationEpoch,
-    HostState, HostStateRecord, IdempotencyIdentity, RecoveryLineageReason, activation_transition,
-    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
-    kernel_transition, store_rebind_transition, wake_transition,
+    AppliedOperation, CutoverIntentState, DrainState, EpochEvidence, EpochRetirementRecord,
+    HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity, RecordFence,
+    RecoveryLineageReason, activation_transition, dependency_transition, drain_transition,
+    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
+    wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -59,6 +61,89 @@ impl AppendReceipt {
     pub fn transaction_id(&self) -> &PlatformHandle {
         &self.transaction_id
     }
+}
+
+/// Exact cutover operation identity whose applied `EpochRetirement` record is
+/// wanted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpochRetirementQuery {
+    /// Canonical operation identity of the retirement record.
+    pub operation: IdempotencyIdentity,
+}
+
+/// Retirement resolved by the journal owner under one exact operation
+/// identity.
+///
+/// Construction is restricted to this crate: every field is private, there is
+/// no public constructor, no `Default`, and no deserialization. The only
+/// producer is [`HostStateJournal::query_epoch_retirement`], so possessing an
+/// observation means this journal durably applied that record. A caller cannot
+/// mint one, and a presented [`AppendReceipt`] remains a lookup hint that must
+/// be checked against [`Self::transaction_id`] rather than believed on
+/// presence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpochRetirementObservation {
+    record: EpochRetirementRecord,
+    transaction_id: PlatformHandle,
+}
+
+impl EpochRetirementObservation {
+    /// Exact record this journal applied, including its own fence and evidence.
+    pub const fn record(&self) -> &EpochRetirementRecord {
+        &self.record
+    }
+
+    /// Canonical operation identity the record was applied under.
+    pub const fn operation(&self) -> &IdempotencyIdentity {
+        &self.record.operation
+    }
+
+    /// Owner-recorded retirement instant.
+    pub const fn retired_at(&self) -> &PlatformHandle {
+        &self.record.retired_at
+    }
+
+    /// Retired Host installation/activation epoch.
+    pub const fn retired_host(&self) -> &HostInstallationEpoch {
+        &self.record.retired_host
+    }
+
+    /// Owner-supplied evidence digests bound to the retirement.
+    pub fn retirement_evidence_refs(&self) -> &[PlatformHandle] {
+        &self.record.retirement_evidence_refs
+    }
+
+    /// Host/activation fence the record was accepted under.
+    pub const fn fence(&self) -> &RecordFence {
+        &self.record.fence
+    }
+
+    /// Transaction identity this journal owner computes for the resolved
+    /// record. A caller-supplied receipt for the same operation is proof of the
+    /// append only when it names exactly this identity.
+    pub const fn transaction_id(&self) -> &PlatformHandle {
+        &self.transaction_id
+    }
+}
+
+/// Typed failures of the owner-resolved epoch-retirement lookup.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum EpochRetirementQueryError {
+    /// The enclosing Host journal could not be read, or the owner could not
+    /// recompute the resolved record's transaction identity.
+    #[error("host-state journal: {0}")]
+    Journal(#[from] JournalError),
+    /// The query named a malformed operation identity.
+    #[error("epoch retirement query invalid: {0}")]
+    Invalid(String),
+    /// This journal log applied no retirement for that exact operation.
+    #[error("epoch retirement was not found for the named operation")]
+    NotFound,
+    /// This journal log holds more than one retirement for that exact
+    /// operation. That is a contradiction about durable state, never a choice
+    /// between candidates, so it is reported instead of resolved.
+    #[error("epoch retirement is contradictory for the named operation")]
+    Contradictory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -666,6 +751,15 @@ fn apply(
                 }
             }
             state.retired_epochs.push(next.retired_host.clone());
+            // Retain the record itself, not only the retired epoch, so the
+            // exact cutover operation that produced the retirement stays
+            // resolvable. This admits nothing new: the record already passed
+            // this crate's own `validate()` at the top of `apply` and every
+            // fence check above, and the `!item.retired` gate above is what
+            // bounds this projection — one entry per retired epoch, so a
+            // second retirement of the same epoch is refused rather than
+            // appended.
+            state.epoch_retirements.push(next.clone());
             state.clean_marker = None;
         }
         HostStateRecord::CutoverIntent(next) => {
@@ -1184,6 +1278,48 @@ impl<B: JournalBackend> HostStateJournal<B> {
             .as_ref()
             .and_then(|queue| queue.committed_entry(&query.operation))
             .ok_or(ReactiveContextQueueError::NotFound)
+    }
+
+    /// Exact `EpochRetirement` record this journal applied for one canonical
+    /// operation identity, or a typed absence.
+    ///
+    /// This is the owner half of retirement resolution: the record is selected
+    /// from the durable log this journal replayed, under the exact operation
+    /// identity the caller named, and the transaction identity is recomputed
+    /// here rather than taken from the caller. A caller-supplied
+    /// [`AppendReceipt`] is therefore only a lookup hint — it may select this
+    /// record, and it is never the proof that this journal applied it.
+    pub fn query_epoch_retirement(
+        &self,
+        query: &EpochRetirementQuery,
+    ) -> Result<EpochRetirementObservation, EpochRetirementQueryError> {
+        query
+            .operation
+            .validate()
+            .map_err(|error| EpochRetirementQueryError::Invalid(error.to_string()))?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| EpochRetirementQueryError::Journal(JournalError::Synchronization))?;
+        let mut matching = state
+            .epoch_retirements
+            .iter()
+            .filter(|record| record.operation == query.operation);
+        let Some(retirement) = matching.next().cloned() else {
+            return Err(EpochRetirementQueryError::NotFound);
+        };
+        if matching.next().is_some() {
+            // Two applied retirements under one canonical operation identity
+            // contradict the log. Picking the first would resolve a
+            // contradiction about durable state by convenience.
+            return Err(EpochRetirementQueryError::Contradictory);
+        }
+        let record = HostStateRecord::EpochRetirement(retirement.clone());
+        let transaction_id = journal_transaction_id(&record, &record_checksum(&record)?)?;
+        Ok(EpochRetirementObservation {
+            record: retirement,
+            transaction_id,
+        })
     }
 
     #[allow(clippy::needless_pass_by_value)]

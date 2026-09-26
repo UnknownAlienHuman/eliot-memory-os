@@ -31,7 +31,8 @@ pub use eliot_contracts::EpochId as EpochIdentity;
 pub use eliot_contracts::{EpochId, EpochLineageId, EpochTransition};
 pub use error::{BackendError, JournalError, ReconcileOutcome};
 pub use journal::{
-    AppendDisposition, AppendReceipt, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
+    AppendDisposition, AppendReceipt, EpochRetirementObservation, EpochRetirementQuery,
+    EpochRetirementQueryError, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
     readonly_project_host_state, record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
