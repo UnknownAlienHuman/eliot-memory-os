@@ -699,7 +699,7 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
         schema = $script:GovernorRetirementClosureSchema
         status = $status
         rule_set = $script:GovernorRetirementClosureRuleSet
-        verifier = $MyInvocation.MyCommand.Name
+        verifier = $MyInvocation.MyCommand.Name  # unqualified: the computing function in every session (matches the trust policy's pinned verifier); the $script: form would name the hosting script per session and break issuance-to-binding agreement
         candidate_commit = $SourceCommit
         candidate_tree = (Get-GovernorRetirementCandidateTree $Repo $SourceCommit)
         tracked_file_count = $tracked.Count
