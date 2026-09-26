@@ -25,12 +25,13 @@ pub mod self_change;
 
 pub use self_change::{
     AdversarialCase, AdversarialProof, AdversarialSuiteRecord, AxisVerdicts, BootstrapPhase,
-    CanaryRecord, ComparisonAxis, ConflictArbiter, EvidenceDigest, FrontDoorVerdict,
-    GenerationReceipt, OracleConflict, OracleResolution, OuterGuardianRecord, ParserOutput,
-    ParserReplayRecord, SelectionOutcome, SelectionSentinelRecord, SelfChangeBootstrap,
-    SelfChangeError, SelfChangeSurface, SentinelCase, ShadowComparisonRecord, SpecialCase,
-    SpecialCaseEvidence, verdict_with_bootstrap, verify_finish_adversarial,
-    verify_outer_guardian_record, verify_parser_replay, verify_selection_sentinel,
+    CanaryRecord, ComparisonAxis, ComparisonOutcome, ConflictArbiter, EvidenceDigest,
+    FrontDoorVerdict, GenerationReceipt, OracleConflict, OracleResolution, OuterGuardianRecord,
+    ParserOutput, ParserReplayRecord, ResolvedOracleConflict, SelectionOutcome,
+    SelectionSentinelRecord, SelfChangeBootstrap, SelfChangeError, SelfChangeSurface, SentinelCase,
+    ShadowComparisonRecord, SpecialCase, SpecialCaseEvidence, verdict_with_bootstrap,
+    verify_finish_adversarial, verify_outer_guardian_record, verify_parser_replay,
+    verify_selection_sentinel,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.instrument.verifier";
