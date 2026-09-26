@@ -16,8 +16,12 @@
 //! - a reusable-candidate subject requires an ACTIVE [`BoundedBacklog`]
 //!   entry admitted under the permit-bound authority (`admit` grants
 //!   eligibility, `archive` revokes it);
-//! - cross-task carryover requires a distinct [`CrossTaskAdmission`]
-//!   revalidating scope, authority, retention, evaluator, and rollback.
+//! - cross-task carryover requires a distinct [`CrossTaskCarryover`]: a
+//!   SECOND owner-issued admission for the foreign target task together with
+//!   the owner-issued record revalidating scope, authority, retention,
+//!   evaluator, and rollback. Both halves are re-verified against the live
+//!   [`Governor`] here, at the delivery choke point, so an epoch rotation
+//!   between retrieval and delivery refuses the carryover.
 //!
 //! Per-mark expiry/draft/closure/owner shape is enforced here as well, so
 //! the mark-level `expires_at_unix_secs` is defense-in-depth behind the
@@ -35,7 +39,7 @@ use eliot_governor::{
 use time::OffsetDateTime;
 
 use crate::candidate_bounds::{
-    BoundedBacklog, BoundsError, CrossTaskAdmission, GovernedOverlay, OverlayState,
+    BoundedBacklog, BoundsError, CrossTaskCarryover, GovernedOverlay, OverlayState,
 };
 
 /// Pure-data view of one learning-marked atom for carriage screening.
@@ -58,9 +62,10 @@ pub struct CarriageMark<'a> {
 /// Everything a native screen must present for one governed retrieval.
 ///
 /// The registry handle (`backlog`) is non-optional: production native
-/// callers always pass the production [`BoundedBacklog`]. `overlay` and
-/// `cross_task_admission` are required exactly when the permit binds an
-/// overlay subject or the requesting task leaves the admitted target.
+/// callers always pass the production [`BoundedBacklog`]. `overlay` is
+/// required exactly when the local permit binds an overlay subject, and
+/// `cross_task` exactly when the requesting task is not that permit's target
+/// task — never both-and-nothing, and never neither-and-something.
 #[derive(Clone, Copy, Debug)]
 pub struct PresentedLearning<'a> {
     pub governor: &'a Governor,
@@ -68,7 +73,7 @@ pub struct PresentedLearning<'a> {
     pub ticket: &'a LearningAdmissionTicket,
     pub overlay: Option<&'a GovernedOverlay>,
     pub backlog: &'a BoundedBacklog,
-    pub cross_task_admission: Option<&'a CrossTaskAdmission>,
+    pub cross_task: Option<&'a CrossTaskCarryover<'a>>,
     pub requesting_campaign_id: &'a str,
     pub requesting_task_id: &'a str,
     /// Wall clock both expiries enforce against. MUST be sourced from the
@@ -211,26 +216,46 @@ pub fn check_governed_carriage(
         }
     }
 
+    // The local/cross-task split is decided by the TASK, for the same reason
+    // and with the same campaign caveat as `retrieve_governed`: neither permit
+    // names a foreign campaign, so `requesting_campaign_id` cannot be part of
+    // the cross-task relation without making a real carryover
+    // unrepresentable. The learning material itself stays pinned to the local
+    // permit's source campaign by the per-mark, overlay and backlog checks
+    // above.
     let source = permit.source_campaign_id();
     let target = permit.target_task_id();
-    let local =
-        presented.requesting_campaign_id == source && presented.requesting_task_id == target;
-    if !local {
-        let admission = presented
-            .cross_task_admission
+    if presented.requesting_task_id == target {
+        if presented.requesting_campaign_id != source {
+            return Err(BoundsError::CrossCampaignLeakage);
+        }
+        if presented.cross_task.is_some() {
+            return Err(BoundsError::CrossTaskAdmissionMismatch);
+        }
+    } else {
+        // Genuinely cross-task. BOTH admissions are re-bound to live owner
+        // state here, the record is re-checked against them, and the carryover
+        // must name THIS requesting task. `cross_task_fence` is the cross-task
+        // permit's own bound fence: this crate holds no owner evidence of the
+        // foreign task's live fence, so it asserts only that the owner channel
+        // knows the fence the foreign admission was issued under, which is
+        // exactly what the Governor compares it to.
+        let carryover = presented
+            .cross_task
             .ok_or(BoundsError::CrossTaskAdmissionMissing)?;
-        admission.validate()?;
-        if admission.source_campaign_id != source
-            || admission.target_task_id != target
-            || !admission.matches_permit(presented.verified)
-        {
-            return Err(BoundsError::CrossTaskAdmissionMismatch);
+        carryover
+            .reverify_live(
+                presented.governor,
+                presented.verified,
+                current_fence,
+                carryover.cross_task_permit().fence(),
+            )
+            .map_err(BoundsError::CrossTaskAdmissionRefused)?;
+        if carryover.cross_task_permit().target_task_id() != presented.requesting_task_id {
+            return Err(BoundsError::CrossTaskScopeMismatch {
+                field: "requesting_task_id",
+            });
         }
-        if presented.requesting_task_id != target {
-            return Err(BoundsError::CrossTaskAdmissionMismatch);
-        }
-    } else if presented.cross_task_admission.is_some() {
-        return Err(BoundsError::CrossTaskAdmissionMismatch);
     }
     Ok(())
 }
@@ -263,6 +288,8 @@ pub fn bounds_to_context_error(error: BoundsError) -> ContextError {
         BoundsError::OwnerlessRecord => ContextError::InvalidField("learning.owner"),
         BoundsError::CrossTaskAdmissionMissing
         | BoundsError::CrossTaskAdmissionMismatch
+        | BoundsError::CrossTaskAdmissionRefused(_)
+        | BoundsError::CrossTaskScopeMismatch { .. }
         | BoundsError::CrossCampaignLeakage
         | BoundsError::GovernorAuthorityUnconfirmed
         | BoundsError::NotBacklogAdmitted

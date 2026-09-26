@@ -16,6 +16,13 @@
 //!   and cited issuance digest must equal the permit-bound values; closure
 //!   and owner must be present. The emitted mark is covered by the atom
 //!   canonical digest, so downstream screens and measurements bind it.
+//! - A compilation for a task that is NOT the local permit's target task is
+//!   only a cross-task carryover, and only with the distinct owner-issued
+//!   [`CrossTaskCarryover`] whose cross-task admission names that task. The
+//!   task proof below reads its expected task from the carryover in that case
+//!   and from the local permit otherwise, so one rule covers both and a
+//!   carryover cannot be skipped by dressing the compilation binding as
+//!   local.
 //! - Drafts are never produced: this producer emits only admitted local
 //!   updates for a compatible attempt, never speculative deltas.
 //!
@@ -32,7 +39,9 @@ use eliot_contracts::fences_match_exact;
 use eliot_evidence::EpistemicStatus;
 use eliot_governor::VerifiedLearningAdmission;
 
-use crate::candidate_bounds::{BoundedBacklog, BoundsError};
+use crate::candidate_bounds::{
+    BoundedBacklog, BoundsError, CrossTaskCarryover, bound_compilation_task,
+};
 
 /// Inputs for producing one learning-marked atom.
 ///
@@ -60,6 +69,9 @@ pub struct LearningProduction<'a> {
     pub measurement_digest: &'a str,
     pub measurement_serializer: &'a str,
     pub verified: &'a VerifiedLearningAdmission<'a>,
+    /// The distinct owner-issued cross-task admission, required exactly when
+    /// `binding.task_id` is not `verified`'s target task.
+    pub cross_task: Option<&'a CrossTaskCarryover<'a>>,
 }
 
 /// Route an overlay-rejected task-level policy change into an Improvement
@@ -138,8 +150,13 @@ pub fn produce_learning_candidate(
     if request.owner.trim().is_empty() {
         return Err(BoundsError::OwnerlessRecord);
     }
-    // Task/fence proof: the compilation identity must be the admitted one.
-    if request.binding.task_id.as_str() != permit.target_task_id() {
+    // Task/fence proof: the compilation identity must be the admitted one —
+    // or, for another task, the one a DISTINCT cross-task admission was
+    // issued for. The shared rule re-checks the carryover against the local
+    // admission, so a bare or stale record cannot buy a foreign compilation
+    // here either.
+    let bound_task = bound_compilation_task(request.verified, request.cross_task)?;
+    if request.binding.task_id.as_str() != bound_task {
         return Err(BoundsError::CrossTaskAdmissionMismatch);
     }
     if !fences_match_exact(&request.binding.state_fence, permit.fence()) {
