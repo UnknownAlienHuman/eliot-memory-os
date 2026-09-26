@@ -36,13 +36,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::StateFence;
 use eliot_research_exchange_api::{
-    AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass, SourceClass,
+    AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass,
+    ResearchContractError, SourceClass,
 };
 
 use crate::evidence_portfolio::{
-    AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable, PortfolioError, RiskState,
-    SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    digest, freeze, grade_name, grade_rank, push_count, push_field, reject_vague, text,
+    AbsenceVerdict, ClaimVerdict, CoverageAccount, LineageTable, PortfolioError,
+    PrecisionAssertion, PrecisionKind, RiskState, SourceDisposition, SourceRecord,
+    SourceRecordParams, UnsupportedPrecisionItem, assess_absence, check_precision, digest, freeze,
+    grade_name, grade_rank, push_count, push_field, reject_vague, text,
 };
 use crate::inquiry_obligations::{
     AcceptanceCertificateKind, InquiryObligation, InquiryObligationParams, InquiryObligationStatus,
@@ -130,6 +132,12 @@ pub enum InquiryError {
     },
     /// The frozen acquisition-side discipline refused the material.
     Portfolio(PortfolioError),
+    /// The exchange contract refused the admitted reference manifest.
+    ///
+    /// I21.7: the run-bound `AllowedReferenceManifest` is a mandatory input, so
+    /// a malformed manifest, or one whose digest does not cover its own content,
+    /// is refused here rather than being published as a bound allowlist.
+    Contract(ResearchContractError),
 }
 
 impl std::fmt::Display for InquiryError {
@@ -186,6 +194,9 @@ impl std::fmt::Display for InquiryError {
                 )
             }
             Self::Portfolio(error) => write!(formatter, "frozen portfolio discipline: {error}"),
+            Self::Contract(error) => {
+                write!(formatter, "reference manifest contract: {error}")
+            }
         }
     }
 }
@@ -195,6 +206,12 @@ impl std::error::Error for InquiryError {}
 impl From<PortfolioError> for InquiryError {
     fn from(error: PortfolioError) -> Self {
         Self::Portfolio(error)
+    }
+}
+
+impl From<ResearchContractError> for InquiryError {
+    fn from(error: ResearchContractError) -> Self {
+        Self::Contract(error)
     }
 }
 
@@ -2232,6 +2249,16 @@ pub struct EvidenceSetPrecision {
 
 impl EvidenceSetPrecision {
     /// Evaluates the evidence set against the manifest's admitted precision.
+    ///
+    /// A set with no eligible source record is a different fact from a set whose
+    /// support is too coarse, so the two cases are recorded distinctly: the
+    /// first is "nothing supports any anchor here" and the second is "the
+    /// admitted anchor is finer than this source supports". The second case is
+    /// checked through the crate's typed precision owner [`check_precision`], so
+    /// an over-precise anchor produces an [`UnsupportedPrecisionItem`] with the
+    /// same structure as a false quantification or a false causal mechanism
+    /// rather than a bespoke shape. Both cases retain typed items, never only a
+    /// rendered line.
     #[must_use]
     pub fn evaluate(
         inquiry_id: &str,
@@ -2262,22 +2289,17 @@ impl EvidenceSetPrecision {
             }
             if manifest_precision > supported {
                 for record in &eligible {
-                    residue.push(UnsupportedPrecisionItem {
-                        asserted: anchor_wire(manifest_precision).to_owned(),
-                        highest_supported: anchor_wire(record.limits.max_anchor_precision)
-                            .to_owned(),
-                        basis: format!(
+                    if let Some(item) = coordinate_residue(
+                        manifest_precision,
+                        record.limits.max_anchor_precision,
+                        &format!(
                             "source {} supports at most {} precision",
                             record.record.handle,
                             anchor_wire(record.limits.max_anchor_precision)
                         ),
-                        risk: "citing beyond the supported precision would be false precision"
-                            .to_owned(),
-                        required_probe:
-                            "narrow the claim to the supported precision or admit a stronger \
-                             source for this anchor"
-                                .to_owned(),
-                    });
+                    ) {
+                        residue.push(item);
+                    }
                 }
             }
         }
@@ -2316,6 +2338,28 @@ impl EvidenceSetPrecision {
     pub fn has_residue(&self) -> bool {
         !self.residue.is_empty()
     }
+}
+
+/// The typed over-precision item for one anchor claimed against the anchor an
+/// admitted source record actually supports, or `None` when the claim is within
+/// it.
+///
+/// The comparison is delegated to [`check_precision`] with the coordinate
+/// precision kind, so a false line anchor is shaped exactly like a false
+/// quantification or a false causal mechanism instead of being a second,
+/// differently shaped residue vocabulary.
+fn coordinate_residue(
+    asserted: AnchorPrecision,
+    supported: AnchorPrecision,
+    basis: &str,
+) -> Option<UnsupportedPrecisionItem> {
+    check_precision(&PrecisionAssertion {
+        kind: PrecisionKind::Coordinate,
+        asserted: anchor_wire(asserted).to_owned(),
+        supported: anchor_wire(supported).to_owned(),
+        basis: basis.to_owned(),
+    })
+    .err()
 }
 
 /// Evidence freeze of one accepted evidence revision (I21.8).
@@ -2724,6 +2768,17 @@ impl ClaimAuditRecord {
                 push_field(&mut preimage, tag, value);
             }
         }
+        // I21.7: the over-precision residue is bound as the typed items it is,
+        // so a binding that covers this record cannot be re-pointed at a
+        // different asserted coordinate by changing only the rendered prose.
+        for line in self.verdict.unsupported_precision_lines() {
+            push_field(&mut preimage, "unsupported_precision", &line);
+        }
+        push_count(
+            &mut preimage,
+            "unsupported_precision",
+            self.verdict.unsupported_precision.len(),
+        );
         freeze(&preimage)
     }
 }
@@ -3047,6 +3102,229 @@ pub struct CandidateEvidence {
     pub refused: bool,
 }
 
+/// Which reference identity an unadmitted observation presented as.
+///
+/// I21.7: "It cannot mint a valid citation, URL, source ID, line range, artifact
+/// handle or support relation through prose." Naming which of those identities
+/// was observed is what makes the retained diagnostic actionable, because each
+/// has a different acquisition path: a URL needs a provider to resolve and
+/// snapshot it, an artifact handle needs a manifest transition, and a stale or
+/// revoked handle needs a fresh admission rather than any acquisition at all.
+///
+/// # What the live record path can actually observe
+///
+/// The whole live classification is `reference_firewall`, and the only thing it
+/// looks at is each `ObservationCandidate`'s `handle`. That makes the reachable
+/// set a property of what a candidate handle can be, not of all six identities
+/// I21.7 enumerates:
+///
+/// - `ArtifactHandle` is what the live path produces. The composition root
+///   supplies exactly one candidate, derived from the retained provider artifact
+///   digest as `provider-artifact:<sha256>`
+///   (`retained_provider_material` in `bins/eliot-mod-research`), which is
+///   caller-influenced text the manifest does not admit.
+/// - `LocatorUrl` is **not** reachable on the live path today, and the reason is
+///   structural: the arm is chosen by a `://` test, and the single live handle
+///   `provider-artifact:<sha256>` contains no scheme separator. A URL inside the
+///   provider body is never observable here because the projection never decodes
+///   the body; the URL surface is closed instead at
+///   `SourceSnapshot::locator` in
+///   `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+/// - `StaleOrRevoked` is reachable only for a manifest that lists a candidate
+///   handle in `stale_or_revoked_handles`. The live handle is minted after
+///   admission from a digest an out-of-repo envelope has no reason to list, so
+///   the live path does not reach it either — but the case it names is real and
+///   distinct: a reference the manifest *did* admit and that has since gone
+///   stale, which [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`]
+///   reports as `ManifestEntryRevoked`.
+///
+/// All three variants are kept because this is the retained diagnostic's
+/// vocabulary and a candidate handle is caller-shaped, not fixed: a bridge that
+/// projects a URL-shaped or manifest-revoked candidate reaches the other two
+/// arms with no code change here. A source identity is judged on the
+/// `SourceRecord.handle` the observation projects into
+/// [`crate::source_admissibility::SourceAdmissibilityRecord::evaluate`], and a
+/// line range is judged by the manifest's admitted anchor precision in
+/// [`EvidenceSetPrecision::evaluate`]; neither can be a *citation* on this path,
+/// so neither is a candidate diagnostic here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnadmittedReferenceKind {
+    /// A URL the manifest does not list as a URL handle.
+    LocatorUrl,
+    /// An artifact handle the manifest does not list.
+    ArtifactHandle,
+    /// A handle the manifest lists but marks stale or revoked.
+    StaleOrRevoked,
+}
+
+impl UnadmittedReferenceKind {
+    /// Stable wire spelling of this reference identity.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::LocatorUrl => "LOCATOR_URL",
+            Self::ArtifactHandle => "ARTIFACT_HANDLE",
+            Self::StaleOrRevoked => "STALE_OR_REVOKED",
+        }
+    }
+}
+
+/// One reference observed in the observed material that the run-bound manifest
+/// does not admit.
+///
+/// I21.7: "A syntactically plausible but absent/stale/wrong-scope reference
+/// remains unsupported text and produces a candidate diagnostic rather than an
+/// evidence edge", and a newly mentioned external URL "may be captured as an
+/// untrusted `ObservationCandidate` for later acquisition, but it is not treated
+/// as an allowed source or citation for the current run". This is that
+/// untrusted candidate diagnostic in the research plane's own vocabulary: the
+/// reference text is retained verbatim as inert data, the kind names which
+/// identity it is, and the reason names why the manifest does not admit it.
+///
+/// The record is a candidate only. `trusted` is always false, it grants no
+/// citation and no support relation, and the only transition out of it is a
+/// Governor-applied `SourceRecord` transition that adds the handle to a new
+/// frozen manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnadmittedReference {
+    /// Inquiry identity this diagnostic belongs to.
+    pub inquiry_id: String,
+    /// Evidence-set identity this diagnostic belongs to.
+    pub evidence_set_id: String,
+    /// The untrusted reference text, retained verbatim as data.
+    pub reference: String,
+    /// Which reference identity this is.
+    pub kind: UnadmittedReferenceKind,
+    /// Why the run-bound manifest does not admit it.
+    pub reason: String,
+    /// State Fence the diagnostic was observed under.
+    ///
+    /// Inside [`Self::digest`]: a fence that can change what a retained
+    /// diagnostic means has to be inside the preimage, so a diagnostic moved
+    /// onto a different fence cannot re-present the old digest.
+    pub state_fence: StateFence,
+    /// Always false: an unadmitted reference is never trusted.
+    pub trusted: bool,
+    /// Digest over the diagnostic shape.
+    pub digest: String,
+}
+
+impl UnadmittedReference {
+    /// Records one observed reference the run-bound manifest does not admit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field error for a blank inquiry, evidence-set or reference
+    /// identity.
+    pub fn observe(
+        inquiry_id: &str,
+        evidence_set_id: &str,
+        reference: &str,
+        kind: UnadmittedReferenceKind,
+        reason: &str,
+        state_fence: &StateFence,
+    ) -> Result<Self, InquiryError> {
+        require_text(inquiry_id, "unadmitted_reference.inquiry_id")?;
+        require_text(evidence_set_id, "unadmitted_reference.evidence_set_id")?;
+        require_text(reference, "unadmitted_reference.reference")?;
+        require_text(reason, "unadmitted_reference.reason")?;
+        let mut record = Self {
+            inquiry_id: inquiry_id.to_owned(),
+            evidence_set_id: evidence_set_id.to_owned(),
+            reference: reference.to_owned(),
+            kind,
+            reason: reason.to_owned(),
+            state_fence: state_fence.clone(),
+            trusted: false,
+            digest: String::new(),
+        };
+        record.digest = record.compute_digest();
+        Ok(record)
+    }
+
+    /// Re-proves this diagnostic's own digest and its candidate-only shape.
+    ///
+    /// The preimage covers the fence as well as the retained text, so this
+    /// stands alone: a diagnostic whose fence was moved fails here, and not
+    /// only where [`InquiryGovernance`] happens to cross-check the fence against
+    /// its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.trusted || self.compute_digest() != self.digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "unadmitted_reference.digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// I21.7 reference firewall: the fence is part of what this record means, so
+    /// it is inside the preimage and not only cross-checked by the governance
+    /// record. No sibling record in this crate pushes a fence of its own, so the
+    /// encoding is the crate's single canonical one — `push_field` per fence
+    /// component, tagged with the `StateFence` field names that
+    /// `canonical_json_bytes` gives the same value inside the sealed
+    /// `AllowedReferenceManifest` — and an absent optional revision is spelled
+    /// `none` under its own tag, as everywhere else in these preimages.
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("unadmitted-reference/v1;");
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
+        push_field(&mut preimage, "reference", &self.reference);
+        push_field(&mut preimage, "kind", self.kind.wire_name());
+        push_field(&mut preimage, "reason", &self.reason);
+        push_field(
+            &mut preimage,
+            "authority_epoch_lineage",
+            self.state_fence.authority_epoch.lineage_id.as_str(),
+        );
+        push_field(
+            &mut preimage,
+            "authority_epoch_sequence",
+            &self.state_fence.authority_epoch.sequence.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "resource_generation",
+            &self.state_fence.resource_generation.value().to_string(),
+        );
+        // The three optional revisions have three DISTINCT types, so each is
+        // spelled out rather than iterated: an array would require one element
+        // type and would either coerce or fail to compile.
+        for (tag, revision) in [
+            (
+                "task_revision",
+                self.state_fence
+                    .task_revision
+                    .map(|value| value.value().to_string()),
+            ),
+            (
+                "policy_revision",
+                self.state_fence
+                    .policy_revision
+                    .map(|value| value.value().to_string()),
+            ),
+            (
+                "integration_revision",
+                self.state_fence
+                    .integration_revision
+                    .map(|value| value.value().to_string()),
+            ),
+        ] {
+            match revision {
+                Some(value) => push_field(&mut preimage, tag, &value),
+                None => push_field(&mut preimage, tag, "none"),
+            }
+        }
+        push_field(&mut preimage, "trusted", bool_text(self.trusted));
+        freeze(&preimage)
+    }
+}
+
 /// Named constructor arguments for [`InquiryGovernance::record`].
 #[derive(Clone, Debug)]
 pub struct InquiryObservation {
@@ -3122,6 +3400,13 @@ pub struct InquiryGovernance {
     pub profile: InquiryProtocolProfile,
     /// Source-admissibility disposition of every proposed source.
     pub admissibility: Vec<SourceAdmissibilityRecord>,
+    /// Untrusted candidate diagnostics for every observed reference the
+    /// run-bound manifest does not admit.
+    ///
+    /// This is the I21.7 demotion: the reference text is retained here as inert
+    /// data instead of being dropped, and nothing in this set is a source, a
+    /// citation, a support relation or an evidence edge.
+    pub unadmitted_references: Vec<UnadmittedReference>,
     /// Frozen source portfolio.
     pub portfolio: SourcePortfolio,
     /// Coverage receipt with its declared denominator kind.
@@ -3154,6 +3439,15 @@ impl InquiryGovernance {
     /// fabricates a closing disposition, a coverage claim, or an evidence
     /// reference.
     pub fn record(observation: InquiryObservation) -> Result<Self, InquiryError> {
+        // I21.7 reference firewall, before candidate promotion and on the live
+        // path: the run-bound allowlist is a mandatory input, so it is validated
+        // and its digest is re-proved against its own content first. A manifest
+        // whose content was widened after it was sealed, or whose digest is a
+        // caller-supplied string unrelated to its fields, produces no record at
+        // all instead of a record that publishes a false bound allowlist into
+        // the profile, coverage receipt, evidence freeze and terminal digests.
+        observation.reference_manifest.validate()?;
+        let unadmitted_references = reference_firewall(&observation)?;
         let profile = resolve_profile(&observation)?;
         let admissibility = assess_sources(&observation, &profile)?;
         let portfolio =
@@ -3213,6 +3507,7 @@ impl InquiryGovernance {
                 .iter()
                 .map(SourceAdmissibilityRecord::transition_request)
                 .collect(),
+            unadmitted_references,
             profile,
             admissibility,
             portfolio,
@@ -3276,6 +3571,17 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
+        for diagnostic in &self.unadmitted_references {
+            diagnostic.validate_integrity()?;
+            if diagnostic.inquiry_id != self.inquiry_id
+                || diagnostic.evidence_set_id != self.evidence_set_id
+                || diagnostic.state_fence != self.terminal.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.unadmitted_reference_binding",
+                });
+            }
+        }
         for obligation in &self.obligations {
             obligation.validate_integrity()?;
         }
@@ -3303,9 +3609,9 @@ impl std::fmt::Display for InquiryGovernance {
              inquiry={} evidence_set={} profile={}@{} protocol={} grade={} lane={} \
              coverage_goal={} goal_text_resolved={} hypothesis_policy={} manifest={} \
              admitted_inquiry={} admitted_denominator={} stop_rule={} output_contract={} \
-             independence_ok={} admissibility={} eligible={} portfolio={} expected_members={} \
-             open_members={} accounted={} all_closed={} denominator_kind={} absence={} \
-             supported_precision={} precision_residue={} obligations={} \
+             independence_ok={} admissibility={} eligible={} unadmitted_refs={} portfolio={} \
+             expected_members={} open_members={} accounted={} all_closed={} denominator_kind={} \
+             absence={} supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} compilation_inputs={} freeze={} debts={} \
              disposition={} terminal_denominator_kind={} may_close={} \
              acquisition_succeeded={} preserved_unknown={} narrower_claim={} \
@@ -3328,6 +3634,7 @@ impl std::fmt::Display for InquiryGovernance {
             self.portfolio.independence.meets_requirement,
             self.admissibility.len(),
             eligible,
+            self.unadmitted_references.len(),
             self.portfolio.digest,
             self.coverage_receipt.expected_members,
             self.coverage_receipt.open_members.len(),
@@ -3415,6 +3722,69 @@ fn assess_sources(
         )?);
     }
     Ok(records)
+}
+
+/// Retains every observed reference the run-bound manifest does not admit as an
+/// untrusted candidate diagnostic.
+///
+/// I21.7: "A syntactically plausible but absent/stale/wrong-scope reference
+/// remains unsupported text and produces a candidate diagnostic rather than an
+/// evidence edge." This is that diagnostic on the live record path, and it is
+/// deliberately *not* a decision: the same reference is still judged by
+/// [`assess_sources`], which refuses it for evidentiary use, so the retention
+/// here cannot promote anything. What it adds is the retained, typed, digest
+/// bound form of the untrusted text, so the Governor sees what the run observed
+/// instead of a dropped string.
+///
+/// The candidate handle is the reference identity this boundary can observe: the
+/// composition root derives it from the retained provider artifact digest, so it
+/// is caller-influenced text and is checked against the manifest like any other.
+/// A URL appearing inside the provider body is not observable here — the live
+/// projection never decodes the body — so a URL is admitted or refused at the
+/// `SourceSnapshot::locator` boundary in
+/// `eliot_research_exchange_api::ResearchEvidenceBundle::validate_against`.
+fn reference_firewall(
+    observation: &InquiryObservation,
+) -> Result<Vec<UnadmittedReference>, InquiryError> {
+    let manifest = &observation.reference_manifest;
+    let mut diagnostics = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in &observation.candidates {
+        if !seen.insert(candidate.handle.clone()) {
+            continue;
+        }
+        let (kind, reason) = if manifest
+            .stale_or_revoked_handles
+            .iter()
+            .any(|stale| stale == &candidate.handle)
+        {
+            (
+                UnadmittedReferenceKind::StaleOrRevoked,
+                "the run-bound manifest lists this reference as stale or revoked",
+            )
+        } else if !manifest.allows(&candidate.handle) {
+            let kind = if candidate.handle.contains("://") {
+                UnadmittedReferenceKind::LocatorUrl
+            } else {
+                UnadmittedReferenceKind::ArtifactHandle
+            };
+            (
+                kind,
+                "the run-bound manifest does not admit this reference handle",
+            )
+        } else {
+            continue;
+        };
+        diagnostics.push(UnadmittedReference::observe(
+            &observation.inquiry_id,
+            &observation.evidence_set_id,
+            &candidate.handle,
+            kind,
+            reason,
+            &manifest.state_fence,
+        )?);
+    }
+    Ok(diagnostics)
 }
 
 /// Opens the exact coverage accounting over the admitted reference members.
