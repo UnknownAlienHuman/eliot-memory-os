@@ -9,6 +9,7 @@ use eliot_contracts::StateFence;
 use eliot_dreamer_contracts::ContractViolation;
 use eliot_dreamer_contracts::ScreenBinding;
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
+use eliot_dreamer_orientation::OrientationDisposition;
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
+mod production_orientation;
 mod pulse;
 mod result_stage;
 mod validation_stage;
@@ -790,6 +792,136 @@ pub struct CurationCandidate {
     pub rollback: String,
 }
 
+/// Exact schema version accepted by [`OrientationPulseResult`].
+pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 1;
+
+/// Closed per-stage disposition for one Orientation pulse member (issue #2901).
+///
+/// The composer emits `Executed` for a stage whose owner entry ran,
+/// `Pending` for a compatibility-composition member whose owner inputs were
+/// absent, and `Blocked` for a production member that cannot proceed (missing
+/// prerequisite, incoherent closure, or owner refusal). `Stale`, `Unknown`,
+/// and `NotApplicable` are versioned contract states for owner-reported
+/// conditions; no current owner reports them, so the composer never emits
+/// them today.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrientationStageDisposition {
+    Executed,
+    Pending,
+    Blocked,
+    Stale,
+    Unknown,
+    NotApplicable,
+}
+
+/// One pulse-member ledger record: stage/owner identity, disposition, input
+/// and output commitments, proof ceiling, bounded reason, and reopen
+/// condition.
+///
+/// Commitments are content digests where the owner value is digestible and
+/// static executed-presence markers otherwise; nothing secret flows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationStageRecord {
+    /// Closed stage identity (`classification`, `packet`, ...).
+    pub stage: String,
+    /// Owning entry path (`eliot_dreamer_classification::classify`, ...).
+    pub owner: String,
+    /// Whether the denominator requires this member for a complete pulse.
+    pub required: bool,
+    /// Typed member disposition.
+    pub disposition: OrientationStageDisposition,
+    /// Required owner-record descriptor for this member.
+    pub expected_input: String,
+    /// Input commitment when the member consumed its owner record.
+    pub input_commitment: Option<String>,
+    /// Output commitment when the member executed.
+    pub output_commitment: Option<String>,
+    /// Proof ceiling (`candidate_only` when executed, `blocked` otherwise).
+    pub proof_ceiling: String,
+    /// Bounded static reason code when not executed.
+    pub reason: Option<String>,
+    /// Bounded static reopen condition when not executed.
+    pub recovery: Option<String>,
+}
+
+/// One CC-002/CC-004 prerequisite boundary record for a production pulse.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationBoundaryRecord {
+    /// Closed boundary identity (`cc002_model_route`, `cc004_projections`).
+    pub boundary: String,
+    /// Whether the admitted boundary value was supplied.
+    pub present: bool,
+    /// Boundary commitment (outcome/projection digest) when supplied.
+    pub commitment: Option<String>,
+    /// Terminal model-route disposition when a CC-002 outcome is supplied.
+    pub disposition: Option<String>,
+    /// Bounded static reason code when absent or unusable.
+    pub reason: Option<String>,
+}
+
+/// Admitted-material prefix commitments binding a production pulse to the
+/// exact v1 validated candidate, sealed dispatch policy, and input bundle it
+/// composed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationAdmittedPrefix {
+    /// Canonical digest of the v1 `ValidatedCandidate`.
+    pub candidate_digest: String,
+    /// Canonical digest of the sealed `OrientationPolicy`.
+    pub policy_digest: String,
+    /// Canonical digest of the `DreamInputBundle`.
+    pub bundle_digest: String,
+}
+
+/// Typed production Orientation pulse result (issue #2901).
+///
+/// The overall [`OrientationDisposition`] is `Complete` only when every
+/// denominator member executed under one coherent identity closure with both
+/// CC-002/CC-004 boundaries admitted; `Partial` when the packet projected but
+/// a member stays unqualified; `Blocked` when prerequisites are missing,
+/// incoherent, or refused, in which case `packet` is always `None`. A
+/// packet-only compatibility result stays on [`DreamResult::Packet`] and can
+/// never satisfy the #41 Product Pulse acceptance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationPulseResult {
+    /// Exact schema version; must be 1.
+    pub schema_version: u32,
+    /// Overall pulse disposition (`Complete`, `Partial`, or `Blocked`).
+    pub disposition: OrientationDisposition,
+    /// Proof ceiling (`candidate_only` with a packet, `blocked` without).
+    pub proof_ceiling: String,
+    /// Owning job identity.
+    pub job_id: String,
+    /// Shared task identity proved by the closure.
+    pub task_id: String,
+    /// Shared scope identity proved by the closure.
+    pub scope_id: String,
+    /// Shared operation identity proved by the closure.
+    pub operation_id: String,
+    /// Shared state fence proved by the closure.
+    pub state_fence: StateFence,
+    /// Canonical denominator identity for the expected member set.
+    pub denominator: String,
+    /// One ledger record per denominator member, in denominator order.
+    pub stages: Vec<OrientationStageRecord>,
+    /// CC-002 admitted model-route outcome boundary.
+    pub model_outcome: OrientationBoundaryRecord,
+    /// CC-004 canonical projection set boundary.
+    pub projections: OrientationBoundaryRecord,
+    /// Admitted-material prefix commitments.
+    pub admitted: OrientationAdmittedPrefix,
+    /// Projected packet; present exactly when the pulse composed one.
+    pub packet: Option<DreamPacket>,
+    /// Bounded static omission/qualification codes.
+    pub omissions: Vec<String>,
+    /// Static owner identities absent from this pulse.
+    pub missing_owners: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 #[allow(
@@ -798,6 +930,7 @@ pub struct CurationCandidate {
 )]
 pub enum DreamResult {
     Packet(DreamPacket),
+    Orientation(OrientationPulseResult),
     Curation {
         job_id: String,
         candidates: Vec<CurationCandidate>,
