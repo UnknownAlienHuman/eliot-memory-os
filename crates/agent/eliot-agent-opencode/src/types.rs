@@ -2504,7 +2504,12 @@ pub struct PhysicalObservationBody {
 
 /// Versioned schema tag for the digest-bound route-disposition summary sealed
 /// into the run extra before candidate sealing (issue #2902).
-pub const SEALED_ROUTE_DISPOSITION_SUMMARY_SCHEMA: &str = "eliot-opencode-route-disposition/v1";
+///
+/// `v2` carries one provenance label per [`RouteFingerprint`] component
+/// (thirteen keys under `component_sources`); `v1` carried only three labels
+/// (`provider`, `model`, `launch_runtime_tool_serializer`), leaving eight
+/// binding-attested components undisclosed.
+pub const SEALED_ROUTE_DISPOSITION_SUMMARY_SCHEMA: &str = "eliot-opencode-route-disposition/v2";
 
 /// Passive reconciliation handle for a seal-time route observation whose
 /// outcome is unknown (issue #2902): the admitted edge seals only reconciled
@@ -2696,7 +2701,13 @@ impl SealedRouteDisposition {
         let (wire_evidence_digest, wire_evidence_ref) = self.summary_wire_fields();
         let (recovery_ref, observation_cursor, observation_sequence) =
             self.summary_recovery_fields();
-        let (provider_source, model_source, binding_source) = observed_component_sources(self);
+        // One provenance label per RouteFingerprint component (issue #2902
+        // item 6): a consumer of the sealed candidate digest can determine
+        // the origin and proof ceiling of every observed-route field.
+        let component_sources = observed_component_sources(self)
+            .into_iter()
+            .map(|(component, source)| (component.to_owned(), Value::String(source.to_owned())))
+            .collect::<serde_json::Map<String, Value>>();
         serde_json::to_value(serde_json::json!({
             "schema": SEALED_ROUTE_DISPOSITION_SUMMARY_SCHEMA,
             "disposition": disposition,
@@ -2708,11 +2719,7 @@ impl SealedRouteDisposition {
             "wire_evidence_digest": wire_evidence_digest,
             "wire_evidence_ref": wire_evidence_ref,
             "recovery_ref": recovery_ref,
-            "component_sources": {
-                "provider": provider_source,
-                "model": model_source,
-                "launch_runtime_tool_serializer": binding_source,
-            },
+            "component_sources": Value::Object(component_sources),
             "observation_cursor": observation_cursor,
             "observation_sequence": observation_sequence,
             "staging_requested_route_digest": requested_digest.as_str(),
@@ -2839,17 +2846,31 @@ fn canonical_state_names(
 }
 
 /// Per-component evidence provenance for one sealed route disposition (issue
-/// #2902 item 6): provider/model are wire-observed exactly when a validated
-/// `Observed` receipt exists; launch/runtime/tool/serializer values are
+/// #2902 item 6): exactly one label per [`RouteFingerprint`] field, in
+/// canonical field order, so no observed-route component rides without a
+/// statement of whether it came from wire observation or execution-binding
+/// attestation.
+///
+/// Provider/model are wire-observed exactly when a validated `Observed`
+/// receipt exists (the only channels the live wire corroborates through the
+/// shared [`wire_route_locator`] recipe). Every other behavior-bearing
+/// component (`host_family`, `adapter`, `protocol_transport`, `runtime_hash`,
+/// `adapter_hash`, `auth_billing`, `serializer_hash`, `tool_semantics_hash`,
+/// `reasoning_mode`, `continuation_behavior`, `feature_flags_hash`) is
 /// execution-binding attestation whenever the disposition was derived under
-/// the verified admission; anything else is unobserved and never fabricated
-/// equal to requested or observed values.
+/// the verified admission — dispatched execution configuration taken from the
+/// exact binding route the adapter launched under, never a
+/// caller-supplied request and never presented as physical observation merely
+/// by equality with requested values. Anything else is unobserved and never
+/// fabricated equal to requested or observed values; a legacy absence
+/// attests nothing at all.
 pub fn observed_component_sources(
     disposition: &SealedRouteDisposition,
-) -> (&'static str, &'static str, &'static str) {
-    match disposition {
+) -> [(&'static str, &'static str); 13] {
+    // Direct (wire-observed) versus attested (binding) source per
+    // disposition class; legacy absence carries neither.
+    let (direct, attested) = match disposition {
         SealedRouteDisposition::Observed(_) => (
-            ROUTE_COMPONENT_SOURCE_WIRE_OBSERVED,
             ROUTE_COMPONENT_SOURCE_WIRE_OBSERVED,
             ROUTE_COMPONENT_SOURCE_BINDING_ATTESTED,
         ),
@@ -2857,15 +2878,28 @@ pub fn observed_component_sources(
         | SealedRouteDisposition::RejectedConflict { .. }
         | SealedRouteDisposition::UnknownOutcome { .. } => (
             ROUTE_COMPONENT_SOURCE_UNOBSERVED,
-            ROUTE_COMPONENT_SOURCE_UNOBSERVED,
             ROUTE_COMPONENT_SOURCE_BINDING_ATTESTED,
         ),
         SealedRouteDisposition::LegacyUnverified { .. } => (
             ROUTE_COMPONENT_SOURCE_UNOBSERVED,
             ROUTE_COMPONENT_SOURCE_UNOBSERVED,
-            ROUTE_COMPONENT_SOURCE_UNOBSERVED,
         ),
-    }
+    };
+    [
+        ("host_family", attested),
+        ("adapter", attested),
+        ("protocol_transport", attested),
+        ("runtime_hash", attested),
+        ("adapter_hash", attested),
+        ("provider", direct),
+        ("model", direct),
+        ("auth_billing", attested),
+        ("serializer_hash", attested),
+        ("tool_semantics_hash", attested),
+        ("reasoning_mode", attested),
+        ("continuation_behavior", attested),
+        ("feature_flags_hash", attested),
+    ]
 }
 
 /// Bounded public cause code for one canonical conversion failure (issue
