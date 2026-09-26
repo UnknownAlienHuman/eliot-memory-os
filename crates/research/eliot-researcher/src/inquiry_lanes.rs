@@ -2124,6 +2124,10 @@ pub struct ExposureLedger {
     /// Channels the owner requires for a confirmatory claim.
     pub mandatory_channels: BTreeSet<ExposureChannel>,
     /// Whether the owner attested complete coverage over the observed channels.
+    ///
+    /// The flag alone authorises nothing: the release gate re-proves the
+    /// coverage receipt, so unknown leak history cannot pass as attested
+    /// coverage.
     pub coverage_attested: bool,
     /// Owner receipt attesting that coverage.
     pub coverage_receipt: Option<OwnerOrderingReceipt>,
@@ -3403,10 +3407,39 @@ fn verify_partition_binding(
 }
 
 /// Verifies that exposure coverage is attested across every mandatory channel.
+///
+/// The attestation is re-proved here, at the release gate, rather than trusted
+/// from the ledger's flag: a bare `coverage_attested` boolean is a caller
+/// assertion, not proof of order, so a ledger whose leak history is unknown —
+/// no receipt, a receipt for another subject, or a receipt that no longer binds
+/// this ledger state — is refused instead of passing as attested coverage.
 fn verify_exposure_coverage(ledger: &ExposureLedger) -> Result<(), LaneRegistrationError> {
     if !ledger.coverage_attested {
         return Err(LaneRegistrationError::ExposureCoverageIncomplete {
             field: "ledger.coverage_attested",
+        });
+    }
+    let Some(receipt) = &ledger.coverage_receipt else {
+        return Err(LaneRegistrationError::ExposureCoverageIncomplete {
+            field: "ledger.coverage_receipt",
+        });
+    };
+    receipt.validate_integrity()?;
+    if receipt.subject != OrderedSubjectKind::CoverageAttestation {
+        return Err(LaneRegistrationError::ExposureCoverageIncomplete {
+            field: "ledger.coverage_receipt",
+        });
+    }
+    // The receipt bound the ledger digest as it stood before the attestation.
+    // Recomputing that preimage rejects a receipt that belongs to another
+    // ledger state — including one superseded by events recorded after the
+    // attestation — so post-attestation exposure cannot ride on stale coverage.
+    let mut pre_attestation = ledger.clone();
+    pre_attestation.coverage_attested = false;
+    pre_attestation.coverage_receipt = None;
+    if pre_attestation.compute_digest() != receipt.subject_digest {
+        return Err(LaneRegistrationError::ExposureCoverageIncomplete {
+            field: "ledger.coverage_receipt",
         });
     }
     if !ledger.unattested_channels().is_empty() {
