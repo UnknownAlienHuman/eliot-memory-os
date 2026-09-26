@@ -97,7 +97,9 @@ use std::sync::mpsc::{
 use std::time::{Duration, Instant};
 
 use eliot_contracts::sha256_hex;
-use eliot_wasm_runtime::lifecycle::InFlightDisposition;
+use eliot_wasm_runtime::lifecycle::{
+    DIVERGENCE_REASON_CODE, DivergenceReport, InFlightDisposition,
+};
 use eliot_wasm_runtime::{
     EngineBinding, GuestInterruptHandle, InvocationRequest, InvocationResult, Sha256Digest,
     VerificationVerdict,
@@ -770,6 +772,12 @@ pub struct WasmHostResultFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain: Option<String>,
     pub rollback_candidate: bool,
+    /// Canonical explicit-divergence reason code, present exactly when the
+    /// sealed execution disagreed with its declared reference.
+    pub divergence_code: Option<String>,
+    /// Explicit leg-level divergence report, present exactly when the
+    /// sealed execution disagreed with its declared reference.
+    pub divergence: Option<DivergenceReport>,
 }
 
 fn disposition_text(disposition: eliot_wasm_runtime::InvocationDisposition) -> String {
@@ -830,16 +838,24 @@ fn usage_frames(result: &InvocationResult) -> (Option<u64>, Option<u64>, Option<
 /// budget-omitted stay distinct. Sequence and terminal disposition are
 /// assigned by the loop when the frame joins the retained sequence, not
 /// here.
+///
+/// The explicit divergence report travels separately from the typed error:
+/// the error keeps its stable classification while the report carries the
+/// leg-level evidence and the canonical divergence reason code.
 fn project_result(
     binding: &AdmittedBinding,
     engine: &EngineBinding,
     command: WorkerCommand,
     result: &InvocationResult,
+    divergence: Option<DivergenceReport>,
 ) -> WasmHostResultFrame {
     let (shadow, canary, rollback, cutover) = lifecycle_frame(evaluate_lifecycle_verdicts(result));
     let (trap, cancelled, drain, rollback_candidate) =
         seated_frame(evaluate_seated_verdicts(result));
     let (fuel_consumed, peak_memory_bytes, table_elements, epoch_ticks) = usage_frames(result);
+    let divergence_code = divergence
+        .as_ref()
+        .map(|_| DIVERGENCE_REASON_CODE.to_owned());
     WasmHostResultFrame {
         wire_id: WASM_HOST_RESULT_WIRE_ID,
         wire_version: WASM_HOST_RESULT_WIRE_VERSION,
@@ -885,6 +901,8 @@ fn project_result(
         cancelled,
         drain,
         rollback_candidate,
+        divergence_code,
+        divergence,
     }
 }
 
@@ -1202,6 +1220,8 @@ fn denial_frame(
         cancelled: false,
         drain: None,
         rollback_candidate: false,
+        divergence_code: None,
+        divergence: None,
     }
 }
 
@@ -1262,6 +1282,8 @@ fn unknown_frame(
             InFlightDisposition::BlockScopeUnknownOutcome
         )),
         rollback_candidate: true,
+        divergence_code: None,
+        divergence: None,
     }
 }
 
@@ -2343,6 +2365,9 @@ struct WorkerOutcome {
     result: Result<InvocationResult, String>,
     /// Whether this Shutdown request won the runner's P-11 request race.
     shutdown_request_won: Option<bool>,
+    /// Explicit divergence report, present exactly when the executed
+    /// outcome was a sealed differential mismatch.
+    divergence: Option<DivergenceReport>,
 }
 
 /// The tracked engine worker's channels and join handle.
@@ -2400,11 +2425,19 @@ fn spawn_worker(runtime: AdmittedRuntime, bound: usize) -> EngineWorker {
                     Err("SHUTDOWN".to_owned())
                 }
             };
+            // Pure readback over the retained outcome: the report exists
+            // exactly when the executed outcome was a sealed differential
+            // mismatch, and costs one cache lookup otherwise.
+            let divergence = match (&result, attempt.as_ref()) {
+                (Ok(_), Some(pending)) => runner.divergence_report(&pending.invocation_id),
+                _ => None,
+            };
             if outcome_tx
                 .send(WorkerOutcome {
                     command,
                     result,
                     shutdown_request_won,
+                    divergence,
                 })
                 .is_err()
             {
@@ -2828,9 +2861,14 @@ impl BoundedRequestLoop {
         // a Cancel outcome answers `OP_CANCEL` in the `contain` phase, a
         // Reconcile outcome answers `OP_RECONCILE` in the `reconcile` phase.
         // Control outcomes never masquerade as Invoke results.
-        let command = outcome.command;
-        let mut frame = match outcome.result {
-            Ok(result) => project_result(&self.binding, &self.engine, command, &result),
+        let WorkerOutcome {
+            command,
+            result,
+            divergence,
+            shutdown_request_won: _,
+        } = outcome;
+        let mut frame = match result {
+            Ok(result) => project_result(&self.binding, &self.engine, command, &result, divergence),
             Err(code) if self.admission.follow_up != FollowUp::None => unknown_frame(
                 &self.binding,
                 command_operation(command),
