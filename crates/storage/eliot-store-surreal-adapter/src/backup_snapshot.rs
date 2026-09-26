@@ -18,18 +18,65 @@
 //! evidence. See [`observed_scope_projection`] for the record-level limit this
 //! honest projection does not claim to cover.
 //!
-//! One release discipline: [`CaptureRelease`] releases exactly the capture-owned
-//! entry on every exit path of a page or end call, including a future dropped
-//! while the provider await is in flight. The registry map is never cleared
-//! wholesale. A capture that stopped being servable - window closed, point
-//! moved, page bound reached, set exhausted, provider read failed - records its
-//! exact partial evidence with [`mark_interruption`] and keeps its entry, so
-//! [`end_snapshot`] issues a real receipt carrying the exact served counts
-//! instead of deleting the only record of what was served. A provider read
-//! failure is the one transient reason: a later close that still observes the
-//! exact bound point clears it through [`clear_transient_interruption`], because
-//! a transport failure observed nothing about the source. A recorded
-//! interruption is terminal for serving, but never for closing.
+//! Three lifetimes, one owner. A capture entry separates:
+//!
+//! * the retained capture identity and progress ([`SnapshotState`]) — the
+//!   issued handle, bound point, served counters, interruption ledger and the
+//!   immutable terminal receipt, which outlive every individual call;
+//! * the heavyweight member payload ([`CapturePayload`]) and the one retained
+//!   page response ([`SnapshotState::last_page`]), freed by the accounted
+//!   payload-to-terminal transition while the entry above survives;
+//! * the in-flight call claim ([`CaptureCallClaim`]) — private, non-cloneable,
+//!   bound to the capture incarnation, the request kind and the progress
+//!   revision it was validated against.
+//!
+//! Every page and end call acquires its own claim after validation, so calls on
+//! one capture are serialized by the claim slot and are additionally re-verified
+//! against an explicit progress revision after the provider await. A digest is
+//! only an index: no post-await counter movement or interruption is applied
+//! without the matching incarnation, claim and revision, and no registry mutex
+//! is ever held across provider IO (I5.7).
+//!
+//! Every exit settles only its own claim. Explicit completion applies the
+//! matching transition and then disarms the claim. Drop releases the local claim
+//! and preserves prior capture evidence: an unpolled future performed nothing,
+//! and cancellation while awaiting a point observation proves neither source
+//! movement nor a stable point nor zero served pages. Drop therefore records no
+//! interruption, issues no provider call and deletes no entry; poisoned or
+//! unreadable bookkeeping leaves the claim occupied as an observable recovery
+//! limitation, never as successful cleanup.
+//!
+//! Interruptions merge instead of overwriting. A capture that stopped being
+//! servable — window closed, point moved, page bound reached, set exhausted,
+//! provider read failed — keeps its entry and its exact partial evidence in
+//! [`CaptureInterruption`], whose bounded reason ledger retains the first causal
+//! failure plus whatever later outcome evidence is necessary. A point movement
+//! or window expiry stays terminal for serving and for completeness, so an
+//! unrelated transient provider error can neither replace it nor later be
+//! cleared into `Complete`. Re-observing the exact original point resolves only
+//! the single unresolved transient-read condition, keeping that reason in the
+//! ledger and leaving every served counter unchanged.
+//!
+//! The close transition is accounted, not destructive. A closed capture freezes
+//! one immutable [`SnapshotEndReceipt`] derived from the authoritative
+//! denominator, the original handle, the exact served counters and the actual
+//! source/window observations, then frees the heavy payload. Expiry maintenance
+//! of another capture performs the same accounted transition instead of deleting
+//! its only evidence, and the bounded terminal record is released only after its
+//! replay horizon has ended. An exact repeated end is answered from that record;
+//! a failed observation leaves the close pending with its recovery identity and
+//! never fabricates a stable-point receipt.
+//!
+//! What this module does *not* claim: the served counters are local accounting of
+//! what this adapter constructed, not proof that the caller received a page or
+//! that a full backup is durable (I5.13: backup existence is not recovery
+//! proof; I5.27: a committed intent never proves the effect occurred). An exact
+//! repeated page cursor is answered from the retained response owner; a cursor
+//! that is not an exact repeat is refused rather than skipped forward, zeroed or
+//! recaptured under the old identity. The registry is process memory: nothing
+//! here is restart-persistent unless it is handed to and acknowledged by the
+//! existing durable backup/evidence owner, and no new snapshot database exists
+//! here.
 //!
 //! Reads only: this module never acquires `adapter.write_lock`, issues no
 //! DDL/migration, performs no restore, and defines no archive format. Every
@@ -703,6 +750,11 @@ struct CapturePoint {
 /// retained once at begin. Every page and end request is compared against it,
 /// and every emitted handle is read back from it, so a presented object can
 /// never stand in for the issued one.
+///
+/// The three lifetimes are separate members, not one blob: identity/progress
+/// and the interruption ledger live here for the whole capture, the heavyweight
+/// payload and the retained page response are freed by the terminal transition,
+/// and the in-flight call claim is owned by exactly one call at a time.
 struct SnapshotState {
     /// The exact handle this capture was opened under, retained once.
     ///
@@ -723,17 +775,67 @@ struct SnapshotState {
     /// is not proven, so the only legal completeness is partial.
     enumeration: Option<EnumerationEvidence>,
     /// Exact partial evidence recorded when the capture stopped being
-    /// servable. Never deleted: it is the receipt's `Partial`/`Expired`
-    /// provenance.
+    /// servable. Never deleted while the entry lives: it is the receipt's
+    /// `Partial`/`Expired` provenance.
     interruption: Option<CaptureInterruption>,
-    ordered_members: Vec<SnapshotMember>,
+    /// The single in-flight page/end claim, or `None` when no call owns this
+    /// capture right now. At most one call can be inside a provider await for
+    /// this entry, which is what makes a post-await result attributable.
+    claim: Option<CaptureClaimSlot>,
+    /// Monotonic progress revision of this entry.
+    ///
+    /// Bumped by every accepted transition that changes observable progress:
+    /// a served page, a recorded interruption, a resolved transient read and
+    /// the terminal close. A claim is bound to the revision it was validated
+    /// against, so a result computed for a different progress state cannot be
+    /// applied to this one.
+    progress_revision: u64,
+    /// The heavyweight observed member payload. `None` after the accounted
+    /// terminal transition freed it; a capture with no payload never
+    /// constructs fresh capture data under its old identity.
+    payload: Option<CapturePayload>,
+    /// The last page this owner constructed, retained as the same-cursor
+    /// replay source for a response the caller may have lost. Bounded by one
+    /// page and freed by the terminal transition.
+    last_page: Option<SnapshotPage>,
+    /// The immutable terminal close result, retained for an exact repeated end
+    /// inside its bounded replay horizon.
+    terminal: Option<RetainedClose>,
     total_bytes: u64,
     total_pages: u64,
+    /// Pages this adapter constructed and accounted locally. This is local
+    /// accounting of constructed responses, not proof of transport delivery
+    /// to the backup consumer and not proof of durability.
     pages_served: u64,
+    /// Members accounted locally in those pages.
     members_served: u64,
+    /// Bytes accounted locally in those pages.
     bytes_served: u64,
     last_digest: String,
     opened_at_ms: u64,
+}
+
+/// The heavyweight member payload of a live capture.
+///
+/// It is separated from [`SnapshotState`] so the accounted terminal transition
+/// can free it while the identity, progress, interruption and terminal evidence
+/// around it survive.
+struct CapturePayload {
+    /// The observed members in the frozen served order.
+    ordered_members: Vec<SnapshotMember>,
+}
+
+/// The immutable terminal close result plus its bounded replay horizon.
+struct RetainedClose {
+    /// The exact receipt this owner issued for this capture. It is never
+    /// recomputed and never rewritten, so an exact repeated end returns the
+    /// same evidence rather than a second derivation.
+    receipt: SnapshotEndReceipt,
+    /// Owner-issued horizon: the capture's own declared duration bound. Inside
+    /// it an exact repeated end is answered from this record; after it the
+    /// bounded record is released by maintenance and no receipt is fabricated
+    /// for a capture whose payload is already gone.
+    retained_until_ms: u64,
 }
 
 /// Module-private capture registry keyed by handle digest.
@@ -756,6 +858,17 @@ fn lock_registry()
 fn next_incarnation() -> u64 {
     static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
     NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Issues the next in-flight call-claim identity.
+///
+/// Owner-issued and monotonic, for the same reason as [`next_incarnation`]: the
+/// post-await re-check only needs a value that identifies exactly one claim
+/// slot, so a released or replaced claim can never be mistaken for the call that
+/// is still awaiting the provider.
+fn next_claim_id() -> u64 {
+    static NEXT_CLAIM_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_CLAIM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Compares a presented handle with the retained owner-issued handle.
@@ -1689,144 +1802,344 @@ fn reconcile_denominator(
 /// to see. The evidence is recorded on the capture instead of being deleted, so
 /// `end_snapshot` can issue an exact `Partial`/`Expired` receipt carrying the
 /// real served counts.
+///
+/// Interruptions merge instead of overwriting: `reasons` is an ordered, bounded
+/// ledger whose index 0 is the first causal failure. A later writer only ever
+/// appends, so an unrelated transient failure can never displace the terminal
+/// reason that actually stopped the capture, and the outcome evidence that
+/// matters is kept next to the cause.
 struct CaptureInterruption {
-    /// Static reason the capture stopped being servable.
-    reason: &'static str,
-    /// Pages served before the interruption.
+    /// Ordered bounded reason ledger; index 0 is the first causal failure.
+    reasons: Vec<InterruptionReason>,
+    /// Set once an exact reread of the original bound point resolved the one
+    /// outstanding transient read condition. The reason itself stays in the
+    /// ledger and every frozen counter below stays unchanged, so resolving a
+    /// transport blip never erases the history of the failure.
+    transient_resolved: bool,
+    /// Pages served when the first reason was recorded.
     pages_served: u64,
-    /// Members served before the interruption.
+    /// Members served when the first reason was recorded.
     members_served: u64,
-    /// Bytes served before the interruption.
+    /// Bytes served when the first reason was recorded.
     bytes_served: u64,
 }
 
-/// The owner-issued window or duration bound closed under the capture.
-const INTERRUPTION_WINDOW_CLOSED: &str = "owner capture window closed";
-/// The bound consistency point moved because the canonical store advanced.
-const INTERRUPTION_POINT_MOVED: &str = "bound consistency point moved";
-/// The per-request page bound was reached before the observed set was served.
-const INTERRUPTION_PAGE_BOUND: &str = "served page bound exceeded";
-/// The observed member set has no further page to serve.
-const INTERRUPTION_CAPTURE_EXHAUSTED: &str = "no further page is available";
-/// A provider read of the bound point failed, so the capture cannot say the
-/// point still holds. Bounded static text: no provider prose, no payload.
-const INTERRUPTION_PROVIDER_FAILED: &str = "bound point read failed";
+impl CaptureInterruption {
+    /// Reports whether a retained reason keeps the capture from `Complete`.
+    ///
+    /// A resolved transient read never blocks: it observed nothing about the
+    /// source. Every other retained reason blocks, including a terminal
+    /// point/window condition recorded after a later transient failure, which
+    /// is exactly the case a single-slot reason could not express.
+    fn blocks_completeness(&self) -> bool {
+        if self.reasons.iter().any(|reason| reason.is_terminal()) {
+            // A point movement or a window expiry is never resolved away, not
+            // even when an unrelated transient failure was recorded first and
+            // the point reread cleanly afterwards.
+            return true;
+        }
+        // A resolved transient read observed nothing about the source, so it
+        // stops blocking. An unresolved one still blocks, and so does any
+        // structural reason retained beside it.
+        self.reasons
+            .iter()
+            .any(|reason| !reason.is_transient_read() || !self.transient_resolved)
+    }
 
-/// Records the exact partial evidence on the capture-owned entry.
+    /// Reports whether the owner window closed under this capture.
+    fn window_closed(&self) -> bool {
+        self.reasons.contains(&InterruptionReason::WindowClosed)
+    }
+}
+
+/// One static reason a capture can no longer serve.
+///
+/// The closed vocabulary replaces the previous single `&'static str` reason
+/// slot: a closed enum is bounded reason storage by construction, and it makes
+/// "terminal" and "observed nothing about the source" properties of the reason
+/// rather than string comparisons at each use. No provider prose and no
+/// captured payload is part of any reason, so nothing foreign can reach an
+/// operator through this ledger.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InterruptionReason {
+    /// The owner-issued window or duration bound closed under the capture.
+    WindowClosed,
+    /// The bound consistency point moved because the canonical store advanced.
+    PointMoved,
+    /// The per-request page bound was reached before the observed set was
+    /// served.
+    PageBound,
+    /// The observed member set has no further page to serve.
+    CaptureExhausted,
+    /// A read of the bound point failed, so the capture cannot say the point
+    /// still holds.
+    ProviderReadFailed,
+}
+
+impl InterruptionReason {
+    /// Reports whether this reason is terminal for serving and for completeness.
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::WindowClosed | Self::PointMoved)
+    }
+
+    /// Reports whether this reason observed nothing at all about the source.
+    const fn is_transient_read(self) -> bool {
+        matches!(self, Self::ProviderReadFailed)
+    }
+}
+
+/// Ceiling on one capture's merged reason ledger.
+///
+/// The closed reason vocabulary is five entries, so this bound is never reached
+/// by a real capture; it exists so the ledger is bounded storage by
+/// construction, and the earliest evidence is what survives when it is.
+const MAX_INTERRUPTION_REASONS: usize = 8;
+
+/// Merges one interruption reason into the capture's retained evidence.
 ///
 /// The entry is deliberately kept: the entry is the only place the served
 /// counters still exist, and deleting it is what previously destroyed the exact
-/// partial evidence on both the page and the end path.
-fn mark_interruption(
+/// partial evidence on both the page and the end path. The merge is monotone —
+/// nothing is ever replaced — so the first causal failure stays the reason of
+/// record and a later, unrelated failure is retained beside it instead of
+/// overwriting it and then being cleared.
+///
+/// A claim from another incarnation never annotates this entry: a replaced
+/// capture keeps its own evidence untouched.
+fn merge_interruption(
     states: &mut HashMap<String, SnapshotState>,
     digest: &str,
-    reason: &'static str,
+    incarnation: u64,
+    reason: InterruptionReason,
 ) {
-    if let Some(state) = states.get_mut(digest) {
-        state.interruption = Some(CaptureInterruption {
-            reason,
-            pages_served: state.pages_served,
-            members_served: state.members_served,
-            bytes_served: state.bytes_served,
-        });
-    }
-}
-
-/// Records the interruption a provider failure leaves behind, then keeps the
-/// entry.
-///
-/// A transport or RPC failure is not evidence that the capture served nothing:
-/// the pages already handed out are exact partial evidence an operator must be
-/// able to see, and `end_snapshot` still owes the caller a receipt carrying
-/// them. The guard therefore stays *armed* across the provider await — a
-/// future dropped mid-await still releases the capture-owned entry through
-/// `Drop`, which is the only observable cancellation in this crate — and this
-/// helper disarms it only on the failure path, after the frozen counters have
-/// been recorded. The reason is bounded static text, so no provider message
-/// crosses the boundary. A poisoned registry lock still retains the entry:
-/// keeping the evidence is the safe direction when it cannot be annotated.
-fn retain_with_interruption(guard: &mut CaptureRelease, digest: &str) {
-    if let Ok(mut states) = registry().lock() {
-        mark_interruption(&mut states, digest, INTERRUPTION_PROVIDER_FAILED);
-    }
-    guard.retain();
-}
-
-/// Clears a recorded provider failure once a later bound-point read proves the
-/// point still holds.
-///
-/// `INTERRUPTION_PROVIDER_FAILED` is the one transient reason: a transport or
-/// RPC blip records no fact about the source, so a later owner read returning
-/// the exact bound point is fresh evidence that the capture never lost its
-/// consistency. Keeping the record anyway permanently downgraded a capture that
-/// had in fact served everything to `Partial`, which is not what actually
-/// completed.
-///
-/// Every other reason records a durable condition and stays terminal, so this
-/// never clears it: `INTERRUPTION_POINT_MOVED` (the source advanced),
-/// `INTERRUPTION_WINDOW_CLOSED` (the owner window or duration bound closed),
-/// `INTERRUPTION_PAGE_BOUND` (a bound was reached before the set was served) and
-/// `INTERRUPTION_CAPTURE_EXHAUSTED` (no further page exists).
-///
-/// Clearing removes no evidence. While any interruption stands, `prepare_page`
-/// and `finish_page` both refuse before `serve_next_page` can reach the
-/// counters, so the frozen counts are the live counts by construction; the
-/// receipt therefore reports exactly the same numbers it would have reported
-/// with the record left in place, and `is_complete_capture` still has to pass
-/// before the closing receipt may say `Complete`.
-fn clear_transient_interruption(states: &mut HashMap<String, SnapshotState>, digest: &str) {
     let Some(state) = states.get_mut(digest) else {
         return;
     };
-    let transient = state
-        .interruption
-        .as_ref()
-        .is_some_and(|interruption| interruption.reason == INTERRUPTION_PROVIDER_FAILED);
-    if transient {
-        state.interruption = None;
+    if state.incarnation != incarnation {
+        return;
     }
-}
-
-/// Releases exactly the capture-owned entry on every exit path of a page or end
-/// call, including a future dropped while the provider await is in flight.
-///
-/// This replaces the three inconsistent release sites. The crate has no
-/// `CancellationToken` and no `tokio::select!`, so a dropped future is the only
-/// observable cancellation; the guard's `Drop` runs on that path too. It takes
-/// the registry lock only for the removal, never across an await (I5.7), and it
-/// closes only capture-owned state: `client::session_pool` returns a pooled slot
-/// on `Drop` without poisoning it, so an in-flight response is possible and the
-/// capture entry is released regardless of any slot health assumption.
-struct CaptureRelease {
-    digest: String,
-    armed: bool,
-}
-
-impl CaptureRelease {
-    /// Arms release for the capture named by `digest`.
-    fn arm(digest: String) -> Self {
-        Self {
-            digest,
-            armed: true,
+    if let Some(entry) = state.interruption.as_mut() {
+        if !entry.reasons.contains(&reason) && entry.reasons.len() < MAX_INTERRUPTION_REASONS {
+            entry.reasons.push(reason);
         }
+        return;
     }
+    let interruption = CaptureInterruption {
+        reasons: vec![reason],
+        transient_resolved: false,
+        pages_served: state.pages_served,
+        members_served: state.members_served,
+        bytes_served: state.bytes_served,
+    };
+    state.interruption = Some(interruption);
+    state.progress_revision = state.progress_revision.saturating_add(1);
+}
 
-    /// Keeps the capture-owned entry because the capture is still live and the
-    /// exact partial evidence must survive for a later `end_snapshot`.
-    fn retain(&mut self) {
-        self.armed = false;
+/// Resolves the single outstanding transient read condition, if that is all the
+/// ledger holds.
+///
+/// `InterruptionReason::ProviderReadFailed` is the one reason that observed
+/// nothing about the source: a transport or RPC blip records no fact about the
+/// store, so a later owner read returning the exact bound point is fresh
+/// evidence that the capture never lost its consistency. Keeping the record
+/// permanently would downgrade a capture that had in fact served everything to
+/// `Partial`, which is not what actually completed.
+///
+/// The resolution is deliberately narrow. It applies only when the transient
+/// read is the *sole* recorded reason, it never removes that reason from the
+/// ledger, it never touches the frozen counters, and it never resolves a reason
+/// that merely happens to appear after a terminal one: `INTERRUPTION_POINT_MOVED`
+/// (the source advanced), `INTERRUPTION_WINDOW_CLOSED` (the owner window or
+/// duration bound closed), `INTERRUPTION_PAGE_BOUND` and
+/// `INTERRUPTION_CAPTURE_EXHAUSTED` all stay terminal forever.
+fn resolve_transient_read(
+    states: &mut HashMap<String, SnapshotState>,
+    digest: &str,
+    incarnation: u64,
+) {
+    let Some(state) = states.get_mut(digest) else {
+        return;
+    };
+    if state.incarnation != incarnation {
+        return;
+    }
+    let Some(entry) = state.interruption.as_mut() else {
+        return;
+    };
+    if entry.reasons.len() != 1 || !entry.reasons[0].is_transient_read() || entry.transient_resolved
+    {
+        return;
+    }
+    entry.transient_resolved = true;
+    // The served counters are untouched; only the completeness eligibility
+    // changes, which is itself observable progress.
+    state.progress_revision = state.progress_revision.saturating_add(1);
+}
+
+/// Which kind of request holds a capture's in-flight claim.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CaptureCallKind {
+    /// A [`read_snapshot_page`] call.
+    Page,
+    /// An [`end_snapshot`] call.
+    End,
+}
+
+/// The registry's record of the one in-flight call claim on a capture.
+struct CaptureClaimSlot {
+    /// Owner-issued identity of this single in-flight claim.
+    claim_id: u64,
+    /// The kind of request that holds the claim.
+    kind: CaptureCallKind,
+    /// The progress revision the claim was validated against.
+    expected_revision: u64,
+}
+
+/// Private, non-cloneable claim over one page or end call on one capture.
+///
+/// The claim is bound to the capture incarnation, the request kind and the
+/// progress revision it was validated against, so a post-await result can be
+/// applied only to the exact owner it was computed for. It is not `Clone`, not
+/// `Copy` and carries no public capability: only the call that acquired it can
+/// settle it, and its `Drop` releases exactly its own claim slot.
+struct CaptureCallClaim {
+    /// Digest of the claimed capture, the registry index for the slot.
+    digest: String,
+    /// Incarnation the claim was validated against.
+    incarnation: u64,
+    /// The kind of request this claim belongs to.
+    kind: CaptureCallKind,
+    /// Identity of this single in-flight claim.
+    claim_id: u64,
+    /// The progress revision this claim was validated against.
+    expected_revision: u64,
+    /// Set once the matching transition was applied and the slot released.
+    settled: bool,
+}
+
+impl CaptureCallClaim {
+    /// Settles the claim after its matching transition was applied.
+    ///
+    /// Explicit completion disarms the local claim only after the state
+    /// transition it belongs to, so an exit that fails before its transition
+    /// leaves the claim armed and `Drop` releases it.
+    fn settle(&mut self, states: &mut HashMap<String, SnapshotState>) {
+        release_claim_slot(states, &self.digest, self.claim_id);
+        self.settled = true;
     }
 }
 
-impl Drop for CaptureRelease {
+impl Drop for CaptureCallClaim {
     fn drop(&mut self) {
-        if !self.armed {
+        if self.settled {
             return;
         }
-        if let Ok(mut states) = registry().lock() {
-            release_owned(&mut states, &self.digest);
-        }
+        // A released claim is the only thing this destructor does. It proves
+        // nothing about the source: an unpolled future performed nothing, and
+        // cancellation while awaiting a point observation establishes neither
+        // source movement nor a stable point nor zero served pages. So prior
+        // evidence — served counters, interruption ledger, retained terminal
+        // receipt — is preserved exactly as it is, no interruption is recorded,
+        // no provider call is issued, and no entry is deleted.
+        let Ok(mut states) = registry().lock() else {
+            // Poisoned bookkeeping is an observable recovery limitation, not
+            // successful cleanup: the slot stays occupied, so the next call sees
+            // a typed conflict instead of a capture that silently lost its
+            // evidence.
+            return;
+        };
+        release_claim_slot(&mut states, &self.digest, self.claim_id);
     }
+}
+
+/// Releases exactly one call's claim slot, and nothing else.
+///
+/// A slot that no longer carries this claim id belongs to a successor, so this
+/// can neither release a successor's claim nor annotate or delete it.
+fn release_claim_slot(states: &mut HashMap<String, SnapshotState>, digest: &str, claim_id: u64) {
+    let Some(state) = states.get_mut(digest) else {
+        return;
+    };
+    if state
+        .claim
+        .as_ref()
+        .is_some_and(|slot| slot.claim_id == claim_id)
+    {
+        state.claim = None;
+    }
+}
+
+/// Re-verifies that a claim still describes the exact owner it was acquired for.
+///
+/// The check is deliberately explicit and layered rather than digest-shaped: a
+/// digest match alone cannot prove which entry or which progress state the
+/// awaiting call belongs to.
+fn resolve_claim(state: &SnapshotState, claim: &CaptureCallClaim) -> Result<(), StoreError> {
+    if state.incarnation != claim.incarnation {
+        // The entry under this digest is a different capture entirely.
+        return Err(StoreError::IdentityConflict);
+    }
+    let Some(slot) = state.claim.as_ref() else {
+        return Err(StoreError::RevisionConflict);
+    };
+    if slot.claim_id != claim.claim_id
+        || slot.kind != claim.kind
+        || slot.expected_revision != claim.expected_revision
+    {
+        return Err(StoreError::RevisionConflict);
+    }
+    if state.progress_revision != claim.expected_revision {
+        // The capture moved to another progress state while this call awaited
+        // the provider, so its result belongs to an earlier revision.
+        return Err(StoreError::RevisionConflict);
+    }
+    Ok(())
+}
+
+/// The typed refusal while another call still owns the capture's claim.
+///
+/// A close that answers here cannot know the final counts, because the live
+/// page claim may still advance them, and a second page call cannot know which
+/// progress state it would extend. `eliot_store_api::StoreError` has no pending
+/// variant, so the typed conflict it does offer for a call that does not own
+/// the capture's current progress revision is used instead of inventing one
+/// here.
+fn capture_claim_pending() -> StoreError {
+    StoreError::RevisionConflict
+}
+
+/// Records the interruption a returned provider failure leaves behind, then
+/// settles only this call's claim.
+///
+/// A transport or RPC failure is not evidence that the capture served nothing:
+/// the pages already accounted are exact partial evidence an operator must be
+/// able to see, and `end_snapshot` still owes the caller a receipt carrying
+/// them. It is also not evidence that the source moved, which is why the reason
+/// is the transient one and why it is merged into the ledger rather than
+/// replacing whatever the ledger already holds.
+///
+/// A poisoned registry lock is not treated as successful cleanup: the claim is
+/// left unsettled, so its `Drop` cannot certify anything either, and the
+/// capture keeps its entry and its evidence.
+fn record_provider_read_failure(claim: &mut CaptureCallClaim) {
+    let Ok(mut states) = registry().lock() else {
+        return;
+    };
+    let owned = states
+        .get(&claim.digest)
+        .is_some_and(|state| resolve_claim(state, claim).is_ok());
+    if !owned {
+        // The claim no longer describes this entry's current owner: a replaced
+        // or closed capture keeps its own evidence untouched.
+        return;
+    }
+    merge_interruption(
+        &mut states,
+        &claim.digest,
+        claim.incarnation,
+        InterruptionReason::ProviderReadFailed,
+    );
+    claim.settle(&mut states);
 }
 
 /// The typed refusal for a handle that names no open capture.
@@ -1847,12 +2160,84 @@ fn capture_is_retired(state: &SnapshotState, now_ms: u64) -> bool {
     )
 }
 
-/// Drops every entry whose owner-issued window has passed, except `keep`.
+/// Applies the accounted expiry transition to every capture but `keep`.
 ///
-/// Scoped cleanup only; live entries and the requested capture are never
-/// touched, so a closed window can still be answered with an exact receipt.
-fn purge_expired_except(states: &mut HashMap<String, SnapshotState>, now_ms: u64, keep: &str) {
-    states.retain(|digest, state| digest == keep || !capture_is_retired(state, now_ms));
+/// This is not a deletion pass any more. A retired capture is converted into the
+/// same terminal record an explicit close would produce — the exact served
+/// counters it reached, an `Expired` completeness, its identity and its
+/// interruption ledger retained, its heavy payload freed — so an operator can
+/// still read what a capture that nobody closed actually served. Only after that
+/// accounted transition, and only for a capture whose replay horizon has ended,
+/// is the bounded record released.
+///
+/// A capture with a live call claim is skipped entirely: no claim may lose the
+/// payload it is currently serving from, and #2691's supervised sweep reaches the
+/// same transition later.
+fn account_expired_captures(states: &mut HashMap<String, SnapshotState>, now_ms: u64, keep: &str) {
+    let expired: Vec<String> = states
+        .iter()
+        .filter(|(digest, state)| {
+            digest.as_str() != keep
+                && state.claim.is_none()
+                && state.terminal.is_none()
+                && capture_is_retired(state, now_ms)
+        })
+        .map(|(digest, _)| digest.clone())
+        .collect();
+    for digest in expired {
+        account_expiry(states, &digest);
+    }
+    release_expired_terminal_records(states, now_ms);
+}
+
+/// Performs the accounted payload-to-terminal transition for one retired capture.
+///
+/// The bound point is deliberately not re-read for a capture whose owner window
+/// has closed: a receipt must not claim the source stayed still across a window
+/// this store no longer vouches for, so no stable-point receipt is fabricated.
+fn account_expiry(states: &mut HashMap<String, SnapshotState>, digest: &str) {
+    let Some(state) = states.get(digest) else {
+        return;
+    };
+    let incarnation = state.incarnation;
+    let Some(receipt) = expiry_receipt(state) else {
+        // A ledger whose frozen counters disagree with the live counters is a
+        // receipt defect. This module never answers a defect by deleting
+        // evidence: the entry is kept exactly as it is and the next maintenance
+        // pass retries the same transition.
+        return;
+    };
+    retain_terminal_close(states, digest, incarnation, receipt);
+}
+
+/// Derives the expiry receipt of one retired capture from retained evidence.
+fn expiry_receipt(state: &SnapshotState) -> Option<SnapshotEndReceipt> {
+    let (completeness, members_served, bytes_served) =
+        closing_accounting(state, true, false).ok()?;
+    build_end_receipt(state, completeness, members_served, bytes_served).ok()
+}
+
+/// Releases bounded terminal records whose replay horizon has ended.
+///
+/// This is the only place a capture entry is removed, and it removes only a
+/// terminal record whose owner replay horizon has passed and whose no live claim
+/// can still be using. A live capture, a claimed capture and a retained receipt
+/// inside its horizon are all left alone.
+fn release_expired_terminal_records(states: &mut HashMap<String, SnapshotState>, now_ms: u64) {
+    let expired: Vec<String> = states
+        .iter()
+        .filter(|(_, state)| {
+            state.claim.is_none()
+                && state
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|closed| now_ms > closed.retained_until_ms)
+        })
+        .map(|(digest, _)| digest.clone())
+        .collect();
+    for digest in expired {
+        states.remove(&digest);
+    }
 }
 
 /// Reports whether one capture proved the complete authoritative denominator
@@ -1863,15 +2248,22 @@ fn purge_expired_except(states: &mut HashMap<String, SnapshotState>, now_ms: u64
 /// observed, and exact served accounting. If the enumeration never ran, the
 /// only legal completeness is partial — `SnapshotValidationReceipt::validate`
 /// requires a complete authoritative denominator for a known-zero count.
+///
+/// A capture whose payload was already reclaimed cannot be complete: the
+/// denominator it would have to prove is gone, and absence of a coverage record
+/// means unknown, not complete.
 fn is_complete_capture(state: &SnapshotState) -> bool {
     let enumeration_ran = state.enumeration.is_some();
     let known_zero = state
         .enumeration
         .is_some_and(EnumerationEvidence::is_authoritative_zero);
+    let Some(payload) = state.payload.as_ref() else {
+        return false;
+    };
     state.begin.denominator.is_complete
         && enumeration_ran
-        && state.ordered_members.is_empty() == known_zero
-        && state.members_served == state.ordered_members.len() as u64
+        && payload.ordered_members.is_empty() == known_zero
+        && state.members_served == payload.ordered_members.len() as u64
         && state.bytes_served == state.total_bytes
         && state.pages_served == state.total_pages
 }
@@ -1904,10 +2296,19 @@ fn closing_accounting(
         || state
             .interruption
             .as_ref()
-            .is_some_and(|interruption| interruption.reason == INTERRUPTION_WINDOW_CLOSED);
+            .is_some_and(CaptureInterruption::window_closed);
+    // A retained reason blocks completeness unless it is the single transient
+    // read that a later exact reread of the original bound point resolved. A
+    // terminal point movement or window expiry, and any reason recorded beside a
+    // transient failure, keep the capture partial.
+    let blocked = moved
+        || state
+            .interruption
+            .as_ref()
+            .is_some_and(CaptureInterruption::blocks_completeness);
     let completeness = if window_closed {
         SnapshotCompleteness::Expired
-    } else if moved || state.interruption.is_some() {
+    } else if blocked {
         SnapshotCompleteness::Partial
     } else if is_complete_capture(state) {
         SnapshotCompleteness::Complete
@@ -1917,9 +2318,61 @@ fn closing_accounting(
     Ok((completeness, members_served, bytes_served))
 }
 
-/// Removes exactly the capture-owned entry. The map itself is never cleared.
-fn release_owned(states: &mut HashMap<String, SnapshotState>, digest: &str) {
-    states.remove(digest);
+/// Builds and validates the closing receipt from retained owner state.
+///
+/// The handle and the operation identity come from the retained owner-issued
+/// state, never from the object the caller presented, so the receipt and its
+/// operation identity describe the same capture by construction rather than by
+/// agreement between two caller-reachable values.
+fn build_end_receipt(
+    state: &SnapshotState,
+    completeness: SnapshotCompleteness,
+    members_served: u64,
+    bytes_served: u64,
+) -> Result<SnapshotEndReceipt, StoreError> {
+    let receipt = SnapshotEndReceipt {
+        handle: state.issued.clone(),
+        operation: state.begin.operation.clone(),
+        member_count: members_served,
+        byte_count: bytes_served,
+        completeness,
+        validation_revision: SNAPSHOT_VALIDATION_REVISION,
+    };
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+/// Freezes the terminal close result and releases the heavy payload.
+///
+/// The receipt is derived first and stored whole, so the retained evidence
+/// always exists before the payload it was derived from is released: a crash or
+/// a cancellation between the two leaves the capture live with its payload
+/// still intact, never a closed capture with no record of what it served.
+fn retain_terminal_close(
+    states: &mut HashMap<String, SnapshotState>,
+    digest: &str,
+    incarnation: u64,
+    receipt: SnapshotEndReceipt,
+) {
+    let Some(state) = states.get_mut(digest) else {
+        return;
+    };
+    if state.incarnation != incarnation || state.terminal.is_some() {
+        return;
+    }
+    // The replay horizon is the capture's own declared duration bound, not an
+    // invented window: inside it an exact repeated end is answered from this
+    // record, and after it maintenance releases the bounded record.
+    let retained_until_ms = state
+        .opened_at_ms
+        .saturating_add(state.begin.bounds.max_duration_ms);
+    state.payload = None;
+    state.last_page = None;
+    state.progress_revision = state.progress_revision.saturating_add(1);
+    state.terminal = Some(RetainedClose {
+        receipt,
+        retained_until_ms,
+    });
 }
 
 /// Opens a coherent capture under one owner-issued consistency point.
@@ -2020,7 +2473,11 @@ pub(crate) async fn begin_snapshot(
             point,
             enumeration: Some(evidence),
             interruption: None,
-            ordered_members,
+            claim: None,
+            progress_revision: 1,
+            payload: Some(CapturePayload { ordered_members }),
+            last_page: None,
+            terminal: None,
             total_bytes,
             total_pages,
             pages_served: 0,
@@ -2053,6 +2510,25 @@ fn check_cursor(state: &SnapshotState, cursor: &SnapshotCursor) -> Result<(), St
     Ok(())
 }
 
+/// Records one interruption under `claim`, settles only that claim, and returns
+/// `refusal`.
+///
+/// The exact partial evidence is merged before the claim is released, so an exit
+/// that ends the capture always leaves the reason of record behind, and the
+/// caller's counters can no longer move: the merge is only ever applied under a
+/// claim this call still owns. Each reason keeps its own typed refusal, so a
+/// structural bound still reports the bound rather than a generic refusal.
+fn interrupt_capture(
+    states: &mut HashMap<String, SnapshotState>,
+    claim: &mut CaptureCallClaim,
+    reason: InterruptionReason,
+    refusal: StoreError,
+) -> StoreError {
+    merge_interruption(states, &claim.digest, claim.incarnation, reason);
+    claim.settle(states);
+    refusal
+}
+
 /// Slices the next page out of a drift-verified capture, advances its served
 /// progress, and chains the predecessor digest. Runs under the registry lock
 /// with no awaits inside.
@@ -2060,29 +2536,50 @@ fn check_cursor(state: &SnapshotState, cursor: &SnapshotCursor) -> Result<(), St
 /// The page's handle is read back from the retained owner-issued handle, never
 /// from the object the caller presented: the caller has already been proven to
 /// hold the issued identity, so echoing its own copy would prove nothing.
+///
+/// Only the claiming call can reach the counters, and the claim is settled after
+/// the transition rather than before it, so the served page and the released
+/// claim are one accounted step.
 fn serve_next_page(
     states: &mut HashMap<String, SnapshotState>,
-    digest: &str,
+    claim: &mut CaptureCallClaim,
     cursor: SnapshotCursor,
 ) -> Result<SnapshotPage, StoreError> {
-    let Some(state) = states.get_mut(digest) else {
+    let Some(state) = states.get(&claim.digest) else {
         return Err(unknown_snapshot_handle());
+    };
+    if state.incarnation != claim.incarnation {
+        return Err(StoreError::IdentityConflict);
+    }
+    // A duplicate cursor can never advance twice: it must name exactly the next
+    // unserved page with cumulative bounds intact.
+    check_cursor(state, &cursor)?;
+    let Some(payload) = state.payload.as_ref() else {
+        // The payload was already reclaimed by the accounted terminal
+        // transition. Absence of live payload must never create fresh capture
+        // data under the old identity.
+        return Err(StoreError::RevisionConflict);
     };
     // Served progress is contiguous from index zero, so the served member
     // count doubles as the next slice start; `try_from` keeps the
     // `u64`-to-`usize` conversion exact.
     let start = usize::try_from(state.members_served).map_err(|_| StoreError::PayloadTooLarge)?;
     let chunk = usize::try_from(SNAPSHOT_PAGE_CHUNK).map_err(|_| StoreError::PayloadTooLarge)?;
-    let end = start.saturating_add(chunk).min(state.ordered_members.len());
-    if start >= state.ordered_members.len() || start >= end {
+    let total_members = payload.ordered_members.len();
+    let end = start.saturating_add(chunk).min(total_members);
+    if start >= total_members || start >= end {
         // The observed set is exhausted. The exact partial evidence is recorded
         // instead of being deleted, so a closing receipt can still state what
         // was served.
-        mark_interruption(states, digest, INTERRUPTION_CAPTURE_EXHAUSTED);
-        return Err(StoreError::Unavailable);
+        return Err(interrupt_capture(
+            states,
+            claim,
+            InterruptionReason::CaptureExhausted,
+            StoreError::Unavailable,
+        ));
     }
-    let state = states.get_mut(digest).ok_or(StoreError::Unavailable)?;
-    let members = state.ordered_members[start..end].to_vec();
+    let members = payload.ordered_members[start..end].to_vec();
+    let state = states.get(&claim.digest).ok_or(StoreError::Unavailable)?;
     let page_bytes = members.iter().fold(0_u64, |total, member| {
         total.saturating_add(member.residency.byte_count)
     });
@@ -2092,15 +2589,19 @@ fn serve_next_page(
         || cumulative_bytes > state.begin.bounds.max_bytes
         || cumulative_bytes > MAX_SNAPSHOT_BYTES
     {
-        mark_interruption(states, digest, INTERRUPTION_PAGE_BOUND);
-        return Err(StoreError::PayloadTooLarge);
+        return Err(interrupt_capture(
+            states,
+            claim,
+            InterruptionReason::PageBound,
+            StoreError::PayloadTooLarge,
+        ));
     }
-    let is_last = end >= state.ordered_members.len();
+    let is_last = end >= total_members;
     let next_cursor = if is_last {
         None
     } else {
         Some(SnapshotCursor {
-            handle_digest: digest.to_owned(),
+            handle_digest: claim.digest.clone(),
             page_index: state.pages_served.saturating_add(1),
             cumulative_members,
             cumulative_bytes,
@@ -2121,10 +2622,20 @@ fn serve_next_page(
         .map_err(redact_snapshot_error)?;
     let page_digest =
         sha256_hex(&canonical_json_bytes(&page).map_err(snapshot_serialization_error)?);
+    let state = states
+        .get_mut(&claim.digest)
+        .ok_or(StoreError::Unavailable)?;
     state.pages_served = state.pages_served.saturating_add(1);
     state.members_served = cumulative_members;
     state.bytes_served = cumulative_bytes;
     state.last_digest = page_digest;
+    // The response this owner constructed is retained for a same-cursor replay,
+    // so a page response the caller lost is answered with the exact page rather
+    // than with a skipped cursor or zeroed counters. It is bounded by one page
+    // and freed by the terminal transition.
+    state.last_page = Some(page.clone());
+    state.progress_revision = state.progress_revision.saturating_add(1);
+    claim.settle(states);
     Ok(page)
 }
 
@@ -2143,6 +2654,40 @@ fn serve_next_page(
 /// and the entry deliberately retained, so a later `end_snapshot` can still
 /// issue an honest `Expired` or `Partial` receipt instead of deleting the only
 /// record of what was served.
+/// What one page request found before any provider observation.
+enum PageAdmission {
+    /// The exact page this owner already constructed for this exact cursor. No
+    /// provider I/O, no counter movement and no new capture data.
+    Replay(SnapshotPage),
+    /// A private claim over the capture that only this call may settle.
+    Claimed(CaptureCallClaim),
+}
+
+/// Reports whether `cursor` is an exact repeat of the retained page response.
+///
+/// The response owner for a page is this module's own retained last page, so an
+/// exact repeated cursor is answered from it. A cursor that is not an exact
+/// repeat is not a replay: it falls through to `check_cursor`, which refuses it
+/// rather than skipping forward, zeroing counters or recapturing data under the
+/// old identity.
+fn is_replay_cursor(page: &SnapshotPage, cursor: &SnapshotCursor) -> bool {
+    page.cursor == *cursor
+}
+
+/// Validates one page request against the live capture without any provider
+/// I/O, and acquires this call's claim. Runs under the registry lock with no
+/// awaits inside.
+///
+/// The presented handle is resolved against the retained owner-issued handle
+/// FIRST, and the claim is acquired only after that resolution. A mismatched
+/// handle therefore advances no counter, records no interruption, takes no claim
+/// and closes nothing; independent expiry maintenance also does not run for a
+/// request that does not target a real capture under its own identity.
+///
+/// When the capture can no longer serve, the exact partial evidence is recorded
+/// and the entry deliberately retained, so a later `end_snapshot` can still
+/// issue an honest `Expired` or `Partial` receipt instead of deleting the only
+/// record of what was served.
 fn prepare_page(
     states: &mut HashMap<String, SnapshotState>,
     digest: &str,
@@ -2150,21 +2695,50 @@ fn prepare_page(
     ctx: &RequestMeta,
     cursor: &SnapshotCursor,
     now_ms: u64,
-) -> Result<u64, StoreError> {
+) -> Result<PageAdmission, StoreError> {
     let Some(state) = states.get(digest) else {
         return Err(unknown_snapshot_handle());
     };
     require_retained_handle(state, presented)?;
     let incarnation = state.incarnation;
-    purge_expired_except(states, now_ms, digest);
+    account_expired_captures(states, now_ms, digest);
     let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+    if state.terminal.is_some() {
+        // The capture is closed and retains only its terminal receipt. New page
+        // delivery stops here: the payload is gone, and a page is never
+        // fabricated for a closed capture.
+        return Err(StoreError::RevisionConflict);
+    }
+    // An exact repeat of the last served cursor is answered from the retained
+    // response even when the capture has since stopped being servable: the page
+    // was already constructed and accounted, so returning it delivers no new
+    // data and moves no counter.
+    if let Some(page) = state.last_page.as_ref()
+        && is_replay_cursor(page, cursor)
+    {
+        return Ok(PageAdmission::Replay(page.clone()));
+    }
+    if state.claim.is_some() {
+        // Another call is inside its provider await for this capture. Its result
+        // may still advance the progress this request would extend, so the
+        // request reports a typed conflict instead of racing it.
+        return Err(capture_claim_pending());
+    }
     let retired = capture_is_retired(state, now_ms);
     let next_page = state.pages_served.saturating_add(1);
     let over_page_bound =
         next_page > state.begin.bounds.max_pages || next_page > MAX_SNAPSHOT_PAGES;
-    let known_empty = state.ordered_members.is_empty();
+    let known_empty = state
+        .payload
+        .as_ref()
+        .is_none_or(|payload| payload.ordered_members.is_empty());
     if retired {
-        mark_interruption(states, digest, INTERRUPTION_WINDOW_CLOSED);
+        merge_interruption(
+            states,
+            digest,
+            incarnation,
+            InterruptionReason::WindowClosed,
+        );
         return Err(StoreError::Unavailable);
     }
     if state.interruption.is_some() {
@@ -2188,28 +2762,25 @@ fn prepare_page(
         });
     }
     if over_page_bound {
-        mark_interruption(states, digest, INTERRUPTION_PAGE_BOUND);
+        merge_interruption(states, digest, incarnation, InterruptionReason::PageBound);
         return Err(StoreError::PayloadTooLarge);
     }
-    Ok(incarnation)
-}
-
-/// Resolves a page/end claim against the live owner entry.
-///
-/// Returns the typed refusal when the claim no longer describes the entry that
-/// occupies the digest: the entry was replaced (a different incarnation), or the
-/// presented handle is not the one it was issued under.
-fn resolve_page_claim(
-    states: &HashMap<String, SnapshotState>,
-    digest: &str,
-    presented: &SnapshotHandle,
-    incarnation: u64,
-) -> Result<(), StoreError> {
-    let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
-    if state.incarnation != incarnation {
-        return Err(StoreError::IdentityConflict);
-    }
-    require_retained_handle(state, presented)
+    let expected_revision = state.progress_revision;
+    let claim_id = next_claim_id();
+    let state = states.get_mut(digest).ok_or_else(unknown_snapshot_handle)?;
+    state.claim = Some(CaptureClaimSlot {
+        claim_id,
+        kind: CaptureCallKind::Page,
+        expected_revision,
+    });
+    Ok(PageAdmission::Claimed(CaptureCallClaim {
+        digest: digest.to_owned(),
+        incarnation,
+        kind: CaptureCallKind::Page,
+        claim_id,
+        expected_revision,
+        settled: false,
+    }))
 }
 
 /// Re-verifies the bound point after the provider await and serves the page, or
@@ -2217,28 +2788,21 @@ fn resolve_page_claim(
 ///
 /// The claim is re-resolved against owner state, not only against the provider:
 /// exact handle equality does not prove the entry was not replaced while the
-/// await was in flight, so the incarnation the pre-read claim was validated
-/// against is re-checked too.
-///
-/// A refusal here disarms the release guard first. The guard is armed across the
-/// provider await and releases BY DIGEST, so leaving it armed on a mismatch would
-/// delete whichever entry now occupies that digest — the successor this check
-/// exists to protect.
+/// await was in flight, so the incarnation, the claim slot, the request kind and
+/// the expected progress revision are all re-checked. A claim that no longer
+/// owns this entry annotates nothing and deletes nothing — its `Drop` can only
+/// release a slot that still carries its own claim id, never a successor's.
 fn finish_page(
-    digest: &str,
+    claim: &mut CaptureCallClaim,
     observed: &CapturePoint,
-    presented: &SnapshotHandle,
-    incarnation: u64,
     cursor: SnapshotCursor,
-    guard: &mut CaptureRelease,
 ) -> Result<SnapshotPage, StoreError> {
     let mut states = lock_registry()?;
-    if let Err(error) = resolve_page_claim(&states, digest, presented, incarnation) {
-        guard.retain();
-        return Err(error);
-    }
     let (moved, retired, interrupted) = {
-        let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        let state = states
+            .get(&claim.digest)
+            .ok_or_else(unknown_snapshot_handle)?;
+        resolve_claim(state, claim)?;
         (
             observed != &state.point,
             capture_is_retired(state, crate::write_execution::current_time_ms()),
@@ -2247,25 +2811,32 @@ fn finish_page(
     };
     if interrupted {
         // The capture was already interrupted between the pre-await validation
-        // and this observation; the recorded evidence stands.
+        // and this observation; the recorded evidence stands and this call
+        // settles only its own claim.
+        claim.settle(&mut states);
         return Err(StoreError::Unavailable);
     }
     if moved {
         // The source moved under the bound point: never mix a newer point, and
         // keep the exact partial evidence for the closing receipt.
-        mark_interruption(&mut states, digest, INTERRUPTION_POINT_MOVED);
-        return Err(StoreError::Unavailable);
+        return Err(interrupt_capture(
+            &mut states,
+            claim,
+            InterruptionReason::PointMoved,
+            StoreError::Unavailable,
+        ));
     }
     if retired {
-        mark_interruption(&mut states, digest, INTERRUPTION_WINDOW_CLOSED);
-        return Err(StoreError::Unavailable);
+        return Err(interrupt_capture(
+            &mut states,
+            claim,
+            InterruptionReason::WindowClosed,
+            StoreError::Unavailable,
+        ));
     }
-    // The point still holds and the capture is still live: keep the entry so
-    // the capture can continue and close with a receipt.
-    guard.retain();
-    let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
-    check_cursor(state, &cursor)?;
-    serve_next_page(&mut states, digest, cursor)
+    // The point still holds and the capture is still live: serve the page, which
+    // advances the progress and settles this claim as one accounted step.
+    serve_next_page(&mut states, claim, cursor)
 }
 
 /// Reads one bounded page of an open capture under its bound point.
@@ -2288,7 +2859,7 @@ pub(crate) async fn read_snapshot_page(
     // only at begin: a page is protected data too.
     bind_capture_principal(adapter, SNAPSHOT_PAGE_OPERATION)?;
     let digest = handle.snapshot_digest.clone();
-    let incarnation = {
+    let admission = {
         let mut states = lock_registry()?;
         prepare_page(
             &mut states,
@@ -2299,51 +2870,58 @@ pub(crate) async fn read_snapshot_page(
             crate::write_execution::current_time_ms(),
         )?
     };
-    // No registry lock is held across this provider await (I5.7). The guard is
-    // armed across it, so a future dropped while the await is in flight still
-    // releases exactly the capture-owned entry; only a provider failure that
-    // actually returns disarms it, and only after recording the exact partial
-    // evidence the pages already served left behind.
-    let mut guard = CaptureRelease::arm(digest.clone());
+    let mut claim = match admission {
+        // The retained response answers an exact repeated cursor without any
+        // provider read and without touching progress.
+        PageAdmission::Replay(page) => return Ok(page),
+        PageAdmission::Claimed(claim) => claim,
+    };
+    // No registry lock is held across this provider await (I5.7). The private
+    // claim is the only in-flight ownership while it is: a future dropped here
+    // releases exactly this claim and preserves every piece of prior evidence,
+    // because a cancelled observation proves nothing about the source. Only a
+    // provider failure that actually returns records an interruption, and it
+    // records it under this claim before settling it.
     let observed = match observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION).await {
         Ok(point) => point,
         Err(error) => {
-            retain_with_interruption(&mut guard, &digest);
+            record_provider_read_failure(&mut claim);
             return Err(error);
         }
     };
-    finish_page(&digest, &observed, &handle, incarnation, cursor, &mut guard)
+    finish_page(&mut claim, &observed, cursor)
 }
 
-/// Builds and validates the closing receipt, then releases the capture entry.
+/// Freezes the terminal close result of one claimed capture.
 ///
 /// `observed` is `None` when the owner window had already closed: the point is
 /// then deliberately not re-read, because a receipt must not claim the source
-/// stayed still across a window this store no longer vouches for.
+/// stayed still across a window this store no longer vouches for. No
+/// stable-point receipt is ever fabricated from a failed or skipped
+/// observation.
 ///
 /// A fresh observation that equals the bound point exactly is the evidence that
-/// a recorded provider failure was only a transport blip, so that one transient
-/// record is cleared before completeness is computed. Every other interruption
-/// reason, and every `moved`/`expired` observation, stays terminal.
-///
-/// The receipt's handle comes from the retained owner-issued handle, so the
-/// receipt and its operation identity describe the same capture by
-/// construction rather than by agreement between two caller-reachable values.
+/// a recorded provider failure was only a transport blip, so only that one
+/// unresolved transient condition is resolved — after the recorded terminal
+/// reasons, never instead of them. Every other interruption reason, and every
+/// `moved`/`expired` observation, stays terminal, so a permanent interruption
+/// followed by a transient failure and a successful reread can never be closed
+/// `Complete`.
 ///
 /// The claim is re-resolved after the provider await, exactly as the page path
-/// does. Without that, a close that began against one capture would clear a
-/// successor's recorded interruption, issue a receipt built from the successor's
-/// identity and counters, and then delete the successor's entry.
+/// does. Without that, a close that began against one capture would resolve a
+/// successor's recorded interruption and issue a receipt built from the
+/// successor's identity and counters.
 fn close_capture(
-    digest: &str,
+    claim: &mut CaptureCallClaim,
     observed: Option<&CapturePoint>,
-    presented: &SnapshotHandle,
-    incarnation: u64,
 ) -> Result<SnapshotEndReceipt, StoreError> {
     let mut states = lock_registry()?;
-    resolve_page_claim(&states, digest, presented, incarnation)?;
     let (expired, moved) = {
-        let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        let state = states
+            .get(&claim.digest)
+            .ok_or_else(unknown_snapshot_handle)?;
+        resolve_claim(state, claim)?;
         (
             observed.is_none()
                 || capture_is_retired(state, crate::write_execution::current_time_ms()),
@@ -2351,36 +2929,121 @@ fn close_capture(
         )
     };
     if expired {
-        mark_interruption(&mut states, digest, INTERRUPTION_WINDOW_CLOSED);
+        merge_interruption(
+            &mut states,
+            &claim.digest,
+            claim.incarnation,
+            InterruptionReason::WindowClosed,
+        );
     } else if moved {
-        mark_interruption(&mut states, digest, INTERRUPTION_POINT_MOVED);
+        merge_interruption(
+            &mut states,
+            &claim.digest,
+            claim.incarnation,
+            InterruptionReason::PointMoved,
+        );
     } else {
         // The bound point still holds on a fresh owner read, so a recorded
         // provider failure never observed anything about the source. A capture
         // that really did serve every member of its denominator closes
         // `Complete`; one that did not still closes `Partial` through
         // `is_complete_capture`.
-        clear_transient_interruption(&mut states, digest);
+        resolve_transient_read(&mut states, &claim.digest, claim.incarnation);
     }
     let receipt = {
-        let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+        let state = states
+            .get(&claim.digest)
+            .ok_or_else(unknown_snapshot_handle)?;
         let (completeness, members_served, bytes_served) =
             closing_accounting(state, expired, moved)?;
-        SnapshotEndReceipt {
-            handle: state.issued.clone(),
-            operation: state.begin.operation.clone(),
-            member_count: members_served,
-            byte_count: bytes_served,
-            completeness,
-            validation_revision: SNAPSHOT_VALIDATION_REVISION,
-        }
+        build_end_receipt(state, completeness, members_served, bytes_served)?
     };
-    receipt.validate()?;
-    release_owned(&mut states, digest);
+    // The immutable result is frozen before the payload it was derived from is
+    // released, and the claim is settled only after that accounted step.
+    retain_terminal_close(
+        &mut states,
+        &claim.digest,
+        claim.incarnation,
+        receipt.clone(),
+    );
+    claim.settle(&mut states);
     Ok(receipt)
 }
 
-/// Closes a capture with an owner-issued end receipt and removes its entry.
+/// What one close request found before any provider observation.
+enum CloseAdmission {
+    /// The immutable terminal receipt this owner already issued, returned
+    /// verbatim inside its replay horizon.
+    Replay(SnapshotEndReceipt),
+    /// A private claim over the capture, plus whether the owner window had
+    /// already closed — in which case the bound point is deliberately not
+    /// re-read.
+    Claimed(CaptureCallClaim, bool),
+}
+
+/// Resolves a close request against the live owner entry and acquires its claim.
+///
+/// An exact repeated end is answered from the retained terminal record rather
+/// than by observing the source again, so a lost close response replays the same
+/// receipt inside its horizon. After the horizon the record is released and no
+/// receipt is fabricated: the capture's payload is already gone, and a fresh
+/// derivation would be a new claim about a capture that no longer exists.
+fn prepare_close(
+    states: &mut HashMap<String, SnapshotState>,
+    digest: &str,
+    presented: &SnapshotHandle,
+    ctx: &RequestMeta,
+    now_ms: u64,
+) -> Result<CloseAdmission, StoreError> {
+    let Some(state) = states.get(digest) else {
+        return Err(unknown_snapshot_handle());
+    };
+    require_retained_handle(state, presented)?;
+    let incarnation = state.incarnation;
+    account_expired_captures(states, now_ms, digest);
+    let state = states.get(digest).ok_or_else(unknown_snapshot_handle)?;
+    if let Some(closed) = state.terminal.as_ref() {
+        if now_ms > closed.retained_until_ms {
+            return Err(StoreError::ReceiptNotFound);
+        }
+        return Ok(CloseAdmission::Replay(closed.receipt.clone()));
+    }
+    if state.claim.is_some() {
+        // A page or end call is still inside its provider await for this
+        // capture, so the final counts are not yet stable. Reporting them now
+        // would state numbers a late page can still change.
+        return Err(capture_claim_pending());
+    }
+    if ctx.state_fence != state.begin.scope.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let window_closed = capture_is_retired(state, now_ms);
+    let expected_revision = state.progress_revision;
+    let claim_id = next_claim_id();
+    let state = states.get_mut(digest).ok_or_else(unknown_snapshot_handle)?;
+    state.claim = Some(CaptureClaimSlot {
+        claim_id,
+        kind: CaptureCallKind::End,
+        expected_revision,
+    });
+    Ok(CloseAdmission::Claimed(
+        CaptureCallClaim {
+            digest: digest.to_owned(),
+            incarnation,
+            kind: CaptureCallKind::End,
+            claim_id,
+            expected_revision,
+            settled: false,
+        },
+        window_closed,
+    ))
+}
+
+/// Closes a capture with an owner-issued end receipt.
+///
+/// The receipt is retained with the capture inside a bounded replay horizon, so
+/// an exact repeated close replays it and the heavy payload is reclaimed instead
+/// of the entry being deleted along with the only record of what was served.
 pub(crate) async fn end_snapshot(
     adapter: &SurrealStoreAdapter,
     ctx: &RequestMeta,
@@ -2392,50 +3055,42 @@ pub(crate) async fn end_snapshot(
     // same single-principal invariant is proved before it can be issued.
     bind_capture_principal(adapter, SNAPSHOT_END_OPERATION)?;
     let digest = handle.snapshot_digest.clone();
-    let (retired, incarnation) = {
+    let admission = {
         let mut states = lock_registry()?;
         // The target request is resolved against the retained owner-issued
-        // handle before any maintenance runs, so a mismatched handle purges
-        // nothing, interrupts nothing and closes nothing. The incarnation this
-        // claim was validated against is carried across the provider await.
-        {
-            let state = states.get(&digest).ok_or_else(unknown_snapshot_handle)?;
-            require_retained_handle(state, &handle)?;
-        }
-        purge_expired_except(
+        // handle before any maintenance runs, so a mismatched handle accounts
+        // nothing, interrupts nothing and closes nothing. The claim acquired
+        // here is carried across the provider await.
+        prepare_close(
             &mut states,
-            crate::write_execution::current_time_ms(),
             &digest,
-        );
-        let state = states.get(&digest).ok_or_else(unknown_snapshot_handle)?;
-        if ctx.state_fence != state.begin.scope.state_fence {
-            return Err(StoreError::FenceMismatch);
-        }
-        (
-            capture_is_retired(state, crate::write_execution::current_time_ms()),
-            state.incarnation,
-        )
+            &handle,
+            ctx,
+            crate::write_execution::current_time_ms(),
+        )?
     };
-    let observed = if retired {
-        // A closed window still owes the caller an exact partial receipt.
+    let (mut claim, window_closed) = match admission {
+        CloseAdmission::Replay(receipt) => return Ok(receipt),
+        CloseAdmission::Claimed(claim, window_closed) => (claim, window_closed),
+    };
+    let observed = if window_closed {
+        // A closed window still owes the caller an exact receipt, and that
+        // receipt must not claim the source stayed still across a window this
+        // store no longer vouches for: the bound point is deliberately not
+        // re-read.
         None
     } else {
-        let mut guard = CaptureRelease::arm(digest.clone());
-        let observed = match observe_capture_point(adapter, SNAPSHOT_END_OPERATION).await {
-            Ok(point) => {
-                guard.retain();
-                point
-            }
+        match observe_capture_point(adapter, SNAPSHOT_END_OPERATION).await {
+            Ok(point) => Some(point),
             Err(error) => {
-                // The end read failed, so no receipt can claim the point held
-                // across this close. The capture-owned entry is still the only
-                // record of what was served, so it is kept with its exact
-                // partial evidence and the caller may retry `end_snapshot`.
-                retain_with_interruption(&mut guard, &digest);
+                // The close read failed, so no receipt can claim the point held
+                // across this close. The exact evidence stays retained under
+                // this claim, the caller may retry `end_snapshot`, and a
+                // stable-point receipt is never fabricated from a failed read.
+                record_provider_read_failure(&mut claim);
                 return Err(error);
             }
-        };
-        Some(observed)
+        }
     };
-    close_capture(&digest, observed.as_ref(), &handle, incarnation)
+    close_capture(&mut claim, observed.as_ref())
 }
