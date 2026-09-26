@@ -15,6 +15,11 @@
 #   (surreal.exe 3.1.4 windows-x64 pe 8664 sha
 #   13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1).
 #   Unsupported class or revision is rejected; there is no fallback provider.
+#   Provider revision v1 requires exactly one Store schema generation whose
+#   content identity is pinned in $Script:StoreRequiredSchemaDigest (sha256
+#   over the ordered migrate_schema file set 000..010); Start records it on
+#   every start receipt and ObserveReadiness compares the observed client
+#   schemaDigest against it. Re-pin only through the eliot-store schema owner.
 # - Plan is finite and mutation-free: it returns Approve-Plan shaped resources
 #   (resourceKey/runId/testClass/providerRevision/owner/generation) and never
 #   carries shellCommand/executablePath/rawArgv/url/credential/environmentMap/
@@ -31,8 +36,11 @@
 #   executable/URL/argv/env input is unrepresentable.
 # - ObserveReadiness binds exact process/start/endpoint identity plus an
 #   authenticated protocol handshake plus namespace/database selection plus
-#   schema identity. Process-alive, TCP-open, authenticated, schema-ready, and
-#   fixture-ready are separate receipts; liveness without auth is not readiness.
+#   the required schema identity carried on the start receipt. Process-alive,
+#   TCP-open, authenticated, schema-ready, and fixture-ready are separate
+#   receipts; schema-ready is true only when the observed client schemaDigest
+#   equals the expected receipt identity, and liveness without auth is not
+#   readiness. A start receipt without an expected schema identity is stale.
 # - ResetForTest requires the exact declared fixture plus baseline
 #   revalidation; a reset failure contaminates exactly its group, never the run.
 # - CollectEvidence returns bounded redacted handles with truncation; it
@@ -71,6 +79,13 @@ $Script:StorePlatform = 'windows'
 $Script:StoreArch = 'x64'
 $Script:StorePeMachine = '8664'
 $Script:StoreDigest = '13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1'
+# Required Store schema identity for provider revision v1: sha256 over the
+# ordered migrate_schema content set (crates/eliot-store/src/surql/
+# 000_schema.surql through 010_memory_search_fts.surql, LF bytes, numeric
+# order), pinned at base 23e4670a. Any schema drift re-fences readiness;
+# re-pin only through the eliot-store schema owner. The test phase binds the
+# live client computation of this digest per the issue matrix.
+$Script:StoreRequiredSchemaDigest = 'c238689ab71773c1b1ecffe8052a7dcd1b82c4e0feb509cf0b55c38596fcbb5c'
 $Script:StoreOwnedRootMarker = 'eliot-harness-owned-root-v1'
 $Script:StoreLoopback = '127.0.0.1'
 
@@ -951,7 +966,7 @@ function Invoke-StoreStart {
             return @{
                 runId            = $runId
                 startState       = 'ReconciliationRequired'
-                requested        = @{ requestKey = $launchInput['requestKey']; endpoint = $launchInput['endpoint'] }
+                requested        = @{ requestKey = $launchInput['requestKey']; endpoint = $launchInput['endpoint']; schemaDigest = $Script:StoreRequiredSchemaDigest }
                 observed         = $null
                 invocation       = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint'] }
                 binary           = @{ version = $version; digest = [string]$receipt['digest']; provenance = $provenance }
@@ -981,7 +996,7 @@ function Invoke-StoreStart {
     return @{
         runId      = $runId
         startState = 'StartRequested'
-        requested  = @{ requestKey = $launchInput['requestKey']; endpoint = $launchInput['endpoint']; nonce = $nonce }
+        requested  = @{ requestKey = $launchInput['requestKey']; endpoint = $launchInput['endpoint']; nonce = $nonce; schemaDigest = $Script:StoreRequiredSchemaDigest }
         observed   = @{ pid = $observedPid; nonce = $observedNonce; endpoint = $launchInput['endpoint'] }
         invocation = @{ argvCount = $fixedArgv.Count; bindEndpoint = $launchInput['endpoint']; artifact = $Script:StoreArtifact }
         binary     = @{ version = $version; architecture = $Script:StoreArchitecture; peMachine = $Script:StorePeMachine; digest = [string]$receipt['digest']; provenance = $provenance }
@@ -1073,7 +1088,16 @@ function Invoke-StoreObserveReadiness {
     }
     $fixtureReady = $false
     if ($client.ContainsKey('fixtureReady')) { $fixtureReady = [bool]$client['fixtureReady'] }
-    $schemaReady = ($authenticated -and $alive -and $open)
+    $expectedSchema = $null
+    if ($StartReceipt.ContainsKey('requested') -and $StartReceipt['requested'] -is [hashtable]) {
+        $expectedSchema = $StartReceipt['requested']['schemaDigest']
+    }
+    if ($null -eq $expectedSchema -and $StartReceipt.ContainsKey('schemaDigest')) { $expectedSchema = $StartReceipt['schemaDigest'] }
+    if ([string]::IsNullOrWhiteSpace([string]$expectedSchema)) {
+        throw [System.InvalidOperationException]::new('STORE-RECEIPT-STALE: start receipt carries no expected schema identity.')
+    }
+    [void](Test-StoreDigestFormat -Digest ([string]$expectedSchema))
+    $schemaReady = ([string]$client['schemaDigest'] -ceq [string]$expectedSchema)
     $ready = ($alive -and $open -and $authenticated -and $schemaReady)
     $state = 'ObservedProcessReadinessUnknown'
     if ($ready) { $state = 'AcceptedSemanticReadiness' }
