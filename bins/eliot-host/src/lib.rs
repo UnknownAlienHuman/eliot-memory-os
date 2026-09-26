@@ -4386,8 +4386,8 @@ impl HostComposition {
         crate::backup_cutover::CutoverError,
     > {
         use crate::backup_cutover::{
-            CutoverDisposition, CutoverError, execute_cutover, reconcile_cutover_outcome,
-            validate_cutover_request,
+            CutoverDisposition, CutoverError, execute_cutover, plan_cutover_attempt,
+            reconcile_cutover_outcome, validate_cutover_identity, validate_cutover_request,
         };
         // Real dispatch decision: only the separately admitted cutover
         // operation resolves `Cutover`. Rehearsal completion and preparation
@@ -4406,7 +4406,23 @@ impl HostComposition {
             .open_registry_store()?
             .load()
             .map_err(|error| CutoverError::Registry(error.to_string()))?;
-        let validated = validate_cutover_request(request, evidence, &registry)?;
+        // Authenticated identity FIRST, then the retained-operation
+        // classification, then admission. The classification reports a typed
+        // difference between "no such operation", "terminally refused" and
+        // "same key, different content", so running it against an
+        // unauthenticated presented operation id would be a pre-authentication
+        // oracle. Authentication first, classification second, admission third.
+        validate_cutover_identity(request)?;
+        // The retained operation is classified and the registry's
+        // operation-bound outcome resolved BEFORE the admission gate set's
+        // expected-predecessor check, so an exact committed retry and an
+        // interrupted post-CAS operation are no longer refused by a gate that is
+        // false by construction once their own activation committed (#2737).
+        // The gate this yields is derived from the durable classification,
+        // never asserted here.
+        let plan = plan_cutover_attempt(self, request, &registry)?;
+        let validated =
+            validate_cutover_request(request, evidence, &registry, plan.predecessor_gate())?;
         drop(registry);
         // The activation bound to the cutover is the Host journal owner's
         // committed generation, never a caller-supplied copy.
@@ -4433,6 +4449,13 @@ impl HostComposition {
         // genuinely absent here: retirement is a separate explicitly
         // authorized step, so the registry flip alone is the observed proof
         // and the honest disposition is `RetirementPending`.
+        //
+        // The projection runs only for a PROVEN commit. An unresolved outcome
+        // is returned exactly as its owner observation produced it, so this
+        // read model can never restate a retained unknown as progress (#2737).
+        if committed.disposition != CutoverDisposition::Committed {
+            return Ok((committed, barrier));
+        }
         let readback = self
             .open_registry_store()?
             .load()
@@ -4447,6 +4470,7 @@ impl HostComposition {
                 })?
                 .pending_cutover
                 .as_ref(),
+            readback.committed_cutover_activation(),
             readback.active_generation(),
             &validated.request.target_generation,
             None,

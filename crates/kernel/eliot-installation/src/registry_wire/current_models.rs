@@ -18,7 +18,7 @@ use serde::Deserialize;
 use super::super::{
     ActivationCommitFence, ActivePhaseBRebind, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
     ActivePhaseBRebindRecovery, AgentBridgeStagePrepared, ApprovedGeneration,
-    ApprovedGenerationRegistry, CandidateManifest, ContractVersion,
+    ApprovedGenerationRegistry, CandidateManifest, CommittedCutoverActivation, ContractVersion,
     HostPhaseBMaterializationIntent, HostPhaseBMaterializationReceipt,
     HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt, InstallationActivationApproval,
     InstallerServiceRegistrationApproval, PendingActivation, PendingActivationAbortReceipt,
@@ -200,6 +200,13 @@ pub(super) struct RegistryWireV11 {
     #[serde(default)]
     aborted_activation_receipts: Vec<PendingActivationAbortReceipt>,
     active_phase_b_rebind: RequiredOption<ActivePhaseBRebindWireV11>,
+    /// Optional operation binding for the cutover that last moved the active
+    /// generation.  A registry written before #2737 has no such member and
+    /// decodes as `None`; it is deliberately not a `RequiredOption`, because a
+    /// missing optional member is a valid earlier state, not a schema
+    /// migration.
+    #[serde(default)]
+    committed_cutover_activation: Option<CommittedCutoverActivation>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -245,6 +252,7 @@ impl RegistryWireV11 {
                 .active_phase_b_rebind
                 .0
                 .map(ActivePhaseBRebindWireV11::into_rebind),
+            committed_cutover_activation: self.committed_cutover_activation,
         }
     }
 }

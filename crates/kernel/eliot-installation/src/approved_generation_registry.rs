@@ -2643,6 +2643,19 @@ pub struct ApprovedGenerationRegistry {
     /// member is mandatory on the current v10 wire; explicit `null` means no
     /// rebind has ever been attempted.
     pub(crate) active_phase_b_rebind: Option<ActivePhaseBRebind>,
+    /// Operation-bound receipt for the cutover that last moved
+    /// `active_generation` (#2737).
+    ///
+    /// `skip_serializing_if` is the wire-compatibility mechanism, not an
+    /// optimization.  `registry_projection_identity` is a SHA-256 over the
+    /// whole serialized registry and is compared against already-staged
+    /// activation intents, so a registry that has never cut over must keep
+    /// serializing byte-identically to the pre-#2737 shape.  Omitting the
+    /// member when it is absent is what preserves that identity; `default`
+    /// lets a pre-#2737 registry decode as `None` without bumping
+    /// `INSTALLATION_REGISTRY_WIRE_VERSION`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) committed_cutover_activation: Option<CommittedCutoverActivation>,
 }
 
 impl Default for ApprovedGenerationRegistry {
@@ -2662,6 +2675,88 @@ pub(crate) fn registry_projection_identity(
         field: "activation_projection.registry_identity".to_owned(),
         reason: error.to_string(),
     })
+}
+
+/// Operation-bound receipt for the cutover that performed the
+/// active-generation flip (#2737).
+///
+/// `active_generation` is a pointer, not attribution.  A pointer alone cannot
+/// tell a replay of the same cutover apart from a different cutover that
+/// happened to select the same target, so a recovery pass must never infer
+/// "this operation activated the generation" from the pointer.  This receipt
+/// is the durable, operation-bound record that makes the flip attributable: it
+/// carries the exact installation, the canonical operation identity, and the
+/// canonical request hash of the operation whose compare-and-swap moved the
+/// pointer, together with the predecessor it consumed and the target it
+/// selected.
+///
+/// Implementation `I5.27` defines idempotency over canonical bytes rather than
+/// caller spelling: reusing an operation identity with a different canonical
+/// request hash is an `IDENTITY_CONFLICT` and performs no transition.  That is
+/// why `request_digest` is a canonical request hash rather than a receipt
+/// digest, and why the receipt carries identity handles only — it embeds no
+/// digest of itself, so recording it cannot feed back into the identity it
+/// describes.
+///
+/// The receipt proves only that the flip was committed under this operation
+/// identity.  It is not a retirement record, and it is not authority to retire.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedCutoverActivation {
+    /// Installation identity whose registry recorded the flip.
+    pub installation: PlatformHandle,
+    /// Canonical operation identity that performed the flip.
+    pub operation_id: PlatformHandle,
+    /// Canonical request hash bound to `operation_id` (Implementation `I5.27`).
+    pub request_digest: PlatformHandle,
+    /// Active generation the flip consumed.
+    pub expected_predecessor: PlatformHandle,
+    /// Active generation the flip selected.
+    pub target_generation: PlatformHandle,
+}
+
+impl CommittedCutoverActivation {
+    /// Validates the receipt as a self-consistent operation binding.
+    ///
+    /// A degenerate binding — one that reuses a generation identity as an
+    /// operation identity, or that names the same generation as both
+    /// predecessor and target — describes no cutover that could have happened
+    /// and is refused rather than stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError`] when a handle is malformed, when
+    /// `request_digest` is not a lowercase SHA-256 digest, or when the binding
+    /// is self-contradictory.
+    pub fn validate(&self) -> Result<(), InstallationError> {
+        handle(
+            &self.installation,
+            "committed_cutover_activation.installation",
+        )?;
+        handle(
+            &self.operation_id,
+            "committed_cutover_activation.operation_id",
+        )?;
+        sha256_handle(
+            &self.request_digest,
+            "committed_cutover_activation.request_digest",
+        )?;
+        handle(
+            &self.expected_predecessor,
+            "committed_cutover_activation.expected_predecessor",
+        )?;
+        handle(
+            &self.target_generation,
+            "committed_cutover_activation.target_generation",
+        )?;
+        if self.operation_id == self.expected_predecessor
+            || self.operation_id == self.target_generation
+            || self.expected_predecessor == self.target_generation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
 }
 
 /// Durable activation candidate handed from the installer coordinator to the
@@ -2753,6 +2848,7 @@ impl ApprovedGenerationRegistry {
             last_terminal_activation: None,
             aborted_activation_receipts: Vec::new(),
             active_phase_b_rebind: None,
+            committed_cutover_activation: None,
         }
     }
 
@@ -3963,6 +4059,13 @@ impl ApprovedGenerationRegistry {
         }
         let previous = self.active_generation.take();
         self.last_known_good_generation.clone_from(&previous);
+        // Any cutover binding describes the flip this transition is about to
+        // perform, so a flip that is not the recorded cutover supersedes it.
+        // Leaving the previous binding in place would leave
+        // `committed_cutover_activation.target_generation` naming a generation
+        // that is no longer active, which `validate` refuses; the caller that
+        // owns this flip records its own binding in the same transaction.
+        self.committed_cutover_activation = None;
         for item in &mut self.generations {
             item.active = false;
             // A cutover has exactly one LKG: the generation that was active
@@ -3983,6 +4086,54 @@ impl ApprovedGenerationRegistry {
         self.active_generation = Some(generation.clone());
         self.validate()?;
         Ok(())
+    }
+
+    /// Records the operation binding for the flip that this same
+    /// transaction just performed.
+    ///
+    /// The receipt is written into the same compare-and-swap closure that
+    /// calls [`Self::activate`], so the binding and the pointer it describes
+    /// become durable together or not at all.  This is an operation-binding
+    /// record only: it carries no rollback, no abort, and no second
+    /// linearization point.
+    pub(crate) fn record_cutover_activation(
+        &mut self,
+        committed: &CommittedCutoverActivation,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        committed.validate()?;
+        if self.active_generation.as_ref() != Some(&committed.target_generation) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.committed_cutover_activation = Some(committed.clone());
+        self.validate()
+    }
+
+    /// Returns the operation-bound receipt for the cutover that last moved the
+    /// active generation.
+    ///
+    /// A caller **may** conclude that the active-generation flip was committed
+    /// under exactly this operation identity and canonical request digest, and
+    /// therefore that replaying that same operation identity is a replay rather
+    /// than a new cutover.
+    ///
+    /// A caller **may not** conclude that:
+    ///
+    /// - the flip is attributable from `active_generation` alone — absence of a
+    ///   receipt means no cutover binding is recorded, and the pointer must
+    ///   never stand in for attribution (#2737);
+    /// - retirement happened, is authorized, or may be performed on the basis
+    ///   of this receipt.  Retirement is a separately authorized path;
+    /// - a registry with no receipt never cut over — a cutover performed
+    ///   before #2737 has no operation binding, and that unknown outcome is
+    ///   retained rather than resolved.
+    ///
+    /// A later authorized activation that moves the active generation
+    /// supersedes this binding; it does not retroactively falsify what the
+    /// receipt proved at the revision where it was written.
+    #[must_use]
+    pub fn committed_cutover_activation(&self) -> Option<&CommittedCutoverActivation> {
+        self.committed_cutover_activation.as_ref()
     }
 
     /// Returns the currently active approved generation.
@@ -4209,6 +4360,23 @@ impl ApprovedGenerationRegistry {
             return Err(InstallationError::IncompleteObservation(
                 "last-known-good flag has no registry identity".to_owned(),
             ));
+        }
+        if let Some(committed) = &self.committed_cutover_activation {
+            // `validate` on the receipt itself already refuses a binding whose
+            // predecessor equals its target.
+            committed.validate()?;
+            if !self
+                .generations
+                .iter()
+                .any(|item| item.manifest.generation == committed.target_generation)
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "committed cutover activation target is absent from registry".to_owned(),
+                ));
+            }
+            if self.active_generation.as_ref() != Some(&committed.target_generation) {
+                return Err(InstallationError::IdentityConflict);
+            }
         }
         if let Some(terminal) = &self.last_terminal_activation {
             self.validate_terminal_activation(terminal)?;

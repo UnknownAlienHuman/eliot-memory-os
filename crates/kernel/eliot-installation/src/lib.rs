@@ -145,9 +145,9 @@ pub use approved_generation_registry::{
     ActivationCommitFence, ActivationCommitReceipt, ActivePhaseBRebind, ActivePhaseBRebindIntent,
     ActivePhaseBRebindReceipt, ActivePhaseBRebindRecovery, AgentBridgePhaseBBinding,
     AgentBridgePreparedBinding, AgentBridgeSecurityContour, AgentBridgeStagePrepared,
-    ApprovedGeneration, ApprovedGenerationRegistry, HostPhaseBPreparedMaterialization,
-    PendingActivation, PendingActivationState, PhaseBDigestState, PhaseBLiveBinding,
-    phase_b_digest_state, phase_b_scm_selector,
+    ApprovedGeneration, ApprovedGenerationRegistry, CommittedCutoverActivation,
+    HostPhaseBPreparedMaterialization, PendingActivation, PendingActivationState,
+    PhaseBDigestState, PhaseBLiveBinding, phase_b_digest_state, phase_b_scm_selector,
 };
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,
