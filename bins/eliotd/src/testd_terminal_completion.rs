@@ -347,7 +347,7 @@ impl DaemonComposition {
         )
     }
 
-    /// Plans the two Governor-owned canonical legs for one terminal evidence
+    /// Plans the first-phase Governor-owned canonical legs for one terminal evidence
     /// row and returns the exact exchanges they still owe.
     ///
     /// This is the pure prepare half of the terminal finish ceremony: it reads
@@ -356,7 +356,9 @@ impl DaemonComposition {
     /// with the identity, operation and pre-commit fence each one binds. It
     /// performs no transport and mutates nothing, so the caller holds the
     /// composition guard for this call alone and releases it before
-    /// [`exchange_testd_owner_finish_leg`].
+    /// [`exchange_testd_owner_finish_leg`]. The finish-evidence leg is planned
+    /// later, after the fact leg publishes, so the evidence join reads the
+    /// published fact image.
     ///
     /// The task-binding denial stays ahead of both legs exactly as before: a
     /// missing admitted task denies the whole completion with the readiness
@@ -427,13 +429,39 @@ impl DaemonComposition {
             .prepare_finish_decision(identity, operation_id, draft)
             .map_err(DaemonError::Finish)
     }
+
+    /// Derives the exact exchange that publishes the Governor-owned
+    /// canonical finish-evidence image for this row.
+    ///
+    /// The synchronous `refresh_from_kernel` runs here, under the caller's
+    /// `&mut self`, because the evidence join must read the verifier-execution
+    /// fact the fact leg actually published and never a pre-publish snapshot.
+    /// Nothing is transported, so the guard is released again before the
+    /// evidence exchange. `None` means the derived image is already the
+    /// current canonical owner image, so the row owes no evidence exchange.
+    pub fn plan_testd_terminal_owner_evidence(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+    ) -> Result<Option<PreparedKernelExchange>, DaemonError> {
+        self.governor
+            .refresh_from_kernel()
+            .map_err(|error| DaemonError::Finish(error.into()))?;
+        self.governor
+            .prepare_finish_evidence(identity, operation_id, draft)
+            .map_err(DaemonError::Finish)
+    }
 }
 
-/// The two Governor-owned canonical legs planned for one terminal `TestD` row.
+/// The three Governor-owned canonical legs planned across the terminal finish
+/// ceremony for one terminal `TestD` row.
 ///
-/// Each leg carries its own identity, operation binding and pre-commit fence;
-/// a caller that exchanges them is running the Governor's decision, not
-/// inventing one.
+/// The fact leg and the evidence-led finish candidate are planned first; the
+/// finish-evidence leg is planned after the fact leg publishes, so its join
+/// reads the published fact image. Each leg carries its own identity,
+/// operation binding and pre-commit fence; a caller that exchanges them is
+/// running the Governor's decision, not inventing one.
 pub struct TestdTerminalOwnerPlan {
     /// The exchange that publishes the verifier-execution fact. `None` means
     /// the derived fact is already the current canonical owner image, so the
@@ -459,26 +487,31 @@ pub async fn exchange_testd_owner_finish_leg(
     prepared.exchange(kernel).await.map_err(completion_error)
 }
 
-/// Commits the two Governor-owned canonical legs for one terminal evidence row
+/// Commits the three Governor-owned canonical legs for one terminal evidence row
 /// as plan, exchange, apply.
 ///
 /// ```text
 /// publish the verifier-execution fact (rehydrate -> canonical write)
+/// -> publish the finish-evidence image (rehydrate task/plan/verifier fact -> canonical write)
 /// -> submit the finish candidate draft (rehydrate -> FinishService::evaluate -> persisted decision)
 /// ```
 ///
-/// The ceremony is now three phases, and the composition guard is alive only
-/// across the two that are pure reads of the retained owners:
+/// The ceremony is phase-split, and the composition guard is alive only
+/// across the phases that are pure reads of the retained owners:
 ///
 /// ```text
-/// (1) guard held  — plan both legs: derive the two immutable transitions and
+/// (1) guard held  — plan the fact leg: derive the immutable transition and
 ///                   the evidence-led candidate (no exchange);
 /// (2) no guard    — publish the verifier-execution fact over the Kernel port;
 /// (3) guard held  — revalidate the fact against the live owner fence, refresh,
+///                   and derive the finish-evidence leg against that image;
+/// (4) no guard    — publish the finish-evidence image over the Kernel port;
+/// (5) guard held  — revalidate the evidence leg;
+/// (6) guard held  — revalidate the fact against the live owner fence, refresh,
 ///                   and derive the finish decision against that image;
-/// (4) no guard    — persist the finish decision over the Kernel port;
-/// (5) guard held  — revalidate the decision against the live owner fence;
-/// (6) guard held  — commit the non-blocking learning-closure edge (phase 6,
+/// (7) no guard    — persist the finish decision over the Kernel port;
+/// (8) guard held  — revalidate the decision against the live owner fence;
+/// (9) guard held  — commit the non-blocking learning-closure edge (phase 9,
 ///                   issue #1863 / I12.24): one durable AttemptLearningDelta
 ///                   edge per consequential attempt, read-only over the
 ///                   retained owner images, no transport, and never able to
@@ -492,8 +525,9 @@ pub async fn exchange_testd_owner_finish_leg(
 /// for the whole duration of a Kernel exchange. The mutual exclusion the guard
 /// does provide is unchanged — each phase still runs alone, and phases (1)/(3)/
 /// (5)/(6) still observe exactly the state the preceding exchange published,
-/// because (3) refreshes the owner before the decision is derived and (3)/(5)
-/// re-check the pre-commit fence before the receipt is admitted.
+/// because (3) refreshes the owner before the evidence leg is derived, (6)
+/// refreshes again before the decision is derived, and (3)/(5)/(8) re-check
+/// the pre-commit fence before the receipt is admitted.
 ///
 /// The daemon never opens the `TestD` database: the row arrives through the
 /// Kernel owner poll. The candidate draft carries only the terminal job
@@ -518,7 +552,25 @@ pub async fn commit_testd_terminal_owner_fact(
     };
     // (2) no guard: the verifier-execution fact exchange.
     let committed = exchange_testd_owner_finish_leg(kernel, fact).await?;
-    // (3) guard held, no exchange: revalidate the fact, publish its image, and
+    // (3) guard held, no exchange: revalidate the fact, publish its image,
+    // refresh, and derive the finish-evidence leg against that image.
+    let evidence_leg = {
+        let mut guard = composition.lock().await;
+        guard.accept_testd_terminal_owner_fact(fact)?;
+        guard.plan_testd_terminal_owner_evidence(
+            &evidence.request_identity,
+            &plan.finish_operation_id,
+            &plan.finish_draft,
+        )?
+    };
+    // (4) no guard: the finish-evidence exchange, if the Governor owes one.
+    if let Some(prepared) = evidence_leg.as_ref() {
+        let _receipt = exchange_testd_owner_finish_leg(kernel, prepared).await?;
+        // (5) guard held, no exchange: revalidate the evidence leg.
+        let guard = composition.lock().await;
+        guard.accept_testd_terminal_owner_fact(prepared)?;
+    }
+    // (6) guard held, no exchange: revalidate the fact, publish its image, and
     // derive the finish decision against that refreshed canonical owner.
     let decision = {
         let mut guard = composition.lock().await;
@@ -529,15 +581,15 @@ pub async fn commit_testd_terminal_owner_fact(
             plan.finish_draft,
         )?
     };
-    // (4) no guard: the finish decision exchange.
+    // (7) no guard: the finish decision exchange.
     if let Some(prepared) = decision.exchange() {
         let _receipt = exchange_testd_owner_finish_leg(kernel, prepared).await?;
-        // (5) guard held, no exchange: revalidate the decision.
+        // (8) guard held, no exchange: revalidate the decision.
         let guard = composition.lock().await;
         guard.accept_testd_terminal_owner_fact(prepared)?;
     }
     let decision = decision.into_decision();
-    // (6) guard held, no exchange: commit the learning-closure edge. The finish
+    // (9) guard held, no exchange: commit the learning-closure edge. The finish
     // decision is already durable at this point, so this phase is a pure
     // read of the retained owner images plus one in-process durable commit; it
     // cannot fail the finish and its outcome is a diagnostic, not a receipt.
@@ -669,8 +721,8 @@ pub fn emit_testd_owner_drain_skip(job_id: &str, error: &DaemonError) {
 pub struct TestdOwnerDrainOutcome {
     /// Verifier-dispatch bindings persisted through the owner bind leg.
     pub dispatch_bindings_persisted: usize,
-    /// Terminal rows whose verifier fact, finish decision, and ack all
-    /// committed.
+    /// Terminal rows whose verifier fact, finish evidence, finish decision,
+    /// and ack all committed.
     pub terminals_drained: usize,
     /// Finish decisions persisted through `FinishService::evaluate`.
     pub finish_decisions_persisted: usize,
