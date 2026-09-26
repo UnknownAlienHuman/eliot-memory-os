@@ -3548,6 +3548,15 @@ impl KernelComposition {
     /// atomicity claim. A lost answer replays safely: acknowledgement
     /// advances monotonically and handoff reconcile converges.
     ///
+    /// Reconcile-key preimage contract (issue #2731, I5.27 identity over
+    /// canonical bytes): `reconcile_key` is the SHA-256 hex of the canonical
+    /// JSON bytes of the reconciliation object BEFORE attaching
+    /// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`,
+    /// so the preimage is the answer minus exactly those three post-key
+    /// legs. The consumer strips all three before re-hashing; covering any
+    /// post-key leg in the digest refuses every answer and discards the
+    /// maintenance receipt while its store-side effect already committed.
+    ///
     /// Issue #2731 runs the bounded handoff maintenance after the reconcile
     /// loop on the same recovery path: per presented namespace it retires
     /// terminal handoffs (freeing the lifetime charge while #2730 replay
@@ -3683,7 +3692,10 @@ impl KernelComposition {
     /// and successive legitimate recovery entries converge. Maintenance
     /// pressure answers typed backpressure (never a cursor reset or a
     /// declaration that missing evidence is complete); any other
-    /// maintenance failure fails the frame closed.
+    /// maintenance failure fails the frame closed. The per-namespace result
+    /// rides the reconcile answer as the `handoff_maintenance` post-key leg,
+    /// excluded from the `reconcile_key` preimage by construction (see the
+    /// preimage contract on [`Self::answer_bridge_event_reconcile`]).
     fn maintain_bridge_event_handoffs(
         &self,
         batch_namespaces: &[(String, String, u64, u64, u64)],
