@@ -23,8 +23,9 @@
 //! [`NamedReadOperation::GetAttentionAndProblems`],
 //! [`NamedReadOperation::GetUnderstandingProjectionInputs`],
 //! [`NamedReadOperation::GetCapabilityEvidenceState`],
-//! [`NamedReadOperation::GetNotificationState`], and the `#2100` owner-feed
-//! [`NamedReadOperation::GetAuthorityRevocationHistory`] pass
+//! [`NamedReadOperation::GetNotificationState`], the `#2100` owner-feed
+//! [`NamedReadOperation::GetAuthorityRevocationHistory`], and — since #1780 —
+//! [`NamedReadOperation::GetOrderingHeads`], pass
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
@@ -129,7 +130,10 @@ impl KernelContextReadClient {
     /// downstream at the catalogue; either way no unvalidated read crosses),
     /// or the `#2100` owner-feed `GetAuthorityRevocationHistory`
     /// (scope-bound, `Eventual`, exactly the catalogue-declared
-    /// `origin_ref`/`max_records` selectors).
+    /// `origin_ref`/`max_records` selectors), or the #1780
+    /// `GetOrderingHeads` compare-and-swap source (scope-free,
+    /// `ExactFence`, parameter-free, exactly as the store catalogue
+    /// declares it).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
@@ -152,6 +156,18 @@ impl KernelContextReadClient {
             NamedReadOperation::GetAuthorityRevocationHistory => {
                 Self::check_revocation_history_selectors(request)
             }
+            // Issue #1780: the owner-side canonical notification-state proposer
+            // needs the live `notification-state` ordering sequence, because
+            // `CanonicalWriteEnvelope::prepare` *derives* `ordering_scopes`
+            // from `expected_ordering_heads` and `PreparedTransition::validate`
+            // refuses an empty `ordering_scopes` (`StoreError::Empty`). Without
+            // this arm the emitter would have to invent a sequence number, which
+            // is a fabricated compare-and-swap expectation on a durability
+            // record. The read is admitted in exactly the shape the store
+            // catalogue declares for it (`GetOrderingHeads`: scope-free, no
+            // parameters) and binds the caller's fence, so the head observed is
+            // the head the write is asserted against.
+            NamedReadOperation::GetOrderingHeads => Self::check_ordering_heads_capability(request),
             NamedReadOperation::GetAuditRange => {
                 if request.scope_id.is_some() {
                     return Err(StoreError::InvalidField {
@@ -200,6 +216,40 @@ impl KernelContextReadClient {
             }
             _ => Err(StoreError::UnknownOperation),
         }
+    }
+
+    /// Checks the closed `GetOrderingHeads` read before any transport
+    /// (issue #1780).
+    ///
+    /// The store catalogue declares this operation scope-free with no
+    /// parameters, so exactly that shape is admitted here: no `scope_id`, no
+    /// parameter keys, and `ExactFence` consistency. `ExactFence` is required
+    /// because the answer becomes a compare-and-swap expectation on a
+    /// durability record, so a fence move must surface as a mismatch rather
+    /// than a head from another generation. The ordering scopes themselves stay
+    /// consumer-owned: the read answers with the whole deduplicated head set and
+    /// the caller selects the one scope its transition addresses.
+    fn check_ordering_heads_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
+        if request.scope_id.is_some() {
+            return Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "GetOrderingHeads is scope-free; ordering scopes stay consumer-owned",
+            });
+        }
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "GetOrderingHeads requires ExactFence",
+            });
+        }
+        if !request.parameters.is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameters",
+                reason: "GetOrderingHeads takes no parameters",
+            });
+        }
+        request.validate()?;
+        Ok(())
     }
 
     /// Checks the closed notification-read selectors before any transport:
