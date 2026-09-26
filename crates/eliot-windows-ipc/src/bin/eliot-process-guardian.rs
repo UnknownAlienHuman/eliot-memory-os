@@ -150,6 +150,14 @@ fn run() -> io::Result<i32> {
         thread::sleep(Duration::from_millis(50));
     }
     let observed_processes = child.observed_processes().len();
+    // The report's observed-processes count is a completeness claim: when the
+    // observer dropped an unknown suffix of notifications, fail the run
+    // rather than emit a silently undercounted report.
+    if !child.observed_history_complete() {
+        return Err(io::Error::other(
+            "process observer history truncated; observed count incomplete",
+        ));
+    }
 
     // The root may have exited while a descendant still owns one of the pipe
     // handles. Terminating the pre-assigned Job closes those handles before the

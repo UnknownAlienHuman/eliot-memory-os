@@ -1509,6 +1509,7 @@ struct JobProcessObserver {
     completion_port: OwnedHandle,
     observed: Arc<Mutex<Vec<ObservedProcess>>>,
     shutdown_requested: Arc<AtomicBool>,
+    history_truncated: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1545,23 +1546,37 @@ impl JobProcessObserver {
         let thread_observed = Arc::clone(&observed);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let thread_shutdown_requested = Arc::clone(&shutdown_requested);
+        let history_truncated = Arc::new(AtomicBool::new(false));
+        let thread_history_truncated = Arc::clone(&history_truncated);
         let raw_port = completion_port.0 as usize;
         let thread = std::thread::Builder::new()
             .name("eliot-job-process-observer".to_owned())
             .spawn(move || {
-                job_process_observer_loop(raw_port, &thread_observed, &thread_shutdown_requested);
+                job_process_observer_loop(
+                    raw_port,
+                    &thread_observed,
+                    &thread_shutdown_requested,
+                    &thread_history_truncated,
+                );
             })?;
         Ok(Self {
             completion_port,
             observed,
             shutdown_requested,
+            history_truncated,
             thread: Some(thread),
         })
     }
 
     fn snapshot(&self) -> Vec<ProcessImageIdentity> {
         self.observed.lock().map_or_else(
-            |_| Vec::new(),
+            |_| {
+                // A poisoned lock hides an unknown subset of history, so the
+                // empty vec below is explicitly marked truncated rather than
+                // reported as a complete observation.
+                self.history_truncated.store(true, Ordering::Release);
+                Vec::new()
+            },
             |observed| {
                 observed
                     .iter()
@@ -1569,6 +1584,10 @@ impl JobProcessObserver {
                     .collect()
             },
         )
+    }
+
+    fn history_complete(&self) -> bool {
+        !self.history_truncated.load(Ordering::Acquire)
     }
 
     fn capture_pid(&self, pid: u32) -> io::Result<()> {
@@ -1635,6 +1654,7 @@ fn job_process_observer_loop(
     raw_port: usize,
     observed: &Arc<Mutex<Vec<ObservedProcess>>>,
     shutdown_requested: &AtomicBool,
+    history_truncated: &AtomicBool,
 ) {
     let completion_port = raw_port as HANDLE;
     loop {
@@ -1670,6 +1690,10 @@ fn job_process_observer_loop(
             if dequeue_error == WAIT_TIMEOUT {
                 continue;
             }
+            // Abnormal exit drops an unknown suffix of job notifications, so
+            // the retained history is marked truncated before breaking: an
+            // unresolved observation outcome must never read as complete.
+            history_truncated.store(true, Ordering::Release);
             break;
         }
         if completion_key == JOB_OBSERVER_SHUTDOWN_KEY {
@@ -2130,6 +2154,8 @@ impl SuspendedJobChild {
     /// # Errors
     ///
     /// Returns an error when Windows cannot query the Job Object or a live process image.
+    /// Returns an error when the observer history is truncated: a silently
+    /// undercounted merge must never read as a complete enumeration.
     pub fn job_processes(&self) -> io::Result<Vec<ProcessImageIdentity>> {
         for pid in job_process_ids(self.job.0)? {
             match self.observer.capture_pid(pid) {
@@ -2147,6 +2173,11 @@ impl SuspendedJobChild {
         let mut processes = self.observed_processes();
         processes.sort();
         processes.dedup();
+        if !self.observer.history_complete() {
+            return Err(io::Error::other(
+                "Job process observer history is truncated",
+            ));
+        }
         Ok(processes)
     }
 
@@ -2201,6 +2232,10 @@ impl SuspendedJobChild {
 
     /// Returns identities already bound to retained process handles without a
     /// fresh Job Object or PID lookup.
+    ///
+    /// The returned history may be truncated when the observer exited
+    /// abnormally; consult [`SuspendedJobChild::observed_history_complete`]
+    /// before treating it as a complete enumeration.
     #[must_use]
     pub fn observed_processes(&self) -> Vec<ProcessImageIdentity> {
         let mut processes = self.observer.snapshot();
@@ -2208,6 +2243,18 @@ impl SuspendedJobChild {
             processes.push(self.root_identity.clone());
         }
         processes
+    }
+
+    /// Reports whether the observer history behind
+    /// [`SuspendedJobChild::observed_processes`] is complete.
+    ///
+    /// Returns `false` once the observer loop has exited on a failed
+    /// dequeue or the history lock has been poisoned: in either case an
+    /// unknown suffix of job notifications was dropped and the retained
+    /// identities must not be reported as a complete observation.
+    #[must_use]
+    pub fn observed_history_complete(&self) -> bool {
+        self.observer.history_complete()
     }
 
     /// Returns the process exit code without waiting.
