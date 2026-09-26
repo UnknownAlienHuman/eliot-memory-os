@@ -57,6 +57,7 @@ mod user_automation_execution_client;
 mod user_automation_failure_history;
 #[cfg(test)]
 mod user_automation_failure_history_tests;
+mod user_automation_runtime_handoff;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
@@ -236,6 +237,12 @@ pub use user_automation_execution_client::{
 };
 pub use user_automation_failure_history::{
     StoreUserAutomationFailureHistory, build_failure_transition,
+};
+pub use user_automation_runtime_handoff::{
+    USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
+    UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationOperatorRuntime,
+    UserAutomationOperatorTransition, UserAutomationRecoveryPhase, UserAutomationWakePhase,
+    committed_configuration_state, run_now_wake_read_request,
 };
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,
