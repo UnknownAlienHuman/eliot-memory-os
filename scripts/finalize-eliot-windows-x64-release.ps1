@@ -2386,6 +2386,51 @@ function Test-FinalizedReleaseBundle(
     $runtime = Get-Content -LiteralPath (Join-Path $resolved 'runtime/RUNTIME_ARTIFACTS.json') -Raw | ConvertFrom-Json
     $checksum = Get-Content -LiteralPath (Join-Path $resolved 'SHA256SUMS.json') -Raw | ConvertFrom-Json
     $verified = Get-Content -LiteralPath (Join-Path $resolved 'SIGNING_VERIFIED.json') -Raw | ConvertFrom-Json
+    $frontDoorProperty = $release.PSObject.Properties['claude_code_front_door']
+    $frontDoor = if ($null -ne $frontDoorProperty) { $frontDoorProperty.Value } else { $null }
+    $dispositionProperty = if ($null -ne $frontDoor) { $frontDoor.PSObject.Properties['legacy_entrypoint_disposition'] } else { $null }
+    $selectionProperty = if ($null -ne $frontDoor) { $frontDoor.PSObject.Properties['selection'] } else { $null }
+    $sourceBehaviorProperty = if ($null -ne $frontDoor) { $frontDoor.PSObject.Properties['source_declared_behavior'] } else { $null }
+    $sourceEvidenceProperty = if ($null -ne $frontDoor) { $frontDoor.PSObject.Properties['source_behavior_evidence'] } else { $null }
+    $observedBehaviorProperty = if ($null -ne $frontDoor) { $frontDoor.PSObject.Properties['observed_behavior'] } else { $null }
+    $installedObservationProperty = if ($null -ne $frontDoor) { $frontDoor.PSObject.Properties['installed_runtime_observation'] } else { $null }
+    $sourceEvidence = if ($null -ne $sourceEvidenceProperty) { $sourceEvidenceProperty.Value } else { $null }
+    $installedObservation = if ($null -ne $installedObservationProperty) { $installedObservationProperty.Value } else { $null }
+    $sourceEvidenceStatusProperty = if ($null -ne $sourceEvidence) { $sourceEvidence.PSObject.Properties['status'] } else { $null }
+    $sourceRuntimeExecutionProperty = if ($null -ne $sourceEvidence) { $sourceEvidence.PSObject.Properties['runtime_execution'] } else { $null }
+    $installedObservationStatusProperty = if ($null -ne $installedObservation) { $installedObservation.PSObject.Properties['status'] } else { $null }
+    $legacyEntrypointEvidence = if ($null -ne $dispositionProperty -and
+        $null -ne $dispositionProperty.Value -and
+        $null -ne $selectionProperty -and
+        -not [string]::IsNullOrWhiteSpace([string]$selectionProperty.Value) -and
+        $null -ne $sourceBehaviorProperty -and
+        -not [string]::IsNullOrWhiteSpace([string]$sourceBehaviorProperty.Value) -and
+        $null -ne $sourceEvidenceStatusProperty -and
+        [string]$sourceEvidenceStatusProperty.Value -ceq 'SOURCE_DECLARED' -and
+        $null -ne $sourceRuntimeExecutionProperty -and
+        [string]$sourceRuntimeExecutionProperty.Value -ceq 'NOT_PERFORMED' -and
+        $null -ne $observedBehaviorProperty -and
+        $null -ne $installedObservationStatusProperty -and
+        [string]$installedObservationStatusProperty.Value -ceq 'NOT_PERFORMED') {
+        [ordered]@{
+            status = 'SOURCE_DECLARED_RUNTIME_UNOBSERVED'
+            selection = [string]$selectionProperty.Value
+            entrypoint_disposition = $dispositionProperty.Value
+            source_declared_behavior = [string]$sourceBehaviorProperty.Value
+            source_behavior_evidence = $sourceEvidence
+            observed_behavior = [string]$observedBehaviorProperty.Value
+            installed_runtime_observation = $installedObservation
+        }
+    }
+    else {
+        [ordered]@{
+            status = 'UNAVAILABLE_IN_RELEASE_MANIFEST'
+            entrypoint_disposition = 'NOT_RECORDED'
+            source_declared_behavior = 'NOT_RECORDED'
+            observed_behavior = 'Installed behavior was not established by this snapshot.'
+            installed_runtime_observation = 'NOT_RECORDED'
+        }
+    }
     foreach ($manifest in @($release, $runtime, $checksum)) {
         if ($manifest.signed -ne $true -or [string]$manifest.signature_policy -cne $script:AuthenticodeSigningPolicy -or
             [string]$manifest.signed_scope -cne $script:AuthenticodeSigningScope) {
@@ -2563,6 +2608,7 @@ function Test-FinalizedReleaseBundle(
         signed_scope = $script:AuthenticodeSigningScope
         roles = $roles.Count
         files = $actual.Count
+        legacy_entrypoint_evidence = $legacyEntrypointEvidence
     }
 }
 
