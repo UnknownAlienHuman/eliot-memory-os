@@ -67,8 +67,8 @@
 //!     eliot_agent_api::PhysicalRouteObservationReceipt::validate_against
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AgentResult, ExecutionOutcome, LowercaseSha256, ProviderExecutionBinding,
-    ResultDisposition, RouteFingerprint, RouteObservationState,
+    AdmittedRouteReceipt, AgentResult, AttemptId, ExecutionOutcome, LowercaseSha256,
+    ProviderExecutionBinding, ResultDisposition, RouteFingerprint, RouteObservationState,
 };
 use eliot_agent_coordinator::{
     AgentCoordinator, CoordinatorConfig, HumanModelPreferencePolicy, ModelCatalogueSnapshot,
@@ -80,12 +80,12 @@ use serde::Deserialize;
 
 use super::capability_admission::{
     CapabilityEvidenceRecord, DynamicCapabilityPulse, ProductionAdmissionRequest,
-    ProductionEvidenceBundle, StaticCapabilityAttestation, canonical_required_set,
-    evaluate_production_admission,
+    ProductionEvidenceBundle, StaticCapabilityAttestation, admit_production_route,
+    canonical_required_set,
 };
 use super::capability_evidence_wiring::GovernorCapabilityAdmission;
 use super::capability_outcome::{AttemptReceipt, FallbackOutcomeRequest, fallback_outcome};
-use super::route_receipts::effective_route_key;
+use super::route_receipts::{RuntimeObservedFacts, effective_route_key};
 use super::{DaemonComposition, DaemonKernelClient, SERVICE_NAME, kernel_port_error};
 
 /// Closed model-execution port behind the governed invoke.
@@ -135,6 +135,16 @@ pub struct ModelInvokeInput {
     pub admission: AdmittedRouteReceipt,
     /// Exact provider-execution binding the attempt runs under.
     pub binding: ProviderExecutionBinding,
+    /// Caller-threaded attempt identity for the Governor route-attempt
+    /// receipt (issue #228 A1). Must equal the binding attempt (already
+    /// linkage-verified against the admission attempt before the gate);
+    /// a mismatch fails the gate closed.
+    pub attempt_id: AttemptId,
+    /// Caller-observed runtime route facts for the Governor route-attempt
+    /// receipt (issue #228 A1): handshake, transport metadata, or
+    /// equivalent evidence-bearing observations. `None` fails the gate
+    /// closed; facts are never derived here from the bound route.
+    pub observed_facts: Option<RuntimeObservedFacts>,
     /// Caller-observed capability evidence records for the funnel side of
     /// the capability gate (issue #1959). Threaded per call from the
     /// retained Governor registry snapshots plus probe/handshake observers;
@@ -544,9 +554,15 @@ fn is_critical_capability(
 ///   registry records). No window is minted here and no TTL constant exists.
 /// - the registry side requires fresh exact-scope positive evidence with no
 ///   fresh restriction; a missing observed scope fails closed.
-/// - the funnel side requires an `Admit` disposition over the threaded
-///   records plus the critical join exactly when the caller threaded
-///   critical evidence.
+/// - the funnel side runs through [`admit_production_route`]: the same
+///   requested route is evaluated over the threaded records plus the
+///   critical join exactly when the caller threaded critical evidence,
+///   while `RouteAdmissionVisibility::observe` plus `GovernorRouteAttempt::new`
+///   observe and link the caller-threaded attempt on handshake-observed
+///   facts. The registry bool path stays: the receipt observes and links
+///   the attempt, it never admits — only the funnel disposition admits.
+///   Absent observed facts fail closed; facts are never fabricated from
+///   the resolved route.
 ///
 /// Returns the evaluated required set for the result-intake join below.
 fn gate_model_capability(
@@ -583,6 +599,21 @@ fn gate_model_capability(
             "dreamer model invoke threads no observed route scope; capability evidence is unevaluable",
         )
     })?;
+    // A1 attempt linkage: the caller-threaded attempt must be the bound
+    // attempt (binding and admission agreement is proven before the gate);
+    // the receipt below links this same identity.
+    if input.attempt_id != input.binding.attempt_id {
+        return Err(owner_error(
+            "dreamer model invoke attempt does not match the bound attempt",
+        ));
+    }
+    // A1 observed facts: handshake/transport observations arrive per call;
+    // absent facts fail closed, never defaulted from the resolved route.
+    let observed = input.observed_facts.as_ref().ok_or_else(|| {
+        owner_error(
+            "dreamer model invoke threads no handshake-observed route facts; capability evidence is unevaluable",
+        )
+    })?;
     let now = input.now_unix_ms;
     for capability in &required {
         if !registry.admit_production_route(capability, scope, now) {
@@ -602,16 +633,17 @@ fn gate_model_capability(
             static_attestation: input.static_attestation.as_ref(),
             pulse: input.pulse.as_ref(),
         };
-        let outcome = evaluate_production_admission(
-            &request,
-            bundle.records,
-            bundle.static_attestation,
-            bundle.pulse,
-        );
-        if !outcome.admitted() {
+        // One owner for the funnel-plus-receipt join: the free admission
+        // route evaluates the disposition and constructs the Governor
+        // attempt receipt in production. Visibility never implies
+        // admission: only the funnel disposition admits.
+        let decision =
+            admit_production_route(&request, &bundle, input.attempt_id.clone(), observed)
+                .map_err(|error| owner_error(format!("dreamer model route receipt: {error}")))?;
+        if !decision.outcome.admitted() {
             return Err(owner_error(format!(
                 "production admission does not admit {capability} for the bound route: {}",
-                outcome.reason
+                decision.outcome.reason
             )));
         }
     }
@@ -1237,6 +1269,8 @@ mod tests {
             now_unix_ms: TEST_NOW,
             admission,
             binding,
+            attempt_id: AttemptId::new("attempt-t12-07-b")?,
+            observed_facts: Some(test_observed_facts()),
             evidence_records: Vec::new(),
             static_attestation: None,
             pulse: None,
@@ -1393,6 +1427,30 @@ mod tests {
         }
     }
 
+    /// Caller-threaded handshake observations for the Governor
+    /// route-attempt receipt (issue #228 A1). Provider/model/billing stay
+    /// unexposed (`unknown` in the observed route, never inferred from
+    /// the bound route); the handshake evidence reference backs the
+    /// observation.
+    fn test_observed_facts() -> RuntimeObservedFacts {
+        RuntimeObservedFacts {
+            host_family: "test-host".to_owned(),
+            adapter: "adapter-model-a".to_owned(),
+            protocol_transport: "fixture".to_owned(),
+            runtime_hash: test_digest("t12-07-runtime").expect("facts runtime digest"),
+            adapter_hash: test_digest("t12-07-adapter").expect("facts adapter digest"),
+            provider: None,
+            model: None,
+            auth_billing: None,
+            serializer_hash: test_digest("t12-07-serializer").expect("facts serializer digest"),
+            tool_semantics_hash: test_digest("t12-07-tools").expect("facts tools digest"),
+            reasoning_mode: "bounded".to_owned(),
+            continuation_behavior: "fresh".to_owned(),
+            feature_flags_hash: test_digest("t12-07-features").expect("facts features digest"),
+            evidence_refs: vec!["handshake:t12-07-session-1".to_owned()],
+        }
+    }
+
     fn gate_input(
         fixtures: &InvokeFixtures,
         records: Vec<CapabilityEvidenceRecord>,
@@ -1405,6 +1463,8 @@ mod tests {
             now_unix_ms: TEST_NOW,
             admission: fixtures.admission.clone(),
             binding: fixtures.binding.clone(),
+            attempt_id: fixtures.binding.attempt_id.clone(),
+            observed_facts: Some(test_observed_facts()),
             evidence_records: records,
             static_attestation: None,
             pulse: None,
