@@ -539,12 +539,31 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 _ => throw new InvalidOperationException(
                     "typed UserAutomation create/edit is not a schedule-carrying operation.")
             };
+            var receipt = schedule.NormalizationReceipt();
+            const int maxPreviewOccurrences = 4;
+            var shownOccurrences = Math.Min(maxPreviewOccurrences, receipt.Occurrences.Count);
+            var occurrencePreview = string.Join(
+                Environment.NewLine,
+                receipt.Occurrences
+                    .Take(shownOccurrences)
+                    .Select((occurrence, index) =>
+                        $"supplied occurrence {index + 1}: requested local {occurrence.RequestedLocal}; resolved local {occurrence.ResolvedLocal}"));
+            var submissionDescription = UserAutomationOutcomeClassifier.DescribeSubmission(
+                UserAutomationOperation,
+                receipt,
+                UserAutomationOperatorRequest.DeriveIdempotencyKey(operation));
+            if (occurrencePreview.Length != 0)
+            {
+                submissionDescription += Environment.NewLine + occurrencePreview;
+            }
+            if (receipt.Occurrences.Count > shownOccurrences)
+            {
+                submissionDescription += Environment.NewLine
+                    + $"...{receipt.Occurrences.Count - shownOccurrences} further occurrence(s); inspect the retained schedule for the complete list.";
+            }
             SetBanner(
                 "UserAutomation create/edit admitted for submission",
-                UserAutomationOutcomeClassifier.DescribeSubmission(
-                    UserAutomationOperation,
-                    schedule.NormalizationReceipt(),
-                    UserAutomationOperatorRequest.DeriveIdempotencyKey(operation)),
+                submissionDescription,
                 OperatorBannerSeverity.Informational);
         }
 

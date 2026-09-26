@@ -72,7 +72,7 @@ public sealed class UserAutomationScheduleContractException : InvalidOperationEx
 /// The raw record is retained verbatim on <see cref="Record"/> so the exact input
 /// bytes stay available for submission and inspection. The decoded fields
 /// are what the Operator displays: zone identity, the pinned zone database
-/// revision, the local wall clock, the resolved UTC instant and applied offset,
+/// revision, the requested and resolved local wall clocks, the resolved UTC instant and applied offset,
 /// and the applied fold/gap disposition.
 /// </remarks>
 public sealed record UserAutomationNormalizedOccurrence(
@@ -80,7 +80,8 @@ public sealed record UserAutomationNormalizedOccurrence(
     string Encoding,
     string Timezone,
     string ZoneDatabaseRevision,
-    string Local,
+    string RequestedLocal,
+    string ResolvedLocal,
     int OffsetMinutes,
     string Offset,
     string Instant,
@@ -92,7 +93,7 @@ public sealed record UserAutomationNormalizedOccurrence(
 {
     /// <summary>
     /// One bounded display line for the Human inspection surface. It states the
-    /// pinned database revision, the local wall clock, the resolved instant and
+    /// pinned database revision, the requested and resolved local clocks, the resolved instant and
     /// offset, the applied disposition and the raw record bytes, so the
     /// projection is inspectable before activation without the Operator
     /// resolving anything.
@@ -104,7 +105,7 @@ public sealed record UserAutomationNormalizedOccurrence(
             : $"{TransitionBeforeOffset}~{TransitionAfterOffset}";
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"{Timezone}@{ZoneDatabaseRevision} local {Local} offset {Offset} instant {Instant} disposition {Disposition} transition {transition} source_digest {SourceDigest} record [{Record}]");
+            $"{Timezone}@{ZoneDatabaseRevision} requested local {RequestedLocal} resolved local {ResolvedLocal} offset {Offset} instant {Instant} disposition {Disposition} transition {transition} source_digest {SourceDigest} record [{Record}]");
     }
 }
 
@@ -204,6 +205,14 @@ public static class UserAutomationScheduleMirror
         }
         return true;
     }
+
+    /// <summary>
+    /// V2 and V3 are retired versioned occurrence contracts. They cannot be
+    /// reinterpreted as V4 because neither carries both local clocks.
+    /// </summary>
+    private static bool IsPredecessorOccurrenceEncoding(string encoding) =>
+        encoding is OperatorScheduleContract.LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2
+            or OperatorScheduleContract.LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3;
 
     /// <summary>
     /// Port of <c>parse_civil_wall_clock</c>. The value must be exactly
@@ -364,27 +373,34 @@ public static class UserAutomationScheduleMirror
     }
 
     /// <summary>
-    /// Port of <c>require_resolved_instant</c>: the recorded instant must be
-    /// exactly the one the recorded disposition and applied offset select for the
-    /// recorded local wall clock. This is arithmetic over the supplied record bytes —
-    /// it consults no zone, no table and no ambient clock — so an occurrence
-    /// whose recorded offset is neither side of its recorded transition, or
-    /// whose instant does not round-trip through its own offset, is refused
-    /// here rather than presented as a fold or gap.
+    /// Port of <c>validate_occurrence_local_relation</c>. The requested and
+    /// resolved wall clocks, transition, applied offset and UTC instant must be
+    /// one arithmetic relation. This consumes supplied bytes only; it consults
+    /// no zone table or ambient timezone data.
     /// </summary>
-    private static void RequireResolvedInstant(
-        long localSeconds,
+    private static void ValidateOccurrenceLocalRelation(
+        long requestedLocalSeconds,
+        long resolvedLocalSeconds,
         int offsetMinutes,
         string disposition,
         (string? Before, string? After) transition,
         long instantSeconds)
     {
-        int applied;
-        if (disposition == "UNIQUE" && transition.Before is null)
+        if (disposition == "UNIQUE")
         {
-            applied = offsetMinutes;
+            if (transition.Before is not null || transition.After is not null)
+            {
+                throw Invalid("schedule.occurrence_key.transition");
+            }
+            if (requestedLocalSeconds != resolvedLocalSeconds)
+            {
+                throw Invalid("schedule.occurrence_key.resolved_local");
+            }
+            RequireInstantForOffset(resolvedLocalSeconds, offsetMinutes, instantSeconds);
+            return;
         }
-        else if (disposition == "FOLD_FIRST"
+
+        if (disposition == "FOLD_FIRST"
             && transition.Before is not null
             && transition.After is not null
             && ParseUtcOffsetMinutes(transition.Before, "schedule.occurrence_key.transition")
@@ -392,9 +408,11 @@ public static class UserAutomationScheduleMirror
             && offsetMinutes == ParseUtcOffsetMinutes(
                 transition.Before, "schedule.occurrence_key.transition"))
         {
-            applied = offsetMinutes;
+            RequireEqualFoldClocksAndInstant(requestedLocalSeconds, resolvedLocalSeconds, offsetMinutes, instantSeconds);
+            return;
         }
-        else if (disposition == "FOLD_SECOND"
+
+        if (disposition == "FOLD_SECOND"
             && transition.Before is not null
             && transition.After is not null
             && ParseUtcOffsetMinutes(transition.Before, "schedule.occurrence_key.transition")
@@ -402,9 +420,11 @@ public static class UserAutomationScheduleMirror
             && offsetMinutes == ParseUtcOffsetMinutes(
                 transition.After, "schedule.occurrence_key.transition"))
         {
-            applied = offsetMinutes;
+            RequireEqualFoldClocksAndInstant(requestedLocalSeconds, resolvedLocalSeconds, offsetMinutes, instantSeconds);
+            return;
         }
-        else if (disposition == "GAP_SHIFT_FORWARD"
+
+        if (disposition == "GAP_SHIFT_FORWARD"
             && transition.Before is not null
             && transition.After is not null
             && ParseUtcOffsetMinutes(transition.Before, "schedule.occurrence_key.transition")
@@ -412,14 +432,45 @@ public static class UserAutomationScheduleMirror
             && offsetMinutes == ParseUtcOffsetMinutes(
                 transition.After, "schedule.occurrence_key.transition"))
         {
-            applied = ParseUtcOffsetMinutes(
-                transition.Before, "schedule.occurrence_key.transition");
+            var pre = ParseUtcOffsetMinutes(transition.Before, "schedule.occurrence_key.transition");
+            var post = ParseUtcOffsetMinutes(transition.After, "schedule.occurrence_key.transition");
+            var gapSeconds = (long)(post - pre) * 60L;
+            if (requestedLocalSeconds + gapSeconds != resolvedLocalSeconds)
+            {
+                throw Invalid("schedule.occurrence_key.resolved_local");
+            }
+            var requestedInstant = requestedLocalSeconds - (long)pre * 60L;
+            var resolvedInstant = resolvedLocalSeconds - (long)post * 60L;
+            if (requestedInstant != resolvedInstant)
+            {
+                throw Invalid("schedule.occurrence_key.resolved_local");
+            }
+            if (instantSeconds != requestedInstant)
+            {
+                throw Invalid("schedule.occurrence_key.instant");
+            }
+            return;
         }
-        else
+
+        throw Invalid("schedule.occurrence_key.transition");
+    }
+
+    private static void RequireEqualFoldClocksAndInstant(
+        long requestedLocalSeconds,
+        long resolvedLocalSeconds,
+        int offsetMinutes,
+        long instantSeconds)
+    {
+        if (requestedLocalSeconds != resolvedLocalSeconds)
         {
-            throw Invalid("schedule.occurrence_key.transition");
+            throw Invalid("schedule.occurrence_key.resolved_local");
         }
-        if (localSeconds - (long)applied * 60L != instantSeconds)
+        RequireInstantForOffset(resolvedLocalSeconds, offsetMinutes, instantSeconds);
+    }
+
+    private static void RequireInstantForOffset(long localSeconds, int offsetMinutes, long instantSeconds)
+    {
+        if (localSeconds - (long)offsetMinutes * 60L != instantSeconds)
         {
             throw Invalid("schedule.occurrence_key.instant");
         }
@@ -456,13 +507,18 @@ public static class UserAutomationScheduleMirror
             OperatorScheduleContract.NORMALIZED_OCCURRENCE_FIELD_SEPARATOR);
         if (fields.Length != OperatorScheduleContract.NORMALIZED_OCCURRENCE_FIELD_COUNT)
         {
-            throw IsLegacyOccurrenceKey(occurrenceKey)
+            throw (IsLegacyOccurrenceKey(occurrenceKey)
+                || (fields.Length > 0 && IsPredecessorOccurrenceEncoding(fields[0])))
                 ? LegacyScheduleEncoding()
                 : Invalid("schedule.occurrence_key.shape");
         }
         var encoding = fields[0];
         if (!string.Equals(encoding, OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING, StringComparison.Ordinal))
         {
+            if (IsPredecessorOccurrenceEncoding(encoding))
+            {
+                throw LegacyScheduleEncoding();
+            }
             // The exact supported contract version is a shape/version refusal,
             // not a semantic one: the Operator does not recognize this record
             // as a current revision, and it never rewrites it into one.
@@ -484,38 +540,42 @@ public static class UserAutomationScheduleMirror
                 OwnerText("ZoneDatabaseRevision", "schedule.occurrence_key.zone_database_revision"),
                 $"obtain a new owner normalization against pinned zone database {OperatorScheduleContract.PINNED_ZONE_DATABASE_RELEASE}; a database update can never rewrite an existing revision");
         }
-        if (fields[8].Length == 0
-            || Encoding.UTF8.GetByteCount(fields[8]) > OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES)
+        if (fields[9].Length == 0
+            || Encoding.UTF8.GetByteCount(fields[9]) > OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES)
         {
             throw Invalid("schedule.occurrence_key.source_digest");
         }
-        var disposition = fields[7];
+        var disposition = fields[8];
         if (!OperatorScheduleContract.Dispositions.Contains(disposition, StringComparer.Ordinal))
         {
             throw Invalid("schedule.occurrence_key.disposition");
         }
         RequireDeclaredDisposition(disposition, dstFold, dstGap);
-        var localSeconds = ParseCivilWallClockSeconds(
-            fields[3], "schedule.occurrence_key.local");
-        var offsetMinutes = ParseUtcOffsetMinutes(fields[4], "schedule.occurrence_key.offset");
-        var instantSeconds = ParseUtcInstantSeconds(fields[5], "schedule.occurrence_key.instant");
+        var requestedLocalSeconds = ParseCivilWallClockSeconds(
+            fields[3], "schedule.occurrence_key.requested_local");
+        var resolvedLocalSeconds = ParseCivilWallClockSeconds(
+            fields[4], "schedule.occurrence_key.resolved_local");
+        var offsetMinutes = ParseUtcOffsetMinutes(fields[5], "schedule.occurrence_key.offset");
+        var instantSeconds = ParseUtcInstantSeconds(fields[6], "schedule.occurrence_key.instant");
         var transition = ParseTransitionWindow(
-            fields[6], disposition, "schedule.occurrence_key.transition");
-        RequireResolvedInstant(localSeconds, offsetMinutes, disposition, transition, instantSeconds);
+            fields[7], disposition, "schedule.occurrence_key.transition");
+        ValidateOccurrenceLocalRelation(
+            requestedLocalSeconds, resolvedLocalSeconds, offsetMinutes, disposition, transition, instantSeconds);
         return new UserAutomationNormalizedOccurrence(
             Record: occurrenceKey,
             Encoding: encoding,
             Timezone: fields[1],
             ZoneDatabaseRevision: fields[2],
-            Local: fields[3],
+            RequestedLocal: fields[3],
+            ResolvedLocal: fields[4],
             OffsetMinutes: offsetMinutes,
-            Offset: fields[4],
-            Instant: fields[5],
+            Offset: fields[5],
+            Instant: fields[6],
             InstantSeconds: instantSeconds,
             TransitionBeforeOffset: transition.Before,
             TransitionAfterOffset: transition.After,
             Disposition: disposition,
-            SourceDigest: fields[8]);
+            SourceDigest: fields[9]);
     }
 
     /// <summary>
@@ -728,7 +788,7 @@ public static class UserAutomationScheduleMirror
         new(
             "LegacyScheduleEncoding",
             OwnerText("LegacyScheduleEncoding", "schedule.next_occurrences"),
-            "this occurrence is the retired shape-only encoding; run the owner re-normalization/migration action and create a NEW revision; an immutable revision is never rewritten in place");
+            "this occurrence uses a retired encoding; run the owner re-normalization/migration action and create a NEW revision; an immutable revision is never rewritten in place");
 
     private static bool IsCanonicalCivilWallClock(string value)
     {

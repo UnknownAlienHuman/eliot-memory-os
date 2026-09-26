@@ -65,6 +65,10 @@ PINNED_CONSTANTS = (
     # occurrence key, so the Operator reads the supported contract version off
     # the owner's own bytes instead of carrying a second copy of it on the wire.
     ("NORMALIZED_OCCURRENCE_ENCODING", USER_AUTOMATION_RS, "string"),
+    # Retired versioned predecessors remain explicit refusal inputs. Read their
+    # spellings from Rust so the Operator cannot carry a drifting legacy list.
+    ("LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3", USER_AUTOMATION_RS, "string"),
+    ("LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2", USER_AUTOMATION_RS, "string"),
     # The domain the owner binds the compiled expression/calendar digest to. The
     # Operator displays it; it cannot recompute the digest (it does not own the
     # expression language), so it never claims to have verified the value.
@@ -127,6 +131,7 @@ PINNED_GRAMMAR_FUNCTIONS = (
     "parse_transition_window",
     "require_declared_disposition",
     "require_resolved_instant",
+    "validate_occurrence_local_relation",
     "is_legacy_occurrence_key",
     "is_canonical_zone_database_revision",
 )
