@@ -177,9 +177,9 @@ RETURN {
   failure_fingerprints: SELECT fingerprint, summary, payload FROM failure_fingerprint
     WHERE project_id = $request.project_id
       AND <string> fingerprint IN array::concat($failure_ids, $relation_neighbors),
+  -- ul_artifacts projects exactly the deny-closed UlMemoryArtifact keys; the
+  -- ORDER BY revision keys below stay out of the projection.
   ul_artifacts: SELECT
-      memory_revision,
-      project_sequence,
       IF receipt_kind = 'module_card' {
         string::concat('card:', <string> receipt_body.card_id)
       } ELSE IF receipt_kind = 'subsystem_capsule' {
