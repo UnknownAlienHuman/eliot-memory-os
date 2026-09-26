@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use std::time::Duration;
 use eliot_runtime::RuntimeConfig;
 use eliot_runtime::{Runtime, ShutdownHandle, ShutdownOutcome};
 use eliot_wasm_runtime::{
-    ComponentEnginePort, InvocationId, InvocationRequest, InvocationResult, RuntimeError,
-    RuntimePorts, WasmRuntime,
+    ComponentEnginePort, GuestInterruptHandle, InvocationId, InvocationRequest, InvocationResult,
+    RuntimeError, RuntimePorts, WasmRuntime,
 };
 
 mod admission;
@@ -222,6 +223,14 @@ impl WasmHostRunner {
         request_digest: &eliot_wasm_runtime::Sha256Digest,
     ) -> Result<InvocationResult, RuntimeError> {
         self.wasm_runtime.reconcile(invocation_id, request_digest)
+    }
+
+    /// Returns the seated engine's cloneable cross-thread interruption
+    /// handle, when the engine offers one. Taken before the worker owns the
+    /// runner, so the control loop can request prompt guest termination while
+    /// a command is outstanding (#2568 A3).
+    pub fn interrupt_handle(&self) -> Option<Arc<dyn GuestInterruptHandle>> {
+        self.wasm_runtime.interrupt_handle()
     }
 
     /// Requests P-11 admission shutdown and returns whether this call won it.

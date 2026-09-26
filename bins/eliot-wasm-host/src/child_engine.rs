@@ -26,14 +26,16 @@
 //! Artifact reads stay zero with an empty digest set: the component bytes
 //! were read by the child, not here.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
-use eliot_process::ProcessLifecycle;
+use eliot_process::{OperationId, ProcessExecutor, ProcessLifecycle};
 use eliot_process_executor::{WindowsProcessExecutor, wasm_p03_adapter::WasmP03ProcessAdapter};
 use eliot_wasm_runtime::{
     CapabilityId, ComponentEnginePort, EngineBinding, EngineInvocation, EngineReport,
-    EngineTermination, EngineUsage, P03ProcessPort, PortError, Sha256Digest,
+    EngineTermination, EngineUsage, GuestInterruptHandle, P03ProcessPort, PortError, Sha256Digest,
 };
 
 use crate::guest_exec::parse_metering_line;
@@ -60,18 +62,22 @@ pub struct IsolatedChildEngine {
     binding: EngineBinding,
     artifact_digest: Sha256Digest,
     component_configuration_digest: Sha256Digest,
+    operation: Option<OperationId>,
 }
 
 impl IsolatedChildEngine {
     /// Composes the isolated engine over the shared operation owner.
     /// The verifier-side adapter never stages (its slot stays empty):
-    /// `reconcile` observes, it never launches.
+    /// `reconcile` observes, it never launches. The operation identity names
+    /// the one child this engine serves; it arms the cross-thread
+    /// interruption handle, and an unparseable identity disarms it (`None`).
     pub fn new(
         executor: Arc<WindowsProcessExecutor>,
         sink: Arc<dyn eliot_process::ProcessEvidenceSink>,
         binding: EngineBinding,
         artifact_digest: Sha256Digest,
         component_configuration_digest: Sha256Digest,
+        operation_id: &str,
     ) -> Self {
         let process = WasmP03ProcessAdapter::new(Arc::clone(&executor), sink);
         Self {
@@ -80,6 +86,43 @@ impl IsolatedChildEngine {
             binding,
             artifact_digest,
             component_configuration_digest,
+            operation: OperationId::new(operation_id.to_owned()).ok(),
+        }
+    }
+}
+
+/// Cloneable cross-thread interruption for isolated-child guest execution
+/// (#2568 A3). Fires the owner-blessed P03 cancellation for exactly the
+/// operation this engine serves, so the worker's observed reap settles
+/// promptly and the invocation reports unknown instead of running to its
+/// wall deadline. Best-effort and idempotent: firing before the child
+/// starts, after it settles, or twice resolves to the same terminated
+/// observation, and the caller retries while the command is outstanding.
+#[derive(Clone)]
+pub struct ChildInterruptHandle {
+    executor: Arc<WindowsProcessExecutor>,
+    operation: OperationId,
+}
+
+impl GuestInterruptHandle for ChildInterruptHandle {
+    fn interrupt(&self) {
+        let _ = drive_executor_future(self.executor.cancel(self.operation.clone()));
+    }
+}
+
+/// Drives one already-created executor future to completion on the calling
+/// thread, using this tree's established spin recipe: the executor futures
+/// are thread-driven, so a `yield_now` spin terminates without an async
+/// runtime and without inventing a second executor or scheduler. (Same
+/// recipe as the P03 adapter's private driver.)
+fn drive_executor_future<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
         }
     }
 }
@@ -202,5 +245,14 @@ impl ComponentEnginePort for IsolatedChildEngine {
 
     fn reconcile(&mut self, _invocation: &EngineInvocation) -> Result<EngineReport, PortError> {
         Err(PortError::UnknownOutcome)
+    }
+
+    fn interrupt_handle(&self) -> Option<Arc<dyn GuestInterruptHandle>> {
+        let operation = self.operation.clone()?;
+        let handle: Arc<dyn GuestInterruptHandle> = Arc::new(ChildInterruptHandle {
+            executor: Arc::clone(&self.executor),
+            operation,
+        });
+        Some(handle)
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use eliot_process::{CancellationReceipt, ProcessEvidence, ProcessRequest, ProcessStartReceipt};
 use thiserror::Error;
 
@@ -82,6 +84,20 @@ pub trait P03ReceiptVerifierPort: Send {
     ) -> Result<(), PortError>;
 }
 
+/// Cloneable cross-thread guest-interruption capability (#2568 A3).
+///
+/// Unlike the `&mut self` ports, this handle is shared with a control thread
+/// while the worker thread blocks inside [`ComponentEnginePort::invoke`], so
+/// an admitted Cancel/Shutdown can terminate pending guest work instead of
+/// queueing behind the bound-1 command slot. Firing is best-effort and
+/// idempotent: the worker's own deadline machinery still bounds the wait when
+/// no interruption lands, and the interrupted invocation reports through the
+/// normal unknown-outcome taxonomy, never as manufactured success.
+pub trait GuestInterruptHandle: Send + Sync {
+    /// Requests prompt termination of the running guest work.
+    fn interrupt(&self);
+}
+
 /// Engine boundary. Reports actual values only and never returns P-03 receipts.
 pub trait ComponentEnginePort: Send {
     fn binding(&self) -> &EngineBinding;
@@ -89,6 +105,13 @@ pub trait ComponentEnginePort: Send {
     fn invoke(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError>;
 
     fn reconcile(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError>;
+
+    /// Returns a cloneable cross-thread interruption handle for the guest
+    /// work this engine runs, or `None` when the engine cannot be interrupted
+    /// externally. The default has no interruption physics.
+    fn interrupt_handle(&self) -> Option<Arc<dyn GuestInterruptHandle>> {
+        None
+    }
 }
 
 /// Typed extension over the engine boundary. Implementors bind one
