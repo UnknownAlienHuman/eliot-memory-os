@@ -100,6 +100,10 @@ const CLAUDE_CODE_PLUGIN_GUIDE: &str =
 const CLAUDE_PLUGIN_README: &str = include_str!("../../../integrations/claude/eliot/README.md");
 const OPENCODE_README: &str = include_str!("../../../integrations/opencode/README.md");
 const WINDOWS_RELEASE_GUIDE: &str = include_str!("../../../docs/release/WINDOWS_X64_RELEASE.md");
+const HOST_BUNDLE_MANIFEST: &str =
+    include_str!("../../../integrations/agent-runtimes/host-bundle.manifest.json");
+const CODEX_ROUTE_PROFILE: &str = include_str!("../../../integrations/codex/route-profile.json");
+const CLAUDE_CONNECTOR_TEST: &str = include_str!("../../../scripts/test-claude-connector.ps1");
 
 /// Every declared install/launch/advertisement surface of the legacy binary.
 ///
@@ -186,6 +190,21 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "docs/release/WINDOWS_X64_RELEASE.md",
         live_reference: "The Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`",
         body: WINDOWS_RELEASE_GUIDE,
+    },
+    ConsumerSurface {
+        path: "integrations/agent-runtimes/host-bundle.manifest.json",
+        live_reference: "\"destination_hint\": \"CODEX_HOME/plugins/eliot-governor\"",
+        body: HOST_BUNDLE_MANIFEST,
+    },
+    ConsumerSurface {
+        path: "integrations/codex/route-profile.json",
+        live_reference: "\"path\": \"plugin/eliot-governor/.mcp.json\"",
+        body: CODEX_ROUTE_PROFILE,
+    },
+    ConsumerSurface {
+        path: "scripts/test-claude-connector.ps1",
+        live_reference: "'release\\eliot-governor.exe'",
+        body: CLAUDE_CONNECTOR_TEST,
     },
 ];
 
@@ -462,6 +481,27 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             live_reference: "The Codex marketplace declares `eliot-governor` as `INSTALLED_BY_DEFAULT`",
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when the retained legacy entry points are deleted under #18",
+        },
+        ConsumerEntry {
+            consumer: "Agent host-bundle Codex plugin staging",
+            proof: "integrations/agent-runtimes/host-bundle.manifest.json",
+            live_reference: "\"destination_hint\": \"CODEX_HOME/plugins/eliot-governor\"",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when host-bundle staging installs the current root plugin route under #13",
+        },
+        ConsumerEntry {
+            consumer: "Codex route-profile plugin surfaces",
+            proof: "integrations/codex/route-profile.json",
+            live_reference: "\"path\": \"plugin/eliot-governor/.mcp.json\"",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when the codex route profile names current-owner surfaces under #13",
+        },
+        ConsumerEntry {
+            consumer: "Claude connector install-layout test",
+            proof: "scripts/test-claude-connector.ps1",
+            live_reference: "'release\\eliot-governor.exe'",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove by 2026-12-31, when connector tests target the current root server binary under #11",
         },
     ]
 }
