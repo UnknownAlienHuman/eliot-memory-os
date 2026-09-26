@@ -511,7 +511,12 @@ fn replay_forced_outcome(
             prior_encoding_version,
             prior_algorithm,
         } => Some(Ok(requires_reconciliation(
-            unestablished_reason(cause, prior_domain, prior_encoding_version, prior_algorithm),
+            unestablished_reason(
+                *cause,
+                prior_domain,
+                prior_encoding_version,
+                prior_algorithm,
+            ),
             owner_id,
         ))),
         ImprovementReplayAssessment::NoRetainedPrior { commitment } => Some(Ok(no_progress(
