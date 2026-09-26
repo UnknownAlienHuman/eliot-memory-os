@@ -483,4 +483,3 @@ fn v1_lifecycle_states_are_not_v2_row_identities() -> TestResult {
     let _ = LifecycleState::Active;
     Ok(())
 }
-

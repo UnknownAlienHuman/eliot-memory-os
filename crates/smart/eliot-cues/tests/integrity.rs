@@ -146,4 +146,3 @@ fn ledger_1143_owner_path_validates_without_facade_fallback() -> TestResult {
     assert_eq!(source.canonical_spelling, "Src/Lib.rs");
     Ok(())
 }
-
