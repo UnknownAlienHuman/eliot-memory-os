@@ -1925,6 +1925,7 @@ dependencies = [
  "eliot-evaluation-contracts",
  "eliot-evidence",
  "eliot-finish",
+ "eliot-influence",
  "eliot-instrument-api",
  "eliot-instrument-nextest",
  "eliot-integration-coverage",

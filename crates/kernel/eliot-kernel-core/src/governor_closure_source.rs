@@ -432,6 +432,20 @@ impl GovernorClosureSource {
             }
         }
 
+        // Receipt-covered delegation edges, keyed by parent/child identity.
+        // The per-declaration N3 gate below uses this to tell an authorized
+        // crossing (refused: v1 cannot fence it) from an unresolved one
+        // (refused: the verdict would be partial/unknown).
+        let covered_edges: BTreeSet<(&str, &str)> = graph_snapshot
+            .root_transitions
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.parent_grant_id.as_str(),
+                    receipt.child_grant_id.as_str(),
+                )
+            })
+            .collect();
         let mut declarations = BTreeMap::new();
         for declaration in restore.declarations {
             if non_admissible.contains(declaration.target_grant_id.as_str()) {
@@ -500,6 +514,7 @@ impl GovernorClosureSource {
                     });
                 }
             }
+            check_declaration_cross_root_closure(&graph_snapshot, &declaration, &covered_edges)?;
             if declarations
                 .insert(declaration.target_grant_id.clone(), declaration)
                 .is_some()
@@ -673,6 +688,112 @@ fn check_preserved_membership(
         }
     }
     Ok(())
+}
+
+/// Mirrors the N3 verdict gate (#2100 item N3) at the trust boundary for one
+/// owner declaration, validating against durable snapshot evidence without
+/// re-deriving membership: the served members still come verbatim from the
+/// declaration.
+///
+/// Governor refuses to emit a declaration unless the closure verdict is
+/// honestly complete with no receipt-authorized cross-root descendants.
+/// This gate fails closed on the same conditions from the mirror side: a
+/// receipt-authorized crossing inside the target closure refuses because
+/// the single-root v1 declaration cannot fence an identity on its own
+/// root; an unresolved cross-root dependent refuses because the verdict
+/// would be partial/unknown; a quarantined dependent inside the closure
+/// consumes its separate-quarantine receipt (bound by Governor's complete
+/// gate) and its inert identity must never appear among the fenced
+/// members.
+fn check_declaration_cross_root_closure(
+    snapshot: &GrantGraphRecoverySnapshot,
+    declaration: &GrantClosureDeclaration,
+    covered_edges: &BTreeSet<(&str, &str)>,
+) -> Result<(), KernelError> {
+    let target = declaration.target_grant_id.as_str();
+    for receipt in &snapshot.root_transitions {
+        if closure_edge_reaches_target(snapshot, &receipt.parent_grant_id, target) {
+            return Err(KernelError::RecoveryUnavailable(
+                "owner declaration target has receipt-authorized cross-root descendants the single-root declaration cannot fence"
+                    .to_owned(),
+            ));
+        }
+    }
+    for grant in &snapshot.grants {
+        let Some(parent_id) = grant.parent_grant_id.as_ref() else {
+            continue;
+        };
+        if covered_edges.contains(&(parent_id.as_str(), grant.grant_id.as_str())) {
+            continue;
+        }
+        let Some(parent) = snapshot
+            .grants
+            .iter()
+            .find(|candidate| &candidate.grant_id == parent_id)
+        else {
+            continue;
+        };
+        if parent.authority_root_ref == grant.authority_root_ref {
+            continue;
+        }
+        if closure_edge_reaches_target(snapshot, parent_id, target) {
+            return Err(KernelError::RecoveryUnavailable(
+                "owner declaration target has an unresolved cross-root dependent; refusing an incomplete closure"
+                    .to_owned(),
+            ));
+        }
+    }
+    let declared = declaration
+        .members
+        .iter()
+        .map(|member| member.grant_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for relation in &snapshot.quarantined_cross_root {
+        if !closure_edge_reaches_target(snapshot, &relation.parent_grant_id, target) {
+            continue;
+        }
+        // The separate-quarantine receipt (`relation_id`) is consumed
+        // here: the quarantined dependent's absence from the fenced
+        // members is backed by this exact relation, never by silent
+        // omission — and the inert identity must never be fenced.
+        if declared.contains(relation.child.grant_id.as_str()) {
+            return Err(KernelError::RecoveryUnavailable(
+                "quarantined identity must never enter the fenced closure".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reports whether `from_grant_id` is the closure target or descends from it
+/// through the durable snapshot parent links. Cycle-safe: a repeated
+/// identity ends the walk without reaching the target.
+fn closure_edge_reaches_target(
+    snapshot: &GrantGraphRecoverySnapshot,
+    from_grant_id: &str,
+    target_grant_id: &str,
+) -> bool {
+    let mut cursor = from_grant_id;
+    let mut visited = BTreeSet::new();
+    loop {
+        if cursor == target_grant_id {
+            return true;
+        }
+        if !visited.insert(cursor.to_owned()) {
+            return false;
+        }
+        let Some(grant) = snapshot
+            .grants
+            .iter()
+            .find(|grant| grant.grant_id == cursor)
+        else {
+            return false;
+        };
+        let Some(parent) = grant.parent_grant_id.as_ref() else {
+            return false;
+        };
+        cursor = parent;
+    }
 }
 
 /// Thin-request root hydration handle shared by the production adapter.
@@ -872,6 +993,18 @@ impl RootGrantHydrationSource for GovernorClosureSource {
                             .to_owned(),
                     )
                 })?;
+            // #2100 item N3: fence on the enumeration root or refuse. The
+            // v1 enumeration is single-root, so a member hydration on any
+            // other root refuses instead of fencing off-root authority.
+            // Quarantined identities never reach this loop: the admit-time
+            // cross-root gate consumes their separate-quarantine receipts
+            // and refuses them as members.
+            if member.intent.authority_root_ref != declaration.authority_root_ref {
+                return Err(KernelError::RecoveryUnavailable(
+                    "closure member hydration disagrees with the enumeration root; refusing to fence off-root"
+                        .to_owned(),
+                ));
+            }
             members.push(member);
         }
         Ok(GrantClosureEnumeration {
