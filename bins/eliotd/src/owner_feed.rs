@@ -230,7 +230,9 @@ async fn read_canonical_closure_receipts(
 /// restarts where [`OwnerFeedTrigger::last_published_revision`] cannot. A
 /// readback failure refuses (fail closed): tolerance applies only on a
 /// proven-unbound owner, never on an unknown one.
-async fn owner_first_bind_pending(kernel: &Arc<DaemonKernelClient>) -> Result<bool, CompositionError> {
+async fn owner_first_bind_pending(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<bool, CompositionError> {
     let readback = kernel
         .query_owner_bundle_readback()
         .await
