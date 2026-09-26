@@ -1503,24 +1503,35 @@ impl AgentActivationResultAck {
         (self.ticket_id.as_str(), self.result_sha256.as_str())
     }
 
-    /// Validates that this positive acknowledgement is the exact retained
-    /// result submitted by the caller.
+    /// Validates that this acknowledgement answers the exact submitted result
+    /// identity without promoting an unknown outcome into success.
+    ///
+    /// `Accepted` must echo the full retained payload. `Unknown` proves only
+    /// that the Kernel answered the exact `(ticket, result digest)` query and
+    /// retained no payload; callers must keep that outcome typed and reconcile
+    /// the original operation instead of treating the missing payload as a
+    /// malformed acknowledgement.
     pub fn validate_against_result(
         &self,
         expected: &AgentActivationResolutionResult,
     ) -> Result<(), ProtocolError> {
         self.validate()?;
         expected.validate()?;
-        if self.outcome == AgentActivationResultAckOutcome::Unknown
-            || self.result.as_ref() != Some(expected)
-            || self.replay_key() != (expected.ticket_id.as_str(), expected.result_sha256.as_str())
-        {
+        if self.replay_key() != (expected.ticket_id.as_str(), expected.result_sha256.as_str()) {
             return Err(ProtocolError::InvalidField {
-                field: "agent_activation_result_ack.result",
-                reason: "must echo the exact submitted result identity and payload",
+                field: "agent_activation_result_ack.binding",
+                reason: "must bind the exact submitted ticket and result digest",
             });
         }
-        Ok(())
+        match self.outcome {
+            AgentActivationResultAckOutcome::Accepted
+                if self.result.as_ref() == Some(expected) => Ok(()),
+            AgentActivationResultAckOutcome::Unknown if self.result.is_none() => Ok(()),
+            _ => Err(ProtocolError::InvalidField {
+                field: "agent_activation_result_ack.result",
+                reason: "accepted must echo the exact payload; unknown must carry no payload",
+            }),
+        }
     }
 
     /// Returns canonical bytes covered by `ack_sha256`.
