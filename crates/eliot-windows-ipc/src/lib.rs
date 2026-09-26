@@ -5,6 +5,7 @@
 
 #![cfg(windows)]
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -88,6 +89,255 @@ const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
 static LEGACY_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 const JOB_OBJECT_TERMINATE_ACCESS: u32 = 0x0008;
+
+/// Typed outcome of one asynchronous Windows I/O operation (issue #789,
+/// implementation-requirements paragraph 4).
+///
+/// Every overlapped/async unsafe wrapper in this crate classifies its raw
+/// submission, poll, cancel, and drain results through these states instead
+/// of collapsing them into `bool`/`io::Error` at the FFI boundary. The
+/// kernel's ownership of OS-visible request storage (the boxed `OVERLAPPED`
+/// and oplock buffers) is tracked alongside: storage may be released or
+/// reused only after [`AsyncIoOutcome::terminal_storage_release`] yields a
+/// [`TerminalStorageRelease`], which exists exactly for the terminal states.
+/// A `CancelIoEx` return value, a wait timeout, a disconnect, or a handle
+/// close alone never constructs that proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncIoOutcome {
+    /// Request storage is prepared but no submit call has been issued; the
+    /// kernel has never observed the allocations.
+    Prepared,
+    /// The submit call was rejected before the kernel could take ownership
+    /// (validation failure or a synchronous API error other than
+    /// `ERROR_IO_PENDING`). Terminal: storage was never kernel-visible, so
+    /// local release is safe and rebuilding for a retry needs no reconcile.
+    RejectedBeforeSubmit,
+    /// The raw submit call has been issued but its result is not yet
+    /// classified. Transient: every producer classifies immediately after.
+    Submitted,
+    /// The submit call completed synchronously: no pending kernel request
+    /// exists. Terminal for ownership (nothing is outstanding), though the
+    /// oplock wrapper still rejects it as a missing durable lease.
+    SynchronousComplete,
+    /// The kernel accepted the request and owns the storage until a terminal
+    /// observation. The only legal exits are cancel or observation; release,
+    /// reuse, and blind retry are forbidden from this state.
+    Pending,
+    /// A submit (or cancel-directive submit) was issued but its acceptance
+    /// could not be established, so kernel ownership is unknown. Release,
+    /// reuse, and blind retry are forbidden; only a reconciled,
+    /// idempotence-justified re-issue (the observer-shutdown directive) or
+    /// fail-closed retention may follow.
+    UnknownSubmit,
+    /// Cancellation was requested for a pending operation. `CancelIoEx`'s
+    /// own return value is recorded via
+    /// [`AsyncIoOutcome::note_cancel_io_result`] and proves nothing: the
+    /// state stays here until the drain wait observes the terminal signal.
+    CancelRequested,
+    /// The drain wait observed the terminal event signal after a cancel
+    /// request: the kernel finished with the storage. Terminal: release is
+    /// proven.
+    ObservedCancel,
+    /// A poll observed the request's completion event (the oplock break was
+    /// delivered). Terminal for ownership: the kernel wrote its output and
+    /// will not write again. The guard still closes its handle before any
+    /// release.
+    ObservedComplete,
+    /// Observation was attempted but the outcome stays indeterminate (the
+    /// cancel drain timed out without the terminal signal). Storage is
+    /// retained fail-closed (leaked, never freed or reused) and the
+    /// operation must not be retried without a fresh reconciliation, which
+    /// this state refuses.
+    Unresolved,
+}
+
+impl AsyncIoOutcome {
+    /// Records that the raw submit call was issued. `Prepared` becomes the
+    /// transient `Submitted`; re-issuing from `Submitted` or `UnknownSubmit`
+    /// is the reconciled retry of the idempotent observer-shutdown
+    /// directive. Any other input is an illegal transition and fails closed
+    /// to `Unresolved` instead of inventing a state.
+    #[must_use]
+    pub fn submit_issued(self) -> Self {
+        match self {
+            Self::Prepared | Self::Submitted | Self::UnknownSubmit => Self::Submitted,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Classifies one `DeviceIoControl` oplock submit result. `requested` is
+    /// the raw return; `error_code` is the calling thread's last-error code,
+    /// read only when `requested == 0`. A nonzero return completed
+    /// synchronously, `ERROR_IO_PENDING` means the kernel owns the request,
+    /// and any other code rejected the submit before the kernel took
+    /// ownership. Any input other than `Submitted` fails closed.
+    #[must_use]
+    pub fn classify_oplock_submit(self, requested: i32, error_code: Option<i32>) -> Self {
+        if self != Self::Submitted {
+            return Self::Unresolved;
+        }
+        if requested != 0 {
+            return Self::SynchronousComplete;
+        }
+        let pending = i32::try_from(ERROR_IO_PENDING).ok();
+        if error_code.is_some() && error_code == pending {
+            Self::Pending
+        } else {
+            Self::RejectedBeforeSubmit
+        }
+    }
+
+    /// Classifies one zero-timeout oplock-event poll (`WaitForSingleObject`
+    /// result): signaled means the break was delivered, timeout means the
+    /// request is still pending, and any other wait result is a failed
+    /// observation that leaves ownership untouched and surfaces the raw
+    /// system error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the raw system error when the wait itself failed.
+    pub fn classify_oplock_poll(wait_result: u32) -> io::Result<Self> {
+        match wait_result {
+            WAIT_OBJECT_0 => Ok(Self::ObservedComplete),
+            WAIT_TIMEOUT => Ok(Self::Pending),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Classifies one observer-shutdown `PostQueuedCompletionStatus` result:
+    /// nonzero queued the directive, zero left the submission unknown (the
+    /// port may still accept a reconciled re-post of this idempotent
+    /// directive). Any input other than `Submitted` fails closed.
+    #[must_use]
+    pub fn classify_directive_post(self, queued: i32) -> Self {
+        if self != Self::Submitted {
+            return Self::Unresolved;
+        }
+        if queued != 0 {
+            Self::Submitted
+        } else {
+            Self::UnknownSubmit
+        }
+    }
+
+    /// Requests cancellation of a pending operation. Only `Pending` moves;
+    /// an already-observed completion stays complete (there is nothing to
+    /// cancel), and anything else fails closed to `Unresolved`.
+    #[must_use]
+    pub fn request_cancel(self) -> Self {
+        match self {
+            Self::Pending => Self::CancelRequested,
+            Self::ObservedComplete => Self::ObservedComplete,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Records one `CancelIoEx` return value without changing state: the
+    /// return proves the cancel was requested, never that the kernel
+    /// released the storage, so the outcome stays `CancelRequested` until
+    /// the drain wait observes the terminal signal. Any input other than
+    /// `CancelRequested` fails closed.
+    #[must_use]
+    pub fn note_cancel_io_result(self, _cancel_return: i32) -> Self {
+        match self {
+            Self::CancelRequested => Self::CancelRequested,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Classifies the cancel-drain wait (`WaitForSingleObject` on the
+    /// request event after `CancelIoEx` plus the handle close): signaled
+    /// proves the kernel finished (`ObservedCancel`), timeout leaves the
+    /// request indeterminate (`Unresolved`), and a failed wait loses the
+    /// completion evidence entirely (`UnknownSubmit`). From an already
+    /// observed completion a renewed signal keeps `ObservedComplete`;
+    /// anything else fails closed.
+    #[must_use]
+    pub fn classify_cancel_drain(self, wait_result: u32) -> Self {
+        match self {
+            Self::CancelRequested => match wait_result {
+                WAIT_OBJECT_0 => Self::ObservedCancel,
+                WAIT_TIMEOUT => Self::Unresolved,
+                _ => Self::UnknownSubmit,
+            },
+            Self::ObservedComplete if wait_result == WAIT_OBJECT_0 => Self::ObservedComplete,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// Exact terminal-ownership proof: yields the release token only for
+    /// states where the kernel provably owns nothing (`RejectedBeforeSubmit`
+    /// and `SynchronousComplete`, which never went outstanding, plus
+    /// `ObservedCancel` and `ObservedComplete`). Every other state —
+    /// including `CancelRequested` after any `CancelIoEx` return, a bare
+    /// timeout, or a closed handle — yields `None`, forcing fail-closed
+    /// retention of the request storage.
+    #[must_use]
+    pub fn terminal_storage_release(self) -> Option<TerminalStorageRelease> {
+        match self {
+            Self::RejectedBeforeSubmit
+            | Self::SynchronousComplete
+            | Self::ObservedCancel
+            | Self::ObservedComplete => Some(TerminalStorageRelease::proven()),
+            Self::Prepared
+            | Self::Submitted
+            | Self::Pending
+            | Self::UnknownSubmit
+            | Self::CancelRequested
+            | Self::Unresolved => None,
+        }
+    }
+
+    /// Reconcile gate for retry after possible submission: only states where
+    /// the kernel provably owns nothing may rebuild and retry. `Pending`,
+    /// `Submitted`, and `CancelRequested` refuse as still possibly live;
+    /// `UnknownSubmit` and `Unresolved` refuse as unknown instead of
+    /// permitting a blind retry against a possibly live kernel request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WouldBlock` for a possibly live operation and `InvalidData`
+    /// for an unknown outcome.
+    pub fn reconcile_before_retry(self) -> io::Result<()> {
+        match self {
+            Self::Prepared
+            | Self::RejectedBeforeSubmit
+            | Self::SynchronousComplete
+            | Self::ObservedCancel
+            | Self::ObservedComplete => Ok(()),
+            Self::Submitted | Self::Pending | Self::CancelRequested => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "async operation may still be live; reconcile before retry",
+            )),
+            Self::UnknownSubmit | Self::Unresolved => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "async operation outcome unknown; reconcile before retry",
+            )),
+        }
+    }
+}
+
+/// Proof token: the kernel provably owns no request storage, so the boxed
+/// `OVERLAPPED`/op-lock allocations may be released. No reuse site exists in
+/// this crate (the oplock request is single-shot); any future reuse must
+/// take this token.
+///
+/// Constructible only through [`AsyncIoOutcome::terminal_storage_release`],
+/// which yields it exactly for the terminal states. There is deliberately
+/// no other constructor: a `CancelIoEx` return, a wait timeout, a
+/// disconnect, or a handle close cannot manufacture this token.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalStorageRelease {
+    sealed: std::marker::PhantomData<fn()>,
+}
+
+impl TerminalStorageRelease {
+    fn proven() -> Self {
+        Self {
+            sealed: std::marker::PhantomData,
+        }
+    }
+}
 
 /// Kernel-derived identity of a process observed through a named pipe or Job Object.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -235,6 +485,11 @@ impl PinnedDirectory {
 pub struct DirectoryOplockGuard {
     directory: Option<File>,
     event: OwnedHandle,
+    // Current async-I/O outcome of the single outstanding oplock request
+    // (`Pending` after `acquire`, possibly `ObservedComplete` after a
+    // signaled poll). `Drop` reads it to select the cancel/drain path and
+    // to gate buffer release on the terminal-ownership proof.
+    outcome: Cell<AsyncIoOutcome>,
     // `Option` so `Drop` takes the kernel-visible allocations and, when the
     // cancel drain never signals, intentionally leaks them instead of freeing
     // request storage a late kernel completion may still write.
@@ -249,6 +504,7 @@ pub struct DirectoryOplockGuard {
 // the pending kernel request stays bound to the same allocations. The guard
 // is only moved, never shared (`Sync` is deliberately not implemented), and
 // `Drop` cancels, then frees the boxes only when drained, else leaks them.
+// The outcome cell is plain `Copy` data that moves with the guard.
 unsafe impl Send for DirectoryOplockGuard {}
 
 impl DirectoryOplockGuard {
@@ -308,6 +564,7 @@ impl DirectoryOplockGuard {
         // SAFETY: the file/event are live, all buffers are boxed and remain at
         // stable addresses in the returned guard, and the OVERLAPPED request is
         // canceled and drained before those buffers are dropped.
+        let submitted = AsyncIoOutcome::Prepared.submit_issued();
         let requested = unsafe {
             DeviceIoControl(
                 directory.as_raw_handle().cast(),
@@ -320,22 +577,32 @@ impl DirectoryOplockGuard {
                 overlapped.as_mut(),
             )
         };
-        if requested != 0 {
-            return Err(io::Error::other(
+        // The submit result is classified through the async-outcome model:
+        // synchronous completion, a pending (kernel-owned) request, or a
+        // rejection before the kernel took ownership. The last-error code is
+        // meaningful only when the call returned zero.
+        let submit_error = (requested == 0).then(io::Error::last_os_error);
+        let outcome = submitted.classify_oplock_submit(
+            requested,
+            submit_error.as_ref().and_then(io::Error::raw_os_error),
+        );
+        match outcome {
+            AsyncIoOutcome::Pending => Ok(Self {
+                directory: Some(directory),
+                event,
+                outcome: Cell::new(outcome),
+                overlapped: Some(overlapped),
+                input: Some(input),
+                output: Some(output),
+            }),
+            AsyncIoOutcome::SynchronousComplete => Err(io::Error::other(
                 "directory oplock completed without a durable pending lease",
-            ));
+            )),
+            AsyncIoOutcome::RejectedBeforeSubmit => {
+                Err(submit_error.unwrap_or_else(io::Error::last_os_error))
+            }
+            _ => unreachable!("oplock submit classification is total over the raw result"),
         }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
-            return Err(error);
-        }
-        Ok(Self {
-            directory: Some(directory),
-            event,
-            overlapped: Some(overlapped),
-            input: Some(input),
-            output: Some(output),
-        })
     }
 
     /// Returns true if Windows has requested an oplock break because a
@@ -345,12 +612,27 @@ impl DirectoryOplockGuard {
     ///
     /// Returns an error when Windows cannot query the oplock event.
     pub fn mutation_attempted(&self) -> io::Result<bool> {
-        // SAFETY: event remains live for the complete guard lifetime.
-        match unsafe { WaitForSingleObject(self.event.0, 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error()),
+        // A signaled manual-reset event latches: once observed complete, the
+        // observation stays complete without another wait call.
+        if self.async_outcome() == AsyncIoOutcome::ObservedComplete {
+            return Ok(true);
         }
+        // SAFETY: event remains live for the complete guard lifetime.
+        let observed =
+            AsyncIoOutcome::classify_oplock_poll(unsafe { WaitForSingleObject(self.event.0, 0) })?;
+        if observed == AsyncIoOutcome::ObservedComplete {
+            self.outcome.set(observed);
+        }
+        Ok(observed == AsyncIoOutcome::ObservedComplete)
+    }
+
+    /// Returns the guard's current async-I/O outcome: `Pending` while the
+    /// kernel may still own the request, `ObservedComplete` once a poll has
+    /// seen the break event. `Drop` consumes this to select its cancel/drain
+    /// path; any other state is unreachable on a live guard.
+    #[must_use]
+    pub fn async_outcome(&self) -> AsyncIoOutcome {
+        self.outcome.get()
     }
 }
 
@@ -364,25 +646,40 @@ impl Drop for DirectoryOplockGuard {
         let mut input = self.input.take();
         let mut output = self.output.take();
         if let Some(directory) = self.directory.take() {
-            if let Some(request) = overlapped.as_ref() {
+            // An already-observed completion has nothing to cancel; any other
+            // stored state requests cancellation of the possibly live kernel
+            // request. Illegal stored states fail closed to `Unresolved`
+            // inside `request_cancel`.
+            let canceling = self.async_outcome().request_cancel();
+            self.outcome.set(canceling);
+            if canceling == AsyncIoOutcome::CancelRequested
+                && let Some(request) = overlapped.as_ref()
+            {
                 // SAFETY: the pending request belongs to this exact file handle and
                 // OVERLAPPED allocation. Closing the handle completes cancellation.
-                unsafe {
-                    CancelIoEx(directory.as_raw_handle().cast(), request.as_ref());
-                }
+                let cancel_return =
+                    unsafe { CancelIoEx(directory.as_raw_handle().cast(), request.as_ref()) };
+                // The return value is recorded explicitly as non-proof: the
+                // outcome stays `CancelRequested` until the drain wait below
+                // observes the terminal signal.
+                self.outcome
+                    .set(canceling.note_cancel_io_result(cancel_return));
             }
             drop(directory);
             // SAFETY: the event outlives this body (it is a later struct
             // field, so it drops after `Drop` returns) and the wait only
             // drains the cancellation before the boxed buffers release below.
             let drained = unsafe { WaitForSingleObject(self.event.0, 5_000) };
-            if drained != WAIT_OBJECT_0 {
-                // Fail-closed: without the terminal event signal the kernel
-                // may still complete the canceled request late and write the
-                // OVERLAPPED/output after this guard is gone, so buffer
-                // ownership is unknown and must not be freed. Leaking three
-                // small allocations once per guard is bounded; a kernel
-                // write-after-free is not.
+            let observed = self.async_outcome().classify_cancel_drain(drained);
+            self.outcome.set(observed);
+            // Release is gated on the exact terminal-ownership proof: only a
+            // drained cancel or an observed completion constructs it. The
+            // `CancelIoEx` return, the 5s timeout, and the handle close above
+            // prove nothing alone, so without the proof the allocations leak
+            // fail-closed instead of freeing storage a late kernel
+            // completion may still write. Leaking three small allocations
+            // once per guard is bounded; a kernel write-after-free is not.
+            if observed.terminal_storage_release().is_none() {
                 if let Some(request) = overlapped.take() {
                     Box::leak(request);
                 }
@@ -1119,14 +1416,27 @@ impl JobProcessObserver {
         if self.thread.is_none() {
             return;
         }
-        // SAFETY: the completion port stays live until the observer thread is joined.
-        unsafe {
-            PostQueuedCompletionStatus(
-                self.completion_port.0,
-                0,
-                JOB_OBSERVER_SHUTDOWN_KEY,
-                ptr::null(),
-            );
+        // The shutdown directive is idempotent (the observer breaks on the
+        // first shutdown key and the port is dropped after the join), so a
+        // failed Post — submission unknown — permits a bounded re-post. Any
+        // further unknown outcome stops the loop; the join below still
+        // bounds observer teardown.
+        let mut directive = AsyncIoOutcome::Prepared;
+        for _ in 0..3 {
+            directive = directive.submit_issued();
+            // SAFETY: the completion port stays live until the observer thread is joined.
+            let queued = unsafe {
+                PostQueuedCompletionStatus(
+                    self.completion_port.0,
+                    0,
+                    JOB_OBSERVER_SHUTDOWN_KEY,
+                    ptr::null(),
+                )
+            };
+            directive = directive.classify_directive_post(queued);
+            if directive == AsyncIoOutcome::Submitted {
+                break;
+            }
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -2444,6 +2754,12 @@ pub fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> 
         if !transient || attempt == 40 {
             return Err(error);
         }
+        // A failed synchronous move submits nothing durable: the attempt was
+        // rejected before the kernel took ownership, so this reconcile check
+        // admits the retry. Any outcome where the kernel may still own the
+        // operation (pending, cancel-requested, unknown, unresolved) refuses
+        // instead of permitting a blind retry.
+        AsyncIoOutcome::RejectedBeforeSubmit.reconcile_before_retry()?;
         std::thread::sleep(Duration::from_millis(25));
     }
     unreachable!("bounded atomic replacement loop always returns")
