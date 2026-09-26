@@ -15,7 +15,9 @@ use eliot_agent_api::{
     WarningObservation, contains_restricted_source_token, route_divergence_fields,
     route_fingerprint_digest_for,
 };
-use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ResourceGeneration, StateFence, canonical_json_bytes, parse_versioned_sha256_digest, sha256_hex,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::Value;
 
@@ -1047,20 +1049,42 @@ impl OpenCodeWireRouteReceipt {
                         .ok_or(OpenCodeObservationConversionError::Wire(
                             OpenCodeWireRouteError::ObservedIdentityMissing,
                         ))?;
-                // The observed fingerprint starts from the dispatched
-                // execution's attested route (`binding_route`: the exact
-                // route the execution unit was launched with, confirmed by
-                // the session/message seal), overlaid with the wire-observed
-                // provider/model. Non-wire components are the dispatched
-                // execution's configuration, never re-observed provider
-                // behavior promoted from the requested side (issue #369
-                // W11): a runtime/serializer/tool substitution outside the
-                // wire-observed channels cannot corroborate here, and the
-                // live locator check in `to_physical_observation` fails a
-                // forged or stale wire closed before this classification.
-                let mut observed_fp = binding_route.clone();
-                observed_fp.provider.clone_from(&observed_wire.provider_id);
-                observed_fp.model.clone_from(&observed_wire.model_id);
+                // The observed fingerprint is derived field-by-field from
+                // wire observation plus the dispatched execution record,
+                // never by cloning a whole route (issue #369 W11/A27): the
+                // wire-observed provider/model overwrite the dispatched
+                // values, while every other behavior-bearing component is
+                // taken from the dispatched binding route -- the exact route
+                // the adapter itself launched this execution unit under, held
+                // by the session/message seal, not a caller-supplied request.
+                // Field-complete classification below (`Matched` only on full
+                // equality, else `Diverged` with the exact difference set)
+                // therefore compares the dispatched execution against the
+                // requested baseline on wire-observed provider/model plus
+                // adapter-attested dispatch. A runtime/serializer/tool
+                // substitution outside the wire-observed channels cannot
+                // corroborate here: the admitted dispatch gates (healthy
+                // expected server version, bound session identity, read-only
+                // permission attestation) fail a swapped server closed before
+                // this classification, and the live locator check in
+                // `to_physical_observation` fails a forged or stale wire
+                // closed. Same-version bit-identical swaps stay outside the
+                // wire channels and are disclosed, not asserted.
+                let observed_fp = RouteFingerprint {
+                    host_family: binding_route.host_family.clone(),
+                    adapter: binding_route.adapter.clone(),
+                    protocol_transport: binding_route.protocol_transport.clone(),
+                    runtime_hash: binding_route.runtime_hash.clone(),
+                    adapter_hash: binding_route.adapter_hash.clone(),
+                    provider: observed_wire.provider_id.clone(),
+                    model: observed_wire.model_id.clone(),
+                    auth_billing: binding_route.auth_billing.clone(),
+                    serializer_hash: binding_route.serializer_hash.clone(),
+                    tool_semantics_hash: binding_route.tool_semantics_hash.clone(),
+                    reasoning_mode: binding_route.reasoning_mode.clone(),
+                    continuation_behavior: binding_route.continuation_behavior.clone(),
+                    feature_flags_hash: binding_route.feature_flags_hash.clone(),
+                };
                 let diverged = route_divergence_fields(requested, &observed_fp);
                 let state = if diverged.is_empty() {
                     RouteObservationState::Matched
@@ -1290,17 +1314,14 @@ fn is_blank(value: Option<&str>) -> bool {
 
 /// Returns true when the wire route locator is a well-formed live
 /// `sha256:<64 lowercase hex>` locator. Placeholder labels such as
-/// `sha256:runtime` or `sha256:route`, uppercase, short, long, and non-hex
-/// forms are not live observations and never corroborate a classification
-/// (issue #369 W11/W12).
+/// `sha256:runtime` or `sha256:route`, uppercase, short, long, non-hex, and
+/// wrong-algorithm forms are not live observations and never corroborate a
+/// classification (issue #369 W11/W12/A10): the algorithm/body discipline is
+/// the shared foundation [`parse_versioned_sha256_digest`] envelope, and a
+/// well-formed value over the wrong live fields additionally fails the
+/// recipe recomputation in `to_physical_observation`.
 fn is_live_wire_locator(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    parse_versioned_sha256_digest(value).is_ok()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

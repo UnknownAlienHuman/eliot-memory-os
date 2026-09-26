@@ -307,9 +307,12 @@ enum CommittedPrior {
 }
 
 /// Returns true when a recorded assistant message is a terminal,
-/// error-free completion of the committed unit under the requested model:
-/// no provider error, a completion timestamp, the admitted route, and a
-/// terminal stop attestation.
+/// error-free completion of the committed unit: no provider error, a
+/// completion timestamp with a terminal stop attestation, and a parseable
+/// provider/model identity. Route divergence does not defeat terminality
+/// (issue #369 W12): a terminal completion on a diverged provider/model is
+/// still the unit's terminal observation and seals as typed `DIVERGED`
+/// downstream, never as silent success and never as a refused error.
 fn committed_assistant_terminal(message: &Value, requested: &ModelSelection) -> bool {
     let Some(info) = message.get("info").and_then(Value::as_object) else {
         return false;
@@ -2088,22 +2091,26 @@ fn attest_unchanged_diff(
     })
 }
 
+/// Attests the reconciled assistant message's provider/model identity and
+/// returns exactly what the server ran, never an error for divergence
+/// (issue #369 W12): a provider/model that differs from the requested route
+/// is material divergence evidence, not a protocol violation. The observed
+/// identity flows into the wire receipt and is preserved downstream as typed
+/// `DIVERGED` with both full fingerprints, the deterministic difference set,
+/// and a quarantine recovery handle; only an unparseable identity fails here.
+/// Callers: `committed_assistant_terminal` treats a diverged terminal message
+/// as terminal (it seals with `DIVERGED`, never as silent success);
+/// `observe_message` admits diverged events into correlation without an early
+/// refusal; `inspect_messages` projects the observed identity for the mint.
 fn attest_message_route(
     info: &serde_json::Map<String, Value>,
-    requested: &ModelSelection,
+    _requested: &ModelSelection,
 ) -> Result<ModelSelection, OpenCodeRunError> {
-    let observed = ModelSelection::new(
+    ModelSelection::new(
         required_string(info.get("providerID"), "assistant providerID")?,
         required_string(info.get("modelID"), "assistant modelID")?,
     )
-    .map_err(|error| OpenCodeRunError::Protocol(error.to_string()))?;
-    if &observed != requested {
-        return Err(OpenCodeRunError::Protocol(format!(
-            "actual route {}/{} differs from requested {}/{}",
-            observed.provider_id, observed.model_id, requested.provider_id, requested.model_id
-        )));
-    }
-    Ok(observed)
+    .map_err(|error| OpenCodeRunError::Protocol(error.to_string()))
 }
 
 fn provider_error(error: Option<&Value>, fallback_kind: &str) -> OpenCodeRunError {
