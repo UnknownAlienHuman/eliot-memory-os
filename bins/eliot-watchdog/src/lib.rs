@@ -899,22 +899,23 @@ impl IndependentKernelSensor {
                 return;
             }
         };
-        let outcome =
-            match self
-                .spool
-                .observe_governor_unavailability(proof, digest, lineage, observed_at_ms)
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    tracing::debug!(
-                        event = "watchdog.intent_spool_failed",
-                        observation = "fenced",
-                        detail = error.to_string().as_str(),
-                        "watchdog could not spool an intent; the observation stays an observation"
-                    );
-                    return;
-                }
-            };
+        let outcome = match self.spool.observe_governor_unavailability(
+            proof,
+            digest.as_str(),
+            lineage,
+            observed_at_ms,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.intent_spool_failed",
+                    observation = "fenced",
+                    detail = error.to_string().as_str(),
+                    "watchdog could not spool an intent; the observation stays an observation"
+                );
+                return;
+            }
+        };
         match outcome {
             GovernorIntentOutcome::Counting { consecutive } => {
                 tracing::debug!(

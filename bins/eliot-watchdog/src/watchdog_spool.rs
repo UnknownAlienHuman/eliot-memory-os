@@ -1003,7 +1003,7 @@ impl WatchdogSpool {
     pub(crate) fn observe_governor_unavailability(
         &self,
         proof: intent::GovernorUnavailability,
-        observation_digest: String,
+        observation_digest: &str,
         lineage: intent::IntentLineage,
         observed_at_ms: u64,
     ) -> Result<intent::GovernorIntentOutcome, SpoolError> {
@@ -1014,7 +1014,7 @@ impl WatchdogSpool {
             .begin_write()
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         let mut state = Self::read_intent_rule_state_in(&write)?;
-        let crossing = match state.classify_observation(&observation_digest) {
+        let crossing = match state.classify_observation(observation_digest) {
             intent::GovernorIntentObservationClass::AlreadyCommitted {
                 intent_class,
                 emission,
@@ -1040,52 +1040,16 @@ impl WatchdogSpool {
         };
         let mut emission = None;
         if let Some(intent_class) = crossing {
-            // The threshold evidence of the episode including this crossing
-            // observation: exactly one digest per unit of threshold progress,
-            // and never more than the bounded evidence frame.
-            let mut evidence_refs = state.episode_evidence_refs();
-            evidence_refs.push(observation_digest.clone());
-            if evidence_refs.len() > intent::MAX_INTENT_EVIDENCE_REFS {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent episode threshold evidence exceeds the bounded frame"
-                        .to_owned(),
-                ));
-            }
-            let payload = match intent_class {
-                intent::WatchdogIntentClass::Problem => intent::ProblemIntentRecord::new(
-                    proof,
-                    SERVICE_NAME.to_owned(),
-                    evidence_refs,
-                    lineage,
-                    observed_at_ms,
-                )?
-                .to_payload(),
-                intent::WatchdogIntentClass::Incident => intent::IncidentIntentRecord::new(
-                    proof,
-                    SERVICE_NAME.to_owned(),
-                    evidence_refs,
-                    lineage,
-                    observed_at_ms,
-                )?
-                .to_payload(),
-            };
-            let (_outcome, created) = Self::append_in_transaction(&write, observed_at_ms, payload)?;
-            // The identity of the record this transaction just created, bound the
-            // same way an export batch binds it. A retention-pressure gap record
-            // written ahead of it can never be mistaken for the intent, and an
-            // interleaved append can never substitute another entry's sequence.
-            let raw = encode_entry(&created)?;
-            let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
-            emission = Some((
+            emission = Some(Self::commit_threshold_intent(
+                &write,
+                &state,
                 intent_class,
-                intent::GovernorIntentEmission {
-                    sequence: created.sequence,
-                    record_digest,
-                    observation_digest: observation_digest.clone(),
-                    observed_at_ms,
-                    producer_generation,
-                },
-            ));
+                proof,
+                observation_digest,
+                lineage,
+                observed_at_ms,
+                producer_generation,
+            )?);
         }
         state.record_observation(intent::GovernorIntentObservationRecord {
             observation_digest: observation_digest.clone(),
@@ -1102,7 +1066,7 @@ impl WatchdogSpool {
                 // applied. Reconcile this observation by its own identity before
                 // deciding, so the caller can never be handed a second threshold
                 // record for an observation that already has one.
-                match self.reconcile_committed_emission(&observation_digest) {
+                match self.reconcile_committed_emission(observation_digest) {
                     Some(reconciled) => Some(reconciled),
                     None => return Err(SpoolError::Database(error.to_string())),
                 }
@@ -1124,6 +1088,69 @@ impl WatchdogSpool {
                 consecutive: state.threshold_progress_observations,
             },
         })
+    }
+
+    /// Appends the threshold intent this crossing observation committed, inside
+    /// the caller's already-open transaction, and returns the emission bound to
+    /// the exact record it created.
+    ///
+    /// Nothing here commits: the caller owns the single transaction that carries
+    /// rule advancement, the intent record and its high-water together.
+    fn commit_threshold_intent(
+        write: &redb::WriteTransaction,
+        state: &intent::GovernorIntentRuleState,
+        intent_class: intent::WatchdogIntentClass,
+        proof: intent::GovernorUnavailability,
+        observation_digest: &str,
+        lineage: intent::IntentLineage,
+        observed_at_ms: u64,
+        producer_generation: u64,
+    ) -> Result<(intent::WatchdogIntentClass, intent::GovernorIntentEmission), SpoolError> {
+        // The threshold evidence of the episode including this crossing
+        // observation: exactly one digest per unit of threshold progress,
+        // and never more than the bounded evidence frame.
+        let mut evidence_refs = state.episode_evidence_refs();
+        evidence_refs.push(observation_digest.to_owned());
+        if evidence_refs.len() > intent::MAX_INTENT_EVIDENCE_REFS {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent episode threshold evidence exceeds the bounded frame".to_owned(),
+            ));
+        }
+        let payload = match intent_class {
+            intent::WatchdogIntentClass::Problem => intent::ProblemIntentRecord::new(
+                proof,
+                SERVICE_NAME.to_owned(),
+                evidence_refs,
+                lineage,
+                observed_at_ms,
+            )?
+            .to_payload(),
+            intent::WatchdogIntentClass::Incident => intent::IncidentIntentRecord::new(
+                proof,
+                SERVICE_NAME.to_owned(),
+                evidence_refs,
+                lineage,
+                observed_at_ms,
+            )?
+            .to_payload(),
+        };
+        let (_outcome, created) = Self::append_in_transaction(write, observed_at_ms, payload)?;
+        // The identity of the record this transaction just created, bound the
+        // same way an export batch binds it. A retention-pressure gap record
+        // written ahead of it can never be mistaken for the intent, and an
+        // interleaved append can never substitute another entry's sequence.
+        let raw = encode_entry(&created)?;
+        let (_payload_digest, record_digest) = export_record_digests(&created, &raw);
+        Ok((
+            intent_class,
+            intent::GovernorIntentEmission {
+                sequence: created.sequence,
+                record_digest,
+                observation_digest: observation_digest.to_owned(),
+                observed_at_ms,
+                producer_generation,
+            },
+        ))
     }
 
     /// Projects one already-committed threshold emission onto its outcome.
@@ -1195,11 +1222,10 @@ impl WatchdogSpool {
             .map_err(|error| SpoolError::Database(error.to_string()))?;
         let mut state = Self::read_intent_rule_state_in(&write)?;
         let closed_episode_id = match state.close_episode(presenting_generation, observed_at_ms)? {
-            intent::GovernorEpisodeClosure::AlreadyClosed => {
-                drop(write);
-                return Ok(false);
-            }
-            intent::GovernorEpisodeClosure::Obsolete => {
+            // Nothing changed in either case, so the uncommitted transaction is
+            // dropped and the caller is told no episode was closed by this call.
+            intent::GovernorEpisodeClosure::AlreadyClosed
+            | intent::GovernorEpisodeClosure::Obsolete => {
                 drop(write);
                 return Ok(false);
             }

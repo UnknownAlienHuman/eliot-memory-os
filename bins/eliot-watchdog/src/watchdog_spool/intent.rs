@@ -851,6 +851,22 @@ impl GovernorIntentRuleState {
     /// with its progress; an emission reference is not canonical; or a
     /// current-schema record claims a threshold crossing it cannot name.
     pub(crate) fn validate(&self) -> Result<(), SpoolError> {
+        self.validate_header()?;
+        self.validate_episode_identity()?;
+        self.validate_phase_against_progress()?;
+        if let Some(emission) = self.problem_intent_emission.as_ref() {
+            validate_intent_emission(emission)?;
+        }
+        if let Some(emission) = self.incident_intent_emission.as_ref() {
+            validate_intent_emission(emission)?;
+        }
+        self.validate_current_emission_agreement()
+    }
+
+    /// Checks the shape every record must have regardless of its phase: the
+    /// schema it was written under, the bounded threshold progress, and a
+    /// canonical bounded evidence list.
+    fn validate_header(&self) -> Result<(), SpoolError> {
         if self.schema_version != INTENT_RULE_SCHEMA_VERSION {
             return Err(SpoolError::Corrupt(
                 "watchdog intent rule state schema is unsupported".to_owned(),
@@ -872,6 +888,13 @@ impl GovernorIntentRuleState {
                 "watchdog intent rule threshold evidence is not canonical and bounded".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    /// Checks that a closed episode retains no episode state at all, and that an
+    /// open one carries a stable identity, a coherent observation lineage, and
+    /// exactly one evidence digest per unit of threshold progress.
+    fn validate_episode_identity(&self) -> Result<(), SpoolError> {
         if self.episode_phase.is_closed() {
             if self.episode_id.is_some()
                 || self.episode_opened_by_generation.is_some()
@@ -886,60 +909,64 @@ impl GovernorIntentRuleState {
                         .to_owned(),
                 ));
             }
-        } else {
-            let Some(episode_id) = self.episode_id.as_deref() else {
+            return Ok(());
+        }
+        let Some(episode_id) = self.episode_id.as_deref() else {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule open episode carries no stable identity".to_owned(),
+            ));
+        };
+        if !is_sha256_hex_shape(episode_id) {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule episode identity is not a 64-character hex digest".to_owned(),
+            ));
+        }
+        match (
+            self.episode_opened_by_generation,
+            self.episode_producer_generation,
+        ) {
+            (None, None) => {
+                if self.legacy_history == GovernorIntentLegacyHistory::Current {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog intent rule open episode carries no observation lineage"
+                            .to_owned(),
+                    ));
+                }
+            }
+            (Some(opened), Some(producer)) => {
+                if producer < opened {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog intent rule open episode producer precedes its opener".to_owned(),
+                    ));
+                }
+            }
+            (Some(_), None) => {
                 return Err(SpoolError::Corrupt(
-                    "watchdog intent rule open episode carries no stable identity".to_owned(),
-                ));
-            };
-            if !is_sha256_hex_shape(episode_id) {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule episode identity is not a 64-character hex digest"
+                    "watchdog intent rule open episode records only part of its observation lineage"
                         .to_owned(),
                 ));
             }
-            match (
-                self.episode_opened_by_generation,
-                self.episode_producer_generation,
-            ) {
-                (None, None) => {
-                    if self.legacy_history == GovernorIntentLegacyHistory::Current {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule open episode carries no observation lineage"
-                                .to_owned(),
-                        ));
-                    }
-                }
-                (Some(opened), Some(producer)) => {
-                    if producer < opened {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule open episode producer precedes its opener"
-                                .to_owned(),
-                        ));
-                    }
-                }
-                (Some(_), None) => {
+            (None, Some(_)) => {
+                if self.legacy_history == GovernorIntentLegacyHistory::Current {
                     return Err(SpoolError::Corrupt(
                         "watchdog intent rule open episode records only part of its observation lineage"
                             .to_owned(),
                     ));
                 }
-                (None, Some(_)) => {
-                    if self.legacy_history == GovernorIntentLegacyHistory::Current {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule open episode records only part of its observation lineage"
-                                .to_owned(),
-                        ));
-                    }
-                }
-            }
-            if self.threshold_evidence.len() != self.threshold_progress_observations as usize {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule threshold evidence is not one digest per unit of threshold progress"
-                        .to_owned(),
-                ));
             }
         }
+        if self.threshold_evidence.len() != self.threshold_progress_observations as usize {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule threshold evidence is not one digest per unit of threshold progress"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks that the recorded phase is the one the threshold progress implies,
+    /// so a phase can never claim a threshold the progress does not reach.
+    fn validate_phase_against_progress(&self) -> Result<(), SpoolError> {
         match self.episode_phase {
             GovernorIntentEpisodePhase::Closed | GovernorIntentEpisodePhase::Counting => {
                 if self.threshold_progress_observations >= PROBLEM_INTENT_OBSERVATION_THRESHOLD {
@@ -968,38 +995,39 @@ impl GovernorIntentRuleState {
                 }
             }
         }
-        if let Some(emission) = self.problem_intent_emission.as_ref() {
-            validate_intent_emission(emission)?;
+        Ok(())
+    }
+
+    /// Checks that a current-schema record's emission references agree with the
+    /// phase it reached. Only an explicitly migrated record may name a threshold
+    /// whose record it cannot.
+    fn validate_current_emission_agreement(&self) -> Result<(), SpoolError> {
+        if self.legacy_history != GovernorIntentLegacyHistory::Current {
+            return Ok(());
         }
-        if let Some(emission) = self.incident_intent_emission.as_ref() {
-            validate_intent_emission(emission)?;
+        // A current-schema record always knows the exact record it
+        // committed for a threshold it reached, so its emission references
+        // and its phase must agree. Only an explicitly migrated record may
+        // name a threshold whose record it cannot.
+        let problem_expected = matches!(
+            self.episode_phase,
+            GovernorIntentEpisodePhase::ProblemEmitted
+                | GovernorIntentEpisodePhase::IncidentEmitted
+        );
+        if problem_expected != self.problem_intent_emission.is_some() {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule problem emission does not match its episode phase".to_owned(),
+            ));
         }
-        if self.legacy_history == GovernorIntentLegacyHistory::Current {
-            // A current-schema record always knows the exact record it
-            // committed for a threshold it reached, so its emission references
-            // and its phase must agree. Only an explicitly migrated record may
-            // name a threshold whose record it cannot.
-            let problem_expected = matches!(
-                self.episode_phase,
-                GovernorIntentEpisodePhase::ProblemEmitted
-                    | GovernorIntentEpisodePhase::IncidentEmitted
-            );
-            if problem_expected != self.problem_intent_emission.is_some() {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule problem emission does not match its episode phase"
-                        .to_owned(),
-                ));
-            }
-            let incident_expected = matches!(
-                self.episode_phase,
-                GovernorIntentEpisodePhase::IncidentEmitted
-            );
-            if incident_expected != self.incident_intent_emission.is_some() {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule incident emission does not match its episode phase"
-                        .to_owned(),
-                ));
-            }
+        let incident_expected = matches!(
+            self.episode_phase,
+            GovernorIntentEpisodePhase::IncidentEmitted
+        );
+        if incident_expected != self.incident_intent_emission.is_some() {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule incident emission does not match its episode phase"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -1133,37 +1161,7 @@ impl GovernorIntentRuleState {
         if let Some((_, committed)) = emission.as_ref() {
             validate_intent_emission(committed)?;
         }
-        if self.episode_phase.is_closed() {
-            self.episode_id = Some(observation_digest.clone());
-            self.episode_opened_by_generation = Some(producer_generation);
-            self.episode_producer_generation = Some(producer_generation);
-            self.episode_phase = GovernorIntentEpisodePhase::Counting;
-        } else {
-            // Continue the same open episode, never restarting it.
-            if let Some(producer) = self.episode_producer_generation
-                && producer_generation < producer
-            {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule observation was produced by an obsolete Watchdog generation"
-                        .to_owned(),
-                ));
-            }
-            if let Some(opened) = self.episode_opened_by_generation
-                && producer_generation < opened
-            {
-                return Err(SpoolError::Corrupt(
-                    "watchdog intent rule observation was produced by an obsolete Watchdog generation"
-                        .to_owned(),
-                ));
-            }
-            // Record the observing generation as this episode's current producer.
-            // A generation above the opening one is a replacement producer
-            // recorded honestly beside the preserved opening lineage, and a
-            // migrated episode whose opening generation was never recorded
-            // adopts this generation while that unknown lineage stays unknown
-            // rather than being invented.
-            self.episode_producer_generation = Some(producer_generation);
-        }
+        self.open_or_continue_episode(&observation_digest, producer_generation)?;
         let saturated =
             self.threshold_progress_observations >= INCIDENT_INTENT_OBSERVATION_THRESHOLD;
         if !saturated {
@@ -1172,50 +1170,99 @@ impl GovernorIntentRuleState {
             self.threshold_evidence.push(observation_digest);
         }
         if let Some((intent_class, committed)) = emission {
-            match intent_class {
-                WatchdogIntentClass::Problem => {
-                    if self.problem_intent_emission.is_some() {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule episode already committed its problem intent"
-                                .to_owned(),
-                        ));
-                    }
-                    if self.threshold_progress_observations != PROBLEM_INTENT_OBSERVATION_THRESHOLD
-                    {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule problem emission does not sit on the configured problem threshold"
-                                .to_owned(),
-                        ));
-                    }
-                    self.problem_intent_emission = Some(committed);
-                    self.problem_intents_spooled = self.problem_intents_spooled.saturating_add(1);
-                    self.episode_phase = GovernorIntentEpisodePhase::ProblemEmitted;
-                }
-                WatchdogIntentClass::Incident => {
-                    if self.incident_intent_emission.is_some() {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule episode already committed its incident intent"
-                                .to_owned(),
-                        ));
-                    }
-                    if self.threshold_progress_observations != INCIDENT_INTENT_OBSERVATION_THRESHOLD
-                    {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog intent rule incident emission does not sit on the configured incident threshold"
-                                .to_owned(),
-                        ));
-                    }
-                    self.incident_intent_emission = Some(committed);
-                    self.incident_intents_spooled = self.incident_intents_spooled.saturating_add(1);
-                    self.episode_phase = GovernorIntentEpisodePhase::IncidentEmitted;
-                }
-            }
+            self.apply_threshold_emission(intent_class, committed)?;
         }
         self.last_observed_at_ms = observed_at_ms;
         self.last_reason = reason;
         self.revision = self.revision.saturating_add(1);
         self.validate()?;
         Ok(self.threshold_progress_observations)
+    }
+
+    /// Opens a new episode, or continues the open one without ever restarting it.
+    fn open_or_continue_episode(
+        &mut self,
+        observation_digest: &str,
+        producer_generation: u64,
+    ) -> Result<(), SpoolError> {
+        if self.episode_phase.is_closed() {
+            self.episode_id = Some(observation_digest.to_owned());
+            self.episode_opened_by_generation = Some(producer_generation);
+            self.episode_producer_generation = Some(producer_generation);
+            self.episode_phase = GovernorIntentEpisodePhase::Counting;
+            return Ok(());
+        }
+        if let Some(producer) = self.episode_producer_generation
+            && producer_generation < producer
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule observation was produced by an obsolete Watchdog generation"
+                    .to_owned(),
+            ));
+        }
+        if let Some(opened) = self.episode_opened_by_generation
+            && producer_generation < opened
+        {
+            return Err(SpoolError::Corrupt(
+                "watchdog intent rule observation was produced by an obsolete Watchdog generation"
+                    .to_owned(),
+            ));
+        }
+        // Record the observing generation as this episode's current producer.
+        // A generation above the opening one is a replacement producer
+        // recorded honestly beside the preserved opening lineage, and a
+        // migrated episode whose opening generation was never recorded
+        // adopts this generation while that unknown lineage stays unknown
+        // rather than being invented.
+        self.episode_producer_generation = Some(producer_generation);
+        Ok(())
+    }
+
+    /// Applies the one threshold emission this observation committed, refusing a
+    /// second emission of a threshold the episode already committed and refusing
+    /// an emission that does not sit exactly on the threshold it claims.
+    fn apply_threshold_emission(
+        &mut self,
+        intent_class: WatchdogIntentClass,
+        committed: GovernorIntentEmission,
+    ) -> Result<(), SpoolError> {
+        match intent_class {
+            WatchdogIntentClass::Problem => {
+                if self.problem_intent_emission.is_some() {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog intent rule episode already committed its problem intent"
+                            .to_owned(),
+                    ));
+                }
+                if self.threshold_progress_observations != PROBLEM_INTENT_OBSERVATION_THRESHOLD {
+                    return Err(SpoolError::Corrupt(
+                            "watchdog intent rule problem emission does not sit on the configured problem threshold"
+                                .to_owned(),
+                    ));
+                }
+                self.problem_intent_emission = Some(committed);
+                self.problem_intents_spooled = self.problem_intents_spooled.saturating_add(1);
+                self.episode_phase = GovernorIntentEpisodePhase::ProblemEmitted;
+            }
+            WatchdogIntentClass::Incident => {
+                if self.incident_intent_emission.is_some() {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog intent rule episode already committed its incident intent"
+                            .to_owned(),
+                    ));
+                }
+                if self.threshold_progress_observations != INCIDENT_INTENT_OBSERVATION_THRESHOLD {
+                    return Err(SpoolError::Corrupt(
+                            "watchdog intent rule incident emission does not sit on the configured incident threshold"
+                                .to_owned(),
+                    ));
+                }
+                self.incident_intent_emission = Some(committed);
+                self.incident_intents_spooled = self.incident_intents_spooled.saturating_add(1);
+                self.episode_phase = GovernorIntentEpisodePhase::IncidentEmitted;
+            }
+        }
+        Ok(())
     }
 
     /// Closes an open episode after a live Governor admission.
