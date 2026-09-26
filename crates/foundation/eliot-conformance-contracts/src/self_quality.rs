@@ -683,6 +683,10 @@ pub enum SelfQualityContractError {
         maximum: usize,
         actual: usize,
     },
+    #[error(
+        "{field} is outside the representable count range on this target; rejected value {actual}"
+    )]
+    UnrepresentableCount { field: &'static str, actual: u64 },
     #[error("duplicate value in {field}: {value}")]
     DuplicateValue { field: &'static str, value: String },
     #[error("{field} is not in canonical order")]
@@ -963,35 +967,22 @@ pub fn validate_prior_record(
 
 /// Validates finite policy bounds.
 pub fn validate_limits(limits: &QualityLimits) -> Result<(), SelfQualityContractError> {
-    if limits.max_observations == 0
-        || usize::try_from(limits.max_observations).unwrap_or(usize::MAX)
-            > MAX_SELF_QUALITY_OBSERVATIONS
-    {
-        return Err(SelfQualityContractError::CollectionTooLarge {
-            field: "policy.limits.max_observations",
-            maximum: MAX_SELF_QUALITY_OBSERVATIONS,
-            actual: limits.max_observations as usize,
-        });
-    }
-    if limits.max_history == 0
-        || usize::try_from(limits.max_history).unwrap_or(usize::MAX) > MAX_SELF_QUALITY_HISTORY
-    {
-        return Err(SelfQualityContractError::CollectionTooLarge {
-            field: "policy.limits.max_history",
-            maximum: MAX_SELF_QUALITY_HISTORY,
-            actual: limits.max_history as usize,
-        });
-    }
-    if limits.max_handoffs == 0
-        || usize::try_from(limits.max_handoffs).unwrap_or(usize::MAX) > MAX_SELF_QUALITY_HANDOFFS
-    {
-        return Err(SelfQualityContractError::CollectionTooLarge {
-            field: "policy.limits.max_handoffs",
-            maximum: MAX_SELF_QUALITY_HANDOFFS,
-            actual: limits.max_handoffs as usize,
-        });
-    }
     for (field, value, maximum) in [
+        (
+            "policy.limits.max_observations",
+            u64::from(limits.max_observations),
+            MAX_SELF_QUALITY_OBSERVATIONS as u64,
+        ),
+        (
+            "policy.limits.max_history",
+            u64::from(limits.max_history),
+            MAX_SELF_QUALITY_HISTORY as u64,
+        ),
+        (
+            "policy.limits.max_handoffs",
+            u64::from(limits.max_handoffs),
+            MAX_SELF_QUALITY_HANDOFFS as u64,
+        ),
         ("policy.limits.max_bytes", limits.max_bytes, 1_u64 << 40),
         (
             "policy.limits.max_work_units",
@@ -1003,32 +994,40 @@ pub fn validate_limits(limits: &QualityLimits) -> Result<(), SelfQualityContract
             limits.max_time_ms,
             31_536_000_000,
         ),
-    ] {
-        if value == 0 || value > maximum {
-            return Err(SelfQualityContractError::CollectionTooLarge {
-                field,
-                maximum: maximum as usize,
-                actual: value as usize,
-            });
-        }
-    }
-    for (field, value, maximum) in [
-        ("policy.limits.max_depth", limits.max_depth, 128_u32),
+        ("policy.limits.max_depth", u64::from(limits.max_depth), 128),
         (
             "policy.limits.max_output_refs",
-            limits.max_output_refs,
-            1_024_u32,
+            u64::from(limits.max_output_refs),
+            1_024,
         ),
     ] {
         if value == 0 || value > maximum {
-            return Err(SelfQualityContractError::CollectionTooLarge {
-                field,
-                maximum: maximum as usize,
-                actual: value as usize,
-            });
+            return Err(diagnostic_count_bound(field, value, maximum));
         }
     }
     Ok(())
+}
+
+/// Builds the rejection diagnostic for one out-of-domain policy bound. Numeric
+/// admission already happened in `u64`; only the rejection path converts, and an
+/// unrepresentable value on a narrower target keeps its exact `u64` magnitude
+/// instead of wrapping, clamping, or being relabelled as a collection count.
+fn diagnostic_count_bound(
+    field: &'static str,
+    value: u64,
+    maximum: u64,
+) -> SelfQualityContractError {
+    match (usize::try_from(maximum), usize::try_from(value)) {
+        (Ok(maximum), Ok(actual)) => SelfQualityContractError::CollectionTooLarge {
+            field,
+            maximum,
+            actual,
+        },
+        _ => SelfQualityContractError::UnrepresentableCount {
+            field,
+            actual: value,
+        },
+    }
 }
 
 /// Validates one explicit policy with its finite bounds.
@@ -1966,7 +1965,11 @@ fn push_field(encoded: &mut String, value: &str) {
 
 fn push_sorted_refs(encoded: &mut String, values: &[String]) {
     let mut sorted: Vec<&str> = values.iter().map(String::as_str).collect();
-    sorted.sort();
+    // Only the primitive reference list is sorted. Equal references are
+    // indistinguishable in the emitted encoding, so an unstable sort keeps the
+    // same lexical order, the same repeated values, and the same U+001F
+    // separator bytes that feed the digest.
+    sorted.sort_unstable();
     for value in sorted {
         push_field(encoded, value);
     }

@@ -525,10 +525,10 @@ fn canonicalize_text_set(
         validate_text(field, value)?;
     }
     values.sort();
-    if let Some(pair) = values.windows(2).find(|pair| pair[0] == pair[1]) {
+    if let Some([duplicate, _]) = values.windows(2).find(|pair| pair[0] == pair[1]) {
         return Err(ConformanceContractError::DuplicateValue {
             field,
-            value: pair[0].clone(),
+            value: duplicate.clone(),
         });
     }
     Ok(())
@@ -562,10 +562,10 @@ fn canonicalize_domain_set(
 ) -> Result<(), ConformanceContractError> {
     validate_collection_bound(field, values.len(), EvidenceDomain::ALL.len())?;
     values.sort();
-    if let Some(pair) = values.windows(2).find(|pair| pair[0] == pair[1]) {
+    if let Some([duplicate, _]) = values.windows(2).find(|pair| pair[0] == pair[1]) {
         return Err(ConformanceContractError::DuplicateValue {
             field,
-            value: format!("{:?}", pair[0]),
+            value: format!("{duplicate:?}"),
         });
     }
     Ok(())
