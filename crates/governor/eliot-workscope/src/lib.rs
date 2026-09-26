@@ -75,7 +75,8 @@ pub use transition::{
     CandidateRecordStanding, ScopeTransition, ScopeTransitionKind, ScopeTransitionReceipt,
     ScopeTransitionStep, StagedCandidateRecord, TRANSITION_STEP_COUNT, TransitionFailure,
     TransitionObservation, TransitionStepEvidence, TransitionStepOutcome, attach_post_commit_guard,
-    execute_transition, observe_transition, propose_transition, resume_transition,
+    endorse_and_observe, execute_transition, observe_transition, propose_transition,
+    resume_transition,
 };
 
 /// Returns whether a retained binding describes a resource descriptor.
