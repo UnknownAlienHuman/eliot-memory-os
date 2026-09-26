@@ -62,6 +62,5 @@ pub use task_controller::{
 mod finish_attempt;
 pub use finish_attempt::{
     FINISH_ATTEMPT_WIRE_ID, FINISH_ATTEMPT_WIRE_VERSION, FINISH_INVOKE_PAYLOAD_SCHEMA_ID,
-    FINISH_RESULT_BODY_WIRE_ID, FINISH_RESULT_BODY_WIRE_VERSION, FinishAttempt,
-    FinishResultBody,
+    FINISH_RESULT_BODY_WIRE_ID, FINISH_RESULT_BODY_WIRE_VERSION, FinishAttempt, FinishResultBody,
 };

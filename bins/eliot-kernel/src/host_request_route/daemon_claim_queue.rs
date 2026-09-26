@@ -21,8 +21,8 @@
 
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
-    FinishAttempt, FinishResultBody, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, TaskControllerAttempt,
+    FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
+    HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_store_api::ScopeId;
@@ -506,14 +506,8 @@ impl KernelComposition {
     pub(crate) fn claim_finish_pair(
         &self,
         session: &Session,
-    ) -> Result<
-        Option<(
-            HostRequestEnvelope,
-            serde_json::Value,
-            FinishAttempt,
-        )>,
-        TransportError,
-    > {
+    ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, FinishAttempt)>, TransportError>
+    {
         let _transition = self.agent_bridge_transition_read()?;
         let _admission_owner = self
             .agent_activation_pending
@@ -789,11 +783,7 @@ impl KernelComposition {
         Ok((envelope, state))
     }
 
-    fn retire_finish_pair_under_transition(
-        &self,
-        operation_id: &str,
-        request_digest: &str,
-    ) {
+    fn retire_finish_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
         let Ok(mut index) = self.host_request_connection_index.lock() else {
             return;
         };
@@ -941,9 +931,7 @@ fn finish_ref_list(value: Option<&serde_json::Value>) -> Result<(), TransportErr
     let Some(items) = value else {
         return Ok(());
     };
-    let items = items
-        .as_array()
-        .ok_or(TransportError::SessionFenced)?;
+    let items = items.as_array().ok_or(TransportError::SessionFenced)?;
     if items.len() > MAX_FINISH_REF_COUNT {
         return Err(TransportError::SessionFenced);
     }
@@ -979,8 +967,7 @@ fn finish_admission(
     let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
     if object.get("name").and_then(serde_json::Value::as_str) != Some("eliot.finish")
         || envelope.identity.capability != "eliot.finish"
-        || envelope.identity.payload_schema_id
-            != eliot_protocol::FINISH_INVOKE_PAYLOAD_SCHEMA_ID
+        || envelope.identity.payload_schema_id != eliot_protocol::FINISH_INVOKE_PAYLOAD_SCHEMA_ID
     {
         return Err(TransportError::SessionFenced);
     }
@@ -1030,9 +1017,7 @@ fn finish_admission(
     finish_ref_list(arguments.get("artifact_refs"))?;
     finish_ref_list(arguments.get("observation_refs"))?;
     finish_ref_list(arguments.get("verifier_run_refs"))?;
-    finish_ref_list(
-        arguments.get("remaining_unknowns_declared_by_caller"),
-    )?;
+    finish_ref_list(arguments.get("remaining_unknowns_declared_by_caller"))?;
     let rationale = arguments
         .get("rationale_candidate")
         .and_then(serde_json::Value::as_str)

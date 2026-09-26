@@ -145,27 +145,21 @@ impl FinishResultBody {
             });
         }
         validate_operation_id(&self.operation_id, "finish_result_body.operation_id")?;
-        lowercase_sha256(
-            &self.request_sha256,
-            "finish_result_body.request_sha256",
-        )?;
-        let operation_digest = self
-            .operation_id
-            .strip_prefix("hostreq:")
-            .ok_or(ProtocolError::InvalidField {
-                field: "finish_result_body.operation_id",
-                reason: "must be the deterministic handle for its request digest",
-            })?;
+        lowercase_sha256(&self.request_sha256, "finish_result_body.request_sha256")?;
+        let operation_digest =
+            self.operation_id
+                .strip_prefix("hostreq:")
+                .ok_or(ProtocolError::InvalidField {
+                    field: "finish_result_body.operation_id",
+                    reason: "must be the deterministic handle for its request digest",
+                })?;
         if operation_digest != self.request_sha256 {
             return Err(ProtocolError::InvalidField {
                 field: "finish_result_body.request_sha256",
                 reason: "request digest does not match the operation handle",
             });
         }
-        lowercase_sha256(
-            &self.result_digest,
-            "finish_result_body.result_digest",
-        )?;
+        lowercase_sha256(&self.result_digest, "finish_result_body.result_digest")?;
         if !self.response.is_object() {
             return Err(ProtocolError::InvalidField {
                 field: "finish_result_body.response",
