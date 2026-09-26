@@ -57,6 +57,7 @@ use super::{
     ProtocolPayload, Session, TransportError, activation_deadline_expired, sha256_json,
     status_frame, unix_ms,
 };
+use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -2269,7 +2270,7 @@ impl KernelComposition {
             }
             AGENT_BRIDGE_EVENT_GAP_OPERATION => {
                 let gap = bridge_gap_from_payload(&payload, &session.connection_id)?;
-                self.admit_bridge_event_gap(&gap)?
+                self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence)?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
                 let scope = bridge_reconcile_scope_from_payload(&payload)?;
@@ -2330,6 +2331,12 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // Owner evidence for the append right comes from the retained
+        // Session and the presenting fence only (issue #2729, item 2): a
+        // new transport authentication recovers old streams through
+        // reconcile, but a fresh event still requires the live producer
+        // generation above — never a relabeled old one. Best-effort
+        // telemetry carries no durability claim and needs no owner bind.
         let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
             .map_err(|_| TransportError::SessionFenced)?;
         let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
@@ -2354,7 +2361,15 @@ impl KernelComposition {
                 if degraded {
                     return Err(TransportError::Backpressure);
                 }
-                self.stage_bridge_event_durable(session, event, &envelope_sha, &privacy, expired)
+                let evidence = bridge_owner_evidence(session, frame_fence)?;
+                self.stage_bridge_event_durable(
+                    session,
+                    event,
+                    &evidence,
+                    &envelope_sha,
+                    &privacy,
+                    expired,
+                )
             }
             DeliveryClass::BestEffortTelemetry => {
                 if degraded {
@@ -2388,6 +2403,7 @@ impl KernelComposition {
         &self,
         session: &Session,
         event: &EventEnvelope,
+        evidence: &BridgeOwnerEvidence,
         envelope_sha: &str,
         privacy: &serde_json::Value,
         expired: bool,
@@ -2418,17 +2434,26 @@ impl KernelComposition {
             "privacy_disposition": privacy_disposition,
             "redacted_classes": redacted_classes,
             "redaction_reason": redaction_reason,
+            "owner_principal": evidence.principal,
+            "owner_authority_lineage": evidence.authority_lineage,
+            "owner_connection": evidence.connection,
+            "owner_launch_nonce": evidence.launch_nonce,
+            "owner_session_epoch": evidence.session_epoch,
         });
-        let outcome = self.generation_gateway.ors.stage_bridge_event(&staged);
+        let outcome = self
+            .generation_gateway
+            .ors
+            .stage_bridge_event_checked(&staged);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(OrsError::DuplicateConflict) => {
                 // Changed bytes under a known identity are a
                 // determined rejection, not an unknown outcome: answer
-                // the conflict with its existing cursor facts so the
-                // bridge surfaces the typed conflict instead of
-                // guessing. The durable row is untouched.
-                return self.bridge_event_conflict_response(event, envelope_sha);
+                // the conflict with the proven owner's cursor facts, or
+                // with an indistinguishable unknown shape for a foreign
+                // presenter, so the durable row is untouched and no
+                // foreign digest or cursor leaks.
+                return self.bridge_event_conflict_response(event, evidence, envelope_sha);
             }
             Err(error) => {
                 return Err(match error {
@@ -2461,7 +2486,10 @@ impl KernelComposition {
         // a second record; a handoff failure fails closed here while
         // the durable row stays staged for reconcile recovery.
         let handoff = serde_json::json!({
-            "stream_id": event.stream_id,
+            "owner_namespace": outcome
+                .get("owner_namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?,
             "event_id": event.event_id,
             "sequence": event.sequence,
             "envelope_sha256": envelope_sha,
@@ -2469,7 +2497,7 @@ impl KernelComposition {
         });
         self.generation_gateway
             .ors
-            .record_bridge_event_handoff(&handoff)
+            .record_bridge_event_handoff_checked(&handoff)
             .map_err(|error| match error {
                 OrsError::DuplicateConflict => TransportError::IdentityConflict,
                 _ => TransportError::SessionFenced,
@@ -2477,22 +2505,33 @@ impl KernelComposition {
         Ok(bridge_event_forward_response(&outcome, true))
     }
 
-    /// Answers a same-identity content conflict with the existing cursor
-    /// facts and the `REJECTED`/`conflict` phase pair.
+    /// Answers a same-identity content conflict with the proven owner's
+    /// cursor facts and the `REJECTED`/`conflict` phase pair (issue #2729,
+    /// item 4).
     ///
-    /// The durable row is untouched; the reply binds the presented digest so
-    /// the bridge can prove the alteration. The bridge maps this determined
-    /// rejection to its typed conflict outcome — never to a guessed phase
-    /// and never to a second record.
+    /// The durable row is untouched; the reply binds the presented digest
+    /// so the bridge can prove the alteration. The bridge maps this
+    /// determined rejection to its typed conflict outcome — never to a
+    /// guessed phase and never to a second record. A foreign or unknown
+    /// presenter receives the identical shape with empty facts, so a
+    /// rejected caller learns no other stream's digest or cursors.
     fn bridge_event_conflict_response(
         &self,
         event: &EventEnvelope,
+        evidence: &BridgeOwnerEvidence,
         presented_sha: &str,
     ) -> Result<serde_json::Value, TransportError> {
+        let query = serde_json::json!({
+            "owner_authority_lineage": evidence.authority_lineage,
+            "owner_principal": evidence.principal,
+            "producer_id": event.producer_id,
+            "stream_id": event.stream_id,
+            "event_id": event.event_id,
+        });
         let existing = self
             .generation_gateway
             .ors
-            .load_bridge_event(&event.stream_id, &event.event_id)
+            .load_bridge_event_conflict_view(&query)
             .map_err(|_| TransportError::SessionFenced)?;
         let (existing_sha, durable, acked) = existing
             .as_ref()
@@ -2555,11 +2594,17 @@ impl KernelComposition {
     }
 
     /// Admits one forwarded coverage gap into durable coverage without moving
-    /// any cursor. Gap rows stay visible through reconcile; absent events are
-    /// accounted for, never converted into applied events.
+    /// any cursor (issue #2729, items 4-5). Gap rows stay visible through
+    /// owner-scoped reconcile; absent events are accounted for, never
+    /// converted into applied events. The gap is namespaced through the
+    /// presenter's admitted owner evidence: scoped gaps ride their
+    /// stream's retained owner, unscoped gaps bind the reporter's own
+    /// occurrence.
     fn admit_bridge_event_gap(
         &self,
+        session: &Session,
         gap: &serde_json::Value,
+        frame_fence: &eliot_contracts::StateFence,
     ) -> Result<serde_json::Value, TransportError> {
         if !matches!(
             self.service_state()
@@ -2568,10 +2613,33 @@ impl KernelComposition {
         ) {
             return Err(TransportError::SessionFenced);
         }
+        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        let mut gap = gap.clone();
+        let object = gap.as_object_mut().ok_or(TransportError::SessionFenced)?;
+        object.insert(
+            "owner_principal".to_owned(),
+            serde_json::Value::String(evidence.principal),
+        );
+        object.insert(
+            "owner_authority_lineage".to_owned(),
+            serde_json::Value::String(evidence.authority_lineage),
+        );
+        object.insert(
+            "owner_connection".to_owned(),
+            serde_json::Value::String(evidence.connection),
+        );
+        object.insert(
+            "owner_launch_nonce".to_owned(),
+            serde_json::Value::String(evidence.launch_nonce),
+        );
+        object.insert(
+            "owner_session_epoch".to_owned(),
+            serde_json::Value::from(evidence.session_epoch),
+        );
         let outcome = self
             .generation_gateway
             .ors
-            .record_bridge_event_gap(gap)
+            .record_bridge_event_gap_checked(&gap)
             .map_err(|error| match error {
                 OrsError::DuplicateConflict => TransportError::IdentityConflict,
                 OrsError::ProjectionLimitExceeded => TransportError::Backpressure,
@@ -2588,22 +2656,35 @@ impl KernelComposition {
     }
 
     /// Answers event-ownership/cursor reconciliation from the bridge-event
-    /// tables only — never from the host-request ledger.
+    /// tables only — never from the host-request ledger (issue #2729).
     ///
-    /// Applies the presented consumed frontier first (monotonic acks at or
-    /// below the durable cursor; anything past it fails the whole scope),
-    /// then enumerates the in-scope streams with their cursors, pending first
-    /// pages, and gaps, binds the reply digest as the reconciliation key
-    /// the bridge carries as its receipt reference, and finally reconciles
-    /// the Governor-intake handoffs covered by the consumed frontier under
-    /// that key (I5(i)). Handoff reconcile is idempotent, so a lost
-    /// reconciliation answer replays to the existing handoff states.
+    /// The whole scope resolves before anything mutates: every consumed
+    /// entry is bound to its admitted owner namespace first, then the
+    /// accepted batch commits in one ORS write transaction with
+    /// expected-owner/revision checks, so a mixed own/foreign batch leaves
+    /// all cursors and payloads unchanged. The Kernel's existing
+    /// transition serialization is held across resolution and commit, so
+    /// revocation between lookup and commit cannot be ignored. The reply
+    /// enumerates exactly the presenter's proven scope plus an explicit
+    /// unproven-scope flag — never an empty successful inventory, never a
+    /// foreign digest, cursor, or gap content. The reply digest binds the
+    /// reconciliation key that later reconciles the Governor-intake
+    /// handoffs covered by the consumed frontier under that key (I5(i));
+    /// handoff reconcile is a separate idempotent step with no cross-store
+    /// atomicity claim. A lost answer replays safely: acknowledgement
+    /// advances monotonically and handoff reconcile converges.
     fn answer_bridge_event_reconcile(
         &self,
         session: &Session,
         scope: &BridgeReconcileScope,
         frame_fence: &eliot_contracts::StateFence,
     ) -> Result<serde_json::Value, TransportError> {
+        // Existing transition serialization first: the read guard is held
+        // across owner resolution and the batch commit below, so bridge
+        // profile fencing (the revocation path) cannot interleave
+        // unnoticed. No caller above holds this guard; the service-state
+        // read inside takes only its own short-lived lock.
+        let _transition = self.agent_bridge_transition_read()?;
         if !matches!(
             self.service_state()
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -2615,27 +2696,80 @@ impl KernelComposition {
         if live_generation == 0 {
             return Err(TransportError::SessionFenced);
         }
+        let evidence = bridge_owner_evidence(session, frame_fence)?;
+        // Contradictory duplicates fail the whole scope before any store
+        // mutation; the batch re-validates the same rule for its callers.
+        reject_contradictory_consumed(&scope.consumed)?;
+        let presenter = serde_json::json!({
+            "owner_authority_lineage": evidence.authority_lineage,
+            "owner_principal": evidence.principal,
+        });
+        // Resolve every consumed entry to its admitted namespace before
+        // mutating: any foreign, stale, or ambiguous item rejects the
+        // whole scope with nothing changed.
+        let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
+        let mut batch_namespaces: Vec<(String, u64)> = Vec::with_capacity(scope.consumed.len());
         for (stream_id, sequence) in &scope.consumed {
+            let item = self
+                .generation_gateway
+                .ors
+                .resolve_bridge_ack_item(&presenter, stream_id)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let namespace = item
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?;
+            let revision = item
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            let incarnation = item
+                .get("incarnation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransportError::SessionFenced)?;
+            batch_namespaces.push((namespace.to_owned(), *sequence));
+            batch_items.push(serde_json::json!({
+                "namespace": namespace,
+                "expected_revision": revision,
+                "expected_incarnation": incarnation,
+                "sequence": sequence,
+                "owner_authority_lineage": evidence.authority_lineage,
+                "owner_principal": evidence.principal,
+            }));
+        }
+        // One ORS write transaction applies the accepted batch; validation
+        // precedes commit inside it, so any failure leaves every cursor
+        // and payload untouched. A commit failure surfaces as a transport
+        // failure — an unknown/replayable result, never evidence that
+        // nothing happened.
+        if !batch_items.is_empty() {
             self.generation_gateway
                 .ors
-                .acknowledge_bridge_events(stream_id, *sequence)
-                .map_err(|_| TransportError::SessionFenced)?;
+                .acknowledge_bridge_event_batch(&serde_json::json!({ "items": batch_items }))
+                .map_err(|error| match error {
+                    OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                        TransportError::Backpressure
+                    }
+                    _ => TransportError::SessionFenced,
+                })?;
         }
         let mut reconciliation = self
             .generation_gateway
             .ors
-            .reconcile_bridge_events(&session.connection_id, live_generation)
+            .reconcile_bridge_events_for_owner(&presenter, live_generation)
             .map_err(|_| TransportError::SessionFenced)?;
+        reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
+        reconciliation["live_generation"] = serde_json::Value::from(live_generation);
         let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
             .map_err(|_| TransportError::SessionFenced)?;
         let reconcile_key = eliot_contracts::sha256_hex(&key_bytes);
         reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key.clone());
         let mut handoffs_reconciled = 0_u64;
-        for (stream_id, sequence) in &scope.consumed {
+        for (namespace, sequence) in &batch_namespaces {
             let marked = self
                 .generation_gateway
                 .ors
-                .reconcile_bridge_event_handoffs(stream_id, *sequence, &reconcile_key)
+                .reconcile_bridge_event_handoffs_checked(namespace, *sequence, &reconcile_key)
                 .map_err(|_| TransportError::SessionFenced)?;
             handoffs_reconciled += marked
                 .get("reconciled")
@@ -2934,6 +3068,82 @@ pub(crate) fn host_request_envelope_from_payload(
 /// `DURABLE` only on this exact persisted phase; anything else fails closed
 /// instead of promoting a weaker fact.
 const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
+
+/// Kernel-derived owner evidence for one bridge-event operation (issue
+/// #2729).
+///
+/// Built from the retained Session and the presenting fence only: the
+/// principal is the platform-verified peer identity, the lineage is the
+/// presenting authority lineage, and the occurrence is the admitted
+/// transport session. No bridge-authored session text is accepted — the
+/// frame carries none by design, and the Kernel builds the sender binding
+/// itself from the retained Session. A matching Windows identity, a
+/// current generation, or an earlier connection alone never satisfies
+/// this evidence: the store still requires the full binding tuple.
+struct BridgeOwnerEvidence {
+    principal: String,
+    authority_lineage: String,
+    connection: String,
+    launch_nonce: String,
+    session_epoch: u64,
+}
+
+/// Derives the owner evidence for one bridge-event operation from the
+/// retained Session and the presenting fence (issue #2729, item 2). The
+/// fence already proved compatibility with the retained Session at
+/// dispatch; this entry only projects the Kernel-owned facts the store
+/// binds into the versioned owner namespace.
+fn bridge_owner_evidence(
+    session: &Session,
+    fence: &eliot_contracts::StateFence,
+) -> Result<BridgeOwnerEvidence, TransportError> {
+    let principal = match &session.peer {
+        PeerIdentity::Authenticated { user_identity, .. } => {
+            if user_identity.trim().is_empty() || user_identity.chars().any(char::is_control) {
+                return Err(TransportError::SessionFenced);
+            }
+            user_identity.clone()
+        }
+        PeerIdentity::Unavailable { .. } => {
+            return Err(TransportError::PeerIdentityUnavailable);
+        }
+    };
+    let authority_lineage = fence.authority_epoch.lineage_id.as_str();
+    if authority_lineage.trim().is_empty() {
+        return Err(TransportError::SessionFenced);
+    }
+    if session.connection_id.trim().is_empty()
+        || session.launch_nonce.trim().is_empty()
+        || session.session_epoch == 0
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(BridgeOwnerEvidence {
+        principal,
+        authority_lineage: authority_lineage.to_owned(),
+        connection: session.connection_id.clone(),
+        launch_nonce: session.launch_nonce.clone(),
+        session_epoch: session.session_epoch,
+    })
+}
+
+/// Rejects contradictory consumed-frontier entries before any mutation
+/// (issue #2729, item 3): the same stream twice with different sequences
+/// fails the whole reconcile scope, so no batch cursor moves. The store
+/// batch re-validates the same rule for its own callers.
+fn reject_contradictory_consumed(consumed: &[(String, u64)]) -> Result<(), TransportError> {
+    for (index, (stream, sequence)) in consumed.iter().enumerate() {
+        if consumed[..index]
+            .iter()
+            .any(|(prior_stream, prior_sequence)| {
+                prior_stream == stream && prior_sequence != sequence
+            })
+        {
+            return Err(TransportError::SessionFenced);
+        }
+    }
+    Ok(())
+}
 /// Bound on consumed-frontier entries carried by one reconcile scope.
 const MAX_BRIDGE_RECONCILE_CONSUMED: usize = 1024;
 
