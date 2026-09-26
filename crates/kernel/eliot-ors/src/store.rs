@@ -205,8 +205,8 @@ const MAX_BRIDGE_HANDOFF_REPAIR_PER_RECOVERY: usize = 64;
 /// retirement converges over successive legitimate recovery entries instead
 /// of one unbounded sweep under the write lock.
 const MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY: usize = 64;
-/// Maximum recorded coverage gaps per stream. Breach fails with
-/// [`OrsError::ProjectionLimitExceeded`]; gaps never compact cursors.
+/// Maximum recorded coverage gaps per stream. Breach returns typed scoped-gap
+/// backpressure; gaps never compact cursors.
 const MAX_BRIDGE_EVENT_GAPS_PER_STREAM: usize = 256;
 /// Committed-and-acknowledged bridge-event rows retained per stream for
 /// duplicate suppression. Compaction evicts only acked rows older than this
@@ -5868,9 +5868,9 @@ impl RedbRecoveryStore {
 
     /// Loads one staged bridge-event row inside a write transaction for the
     /// idempotent-duplicate check. Enforces the record bound for fresh
-    /// identities: a full table fails new identities with
-    /// [`OrsError::ProjectionLimitExceeded`] while idempotent replays of
-    /// stored identities still succeed.
+    /// identities: a full table fails new identities with a typed
+    /// `EventRecords` backpressure result while idempotent replays of stored
+    /// identities still succeed.
     fn load_bridge_event_row_in(
         write: &redb::WriteTransaction,
         key: &str,
@@ -5879,7 +5879,11 @@ impl RedbRecoveryStore {
         if records.len().map_err(storage)? >= MAX_BRIDGE_EVENT_RECORDS as u64
             && records.get(key).map_err(storage)?.is_none()
         {
-            return Err(OrsError::ProjectionLimitExceeded);
+            return Err(OrsError::BridgeEventCapacityExceeded(
+                eliot_contracts::BridgeEventCapacityPressure::event_records(
+                    eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                ),
+            ));
         }
         records
             .get(key)
@@ -6142,7 +6146,11 @@ impl RedbRecoveryStore {
                 if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64
                     && handoffs.get(key.as_str()).map_err(storage)?.is_none()
                 {
-                    return Err(OrsError::ProjectionLimitExceeded);
+                    return Err(OrsError::BridgeEventCapacityExceeded(
+                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                            eliot_contracts::BridgeEventLocalPhase::Durable,
+                        ),
+                    ));
                 }
                 handoffs
                     .get(key.as_str())
@@ -6459,7 +6467,11 @@ impl RedbRecoveryStore {
                     }
                 }
                 if stream_gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
-                    return Err(OrsError::ProjectionLimitExceeded);
+                    return Err(OrsError::BridgeEventCapacityExceeded(
+                        eliot_contracts::BridgeEventCapacityPressure::scoped_gaps(
+                            eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                        ),
+                    ));
                 }
             }
         }
@@ -8036,7 +8048,7 @@ impl RedbRecoveryStore {
     /// binding, cursor advance, and pending handoff — so no crash or timeout
     /// between the former split commits can leave a staged event without its
     /// required handoff. A full handoff table fails the whole stage here with
-    /// [`OrsError::ProjectionLimitExceeded`] (typed backpressure that reserves
+    /// a typed `PendingHandoffs` backpressure result (reserving
     /// terminalization/recovery room at admission), never with a
     /// staged-but-handoff-less row. An already-recorded handoff is kept
     /// as-is; a conflicting one was already rejected by
@@ -8055,7 +8067,11 @@ impl RedbRecoveryStore {
             return Ok(());
         }
         if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64 {
-            return Err(OrsError::ProjectionLimitExceeded);
+            return Err(OrsError::BridgeEventCapacityExceeded(
+                eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                    eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                ),
+            ));
         }
         drop(handoffs);
         let row = BridgeEventHandoffRow {
@@ -9112,7 +9128,11 @@ impl RedbRecoveryStore {
                     }
                 }
                 if scoped_gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
-                    return Err(OrsError::ProjectionLimitExceeded);
+                    return Err(OrsError::BridgeEventCapacityExceeded(
+                        eliot_contracts::BridgeEventCapacityPressure::scoped_gaps(
+                            eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                        ),
+                    ));
                 }
             }
         }
@@ -9282,7 +9302,11 @@ impl RedbRecoveryStore {
                 if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64
                     && handoffs.get(key.as_str()).map_err(storage)?.is_none()
                 {
-                    return Err(OrsError::ProjectionLimitExceeded);
+                    return Err(OrsError::BridgeEventCapacityExceeded(
+                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                            eliot_contracts::BridgeEventLocalPhase::Durable,
+                        ),
+                    ));
                 }
                 handoffs
                     .get(key.as_str())
@@ -9732,7 +9756,11 @@ impl RedbRecoveryStore {
                 // its bounded charge or the call answers backpressure with
                 // nothing committed.
                 if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64 {
-                    return Err(OrsError::ProjectionLimitExceeded);
+                    return Err(OrsError::BridgeEventCapacityExceeded(
+                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                            eliot_contracts::BridgeEventLocalPhase::Durable,
+                        ),
+                    ));
                 }
                 let key = format!("{}::{}", access.namespace, row.event_id);
                 if handoffs.get(key.as_str()).map_err(storage)?.is_some() {

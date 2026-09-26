@@ -14,7 +14,7 @@ use eliot_agent_bridge_core::{
     DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
     RecoveryView, SessionId,
 };
-use eliot_contracts::EpochId;
+use eliot_contracts::{BridgeEventCapacityPressure, EpochId};
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
@@ -329,6 +329,12 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reactive_receipts: Vec<InjectionReceipt>,
+    },
+    /// Typed refusal to allocate a bridge-event slot. The exact exhausted
+    /// resource, permitted reconciliation path, and ORS-local acceptance
+    /// phase remain structured through the host response.
+    Backpressure {
+        pressure: BridgeEventCapacityPressure,
     },
     /// Typed acknowledgement of one live reactive admission.
     ///
@@ -1063,6 +1069,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::RecoveryPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => bootstrap,
         Response::Bootstrap { .. }
+        | Response::Backpressure { .. }
         | Response::Error { .. }
         | Response::ActivationDenied { .. }
         | Response::DryRun { .. } => {
@@ -1151,7 +1158,8 @@ fn forward_stage(error: &BridgeError) -> &'static str {
         BridgeError::MissingDurableAck
         | BridgeError::OutstandingDeliveryReconciliationRequired { .. }
         | BridgeError::ExternalAttachReconciliationRequired
-        | BridgeError::ExternalReconciliationDenied(_) => "durability",
+        | BridgeError::ExternalReconciliationDenied(_)
+        | BridgeError::Backpressure(_) => "durability",
         BridgeError::InvalidContract { .. }
         | BridgeError::ProviderContract(_)
         | BridgeError::AckIdentityMismatch
@@ -1955,6 +1963,10 @@ fn bridge_error(error: &BridgeError) -> Response {
         Response::Error {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
+        }
+    } else if let BridgeError::Backpressure(pressure) = error {
+        Response::Backpressure {
+            pressure: *pressure,
         }
     } else if let BridgeError::ActivationDenied(report) = error {
         Response::ActivationDenied {

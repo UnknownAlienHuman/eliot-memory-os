@@ -15,10 +15,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod bridge_event_capacity;
 mod capability_cell_registry;
 mod cell_effective_manifest;
 mod epoch_identity;
 
+pub use bridge_event_capacity::*;
 pub use capability_cell_registry::*;
 pub use cell_effective_manifest::*;
 pub use epoch_identity::*;

@@ -39,8 +39,8 @@ pub use eliot_agent_bridge_core::{
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes, sha256_hex,
+    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase, ClockReading,
+    ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -445,6 +445,41 @@ fn decode_event_port_outcome(
     envelope_sha: &str,
     port: &mut KernelMcpForwardingPort,
 ) -> Result<EventPortOutcome, ProviderFailure> {
+    if let Some(pressure_value) = value.get("capacity_pressure") {
+        let pressure: BridgeEventCapacityPressure = serde_json::from_value(pressure_value.clone())
+            .map_err(|_| {
+                event_shape_failure("event reply refused: malformed typed capacity pressure")
+            })?;
+        let reply_stream = value
+            .get("stream_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(event_transport_failure)?;
+        let reply_event = value
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(event_transport_failure)?;
+        if !pressure.is_consistent()
+            || !matches!(
+                pressure.dimension,
+                BridgeEventCapacityDimension::EventRecords
+                    | BridgeEventCapacityDimension::PendingHandoffs
+            )
+            || (pressure.dimension == BridgeEventCapacityDimension::EventRecords
+                && pressure.local_phase != BridgeEventLocalPhase::NotCommitted)
+            || value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
+            || reply_stream != event.stream_id
+            || reply_event != event.event_id
+            || !matches!(
+                event.delivery_class,
+                DeliveryClass::DurableControl | DeliveryClass::DurableObservation
+            )
+        {
+            return Err(event_shape_failure(
+                "event reply refused: capacity report does not match this durable event",
+            ));
+        }
+        return Err(ProviderFailure::bridge_event_capacity(pressure));
+    }
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -984,6 +1019,8 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: live generation does not match the presenting attach",
         ));
     }
+    let key = verify_reconcile_key(reconciliation)?;
+    decode_handoff_maintenance_pressure(reconciliation)?;
     let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
     let (stream_facts, stream_list_complete) =
         decode_reconciliation_streams(reconciliation, live_generation, &mut budget, port)?;
@@ -994,7 +1031,6 @@ fn decode_reconciliation_outcome(
         .ok_or_else(|| {
             event_shape_failure("reconciliation refused: owner answer without scope provenance")
         })?;
-    let key = verify_reconcile_key(reconciliation)?;
     let handoffs_reconciled = reconciliation
         .get("handoffs_reconciled")
         .and_then(serde_json::Value::as_u64)
@@ -1032,6 +1068,41 @@ fn decode_reconciliation_outcome(
         )
     })?;
     Ok(ReconciliationPortOutcome::Reconciled(result))
+}
+
+/// Validates typed capacity pressure returned by bounded handoff maintenance.
+/// The event response remains an ordinary reconciliation result, so this leg
+/// must retain its typed pressure instead of dropping it during decode.
+fn decode_handoff_maintenance_pressure(
+    reconciliation: &serde_json::Value,
+) -> Result<(), ProviderFailure> {
+    let Some(maintenance) = reconciliation
+        .get("handoff_maintenance")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for item in maintenance {
+        let Some(pressure_value) = item.get("capacity_pressure") else {
+            continue;
+        };
+        let pressure: BridgeEventCapacityPressure = serde_json::from_value(pressure_value.clone())
+            .map_err(|_| {
+                event_shape_failure(
+                    "reconciliation refused: malformed typed handoff capacity pressure",
+                )
+            })?;
+        if !pressure.is_consistent()
+            || pressure.dimension != BridgeEventCapacityDimension::PendingHandoffs
+            || pressure.local_phase != BridgeEventLocalPhase::Durable
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: handoff capacity report has the wrong resource or phase",
+            ));
+        }
+        return Err(ProviderFailure::bridge_event_capacity(pressure));
+    }
+    Ok(())
 }
 
 /// Decodes the stream enumeration of one owner answer within the
@@ -1533,6 +1604,24 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let reply = self.exchange(&frame)?;
         let value =
             decode_bridge_event_reply(&reply, &frame).ok_or_else(event_transport_failure)?;
+        if let Some(pressure_value) = value.get("capacity_pressure") {
+            let pressure: BridgeEventCapacityPressure =
+                serde_json::from_value(pressure_value.clone()).map_err(|_| {
+                    event_shape_failure("gap reply refused: malformed typed capacity pressure")
+                })?;
+            if !pressure.is_consistent()
+                || pressure.dimension != BridgeEventCapacityDimension::ScopedGaps
+                || pressure.local_phase != BridgeEventLocalPhase::NotCommitted
+                || value.get("accepted").and_then(serde_json::Value::as_bool) != Some(false)
+                || value.get("gap_id").and_then(serde_json::Value::as_str)
+                    != Some(gap.gap_id.as_str())
+            {
+                return Err(event_shape_failure(
+                    "gap reply refused: capacity report does not match the presented gap",
+                ));
+            }
+            return Err(ProviderFailure::bridge_event_capacity(pressure));
+        }
         if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
             || value.get("gap_id").and_then(serde_json::Value::as_str) != Some(gap.gap_id.as_str())
         {

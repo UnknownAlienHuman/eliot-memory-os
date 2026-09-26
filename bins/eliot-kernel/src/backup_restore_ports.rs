@@ -1331,6 +1331,23 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
             field: "restore.journal_page",
             limit: MAX_JOURNAL_PAGE_ENTRIES,
         },
+        OrsError::BridgeEventCapacityExceeded(pressure) => {
+            let component = match pressure.dimension {
+                eliot_contracts::BridgeEventCapacityDimension::EventRecords => {
+                    "bridge event-record capacity pressure"
+                }
+                eliot_contracts::BridgeEventCapacityDimension::PendingHandoffs => {
+                    "bridge pending-handoff capacity pressure"
+                }
+                eliot_contracts::BridgeEventCapacityDimension::ScopedGaps => {
+                    "bridge scoped-gap capacity pressure"
+                }
+            };
+            // Backup/restore operations cannot admit bridge events. Keep the
+            // failure in the existing unexpected-component class rather than
+            // misreporting it as a journal limit or corrupt backup input.
+            BackupError::UnexpectedRecoveryComponent(component)
+        }
         OrsError::UnsupportedContractVersion(version) => BackupError::UnsupportedFormat(format!(
             "restore journal envelope contract version {version}"
         )),

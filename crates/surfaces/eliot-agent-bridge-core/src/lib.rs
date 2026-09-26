@@ -16,7 +16,7 @@ pub use eliot_agent_api::{
     AttemptId, AttemptState, EventCursor, EventId, HostEventEnvelope, HostEventKind,
     RouteFingerprint, SessionId, TaskId, WorkUnitId,
 };
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{BridgeEventCapacityPressure, RequestMetadata};
 pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
@@ -2213,7 +2213,10 @@ impl AgentBridgeCore {
             }
             active.binding.clone()
         };
-        let outcome = self.forwarder()?.reconcile_external(&binding)?;
+        let outcome = self
+            .forwarder()?
+            .reconcile_external(&binding)
+            .map_err(BridgeError::from_forwarding_failure)?;
         let permit = match outcome {
             ReconciliationPortOutcome::Reconciled(result) => ReconciliationPermit::seal(result)?,
             ReconciliationPortOutcome::Denied { reason_code } => {
@@ -2311,7 +2314,10 @@ impl AgentBridgeCore {
         {
             return Err(BridgeError::StaleAuthority);
         }
-        let outcome = self.forwarder()?.reconcile_continue(&binding, &request)?;
+        let outcome = self
+            .forwarder()?
+            .reconcile_continue(&binding, &request)
+            .map_err(BridgeError::from_forwarding_failure)?;
         let permit = match outcome {
             ReconciliationPortOutcome::Reconciled(result) => ReconciliationPermit::seal(result)?,
             ReconciliationPortOutcome::Denied { reason_code } => {
@@ -2852,7 +2858,10 @@ impl AgentBridgeCore {
             }
         }
 
-        let outcome = self.forwarder()?.forward_event(binding, event)?;
+        let outcome = self
+            .forwarder()?
+            .forward_event(binding, event)
+            .map_err(BridgeError::from_forwarding_failure)?;
         let EventPortOutcome::Acknowledged(ack) = outcome else {
             return Err(BridgeError::MissingDurableAck);
         };
@@ -2899,7 +2908,11 @@ impl AgentBridgeCore {
         binding: &AttachBinding,
         event: &EventEnvelope,
     ) -> Result<EventForwardStatus, BridgeError> {
-        match self.forwarder()?.forward_event(binding, event)? {
+        match self
+            .forwarder()?
+            .forward_event(binding, event)
+            .map_err(BridgeError::from_forwarding_failure)?
+        {
             EventPortOutcome::BestEffortForwarded => Ok(EventForwardStatus::BestEffortForwarded),
             EventPortOutcome::BestEffortDropped { reason_ref } => {
                 validate_text(&reason_ref, "telemetry_gap.reason_ref")?;
@@ -2917,7 +2930,9 @@ impl AgentBridgeCore {
                 };
                 gap.validate()
                     .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
-                self.forwarder()?.forward_gap(binding, &gap)?;
+                self.forwarder()?
+                    .forward_gap(binding, &gap)
+                    .map_err(BridgeError::from_forwarding_failure)?;
                 Ok(EventForwardStatus::BestEffortGapSignalled { gap })
             }
             EventPortOutcome::Acknowledged(_) => Err(BridgeError::InvalidTransition(
@@ -3451,11 +3466,30 @@ impl AgentBridgeCore {
 pub struct ProviderFailure {
     provider: &'static str,
     reason: &'static str,
+    capacity_pressure: Option<BridgeEventCapacityPressure>,
 }
 
 impl ProviderFailure {
     pub const fn new(provider: &'static str, reason: &'static str) -> Self {
-        Self { provider, reason }
+        Self {
+            provider,
+            reason,
+            capacity_pressure: None,
+        }
+    }
+
+    /// Creates a provider result that preserves typed Kernel capacity pressure.
+    pub const fn bridge_event_capacity(pressure: BridgeEventCapacityPressure) -> Self {
+        Self {
+            provider: "eliot-kernel-front-door",
+            reason: "typed bridge-event capacity pressure",
+            capacity_pressure: Some(pressure),
+        }
+    }
+
+    /// Returns the exact typed capacity report, when this failure carries one.
+    pub const fn capacity_pressure(&self) -> Option<BridgeEventCapacityPressure> {
+        self.capacity_pressure
     }
 }
 
@@ -3473,6 +3507,8 @@ pub enum BridgeError {
     ProviderContract(String),
     #[error(transparent)]
     Provider(#[from] ProviderFailure),
+    #[error("bridge-event capacity exhausted: {0:?}")]
+    Backpressure(BridgeEventCapacityPressure),
     #[error("bridge is not attached")]
     NotAttached,
     #[error("activation denied: {0}")]
@@ -3522,6 +3558,15 @@ pub enum BridgeError {
     UnmeasuredTokens { reason: UnmeasuredReason },
     #[error(transparent)]
     Skill(#[from] SkillError),
+}
+
+impl BridgeError {
+    fn from_forwarding_failure(failure: ProviderFailure) -> Self {
+        match failure.capacity_pressure() {
+            Some(pressure) if pressure.is_consistent() => Self::Backpressure(pressure),
+            _ => Self::Provider(failure),
+        }
+    }
 }
 
 impl fmt::Debug for AgentBridgeCore {
