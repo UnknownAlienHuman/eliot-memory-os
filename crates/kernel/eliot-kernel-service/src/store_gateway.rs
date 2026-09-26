@@ -53,17 +53,23 @@ use crate::user_automation_execution::{
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
     StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
-    UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
-    UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
-    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationRuntimeError,
-    UserAutomationRuntimePort, UserAutomationService, UserAutomationServiceRequest,
-    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
-    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
-    run_now_wake_read_request,
+    UserAutomationExecutionError, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
+    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationMutationResult,
+    UserAutomationOperatorTransition, UserAutomationOwnerLookup, UserAutomationOwnerSnapshot,
+    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationService,
+    UserAutomationServiceRequest, UserAutomationStoreRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakePhase, UserAutomationWakePort, committed_configuration_state,
+    compile_wake_horizon, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+
+fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomationExecutionError {
+    UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::UnknownOutcome(
+        error.to_string(),
+    ))
+}
 
 #[path = "store_receipt_gateway.rs"]
 mod store_receipt_gateway;
@@ -1189,6 +1195,22 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string())
     }
 
+    /// Validates the immutable caller-authored operation before Store admission.
+    ///
+    /// This check deliberately excludes `OperationIdentity::canonical_request_hash`:
+    /// the daemon supplies that field empty and the gateway seals it only after
+    /// building the exact canonical transition. This method is pure and makes no
+    /// Store call, so a returned `Contract` error is a pre-Store refusal for this
+    /// attempt.
+    pub fn validate_user_automation_request(
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request
+            .intent
+            .validate()
+            .map_err(UserAutomationExecutionError::Contract)
+    }
+
     /// Executes one authenticated `UserAutomation` operator operation as one
     /// post-commit orchestration transition.
     ///
@@ -1220,32 +1242,37 @@ impl KernelStoreGateway {
         &self,
         request: UserAutomationServiceRequest,
         runtime: Option<&R>,
-    ) -> Result<UserAutomationOperatorTransition, String>
+    ) -> Result<UserAutomationOperatorTransition, UserAutomationExecutionError>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
+        Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(
             self.store.as_ref(),
         ));
-        let sealed = self.seal_user_automation_operation(&store, request).await?;
+        let sealed = self
+            .seal_user_automation_operation(&store, request)
+            .await
+            .map_err(user_automation_gateway_unknown)?;
         let response = Box::pin(UserAutomationService::new(&store).dispatch(sealed.clone()))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(user_automation_gateway_unknown)?;
         if response.identity != sealed.identity
             || response.state_fence != sealed.context.state_fence
         {
-            return Err(
-                "canonical UserAutomation response does not bind to the sealed operation"
-                    .to_owned(),
-            );
+            return Err(user_automation_gateway_unknown(
+                "canonical UserAutomation response does not bind to the sealed operation",
+            ));
         }
         let configuration = UserAutomationConfigurationPhase::from_store_outcome(response.outcome);
         let (wake, execution) = self
             .user_automation_runtime_handoff(&sealed, &configuration, runtime)
-            .await?;
+            .await
+            .map_err(user_automation_gateway_unknown)?;
         let horizon = self
             .publish_schedule_horizon(&sealed, &configuration, runtime)
-            .await?;
+            .await
+            .map_err(user_automation_gateway_unknown)?;
         let transition = UserAutomationOperatorTransition::with_horizon(
             sealed.identity.clone(),
             sealed.context.state_fence.clone(),
@@ -1254,7 +1281,9 @@ impl KernelStoreGateway {
             execution,
             horizon,
         );
-        transition.validate()?;
+        transition
+            .validate()
+            .map_err(user_automation_gateway_unknown)?;
         Ok(transition)
     }
 

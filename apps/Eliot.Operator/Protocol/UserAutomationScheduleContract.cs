@@ -906,8 +906,17 @@ public enum UserAutomationOutcomeClass
     /// </summary>
     OwnerIssuedNormalization,
 
-    /// <summary>The owner answered with a typed refusal this build can name.</summary>
+    /// <summary>The owner answered with a structured refusal this build can name.</summary>
     OwnerRefused,
+
+    /// <summary>The owner route is unavailable and this operation remains unresolved.</summary>
+    OwnerUnavailable,
+
+    /// <summary>
+    /// An unresolved owner transition includes a schedule projection that can
+    /// be inspected, but does not settle the operation outcome.
+    /// </summary>
+    OwnerScheduleOutcomeUnknown,
 
     /// <summary>
     /// The owner answered, and this answer proves nothing about the schedule.
@@ -947,11 +956,10 @@ public sealed record UserAutomationOutcome(
 /// </summary>
 /// <remarks>
 /// <para>
-/// A Kernel refusal is decoded from the owner answer by matching the exact
-/// <c>Display</c> strings the owner emits, using the GENERATED refusal table
-/// rather than a hand-typed list. The scan is bounded in depth, member count and
-/// string length, and it reports nothing as decoded unless it actually matched
-/// an owner sentence: an unrecognised answer is
+/// A Kernel refusal is decoded only from the bounded, closed typed envelope.
+/// Its operation identity is checked against the request that produced this
+/// answer. Refusal codes are a closed vocabulary; display prose is never scanned
+/// to infer a code. An unknown, malformed or mismatched envelope is
 /// <see cref="UserAutomationOutcomeClass.UnverifiedOwnerAnswer"/>, never a
 /// success.
 /// </para>
@@ -965,15 +973,14 @@ public sealed record UserAutomationOutcome(
 /// </remarks>
 public static class UserAutomationOutcomeClassifier
 {
-    /// <summary>Owner answer member names that may carry a refusal sentence.</summary>
-    private static readonly string[] RefusalMembers =
-    [
-        "error", "reason", "message", "detail", "cause", "display", "refusal", "diagnosis"
-    ];
-
-    private const int MaxScanDepth = 6;
-    private const int MaxScannedStrings = 64;
-    private const int MaxScannedStringChars = 1_024;
+    private const int MaxTypedEnvelopeChars = 8_192;
+    private const int MaxIdentityChars = 256;
+    // The Kernel's bounded idempotency key is prefixed in operation_id.
+    private const int MaxOperationIdChars = 320;
+    private const int MaxRefusalFieldChars = 256;
+    private const int MaxRecoveryReasonChars = 1_024;
+    private const int MaxScheduleScanDepth = 6;
+    private const int MaxScheduleScannedObjects = 64;
 
     /// <summary>
     /// How many owner occurrence lines the summary names. The retained owner
@@ -983,29 +990,57 @@ public static class UserAutomationOutcomeClassifier
     /// </summary>
     private const int MaxDescribedOccurrences = 8;
 
-    /// <summary>Decodes one owner answer for one typed operation.</summary>
-    public static UserAutomationOutcome Read(string action, JsonElement answer)
+    /// <summary>Decodes one owner answer for one typed operation identity.</summary>
+    public static UserAutomationOutcome Read(
+        string action,
+        JsonElement answer,
+        string expectedIdempotencyKey)
     {
         ArgumentNullException.ThrowIfNull(action);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedIdempotencyKey);
         if (answer.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
             return OwnerAbsent(action, "the owner route returned no result payload.");
         }
 
-        var refusal = FindRefusal(answer);
-        if (refusal is not null)
+        if (answer.ValueKind != JsonValueKind.Object)
         {
-            // The owner's exact sentence is shown verbatim and the Operator adds
-            // only the one next action. Neither is reworded, abbreviated, nor
-            // collapsed into a generic JSON error.
-            var text = refusal.Value.Text;
-            return new UserAutomationOutcome(
-                UserAutomationOutcomeClass.OwnerRefused,
-                $"UserAutomation {action} refused by the owner",
-                $"{text} {ExplainVariant(refusal.Value.Template.Variant)}",
-                refusal.Value.Template.Variant,
-                text,
-                Receipt: null);
+            return UnverifiedOwnerAnswer(action, "the owner answer is not one JSON object");
+        }
+
+        if (answer.TryGetProperty("status", out _))
+        {
+            if (!TryReadBoundedText(answer, "status", 32, out var statusText))
+            {
+                return UnverifiedOwnerAnswer(action, "the typed owner status is malformed");
+            }
+
+            if (string.Equals(statusText, "unknown", StringComparison.Ordinal))
+            {
+                return ReadUnknownEnvelope(action, answer, expectedIdempotencyKey);
+            }
+
+            if (string.Equals(statusText, "known", StringComparison.Ordinal))
+            {
+                // Known owner transitions can carry a full bounded schedule
+                // projection. Do not apply the much smaller refusal-envelope
+                // size limit to this successful result.
+                return ReadKnownEnvelope(action, answer);
+            }
+
+            return UnverifiedOwnerAnswer(
+                action,
+                $"the owner returned the unsupported or mismatched typed status '{statusText}'");
+        }
+
+        // The typed error contract is a top-level envelope. An object carrying
+        // its `value` without the required status cannot fall through to the
+        // success projection scanner.
+        if (answer.TryGetProperty("value", out _)
+            || answer.TryGetProperty("refusal", out _)
+            || answer.TryGetProperty("attempt_state", out _))
+        {
+            return UnverifiedOwnerAnswer(action, "the typed owner envelope is missing its status");
         }
 
         var receipt = FindOwnerSchedule(answer);
@@ -1031,6 +1066,415 @@ public static class UserAutomationOutcomeClassifier
             Receipt: null);
     }
 
+    private static UserAutomationOutcome ReadKnownEnvelope(string action, JsonElement answer)
+    {
+        if (!HasExactProperties(answer, "status", "value", "recovery")
+            || !TryReadBoundedText(answer, "status", 32, out var status)
+            || !string.Equals(status, "known", StringComparison.Ordinal)
+            || !TryGetObject(answer, "value", out var value)
+            || !answer.TryGetProperty("recovery", out var recovery)
+            || recovery.ValueKind != JsonValueKind.Null)
+        {
+            return UnverifiedOwnerAnswer(action, "the known owner transition is not a closed, settled typed shape");
+        }
+
+        // A pre-Store runtime-channel rejection uses this separate closed
+        // shape. It explains this attempt but cannot settle a retained retry.
+        if (HasExactProperties(value, "accepted", "outcome", "reason")
+            && value.TryGetProperty("accepted", out var accepted)
+            && accepted.ValueKind == JsonValueKind.False
+            && TryReadBoundedText(value, "outcome", 64, out var outcome)
+            && string.Equals(outcome, "rejected", StringComparison.Ordinal)
+            && TryReadBoundedText(value, "reason", MaxRecoveryReasonChars, out var reason))
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerRefused,
+                $"UserAutomation {action} rejected on this attempt — reconcile the operation",
+                $"The owner rejected this attempt before Store: {reason}. An earlier attempt under this same identity may still have committed. "
+                + "Action: address the semantic rejection named by the owner; obtain fresh owner evidence if schedule semantics changed, "
+                + "then reconcile this same operation before any new submission.",
+                "semantic_rejection",
+                reason,
+                Receipt: null);
+        }
+
+        if (HasExactProperties(value, "accepted", "outcome")
+            && value.TryGetProperty("accepted", out var identityAccepted)
+            && identityAccepted.ValueKind == JsonValueKind.False
+            && TryReadBoundedText(value, "outcome", 64, out var identityOutcome)
+            && string.Equals(identityOutcome, "identity_conflict", StringComparison.Ordinal))
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerRefused,
+                $"UserAutomation {action} identity conflict on this attempt — reconcile the operation",
+                "The owner rejected this attempt before Store because the request identity or State Fence did not match the authenticated owner session. "
+                + "An earlier attempt under this same identity may still have committed. Action: establish a fresh authenticated owner session with the matching identity and State Fence, "
+                + "then reconcile this same operation before any new submission.",
+                "identity_conflict",
+                RefusalText: null,
+                Receipt: null);
+        }
+
+        if (!HasUserAutomationTransitionProperties(value))
+        {
+            return UnverifiedOwnerAnswer(action, "the known owner result has an unsupported value shape");
+        }
+
+        var receipt = FindOwnerSchedule(answer);
+        if (receipt is not null)
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerIssuedNormalization,
+                $"UserAutomation {action} owner-issued schedule",
+                DescribeOwnerSchedule(receipt),
+                RefusalKind: null,
+                RefusalText: null,
+                Receipt: receipt);
+        }
+
+        return new UserAutomationOutcome(
+            UserAutomationOutcomeClass.UnverifiedOwnerAnswer,
+            $"UserAutomation {action} answered — schedule not verified",
+            "the owner answered this typed operation but this answer carries no owner-issued "
+            + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
+            + "so the Operator does not report the schedule as normalized",
+            RefusalKind: null,
+            RefusalText: null,
+            Receipt: null);
+    }
+
+    private static UserAutomationOutcome ReadUnknownEnvelope(
+        string action,
+        JsonElement answer,
+        string expectedIdempotencyKey)
+    {
+        if (!HasExactProperties(answer, "status", "value", "recovery")
+            || !TryReadBoundedText(answer, "status", 32, out var status)
+            || !string.Equals(status, "unknown", StringComparison.Ordinal)
+            || !TryGetObject(answer, "value", out var value)
+            || !TryGetObject(answer, "recovery", out var recovery))
+        {
+            return UnverifiedOwnerAnswer(action, "the unknown-outcome envelope is not a closed typed shape");
+        }
+
+        if (TryReadBoundedText(value, "kind", 64, out var kind)
+            && string.Equals(kind, "user_automation_refusal", StringComparison.Ordinal))
+        {
+            if (answer.GetRawText().Length > MaxTypedEnvelopeChars)
+            {
+                return UnverifiedOwnerAnswer(action, "the typed refusal envelope exceeds its size bound");
+            }
+            return ReadAttemptRefusal(action, value, recovery, expectedIdempotencyKey);
+        }
+
+        if (HasExactProperties(value, "outcome")
+            && TryReadBoundedText(value, "outcome", 64, out var outcome)
+            && string.Equals(outcome, "unavailable", StringComparison.Ordinal)
+            && HasExactProperties(recovery, "kind", "reason")
+            && TryReadBoundedText(recovery, "kind", 64, out var recoveryKind)
+            && string.Equals(recoveryKind, "unavailable", StringComparison.Ordinal)
+            && TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var reason))
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerUnavailable,
+                $"UserAutomation {action} owner unavailable — outcome remains unknown",
+                $"The UserAutomation owner is unavailable: {reason}. The operation outcome remains unknown. "
+                + "Action: restore owner availability, then reconcile this same operation before any new submission.",
+                RefusalKind: null,
+                RefusalText: null,
+                Receipt: null);
+        }
+
+        if (HasExactProperties(value, "outcome")
+            && TryReadBoundedText(value, "outcome", 64, out var unknownOutcome)
+            && string.Equals(unknownOutcome, "unknown_outcome", StringComparison.Ordinal)
+            && HasExactProperties(recovery, "kind", "reason")
+            && TryReadBoundedText(recovery, "kind", 64, out var unknownRecoveryKind)
+            && string.Equals(unknownRecoveryKind, "unknown_outcome", StringComparison.Ordinal)
+            && TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var unknownReason))
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.UnverifiedOwnerAnswer,
+                $"UserAutomation {action} outcome unknown — reconcile the operation",
+                $"The owner reports an unknown outcome: {unknownReason}. Action: reconcile this same operation identity before any new submission. "
+                + "The Operator does not claim commit or noncommit.",
+                RefusalKind: null,
+                RefusalText: null,
+                Receipt: null);
+        }
+
+        if (HasUserAutomationTransitionProperties(value)
+            && HasExactProperties(recovery, "kind", "reason")
+            && TryReadBoundedText(recovery, "kind", 64, out var transitionRecoveryKind)
+            && (string.Equals(transitionRecoveryKind, "unknown_outcome", StringComparison.Ordinal)
+                || string.Equals(transitionRecoveryKind, "unavailable", StringComparison.Ordinal))
+            && TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var transitionRecoveryReason))
+        {
+            var receipt = FindOwnerSchedule(answer);
+            if (receipt is not null)
+            {
+                return new UserAutomationOutcome(
+                    UserAutomationOutcomeClass.OwnerScheduleOutcomeUnknown,
+                    $"UserAutomation {action} outcome unknown — owner schedule available for inspection",
+                    $"The owner returned an occurrence projection, but its {transitionRecoveryKind} handoff leaves the operation unresolved. "
+                    + $"Reason: {transitionRecoveryReason}. Action: follow the recovery reason and reconcile this same operation identity before any new submission.\n"
+                    + DescribeOwnerSchedule(receipt),
+                    RefusalKind: null,
+                    RefusalText: null,
+                    Receipt: receipt);
+            }
+
+            return UnverifiedOwnerAnswer(
+                action,
+                $"the owner transition remains unknown ({transitionRecoveryKind}): {transitionRecoveryReason}");
+        }
+
+        return UnverifiedOwnerAnswer(action, "the unknown-outcome envelope has an unsupported value or recovery shape");
+    }
+
+    private static bool HasUserAutomationTransitionProperties(JsonElement value) =>
+        HasExactProperties(
+            value,
+            "identity",
+            "state_fence",
+            "configuration",
+            "wake",
+            "horizon",
+            "execution",
+            "occurrences");
+
+    private static UserAutomationOutcome ReadAttemptRefusal(
+        string action,
+        JsonElement value,
+        JsonElement recovery,
+        string expectedIdempotencyKey)
+    {
+        if (!HasExactProperties(
+                value,
+                "kind",
+                "schema_version",
+                "operation",
+                "state_fence",
+                "attempt_state",
+                "refusal")
+            || !TryReadBoundedText(value, "kind", 64, out var kind)
+            || !string.Equals(kind, "user_automation_refusal", StringComparison.Ordinal)
+            || !value.TryGetProperty("schema_version", out var schemaVersion)
+            || schemaVersion.ValueKind != JsonValueKind.Number
+            || !schemaVersion.TryGetInt32(out var version)
+            || version != 1
+            || !TryGetObject(value, "operation", out var operation)
+            || !MatchesOperationIdentity(operation, expectedIdempotencyKey)
+            || !TryGetObject(value, "state_fence", out var stateFence)
+            || !IsClosedStateFence(stateFence)
+            || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
+            || !string.Equals(attemptState, "store_not_called", StringComparison.Ordinal)
+            || !HasExactProperties(recovery, "kind", "reason")
+            || !TryReadBoundedText(recovery, "kind", 64, out var recoveryKind)
+            || !string.Equals(recoveryKind, "unknown_outcome", StringComparison.Ordinal)
+            || !TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var recoveryReason)
+            || !TryGetObject(value, "refusal", out var refusal))
+        {
+            return UnverifiedOwnerAnswer(
+                action,
+                "the typed refusal is malformed or does not bind to this request; the operation outcome remains unknown");
+        }
+
+        var hasField = HasExactProperties(refusal, "code", "field");
+        if (!hasField && !HasExactProperties(refusal, "code"))
+        {
+            return UnverifiedOwnerAnswer(action, "the typed refusal has an open or malformed code shape");
+        }
+
+        if (!TryReadBoundedText(refusal, "code", 64, out var code)
+            || !TryExplainRefusal(code, out var explanation))
+        {
+            return UnverifiedOwnerAnswer(action, "the typed refusal code is unsupported; the operation outcome remains unknown");
+        }
+
+        string? field = null;
+        if (hasField)
+        {
+            if (!TryReadBoundedText(refusal, "field", MaxRefusalFieldChars, out var fieldValue))
+            {
+                return UnverifiedOwnerAnswer(action, "the typed refusal field is malformed; the operation outcome remains unknown");
+            }
+            field = fieldValue;
+        }
+
+        if (string.Equals(code, "semantic_rejection", StringComparison.Ordinal)
+            && string.Equals(field, "revision.supersedes", StringComparison.Ordinal))
+        {
+            explanation = "Action: submit one new immutable revision superseding one distinct revision of the same automation.";
+        }
+
+        var fieldText = field is null ? string.Empty : $" Field: {field}.";
+        return new UserAutomationOutcome(
+            UserAutomationOutcomeClass.OwnerRefused,
+            $"UserAutomation {action} refused on this attempt — reconcile the operation",
+            $"This attempt was refused before Store ({attemptState}); an earlier attempt under the same identity may still have committed. "
+            + $"Owner reason: {code}.{fieldText} {explanation} "
+            + $"Recovery: {recoveryReason}",
+            code,
+            RefusalText: null,
+            Receipt: null);
+    }
+
+    private static bool MatchesOperationIdentity(JsonElement operation, string expectedIdempotencyKey)
+    {
+        if (!HasExactProperties(operation, "operation_id", "request_id", "idempotency_key")
+            || !TryReadBoundedText(operation, "operation_id", MaxOperationIdChars, out var operationId)
+            || !TryReadBoundedText(operation, "request_id", MaxIdentityChars, out _)
+            || !TryReadBoundedText(operation, "idempotency_key", MaxIdentityChars, out var idempotencyKey))
+        {
+            return false;
+        }
+
+        // RequestId is minted inside the authenticated Kernel route and is
+        // correlated by the pipe response; the Operator cannot independently
+        // derive it. The two identities it does hold are exact: the pending
+        // operation ID is the request idempotency key, and Kernel prefixes that
+        // key when it returns its operation ID.
+        return string.Equals(idempotencyKey, expectedIdempotencyKey, StringComparison.Ordinal)
+            && string.Equals(
+                operationId,
+                $"user-automation-operation:{expectedIdempotencyKey}",
+                StringComparison.Ordinal);
+    }
+
+    private static bool IsClosedStateFence(JsonElement stateFence)
+    {
+        if (!HasExactProperties(
+                stateFence,
+                "authority_epoch",
+                "resource_generation",
+                "task_revision",
+                "policy_revision",
+                "integration_revision")
+            || !TryGetObject(stateFence, "authority_epoch", out var authorityEpoch)
+            || !HasExactProperties(authorityEpoch, "lineage_id", "sequence")
+            || !TryReadBoundedText(authorityEpoch, "lineage_id", 36, out var lineageId)
+            || !IsLowercaseUuid(lineageId)
+            || !stateFence.TryGetProperty("resource_generation", out var resourceGeneration)
+            || !IsPositiveUInt64(resourceGeneration))
+        {
+            return false;
+        }
+
+        if (!authorityEpoch.TryGetProperty("sequence", out var sequence)
+            || !IsPositiveUInt64(sequence))
+        {
+            return false;
+        }
+
+        return IsOptionalPositiveUInt64(stateFence, "task_revision")
+            && IsOptionalPositiveUInt64(stateFence, "policy_revision")
+            && IsOptionalPositiveUInt64(stateFence, "integration_revision");
+    }
+
+    private static bool IsOptionalPositiveUInt64(JsonElement value, string propertyName) =>
+        value.TryGetProperty(propertyName, out var member)
+        && (member.ValueKind == JsonValueKind.Null || IsPositiveUInt64(member));
+
+    private static bool IsPositiveUInt64(JsonElement value) =>
+        value.ValueKind == JsonValueKind.Number
+        && value.TryGetUInt64(out var number)
+        && number > 0;
+
+    private static bool IsLowercaseUuid(string value)
+    {
+        if (value.Length != 36) return false;
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (index is 8 or 13 or 18 or 23)
+            {
+                if (value[index] != '-') return false;
+            }
+            else if (!((value[index] >= '0' && value[index] <= '9')
+                || (value[index] >= 'a' && value[index] <= 'f')))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasExactProperties(JsonElement value, params string[] expectedNames)
+    {
+        if (value.ValueKind != JsonValueKind.Object) return false;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!expectedNames.Contains(property.Name, StringComparer.Ordinal)
+                || !names.Add(property.Name))
+            {
+                return false;
+            }
+        }
+        return names.Count == expectedNames.Length;
+    }
+
+    private static bool TryGetObject(JsonElement parent, string propertyName, out JsonElement value)
+    {
+        value = default;
+        return parent.ValueKind == JsonValueKind.Object
+            && parent.TryGetProperty(propertyName, out value)
+            && value.ValueKind == JsonValueKind.Object;
+    }
+
+    private static bool TryReadBoundedText(
+        JsonElement parent,
+        string propertyName,
+        int maximumLength,
+        out string value)
+    {
+        value = string.Empty;
+        if (parent.ValueKind != JsonValueKind.Object
+            || !parent.TryGetProperty(propertyName, out var member)
+            || member.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        var text = member.GetString();
+        if (string.IsNullOrWhiteSpace(text)
+            || text.Length > maximumLength
+            || text.Any(char.IsControl))
+        {
+            return false;
+        }
+        value = text;
+        return true;
+    }
+
+    private static bool TryExplainRefusal(string code, out string explanation)
+    {
+        explanation = code switch
+        {
+            "unsupported_contract_version" =>
+                $"Action: re-normalize under {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} and submit a new immutable revision; do not rewrite the existing revision.",
+            "legacy_encoding" =>
+                "Action: run the owner re-normalization or migration path and submit a NEW immutable revision; the Operator never rewrites a revision in place.",
+            "stale_normalization_revision" =>
+                "Action: obtain a fresh owner normalization for the current effect-relevant schedule fields, then submit a new immutable revision.",
+            "invalid_or_moved_receipt" =>
+                "Action: obtain a valid owner-issued receipt bound to this exact schedule and operation; do not move or reuse the prior receipt.",
+            "semantic_rejection" =>
+                "Action: correct the owner-rejected field or schedule meaning, obtain fresh owner evidence when schedule semantics changed, and submit a new operation.",
+            _ => string.Empty
+        };
+        return explanation.Length != 0;
+    }
+
+    private static UserAutomationOutcome UnverifiedOwnerAnswer(string action, string reason) =>
+        new(
+            UserAutomationOutcomeClass.UnverifiedOwnerAnswer,
+            $"UserAutomation {action} answered — outcome unverified",
+            $"{reason}. The operation remains unknown and must be reconciled under its same identity; the Operator does not claim commit or noncommit.",
+            RefusalKind: null,
+            RefusalText: null,
+            Receipt: null);
+
     /// <summary>
     /// The inspection summary of one owner-issued occurrence set: the contract
     /// identity first, then each occurrence's zone database revision, local wall
@@ -1051,35 +1495,6 @@ public static class UserAutomationOutcomeClassifier
         }
         return builder.ToString();
     }
-
-    /// <summary>
-    /// The one next action for a decoded owner refusal variant, in the
-    /// Operator's own words. The owner's exact sentence is always shown
-    /// alongside it and is never reworded.
-    /// </summary>
-    private static string ExplainVariant(string variant) => variant switch
-    {
-        "LegacyScheduleEncoding" =>
-            "Action: run the owner re-normalization/migration action and create a NEW immutable revision; the Operator never rewrites a revision in place.",
-        "ZoneDatabaseRevision" =>
-            $"Action: obtain a new owner normalization against pinned zone database {OperatorScheduleContract.PINNED_ZONE_DATABASE_RELEASE}; a database update can never rewrite an existing revision.",
-        "UnknownZone" =>
-            "Action: declare a zone the pinned owner zone table actually carries; the Operator does not resolve a zone from its spelling or from ambient Windows timezone data.",
-        "ZoneEvidence" or "ZoneTableIntegrity" =>
-            "Action: obtain a fresh owner normalization result; the recorded offset, transition or disposition is not what the owner's pinned zone table applies.",
-        "ZoneTableWindow" =>
-            "Action: obtain a new owner normalization result inside the owner's pinned zone table window; the Operator never extrapolates it.",
-        "Receipt" or "ReceiptBinding" =>
-            "Action: obtain a valid, request-bound owner-issued source receipt; a moved or unbound receipt is refused rather than repaired.",
-        "RevisionMismatch" or "OccurrenceMismatch" =>
-            "Action: resend the exact immutable revision and occurrence identity the owner issued.",
-        "InvalidSupersession" =>
-            "Action: submit one edit that supersedes one distinct revision of the same automation.",
-        "Invalid" or "LimitExceeded" =>
-            "Action: correct the named field against the owner contract and submit a new revision.",
-        _ =>
-            "Action: read the owner's sentence above; the Operator reports it verbatim and infers nothing further."
-    };
 
     /// <summary>
     /// Reports an owner that did not answer. No schedule state is asserted: the
@@ -1122,67 +1537,6 @@ public static class UserAutomationOutcomeClassifier
             CultureInfo.InvariantCulture,
             $"UserAutomation {action} is bound to {receipt.ContractIdentity()} under one retry-stable operation identity {operationIdentity}. Shape and contract version are checked locally; admission and normalization remain the owner's decision, and the owner's own source-digest value is not verified here.");
 
-    private static (OperatorOwnerRefusalTemplate Template, string Text)? FindRefusal(JsonElement answer)
-    {
-        var seen = 0;
-        return ScanForRefusal(answer, 0, ref seen);
-    }
-
-    private static (OperatorOwnerRefusalTemplate Template, string Text)? ScanForRefusal(
-        JsonElement element,
-        int depth,
-        ref int seen)
-    {
-        if (element.ValueKind == JsonValueKind.String)
-        {
-            if (seen >= MaxScannedStrings) return null;
-            var text = element.GetString();
-            if (string.IsNullOrEmpty(text) || text.Length > MaxScannedStringChars) return null;
-            seen++;
-            var template = Match(text);
-            return template is null ? null : (template, text);
-        }
-        if (depth >= MaxScanDepth) return null;
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var property in element.EnumerateObject())
-            {
-                if (!RefusalMembers.Contains(property.Name, StringComparer.Ordinal)) continue;
-                var matched = ScanForRefusal(property.Value, depth + 1, ref seen);
-                if (matched is not null) return matched;
-            }
-            return null;
-        }
-        if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-            {
-                var matched = ScanForRefusal(item, depth + 1, ref seen);
-                if (matched is not null) return matched;
-            }
-        }
-        return null;
-    }
-
-    /// <summary>
-    /// Matches one owner sentence against the generated refusal table. The
-    /// longest literal prefix wins, so a variant whose sentence is a prefix of
-    /// another's cannot shadow it.
-    /// </summary>
-    private static OperatorOwnerRefusalTemplate? Match(string text)
-    {
-        OperatorOwnerRefusalTemplate? best = null;
-        foreach (var template in OperatorScheduleContract.OwnerRefusals)
-        {
-            if (!text.StartsWith(template.LiteralPrefix, StringComparison.Ordinal)) continue;
-            if (best is null || template.LiteralPrefix.Length > best.LiteralPrefix.Length)
-            {
-                best = template;
-            }
-        }
-        return best;
-    }
-
     /// <summary>
     /// Decodes the owner-issued occurrence projection when the answer carries
     /// one. The answer is treated as untrusted data at a bounded depth, and a
@@ -1200,7 +1554,7 @@ public static class UserAutomationOutcomeClassifier
         int depth,
         ref int seen)
     {
-        if (depth > MaxScanDepth || seen > MaxScannedStrings) return null;
+        if (depth > MaxScheduleScanDepth || seen > MaxScheduleScannedObjects) return null;
         if (element.ValueKind == JsonValueKind.Object)
         {
             seen++;

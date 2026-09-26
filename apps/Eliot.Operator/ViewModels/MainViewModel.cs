@@ -567,10 +567,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             try
             {
+                var readRequest = UserAutomationOperatorRequest.Create(operation);
                 var read = await _client.UserAutomationAsync(
-                    UserAutomationOperatorRequest.Create(operation),
+                    readRequest,
                     _requestCancellation?.Token ?? CancellationToken.None);
-                ShowUserAutomationResult(action, read);
+                ShowUserAutomationResult(action, read, readRequest.IdempotencyKey);
             }
             catch (Exception error)
             {
@@ -640,11 +641,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var answer = await _client.UserAutomationAsync(
                 request,
                 _requestCancellation?.Token ?? CancellationToken.None);
-            ShowUserAutomationResult(action, answer);
-            // The owner answered. This route reports admission, not a canonical
-            // write receipt, so the effect stays reconcilable under the same
-            // identity until the owner proves its terminal disposition.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            ShowUserAutomationResult(action, answer, request.IdempotencyKey);
+            // A typed attempt refusal can prove that this attempt stopped before
+            // Store, but it does not settle an earlier attempt of the same
+            // retained identity. Preserve an already-unknown phase; a first
+            // structured answer becomes reconcilable under this exact identity.
+            var unresolvedPhase = pending.Phase is
+                OperatorOperationPhase.UnknownReconciling
+                or OperatorOperationPhase.PossiblyExecuted
+                    ? pending.Phase
+                    : OperatorOperationPhase.UnknownReconciling;
+            ReplacePending(pending.OperationId, unresolvedPhase);
             RefreshPendingState();
         }
         catch (OperatorUnknownOutcomeException unknown)
@@ -721,7 +728,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// The answer is decoded into a typed outcome instead of being reported as an
     /// undifferentiated success. A typed Kernel refusal is shown as its own
     /// actionable reason — unsupported contract version, legacy encoding, stale
-    /// normalization revision, invalid or moved receipt, or semantic rejection —
+    /// normalization revision, owner unavailability, invalid or moved receipt,
+    /// or semantic rejection —
     /// and the retained owner bytes stay available for exact inspection. When the
     /// owner answer itself carries the versioned occurrence projection, the zone
     /// database revision, the resolved instant and offset and the applied fold or
@@ -731,10 +739,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// and never as normalized: a success banner is reachable only with owner
     /// evidence in hand.
     /// </remarks>
-    private void ShowUserAutomationResult(string action, JsonElement answer)
+    private void ShowUserAutomationResult(
+        string action,
+        JsonElement answer,
+        string expectedIdempotencyKey)
     {
         ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(answer) ?? string.Empty;
-        var outcome = UserAutomationOutcomeClassifier.Read(action, answer);
+        var outcome = UserAutomationOutcomeClassifier.Read(action, answer, expectedIdempotencyKey);
         ResultSummary = outcome.Detail;
         SetBanner(
             outcome.Title,
