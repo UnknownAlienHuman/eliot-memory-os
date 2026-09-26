@@ -1,19 +1,38 @@
 //! Governed exchange state machine for a replaceable Research bridge.
+//!
+//! Every job this state machine accepts carries a durable lifecycle record
+//! (`ExchangeJobLifecycleRecord`): exchange, request, job, Research system and
+//! protocol identity, the idempotency key, progress, cancellation state, the
+//! partial bundles already transferred, the coverage and failed-acquisition
+//! detail, the disclosure and invalidation state, and the terminal typed
+//! outcome. The live `ExchangeSnapshot` is only the process-local projection of
+//! that record; `lifecycle` is the owner's durable seam over the store-neutral
+//! ledger, so a retry resumes the same exchange by idempotency identity instead
+//! of duplicating a transfer.
 
 #![forbid(unsafe_code)]
 
 pub mod handoff;
+mod lifecycle;
+
+pub use lifecycle::DurableExchangeError;
 
 use std::collections::BTreeMap;
 
 use eliot_contracts::{ContractVersion, StateFence};
 use eliot_research_exchange_api::{
-    ResearchContractError, ResearchEvidenceBundle, ResearchExportBundle, ResearchQueryRequest,
+    ExchangeJobLifecycleRecord, GapContinuation, ResearchContractError, ResearchEvidenceBundle,
+    ResearchExportBundle, ResearchQueryRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const EXCHANGE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+
+/// Why a cancellation was recorded as issued, before the bridge was contacted.
+const CANCELLATION_REQUESTED_REASON: &str = "governed cancellation request";
+/// Why a cancellation was recorded as confirmed by the bridge.
+const CANCELLATION_CONFIRMED_REASON: &str = "bridge confirmed the governed cancellation";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -37,6 +56,11 @@ pub struct ExchangeJob {
     pub progress_units: u64,
     pub result: Option<ResearchEvidenceBundle>,
     pub failure: Option<String>,
+    /// The durable lifecycle record of this job. Progress, cancellation, partial
+    /// results, coverage, disclosure and the terminal typed outcome are written
+    /// through this record, so the live fields above never state a lifecycle
+    /// fact the durable record does not carry.
+    pub lifecycle: ExchangeJobLifecycleRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -152,6 +176,7 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             exchange_id: request.exchange_id.clone(),
             job_id: job_id.clone(),
             state_fence: request.state_fence.clone(),
+            lifecycle: ExchangeJobLifecycleRecord::opened(&request, &job_id)?,
             request,
             status: ExchangeStatus::Accepted,
             progress_units: 0,
@@ -192,8 +217,48 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         {
             return Err(ExchangeError::InvalidTransition);
         }
+        job.lifecycle = job.lifecycle.advanced(units)?;
         job.status = ExchangeStatus::Partial;
-        job.progress_units = job.progress_units.saturating_add(units);
+        job.progress_units = job.lifecycle.progress.spent_units;
+        Ok(job.clone())
+    }
+
+    /// Records verified partial evidence for a running job.
+    ///
+    /// I21.11: jobs expose partial results, so the durable record keeps what
+    /// this exchange already transferred under the bound job identity and an
+    /// interrupted exchange can report it instead of repeating the transfer. A
+    /// running job cannot present a closable disposition as partial work: only
+    /// a terminal close may, and only through the supported-close witness.
+    pub fn record_partial_bundle(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        units: u64,
+        bundle: &ResearchEvidenceBundle,
+    ) -> Result<ExchangeJob, ExchangeError> {
+        let job = self
+            .snapshot
+            .jobs
+            .get_mut(job_id)
+            .ok_or(ExchangeError::NotFound)?;
+        if job.state_fence != *fence
+            || !matches!(
+                job.status,
+                ExchangeStatus::Accepted | ExchangeStatus::Running | ExchangeStatus::Partial
+            )
+        {
+            return Err(ExchangeError::InvalidTransition);
+        }
+        bundle.validate_against(&job.request)?;
+        if bundle.disposition.may_close_inquiry() {
+            return Err(ExchangeError::Contract(
+                ResearchContractError::InvalidDisposition,
+            ));
+        }
+        job.lifecycle = job.lifecycle.with_partial(bundle, units)?;
+        job.status = ExchangeStatus::Partial;
+        job.progress_units = job.lifecycle.progress.spent_units;
         Ok(job.clone())
     }
 
@@ -207,23 +272,19 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             .get_mut(&bundle.job_id)
             .ok_or(ExchangeError::NotFound)?;
         bundle.validate_against(&job.request)?;
-        // A13.11: on budget exhaustion paid jobs stop while verified partial
-        // work AND the coverage gap remain. Fail closed: an exhausted bundle
-        // (spent progress reached the admitted budget) must carry an explicit
-        // BudgetExhausted gap entry; other gap kinds alone hide exhaustion
-        // and violate ARCH-RES-04 (degradation visible and local).
-        let exhausted = job.progress_units >= job.request.budget_units;
-        if exhausted && !bundle.has_budget_exhausted_gap() {
-            return Err(ExchangeError::Contract(
-                ResearchContractError::InvalidDisposition,
-            ));
-        }
         if !matches!(
             job.status,
             ExchangeStatus::Accepted | ExchangeStatus::Running | ExchangeStatus::Partial
         ) {
             return Err(ExchangeError::InvalidTransition);
         }
+        // A13.11: on budget exhaustion paid jobs stop while verified partial
+        // work AND the coverage gap remain. The durable record fails the close
+        // closed when a spent budget hides its exhaustion behind other gap
+        // kinds, so degradation stays visible and local (ARCH-RES-04).
+        job.lifecycle = job
+            .lifecycle
+            .closed(&bundle, GapContinuation::declared_by(&bundle))?;
         job.result = Some(bundle);
         job.status = ExchangeStatus::Completed;
         Ok(job.clone())
@@ -247,6 +308,13 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         {
             return Err(ExchangeError::InvalidTransition);
         }
+        // The issued cancellation is recorded durably before the bridge is
+        // contacted: an interruption in between leaves the job
+        // cancellation-unconfirmed instead of decoding as a clean stop.
+        job.lifecycle = job
+            .lifecycle
+            .cancellation_requested(CANCELLATION_REQUESTED_REASON)?;
+        job.status = ExchangeStatus::CancelRequested;
         self.bridge
             .cancel(job_id)
             .map_err(|_| ExchangeError::InvalidTransition)?;
@@ -255,6 +323,9 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             .jobs
             .get_mut(job_id)
             .ok_or(ExchangeError::NotFound)?;
+        job.lifecycle = job
+            .lifecycle
+            .cancellation_confirmed(CANCELLATION_CONFIRMED_REASON)?;
         job.status = ExchangeStatus::Cancelled;
         Ok(job.clone())
     }

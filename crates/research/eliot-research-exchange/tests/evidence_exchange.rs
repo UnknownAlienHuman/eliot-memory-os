@@ -31,6 +31,8 @@ const GOLDEN: &str = include_str!("data/evidence_exchange.json");
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const RECEIPT_SOURCE: &str = "src-a";
+const RECEIPT_REQUEST: &str = "req-700";
 
 const EXPIRES_MS: i64 = 1_900_000_000_000;
 const NOW_MS: i64 = 1_700_000_300_000;
@@ -177,22 +179,28 @@ fn exact_replay_versus_changed_same_id_payload() {
     let mut journal = ReceiptJournal::default();
     assert!(journal.is_empty());
     assert_eq!(
-        journal.ingest("rcpt-1", "op-1", DIGEST_A).expect("accept"),
+        journal
+            .ingest("rcpt-1", RECEIPT_SOURCE, RECEIPT_REQUEST, "op-1", DIGEST_A)
+            .expect("accept"),
         IngestOutcome::Accepted
     );
     assert_eq!(journal.len(), 1);
     assert_eq!(
-        journal.ingest("rcpt-1", "op-1", DIGEST_A).expect("replay"),
+        journal
+            .ingest("rcpt-1", RECEIPT_SOURCE, RECEIPT_REQUEST, "op-1", DIGEST_A)
+            .expect("replay"),
         IngestOutcome::ReplayDuplicate
     );
     assert_eq!(journal.len(), 1);
     assert!(matches!(
-        journal.ingest("rcpt-1", "op-1", DIGEST_B),
+        journal.ingest("rcpt-1", RECEIPT_SOURCE, RECEIPT_REQUEST, "op-1", DIGEST_B),
         Err(ExchangeError::IdempotencyConflict)
     ));
     assert_eq!(journal.len(), 1);
     assert_eq!(
-        journal.ingest("rcpt-2", "op-1", DIGEST_B).expect("second"),
+        journal
+            .ingest("rcpt-2", RECEIPT_SOURCE, RECEIPT_REQUEST, "op-1", DIGEST_B)
+            .expect("second"),
         IngestOutcome::Accepted
     );
     assert_eq!(journal.len(), 2);
@@ -204,7 +212,9 @@ fn exact_replay_versus_changed_same_id_payload() {
 #[test]
 fn possible_acquisition_after_timeout_requires_reconciliation() {
     let mut journal = ReceiptJournal::default();
-    journal.ingest("rcpt-1", "op-1", DIGEST_A).expect("accept");
+    journal
+        .ingest("rcpt-1", RECEIPT_SOURCE, RECEIPT_REQUEST, "op-1", DIGEST_A)
+        .expect("accept");
     let directive = journal.reconcile("op-1");
     assert_eq!(directive.wire_name(), "RECONCILE_VIA_ORIGINAL");
     assert_eq!(
