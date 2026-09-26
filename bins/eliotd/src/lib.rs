@@ -403,12 +403,19 @@ pub fn governed_improvement_pipeline_owner() -> &'static str {
 
 /// Routes one improvement candidate through the Governor-owned pipeline.
 ///
-/// Production caller of [`improvement_candidate_route::route_improvement_candidate`]
-/// (and transitively of `eliot_maintenance::run_improvement_candidate_pipeline`
-/// and `admit_improvement_candidate`). Pure thin forwarder for the
-/// candidate → experiment → independent evaluation → rejected-or-canary-admitted
-/// path (#1100/#18/#20); Kernel activation (#11) stays a handoff, never executed
-/// here.
+/// #2703: this function IS a caller of
+/// [`improvement_candidate_route::route_improvement_candidate`] (and
+/// transitively of `eliot_maintenance::run_improvement_candidate_pipeline` and
+/// `admit_improvement_candidate`), but it is NOT itself called from any live
+/// request path: `ImprovementRouteRequest` is never constructed in `bins/` or
+/// `crates/`. The typed result mapping behind this call is exhaustive and
+/// correct; the missing link is a production request source, which is #1145's
+/// owner scope. Do not cite this function as evidence that the improvement
+/// pipeline is wired into the daemon.
+///
+/// It remains a pure thin forwarder for the candidate → experiment → independent
+/// evaluation → rejected-or-canary-admitted path (#1100/#18/#20); Kernel
+/// activation (#11) stays a handoff, never executed here.
 pub fn govern_improvement_candidate(
     request: improvement_candidate_route::ImprovementRouteRequest<'_>,
 ) -> Result<eliot_maintenance::ImprovementTerminalDisposition, eliot_maintenance::PipelineError> {
@@ -1229,10 +1236,17 @@ impl DaemonComposition {
     }
 
     /// Returns a bounded status projection.
+    ///
+    /// #2703: this projection deliberately does NOT reference
+    /// `governed_improvement_pipeline_owner`. A previous revision bound it to
+    /// `let _improvement_owner = ...` and dropped it, which constructed a value
+    /// and discarded it — the construct-and-drop shape that is not a
+    /// production caller. The owner identity is reported for real, from
+    /// `daemon_runtime`'s startup diagnostic, so nothing is lost by removing
+    /// the dead reference here.
     #[must_use]
     pub fn status(&self) -> DaemonStatus {
         let snapshot = self.kernel_snapshot();
-        let _improvement_owner = governed_improvement_pipeline_owner();
         DaemonStatus {
             service: SERVICE_NAME.to_owned(),
             protocol: PROTOCOL_VERSION.to_owned(),
