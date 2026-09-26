@@ -12,7 +12,7 @@
 //! client, table, or semantic decoder: physical namespace, key layout and
 //! `SurrealQL` stay private to this module plus [`crate::schema`].
 //!
-//! Scope (B-DRM-S1 #775, full ledger edge): all twelve K0 operations are
+//! Scope (B-DRM-S1 #775, full ledger edge): all thirteen K0 operations are
 //! durably implemented with compare-and-swap exclusion and exact-replay vs
 //! changed-content discrimination. Every mutation commits record, monotonic
 //! event, unique operation-idempotency evidence and immutable receipt rows in
@@ -291,20 +291,25 @@ pub(crate) async fn dreamer_job(
     let db = crate::apply::client(adapter).await?;
     crate::apply::ensure_ready(adapter, db).await?;
     match &request.operation {
-        JobOperation::Submit { .. } => submit(adapter, db, ctx, request).await,
-        JobOperation::LeaseNext { .. } => op_lease_next(adapter, db, ctx, request).await,
-        JobOperation::LeaseExact { .. } => lease_exact(adapter, db, ctx, request).await,
-        JobOperation::Renew { .. } => op_renew(adapter, db, ctx, request).await,
-        JobOperation::Start { .. } => op_start(adapter, db, ctx, request).await,
-        JobOperation::Checkpoint { .. } => op_checkpoint(adapter, db, ctx, request).await,
-        JobOperation::Resume { .. } => op_resume(adapter, db, ctx, request).await,
+        JobOperation::Submit { .. } => Box::pin(submit(adapter, db, ctx, request)).await,
+        JobOperation::LeaseNext { .. } => Box::pin(op_lease_next(adapter, db, ctx, request)).await,
+        JobOperation::LeaseExact { .. } => Box::pin(lease_exact(adapter, db, ctx, request)).await,
+        JobOperation::Renew { .. } => Box::pin(op_renew(adapter, db, ctx, request)).await,
+        JobOperation::Start { .. } => Box::pin(op_start(adapter, db, ctx, request)).await,
+        JobOperation::Checkpoint { .. } => Box::pin(op_checkpoint(adapter, db, ctx, request)).await,
+        JobOperation::Resume { .. } => Box::pin(op_resume(adapter, db, ctx, request)).await,
         JobOperation::BeginVerification { .. } => {
-            op_begin_verification(adapter, db, ctx, request).await
+            Box::pin(op_begin_verification(adapter, db, ctx, request)).await
         }
-        JobOperation::Publish { .. } => op_publish(adapter, db, ctx, request).await,
+        JobOperation::Publish { .. } => Box::pin(op_publish(adapter, db, ctx, request)).await,
         JobOperation::Status { .. } => status(db, &adapter.config, ctx, request).await,
-        JobOperation::RequestCancel { .. } => op_request_cancel(adapter, db, ctx, request).await,
+        JobOperation::RequestCancel { .. } => {
+            Box::pin(op_request_cancel(adapter, db, ctx, request)).await
+        }
         JobOperation::Reconcile { .. } => op_reconcile(adapter, db, ctx, request).await,
+        JobOperation::RecordApplicability { .. } => {
+            Box::pin(op_record_applicability(adapter, db, ctx, request)).await
+        }
     }
 }
 
@@ -367,6 +372,7 @@ async fn submit(
         checkpoint: None,
         result_under_verification: None,
         outcome: None,
+        applicability_history: Vec::new(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -397,6 +403,7 @@ async fn submit(
         active_lease: None,
         lease_history: Vec::new(),
         result_under_verification: None,
+        applicability_history: Vec::new(),
         last_mutation: mutation.clone(),
         last_receipt_id: Some(receipt_id.clone()),
         record_digest: "0".repeat(64),
@@ -614,6 +621,7 @@ async fn lease_exact(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: None,
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -748,6 +756,147 @@ async fn lease_exact(
     }
 }
 
+/// Appends one requester-owned applicability disposition against the immutable
+/// terminal output already stored on this job attempt. The operation records
+/// the observed current fence but never retargets the original source fence or
+/// changes execution state, revision, or outcome.
+async fn op_record_applicability(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::RecordApplicability { update } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Requester {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &update.job_id.to_string(),
+        &update.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    let expected_applicability_revision = ledger
+        .applicability_history
+        .last()
+        .map_or(0, |revision| revision.revision);
+    if update.expected_applicability_revision != expected_applicability_revision {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    if ledger.applicability_history.len() >= MAX_DREAMER_JOB_HISTORY {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    if let Some(previous) = ledger.applicability_history.last() {
+        use eliot_protocol::dreamer_job::OutputApplicabilityDisposition as Disposition;
+        if matches!(previous.disposition, Disposition::Stale)
+            && !matches!(update.disposition, Disposition::Stale)
+        {
+            return Err(AdapterError::Store(StoreError::RevisionConflict));
+        }
+        if matches!(previous.disposition, Disposition::NotApplicable)
+            && matches!(update.disposition, Disposition::Unknown)
+        {
+            return Err(AdapterError::Store(StoreError::RevisionConflict));
+        }
+    }
+    let applicability_revision = expected_applicability_revision
+        .checked_add(1)
+        .ok_or(AdapterError::Store(StoreError::PayloadTooLarge))?;
+    let applicability = eliot_protocol::dreamer_job::JobOutputApplicabilityRevision::from_update(
+        update,
+        &ledger.record,
+        applicability_revision,
+    )
+    .map_err(map_durable_error)
+    .map_err(AdapterError::Store)?;
+    let expected_outer = job_row.revision;
+    ledger.applicability_history.push(applicability);
+    let (ledger, event, response) = prepare_applicability_mutation(&request, ledger)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+fn prepare_applicability_mutation(
+    request: &DurableJobRequest,
+    mut ledger: DreamerJobLedgerRecord,
+) -> Result<
+    (
+        DreamerJobLedgerRecord,
+        DreamerJobLedgerEvent,
+        DurableJobResponse,
+    ),
+    AdapterError,
+> {
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(request);
+    ledger.last_receipt_id = Some(validated_id(receipt_id_text(
+        &request.request_identity.operation.operation_id,
+    ))?);
+    let receipt_id = ledger
+        .last_receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state: ledger.record.state,
+        next_state: ledger.record.state,
+        prior_revision: ledger.record.revision,
+        next_revision: ledger.record.revision,
+        event_cursor: ledger.event_cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: ledger.active_lease.clone(),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        mutation: mutation_identity(request),
+        receipt_id: Some(receipt_id.clone()),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: ledger.record.state,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(receipt_id),
+        lease: ledger.active_lease.clone(),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        outcome: ledger.record.outcome.clone(),
+        applicability_history: ledger.applicability_history.clone(),
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    Ok((ledger, event, response))
+}
+
 async fn status(
     db: &client::RpcTransport,
     config: &crate::config::SurrealAdapterConfig,
@@ -793,6 +942,7 @@ async fn status(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: ledger.record.outcome.clone(),
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1136,6 +1286,7 @@ async fn op_lease_next(
         checkpoint: None,
         result_under_verification: None,
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: coverage,
         selection_frontier: Some(ledger.queue_key.clone()),
     };
@@ -1244,6 +1395,7 @@ async fn op_renew(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: ledger.record.outcome.clone(),
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1352,6 +1504,7 @@ async fn op_start(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: None,
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1511,6 +1664,7 @@ async fn op_checkpoint(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: None,
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1623,6 +1777,7 @@ async fn op_resume(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: None,
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1731,6 +1886,7 @@ async fn op_begin_verification(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1848,6 +2004,7 @@ async fn op_publish(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: None,
         outcome: ledger.record.outcome.clone(),
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1970,6 +2127,7 @@ async fn op_request_cancel(
         checkpoint: ledger.record.checkpoint.clone(),
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: None,
+        applicability_history: ledger.applicability_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -2082,6 +2240,7 @@ async fn op_reconcile(
             checkpoint: ledger.record.checkpoint.clone(),
             result_under_verification: ledger.result_under_verification.clone(),
             outcome: ledger.record.outcome.clone(),
+            applicability_history: ledger.applicability_history.clone(),
             selection_coverage: Vec::new(),
             selection_frontier: None,
         };
@@ -2126,6 +2285,7 @@ async fn op_reconcile(
             checkpoint: ledger.record.checkpoint.clone(),
             result_under_verification: ledger.result_under_verification.clone(),
             outcome: ledger.record.outcome.clone(),
+            applicability_history: ledger.applicability_history.clone(),
             selection_coverage: Vec::new(),
             selection_frontier: None,
         };
@@ -2285,7 +2445,7 @@ async fn cas_job_plus_three(
 }
 
 /// Full capability denominator: every closed K0 operation is implemented and
-/// advertised. The match is exhaustive (no wildcard) so a future thirteenth
+/// advertised. The match is exhaustive (no wildcard) so a future fourteenth
 /// operation variant fails the build instead of silently defaulting.
 #[must_use]
 pub(crate) fn is_supported_operation(operation: &JobOperation) -> bool {
@@ -2303,6 +2463,7 @@ pub(crate) fn is_supported_operation(operation: &JobOperation) -> bool {
             | JobOperation::Status { .. }
             | JobOperation::RequestCancel { .. }
             | JobOperation::Reconcile { .. }
+            | JobOperation::RecordApplicability { .. }
     )
 }
 

@@ -316,7 +316,8 @@ fn dreamer_operation_effect(operation: &JobOperation) -> DreamerOperationEffect 
         | JobOperation::BeginVerification { .. }
         | JobOperation::Publish { .. }
         | JobOperation::RequestCancel { .. }
-        | JobOperation::Reconcile { .. } => DreamerOperationEffect::Mutation,
+        | JobOperation::Reconcile { .. }
+        | JobOperation::RecordApplicability { .. } => DreamerOperationEffect::Mutation,
     }
 }
 

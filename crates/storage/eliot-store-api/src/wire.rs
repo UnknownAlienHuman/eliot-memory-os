@@ -81,6 +81,8 @@ pub const CAPABILITY_DREAMER_JOB_PUBLISH: &str = "store.dreamer_job.publish";
 pub const CAPABILITY_DREAMER_JOB_STATUS: &str = "store.dreamer_job.status";
 pub const CAPABILITY_DREAMER_JOB_REQUEST_CANCEL: &str = "store.dreamer_job.request_cancel";
 pub const CAPABILITY_DREAMER_JOB_RECONCILE: &str = "store.dreamer_job.reconcile";
+pub const CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY: &str =
+    "store.dreamer_job.record_applicability";
 
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
@@ -106,6 +108,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_DREAMER_JOB_STATUS,
     CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
     CAPABILITY_DREAMER_JOB_RECONCILE,
+    CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
 ];
 
 /// Returns the exact per-operation capability for one closed Dreamer job
@@ -129,6 +132,7 @@ pub fn dreamer_job_capability(
         Op::Status { .. } => CAPABILITY_DREAMER_JOB_STATUS,
         Op::RequestCancel { .. } => CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
         Op::Reconcile { .. } => CAPABILITY_DREAMER_JOB_RECONCILE,
+        Op::RecordApplicability { .. } => CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
     }
 }
 

@@ -2546,6 +2546,7 @@ fn case_20_malformed_and_delegation() {
             JobOperationKind::Status => CAPABILITY_DREAMER_JOB_STATUS,
             JobOperationKind::RequestCancel => CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
             JobOperationKind::Reconcile => CAPABILITY_DREAMER_JOB_RECONCILE,
+            JobOperationKind::RecordApplicability => "store.dreamer_job.record_applicability",
         };
         assert_eq!(observed, expected);
         assert!(observed.starts_with("store.dreamer_job."));
