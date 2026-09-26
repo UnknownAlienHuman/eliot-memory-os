@@ -63,13 +63,16 @@ pub use resolver::{
 pub use scanner::{
     AdapterEvidence, ArtifactDirEvidence, BootstrapDiscoveryInputs, BootstrapScanEvidence,
     BootstrapScanOutcome, BootstrapScanner, ChangeSummary, DiscoveryLeaseKey,
-    DiscoveryLeaseRequest, DiscoveryOperation, DurableScanDisclosureStore, EditorWorkspaceEvidence,
-    ExistingRecordEvidence, FileTypeCount, ForbiddenScanClass, MAX_DISCOVERY_CONSUMPTION,
-    ManifestEvidence, OnboardingRecommendation, PrivacyBoundary, ProvisionalScopeProfile,
-    RegisteredBuildProfile, RootServiceEvidence, SCAN_PRIVACY_BOUNDARY_REQUIRED,
-    ScanDisclosureReceipt, ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs,
-    authorize_operation, candidate_source_roles, derive_lease_ref, issue_discovery_lease,
-    run_bootstrap_discovery, run_bootstrap_discovery_durable,
+    DiscoveryLeaseRequest, DiscoveryOperation, EditorWorkspaceEvidence, ExistingRecordEvidence,
+    FileTypeCount, ForbiddenScanClass, LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX,
+    LooseScanQuarantine, MAX_DISCOVERY_CONSUMPTION, ManifestEvidence, OnboardingRecommendation,
+    PrivacyBoundary, ProvisionalScopeProfile, RegisteredBuildProfile, RootServiceEvidence,
+    SCAN_DISCLOSURE_OPERATION_DOMAIN, SCAN_DISCLOSURE_SCHEMA_VERSION,
+    SCAN_PRIVACY_BOUNDARY_REQUIRED, ScanDisclosureOwnerBinding, ScanDisclosureReceipt,
+    ScanDisclosureStore, ScanReceiptDiagnosticView, ScanReceiptHandle, ScanReceiptRetention,
+    ScanRetentionPolicy, ScannerResolverInputs, authorize_operation, candidate_source_roles,
+    derive_lease_ref, issue_discovery_lease, quarantine_loose_scan_disclosure,
+    run_bootstrap_discovery,
 };
 pub use transition::{
     CandidateRecordStanding, ScopeTransition, ScopeTransitionKind, ScopeTransitionReceipt,
@@ -503,8 +506,24 @@ pub enum WorkScopeError {
     BindingReceiptNotMatched,
     #[error("scope binding guard receipt does not match the retained binding")]
     BindingReceiptMismatch,
-    #[error("scan disclosure receipt cannot be durably captured")]
-    DisclosureCaptureFailed,
+    #[error("scan disclosure storage contour is not admitted by the installation owner")]
+    ScanContourNotAdmitted,
+    #[error("scan disclosure identity conflicts with the retained owner record")]
+    ScanIdentityConflict,
+    #[error("scan disclosure owner record is missing")]
+    ScanReceiptMissing,
+    #[error("scan disclosure owner record is inaccessible")]
+    ScanReceiptInaccessible,
+    #[error("scan disclosure owner record is corrupt")]
+    ScanReceiptCorrupt,
+    #[error("scan disclosure owner record was replaced")]
+    ScanReceiptReplaced,
+    #[error("scan disclosure owner record is stale for this binding")]
+    ScanReceiptStale,
+    #[error("scan disclosure owner record was invalidated by retention policy")]
+    ScanReceiptInvalidated,
+    #[error("scan disclosure write outcome is unknown; reconcile the original operation")]
+    ScanReceiptUnknownCommit,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
@@ -1078,6 +1097,13 @@ pub struct OnboardingReadinessReceipt {
     pub maintenance_recommendations: Vec<String>,
     /// Lease deadline carried as the receipt expiry.
     pub expiry_tick: u64,
+    /// Owner record commitment of the durable scan disclosure receipt that
+    /// fed this readiness compilation, when a trigger scan ran before
+    /// compilation. Absent (explicit `None`, never defaulted) when no scan
+    /// fed the receipt. A live terminal readiness receipt carries the exact
+    /// commitment the owner store returned; no in-memory-only or loose-file
+    /// reference is ever recorded here.
+    pub scan_receipt_ref: Option<String>,
 }
 
 impl OnboardingReadinessReceipt {
@@ -1200,6 +1226,7 @@ impl OnboardingReadinessReceipt {
         if let Some(store) = &receipt.store_identity_ref {
             text(store, "store_identity_ref")?;
         }
+        receipt.validate_scan_evidence()?;
         Self::check_refs(
             &receipt.minimum_understanding_seed,
             "minimum_understanding_seed",
@@ -1215,6 +1242,18 @@ impl OnboardingReadinessReceipt {
             "maintenance_recommendations",
             8,
         )
+    }
+
+    /// Validates the durable scan evidence reference of one receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a present scan receipt reference is blank.
+    fn validate_scan_evidence(&self) -> Result<(), WorkScopeError> {
+        if let Some(scan_receipt) = &self.scan_receipt_ref {
+            text(scan_receipt, "scan_receipt_ref")?;
+        }
+        Ok(())
     }
 
     fn check_refs(
@@ -1392,6 +1431,9 @@ impl ColdStartController {
     /// the privacy boundary; [`WorkScopeError::SourceSetMismatch`] when the
     /// governing sources do not close over the scope; and the usual text,
     /// counter or collection errors when task or receipt fields are invalid.
+    /// A supplied scan handle is validated and its owner record commitment is
+    /// recorded as the receipt's scan evidence reference; an absent handle
+    /// leaves the reference explicitly empty.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         &self,
@@ -1418,6 +1460,7 @@ impl ColdStartController {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<OnboardingReadinessReceipt, WorkScopeError> {
         let receipt_ref = receipt_ref.into();
@@ -1436,6 +1479,12 @@ impl ColdStartController {
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy, lease)?;
         let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
             Self::resolve_task_binding(task)?;
+        let scan_receipt_ref = scan_receipt
+            .map(|handle| {
+                handle.validate()?;
+                Ok::<_, WorkScopeError>(handle.record_commitment.clone())
+            })
+            .transpose()?;
         let governing_source_set_ref = format!(
             "governing-source-set:{}:{}",
             sources.scope_ref, sources.generation
@@ -1490,6 +1539,7 @@ impl ColdStartController {
             ),
             maintenance_recommendations: Self::maintenance_for(readiness),
             expiry_tick: lease.deadline,
+            scan_receipt_ref,
         };
         receipt.validate()?;
         Ok(receipt)
@@ -1500,7 +1550,10 @@ impl ColdStartController {
     ///
     /// The caller supplies fresh identities for the new lease; the previous
     /// receipt is validated and left untouched, and the new receipt carries
-    /// `previous.receipt_revision + 1`.
+    /// `previous.receipt_revision + 1`. A fresh scan handle replaces the scan
+    /// evidence reference; without one the previous scan evidence reference
+    /// is preserved verbatim, so invalidation revisions never lose the owner
+    /// receipt that fed the original compilation.
     ///
     /// # Errors
     ///
@@ -1536,6 +1589,7 @@ impl ColdStartController {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<OnboardingReadinessReceipt, WorkScopeError> {
         previous.validate()?;
@@ -1568,9 +1622,15 @@ impl ColdStartController {
             projection_generation,
             privacy,
             task,
+            scan_receipt,
             now,
         )?;
         receipt.receipt_revision = previous.receipt_revision + 1;
+        if scan_receipt.is_none() {
+            receipt
+                .scan_receipt_ref
+                .clone_from(&previous.scan_receipt_ref);
+        }
         receipt.validate()?;
         Ok(receipt)
     }
@@ -1640,9 +1700,11 @@ impl ColdStartController {
     /// This is the controller's scanner invocation: the trigger's read set is
     /// authorized and bound to the scan evidence first, then
     /// [`BootstrapScanner::scan`] runs the deterministic model-free pass
-    /// (lease-key binding, forbidden-operation guard, lease charging, durable
-    /// receipt write). No trigger reaches the scanner past an unadmitted or
-    /// unattested read.
+    /// (owner-binding admission, lease-key binding, forbidden-operation guard,
+    /// lease charging, durable receipt write through the installation-bound
+    /// store). No trigger reaches the scanner past an unadmitted or
+    /// unattested read, and no trigger scan completes without the owner
+    /// receipt.
     ///
     /// # Errors
     ///
@@ -1655,6 +1717,7 @@ impl ColdStartController {
         discovery_lease: &mut DiscoveryReadLease,
         lease_key: &DiscoveryLeaseKey,
         store: &mut impl ScanDisclosureStore,
+        binding: &ScanDisclosureOwnerBinding,
         candidate_privacy: PrivacyClass,
         privacy_boundary: Option<&PrivacyBoundary>,
         evidence: &BootstrapScanEvidence,
@@ -1671,6 +1734,7 @@ impl ColdStartController {
             discovery_lease,
             lease_key,
             store,
+            binding,
             candidate_privacy,
             privacy_boundary,
             evidence,
@@ -2578,6 +2642,7 @@ impl OnboardingSingleFlight {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<LeaseJoin, CompileDriverError> {
         let created_ref = proposed.lease_ref.clone();
@@ -2617,6 +2682,7 @@ impl OnboardingSingleFlight {
                     projection_generation,
                     privacy,
                     task,
+                    scan_receipt,
                     now,
                 )?;
                 if let Some(entry) = self
@@ -2724,6 +2790,7 @@ impl OnboardingSingleFlight {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<LeaseJoin, CompileDriverError> {
         match self.invalidate(lease_ref, observed, now)? {
@@ -2797,6 +2864,7 @@ impl OnboardingSingleFlight {
                     projection_generation,
                     privacy,
                     task,
+                    scan_receipt,
                     now,
                 )?;
                 self.publish_fresh(&created_ref, receipt, now)
@@ -2975,7 +3043,9 @@ impl WorkScopeBindingOwner {
 mod tests {
     #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_contracts::{
+        EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
+    };
     use serde::de::DeserializeOwned;
     use std::num::NonZeroU64;
 
@@ -3399,6 +3469,7 @@ mod tests {
             1,
             &privacy,
             task,
+            None,
             1,
         )
     }
@@ -3643,21 +3714,110 @@ mod tests {
         }
     }
 
+    fn bootstrap_binding() -> ScanDisclosureOwnerBinding {
+        ScanDisclosureOwnerBinding {
+            installation_id: "installation:one".into(),
+            principal_ref: "proposer:one".into(),
+            session_ref: "session:one".into(),
+            host_generation_ref: "host:one:gen:1".into(),
+            lease_ref: "discovery-lease:proposer:one:session:one:host:one:root:a".into(),
+            candidate_root_ref: "root:a".into(),
+            privacy_boundary_ref: "boundary:one".into(),
+            state_fence_ref: None,
+            authority_epoch_ref: None,
+            operation_id: "scan-op:one".into(),
+            idempotency_key: "scan-idem:one".into(),
+            lease_consumed: 0,
+            policy_revision: 1,
+            deadline: 10,
+        }
+    }
+
     struct TestReceiptStore {
         stored: Vec<ScanDisclosureReceipt>,
+        handles: Vec<(String, ScanReceiptHandle)>,
     }
 
     impl ScanDisclosureStore for TestReceiptStore {
         fn store_receipt(
             &mut self,
+            binding: &ScanDisclosureOwnerBinding,
             receipt: &ScanDisclosureReceipt,
         ) -> Result<ScanReceiptHandle, WorkScopeError> {
+            binding.admit()?;
             receipt.validate()?;
-            self.stored.push(receipt.clone());
-            Ok(ScanReceiptHandle {
+            let bytes = canonical_json_bytes(receipt)
+                .map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
+            let receipt_digest = sha256_hex(&bytes);
+            let handle = ScanReceiptHandle {
                 receipt_ref: receipt.scan_ref.clone(),
-                store_ref: format!("durable:{}", self.stored.len()),
-            })
+                store_ref: format!("test:{}", binding.operation_key()),
+                owner_ref: binding.owner_ref(),
+                record_commitment: binding.record_commitment(&receipt_digest),
+                receipt_digest,
+                schema_version: SCAN_DISCLOSURE_SCHEMA_VERSION,
+                writer_receipt_ref: format!("test-write:{}", binding.operation_id),
+                retention: ScanReceiptRetention::Active,
+            };
+            handle.validate()?;
+            self.stored.push(receipt.clone());
+            self.handles.push((binding.operation_key(), handle.clone()));
+            Ok(handle)
+        }
+
+        fn readback(
+            &self,
+            handle: &ScanReceiptHandle,
+            binding: &ScanDisclosureOwnerBinding,
+        ) -> Result<ScanDisclosureReceipt, WorkScopeError> {
+            handle.validate()?;
+            binding.admit()?;
+            let position = self
+                .handles
+                .iter()
+                .position(|(_, stored)| stored.record_commitment == handle.record_commitment)
+                .ok_or(WorkScopeError::ScanReceiptMissing)?;
+            let receipt = self.stored[position].clone();
+            if binding.lease_ref != receipt.lease_ref {
+                return Err(WorkScopeError::ScanReceiptStale);
+            }
+            Ok(receipt)
+        }
+
+        fn reconcile(
+            &mut self,
+            binding: &ScanDisclosureOwnerBinding,
+        ) -> Result<ScanReceiptHandle, WorkScopeError> {
+            binding.admit()?;
+            self.handles
+                .iter()
+                .find(|(key, _)| *key == binding.operation_key())
+                .map(|(_, handle)| handle.clone())
+                .ok_or(WorkScopeError::ScanReceiptUnknownCommit)
+        }
+
+        fn retire(
+            &mut self,
+            handle: &ScanReceiptHandle,
+            binding: &ScanDisclosureOwnerBinding,
+            policy: &ScanRetentionPolicy,
+        ) -> Result<ScanReceiptHandle, WorkScopeError> {
+            handle.validate()?;
+            binding.admit()?;
+            policy.validate()?;
+            let retired = self
+                .handles
+                .iter_mut()
+                .find(|(_, stored)| stored.record_commitment == handle.record_commitment)
+                .map(|(_, stored)| {
+                    stored.retention = ScanReceiptRetention::Retired {
+                        policy_revision: policy.policy_revision,
+                    };
+                    stored.clone()
+                })
+                .ok_or(WorkScopeError::ScanReceiptMissing)?;
+            retired.validate()?;
+            Ok(retired)
         }
     }
 
@@ -3672,9 +3832,13 @@ mod tests {
     #[test]
     fn a1_valid_lease_bootstrap_returns_profile_and_receipt_with_allowed_classes_only() {
         let mut lease = bootstrap_lease();
-        let mut store = TestReceiptStore { stored: Vec::new() };
+        let mut store = TestReceiptStore {
+            stored: Vec::new(),
+            handles: Vec::new(),
+        };
         let outcome = match run_bootstrap_discovery(
             &mut store,
+            &bootstrap_binding(),
             &mut lease,
             &bootstrap_key(),
             &bootstrap_discovery(Some(bootstrap_boundary())),
@@ -3721,9 +3885,13 @@ mod tests {
     #[test]
     fn a2_missing_boundary_returns_boundary_required_with_question_only() {
         let mut lease = bootstrap_lease();
-        let mut store = TestReceiptStore { stored: Vec::new() };
+        let mut store = TestReceiptStore {
+            stored: Vec::new(),
+            handles: Vec::new(),
+        };
         let outcome = match run_bootstrap_discovery(
             &mut store,
+            &bootstrap_binding(),
             &mut lease,
             &bootstrap_key(),
             &bootstrap_discovery(None),

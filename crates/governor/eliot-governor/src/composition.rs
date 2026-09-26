@@ -24,6 +24,7 @@ use crate::owner_closure_feed::{
     OwnerPublishPort, synchronize_owner_feed, synchronize_owner_feed_with_canonical_receipts,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::scan_disclosure_owner::InstallationScanDisclosureStore;
 use crate::scope_identity_admission::{
     ensure_snapshot_fresh, guard_recovery_error, require_fresh_matched_binding,
 };
@@ -92,18 +93,18 @@ use eliot_workscope::{
     AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    IdentityEvidence, IdentityLegOutcome, LeaseJoin, MaterialAdmission, MaterialReadinessInputs,
-    ObservedScopeResources, OnboardingLease, OnboardingSingleFlight, PrivacyBoundary,
-    PrivacyProfile, ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect,
-    ResolutionAuthentication, ResolutionRequest, ScanDisclosureStore, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
-    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
-    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
-    WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
-    evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt,
+    IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
+    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
+    PrivacyBoundary, PrivacyProfile, ReadinessLifecycle, RepositoryLineageIdentity,
+    RequestedEffect, ResolutionAuthentication, ResolutionRequest, ScanDisclosureOwnerBinding,
+    ScanReceiptHandle, ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition,
+    ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeRelocationOrAttachReceipt, ScopeResolution,
+    SourceAdmissionRequest, TaskBindingInput, TaskBindingState, TaskIntakeCandidate,
+    TaskSelectionRequired, TriggerAdmission, TriggerReport, WorkScopeBindingOwner,
+    WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor,
+    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity,
+    admit_at_trigger, admit_initial_binding, check_at_trigger, evaluate_material_request,
+    issue_resolution_receipt, produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -5088,31 +5089,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Runs one I4.4.1 cold-start trigger's discovery pass through the
     /// privacy-bounded scanner (issue #1790, cold-start trigger production
-    /// caller).
+    /// caller; issue #2900, installation-bound durable owner).
     ///
     /// Owning thin entry for attach/onboarding ingress: the caller names the
     /// trigger (first project open, attach/launch, unknown workspace,
     /// onboarding request, stale generation, or resume without a current
-    /// task) and supplies the discovery lease, lease key, disclosure store,
-    /// privacy boundary, scan evidence and identity inputs the trigger's
-    /// scanner pass requires. The pass runs
-    /// [`ColdStartController::run_trigger_scan`]: the trigger's read set is
-    /// authorized against the discovery lease and bound to the scan evidence
-    /// first, and only then does [`BootstrapScanner::scan`] run. No trigger
-    /// reaches the scanner past an unadmitted or unattested read.
+    /// task) and supplies the discovery lease, lease key, owner-bound
+    /// disclosure store, owner binding, privacy boundary, scan evidence and
+    /// identity inputs the trigger's scanner pass requires. The store is the
+    /// installation-bound durable owner, never a caller-chosen directory or
+    /// an in-memory fallback: the pass in [`ColdStartController::run_trigger_scan`]
+    /// authorizes the trigger's read set against the discovery lease and
+    /// binds it to the scan evidence first, admits the owner binding, and
+    /// only then does [`BootstrapScanner::scan`] run and durably persist the
+    /// receipt through the owner. No trigger reaches the scanner past an
+    /// unadmitted or unattested read, and no trigger scan completes without
+    /// the owner receipt.
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the scanner inputs yet (BLOCKED-BY
     /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
     /// discovery lease).
     #[allow(
         clippy::too_many_arguments,
-        reason = "trigger scan carries the trigger, lease, key, store, privacy, evidence, and identity inputs in one fail-closed entry"
+        reason = "trigger scan carries the trigger, lease, key, owner store, owner binding, privacy, evidence, and identity inputs in one fail-closed entry"
     )]
     pub fn run_cold_start_trigger_scan(
         trigger: ColdStartTrigger,
         discovery_lease: &mut DiscoveryReadLease,
         lease_key: &DiscoveryLeaseKey,
-        store: &mut impl ScanDisclosureStore,
+        store: &mut InstallationScanDisclosureStore,
+        binding: &ScanDisclosureOwnerBinding,
         candidate_privacy: PrivacyClass,
         privacy_boundary: Option<&PrivacyBoundary>,
         evidence: &BootstrapScanEvidence,
@@ -5127,6 +5133,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             discovery_lease,
             lease_key,
             store,
+            binding,
             candidate_privacy,
             privacy_boundary,
             evidence,
@@ -5137,6 +5144,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             now,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Quarantines one loose `scan-disclosure-*.json` capture left by the
+    /// retired caller-chosen directory implementation (issue #2900,
+    /// migration ingress).
+    ///
+    /// Owning thin entry for attach/onboarding ingress: the caller hands over
+    /// the suspected filename and its bytes, and the installation-bound store
+    /// classifies the file without adopting it. A matching filename alone is
+    /// not owner provenance, so even well-formed bytes stay quarantined for
+    /// the migration owner instead of becoming readable evidence.
+    pub fn quarantine_loose_scan_disclosure_capture(
+        store: &InstallationScanDisclosureStore,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<LooseScanQuarantine, CompositionError> {
+        store
+            .quarantine_loose_capture(file_name, bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
     /// Joins one I4.4.1 trigger to the retained cold-start single-flight
@@ -5192,14 +5218,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
     /// the retained registry (issue #1790, cold-start compilation production
-    /// caller).
+    /// caller; issue #2900, durable scan receipt reference).
     ///
     /// The trigger that creates the lease compiles exactly one
     /// [`eliot_workscope::OnboardingReadinessReceipt`] through
     /// [`ColdStartController::compile`] before the first scope-sensitive work
     /// and publishes it as the lease terminal, so compatible concurrent
     /// attaches receive the same receipt and no worker independently creates
-    /// a second `WorkScope` or "latest task" while the lease is active. An
+    /// a second `WorkScope` or "latest task" while the lease is active. A
+    /// supplied scan handle binds the terminal receipt to the exact durable
+    /// scan receipt that fed the compilation; without one the scan evidence
+    /// reference stays explicitly empty, never an in-memory or loose-file
+    /// fallback. An
     /// already-terminal lease returns its `JoinedTerminal` surface without
     /// recompiling; a lease owned by an in-flight trigger returns `Joined`
     /// without a second compilation.
@@ -5238,6 +5268,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan_receipt: Option<&ScanReceiptHandle>,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -5270,6 +5301,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 projection_generation,
                 privacy,
                 task,
+                scan_receipt,
                 now,
             )
             .map_err(|error| CompositionError::Recovery(error.to_string()))
@@ -9207,6 +9239,7 @@ mod tests {
                 1,
                 &privacy,
                 task,
+                None,
                 1,
             )
             .expect("readiness receipt");

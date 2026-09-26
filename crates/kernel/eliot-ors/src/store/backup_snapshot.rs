@@ -200,6 +200,8 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::RestoreJournalResults),
         // Journal meta is linkage evidence.
         RowFamilyDisposition::of(RowFamilyKind::RestoreJournalMeta),
+        // Scan disclosure receipts are evidence, never live scan state (#2900).
+        RowFamilyDisposition::of(RowFamilyKind::ScanDisclosure),
     ]
 }
 

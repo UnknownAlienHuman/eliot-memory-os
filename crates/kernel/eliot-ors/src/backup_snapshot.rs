@@ -185,6 +185,11 @@ pub enum RowFamilyKind {
     RestoreJournalIntents,
     RestoreJournalResults,
     RestoreJournalMeta,
+    /// Durable scan disclosure receipts (issue #2900): one row per
+    /// `scan-disclosure:<installation>:<operation>` identity. Evidence, not
+    /// live state: backup/export preserves the family under policy, import
+    /// never restores scan state.
+    ScanDisclosure,
 }
 /// Backup disposition of one row family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -207,7 +212,8 @@ impl RowFamilyKind {
             | Self::ActivationLifecycle
             | Self::ActivationResultRetention
             | Self::NativeWorkerClaims
-            | Self::CutoverOwnership => RowDisposition::NonrestorableHistorical,
+            | Self::CutoverOwnership
+            | Self::ScanDisclosure => RowDisposition::NonrestorableHistorical,
             // Everything else, including the #269 process-stream recovery
             // family, is `Restorable`. That word only means eligible for the
             // family's own quarantined import: the sole durable import for a

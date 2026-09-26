@@ -5099,3 +5099,247 @@ impl ProviderCapabilityLookup {
             && record.operation_id.as_str() == self.operation_id
     }
 }
+
+/// Stable ORS record-type name of one durable scan disclosure record.
+///
+/// It is published rather than spelled as a literal at the call site so the
+/// Governor scan-disclosure adapter can name the I5.27 identity-conflict
+/// signal by this contract instead of by a second copy of the same string.
+pub const SCAN_DISCLOSURE_RECORD_TYPE: &str = "scan_disclosure";
+
+/// Bounded canonical receipt payload of one scan disclosure record.
+///
+/// Scan disclosure receipts carry bounded references and class dispositions
+/// only (I4.3.1 intake shapes); 64 KiB is a hard ceiling, never a target.
+pub const MAX_SCAN_DISCLOSURE_RECEIPT_BYTES: usize = 64 * 1024;
+
+/// Bounded page size for historical scan disclosure reads.
+pub const MAX_SCAN_DISCLOSURE_PAGE: u16 = 64;
+
+/// Lifecycle of one durable scan disclosure record.
+///
+/// `Prepared` is the atomic-stage state: durable but not yet published at the
+/// final content address. A crash between stage and commit leaves `Prepared`,
+/// which reconciles the original operation instead of poisoning the key.
+/// `Committed` is the final addressable answer. `Retired` and `Superseded`
+/// mark retention without deleting evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanDisclosureRecordState {
+    Prepared,
+    Committed,
+    Retired,
+    Superseded,
+}
+
+/// Outcome of staging one durable scan disclosure record.
+///
+/// The disposition names what the durable row says about the request, never a
+/// retry policy: `AlreadyBound` is the exact-replay answer for one operation
+/// identity, and the durable winner it carries is the record the caller must
+/// answer from. The winner is boxed so this two-variant disposition stays
+/// small next to `Stored` instead of being sized by the record it may carry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScanDisclosureStageOutcome {
+    /// This candidate is now the durable `Prepared` row under its key.
+    Stored,
+    /// An already-durable row owns this operation key under the same
+    /// binding. The carried record is the durable winner.
+    AlreadyBound(Box<ScanDisclosureOrsRecord>),
+}
+
+/// One durable scan disclosure record (issue #2900).
+///
+/// ORS stores the owner-admitted write identity and the exact canonical
+/// receipt bytes verbatim and interprets no scan, class, fence or recovery
+/// meaning: every binding field is an opaque shape-admitted string, and the
+/// receipt bytes are re-hashed against their digest on every read. A changed
+/// privacy boundary, governing-source generation, root identity or scanner
+/// schema arrives as a new operation key; this row is never mutated into a
+/// different answer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanDisclosureOrsRecord {
+    /// ORS wire/storage contract version of this row. A row written under
+    /// another version fails its read closed instead of being reinterpreted
+    /// as the same answer.
+    pub contract_version: u16,
+    /// Durable key: `scan-disclosure:<installation>:<operation>`.
+    pub operation_key: String,
+    /// Idempotency key admitted with this write.
+    pub idempotency_key: String,
+    /// Canonical request hash binding the exact receipt bytes to this write
+    /// identity (I5.27). Reusing the key with a different value is an
+    /// identity conflict, never a silent overwrite of the bound row.
+    pub request_hash: String,
+    /// Installation that owns the storage contour.
+    pub installation_id: String,
+    /// Principal the write is bound to (Kernel-issued, never self-declared).
+    pub principal_ref: String,
+    /// Session the write is bound to.
+    pub session_ref: String,
+    /// Host generation the write is bound to.
+    pub host_generation_ref: String,
+    /// Discovery lease identity this scan consumed.
+    pub lease_ref: String,
+    /// Discovery lease consumption units already consumed when the owner
+    /// issued the write binding: the lease operation window this write rode
+    /// on. Part of the canonical request hash, so the same key with a
+    /// different consumption window conflicts.
+    pub lease_consumed: u64,
+    /// Candidate root this scan covered.
+    pub candidate_root_ref: String,
+    /// Privacy boundary admitted for this scan.
+    pub privacy_boundary_ref: String,
+    /// `StateFence` reference where available before `WorkScope` creation.
+    pub state_fence_ref: Option<String>,
+    /// `AuthorityEpoch` reference where available before creation.
+    pub authority_epoch_ref: Option<String>,
+    /// Policy revision admitted with this write.
+    pub policy_revision: u64,
+    /// Deadline admitted with this write.
+    pub deadline: u64,
+    /// Digest of the exact canonical receipt bytes.
+    pub receipt_digest: String,
+    /// Write-identity schema version of this row.
+    pub schema_version: u32,
+    /// Exact canonical receipt bytes (canonical JSON).
+    pub receipt_bytes: String,
+    /// Owner write receipt bound at commit; empty while `Prepared`.
+    pub writer_receipt: String,
+    /// Lifecycle state of this row.
+    pub state: ScanDisclosureRecordState,
+    /// Successor operation key when superseded; otherwise `None`.
+    pub supersedes_ref: Option<String>,
+    /// Policy revision that retired this row; otherwise `None`.
+    pub retired_by_policy: Option<u64>,
+}
+
+impl ScanDisclosureOrsRecord {
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// ORS-owned reconciliation progression (`state`, `writer_receipt`,
+    /// `supersedes_ref`, `retired_by_policy`) is excluded: it is durable
+    /// progression, not caller binding.
+    #[must_use]
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.operation_key == other.operation_key
+            && self.idempotency_key == other.idempotency_key
+            && self.request_hash == other.request_hash
+            && self.installation_id == other.installation_id
+            && self.principal_ref == other.principal_ref
+            && self.session_ref == other.session_ref
+            && self.host_generation_ref == other.host_generation_ref
+            && self.lease_ref == other.lease_ref
+            && self.lease_consumed == other.lease_consumed
+            && self.candidate_root_ref == other.candidate_root_ref
+            && self.privacy_boundary_ref == other.privacy_boundary_ref
+            && self.state_fence_ref == other.state_fence_ref
+            && self.authority_epoch_ref == other.authority_epoch_ref
+            && self.policy_revision == other.policy_revision
+            && self.deadline == other.deadline
+            && self.receipt_digest == other.receipt_digest
+            && self.schema_version == other.schema_version
+            && self.receipt_bytes == other.receipt_bytes
+    }
+
+    /// Validates shape and identity binding without interpreting scan
+    /// semantics. A `Prepared` row carries no writer receipt; any other state
+    /// always binds one. Retirement markers appear only on retired rows.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(&self.operation_key, "scan_disclosure_operation_key")?;
+        validate_text(&self.idempotency_key, "scan_disclosure_idempotency_key")?;
+        validate_digest(&self.request_hash, "scan_disclosure_request_hash")?;
+        validate_text(&self.installation_id, "scan_disclosure_installation_id")?;
+        validate_text(&self.principal_ref, "scan_disclosure_principal_ref")?;
+        validate_text(&self.session_ref, "scan_disclosure_session_ref")?;
+        validate_text(
+            &self.host_generation_ref,
+            "scan_disclosure_host_generation_ref",
+        )?;
+        validate_text(&self.lease_ref, "scan_disclosure_lease_ref")?;
+        validate_text(
+            &self.candidate_root_ref,
+            "scan_disclosure_candidate_root_ref",
+        )?;
+        validate_text(
+            &self.privacy_boundary_ref,
+            "scan_disclosure_privacy_boundary_ref",
+        )?;
+        if let Some(fence) = &self.state_fence_ref {
+            validate_text(fence, "scan_disclosure_state_fence_ref")?;
+        }
+        if let Some(epoch) = &self.authority_epoch_ref {
+            validate_text(epoch, "scan_disclosure_authority_epoch_ref")?;
+        }
+        if self.policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_policy_revision",
+                reason: "policy revision must be non-zero",
+            });
+        }
+        if self.deadline == 0 {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_deadline",
+                reason: "deadline must be non-zero",
+            });
+        }
+        validate_digest(&self.receipt_digest, "scan_disclosure_receipt_digest")?;
+        if self.schema_version == 0 {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_schema_version",
+                reason: "schema version must be non-zero",
+            });
+        }
+        if self.receipt_bytes.is_empty()
+            || self.receipt_bytes.len() > MAX_SCAN_DISCLOSURE_RECEIPT_BYTES
+        {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_receipt_bytes",
+                reason: "receipt bytes must be non-empty and bounded",
+            });
+        }
+        serde_json::from_str::<Value>(&self.receipt_bytes).map_err(|_| OrsError::InvalidField {
+            field: "scan_disclosure_receipt_bytes",
+            reason: "receipt bytes must be JSON",
+        })?;
+        match self.state {
+            ScanDisclosureRecordState::Prepared => {
+                if !self.writer_receipt.is_empty() {
+                    return Err(OrsError::InvalidField {
+                        field: "scan_disclosure_writer_receipt",
+                        reason: "a prepared record carries no writer receipt",
+                    });
+                }
+            }
+            ScanDisclosureRecordState::Committed
+            | ScanDisclosureRecordState::Retired
+            | ScanDisclosureRecordState::Superseded => {
+                validate_text(&self.writer_receipt, "scan_disclosure_writer_receipt")?;
+            }
+        }
+        if let Some(successor) = &self.supersedes_ref {
+            if self.state != ScanDisclosureRecordState::Superseded {
+                return Err(OrsError::InvalidField {
+                    field: "scan_disclosure_supersedes_ref",
+                    reason: "only a superseded record names its successor",
+                });
+            }
+            validate_text(successor, "scan_disclosure_supersedes_ref")?;
+        }
+        let retired_row = matches!(
+            self.state,
+            ScanDisclosureRecordState::Retired | ScanDisclosureRecordState::Superseded
+        );
+        if self.retired_by_policy.is_some() != retired_row {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_retired_by_policy",
+                reason: "retirement markers appear only on retired rows",
+            });
+        }
+        Ok(())
+    }
+}

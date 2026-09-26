@@ -136,6 +136,16 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
+/// Durable scan disclosure rows (issue #2900): one row per
+/// `scan-disclosure:<installation>:<operation>` identity holding the exact
+/// canonical receipt bytes under their digest plus the owner-admitted write
+/// identity. A new table in the existing ORS family with the single
+/// installation-bound scan-disclosure adapter as its one writer; it never
+/// reuses [`UNKNOWN_COMMIT_RECOVERY`], because a scan disclosure receipt is
+/// evidence with its own Prepared/Committed/Retired lifecycle, not a
+/// canonical ordering write attempt.
+const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_scan_disclosure_v1");
 /// Durable owner-backed `backup.verify` results (issue #2802; I5.27, I14.21).
 ///
 /// One row per public request operation identity, so an exact replay of the same
@@ -2297,6 +2307,103 @@ pub struct RedbRecoveryStore {
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
 }
 
+/// Narrow durable port for scan disclosure records (issue #2900).
+///
+/// The installation-bound scan-disclosure adapter writes, replays, reads and
+/// retires through this port; the canonical Store/ORS owner behind it keeps
+/// every atomicity, conflict and reconciliation semantic. The port is
+/// object-safe so the adapter holds it behind `Arc`.
+pub trait ScanDisclosureRecordOwner: Send + Sync {
+    /// Stages one `Prepared` record; exact replay returns the durable
+    /// winner, changed bindings conflict.
+    fn stage_scan_disclosure(
+        &self,
+        record: &crate::ScanDisclosureOrsRecord,
+    ) -> Result<crate::ScanDisclosureStageOutcome, OrsError>;
+
+    /// Commits one staged record; unknown keys return `Ok(None)` and never
+    /// invent state.
+    fn commit_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        writer_receipt: &str,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError>;
+
+    /// Loads one record with digest re-verification; unknown keys return
+    /// `Ok(None)`.
+    fn load_scan_disclosure(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError>;
+
+    /// Retires one committed record under an explicit policy; unknown keys
+    /// return `Ok(None)`.
+    fn retire_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        policy_revision: u64,
+        successor_ref: Option<&str>,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError>;
+
+    /// Lists one installation's records bounded by `limit`, oldest first.
+    fn list_scan_disclosures(
+        &self,
+        installation_id: &str,
+        limit: u16,
+    ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError>;
+}
+
+impl ScanDisclosureRecordOwner for RedbRecoveryStore {
+    fn stage_scan_disclosure(
+        &self,
+        record: &crate::ScanDisclosureOrsRecord,
+    ) -> Result<crate::ScanDisclosureStageOutcome, OrsError> {
+        RedbRecoveryStore::stage_scan_disclosure(self, record)
+    }
+
+    fn commit_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        writer_receipt: &str,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
+        RedbRecoveryStore::commit_scan_disclosure(self, operation_key, request_hash, writer_receipt)
+    }
+
+    fn load_scan_disclosure(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
+        RedbRecoveryStore::load_scan_disclosure(self, operation_key)
+    }
+
+    fn retire_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        policy_revision: u64,
+        successor_ref: Option<&str>,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
+        RedbRecoveryStore::retire_scan_disclosure(
+            self,
+            operation_key,
+            request_hash,
+            policy_revision,
+            successor_ref,
+        )
+    }
+
+    fn list_scan_disclosures(
+        &self,
+        installation_id: &str,
+        limit: u16,
+    ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
+        RedbRecoveryStore::list_scan_disclosures(self, installation_id, limit)
+    }
+}
+
 impl RedbRecoveryStore {
     /// Exports one coherent backup page under a single read transaction.
     ///
@@ -3460,6 +3567,273 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(Some(resolved))
+    }
+
+    /// Stages one scan disclosure record as `Prepared` (issue #2900).
+    ///
+    /// The stage is the atomic durable step: an exact replay of the same
+    /// operation identity with the same binding returns the durable winner,
+    /// while the same key with changed bytes or bindings conflicts and never
+    /// overwrites. A crash between stage and commit leaves `Prepared`, which
+    /// [`RedbRecoveryStore::reconcile_scan_disclosure`] resolves; the final
+    /// `Committed` address is only ever occupied by commit.
+    pub fn stage_scan_disclosure(
+        &self,
+        record: &crate::ScanDisclosureOrsRecord,
+    ) -> Result<crate::ScanDisclosureStageOutcome, OrsError> {
+        record.validate()?;
+        if record.state != crate::ScanDisclosureRecordState::Prepared {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_state",
+                reason: "only a prepared scan disclosure record stages",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.operation_key.clone();
+        let stored = {
+            let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
+            let staged_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(crate::ScanDisclosureStageOutcome::Stored);
+            };
+            let existing: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                    reason: "existing scan disclosure binding conflicts".to_owned(),
+                });
+            }
+            existing
+        };
+        write.commit().map_err(storage)?;
+        Ok(crate::ScanDisclosureStageOutcome::AlreadyBound(Box::new(
+            stored,
+        )))
+    }
+
+    /// Commits one staged scan disclosure record (issue #2900).
+    ///
+    /// Only a `Prepared` row commits, and only with the exact request hash it
+    /// staged: the commit publishes the final content address in one atomic
+    /// owner transaction. An exact `Committed` replay returns the same
+    /// record; a changed binding under the same key conflicts. Returns
+    /// `Ok(None)` for an unknown key: commit never invents a record, so a
+    /// lost stage surfaces as unknown-commit for the caller to reconcile.
+    pub fn commit_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        writer_receipt: &str,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
+        crate::model::validate_text(operation_key, "scan_disclosure_operation_key")?;
+        crate::model::validate_digest(request_hash, "scan_disclosure_request_hash")?;
+        crate::model::validate_text(writer_receipt, "scan_disclosure_writer_receipt")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let committed = {
+            let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
+            let staged_bytes = table
+                .get(operation_key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let mut next: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
+            next.validate()?;
+            if next.request_hash != request_hash {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                    reason: "scan disclosure commit binds a different request hash".to_owned(),
+                });
+            }
+            match next.state {
+                crate::ScanDisclosureRecordState::Prepared => {
+                    next.state = crate::ScanDisclosureRecordState::Committed;
+                    next.writer_receipt = writer_receipt.into();
+                    next.validate()?;
+                    let payload = encode(&next)?;
+                    table
+                        .insert(operation_key, payload.as_str())
+                        .map_err(storage)?;
+                    next
+                }
+                crate::ScanDisclosureRecordState::Committed => next,
+                crate::ScanDisclosureRecordState::Retired
+                | crate::ScanDisclosureRecordState::Superseded => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                        reason: "a retired scan disclosure record never recommits".to_owned(),
+                    });
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(committed))
+    }
+
+    /// Loads one scan disclosure record by exact operation key (issue #2900).
+    ///
+    /// The stored receipt bytes are re-hashed against their digest on every
+    /// read: a digest mismatch fails closed as corruption instead of
+    /// returning foreign bytes as a completed receipt. Returns `Ok(None)`
+    /// for an unknown key.
+    pub fn load_scan_disclosure(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
+        table
+            .get(operation_key)
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
+                record.validate()?;
+                if record.operation_key != operation_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                        reason: "scan disclosure record key does not match its row".to_owned(),
+                    });
+                }
+                if crate::model::sha256_hex(record.receipt_bytes.as_bytes())
+                    != record.receipt_digest
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                        reason: "stored scan receipt bytes do not match their digest".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Retires one committed scan disclosure record under an explicit policy
+    /// (issue #2900).
+    ///
+    /// Retirement only marks: the row stays addressable as historical
+    /// evidence and is never deleted. A `Prepared` row cannot retire
+    /// (reconcile it first); an already-retired row replays only under the
+    /// same policy. Returns `Ok(None)` for an unknown key.
+    pub fn retire_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        policy_revision: u64,
+        successor_ref: Option<&str>,
+    ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
+        crate::model::validate_text(operation_key, "scan_disclosure_operation_key")?;
+        crate::model::validate_digest(request_hash, "scan_disclosure_request_hash")?;
+        if policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_policy_revision",
+                reason: "policy revision must be non-zero",
+            });
+        }
+        if let Some(successor) = successor_ref {
+            crate::model::validate_text(successor, "scan_disclosure_supersedes_ref")?;
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let retired = {
+            let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
+            let staged_bytes = table
+                .get(operation_key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let mut next: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
+            next.validate()?;
+            if next.request_hash != request_hash {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                    reason: "scan disclosure retirement binds a different request hash".to_owned(),
+                });
+            }
+            match next.state {
+                crate::ScanDisclosureRecordState::Prepared => {
+                    return Err(OrsError::InvalidField {
+                        field: "scan_disclosure_state",
+                        reason: "a prepared scan disclosure record reconciles before it retires",
+                    });
+                }
+                crate::ScanDisclosureRecordState::Committed => {
+                    next.state = if successor_ref.is_some() {
+                        crate::ScanDisclosureRecordState::Superseded
+                    } else {
+                        crate::ScanDisclosureRecordState::Retired
+                    };
+                    next.supersedes_ref = successor_ref.map(str::to_owned);
+                    next.retired_by_policy = Some(policy_revision);
+                    next.validate()?;
+                    let payload = encode(&next)?;
+                    table
+                        .insert(operation_key, payload.as_str())
+                        .map_err(storage)?;
+                    next
+                }
+                crate::ScanDisclosureRecordState::Retired
+                | crate::ScanDisclosureRecordState::Superseded => {
+                    if next.retired_by_policy != Some(policy_revision) {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+                            reason: "scan disclosure retirement policy conflicts".to_owned(),
+                        });
+                    }
+                    next
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(retired))
+    }
+
+    /// Lists scan disclosure records for one installation, oldest first,
+    /// bounded by `limit` (issue #2900).
+    ///
+    /// Historical evidence stays addressable under retention policy: this is
+    /// the bounded read new scans never mutate. Every returned row is
+    /// validated before it leaves the store.
+    pub fn list_scan_disclosures(
+        &self,
+        installation_id: &str,
+        limit: u16,
+    ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
+        crate::model::validate_text(installation_id, "scan_disclosure_installation_id")?;
+        if limit == 0 || limit > crate::MAX_SCAN_DISCLOSURE_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
+            record.validate()?;
+            if record.installation_id == installation_id {
+                records.push(record);
+            }
+            if records.len() >= usize::from(limit) {
+                break;
+            }
+        }
+        records.sort_by(|left, right| left.operation_key.cmp(&right.operation_key));
+        Ok(records)
     }
 
     /// Loads one durable `backup.verify` result by exact idempotency key
