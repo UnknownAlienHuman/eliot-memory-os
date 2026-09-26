@@ -15,7 +15,6 @@ use eliot_agent_contracts::{
     LivePeerMessage, LivePeerMessageState, MessageId, ParentFinishCeiling, RevisionId, WorkItemId,
     contract_shape_digest,
 };
-use eliot_contracts::PolicyRevision;
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
@@ -2623,6 +2622,17 @@ fn select_route(
     candidates: Vec<RouteCandidateEvidence>,
     health: Option<&ProviderSelectionHealth>,
 ) -> Result<RouteSelectionCandidate, CoordinatorError> {
+    // Route selection must bind to the policy revision captured by the
+    // request's State Fence. The plan-only coordinator remains usable when
+    // provider authority is a PLAN_GAP, but an absent policy revision cannot
+    // be inspected as if it were a real policy or replaced with a default.
+    let policy_revision =
+        request
+            .state_fence
+            .policy_revision
+            .ok_or(CoordinatorError::InvalidField(
+                "state_fence.policy_revision",
+            ))?;
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
     }
@@ -2717,18 +2727,9 @@ fn select_route(
     }
     let mut rejected = ineligible;
     rejected.extend(rank_rejected);
-    // Typed policy revision binds to the fence's policy revision when present;
-    // no bare-string parsing. Capability/intent/scope are deterministic
-    // staffing-lane projections, never admission claims.
-    // Explicit compatibility (issue #1703 residual): an absent fence policy
-    // keeps the long-standing genesis mapping so pre-policy wire still plans;
-    // the selector cannot mint an unknown-policy marker in the required
-    // `PolicyRevision` field, so callers must supply the fence revision and
-    // the fence producer owns making it always present.
-    let policy_revision = request
-        .state_fence
-        .policy_revision
-        .unwrap_or_else(PolicyRevision::genesis);
+    // Capability/intent/scope are deterministic staffing-lane projections,
+    // never admission claims. Policy identity came directly from the exact
+    // State Fence above.
     let capability = role.required_competence.join("+");
     let query_intent = request.candidate_id.as_str().to_owned();
     let scope_ref = format!(
