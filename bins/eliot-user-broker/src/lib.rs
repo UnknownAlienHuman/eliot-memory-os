@@ -36,9 +36,9 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
     AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
     DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest, IssuedOperationIdentity,
-    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, PortError,
-    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
-    UserBroker,
+    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, OperatorArtifact,
+    OperatorEndpoint, OperatorHandoffRequest, PortError, ProcessPort, ProcessStartOutcome,
+    RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -155,6 +155,30 @@ pub enum BrokerAdmissionRefusal {
     /// spent, under a new generation.
     #[error("UNKNOWN_OUTCOME")]
     RetiredOperation,
+    /// A one-shot Operator handoff was presented a second time, or an endpoint
+    /// was presented that this broker never issued for the live registration.
+    /// Reconnect requires a newly issued handoff, never a replayed one.
+    #[error("RESOURCE_LEASE_REPLAYED")]
+    OperatorHandoffReplayed,
+    /// A one-shot Operator handoff was presented after its own expiry window.
+    #[error("DEADLINE_EXCEEDED")]
+    OperatorHandoffExpired,
+    /// A one-shot Operator handoff was presented against a registration epoch,
+    /// logon Session, or installation-approved artifact that is no longer the
+    /// live one, so the endpoint generation it names is stale.
+    #[error("STALE_AUTHORITY_EPOCH")]
+    OperatorHandoffStaleGeneration,
+    /// The one-shot Operator handoff boundary is not composed: this broker has
+    /// no authenticated protected launch declaration naming the approved
+    /// Operator artifact, so it can name no image to hand off.
+    #[error("BROKER_OPERATOR_HANDOFF_UNCOMPOSED")]
+    OperatorHandoffUncomposed,
+    /// The request named a role or capability set the handoff policy does not
+    /// introduce. The handoff introduces exactly
+    /// `eliot_user_broker_core::OPERATOR_CAPABILITIES`; anything wider is
+    /// refused rather than narrowed.
+    #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
+    OperatorHandoffNotAdmitted,
 }
 
 impl BrokerAdmissionRefusal {
@@ -170,10 +194,15 @@ impl BrokerAdmissionRefusal {
             | Self::IntroductionResourceNotGranted
             | Self::IntroductionEffectCeilingExceeded
             | Self::IntroductionRequired
-            | Self::IntroductionCredentialUnnamed => "CAPABILITY_INTRODUCTION_REQUIRED",
+            | Self::IntroductionCredentialUnnamed
+            | Self::OperatorHandoffNotAdmitted => "CAPABILITY_INTRODUCTION_REQUIRED",
             Self::IntroductionExpired => "CAPABILITY_GRANT_REVOKED",
             Self::OperationIdRetired => "IDENTITY_CONFLICT",
             Self::RetiredOperation => "UNKNOWN_OUTCOME",
+            Self::OperatorHandoffReplayed => "RESOURCE_LEASE_REPLAYED",
+            Self::OperatorHandoffExpired => "DEADLINE_EXCEEDED",
+            Self::OperatorHandoffStaleGeneration => "STALE_AUTHORITY_EPOCH",
+            Self::OperatorHandoffUncomposed => "BROKER_OPERATOR_HANDOFF_UNCOMPOSED",
         }
     }
 
@@ -1238,6 +1267,102 @@ impl BrokerComposition {
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
         self.broker.launch(request).map_err(Self::classify)
+    }
+
+    /// The composition's production entry to the owner-issued, single-use
+    /// Operator handoff, and the replacement for a consumed-environment
+    /// reconnect: a reconnect is *this call again*, never a replay of the
+    /// previous endpoint.
+    ///
+    /// Everything the handoff is bound to comes from owner state, not from the
+    /// caller. The installation/SID/logon Session, broker artifact, and
+    /// installation epoch fence come from the retained protected launch
+    /// declaration (whose lease and live process identity are re-proven first);
+    /// the approved Operator image comes from that same declaration's
+    /// `operator_artifact`; the endpoint generation is the live registration
+    /// epoch, which the core reads from its own registration; the nonce is
+    /// minted by the core authority. The caller's `request` may name only the
+    /// role and the capability set, and any widening is refused.
+    ///
+    /// It is deliberately not a heartbeat: an expired or fenced registration
+    /// makes the handoff unavailable rather than being refreshed here, so a dead
+    /// broker cannot mint one.
+    pub fn admit_operator_handoff(
+        &mut self,
+        request: &OperatorHandoffRequest,
+    ) -> Result<OperatorEndpoint, CompositionError> {
+        self.verify_launch_lease()?;
+        let artifact = self.operator_artifact()?;
+        let observed_at = now_unix_ms()?;
+        self.broker
+            .issue_operator_handoff(request, &artifact, observed_at)
+            .map_err(Self::classify_operator_handoff)
+    }
+
+    /// Redeems one issued Operator handoff exactly once and returns the
+    /// installation-approved image it authenticates.
+    ///
+    /// This is the redemption half of the same boundary, and it is where
+    /// single-use is enforced rather than asserted: a second presentation of a
+    /// consumed nonce is `RESOURCE_LEASE_REPLAYED`, an endpoint past its own
+    /// expiry is `DEADLINE_EXCEEDED`, and an endpoint naming a superseded
+    /// registration epoch or logon Session is `STALE_AUTHORITY_EPOCH`. It
+    /// resolves and returns an artifact identity; it starts nothing.
+    pub fn redeem_operator_handoff(
+        &mut self,
+        endpoint: &OperatorEndpoint,
+    ) -> Result<OperatorArtifact, CompositionError> {
+        self.verify_launch_lease()?;
+        let artifact = self.operator_artifact()?;
+        let now = now_unix_ms()?;
+        self.broker
+            .consume_operator_handoff(endpoint, &artifact, now)
+            .map_err(Self::classify_operator_handoff)
+    }
+
+    /// The installation-approved Operator image from the retained protected
+    /// launch declaration.  It is not a configured value, a caller argument, or
+    /// a discovered path: a broker without that declaration names no image.
+    fn operator_artifact(&self) -> Result<OperatorArtifact, CompositionError> {
+        let artifact = self
+            .launch_binding
+            .as_ref()
+            .ok_or(
+                BrokerAdmissionRefusal::OperatorHandoffUncomposed
+                    .with_platform("protected launch configuration is not composed"),
+            )?
+            .operator_artifact
+            .clone();
+        Ok(OperatorArtifact {
+            image_id: artifact.image_id,
+            executable: artifact.executable,
+            artifact_digest: artifact.artifact_digest,
+        })
+    }
+
+    /// Projects one Operator-handoff refusal onto the broker's closed
+    /// admission taxonomy.
+    ///
+    /// The three properties this boundary exists to hold — single-use,
+    /// expiry, and generation binding — each keep their own exact stable code
+    /// instead of collapsing into a generic composition error, so a reconnect
+    /// attempt is distinguishable from a dead registration at the wire.
+    fn classify_operator_handoff(error: BrokerError) -> CompositionError {
+        let refusal = match error {
+            BrokerError::ReplayConflict => Some(BrokerAdmissionRefusal::OperatorHandoffReplayed),
+            BrokerError::StaleLease => Some(BrokerAdmissionRefusal::OperatorHandoffExpired),
+            BrokerError::StaleEpoch | BrokerError::StaleRegistrationIdentity => {
+                Some(BrokerAdmissionRefusal::OperatorHandoffStaleGeneration)
+            }
+            BrokerError::Denied | BrokerError::InvalidField(_) => {
+                Some(BrokerAdmissionRefusal::OperatorHandoffNotAdmitted)
+            }
+            _ => None,
+        };
+        match refusal {
+            Some(refusal) => refusal.with_platform(error),
+            None => CompositionError::Recovery(error),
+        }
     }
 
     /// Cancels a broker-owned operation selected by its admitted operation
