@@ -407,20 +407,32 @@ impl SupervisionProgressProducer {
 
     /// Records one claimed activation ticket on the Claim channel.
     pub fn note_claim(&mut self) {
-        self.observed[channel_index(DaemonProgressChannel::Claim)] =
-            self.observed[channel_index(DaemonProgressChannel::Claim)].saturating_add(1);
+        self.note_deferred_activity(1, 0);
     }
 
     /// Records one completed dispatch whose result the Kernel accepted. The
     /// accepted acknowledgement proves both dispatch and apply, so both
     /// channels advance together from this single event.
     pub fn note_kernel_applied(&mut self) {
+        self.note_deferred_activity(0, 1);
+    }
+
+    /// Records activation activity deferred by the heartbeat flight.
+    ///
+    /// Each counted Claim is an observed ticket claim. Each counted applied
+    /// dispatch follows the existing `note_kernel_applied` signal and advances
+    /// Dispatch and Apply together. The caller must pass only events it
+    /// actually observed; this producer does not infer or synthesize progress.
+    pub fn note_deferred_activity(&mut self, claims: u64, applied: u64) {
+        let claim = &mut self.observed[channel_index(DaemonProgressChannel::Claim)];
+        *claim = claim.saturating_add(claims);
+
         for channel in [
             DaemonProgressChannel::Dispatch,
             DaemonProgressChannel::Apply,
         ] {
-            let slot = &mut self.observed[channel_index(channel)];
-            *slot = slot.saturating_add(1);
+            let cursor = &mut self.observed[channel_index(channel)];
+            *cursor = cursor.saturating_add(applied);
         }
     }
 
