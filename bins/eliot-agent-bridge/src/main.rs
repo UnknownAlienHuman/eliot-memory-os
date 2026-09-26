@@ -11,8 +11,8 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
-    RecoveryView, SessionId,
+    DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveredPendingView,
+    RecoveryDisposition, RecoveryView, SessionId,
 };
 use eliot_contracts::EpochId;
 use eliot_mcp::{
@@ -29,7 +29,7 @@ use eliot_mcp::{
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
-use eliot_protocol::{AgentActivationResolutionDisposition, EventEnvelope};
+use eliot_protocol::{AckPhase, AgentActivationResolutionDisposition, EventEnvelope};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
@@ -37,12 +37,14 @@ use request_input::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
+const MAX_RECOVERY_PENDING_PROJECTION: usize = 64;
 
 /// Explicit checked MCP entrypoint token (issue #2562): a leading `mcp`
 /// argv token selects the MCP JSON-RPC front door on stdio. It is coherent
@@ -365,6 +367,8 @@ enum Response {
     },
     Reconciled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryPageProjection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
     /// Typed projection of one bounded recovery page (issue #2732).
@@ -470,9 +474,25 @@ struct RecoveryPageProjection {
     unscoped_gaps: u64,
     unproven_scope_present: bool,
     stream_list_complete: bool,
+    unscoped_gaps_complete: bool,
+    pending_total: usize,
+    new_pending: Vec<RecoveryPendingProjection>,
+    new_pending_truncated: bool,
     disposition: &'static str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disposition_reason: Option<&'static str>,
+}
+
+/// Bounded identity of an owner-retained pending obligation imported on this
+/// call. The digest stays a reference; no event envelope is fabricated.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPendingProjection {
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    phase: AckPhase,
+    envelope_digest: String,
 }
 
 /// Per-stream cursor facts and recovered counts inside one recovery page.
@@ -499,41 +519,67 @@ struct RecoveryStreamProjection {
 ///
 /// The disposition is projected losslessly: `complete` carries no reason,
 /// `partial`/`unavailable` carry the exact core reason the gate is held
-/// under. The window key itself never crosses: it is the verified
-/// reconciliation hash that already names the receipt, not host-driving
-/// state — pagination is driven by repeating the operation, with the bridge
-/// deriving each bounded read from its own live window.
-fn recovery_page_response(view: &RecoveryView) -> Response {
+/// under. The owner window key stays inside the bridge; pagination is driven
+/// by repeating the operation. Pending identities newly imported by this
+/// call are projected within a fixed cap, separate from the total count.
+fn recovery_page_projection(
+    view: &RecoveryView,
+    before: &[RecoveredPendingView],
+    after: &[RecoveredPendingView],
+) -> RecoveryPageProjection {
     let (disposition, disposition_reason) = match view.disposition() {
         RecoveryDisposition::Complete => ("complete", None),
         RecoveryDisposition::Partial { reason } => ("partial", Some(reason)),
         RecoveryDisposition::Unavailable { reason } => ("unavailable", Some(reason)),
     };
-    Response::RecoveryPage {
-        page: RecoveryPageProjection {
-            live_generation: view.live_generation(),
-            streams: view
-                .streams()
-                .iter()
-                .map(|stream| RecoveryStreamProjection {
-                    stream_id: stream.stream_id().to_owned(),
-                    acked_base: stream.acked_base(),
-                    durable_cursor: stream.durable_cursor(),
-                    contiguous_frontier: stream.contiguous_frontier(),
-                    highest_observed: stream.highest_observed(),
-                    next_after: stream.next_after(),
-                    recovered_events: stream.recovered_events(),
-                    recovered_gaps: stream.recovered_gaps(),
-                    page_complete: stream.page_complete(),
-                })
-                .collect(),
-            unscoped_gaps: view.unscoped_gaps(),
-            unproven_scope_present: view.unproven_scope_present(),
-            stream_list_complete: view.stream_list_complete(),
-            disposition,
-            disposition_reason,
-        },
-        bootstrap: None,
+    let before_keys: BTreeSet<_> = before
+        .iter()
+        .map(|item| (item.stream_id(), item.event_id(), item.sequence()))
+        .collect();
+    let mut new_pending = Vec::new();
+    let mut new_pending_truncated = false;
+    for item in after {
+        if before_keys.contains(&(item.stream_id(), item.event_id(), item.sequence())) {
+            continue;
+        }
+        if new_pending.len() == MAX_RECOVERY_PENDING_PROJECTION {
+            new_pending_truncated = true;
+            break;
+        }
+        new_pending.push(RecoveryPendingProjection {
+            stream_id: item.stream_id().to_owned(),
+            event_id: item.event_id().to_owned(),
+            sequence: item.sequence(),
+            phase: item.phase(),
+            envelope_digest: item.envelope_digest().to_owned(),
+        });
+    }
+    RecoveryPageProjection {
+        live_generation: view.live_generation(),
+        streams: view
+            .streams()
+            .iter()
+            .map(|stream| RecoveryStreamProjection {
+                stream_id: stream.stream_id().to_owned(),
+                acked_base: stream.acked_base(),
+                durable_cursor: stream.durable_cursor(),
+                contiguous_frontier: stream.contiguous_frontier(),
+                highest_observed: stream.highest_observed(),
+                next_after: stream.next_after(),
+                recovered_events: stream.recovered_events(),
+                recovered_gaps: stream.recovered_gaps(),
+                page_complete: stream.page_complete(),
+            })
+            .collect(),
+        unscoped_gaps: view.unscoped_gaps(),
+        unproven_scope_present: view.unproven_scope_present(),
+        stream_list_complete: view.stream_list_complete(),
+        unscoped_gaps_complete: view.unscoped_gaps_complete(),
+        pending_total: after.len(),
+        new_pending,
+        new_pending_truncated,
+        disposition,
+        disposition_reason,
     }
 }
 
@@ -900,20 +946,41 @@ fn main() {
                 disposition,
             }) => handle_reactive_record_disposition(&mut runner, &item_id, disposition),
             Ok(Request::ReactiveSnapshot) => handle_reactive_snapshot(&runner),
-            Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                Ok(_) => Response::Reconciled { bootstrap: None },
-                Err(error) => {
-                    provider_failure |= is_provider_failure(&error);
-                    bridge_error(&error)
+            Ok(Request::ReconcileExternal {}) => {
+                let before = runner.recovered_pending();
+                match runner.reconcile_external() {
+                    Ok(_) => {
+                        let after = runner.recovered_pending();
+                        Response::Reconciled {
+                            recovery: runner
+                                .recovery_view()
+                                .as_ref()
+                                .map(|view| recovery_page_projection(view, &before, &after)),
+                            bootstrap: None,
+                        }
+                    }
+                    Err(error) => {
+                        provider_failure |= is_provider_failure(&error);
+                        bridge_error(&error)
+                    }
                 }
-            },
-            Ok(Request::RecoverNextPage {}) => match runner.recover_next_page() {
-                Ok(view) => recovery_page_response(&view),
-                Err(error) => {
-                    provider_failure |= is_provider_failure(&error);
-                    bridge_error(&error)
+            }
+            Ok(Request::RecoverNextPage {}) => {
+                let before = runner.recovered_pending();
+                match runner.recover_next_page() {
+                    Ok(view) => {
+                        let after = runner.recovered_pending();
+                        Response::RecoveryPage {
+                            page: recovery_page_projection(&view, &before, &after),
+                            bootstrap: None,
+                        }
+                    }
+                    Err(error) => {
+                        provider_failure |= is_provider_failure(&error);
+                        bridge_error(&error)
+                    }
                 }
-            },
+            }
             Ok(Request::Bootstrap {
                 context,
                 tasks,
@@ -1059,7 +1126,7 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::ReactiveAdmitted { bootstrap, .. }
         | Response::ReactiveRecorded { bootstrap, .. }
         | Response::ReactiveLedger { bootstrap, .. }
-        | Response::Reconciled { bootstrap }
+        | Response::Reconciled { bootstrap, .. }
         | Response::RecoveryPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => bootstrap,
         Response::Bootstrap { .. }

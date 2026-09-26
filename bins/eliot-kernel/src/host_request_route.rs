@@ -3774,14 +3774,17 @@ impl KernelComposition {
     /// atomicity claim. A lost answer replays safely: acknowledgement
     /// advances monotonically and handoff reconcile converges.
     ///
-    /// Reconcile-key preimage contract (issue #2731, I5.27 identity over
-    /// canonical bytes): `reconcile_key` is the SHA-256 hex of the canonical
-    /// JSON bytes of the reconciliation object BEFORE attaching
-    /// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`,
-    /// so the preimage is the answer minus exactly those three post-key
-    /// legs. The consumer strips all three before re-hashing; covering any
-    /// post-key leg in the digest refuses every answer and discards the
-    /// maintenance receipt while its store-side effect already committed.
+    /// Reconcile-key preimage contract (issues #2731/#2732, I5.27 identity
+    /// over canonical bytes): `reconcile_key` is the SHA-256 hex of the
+    /// canonical JSON bytes of the reconciliation object BEFORE attaching
+    /// `reconcile_key`, `handoffs_reconciled`, and `handoff_maintenance`.
+    /// `reconcile_key_version: 1` identifies this exact preimage contract;
+    /// `requested_recovery_scope` plus the ORS-owned window, status,
+    /// continuation selectors, revision/floor/upper bounds, and returned
+    /// facts are observation legs and remain in the preimage. The consumer
+    /// strips exactly the key and the two later mutation-receipt legs before
+    /// re-hashing. Pure read calls report truthful zero/empty mutation legs
+    /// without running either mutation.
     ///
     /// Issue #2731 runs the bounded handoff maintenance after the reconcile
     /// loop on the same recovery path: per presented namespace it retires
@@ -3789,6 +3792,10 @@ impl KernelComposition {
     /// identity stands) and repairs retained events missing their handoff
     /// under the original identity, each with a finite budget and a
     /// continuation the next legitimate recovery entry resumes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "owner resolution, atomic ack, pure read, and keyed answer share one serialization guard"
+    )]
     fn answer_bridge_event_reconcile(
         &self,
         session: &Session,
@@ -3796,8 +3803,8 @@ impl KernelComposition {
         frame_fence: &eliot_contracts::StateFence,
     ) -> Result<serde_json::Value, TransportError> {
         // Existing transition serialization first: the read guard is held
-        // across owner resolution and the batch commit below, so bridge
-        // profile fencing (the revocation path) cannot interleave
+        // across the owner read and any consumed-frontier batch commit, so
+        // bridge profile fencing (the revocation path) cannot interleave
         // unnoticed. No caller above holds this guard; the service-state
         // read inside takes only its own short-lived lock.
         let _transition = self.agent_bridge_transition_read()?;
@@ -3813,6 +3820,12 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let evidence = bridge_owner_evidence(session, frame_fence)?;
+        // Continuation selectors are pure reads. They cannot carry a
+        // consumed frontier because acknowledging one would mutate the
+        // durable cursor before the bounded owner page is accepted.
+        if scope.recovery_scope.is_some() && !scope.consumed.is_empty() {
+            return Err(TransportError::SessionFenced);
+        }
         // Contradictory duplicates fail the whole scope before any store
         // mutation; the batch re-validates the same rule for its callers.
         reject_contradictory_consumed(&scope.consumed)?;
@@ -3820,45 +3833,49 @@ impl KernelComposition {
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_principal": evidence.principal,
         });
+        let pure_read = scope.recovery_scope.is_some() || scope.consumed.is_empty();
         // Resolve every consumed entry to its admitted namespace before
         // mutating: any foreign, stale, or ambiguous item rejects the
-        // whole scope with nothing changed.
+        // whole scope with nothing changed. An open read with no consumed
+        // frontiers is also pure and does not run handoff maintenance.
         let mut batch_items: Vec<serde_json::Value> = Vec::with_capacity(scope.consumed.len());
         let mut batch_namespaces: Vec<(String, String, u64, u64, u64)> =
             Vec::with_capacity(scope.consumed.len());
-        for (stream_id, sequence) in &scope.consumed {
-            let item = self
-                .generation_gateway
-                .ors
-                .resolve_bridge_ack_item(&presenter, stream_id)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let namespace = item
-                .get("namespace")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(TransportError::SessionFenced)?;
-            let revision = item
-                .get("revision")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or(TransportError::SessionFenced)?;
-            let incarnation = item
-                .get("incarnation")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or(TransportError::SessionFenced)?;
-            batch_namespaces.push((
-                namespace.to_owned(),
-                stream_id.clone(),
-                *sequence,
-                revision,
-                incarnation,
-            ));
-            batch_items.push(serde_json::json!({
-                "namespace": namespace,
-                "expected_revision": revision,
-                "expected_incarnation": incarnation,
-                "sequence": sequence,
-                "owner_authority_lineage": evidence.authority_lineage,
-                "owner_principal": evidence.principal,
-            }));
+        if !pure_read {
+            for (stream_id, sequence) in &scope.consumed {
+                let item = self
+                    .generation_gateway
+                    .ors
+                    .resolve_bridge_ack_item(&presenter, stream_id)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let namespace = item
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(TransportError::SessionFenced)?;
+                let revision = item
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(TransportError::SessionFenced)?;
+                let incarnation = item
+                    .get("incarnation")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(TransportError::SessionFenced)?;
+                batch_namespaces.push((
+                    namespace.to_owned(),
+                    stream_id.clone(),
+                    *sequence,
+                    revision,
+                    incarnation,
+                ));
+                batch_items.push(serde_json::json!({
+                    "namespace": namespace,
+                    "expected_revision": revision,
+                    "expected_incarnation": incarnation,
+                    "sequence": sequence,
+                    "owner_authority_lineage": evidence.authority_lineage,
+                    "owner_principal": evidence.principal,
+                }));
+            }
         }
         // One ORS write transaction applies the accepted batch; validation
         // precedes commit inside it, so any failure leaves every cursor
@@ -3879,14 +3896,31 @@ impl KernelComposition {
         let mut reconciliation = self
             .generation_gateway
             .ors
-            .reconcile_bridge_events_for_owner(&presenter, live_generation)
+            .reconcile_bridge_events_for_owner(
+                &presenter,
+                live_generation,
+                scope.recovery_scope.as_ref(),
+            )
             .map_err(|_| TransportError::SessionFenced)?;
         reconciliation["connection_id"] = serde_json::Value::String(session.connection_id.clone());
         reconciliation["live_generation"] = serde_json::Value::from(live_generation);
+        reconciliation["reconcile_key_version"] = serde_json::Value::from(1_u64);
+        reconciliation["requested_recovery_scope"] = scope
+            .recovery_scope
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
         let key_bytes = eliot_contracts::canonical_json_bytes(&reconciliation)
             .map_err(|_| TransportError::SessionFenced)?;
         let reconcile_key = eliot_contracts::sha256_hex(&key_bytes);
         reconciliation["reconcile_key"] = serde_json::Value::String(reconcile_key.clone());
+        if pure_read {
+            reconciliation["handoffs_reconciled"] = serde_json::Value::from(0_u64);
+            reconciliation["handoff_maintenance"] = serde_json::Value::Array(Vec::new());
+            return Ok(serde_json::json!({ "status": "known", "value": {
+                "accepted": true,
+                "reconciliation": reconciliation,
+            } }));
+        }
         let mut handoffs_reconciled = 0_u64;
         for (namespace, _, sequence, _, _) in &batch_namespaces {
             let marked = self
@@ -4472,16 +4506,161 @@ pub(crate) fn bridge_gap_from_payload(
     }))
 }
 
-/// Consumed-frontier scope carried by one event reconcile request: the
-/// bridge-owned delivered frontier per stream. Applied monotonically at or
-/// below the durable cursor before enumeration.
+/// Scope carried by one event reconcile request. Consumed frontiers advance
+/// monotonically at or below the durable cursor; an optional owner-issued
+/// recovery selector asks for one bounded continuation page and is read-only.
 pub(crate) struct BridgeReconcileScope {
     pub(crate) consumed: Vec<(String, u64)>,
+    pub(crate) recovery_scope: Option<serde_json::Value>,
 }
 
-/// Decodes the reconcile scope: a bounded list of `{stream_id, sequence}`
-/// consumed-frontier entries. The list may be empty (pure ownership/cursor
-/// read); anything malformed fails the whole scope.
+const MAX_BRIDGE_RECOVERY_STREAMS: u64 = 4;
+const MAX_BRIDGE_RECOVERY_EVENTS: u64 = 128;
+const MAX_BRIDGE_RECOVERY_GAPS: u64 = 256;
+const MAX_BRIDGE_RECONCILE_TEXT_BYTES: usize = 1024;
+
+/// Requires a closed field set for one versioned recovery selector. In
+/// particular, a future field cannot silently weaken this route's bounds.
+fn bridge_recovery_scope_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+) -> Result<(), TransportError> {
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn bridge_recovery_scope_text<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str, TransportError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
+                && !text.chars().any(char::is_control)
+        })
+        .ok_or(TransportError::SessionFenced)
+}
+
+fn bridge_recovery_scope_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<u64, TransportError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(TransportError::SessionFenced)
+}
+
+/// Validates one bounded, versioned owner continuation selector. The raw
+/// object is forwarded unchanged to ORS only after this closed typed parse.
+fn validate_bridge_recovery_scope(value: &serde_json::Value) -> Result<(), TransportError> {
+    let object = value.as_object().ok_or(TransportError::SessionFenced)?;
+    if bridge_recovery_scope_u64(object, "version")? != 1 {
+        return Err(TransportError::SessionFenced);
+    }
+    let kind = bridge_recovery_scope_text(object, "kind")?;
+    let window_key = bridge_recovery_scope_text(object, "window_key")?;
+    if window_key.len() != 64
+        || !window_key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(TransportError::SessionFenced);
+    }
+
+    match kind {
+        "streams" => {
+            bridge_recovery_scope_fields(
+                object,
+                &[
+                    "version",
+                    "kind",
+                    "window_key",
+                    "after_stream",
+                    "stream_limit",
+                ],
+            )?;
+            bridge_recovery_scope_text(object, "after_stream")?;
+            let limit = bridge_recovery_scope_u64(object, "stream_limit")?;
+            if limit == 0 || limit > MAX_BRIDGE_RECOVERY_STREAMS {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        "stream" => {
+            bridge_recovery_scope_fields(
+                object,
+                &[
+                    "version",
+                    "kind",
+                    "window_key",
+                    "stream_id",
+                    "after_sequence",
+                    "upper_sequence",
+                    "expected_revision",
+                    "retention_floor",
+                    "event_limit",
+                    "gap_offset",
+                    "gap_limit",
+                ],
+            )?;
+            let stream_id = bridge_recovery_scope_text(object, "stream_id")?;
+            if stream_id.contains("::") {
+                return Err(TransportError::SessionFenced);
+            }
+            let after_sequence = bridge_recovery_scope_u64(object, "after_sequence")?;
+            let upper_sequence = bridge_recovery_scope_u64(object, "upper_sequence")?;
+            let expected_revision = bridge_recovery_scope_u64(object, "expected_revision")?;
+            let retention_floor = bridge_recovery_scope_u64(object, "retention_floor")?;
+            let event_limit = bridge_recovery_scope_u64(object, "event_limit")?;
+            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
+            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
+            if expected_revision == 0
+                || after_sequence > upper_sequence
+                || retention_floor > upper_sequence
+                || event_limit == 0
+                || event_limit > MAX_BRIDGE_RECOVERY_EVENTS
+                || gap_limit == 0
+                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
+                || gap_offset.checked_add(gap_limit).is_none()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        "unscoped_gaps" => {
+            bridge_recovery_scope_fields(
+                object,
+                &[
+                    "version",
+                    "kind",
+                    "window_key",
+                    "after_gap_scope",
+                    "gap_offset",
+                    "gap_limit",
+                ],
+            )?;
+            bridge_recovery_scope_text(object, "after_gap_scope")?;
+            let gap_offset = bridge_recovery_scope_u64(object, "gap_offset")?;
+            let gap_limit = bridge_recovery_scope_u64(object, "gap_limit")?;
+            if gap_limit == 0
+                || gap_limit > MAX_BRIDGE_RECOVERY_GAPS
+                || gap_offset.checked_add(gap_limit).is_none()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        _ => return Err(TransportError::SessionFenced),
+    }
+    Ok(())
+}
+
+/// Decodes the bounded consumed-frontier list and optional exact recovery
+/// selector. Initial/open reads omit the selector. Continuation selectors
+/// are closed version-1 objects and cannot be combined with acknowledgements.
 pub(crate) fn bridge_reconcile_scope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<BridgeReconcileScope, TransportError> {
@@ -4501,6 +4680,7 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
             .and_then(serde_json::Value::as_str)
             .filter(|text| {
                 !text.trim().is_empty()
+                    && text.len() <= MAX_BRIDGE_RECONCILE_TEXT_BYTES
                     && !text.chars().any(char::is_control)
                     && !text.contains("::")
             })
@@ -4512,7 +4692,20 @@ pub(crate) fn bridge_reconcile_scope_from_payload(
             .ok_or(TransportError::SessionFenced)?;
         consumed.push((stream_id.to_owned(), sequence));
     }
-    Ok(BridgeReconcileScope { consumed })
+    let recovery_scope = match payload.get("recovery_scope") {
+        Some(value) => {
+            validate_bridge_recovery_scope(value)?;
+            Some(value.clone())
+        }
+        None => None,
+    };
+    if recovery_scope.is_some() && !consumed.is_empty() {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(BridgeReconcileScope {
+        consumed,
+        recovery_scope,
+    })
 }
 
 /// Typed answer for one staged durable event: the store outcome plus the
