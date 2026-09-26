@@ -38,8 +38,8 @@ pub use governance::{
     TaskSelectionRequired, admit_governing_sources, source_readiness, task_selection_required,
 };
 pub use guard::{
-    GuardTrigger, GuardVerdict, IdentityLegOutcome, TriggerReport, check_at_trigger, identity_legs,
-    produce_attach_receipt, rebind_with_receipt,
+    GuardTrigger, GuardVerdict, IdentityLegOutcome, QuarantinedScopeRecord, TriggerReport,
+    check_at_trigger, identity_legs, produce_attach_receipt, rebind_with_receipt,
 };
 pub use identity::{
     EvidenceStanding, GenerationEvidence, IdentityEvidence, MemoryApplicability, ProposalSource,

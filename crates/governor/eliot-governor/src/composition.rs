@@ -95,16 +95,16 @@ use eliot_workscope::{
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
     MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, OnboardingSingleFlight,
-    PrivacyBoundary, PrivacyProfile, ReadinessLifecycle, RepositoryLineageIdentity,
-    RequestedEffect, ResolutionAuthentication, ResolutionRequest, ScanDisclosureOwnerBinding,
-    ScanReceiptHandle, ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition,
-    ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeRelocationOrAttachReceipt, ScopeResolution,
-    SourceAdmissionRequest, TaskBindingInput, TaskBindingState, TaskIntakeCandidate,
-    TaskSelectionRequired, TriggerAdmission, TriggerReport, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor,
-    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity,
-    admit_at_trigger, admit_initial_binding, check_at_trigger, evaluate_material_request,
-    issue_resolution_receipt, produce_attach_receipt, rebind_with_receipt,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
+    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
+    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
+    WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
+    evaluate_material_request, issue_resolution_receipt, produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -3499,6 +3499,12 @@ pub struct GovernorComposition<P: ?Sized> {
     /// cold-start legs below coalesces on exact workspace identity, privacy
     /// boundary and governing-source generation.
     cold_start: OnboardingSingleFlight,
+    /// Latest quarantined/withheld scope-identity observation (issue #1787).
+    /// A `CanonicalWrite` mismatch retains its conflicting evidence here while
+    /// the binding, task state, and project memory stay preserved; a later
+    /// authorized rebind reconciles against it. Read with
+    /// [`Self::last_scope_quarantine`].
+    scope_quarantine: Option<QuarantinedScopeRecord>,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -4119,6 +4125,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
             cold_start: OnboardingSingleFlight::new(),
+            scope_quarantine: None,
         })
     }
 
@@ -4126,6 +4133,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Returns the latest quarantined/withheld scope-identity observation
+    /// (issue #1787).
+    ///
+    /// The `CanonicalWrite` guard retains the conflicting evidence here when
+    /// it withholds a write; `None` means no mismatch has been observed since
+    /// construction. The retained binding is never replaced by this record.
+    #[must_use]
+    pub const fn last_scope_quarantine(&self) -> Option<&QuarantinedScopeRecord> {
+        self.scope_quarantine.as_ref()
     }
 
     /// Rehydrates one verifier execution fact from the current Governor task,
@@ -4826,7 +4844,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the owner with [`Self::install_admitted_work_scope_owner`]. The prior
     /// identity stays preserved inside the receipt; the retained binding, task
     /// state, and project memory are untouched on any failure. Live status:
-    /// reachable from the daemon admit_scope_attach entry; no live attach
+    /// reachable from the daemon `admit_scope_attach` entry; no live attach
     /// transport calls that entry yet (BLOCKED-BY attach-transport).
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
@@ -4954,13 +4972,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// generation, privacy, and source-generation facts, so the guard can
     /// prove a scope mismatch without ever minting authority from the claim.
     /// A quarantined or non-identity-clear report fails the write before any
-    /// canonical commit; an identity-clear observation proceeds because the
-    /// guard proved no mismatch (source-closure enforcement lives at
-    /// issuance and admission, where sources exist). With no retained binding
-    /// there is nothing to revalidate and the write proceeds unchanged, so
-    /// pre-bootstrap genesis writes keep working.
+    /// canonical commit and retains the conflicting evidence as the
+    /// [`QuarantinedScopeRecord`] returned by [`Self::last_scope_quarantine`];
+    /// an identity-clear observation proceeds because the guard proved no
+    /// mismatch (source-closure enforcement lives at issuance and admission,
+    /// where sources exist). With no retained binding there is nothing to
+    /// revalidate and the write proceeds unchanged, so pre-bootstrap genesis
+    /// writes keep working.
     pub fn check_canonical_write_work_scope(
-        &self,
+        &mut self,
         scope_id: &str,
     ) -> Result<Option<TriggerReport>, CompositionError> {
         let Some(owner) = self.owners.work_scope.as_ref() else {
@@ -4989,9 +5009,21 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             // Issue #1787: the mismatch carries its withholding proof instead
             // of a bare error — trigger, identity legs, verdict, and the
             // expected/observed instance pair — while the retained binding,
-            // task state, and project memory stay preserved. No source closure
-            // exists on this edge, so no receipt is minted here; source
-            // closure is enforced at issuance and admission.
+            // task state, and project memory stay preserved. The conflicting
+            // evidence is additionally retained as a durable
+            // [`QuarantinedScopeRecord`] (no source closure exists on this
+            // edge, so no receipt is minted here; source closure is enforced
+            // at issuance and admission). Record retention never fails the
+            // withhold: when the record itself is malformed the original
+            // proof-carrying error still returns.
+            if let Ok(record) = QuarantinedScopeRecord::for_report(
+                &snapshot.binding,
+                &observed,
+                &report,
+                fence.resource_generation.value(),
+            ) {
+                self.scope_quarantine = Some(record);
+            }
             return Err(CompositionError::Recovery(format!(
                 "canonical write addresses scope {scope_id} while WorkScope is bound to {}; guard withheld at trigger {:?} (identity {:?}, verdict {:?}; expected instance {} observed instance {}); retained binding preserved, write withheld",
                 snapshot.binding.scope.scope_ref,

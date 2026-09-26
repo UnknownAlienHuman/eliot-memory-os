@@ -174,6 +174,112 @@ impl TriggerReport {
     }
 }
 
+/// Durable record of one withheld or quarantined scope-identity observation
+/// (issue #1787, quarantine persistence).
+///
+/// When a trigger evaluation withholds or quarantines, the conflicting
+/// evidence is preserved here instead of living only in a transient error
+/// string: the expected (retained) and observed scope, instance, root, and
+/// generation references, the trigger, the identity-leg outcome, and the
+/// verdict, bound to the fence generation the evaluation ran under. The
+/// retained binding, task state, and project memory are untouched; only this
+/// record is retained, so a later authorized rebind/relocation reconciles
+/// against the exact conflicting evidence. The record proves a mismatch; it
+/// never admits the observed scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantinedScopeRecord {
+    pub expected_scope_ref: String,
+    pub expected_instance_ref: String,
+    pub expected_root_identity: String,
+    pub expected_generation: u64,
+    pub observed_scope_ref: String,
+    pub observed_instance_ref: String,
+    pub observed_root_identity: String,
+    pub observed_generation: u64,
+    pub trigger: GuardTrigger,
+    pub identity: IdentityLegOutcome,
+    pub verdict: GuardVerdict,
+    pub fence_generation: u64,
+}
+
+impl QuarantinedScopeRecord {
+    /// Builds the quarantine record for one evaluated report.
+    ///
+    /// `fence_generation` is the admission fence generation the evaluation
+    /// ran under (genesis zero is legitimate, so it is never counter-checked).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any carried reference is blank.
+    pub fn for_report(
+        expected: &ScopeBinding,
+        observed: &ScopeBinding,
+        report: &TriggerReport,
+        fence_generation: u64,
+    ) -> Result<Self, WorkScopeError> {
+        text(&expected.scope.scope_ref, "quarantine.expected_scope_ref")?;
+        text(
+            &expected.scope.instance_ref,
+            "quarantine.expected_instance_ref",
+        )?;
+        text(
+            &expected.scope.root_identity,
+            "quarantine.expected_root_identity",
+        )?;
+        text(&observed.scope.scope_ref, "quarantine.observed_scope_ref")?;
+        text(
+            &observed.scope.instance_ref,
+            "quarantine.observed_instance_ref",
+        )?;
+        text(
+            &observed.scope.root_identity,
+            "quarantine.observed_root_identity",
+        )?;
+        Ok(Self {
+            expected_scope_ref: expected.scope.scope_ref.clone(),
+            expected_instance_ref: expected.scope.instance_ref.clone(),
+            expected_root_identity: expected.scope.root_identity.clone(),
+            expected_generation: expected.scope.generation,
+            observed_scope_ref: observed.scope.scope_ref.clone(),
+            observed_instance_ref: observed.scope.instance_ref.clone(),
+            observed_root_identity: observed.scope.root_identity.clone(),
+            observed_generation: observed.scope.generation,
+            trigger: report.trigger,
+            identity: report.identity,
+            verdict: report.verdict,
+            fence_generation,
+        })
+    }
+
+    /// Validates the retained conflicting-evidence references.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any carried reference is blank.
+    pub fn validate(&self) -> Result<(), WorkScopeError> {
+        text(&self.expected_scope_ref, "quarantine.expected_scope_ref")?;
+        text(
+            &self.expected_instance_ref,
+            "quarantine.expected_instance_ref",
+        )?;
+        text(
+            &self.expected_root_identity,
+            "quarantine.expected_root_identity",
+        )?;
+        text(&self.observed_scope_ref, "quarantine.observed_scope_ref")?;
+        text(
+            &self.observed_instance_ref,
+            "quarantine.observed_instance_ref",
+        )?;
+        text(
+            &self.observed_root_identity,
+            "quarantine.observed_root_identity",
+        )?;
+        Ok(())
+    }
+}
+
 /// Produces an authorized attach receipt for one newly observed workspace instance.
 ///
 /// This is the production side of the attach edge that [`rebind_with_receipt`]
