@@ -343,10 +343,13 @@ impl SingleInstanceObservations {
 /// the recorded owner PID was proven dead for this exact runtime root:
 /// every present identity source (PID file, lock bytes, app-validated
 /// publication) agrees on one PID, the liveness probe reports that PID
-/// dead twice, and the lock file object still matches the validated
-/// snapshot (byte content and platform object identity) at removal and at
-/// exclusive re-creation, so two contenders cannot both reclaim and a stale
-/// observer cannot unlink a replacement lock.
+/// dead twice, and the lock file object is pinned with delete/write sharing
+/// denied across validation (Windows) with a second pin proving the same
+/// `FileIdentity` and bytes just before mutation, so two contenders cannot
+/// both reclaim and a stale observer cannot unlink a replacement lock. A
+/// live successor additionally holds its lock with delete sharing denied,
+/// so a paused observer's removal fails into a typed refusal instead of
+/// deleting the new owner's lock.
 ///
 /// Returns `Ok(false)` — removing nothing — when no lock file exists.
 /// A live owner, contradictory or malformed identity, inaccessible or
@@ -400,14 +403,21 @@ pub fn recover_stale_single_instance_lock(
         observations.publication_pid,
     )?;
     probe_owner_dead(&lock_path, owner_pid)?;
-    // Re-verify the validated snapshot immediately before mutation: byte
-    // equality against the snapshot plus existence-serialized removal plus
-    // exclusive re-creation is the serialization. (File-index object
-    // identity is unavailable: `MetadataExt::file_index` is unstable
-    // (`windows_by_handle`) on the pinned toolchain and `unsafe_code` is
-    // forbidden workspace-wide, so a raw Win32 identity query cannot live
-    // here; the post-creation ownership proof below closes the residual
-    // replacement window instead — see `path_names_owned_lock`.)
+    // Exclusive-ownership guard spanning validation to mutation (Windows):
+    // pin the validated lock object with delete/write sharing denied, so no
+    // contender can replace or unlink it while this validation runs. The
+    // held handle is the object-identity anchor: bytes are re-read from the
+    // handle itself, and a second pin just before mutation must resolve to
+    // the same `FileIdentity`. A byte re-read alone is insufficient without
+    // this serialization, so it is not relied on here.
+    #[cfg(windows)]
+    let pinned = pin_single_instance_lock(&lock_path, &lock_snapshot)?;
+    #[cfg(windows)]
+    let pinned_identity = pinned.identity();
+    // Re-verify the validated snapshot immediately before mutation. The
+    // pinned handle above serializes validation against replacement; the
+    // path re-reads below additionally refuse when caller-observed state
+    // rotated before the pin was taken.
     if std::fs::read(&lock_path).ok().as_deref() != Some(lock_snapshot.as_slice()) {
         return Err(single_instance_contention(
             &lock_path,
@@ -416,16 +426,7 @@ pub fn recover_stale_single_instance_lock(
         ));
     }
     if pid_snapshot.is_some() {
-        match std::fs::read(&pid_path).ok() {
-            Some(current) if Some(current.as_slice()) == pid_snapshot.as_deref() => {}
-            _ => {
-                return Err(single_instance_contention(
-                    &lock_path,
-                    SingleInstanceRefusal::ReplacementDetected,
-                    "daemon.pid was replaced during stale-owner validation; refusing removal",
-                ));
-            }
-        }
+        confirm_pid_snapshot_unchanged(&lock_path, &pid_path, pid_snapshot.as_deref())?;
     } else if pid_path.exists() {
         return Err(single_instance_contention(
             &lock_path,
@@ -434,17 +435,15 @@ pub fn recover_stale_single_instance_lock(
         ));
     }
     probe_owner_dead(&lock_path, owner_pid)?;
-    match std::fs::remove_file(&lock_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(single_instance_contention(
-                &lock_path,
-                SingleInstanceRefusal::ReplacementDetected,
-                "daemon.lock vanished during stale-owner recovery; a competing starter reclaimed it",
-            ));
-        }
-        Err(error) => return Err(EngineError::Io(error)),
-    }
+    #[cfg(windows)]
+    confirm_single_instance_identity(&lock_path, &lock_snapshot, pinned_identity)?;
+    // The explicit drop is load-bearing: without it the pin above would deny
+    // our own removal. The drop-to-remove window is closed by the owner's
+    // deny-delete creation handle (a live successor's lock resists unlink)
+    // plus the sharing-violation refusal below.
+    #[cfg(windows)]
+    drop(pinned);
+    remove_reclaimed_lock(&lock_path)?;
     if let Some(snapshot) = pid_snapshot.as_deref()
         && std::fs::read(&pid_path).ok().as_deref() == Some(snapshot)
     {
@@ -467,12 +466,13 @@ pub fn recover_stale_single_instance_lock(
 /// disposition with the primary failure, so the next contender meets a
 /// recoverable state.
 ///
-/// Serialization rests on the platform's exclusive-creation primitive:
-/// exactly one `create_new` succeeds, every removal re-proves the expected
-/// bytes first, and a final triple verification (lock bytes, PID bytes,
-/// startup owner) gates the return, so a stale observer that unlinked a
-/// replacement lock meets a verification failure instead of becoming a
-/// second owner.
+/// Serialization rests on the platform's exclusive-creation primitive and
+/// on the owner's deny-delete creation handle (Windows): exactly one
+/// `create_new` succeeds, a live owner's lock resists unlink by any stale
+/// observer, every removal re-proves the expected bytes first, and a final
+/// triple verification (lock bytes, PID bytes, startup owner) gates the
+/// return, so a stale observer that outlived validation meets a
+/// `ReplacementDetected` refusal instead of becoming a second owner.
 fn establish_single_instance_ownership(
     runtime_dir: &Path,
     lock_path: &Path,
@@ -511,6 +511,10 @@ fn establish_single_instance_ownership(
         ));
     }
     if let Err(error) = std::fs::write(&pid_path, &owner_text) {
+        // Close the creation handle first so the partial-claim cleanup below
+        // can remove our own lock; the handle denies delete sharing on
+        // Windows while it is open.
+        drop(file);
         let cleanup = abandon_partial_claim(
             lock_path,
             &pid_path,
@@ -533,6 +537,10 @@ fn establish_single_instance_ownership(
         owner_pid,
     )?;
     if !verify_owned_establishment(lock_path, &pid_path, &startup_marker_path, owner_pid) {
+        // Close the creation handle first so the partial-claim cleanup below
+        // can remove our own lock; the handle denies delete sharing on
+        // Windows while it is open.
+        drop(file);
         let cleanup = abandon_partial_claim(
             lock_path,
             &pid_path,
@@ -555,7 +563,7 @@ fn establish_single_instance_ownership(
         pid_path,
         clean_marker_path,
         owner_pid,
-        _file: file,
+        lock_handle: Some(file),
     })
 }
 
@@ -749,16 +757,40 @@ fn restore_marker_or_remove(
                 notes.push(format!("{role} left in place: not provably this attempt"));
             }
         }
-        MarkerBackup::Previous(previous) => match std::fs::write(path, &previous) {
-            Ok(()) => notes.push(format!("restored previous {role}")),
-            Err(_) => {
+        MarkerBackup::Previous(previous) => {
+            // Never overwrite a successor's marker publication: a failed
+            // claimant that restores unconditionally could clobber objects a
+            // new owner published after this attempt's lock was removed. Only
+            // our own or ownerless content may be restored.
+            let successor_owned = std::fs::read(path).ok().is_some_and(
+                |current| matches!(parse_owner_marker(&current), Some(pid) if pid != owner_pid),
+            );
+            if successor_owned {
                 notes.push(format!(
-                    "previous {role} restore failed; disposition uncertain"
+                    "{role} left in place: successor-owned; previous-state restore skipped"
                 ));
+            } else {
+                match std::fs::write(path, &previous) {
+                    Ok(()) => notes.push(format!("restored previous {role}")),
+                    Err(_) => {
+                        notes.push(format!(
+                            "previous {role} restore failed; disposition uncertain"
+                        ));
+                    }
+                }
             }
-        },
+        }
     }
 }
+
+/// Windows share mode for the owned single-instance lock: read-only sharing
+/// (`FILE_SHARE_READ`, numeric literal matching the `claim_root_lease`
+/// precedent in `eliot-store`) denies concurrent write and delete access
+/// while the owner holds the creation handle, so a stale observer or a
+/// finishing old `Drop` cannot unlink a live owner's lock. A dead owner
+/// holds no handle, so a proven-dead lock stays reclaimable.
+#[cfg(windows)]
+const SINGLE_INSTANCE_LOCK_SHARE_MODE: u32 = 1;
 
 /// Exclusive-creation outcome. `Exists` means a competing starter holds the
 /// path; only the lifecycle-owned recovery protocol may act on it.
@@ -769,11 +801,14 @@ enum LockCreateOutcome {
 }
 
 fn create_single_instance_lock_file(lock_path: &Path) -> LockCreateOutcome {
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lock_path)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(SINGLE_INSTANCE_LOCK_SHARE_MODE);
+    }
+    match options.open(lock_path) {
         Ok(file) => LockCreateOutcome::Created(file),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             LockCreateOutcome::Exists
@@ -954,16 +989,158 @@ fn liveness_refusal() -> SingleInstanceRefusal {
     SingleInstanceRefusal::UnsupportedPlatform
 }
 
-/// Platform file-object identity cannot back the ownership proof on the
-/// pinned toolchain: `MetadataExt::file_index`/`volume_serial_number` are
-/// unstable (`windows_by_handle`) on Rust 1.97.1 and `unsafe_code` is
-/// forbidden workspace-wide, so no raw Win32 identity query may live here.
-/// Ownership is proven by byte content instead: the agreed owner PID is
-/// unique among live processes, so a path carrying our PID bytes names our
-/// claim, and every removal re-proves those bytes first. Combined with
-/// exclusive creation (exactly one `create_new` succeeds) and the final
-/// triple verification in `establish_single_instance_ownership`, a stale
-/// observer cannot unlink a replacement lock without meeting a
+/// Re-verifies the PID-file snapshot immediately before mutation: a
+/// replaced or newly appeared PID file proves the world rotated and refuses
+/// removal instead of unlinking a successor's evidence.
+fn confirm_pid_snapshot_unchanged(
+    lock_path: &Path,
+    pid_path: &Path,
+    pid_snapshot: Option<&[u8]>,
+) -> Result<(), EngineError> {
+    match std::fs::read(pid_path).ok() {
+        Some(current) if Some(current.as_slice()) == pid_snapshot => Ok(()),
+        _ => Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.pid was replaced during stale-owner validation; refusing removal",
+        )),
+    }
+}
+
+/// Removes a validated stale lock. A vanished path means a competing starter
+/// reclaimed it; a sharing/permission denial means a live owner holds the
+/// lock with delete sharing denied — both refuse as replacement instead of
+/// surfacing I/O noise. Genuine I/O failures stay typed.
+fn remove_reclaimed_lock(lock_path: &Path) -> Result<(), EngineError> {
+    match std::fs::remove_file(lock_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                "daemon.lock vanished during stale-owner recovery; a competing starter reclaimed it",
+            ))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                "daemon.lock is held by a live owner; refusing removal",
+            ))
+        }
+        Err(error) => Err(EngineError::Io(error)),
+    }
+}
+
+/// Pins the validated lock path with delete/write sharing denied and proves
+/// the pinned object still carries the validated snapshot bytes.
+///
+/// The returned handle must stay alive across the remaining validation:
+/// while it is open, no contender can replace or unlink the lock object,
+/// and every byte re-read comes from the pinned object rather than a
+/// re-resolved path, which a byte re-read alone cannot guarantee.
+#[cfg(windows)]
+fn pin_single_instance_lock(
+    lock_path: &Path,
+    lock_snapshot: &[u8],
+) -> Result<eliot_windows_ipc::PinnedFile, EngineError> {
+    let mut pinned = match eliot_windows_ipc::PinnedFile::open(lock_path) {
+        Ok(pinned) => pinned,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                "daemon.lock vanished during stale-owner validation; refusing removal",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::MalformedIdentity,
+                "daemon.lock is not a regular file; refusing removal",
+            ));
+        }
+        Err(error) => {
+            return Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::InaccessibleEvidence,
+                format!("cannot pin daemon.lock for validated removal: {error}"),
+            ));
+        }
+    };
+    match pinned.read_all() {
+        Ok(bytes) if bytes == lock_snapshot => Ok(pinned),
+        _ => Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.lock changed during stale-owner validation; refusing removal",
+        )),
+    }
+}
+
+/// Proves the lock path still resolves to the pinned validation object just
+/// before mutation: a fresh pin must expose the same `FileIdentity` and the
+/// same snapshot bytes. A replacement lock created after validation carries
+/// a different object identity and is refused here instead of unlinked.
+#[cfg(windows)]
+fn confirm_single_instance_identity(
+    lock_path: &Path,
+    lock_snapshot: &[u8],
+    pinned_identity: eliot_windows_ipc::FileIdentity,
+) -> Result<(), EngineError> {
+    let mut fresh = match eliot_windows_ipc::PinnedFile::open(lock_path) {
+        Ok(fresh) => fresh,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::ReplacementDetected,
+                "daemon.lock vanished during stale-owner validation; refusing removal",
+            ));
+        }
+        Err(error) => {
+            return Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::InaccessibleEvidence,
+                format!("cannot re-pin daemon.lock before validated removal: {error}"),
+            ));
+        }
+    };
+    let bytes = match fresh.read_all() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(single_instance_contention(
+                lock_path,
+                SingleInstanceRefusal::InaccessibleEvidence,
+                format!("cannot re-read daemon.lock before validated removal: {error}"),
+            ));
+        }
+    };
+    if fresh.identity() != pinned_identity || bytes != lock_snapshot {
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.lock was replaced during stale-owner validation; refusing removal",
+        ));
+    }
+    Ok(())
+}
+
+/// Platform file-object identity backs the ownership proof on Windows via
+/// `eliot_windows_ipc::PinnedFile` (deny-delete pin spanning validation to
+/// mutation plus a `FileIdentity` comparison just before removal — see
+/// `pin_single_instance_lock` and `confirm_single_instance_identity`). The
+/// byte-content check below is the portable re-proof used at every removal
+/// and establishment gate: the agreed owner PID is unique among live
+/// processes, so a path carrying our PID bytes names our claim. Combined
+/// with exclusive creation (exactly one `create_new` succeeds), the owner's
+/// deny-delete creation handle (a live successor's lock resists unlink), and
+/// the final triple verification in `establish_single_instance_ownership`, a
+/// stale observer cannot unlink a replacement lock without meeting a
 /// `ReplacementDetected` refusal instead of becoming a second owner.
 fn path_names_owned_lock(lock_path: &Path, owner_bytes: &[u8]) -> bool {
     std::fs::read(lock_path).ok().as_deref() == Some(owner_bytes)
@@ -1018,7 +1195,7 @@ pub struct RuntimeLock {
     pid_path: PathBuf,
     clean_marker_path: PathBuf,
     owner_pid: u32,
-    _file: File,
+    lock_handle: Option<File>,
 }
 
 impl RuntimeLock {
@@ -1073,10 +1250,14 @@ impl RuntimeLock {
 impl Drop for RuntimeLock {
     fn drop(&mut self) {
         // Release only owned resources: a successor's lock, PID file, or
-        // clean indication is never removed or written here. A paused stale
-        // recovery or a finishing old Drop therefore cannot delete the new
-        // owner's objects — every removal re-proves bytes and object
-        // identity first.
+        // clean indication is never removed or written here. The owned
+        // creation handle is closed first — on Windows it denies delete
+        // sharing, which protects a live owner's lock from unlinking but
+        // would also deny our own removal. Every removal below then
+        // re-proves bytes, and a successor's live handle additionally denies
+        // our unlink, so a paused stale recovery or a finishing old Drop
+        // cannot delete the new owner's objects.
+        drop(self.lock_handle.take());
         if path_names_owned_lock(&self.lock_path, self.owner_pid.to_string().as_bytes()) {
             let _ = std::fs::remove_file(&self.lock_path);
         }
