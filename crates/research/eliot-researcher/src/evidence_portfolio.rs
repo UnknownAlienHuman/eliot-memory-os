@@ -5626,7 +5626,9 @@ pub fn audit_claim(
             }
             HandleStanding::Unresolved => {
                 lineage_gap = true;
-                residue.push(format!("claim: citation {handle} has no authoritative lineage"));
+                residue.push(format!(
+                    "claim: citation {handle} has no authoritative lineage"
+                ));
                 continue;
             }
             HandleStanding::SubstitutedRecord => {
