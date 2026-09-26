@@ -163,7 +163,11 @@ fn manifest_for(portfolio: &EvidencePortfolio, inquiry: &FrozenInquiry) -> Autho
     for (handle, entry) in &portfolio.records {
         sources.insert(
             handle.clone(),
-            (entry.content_digest.clone(), entry.transformed_from.clone()),
+            ManifestSource {
+                record_digest: entry.digest().expect("source record commitment"),
+                content_digest: entry.content_digest.clone(),
+                transformed_from: entry.transformed_from.clone(),
+            },
         );
     }
     let edges: BTreeSet<(String, String)> = portfolio

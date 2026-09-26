@@ -257,6 +257,22 @@ pub struct SourceAdmissibilityRecord {
     pub digest: String,
 }
 
+/// Declared identity domain of [`SourceAdmissibilityRecord`].
+///
+/// Bumped `v1` -> `v2` for two reasons, both of which change the bytes:
+///
+/// 1. the preimage binds the source record's own canonical digest, and that
+///    digest moved to a new declared domain with a complete field set, so the
+///    same decision shape hashes differently than it did under `v1`;
+/// 2. an absent independence root was spelled as the sentinel string
+///    `unknown_lineage`, which collided with a real root carrying that name.
+///    Absence is now bound as its own declared state.
+///
+/// A named constant rather than an inline literal, so a consumer or a migration
+/// check can name the domain it must reject instead of matching on a string
+/// buried in a function body.
+pub const SOURCE_ADMISSIBILITY_DIGEST_DOMAIN: &str = "source-admissibility/v2";
+
 impl SourceAdmissibilityRecord {
     /// Decides whether one vetted source may enter one inquiry evidence set.
     ///
@@ -321,7 +337,7 @@ impl SourceAdmissibilityRecord {
             governor_admission_required: true,
             digest: String::new(),
         };
-        disposition.digest = disposition.compute_digest();
+        disposition.digest = disposition.compute_digest()?;
         Ok(disposition)
     }
 
@@ -339,9 +355,14 @@ impl SourceAdmissibilityRecord {
     /// The request asks the existing Governor admission path to apply the
     /// resulting transition. It grants no canonical write, no finish and no
     /// influence over any other source.
-    #[must_use]
-    pub fn transition_request(&self) -> GovernorSourceTransitionRequest {
-        GovernorSourceTransitionRequest {
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoding refusal when the decision's own source record has no
+    /// computable canonical commitment. A Governor-facing request must not carry
+    /// an invented or empty source identity, so this refuses instead.
+    pub fn transition_request(&self) -> Result<GovernorSourceTransitionRequest, InquiryError> {
+        Ok(GovernorSourceTransitionRequest {
             request_kind: GovernorSourceTransitionRequest::REQUEST_KIND.to_owned(),
             inquiry_id: self.inquiry_id.clone(),
             evidence_set_id: self.evidence_set_id.clone(),
@@ -349,18 +370,30 @@ impl SourceAdmissibilityRecord {
             profile_revision: self.profile_revision,
             profile_digest: self.profile_digest.clone(),
             source_handle: self.record.handle.clone(),
-            source_record_digest: self.record.digest(),
+            source_record_digest: self.record.digest().map_err(InquiryError::from)?,
             eligibility: self.eligibility,
             admissibility_digest: self.digest.clone(),
             scope: self.scope.clone(),
             state_fence: self.state_fence.clone(),
             candidate_only: true,
             canonical_write_authorized: false,
-        }
+        })
     }
 
-    fn compute_digest(&self) -> String {
-        let mut preimage = String::from("source-admissibility/v1;");
+    /// Canonical digest over the whole decision shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoding refusal when the bound source record cannot be
+    /// encoded into its canonical domain. A decision whose own source record has
+    /// no computable commitment has no decision identity, so this refuses rather
+    /// than hashing a shortened preimage.
+    ///
+    /// The domain is [`SOURCE_ADMISSIBILITY_DIGEST_DOMAIN`]; see it for why it
+    /// moved and what the previous spelling conflated.
+    fn compute_digest(&self) -> Result<String, InquiryError> {
+        let source_record = self.record.digest().map_err(InquiryError::from)?;
+        let mut preimage = String::from(SOURCE_ADMISSIBILITY_DIGEST_DOMAIN);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
         push_field(&mut preimage, "profile_id", &self.profile_id);
@@ -370,21 +403,27 @@ impl SourceAdmissibilityRecord {
             &self.profile_revision.to_string(),
         );
         push_field(&mut preimage, "profile_digest", &self.profile_digest);
-        push_field(&mut preimage, "source_record", &self.record.digest());
+        push_field(&mut preimage, "source_record", &source_record);
         push_field(&mut preimage, "scope", &self.scope);
         push_field(&mut preimage, "eligibility", self.eligibility.wire_name());
         push_count(&mut preimage, "taint", self.taint.len());
         for taint in &self.taint {
             push_field(&mut preimage, "taint", taint.wire_name());
         }
-        push_field(
-            &mut preimage,
-            "independence_root",
-            self.independence
-                .lineage_root
-                .as_deref()
-                .unwrap_or("unknown_lineage"),
-        );
+        // The absence of a lineage root is bound as its own declared state, not
+        // as a sentinel string. The previous spelling used `unknown_lineage` for
+        // `None`, which made "independence was never established" and
+        // "independence was established and its root is literally named
+        // `unknown_lineage`" the same bytes — and it contradicted
+        // `SourceRecord::lineage_root`'s own contract, which states that `None`
+        // preserves unknown independence and is never treated as a unique root.
+        match &self.independence.lineage_root {
+            Some(root) => {
+                push_field(&mut preimage, "independence_root_declared", "true");
+                push_field(&mut preimage, "independence_root", root);
+            }
+            None => push_field(&mut preimage, "independence_root_declared", "false"),
+        }
         push_field(
             &mut preimage,
             "max_anchor_precision",
@@ -405,17 +444,22 @@ impl SourceAdmissibilityRecord {
             "assessment_time_ms",
             &self.assessment_time_ms.to_string(),
         );
-        freeze(&preimage)
+        Ok(freeze(&preimage))
     }
 
     /// Re-proves this decision's own digest.
+    ///
+    /// This is the readback check: a decision reloaded or relayed after the fact
+    /// still has individually well-formed fields, and only recomputing the digest
+    /// over the bytes actually present can say that it is no longer the decision
+    /// that was made.
     ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
     /// disagrees with the stored one.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
-        if self.compute_digest() != self.digest {
+        if self.compute_digest()? != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "admissibility.digest",
             });
