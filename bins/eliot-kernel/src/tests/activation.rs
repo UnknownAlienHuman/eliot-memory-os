@@ -1319,7 +1319,7 @@ fn activation_result_cross_shape_conflicts_fail_closed_in_both_submission_orders
         .submit_agent_activation_resolution_result(canonical_winner.clone())
         .expect("raw exact replay is idempotent");
     let raw_conflict = canonical_kernel
-        .submit_agent_activation_resolution_result(raw_changed)
+        .submit_agent_activation_resolution_result(raw_changed.clone())
         .expect_err("changed raw payload under the retained ticket must conflict");
     assert!(
         matches!(&raw_conflict, TransportError::IdentityConflict),
@@ -1350,6 +1350,83 @@ fn activation_result_cross_shape_conflicts_fail_closed_in_both_submission_orders
         );
     }
     drop(canonical_kernel);
+
+    let canonical_restarted = KernelComposition::new(KernelConfig::new(&canonical_root))
+        .expect("restart after canonical-first cross-shape commit");
+    {
+        let pending = canonical_restarted
+            .agent_activation_pending
+            .lock()
+            .expect("canonical-first restarted pending lock");
+        let raw = canonical_restarted
+            .agent_activation_results
+            .lock()
+            .expect("canonical-first restarted raw lock");
+        assert!(pending.entries.is_empty(), "restart must not restore a live ticket");
+        assert_eq!(
+            pending.results.get(&canonical_ticket.ticket_id).map(|record| &record.result),
+            Some(&canonical_winner),
+            "restart must restore the exact canonical result row"
+        );
+        assert_eq!(
+            raw.get(&canonical_ticket.ticket_id).map(|record| &record.result),
+            Some(&canonical_winner),
+            "restart must restore the exact raw result row"
+        );
+    }
+    let canonical_restart_replay = canonical_restarted
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(canonical_winner.clone())
+                .expect("canonical-first restarted replay submit"),
+        )
+        .expect("canonical-first replay after restart");
+    assert_eq!(
+        canonical_restart_replay.outcome,
+        AgentActivationResultAckOutcome::ExactReplay
+    );
+    assert_eq!(canonical_restart_replay.result, Some(canonical_winner.clone()));
+    canonical_restarted
+        .submit_agent_activation_resolution_result(canonical_winner.clone())
+        .expect("raw exact replay after canonical-first restart");
+    let raw_restart_conflict = canonical_restarted
+        .submit_agent_activation_resolution_result(raw_changed.clone())
+        .expect_err("changed raw result must conflict after canonical-first restart");
+    assert!(matches!(
+        &raw_restart_conflict,
+        TransportError::IdentityConflict
+    ));
+    let canonical_restart_conflict = canonical_restarted
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(raw_changed)
+                .expect("changed canonical-shape result after restart"),
+        )
+        .expect_err("changed canonical result must conflict after restart");
+    assert!(matches!(
+        &canonical_restart_conflict,
+        TransportError::IdentityConflict
+    ));
+    {
+        let pending = canonical_restarted
+            .agent_activation_pending
+            .lock()
+            .expect("canonical-first post-replay pending lock");
+        let raw = canonical_restarted
+            .agent_activation_results
+            .lock()
+            .expect("canonical-first post-replay raw lock");
+        assert!(pending.entries.is_empty());
+        assert_eq!(
+            pending.results.get(&canonical_ticket.ticket_id).map(|record| &record.result),
+            Some(&canonical_winner),
+            "replay and rejected conflicts must leave canonical retention unchanged"
+        );
+        assert_eq!(
+            raw.get(&canonical_ticket.ticket_id).map(|record| &record.result),
+            Some(&canonical_winner),
+            "replay and rejected conflicts must leave raw retention unchanged"
+        );
+    }
+    drop(canonical_restarted);
     let _ = std::fs::remove_dir_all(canonical_root);
 
     // Raw P-04 wins first. Canonical v2 sees that retained identity, replays
@@ -1382,7 +1459,8 @@ fn activation_result_cross_shape_conflicts_fail_closed_in_both_submission_orders
     assert_eq!(canonical_replay.result, Some(raw_winner.clone()));
     let canonical_conflict = raw_kernel
         .submit_agent_activation_result(
-            AgentActivationResultSubmit::new(canonical_changed).expect("changed canonical submit"),
+            AgentActivationResultSubmit::new(canonical_changed.clone())
+                .expect("changed canonical submit"),
         )
         .expect_err("changed canonical payload under the retained ticket must conflict");
     assert!(
@@ -1409,6 +1487,81 @@ fn activation_result_cross_shape_conflicts_fail_closed_in_both_submission_orders
         );
     }
     drop(raw_kernel);
+
+    let raw_restarted = KernelComposition::new(KernelConfig::new(&raw_root))
+        .expect("restart after raw-first cross-shape commit");
+    {
+        let pending = raw_restarted
+            .agent_activation_pending
+            .lock()
+            .expect("raw-first restarted pending lock");
+        let raw = raw_restarted
+            .agent_activation_results
+            .lock()
+            .expect("raw-first restarted raw lock");
+        assert!(pending.entries.is_empty(), "restart must not restore a live ticket");
+        assert!(
+            !pending.results.contains_key(&raw_ticket.ticket_id),
+            "raw-first restart must not manufacture a canonical-v2 row"
+        );
+        assert_eq!(
+            raw.get(&raw_ticket.ticket_id).map(|record| &record.result),
+            Some(&raw_winner),
+            "restart must restore the exact raw-first winner"
+        );
+    }
+    raw_restarted
+        .submit_agent_activation_resolution_result(raw_winner.clone())
+        .expect("raw exact replay after raw-first restart");
+    let canonical_restart_replay = raw_restarted
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(raw_winner.clone())
+                .expect("canonical replay after raw-first restart"),
+        )
+        .expect("canonical exact replay after raw-first restart");
+    assert_eq!(
+        canonical_restart_replay.outcome,
+        AgentActivationResultAckOutcome::ExactReplay
+    );
+    assert_eq!(canonical_restart_replay.result, Some(raw_winner.clone()));
+    let raw_restart_conflict = raw_restarted
+        .submit_agent_activation_resolution_result(canonical_changed.clone())
+        .expect_err("changed raw result must conflict after raw-first restart");
+    assert!(matches!(
+        &raw_restart_conflict,
+        TransportError::IdentityConflict
+    ));
+    let canonical_restart_conflict = raw_restarted
+        .submit_agent_activation_result(
+            AgentActivationResultSubmit::new(canonical_changed)
+                .expect("changed canonical result after restart"),
+        )
+        .expect_err("changed canonical result must conflict after raw-first restart");
+    assert!(matches!(
+        &canonical_restart_conflict,
+        TransportError::IdentityConflict
+    ));
+    {
+        let pending = raw_restarted
+            .agent_activation_pending
+            .lock()
+            .expect("raw-first post-replay pending lock");
+        let raw = raw_restarted
+            .agent_activation_results
+            .lock()
+            .expect("raw-first post-replay raw lock");
+        assert!(pending.entries.is_empty());
+        assert!(
+            !pending.results.contains_key(&raw_ticket.ticket_id),
+            "replay and rejected conflicts must not create a canonical row"
+        );
+        assert_eq!(
+            raw.get(&raw_ticket.ticket_id).map(|record| &record.result),
+            Some(&raw_winner),
+            "replay and rejected conflicts must leave raw retention unchanged"
+        );
+    }
+    drop(raw_restarted);
     let _ = std::fs::remove_dir_all(raw_root);
 }
 
