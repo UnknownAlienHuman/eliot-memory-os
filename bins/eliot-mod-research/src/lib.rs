@@ -21,9 +21,14 @@ pub mod kernel_client;
 pub mod protocol;
 
 use eliot_contracts::StateFence;
+use eliot_process::ExitDisposition;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
-use eliot_research_exchange_api::{CoverageGapKind, ResearchQueryRequest};
-use eliot_researcher::Researcher;
+use eliot_research_exchange_api::{CoverageGapKind, ResearchQueryRequest, SourceClass};
+use eliot_researcher::{
+    AcquisitionOutcome, CandidateEvidence, InquiryGovernance, InquiryHorizon, InquiryObservation,
+    InquiryRisk, InquirySelectionFeatures, InquiryUncertainty, Researcher,
+    SpecialistDiscoverability, StreamEvidence, VerifierStrength,
+};
 use thiserror::Error;
 
 pub use admission::{AdmissionRefusal, ProviderAdmission};
@@ -105,6 +110,24 @@ pub enum BridgeError {
     },
     #[error("shared process contour failed: {0}")]
     Process(#[from] eliot_process::ProcessExecutionError),
+}
+
+/// Why the `R6` inquiry-governance view of one admitted operation could not be
+/// projected.
+///
+/// The refusal is a typed gap on the evidence stream. It never becomes a closed
+/// inquiry, an admitted result, or a substitute provider receipt.
+#[derive(Debug, Error)]
+pub enum R6ProjectionError {
+    /// The admitted material does not bind one exact operation.
+    #[error("inquiry governance projection refused: {reason}")]
+    UnboundAdmission {
+        /// Stable reason for the refusal.
+        reason: &'static str,
+    },
+    /// The `R6` domain refused the admitted material.
+    #[error("inquiry governance projection refused by the researcher domain: {0}")]
+    Domain(#[from] eliot_researcher::InquiryError),
 }
 
 impl BridgeError {
@@ -638,6 +661,192 @@ pub fn exchange_snapshot<B>(
     researcher: &Researcher<B>,
 ) -> &eliot_research_exchange::ExchangeSnapshot {
     researcher.exchange().snapshot()
+}
+
+/// Stable code prefixed to the `R6` inquiry-governance view of one admitted
+/// operation on the evidence stream.
+pub const INQUIRY_GOVERNANCE_VIEW: &str = "INQUIRY_GOVERNANCE_VIEW";
+
+/// Stable code emitted on the evidence stream when the `R6` inquiry-governance
+/// view of one admitted operation could not be projected.
+///
+/// The provider receipt stays the operation's own truth: a governance projection
+/// that cannot be built is reported as a typed gap, never as a closed inquiry
+/// and never as an admitted result.
+pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
+
+/// Projects the `R6` inquiry-governance view of one admitted provider
+/// operation.
+///
+/// This is the production edge that makes the `R6` typed domain reachable: every
+/// admitted operation this composition root performs is observed exactly once
+/// here, and the resulting record is a versioned inquiry profile with its
+/// selected grade and lane, the source-admissibility disposition of the retained
+/// material, a coverage receipt with a declared denominator kind, the compiler
+/// inputs for the open obligations, the non-canonical governed artifacts, and a
+/// terminal typed inquiry disposition bound to the profile, portfolio, manifest
+/// and State Fence.
+///
+/// Every field is derived from already-admitted material and from the retained
+/// raw evidence of this process. The projection never decodes the provider body,
+/// never claims a source, citation, anchor or coverage the evidence does not
+/// carry, and never promotes the result: the record stays candidate-only and the
+/// Governor applies any transition.
+///
+/// # Errors
+///
+/// Returns [`R6ProjectionError::UnboundAdmission`] when the admitted request and
+/// the terminal receipt do not bind the same operation, exchange, budget or
+/// deadline, and [`R6ProjectionError::Domain`] when the `R6` domain refuses the
+/// admitted material. Neither variant changes the provider receipt or this
+/// process's exit code: the refusal is reported on the evidence stream.
+pub fn project_admitted_inquiry(
+    request: &ResearchQueryRequest,
+    receipt: &ProviderExecutionReceipt,
+) -> Result<InquiryGovernance, crate::R6ProjectionError> {
+    if receipt.operation_id.is_empty()
+        || receipt.exchange_id != request.exchange_id
+        || receipt.cancellation_id.is_empty()
+        || receipt.inquiry_digest.is_empty()
+        || receipt.denominator_digest.is_empty()
+    {
+        return Err(crate::R6ProjectionError::UnboundAdmission {
+            reason: "admitted request and terminal receipt do not bind the same operation",
+        });
+    }
+    if receipt.budget_units != request.budget_units || receipt.deadline_ms != request.deadline_ms {
+        return Err(crate::R6ProjectionError::UnboundAdmission {
+            reason: "terminal receipt widens the admitted budget or deadline",
+        });
+    }
+    let assessment_time_ms = i64::try_from(dispatch_authority::unix_ms()).unwrap_or(i64::MAX);
+    let route = format!(
+        "{}@{}",
+        receipt.module_generation_id, receipt.executable_sha256
+    );
+    let observation = InquiryObservation {
+        inquiry_id: receipt.exchange_id.clone(),
+        evidence_set_id: request.allowed_references.run_id.clone(),
+        profile_id: format!("inquiry-profile-{}", receipt.exchange_id),
+        operation_id: receipt.operation_id.clone(),
+        exchange_id: receipt.exchange_id.clone(),
+        inquiry_digest: receipt.inquiry_digest.clone(),
+        denominator_digest: receipt.denominator_digest.clone(),
+        question: request.question.clone(),
+        scope: request.question_scope.clone(),
+        intended_decision_or_artifact: request.expected_decision.clone(),
+        requester: request.requester_principal.clone(),
+        requested_source_classes: request.source_classes.clone(),
+        reference_manifest: request.allowed_references.clone(),
+        admitted_coverage_goal: request.coverage_goal.clone(),
+        required_schema: request.required_schema.clone(),
+        disclosure: request.disclosure,
+        budget_units: request.budget_units,
+        deadline_ms: request.deadline_ms,
+        cancellation_id: receipt.cancellation_id.clone(),
+        provider_generation: receipt.module_generation_id.clone(),
+        admissible_routes: vec![route.clone()],
+        features: admitted_selection_features(request),
+        candidates: vec![retained_provider_material(request, receipt, &route)],
+        outcome: acquisition_outcome(receipt),
+        reason_code: receipt.reason_code.to_owned(),
+        assessment_time_ms,
+    };
+    InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
+}
+
+/// The structural selection features this boundary can prove from admitted
+/// material.
+///
+/// The selection inputs I21.3 requires are properties of the requesting task
+/// definition: sequential dependency, branch independence, shared mutable state,
+/// verifier cost and strength, specialist discoverability, horizon, uncertainty
+/// and risk. A bounded provider admission does not carry them, and this process
+/// does not read them from ambient material. Rather than guess them, every
+/// feature takes the weakest value the admitted intent can support, and the two
+/// facts the admission does establish are read from the requester-declared
+/// source classes: whether a primary-source class and whether a measured-evidence
+/// class were named. The resulting profile is therefore the weakest profile the
+/// admitted intent can support, and the inquiry disposition it produces cannot
+/// claim more rigour than the observation carries.
+fn admitted_selection_features(request: &ResearchQueryRequest) -> InquirySelectionFeatures {
+    let names_primary_source = request.source_classes.iter().any(|class| {
+        matches!(
+            class,
+            SourceClass::Paper | SourceClass::Documentation | SourceClass::Repository
+        )
+    });
+    let names_measured_evidence = request.source_classes.contains(&SourceClass::Dataset);
+    InquirySelectionFeatures {
+        sequential_dependency: false,
+        branch_independence: false,
+        shared_mutable_state: false,
+        verifier_cost: VerifierStrength::Low,
+        verifier_strength: VerifierStrength::Low,
+        specialist_discoverability: SpecialistDiscoverability::None,
+        horizon: InquiryHorizon::Immediate,
+        uncertainty: InquiryUncertainty::High,
+        risk: InquiryRisk::Low,
+        evaluator_exists: false,
+        primary_source_available: names_primary_source,
+        measured_evidence_available: names_measured_evidence,
+        bounded_decision: true,
+    }
+}
+
+/// Projects the retained provider material of one run into the candidate source
+/// material the `R6` boundary assesses.
+///
+/// The candidate carries the exact custody this process holds: the retained
+/// stdout digest, the retained evidence transport digest, the admitted route and
+/// provider generation, the terminal outcome, the retained stream state and the
+/// physical exit disposition. It never carries the provider body.
+fn retained_provider_material(
+    request: &ResearchQueryRequest,
+    receipt: &ProviderExecutionReceipt,
+    route: &str,
+) -> CandidateEvidence {
+    let stream = match (receipt.raw.stdout.omission, receipt.raw.stdout.complete) {
+        (Some(StreamOmission::NoHandle), _) => StreamEvidence::Absent,
+        (None, true) => StreamEvidence::Complete,
+        _ => StreamEvidence::Partial,
+    };
+    let receipt_handle = receipt.evidence_records.first().map_or_else(
+        || receipt.raw.invocation_digest.clone(),
+        |record| record.transport_sha256.clone(),
+    );
+    CandidateEvidence {
+        handle: format!("provider-artifact:{}", receipt.raw.stdout.sha256),
+        class: request
+            .source_classes
+            .first()
+            .copied()
+            .unwrap_or(SourceClass::Unknown),
+        operation_id: receipt.operation_id.clone(),
+        content_digest: receipt.raw.stdout.sha256.clone(),
+        receipt_handle,
+        route: route.to_owned(),
+        provider_generation: receipt.module_generation_id.clone(),
+        lineage_root: Some(route.to_owned()),
+        outcome: acquisition_outcome(receipt),
+        stream,
+        exit_completed: matches!(receipt.raw.exit_disposition, ExitDisposition::Completed),
+        // A submit binding exists only once a submit reached the shared process
+        // contour, so its absence with no stream handle is the exact "refused
+        // before acquisition" signal rather than a crash with no output.
+        refused: stream == StreamEvidence::Absent && receipt.submit_binding_sha256.is_empty(),
+    }
+}
+
+/// Maps this crate's typed provider outcome onto the `R6` domain vocabulary.
+fn acquisition_outcome(receipt: &ProviderExecutionReceipt) -> AcquisitionOutcome {
+    match receipt.outcome {
+        ProviderOutcome::Completed => AcquisitionOutcome::Completed,
+        ProviderOutcome::Crashed => AcquisitionOutcome::Crashed,
+        ProviderOutcome::TimedOut => AcquisitionOutcome::TimedOut,
+        ProviderOutcome::Cancelled => AcquisitionOutcome::Cancelled,
+        ProviderOutcome::Unknown => AcquisitionOutcome::Unknown,
+    }
 }
 
 /// Shared deterministic builders for the crate's proof surface.
