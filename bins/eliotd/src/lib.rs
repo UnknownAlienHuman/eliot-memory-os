@@ -172,7 +172,7 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, check_improvement_repeat, improvement_operation_owners,
+    ImprovementRouteRequest, assess_improvement_repeat, improvement_operation_owners,
     improvement_route_owner, reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;

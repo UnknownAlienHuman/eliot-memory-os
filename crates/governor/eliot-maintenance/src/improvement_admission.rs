@@ -49,6 +49,11 @@ pub enum ImprovementPulseOutcome {
 /// Binds one closure candidate (`#819`) and, when present, its promotion-input
 /// advisory (`#972`) by exact identity and digest. No candidate internals are
 /// reinterpreted here; digests are opaque and order-invariant at the source.
+///
+/// `admitted_scope_ref` is the `WorkScope` the candidate owner proved for this
+/// candidate. It is the only admitted scope evidence: the experiment scope is
+/// never derived from the candidate identity. An absent binding stays a named
+/// gap and is disposed as `Blocked`, never replaced by a default.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImprovementCandidateView {
@@ -64,6 +69,8 @@ pub struct ImprovementCandidateView {
     pub promotion_input_id: Option<String>,
     /// Promotion evidence digest (opaque), when prepared.
     pub promotion_digest: Option<String>,
+    /// Admitted work scope the candidate owner proved; absent stays a named gap.
+    pub admitted_scope_ref: Option<String>,
     /// Proof ceiling claimed by the candidate; must stay candidate-only.
     pub proof_ceiling: String,
     /// Requested effect class; must stay advisory-only.
@@ -81,12 +88,25 @@ pub struct ImprovementCandidateView {
 }
 
 /// Independent experiment evidence bound to the exact candidate.
+///
+/// A later independent admission review may legitimately carry a different
+/// `verifier_id` than the experiment evaluation. What binds it is the typed
+/// relation to the same candidate, experiment, and evaluated content revision,
+/// never an indiscriminate comparison of verifier identities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ImprovementEvidenceView {
     /// Independent evaluator identity.
     pub verifier_id: String,
+    /// Candidate this admission review is bound to.
+    pub bound_candidate_id: String,
+    /// Experiment this admission review is bound to.
+    pub bound_experiment_id: String,
+    /// Exact content revision this admission review evaluated.
+    pub content_revision_ref: String,
+    /// Exact run this admission review observed.
+    pub run_ref: String,
     /// Whether the evaluator is independent of the candidate source.
     pub independent: bool,
     /// Whether the independent evaluator passed the candidate.
@@ -135,14 +155,88 @@ pub struct ImprovementAdmissionPolicy {
     pub require_independent_verifier: bool,
 }
 
+/// Owner-defined cause of a rejected improvement candidate.
+///
+/// The cause is typed machine state, not prose. Explanatory reason text may be
+/// reworded without changing this value, and this value is never inferred from
+/// the words of a reason string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementRejectCause {
+    /// The closure binding is invalid.
+    InvalidClosureBinding,
+    /// Harm was observed on a denominator member and is never compensated.
+    HarmObserved,
+    /// The product pulse regressed on the exact pulse identity.
+    PulseRegression,
+}
+
+/// Owner-defined cause of a blocked improvement candidate.
+///
+/// A block names a prerequisite that is still missing or a binding that must be
+/// revalidated. It is neither a rejection nor an observed completed rollback,
+/// and a named rollback contract never supplies the cause.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementBlockCause {
+    /// A required rollback contract reference is still missing.
+    MissingRollback,
+    /// A required disable contract reference is still missing.
+    MissingDisable,
+    /// A required reopen contract reference is still missing.
+    MissingReopen,
+    /// A required expiry binding is still missing.
+    MissingExpiry,
+    /// The evidence rollback owner differs from the policy rollback owner.
+    RollbackOwnerGap,
+    /// The candidate carries no owner-proved admitted scope binding.
+    MissingAdmittedScope,
+    /// The closure binding went stale and reuse is invalid.
+    StaleClosure,
+}
+
+/// What a blocked candidate's owner must do before it may be re-evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementBlockRemedy {
+    /// A named prerequisite contract reference is still missing.
+    MissingPrerequisite,
+    /// The candidate must be revalidated against current evidence bindings.
+    RevalidationRequired,
+}
+
+impl ImprovementBlockCause {
+    /// Returns the remedy the responsible owner must complete.
+    ///
+    /// Derived from the typed cause so the obligation cannot drift with the
+    /// wording of an explanation.
+    pub const fn remedy(self) -> ImprovementBlockRemedy {
+        match self {
+            Self::MissingRollback
+            | Self::MissingDisable
+            | Self::MissingReopen
+            | Self::MissingExpiry => ImprovementBlockRemedy::MissingPrerequisite,
+            Self::RollbackOwnerGap | Self::MissingAdmittedScope | Self::StaleClosure => {
+                ImprovementBlockRemedy::RevalidationRequired
+            }
+        }
+    }
+}
+
 /// Maintenance-owned admission decision for one improvement candidate.
 ///
 /// `AdmitForExperiment` releases the candidate to bounded Testd/Instrument
 /// execution only. Every other variant keeps the candidate out of the
 /// experiment path with exact missing evidence and owner. No variant performs
-/// promotion, activation, canary cutover, or Finish.
+/// promotion, activation, canary cutover, rollback execution, or Finish, and no
+/// variant ever reports an observed completed rollback.
+///
+/// Wire revision: `Reject` and `Blocked` carry a typed `cause`, and
+/// `RequiresReconciliation` carries the owner holding the reconciliation debt.
+/// Unknown fields are refused, so bytes written before that revision no longer
+/// decode into a current decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImprovementAdmissionDecision {
     /// Candidate may proceed to one bounded experiment under Testd ownership.
     AdmitForExperiment {
@@ -150,7 +244,8 @@ pub enum ImprovementAdmissionDecision {
         candidate_id: String,
         /// Campaign the experiment must run against.
         campaign_id: String,
-        /// Scope the experiment must not exceed.
+        /// Scope the experiment must not exceed, taken from the candidate's
+        /// owner-proved admitted scope binding.
         experiment_scope_ref: String,
         /// Evaluator that must independently verify the run.
         evaluator_id: String,
@@ -159,6 +254,8 @@ pub enum ImprovementAdmissionDecision {
     },
     /// Candidate is rejected; the scope is retained, nothing is removed silently.
     Reject {
+        /// Owner-defined rejection cause.
+        cause: ImprovementRejectCause,
         /// Stable rejection reason naming exact evidence.
         reason: String,
         /// Owner holding the retained scope.
@@ -171,8 +268,11 @@ pub enum ImprovementAdmissionDecision {
         /// Owner that must supply it.
         owner_id: String,
     },
-    /// Candidate is well-formed but blocked on rollback/staleness/cancellation.
+    /// Candidate is well-formed but blocked on a rollback prerequisite, a
+    /// missing admitted scope, or a stale closure binding.
     Blocked {
+        /// Owner-defined block cause.
+        cause: ImprovementBlockCause,
         /// Stable block reason naming exact evidence.
         reason: String,
         /// Owner that must clear it.
@@ -182,6 +282,8 @@ pub enum ImprovementAdmissionDecision {
     RequiresReconciliation {
         /// What must be reconciled before any retry.
         reason: String,
+        /// Owner holding the unresolved reconciliation debt.
+        owner_id: String,
     },
     /// Materially identical repeat without a new discriminator; not improvement.
     NoProgress {
@@ -235,22 +337,26 @@ pub fn admit_improvement_candidate(
         return Ok(ImprovementAdmissionDecision::RequiresReconciliation {
             reason: "unknown-execution-outcome: reconcile exact external effect before retry"
                 .to_string(),
+            owner_id: policy.external_owner_id.clone(),
         });
     }
     if !evidence.closure_valid {
         return Ok(ImprovementAdmissionDecision::Reject {
+            cause: ImprovementRejectCause::InvalidClosureBinding,
             reason: "invalid-closure-binding: valid closure required".to_string(),
             owner_id: policy.external_owner_id.clone(),
         });
     }
     if evidence.closure_stale {
         return Ok(ImprovementAdmissionDecision::Blocked {
+            cause: ImprovementBlockCause::StaleClosure,
             reason: "stale-closure-binding: reuse-invalid; revalidation required".to_string(),
             owner_id: policy.external_owner_id.clone(),
         });
     }
     if evidence.harm_observed {
         return Ok(ImprovementAdmissionDecision::Reject {
+            cause: ImprovementRejectCause::HarmObserved,
             reason: "harm-observed: harm is never compensated".to_string(),
             owner_id: policy.external_owner_id.clone(),
         });
@@ -258,6 +364,7 @@ pub fn admit_improvement_candidate(
     match &evidence.pulse {
         ImprovementPulseOutcome::Regression => {
             return Ok(ImprovementAdmissionDecision::Reject {
+                cause: ImprovementRejectCause::PulseRegression,
                 reason: "pulse-regression: positive candidate blocked".to_string(),
                 owner_id: policy.external_owner_id.clone(),
             });
@@ -287,12 +394,26 @@ pub fn admit_improvement_candidate(
             owner_id: evidence.verifier_id.clone(),
         });
     }
-    if let Some(reason) = rollback_gap(evidence, policy) {
+    if let Some((cause, reason)) = rollback_gap(evidence, policy) {
         return Ok(ImprovementAdmissionDecision::Blocked {
+            cause,
             reason,
             owner_id: policy.rollback_owner_id.clone(),
         });
     }
+    let Some(admitted_scope_ref) = candidate
+        .admitted_scope_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(ImprovementAdmissionDecision::Blocked {
+            cause: ImprovementBlockCause::MissingAdmittedScope,
+            reason: "missing-admitted-scope: owner-proved work scope required before experiment"
+                .to_string(),
+            owner_id: policy.external_owner_id.clone(),
+        });
+    };
     if evidence.repeat_of_known_digest && !evidence.new_discriminator {
         return Ok(ImprovementAdmissionDecision::NoProgress {
             reason: "repeat-without-discriminator: materially identical repeat is not improvement"
@@ -303,7 +424,7 @@ pub fn admit_improvement_candidate(
     Ok(ImprovementAdmissionDecision::AdmitForExperiment {
         candidate_id: candidate.candidate_id.clone(),
         campaign_id: candidate.campaign_id.clone(),
-        experiment_scope_ref: candidate.candidate_id.clone(),
+        experiment_scope_ref: admitted_scope_ref.to_string(),
         evaluator_id: evidence.verifier_id.clone(),
         rollback_owner_id: policy.rollback_owner_id.clone(),
     })
@@ -374,46 +495,67 @@ fn validate_policy(
 
 fn validate_evidence(evidence: &ImprovementEvidenceView) -> Result<(), ImprovementAdmissionError> {
     text(&evidence.verifier_id, "verifier_id")?;
+    text(&evidence.bound_candidate_id, "bound_candidate_id")?;
+    text(&evidence.bound_experiment_id, "bound_experiment_id")?;
+    text(&evidence.content_revision_ref, "content_revision_ref")?;
+    text(&evidence.run_ref, "run_ref")?;
     text(&evidence.rollback_owner_id, "rollback_owner_id")?;
     Ok(())
 }
 
+/// Returns the typed cause and bounded reason of a missing rollback prerequisite.
+///
+/// The cause is machine state; the reason is explanatory text. Neither is ever
+/// derived from the other's wording.
 fn rollback_gap(
     evidence: &ImprovementEvidenceView,
     policy: &ImprovementAdmissionPolicy,
-) -> Option<String> {
+) -> Option<(ImprovementBlockCause, String)> {
     if evidence
         .rollback_ref
         .as_deref()
         .is_none_or(|value| value.trim().is_empty())
     {
-        return Some("missing-rollback: rollback contract required before experiment".to_string());
+        return Some((
+            ImprovementBlockCause::MissingRollback,
+            "missing-rollback: rollback contract required before experiment".to_string(),
+        ));
     }
     if evidence
         .disable_ref
         .as_deref()
         .is_none_or(|value| value.trim().is_empty())
     {
-        return Some("missing-disable: disable contract required before experiment".to_string());
+        return Some((
+            ImprovementBlockCause::MissingDisable,
+            "missing-disable: disable contract required before experiment".to_string(),
+        ));
     }
     if evidence
         .reopen_ref
         .as_deref()
         .is_none_or(|value| value.trim().is_empty())
     {
-        return Some("missing-reopen: reopen contract required before experiment".to_string());
+        return Some((
+            ImprovementBlockCause::MissingReopen,
+            "missing-reopen: reopen contract required before experiment".to_string(),
+        ));
     }
     if evidence.rollback_owner_id != policy.rollback_owner_id {
-        return Some(
+        return Some((
+            ImprovementBlockCause::RollbackOwnerGap,
             "rollback-owner-gap: evidence owner must match policy rollback owner".to_string(),
-        );
+        ));
     }
     if evidence
         .expiry_ref
         .as_deref()
         .is_none_or(|value| value.trim().is_empty())
     {
-        return Some("missing-expiry: expiry must bind the admitted operation".to_string());
+        return Some((
+            ImprovementBlockCause::MissingExpiry,
+            "missing-expiry: expiry must bind the admitted operation".to_string(),
+        ));
     }
     None
 }
@@ -430,6 +572,7 @@ mod tests {
             closure_digest: "digest-closure-1145-a".to_string(),
             promotion_input_id: Some("promo-cand-1145-a".to_string()),
             promotion_digest: Some("digest-promo-1145-a".to_string()),
+            admitted_scope_ref: Some("scope-1145-a".to_string()),
             proof_ceiling: IMPROVEMENT_PROOF_CEILING.to_string(),
             requested_effect: IMPROVEMENT_REQUESTED_EFFECT.to_string(),
             direct_promotion: false,
@@ -443,6 +586,10 @@ mod tests {
     fn evidence() -> ImprovementEvidenceView {
         ImprovementEvidenceView {
             verifier_id: "verifier-1145-a".to_string(),
+            bound_candidate_id: "cand-1145-a".to_string(),
+            bound_experiment_id: "exp-1145-a".to_string(),
+            content_revision_ref: "revision-1145-a".to_string(),
+            run_ref: "run-1145-a".to_string(),
             independent: true,
             verifier_passed: true,
             pulse: ImprovementPulseOutcome::Pass,
@@ -582,7 +729,7 @@ mod tests {
         let mut ev = evidence();
         ev.outcome_unknown = true;
         match decide(&candidate(), &ev, &policy()) {
-            ImprovementAdmissionDecision::RequiresReconciliation { reason } => {
+            ImprovementAdmissionDecision::RequiresReconciliation { reason, .. } => {
                 assert!(reason.contains("reconcile"));
             }
             other => panic!("unknown must reconcile, got {other:?}"),

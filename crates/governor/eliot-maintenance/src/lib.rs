@@ -29,17 +29,24 @@ pub mod improvement_pipeline;
 pub use improvement_admission::{
     IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE, IMPROVEMENT_PROMOTION_MODULE,
     IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT, ImprovementAdmissionDecision,
-    ImprovementAdmissionError, ImprovementAdmissionPolicy, ImprovementCandidateView,
-    ImprovementEvidenceView, ImprovementPulseOutcome, admit_improvement_candidate,
+    ImprovementAdmissionError, ImprovementAdmissionPolicy, ImprovementBlockCause,
+    ImprovementBlockRemedy, ImprovementCandidateView, ImprovementEvidenceView,
+    ImprovementPulseOutcome, ImprovementRejectCause, admit_improvement_candidate,
 };
 pub use improvement_pipeline::{
-    ActivationEvidence, ExperimentPlan, IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PIPELINE_OWNER,
-    IMPROVEMENT_RISK_MARKER, ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal,
-    ImprovementTerminalDisposition, KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT,
-    OP_CANARY_ACTIVATE, OP_EVALUATE, OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE,
-    OP_ROLLBACK, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
-    detect_no_progress, proposal_digest, reconcile_unknown_activation,
-    run_improvement_candidate_pipeline,
+    ActivationEvidence, AdmittedResourceCeiling, AdmittedScopeRefinement, ExperimentPlan,
+    IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_LEGACY_DIGEST_ALGORITHM,
+    IMPROVEMENT_MAX_COMMITMENT_BYTES, IMPROVEMENT_MAX_REFERENCE_BYTES, IMPROVEMENT_MAX_SET_MEMBERS,
+    IMPROVEMENT_MAX_TEXT_BYTES, IMPROVEMENT_PIPELINE_OWNER, IMPROVEMENT_PIPELINE_WIRE_REVISION,
+    IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN, IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
+    IMPROVEMENT_PROPOSAL_ENCODING_VERSION, IMPROVEMENT_RISK_CEILING_BOUNDED,
+    IMPROVEMENT_RISK_CEILING_ENCODING_VERSION, ImprovementCanaryHandoff, ImprovementOperation,
+    ImprovementPipelineInputs, ImprovementProposal, ImprovementProposalCommitmentEnvelope,
+    ImprovementReplayAssessment, ImprovementTerminalDisposition, KERNEL_CANARY_OWNER,
+    MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_EVALUATE, OP_EXECUTE_EXPERIMENT,
+    OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError, ProposalCommitment,
+    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY, assess_improvement_replay,
+    proposal_digest, reconcile_unknown_activation, run_improvement_candidate_pipeline,
 };
 
 /// Stable wire name for the maintenance governor contract.
