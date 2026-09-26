@@ -31,10 +31,19 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod claim;
+mod typed_evidence;
 
 pub use claim::{
     ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
     validate_claim_binding,
+};
+pub use typed_evidence::{
+    EphemeralSourceBytes, ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
+    ProcessStreamSourceReadbackRequest, TestdArtifactBinding, TestdEvaluationObservation,
+    TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
+    TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
+    TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
+    TestdStreamResolution, TestdStreamSlot,
 };
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
@@ -1887,6 +1896,11 @@ pub struct VerificationReceipt {
     pub source_observation: Option<TestdSourceObservationRange>,
     pub raw_artifacts: Vec<RawArtifact>,
     pub normalized: Vec<NormalizedEvidence>,
+    /// Owner-neutral typed stream bundles admitted from the emitted
+    /// `ProcessEvidence` records (issue #456, Wave A). Empty for legacy-only
+    /// receipts; populated additively without changing legacy handle lineage.
+    #[serde(default)]
+    pub typed_evidence: Vec<TestdProcessEvidenceBundle>,
 }
 
 /// Evaluates the admitted TestD profile after the process observation has
@@ -2034,6 +2048,15 @@ impl VerificationReceipt {
         if artifacts.len() != referenced.len() {
             return Err(TestdError::InvalidBinding);
         }
+        // Typed bundles revalidate structurally only: each bundle rechecks
+        // its own record coherence. Cross-job/cross-operation rejection needs
+        // the job-bound collector (issue #456, Wave B); an empty bundle list
+        // keeps legacy receipts validating exactly as before.
+        for bundle in &self.typed_evidence {
+            bundle
+                .validate()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -2045,6 +2068,7 @@ pub struct EvidenceCollector {
     raw_artifacts: Arc<Mutex<BTreeMap<String, RawArtifact>>>,
     next_capture_sequence: Arc<AtomicU64>,
     tool_observation: Arc<Mutex<Option<TestdToolObservation>>>,
+    typed: Arc<Mutex<Vec<TestdProcessEvidenceBundle>>>,
 }
 
 impl EvidenceCollector {
@@ -2053,6 +2077,34 @@ impl EvidenceCollector {
         self.records
             .lock()
             .map_or_else(|_| Vec::new(), |items| items.clone())
+    }
+
+    /// Returns a stable snapshot of admitted typed stream bundles.
+    pub fn typed_bundles(&self) -> Vec<TestdProcessEvidenceBundle> {
+        self.typed
+            .lock()
+            .map_or_else(|_| Vec::new(), |items| items.clone())
+    }
+
+    /// Resolves every pending typed bundle through the injected immutable-
+    /// source readback port.
+    ///
+    /// Each bundle yields one explicit per-stream outcome; refusal and
+    /// failure outcomes update the retained dispositions in place and never
+    /// expose bytes. Resolution never fails wholesale.
+    pub fn resolve_typed_sources(
+        &self,
+        port: &dyn ProcessStreamSourceReadbackPort,
+        context: &TestdReadbackContext,
+    ) -> Result<Vec<Vec<TestdStreamResolution>>, TestdError> {
+        let mut bundles = self
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        Ok(bundles
+            .iter_mut()
+            .map(|bundle| bundle.resolve_pending(port, context))
+            .collect())
     }
 
     /// Captures bytes before normalization; the digest is always over bytes.
@@ -2213,6 +2265,7 @@ impl EvidenceCollector {
             source_observation: None,
             raw_artifacts,
             normalized,
+            typed_evidence: self.typed_bundles(),
         }
     }
 }
@@ -2222,12 +2275,27 @@ impl eliot_process::ProcessEvidenceSink for EvidenceCollector {
         &self,
         evidence: eliot_process::ProcessEvidence,
     ) -> Result<(), eliot_process::EvidenceSinkError> {
+        // Typed admission runs on every arrival: the bundle consumes only the
+        // typed stdout()/stderr() values with an explicit disposition per
+        // requested stream. Incoherent evidence fails closed here instead of
+        // entering the receipt; every validly constructed record admits.
+        let bundle = TestdProcessEvidenceBundle::admit(&evidence).map_err(|error| {
+            eliot_process::EvidenceSinkError {
+                message: error.to_string(),
+            }
+        })?;
         self.records
             .lock()
             .map_err(|_| eliot_process::EvidenceSinkError {
                 message: "evidence collector lock poisoned".to_owned(),
             })
-            .map(|mut records| records.push(evidence))
+            .map(|mut records| records.push(evidence))?;
+        self.typed
+            .lock()
+            .map_err(|_| eliot_process::EvidenceSinkError {
+                message: "evidence collector lock poisoned".to_owned(),
+            })
+            .map(|mut typed| typed.push(bundle))
     }
 }
 
