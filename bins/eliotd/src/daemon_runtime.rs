@@ -471,12 +471,18 @@ pub(super) fn run() -> Result<(), String> {
     // explicit disposition for each. The returned ledger — not control flow —
     // decides what this generation observed.
     let bindings = bind_declared_startup_capabilities(&kernel, &mut composition);
-    // #1145: root the Governor-owned improvement candidate route in the
-    // production daemon: report the pipeline owner at startup (diagnostics
-    // only). The candidate → experiment → evaluation → admission path itself
-    // runs through `eliotd::govern_improvement_candidate` on live requests;
-    // this reference keeps the owner identity observable without adding
+    // #1145: report the Governor-owned improvement pipeline owner at startup
+    // (diagnostics only), keeping the owner identity observable without adding
     // policy semantics to the composition root.
+    //
+    // Measured at #2703: this is a DIAGNOSTIC REFERENCE ONLY. It is not a
+    // dispatch site. No live request reaches `govern_improvement_candidate`,
+    // because `ImprovementRouteRequest` is never constructed anywhere in
+    // `bins/` or `crates/`, and the candidate → experiment → evaluation →
+    // admission path is therefore not yet served by this daemon. The typed
+    // result mapping behind it is exhaustive and correct; what is missing is a
+    // request source, which is owner scope for #1145, not for this diagnostic.
+    // Do not read this line as evidence that the route is wired.
     tracing::info!(
         target: "eliotd::diagnostics",
         event = "eliotd.improvement_pipeline_owner",
