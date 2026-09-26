@@ -74,8 +74,8 @@ use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
 use super::backup_capture_ports::{
-    CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError, PublicationPort,
-    PublishedArchive, SnapshotRelation, require_capture_admitted,
+    CaptureBudgets, CaptureCallerAuth, CapturePorts, FrozenCapturePlan, KernelCaptureError,
+    PublicationPort, PublishedArchive, SnapshotRelation, require_capture_admitted,
 };
 
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
@@ -368,6 +368,12 @@ impl KernelBackupCapture {
     /// second publish). Bounded unresolved operations are not corruption: a
     /// `full_recovery` capture with suspended entries still completes and
     /// records the suspended marker as its receipt identity.
+    ///
+    /// The frozen `max_duration_ms` is enforced as a real bound at every stage
+    /// boundary. A capture that spends its admitted duration before publication
+    /// has a real, validated archive and no owner receipt, so it is reported as
+    /// [`CaptureState::Cancelled`] at the structurally-valid evidence level
+    /// rather than published past its budget or discarded silently.
     #[allow(
         clippy::unused_self,
         reason = "governed owner seam keeps &self receivers; the work root binds composition"
@@ -379,33 +385,52 @@ impl KernelBackupCapture {
     ) -> Result<CaptureReport, KernelCaptureError> {
         require_capture_admitted(&request.caller)?;
         request.plan.validate()?;
+        let duration = CaptureDuration::start(request.plan.budgets);
         gate_class_capability(request)?;
-        let relation = snapshot_relation(request);
+        let relation = snapshot_relation(&SnapshotEvidence::from_request(request));
         Self::validate_snapshot_relation(&relation)?;
+        duration.check()?;
         let member_dispositions = check_denominator(request)?;
         check_budgets(request)?;
+        duration.check()?;
         let bundle = BackupBundle::build(assemble_input(request))
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
+        duration.check()?;
         bundle
             .validate()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
         let bytes = bundle
             .encode()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
+        duration.check()?;
         let archive_sha256 = bundle
             .bundle_sha256()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
-        let backup_id = bundle.manifest.backup_id.clone();
-        let operation_id = format!("capture-publish-{backup_id}");
-        let idempotency_key = format!("{backup_id}:{archive_sha256}");
+        let identities = ArchiveIdentities::from_bundle(&bundle, archive_sha256);
+        let operation_id = format!("capture-publish-{}", identities.backup_id);
+        let idempotency_key = format!("{}:{}", identities.backup_id, identities.archive_sha256);
+        // The last point at which no owner effect has happened. A capture that
+        // is already over its admitted duration here produced real bytes and
+        // owns no publication receipt, so the honest terminal state is a
+        // cancelled one: publishing anyway would exceed the authorisation the
+        // caller granted, and dropping the bytes would hide that a validated
+        // archive exists.
+        if duration.is_spent() {
+            return Ok(cancelled_report(
+                &identities,
+                request.plan.class,
+                operation_id,
+                member_dispositions,
+            ));
+        }
         let receipt = match publisher.publish_once(&operation_id, &idempotency_key, &bytes) {
             Ok(receipt) => receipt,
             Err(KernelCaptureError::PublicationUnknown(_)) => publisher.reconcile(&operation_id)?,
             Err(other) => return Err(other),
         };
         let archive = PublishedArchive {
-            backup_id: backup_id.clone(),
-            archive_sha256: archive_sha256.clone(),
+            backup_id: identities.backup_id.clone(),
+            archive_sha256: identities.archive_sha256.clone(),
             operation_id: operation_id.clone(),
             idempotency_key,
             durability_note: "owner-durable".to_owned(),
@@ -430,23 +455,23 @@ impl KernelBackupCapture {
             Some(operation_id.clone())
         };
         Ok(CaptureReport {
-            backup_id,
+            backup_id: identities.backup_id,
             class: request.plan.class,
-            archive_sha256,
+            archive_sha256: identities.archive_sha256,
             // The producing owner is this very operation, so the archive's own
             // source installation and owner contract are the frozen plan's and
             // the export fence's own declared values, and the fence digest is
             // the one the bundle format computed and validated at build.
-            source_installation: bundle.export_fence.export_id.clone(),
-            owner_contract: bundle.manifest.source_adapter.clone(),
-            export_fence_digest: bundle.manifest.export_fence_sha256.clone(),
+            source_installation: identities.source_installation,
+            owner_contract: identities.owner_contract,
+            export_fence_digest: identities.export_fence_digest,
             operation_id,
             state,
             // The capture really did build, validate and publish once through
             // the admitted port, so it is the class/compatibility qualified
             // level; the class ceiling still bounds what the archive may claim.
             evidence_level: CaptureEvidenceLevel::ClassQualified,
-            class_ceiling: bundle.manifest.class.evidence_level(),
+            class_ceiling: identities.class_ceiling,
             // The producing operation is this owner: the published fence is the
             // frozen export fence of the operation in flight, so no historical
             // relation applies. The verify path is where a carried archive
@@ -477,6 +502,18 @@ impl KernelBackupCapture {
     /// different operation rather than a replay (#2883 instruction 6); reading
     /// them here is a decode, not a second validation, so no check is duplicated
     /// and none is weakened.
+    ///
+    /// The decoded archive's own cross-owner snapshot relation is built and
+    /// validated here too, through the same implementation the capture contour
+    /// uses. A structurally decodable archive whose carried owner evidence does
+    /// not form a coherent relation — empty cursors, incompatible owner fences,
+    /// a foreign installation or lineage — is not a verifiable capture, and
+    /// reporting it as one would let a caller substitute a self-consistent
+    /// decode for the owner-relation proof I5.16 requires.
+    ///
+    /// This contour reads no `FrozenCapturePlan`, so it enforces no duration
+    /// budget and produces no cancellation: there is no admitted operation
+    /// whose authorisation could be spent, and no publication happens here.
     #[allow(
         clippy::unused_self,
         reason = "governed owner seam keeps &self receivers; the work root binds composition"
@@ -494,6 +531,8 @@ impl KernelBackupCapture {
         bundle
             .validate()
             .map_err(|error| KernelCaptureError::ArchiveInvalid(error.to_string()))?;
+        let relation = snapshot_relation(&SnapshotEvidence::from_bundle(&bundle));
+        Self::validate_snapshot_relation(&relation)?;
         let archived_fence_relation =
             classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence)?;
         let archive_sha256 = bundle
@@ -687,52 +726,213 @@ fn gate_class_capability(request: &CaptureRequest) -> Result<(), KernelCaptureEr
     Ok(())
 }
 
+/// The exact per-owner evidence one snapshot relation is derived from.
+///
+/// `capture` reads it from the admitted [`CaptureRequest`]; `verify_only` reads
+/// the same fields out of the archive it just decoded. Both contours therefore
+/// derive the relation through one implementation and cannot drift into two
+/// definitions of what a coherent relation is.
+struct SnapshotEvidence<'a> {
+    /// Coherent canonical export fence binding the evidence.
+    export_fence: &'a ExportFence,
+    /// Canonical event records covered by the evidence.
+    canonical_events: &'a [CanonicalRecord],
+    /// Canonical write receipts covered by the evidence.
+    receipts: &'a [WriteReceipt],
+    /// Purge ledger entries covered by the evidence.
+    purge_ledger: &'a [PurgeLedgerEntry],
+    /// Logical ORS snapshot fence, when the class carries one.
+    ors_snapshot: Option<&'a OrsSnapshotFence>,
+    /// Bounded Watchdog spool fence, when the class carries one.
+    watchdog_spool: Option<&'a WatchdogSpoolFence>,
+}
+
+impl<'a> SnapshotEvidence<'a> {
+    /// Reads the relation-bearing evidence out of one admitted request.
+    fn from_request(request: &'a CaptureRequest) -> Self {
+        Self {
+            export_fence: &request.export_fence,
+            canonical_events: &request.canonical_events,
+            receipts: &request.receipts,
+            purge_ledger: &request.purge_ledger,
+            ors_snapshot: request.ors_snapshot.as_ref(),
+            watchdog_spool: request.watchdog_spool.as_ref(),
+        }
+    }
+
+    /// Reads the same evidence out of one decoded archive.
+    fn from_bundle(bundle: &'a BackupBundle) -> Self {
+        Self {
+            export_fence: &bundle.export_fence,
+            canonical_events: &bundle.canonical_events,
+            receipts: &bundle.receipts,
+            purge_ledger: &bundle.purge_ledger,
+            ors_snapshot: bundle.ors_snapshot.as_ref(),
+            watchdog_spool: bundle.watchdog_spool.as_ref(),
+        }
+    }
+}
+
+/// The archive-derived identities every capture report carries.
+///
+/// They are read out of the bundle this owner built, validated and encoded, so
+/// a report can never mix the archive's own commitments with the verifying
+/// session's. I5.27 requires the source installation and the owner contract in
+/// the canonical request digest, because an archive SHA-256 alone is content
+/// integrity and not the source/capture operation identity. `export_fence_digest`
+/// is the manifest's own precomputed `export_fence_sha256`, which
+/// `BackupBundle::validate` has already recomputed and re-bound on this bundle —
+/// it is never a digest recomputed here.
+struct ArchiveIdentities {
+    /// The archive's own declared backup identity.
+    backup_id: String,
+    /// This bundle's own content digest.
+    archive_sha256: String,
+    /// The archive's own declared source installation.
+    source_installation: String,
+    /// The archive's own declared owner contract.
+    owner_contract: String,
+    /// The manifest's precomputed export-fence digest.
+    export_fence_digest: String,
+    /// The exact restore proof ceiling the archive's own class permits.
+    class_ceiling: RestoreEvidenceLevel,
+}
+
+impl ArchiveIdentities {
+    /// Reads the identities out of one already-validated bundle and its content
+    /// digest.
+    fn from_bundle(bundle: &BackupBundle, archive_sha256: String) -> Self {
+        Self {
+            backup_id: bundle.manifest.backup_id.clone(),
+            archive_sha256,
+            source_installation: bundle.export_fence.export_id.clone(),
+            owner_contract: bundle.manifest.source_adapter.clone(),
+            export_fence_digest: bundle.manifest.export_fence_sha256.clone(),
+            class_ceiling: bundle.manifest.class.evidence_level(),
+        }
+    }
+}
+
+/// Builds the terminal report for a capture that spent its admitted duration
+/// before publication.
+///
+/// Such a capture owns real, built and validated bytes and no owner-issued
+/// publication receipt, so its terminal state is
+/// [`CaptureState::Cancelled`] at the structurally-valid evidence level.
+/// Reporting `Complete` would claim a receipt that does not exist; reporting
+/// the qualified level would claim a provenance binding that was never
+/// obtained; discarding the bytes silently would hide that a validated archive
+/// exists at all. I5.13 keeps backup existence from being recovery proof, which
+/// is exactly why a cancelled capture is not a completed one.
+fn cancelled_report(
+    identities: &ArchiveIdentities,
+    class: BackupClass,
+    operation_id: String,
+    member_dispositions: Vec<(String, String)>,
+) -> CaptureReport {
+    CaptureReport {
+        backup_id: identities.backup_id.clone(),
+        class,
+        archive_sha256: identities.archive_sha256.clone(),
+        source_installation: identities.source_installation.clone(),
+        owner_contract: identities.owner_contract.clone(),
+        export_fence_digest: identities.export_fence_digest.clone(),
+        operation_id,
+        state: CaptureState::Cancelled,
+        evidence_level: CaptureEvidenceLevel::StructurallyValidCandidate,
+        class_ceiling: identities.class_ceiling,
+        archived_fence_relation: ArchivedFenceRelation::CurrentSession,
+        member_dispositions,
+        receipt_identity: None,
+    }
+}
+
+/// One admitted capture operation's monotonic duration budget.
+///
+/// `max_duration_ms` is a ceiling on the authorisation the caller granted, so
+/// it needs a real clock: this owner reads `std::time::Instant`, which is
+/// monotonic, and therefore a wall-clock adjustment can neither extend nor
+/// shrink an admitted duration. There is deliberately no injected clock and no
+/// waiting observer — a capture that would have to wait for a cancellation
+/// signal or a globally quiet instant is exactly the unbounded wait the frozen
+/// budgets exist to refuse (I14.3 keeps recovery inside protected capacity).
+///
+/// The budget is consulted at every stage boundary rather than only at the end,
+/// so an over-long capture stops as soon as it is observably over its ceiling
+/// instead of running to completion and reporting afterwards.
+struct CaptureDuration {
+    /// Monotonic instant at which the admitted operation started.
+    started: std::time::Instant,
+    /// The frozen ceiling from the admitted plan.
+    budgets: CaptureBudgets,
+}
+
+impl CaptureDuration {
+    /// Starts the budget at the moment the operation is admitted.
+    fn start(budgets: CaptureBudgets) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            budgets,
+        }
+    }
+
+    /// Whole milliseconds elapsed since the operation was admitted.
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether the frozen ceiling is already spent.
+    fn is_spent(&self) -> bool {
+        self.elapsed_ms() > self.budgets.max_duration_ms
+    }
+
+    /// Refuses the operation once its admitted duration is spent.
+    fn check(&self) -> Result<(), KernelCaptureError> {
+        self.budgets.check_duration(self.elapsed_ms())
+    }
+}
+
 /// Builds the exact cross-owner snapshot relation from validated request
 /// evidence: cursors from the ORS snapshot when present, otherwise from the
 /// observed canonical coverage; lineage from the export state fence;
 /// checkpoints, cutovers, and spool signals from their owners. Capture times
 /// stay empty here: production composition records per-owner capture times,
 /// and times alone never satisfy the relation.
-fn snapshot_relation(request: &CaptureRequest) -> SnapshotRelation {
-    let receipt_cursor = request
+fn snapshot_relation(evidence: &SnapshotEvidence<'_>) -> SnapshotRelation {
+    let export_fence = evidence.export_fence;
+    let receipt_cursor = evidence
         .ors_snapshot
-        .as_ref()
-        .map_or(request.receipts.len() as u64, |snapshot| {
+        .map_or(evidence.receipts.len() as u64, |snapshot| {
             snapshot.last_receipt_cursor
         });
-    let event_cursor = request
+    let event_cursor = evidence
         .ors_snapshot
-        .as_ref()
-        .map_or(request.canonical_events.len() as u64, |snapshot| {
+        .map_or(evidence.canonical_events.len() as u64, |snapshot| {
             snapshot.last_event_cursor
         });
-    let outbox_cursor = request
+    let outbox_cursor = evidence
         .ors_snapshot
-        .as_ref()
         .map_or(0, |snapshot| snapshot.last_outbox_cursor);
-    let ors_compatible = request
+    let ors_compatible = evidence
         .ors_snapshot
-        .as_ref()
-        .is_none_or(|snapshot| snapshot.state_fence == request.export_fence.state_fence);
-    let watchdog_compatible = request
+        .is_none_or(|snapshot| snapshot.state_fence == export_fence.state_fence);
+    let watchdog_compatible = evidence
         .watchdog_spool
-        .as_ref()
-        .is_none_or(|spool| spool.state_fence == request.export_fence.state_fence);
-    let purge_compatible = request.purge_ledger.iter().all(|entry| {
+        .is_none_or(|spool| spool.state_fence == export_fence.state_fence);
+    let purge_compatible = evidence.purge_ledger.iter().all(|entry| {
         entry
             .state_fence
-            .is_compatible_with(&request.export_fence.state_fence)
+            .is_compatible_with(&export_fence.state_fence)
     });
-    let receipt_compatible = request.receipts.iter().all(|receipt| {
+    let receipt_compatible = evidence.receipts.iter().all(|receipt| {
         receipt
             .state_fence
-            .is_compatible_with(&request.export_fence.state_fence)
+            .is_compatible_with(&export_fence.state_fence)
     });
     SnapshotRelation {
-        installation_id: request.export_fence.export_id.clone(),
-        store_generation: request.export_fence.store_generation.clone(),
-        authority_lineage: request
-            .export_fence
+        installation_id: export_fence.export_id.clone(),
+        store_generation: export_fence.store_generation.clone(),
+        authority_lineage: export_fence
             .state_fence
             .authority_epoch
             .lineage_id
@@ -741,25 +941,21 @@ fn snapshot_relation(request: &CaptureRequest) -> SnapshotRelation {
         receipt_cursor,
         event_cursor,
         outbox_cursor,
-        pending_operation_ids: request
+        pending_operation_ids: evidence
             .ors_snapshot
-            .as_ref()
             .map(|snapshot| snapshot.pending_operation_ids.clone())
             .unwrap_or_default(),
         pending_operation_hashes: Vec::new(),
-        checkpoint_ids: request
+        checkpoint_ids: evidence
             .ors_snapshot
-            .as_ref()
             .map(|snapshot| snapshot.job_checkpoint_ids.clone())
             .unwrap_or_default(),
-        cutover_ids: request
+        cutover_ids: evidence
             .ors_snapshot
-            .as_ref()
             .map(|snapshot| snapshot.generation_cutover_ids.clone())
             .unwrap_or_default(),
-        spool_signal_digests: request
+        spool_signal_digests: evidence
             .watchdog_spool
-            .as_ref()
             .map(|spool| spool.unresolved_signal_digests.clone())
             .unwrap_or_default(),
         spool_gaps: Vec::new(),
