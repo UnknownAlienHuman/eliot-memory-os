@@ -32,6 +32,17 @@
 //! whose intent mutation records a pending intent projection keyed by
 //! [`watchdog_intent_reconciliation_idempotency_key`] and never a canonical
 //! Problem or Incident decision.
+//!
+//! Cold-start coverage: the escalation rule above is reached on every failing
+//! supervision tick, including the ticks of a Watchdog that started while the
+//! Governor was already unavailable. That contour holds a gap-only sensor,
+//! whose `Watchdog` object is created only inside `record_heartbeat` and
+//! therefore only after a lease has been admitted, so requiring an established
+//! supervision epoch before minting would have made every cold-start outage end
+//! as a durable gap with no intent at all. [`IntentLineage`] therefore accepts
+//! the installer-approved authority epoch of the retained binding as the
+//! observation epoch for that contour; see its documentation for the two
+//! accepted bases.
 
 use eliot_contracts::sha256_hex;
 
@@ -89,11 +100,21 @@ fn is_sha256_hex_shape(value: &str) -> bool {
 /// (installation, generation, epoch) so a later reconciliation can place the
 /// intent without inventing authority. Every field is private and [`IntentLineage::new`]
 /// is the only construction path.
+///
+/// `observation_epoch` is whichever epoch contour the observing sensor really
+/// owns: its own established supervision epoch once a signed lease has been
+/// verified, or — on a gap-only sensor that has never held one — the
+/// installer-approved authority epoch sequence of its retained binding. The
+/// second basis exists so a Governor outage at Watchdog start escalates instead
+/// of only recording a gap, and it is a retained real value rather than a
+/// placeholder; the distinction never widens authority, because the record is
+/// observation evidence and the fenced submission still names a verified
+/// supervision lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IntentLineage {
     installation_id: String,
     watchdog_generation: u64,
-    watchdog_epoch: u64,
+    observation_epoch: u64,
 }
 
 impl IntentLineage {
@@ -107,7 +128,7 @@ impl IntentLineage {
     pub(crate) fn new(
         installation_id: String,
         watchdog_generation: u64,
-        watchdog_epoch: u64,
+        observation_epoch: u64,
     ) -> Result<Self, SpoolError> {
         if installation_id.is_empty() || installation_id.len() > MAX_INTENT_LINEAGE_ID_LEN {
             return Err(SpoolError::Corrupt(
@@ -122,7 +143,7 @@ impl IntentLineage {
         Ok(Self {
             installation_id,
             watchdog_generation,
-            watchdog_epoch,
+            observation_epoch,
         })
     }
 }
@@ -338,7 +359,7 @@ impl ProblemIntentRecord {
             evidence_refs: self.evidence_refs.clone(),
             lineage_installation_id: self.lineage.installation_id.clone(),
             lineage_generation: self.lineage.watchdog_generation,
-            lineage_epoch: self.lineage.watchdog_epoch,
+            lineage_epoch: self.lineage.observation_epoch,
             governor_unavailable_reason: self.governor_unavailable_reason,
         }
     }
@@ -391,7 +412,7 @@ impl IncidentIntentRecord {
             evidence_refs: self.evidence_refs.clone(),
             lineage_installation_id: self.lineage.installation_id.clone(),
             lineage_generation: self.lineage.watchdog_generation,
-            lineage_epoch: self.lineage.watchdog_epoch,
+            lineage_epoch: self.lineage.observation_epoch,
             governor_unavailable_reason: self.governor_unavailable_reason,
         }
     }
