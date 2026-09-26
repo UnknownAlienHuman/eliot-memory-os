@@ -30,7 +30,6 @@ use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-#[cfg(test)]
 use uuid::Uuid;
 
 pub const CONTRACT_NAME: &str = "eliot.surfaces.user-broker-core/v1";
@@ -103,7 +102,13 @@ pub struct OperatorHandoffRequest {
     pub capabilities: Vec<String>,
 }
 
-#[cfg(test)]
+/// Server-side single-use ledger row for one issued Operator handoff.
+///
+/// This is the owner half of the single-use property: the client guard in
+/// `OperatorHandoff.Consume` can only prove *this* process will not re-present
+/// its own envelope, while this row is what lets the owner refuse a replayed
+/// nonce.  It is private to the authority because no consumer outside this
+/// crate may name or construct a ledger row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HandoffState {
     endpoint: OperatorEndpoint,
@@ -111,9 +116,27 @@ struct HandoffState {
     consumed: bool,
 }
 
-/// One-shot broker handoff authority.  The nonce is an authenticator for one
-/// inherited endpoint parse, not a reconnect token or durable credential.
-#[cfg(test)]
+/// One-shot broker handoff authority: the only minter of an
+/// [`OperatorEndpoint`].
+///
+/// The nonce is an authenticator for one inherited endpoint parse, not a
+/// reconnect token or durable credential.  The admitted broker owner composes
+/// one authority from its authenticated installation declaration, its live
+/// broker epoch, and its interactive session id, and then drives it through
+/// two operations:
+///
+/// - [`Self::issue`] mints one fresh single-use envelope for the exact
+///   admitted [`OPERATOR_ROLE`]/[`OPERATOR_CAPABILITIES`] triple and records
+///   the nonce in the retained ledger with the owner's own
+///   [`OPERATOR_HANDOFF_TTL_MS`] window applied to the observed clock;
+/// - [`Self::consume`] is the owner-side ledger gate.  It spends the nonce,
+///   refuses an already-spent, expired, or altered envelope, and returns the
+///   exact installation-approved image the envelope may be bound to.
+///
+/// Because the authority is retained by the composition owner, an old
+/// nonce/endpoint replay fails at the owner: it is either already
+/// `consumed` (refused) or belongs to a previous broker generation, which
+/// this authority never learned (refused).
 #[derive(Clone, Debug)]
 pub struct OperatorHandoffAuthority {
     artifact: OperatorArtifact,
@@ -123,9 +146,8 @@ pub struct OperatorHandoffAuthority {
     handoffs: BTreeMap<String, HandoffState>,
 }
 
-#[cfg(test)]
 impl OperatorHandoffAuthority {
-    pub(crate) fn new(
+    pub fn new(
         artifact: OperatorArtifact,
         pipe_name: String,
         broker_epoch: u64,
@@ -145,7 +167,26 @@ impl OperatorHandoffAuthority {
         })
     }
 
-    pub(crate) fn issue(
+    /// The broker generation this authority mints endpoints for.
+    ///
+    /// A composition uses this to notice that the broker's registration
+    /// generation has moved and that the retained ledger therefore belongs to
+    /// a generation this broker no longer owns.
+    #[must_use]
+    pub fn broker_epoch(&self) -> u64 {
+        self.broker_epoch
+    }
+
+    /// Mints one fresh single-use envelope for this exact broker generation.
+    ///
+    /// The request is the caller's ask; this method is the policy.  A role
+    /// other than [`OPERATOR_ROLE`], a capability set other than the exact
+    /// ordered [`OPERATOR_CAPABILITIES`] triple, and an unusable clock
+    /// observation are all refusals, not defaults.  The returned nonce is
+    /// minted here and nowhere else, and the expiry is
+    /// `observed_at + OPERATOR_HANDOFF_TTL_MS` computed by this method — the
+    /// caller cannot shorten, extend, or supply either value.
+    pub fn issue(
         &mut self,
         request: &OperatorHandoffRequest,
         observed_at: u64,
@@ -187,7 +228,14 @@ impl OperatorHandoffAuthority {
         Ok(endpoint)
     }
 
-    pub(crate) fn consume(
+    /// Spends one presented handoff exactly once against the retained ledger.
+    ///
+    /// This is the owner-side half of single use.  An envelope that was never
+    /// issued here, was already spent, has passed its owner-computed expiry,
+    /// or does not equal the exact envelope that was issued under that nonce
+    /// is refused; only a live, exact, unspent envelope yields the one
+    /// installation-approved image it may be bound to.
+    pub fn consume(
         &mut self,
         endpoint: &OperatorEndpoint,
         now: u64,

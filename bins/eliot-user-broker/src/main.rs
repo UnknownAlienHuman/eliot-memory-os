@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use eliot_process::OperationId;
 use eliot_user_broker::{
-    BrokerComposition, BrokerConfig, canonical_root, request_names_notify_image,
+    BrokerComposition, BrokerConfig, OperatorHandoffAdmission, canonical_root,
+    request_names_notify_image,
 };
-use eliot_user_broker_core::LaunchRequest;
+use eliot_user_broker_core::{LaunchRequest, OperatorEndpoint, OperatorHandoffRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -37,6 +38,24 @@ enum Request {
     Cancel {
         operation_id: OperationId,
     },
+    /// Asks the composition owner for one fresh single-use Operator handoff.
+    ///
+    /// This is the owner's answer to pipe loss: the request names only the
+    /// role and capability set the admitted client wants, and the owner
+    /// decides. Every value in the returned envelope is owner-issued — a new
+    /// nonce minted by the retained handoff authority, the sealed registration
+    /// epoch as the generation, the live interactive session id, the owner's
+    /// pipe name, and the owner's own handoff lifetime. No environment
+    /// variable is re-read, and the consumed nonce is never returned again.
+    Handoff {
+        request: OperatorHandoffRequest,
+    },
+    /// Presents one Operator handoff envelope to the owner's single-use
+    /// ledger. The envelope is spent exactly once: a replay of an old
+    /// nonce/endpoint is refused here rather than admitted a second time.
+    ConsumeHandoff {
+        endpoint: OperatorEndpoint,
+    },
     Reconcile {
         operation_id: OperationId,
     },
@@ -51,6 +70,8 @@ enum Message {
     Launched { receipt: Value },
     Cancelled { receipt: Value },
     Reconciled { view: Value },
+    Handoff { endpoint: Value },
+    HandoffSpent { admission: Value },
     Stopped,
     Error { code: &'static str, detail: String },
 }
@@ -280,6 +301,12 @@ fn dispatch(
             dispatch_launch(composition.launch(request))
         }
         Request::NotifyLaunch { request } => dispatch_launch(composition.launch_notify(request)),
+        Request::Handoff { request } => {
+            dispatch_operator_handoff(composition.issue_operator_handoff(&request))
+        }
+        Request::ConsumeHandoff { endpoint } => {
+            dispatch_operator_admission(composition.admit_operator_handoff(&endpoint))
+        }
         Request::Cancel { operation_id } => composition.cancel(&operation_id).map_or_else(
             |error| composition_rejection(&error),
             |receipt| Message::Cancelled {
@@ -351,6 +378,54 @@ fn dispatch_launch(
                 },
             }
         }
+    }
+}
+
+/// Projects one owner-issued Operator handoff envelope onto the wire.
+///
+/// The envelope leaves only after the owner's own `validate` accepts it, so a
+/// response that reaches the wire is one the owner minted for its own current
+/// generation, role and capability set. An owner refusal keeps its own stable
+/// code through [`composition_rejection`] and never degrades into a generic
+/// success shape.
+fn dispatch_operator_handoff(
+    outcome: Result<OperatorEndpoint, eliot_user_broker::CompositionError>,
+) -> Message {
+    match outcome {
+        Err(error) => composition_rejection(&error),
+        Ok(endpoint) => match endpoint.validate() {
+            Err(error) => Message::Error {
+                code: "OPERATOR_HANDOFF_BINDING_REJECTED",
+                detail: error.to_string(),
+            },
+            Ok(()) => match serde_json::to_value(&endpoint) {
+                Ok(endpoint) => Message::Handoff { endpoint },
+                Err(error) => Message::Error {
+                    code: "OPERATOR_HANDOFF_ENCODING",
+                    detail: error.to_string(),
+                },
+            },
+        },
+    }
+}
+
+/// Projects one spent-handoff acknowledgement onto the wire.
+///
+/// A refusal to spend the presented envelope keeps its own stable code, so a
+/// replayed nonce/endpoint is visibly refused instead of answered with a
+/// second envelope.
+fn dispatch_operator_admission(
+    outcome: Result<OperatorHandoffAdmission, eliot_user_broker::CompositionError>,
+) -> Message {
+    match outcome {
+        Err(error) => composition_rejection(&error),
+        Ok(admission) => match serde_json::to_value(&admission) {
+            Ok(admission) => Message::HandoffSpent { admission },
+            Err(error) => Message::Error {
+                code: "OPERATOR_HANDOFF_ENCODING",
+                detail: error.to_string(),
+            },
+        },
     }
 }
 

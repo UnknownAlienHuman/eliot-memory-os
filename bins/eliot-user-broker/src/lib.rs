@@ -36,9 +36,10 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
     AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
     DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest, IssuedOperationIdentity,
-    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, PortError,
-    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
-    UserBroker,
+    IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest, LostOperation, OPERATOR_PIPE_NAME,
+    OperatorArtifact, OperatorEndpoint, OperatorHandoffAuthority, OperatorHandoffRequest,
+    PortError, ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus,
+    RequiredProvider, UserBroker,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -155,6 +156,18 @@ pub enum BrokerAdmissionRefusal {
     /// spent, under a new generation.
     #[error("UNKNOWN_OUTCOME")]
     RetiredOperation,
+    /// The owner refuses to mint an Operator handoff envelope.  The request is
+    /// not this owner's exact admitted role/capability triple, the broker's
+    /// own registration is not a live active generation, or the observed clock
+    /// cannot express a handoff window.  No envelope is produced.
+    #[error("OPERATOR_HANDOFF_DENIED")]
+    OperatorHandoffDenied,
+    /// A presented Operator handoff envelope is refused by the owner's
+    /// single-use ledger: it was never issued by this broker generation, was
+    /// already spent, has expired, or does not equal the exact envelope issued
+    /// under that nonce.
+    #[error("OPERATOR_HANDOFF_REJECTED")]
+    OperatorHandoffRejected,
 }
 
 impl BrokerAdmissionRefusal {
@@ -174,6 +187,8 @@ impl BrokerAdmissionRefusal {
             Self::IntroductionExpired => "CAPABILITY_GRANT_REVOKED",
             Self::OperationIdRetired => "IDENTITY_CONFLICT",
             Self::RetiredOperation => "UNKNOWN_OUTCOME",
+            Self::OperatorHandoffDenied => "OPERATOR_HANDOFF_DENIED",
+            Self::OperatorHandoffRejected => "OPERATOR_HANDOFF_REJECTED",
         }
     }
 
@@ -807,6 +822,26 @@ pub struct BrokerReadiness<'a> {
     pub snapshot: String,
 }
 
+/// Owner-issued acknowledgement that one presented Operator handoff envelope
+/// was spent exactly once against this broker's retained ledger.
+///
+/// Every field is read back from owner state: the image id and artifact digest
+/// are the installation-approved Operator image the envelope is now bound to,
+/// and the generation is the sealed registration epoch the envelope was
+/// admitted against.  Nothing here echoes the presented nonce, pipe name, or
+/// session id back to the caller, so a refusal and an acknowledgement cannot
+/// be confused with a replayable token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OperatorHandoffAdmission {
+    /// Installation-approved Operator image id this owner admits the presented
+    /// handoff to.
+    pub image_id: String,
+    /// SHA-256 of the exact approved Operator image bytes.
+    pub artifact_digest: String,
+    /// Sealed broker registration epoch the handoff was admitted against.
+    pub broker_epoch: u64,
+}
+
 pub struct BrokerComposition {
     broker: UserBroker,
     snapshot: PathBuf,
@@ -824,6 +859,13 @@ pub struct BrokerComposition {
     /// launchable only from here; see
     /// [`BrokerComposition::launch_notify`].
     notify_launch: BrokerNotifyLaunchAuthority,
+    /// Broker-retained Operator handoff authority, composed on first demand
+    /// from this broker's authenticated installation declaration and its live
+    /// registration generation.  It is the only minter of an
+    /// [`OperatorEndpoint`] and the only server-side single-use ledger; see
+    /// [`BrokerComposition::issue_operator_handoff`] and
+    /// [`BrokerComposition::admit_operator_handoff`].
+    operator_handoff: Option<OperatorHandoffAuthority>,
 }
 
 impl BrokerComposition {
@@ -972,6 +1014,7 @@ impl BrokerComposition {
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
                 reason: "NOT_STAGED",
             }),
+            operator_handoff: None,
         })
     }
 
@@ -1238,6 +1281,153 @@ impl BrokerComposition {
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
         self.broker.launch(request).map_err(Self::classify)
+    }
+
+    /// Mints one fresh single-use Operator handoff envelope for the admitted
+    /// role, on demand, from owner state only.
+    ///
+    /// This is the owner's answer to a reconnecting Operator: a *new* envelope
+    /// with a new nonce, the sealed registration epoch as its generation, the
+    /// live interactive session id, and the owner's own
+    /// [`OPERATOR_PIPE_NAME`].  It is not a second read of an environment
+    /// variable, and nothing in it is derived from a process id, a user name, a
+    /// pipe name, or a previously returned envelope: the consumed nonce is
+    /// never re-presented, and the previous envelope is never re-issued.
+    ///
+    /// The retained authority is this composition's server-side single-use
+    /// ledger, so every handoff this broker hands out — initial or
+    /// replacement — can be spent exactly once by
+    /// [`Self::admit_operator_handoff`].
+    pub fn issue_operator_handoff(
+        &mut self,
+        request: &OperatorHandoffRequest,
+    ) -> Result<OperatorEndpoint, CompositionError> {
+        self.verify_launch_lease()?;
+        let observed_at = now_unix_ms()?;
+        let (artifact, broker_epoch, interactive_session_id) =
+            self.operator_handoff_binding(observed_at)?;
+        let authority =
+            self.operator_handoff_authority(artifact, broker_epoch, interactive_session_id)?;
+        authority
+            .issue(request, observed_at)
+            .map_err(|error| BrokerAdmissionRefusal::OperatorHandoffDenied.with_platform(error))
+    }
+
+    /// Spends one presented Operator handoff envelope exactly once against the
+    /// retained ledger and returns the exact installation-approved image the
+    /// envelope is now bound to.
+    ///
+    /// This is the owner half of single use.  A nonce this broker never issued,
+    /// a nonce it already spent, an envelope past the owner-computed expiry,
+    /// and an envelope altered in any field are all refusals — an old
+    /// nonce/endpoint replay therefore *fails* here rather than returning a
+    /// second envelope.  An envelope minted for a broker generation this
+    /// process no longer owns is refused on the generation check before the
+    /// ledger is consulted at all.
+    pub fn admit_operator_handoff(
+        &mut self,
+        endpoint: &OperatorEndpoint,
+    ) -> Result<OperatorHandoffAdmission, CompositionError> {
+        self.verify_launch_lease()?;
+        let observed_at = now_unix_ms()?;
+        let (artifact, broker_epoch, interactive_session_id) =
+            self.operator_handoff_binding(observed_at)?;
+        if endpoint.broker_epoch != broker_epoch
+            || endpoint.interactive_session_id != interactive_session_id
+        {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffRejected
+                .with_platform("presented handoff is not bound to this broker generation"));
+        }
+        let authority =
+            self.operator_handoff_authority(artifact, broker_epoch, interactive_session_id)?;
+        let approved = authority.consume(endpoint, observed_at).map_err(|error| {
+            BrokerAdmissionRefusal::OperatorHandoffRejected.with_platform(error)
+        })?;
+        Ok(OperatorHandoffAdmission {
+            image_id: approved.image_id.clone(),
+            artifact_digest: approved.artifact_digest.clone(),
+            broker_epoch,
+        })
+    }
+
+    /// Reads the owner state one Operator handoff is bound to.
+    ///
+    /// All three values are read, never derived: the approved image comes from
+    /// the protected installation declaration whose `validate_launch_binding`
+    /// already validated it, the generation and session come from the sealed
+    /// registration receipt this broker currently holds, and the broker's own
+    /// monotonic epoch ledger must agree with that receipt.  A broker that
+    /// cannot name its own live generation mints and admits no handoff at all.
+    fn operator_handoff_binding(
+        &self,
+        observed_at: u64,
+    ) -> Result<(OperatorArtifact, u64, String), CompositionError> {
+        let declaration = self.launch_binding.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffDenied
+                .with_platform("protected launch configuration is not composed")
+        })?;
+        let registration = self.broker.registration().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffDenied
+                .with_platform("broker holds no registration")
+        })?;
+        if registration.status != RegistrationStatus::Active
+            || observed_at >= registration.expires_at
+        {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffDenied
+                .with_platform("broker registration is not a live active generation"));
+        }
+        let broker_epoch = registration.user_broker_epoch;
+        if broker_epoch == 0 || broker_epoch != self.broker.broker_epoch() {
+            return Err(BrokerAdmissionRefusal::OperatorHandoffDenied
+                .with_platform("registration epoch disagrees with the broker epoch ledger"));
+        }
+        let artifact = OperatorArtifact {
+            image_id: declaration.operator_artifact.image_id.clone(),
+            executable: declaration.operator_artifact.executable.clone(),
+            artifact_digest: declaration.operator_artifact.artifact_digest.clone(),
+        };
+        Ok((
+            artifact,
+            broker_epoch,
+            registration.interactive_session_id.clone(),
+        ))
+    }
+
+    /// Returns the retained handoff authority, composing it on first demand
+    /// and rebuilding it when the broker's registration generation has moved.
+    ///
+    /// A new broker generation fences the previous one, so the previous
+    /// generation's handoffs stop being this broker's live lineage. The
+    /// retained ledger is then dropped, not merged: a nonce from the fenced
+    /// generation is unknown to the new authority and is refused exactly as
+    /// loudly as a replay of a spent one.
+    fn operator_handoff_authority(
+        &mut self,
+        artifact: OperatorArtifact,
+        broker_epoch: u64,
+        interactive_session_id: String,
+    ) -> Result<&mut OperatorHandoffAuthority, CompositionError> {
+        let retained = self
+            .operator_handoff
+            .as_ref()
+            .is_some_and(|authority| authority.broker_epoch() == broker_epoch);
+        if !retained {
+            self.operator_handoff = Some(
+                OperatorHandoffAuthority::new(
+                    artifact,
+                    OPERATOR_PIPE_NAME.to_owned(),
+                    broker_epoch,
+                    interactive_session_id,
+                )
+                .map_err(|error| {
+                    BrokerAdmissionRefusal::OperatorHandoffDenied.with_platform(error)
+                })?,
+            );
+        }
+        self.operator_handoff.as_mut().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorHandoffDenied
+                .with_platform("operator handoff authority is not composed")
+        })
     }
 
     /// Cancels a broker-owned operation selected by its admitted operation
