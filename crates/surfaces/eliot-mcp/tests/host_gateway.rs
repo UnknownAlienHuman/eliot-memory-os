@@ -57,6 +57,7 @@ fn invocation() -> Result<HostInvocationRequest, HostContractError> {
     Ok(HostInvocationRequest {
         protocol_version: McpProtocolVersion::Final2026_07_28,
         correlation_id: HostCorrelationId::new("host-request-1")?,
+        correlation_projection: None,
         client_capabilities: ClientCapabilities { tasks: true },
         tool: ToolRequest::State(StateInput {
             include: vec!["task".to_owned(), "attention".to_owned()],
@@ -75,6 +76,7 @@ fn cancellation() -> Result<HostCancellationRequest, HostContractError> {
     Ok(HostCancellationRequest {
         protocol_version: McpProtocolVersion::Final2026_07_28,
         correlation_id: HostCorrelationId::new("host-cancel-1")?,
+        correlation_projection: None,
         operation_handle: HostOperationHandle::new("kernel-operation-1")?,
         reason: None,
         deadline_preference_ms: Some(2_000),

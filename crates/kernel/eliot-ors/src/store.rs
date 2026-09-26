@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::canonical_json_bytes;
+use eliot_contracts::{HostCorrelationProjection, HostJsonRpcCorrelationId, canonical_json_bytes};
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
@@ -4162,17 +4162,34 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
-        Self::host_request_logical_key(
-            record.kind,
-            session.as_str(),
-            record.request_id.as_str(),
-            record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
-            record.task_ref.as_ref().map(OpaqueLabel::as_str),
-            record.scope_ref.as_ref().map(OpaqueLabel::as_str),
-            record.capability_ref.as_str(),
-            record.payload_digest.as_str(),
-        )
-        .map(Some)
+        match &record.correlation_projection {
+            None => Ok(Some(Self::host_request_logical_key(
+                record.kind,
+                session.as_str(),
+                record.request_id.as_str(),
+                record.parent_operation_id.as_ref().map(OpaqueLabel::as_str),
+                record.task_ref.as_ref().map(OpaqueLabel::as_str),
+                record.scope_ref.as_ref().map(OpaqueLabel::as_str),
+                record.capability_ref.as_str(),
+                record.payload_digest.as_str(),
+            )?)),
+            Some(projection) => {
+                let kind = match record.kind {
+                    crate::HostRequestKind::Invocation => "INVOCATION",
+                    crate::HostRequestKind::Cancellation => "CANCELLATION",
+                    _ => return Ok(None),
+                };
+                let projection = serde_json::to_string(projection)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                Ok(Some(crate::model::sha256_hex(
+                    format!(
+                        "eliot.host-request.logical.v2\x1fkind={kind}\x1fsession={}\x1fprojection={projection}",
+                        session.as_str()
+                    )
+                    .as_bytes(),
+                )))
+            }
+        }
     }
 
     /// Atomically claims one logical host-request key or returns its durable
@@ -4246,6 +4263,51 @@ impl RedbRecoveryStore {
                 }
                 winner
             } else {
+                // The new typed key has a separate domain from every legacy
+                // text projection. Before admitting a fresh marked stage,
+                // inspect both historical MCP spellings (bare and the former
+                // qualified-unmarked form) under this same owner write lock.
+                // A hit cannot recover a typed handle because the old row
+                // never recorded the JSON-RPC id type.
+                for legacy_key in Self::legacy_host_request_logical_keys(record)? {
+                    if let Some(link_value) = links.get(legacy_key.as_str()).map_err(storage)? {
+                        let link: HostRequestLogicalLink = decode(link_value.value())?;
+                        let winner = {
+                            let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                            let row_key =
+                                format!("{}::{}", link.operation_id.as_str(), link.request_digest);
+                            operations
+                                .get(row_key.as_str())
+                                .map_err(storage)?
+                                .map(|value| {
+                                    let winner: crate::HostRequestRecord = decode(value.value())?;
+                                    winner.validate()?;
+                                    Ok::<_, OrsError>(winner)
+                                })
+                                .transpose()?
+                                .ok_or_else(|| OrsError::IntegrityProblem {
+                                    record_type: "host_request_logical_link",
+                                    reason:
+                                        "legacy logical link points at a missing host-request row"
+                                            .to_owned(),
+                                })?
+                        };
+                        let winner_key = Self::host_request_logical_key_for_record(&winner)?
+                            .ok_or_else(|| OrsError::IntegrityProblem {
+                                record_type: "host_request_logical_link",
+                                reason: "legacy logical link points at a non-indexable row"
+                                    .to_owned(),
+                            })?;
+                        if winner.correlation_projection.is_some() || winner_key != legacy_key {
+                            return Err(OrsError::IntegrityProblem {
+                                record_type: "host_request_logical_link",
+                                reason: "legacy logical link does not match an unmarked row"
+                                    .to_owned(),
+                            });
+                        }
+                        return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
+                    }
+                }
                 let staged = Self::stage_host_request_in(&write, record)?;
                 let link = HostRequestLogicalLink {
                     operation_id: staged.operation_id.clone(),
@@ -4260,6 +4322,59 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
+    }
+
+    /// Derives the bounded pre-marker logical keys that could represent one
+    /// explicitly typed request. These are presence-only candidates: callers
+    /// never receive a legacy row as the winner.
+    fn legacy_host_request_logical_keys(
+        record: &crate::HostRequestRecord,
+    ) -> Result<Vec<String>, OrsError> {
+        let Some(projection) = record.correlation_projection.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let candidates = match projection {
+            HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence,
+            } => vec![occurrence.clone()],
+            HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                occurrence,
+            } => vec![occurrence.clone(), format!("cancel:{occurrence}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                id: HostJsonRpcCorrelationId::String(value),
+            } => vec![value.clone(), format!("str:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                id: HostJsonRpcCorrelationId::Integer(value),
+            } => vec![value.to_string(), format!("int:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                id: HostJsonRpcCorrelationId::String(value),
+            } => vec![format!("cancel:{value}"), format!("cancel:str:{value}")],
+            HostCorrelationProjection::McpJsonRpc {
+                domain: eliot_contracts::HostCorrelationDomain::Cancellation,
+                id: HostJsonRpcCorrelationId::Integer(value),
+            } => vec![format!("cancel:{value}"), format!("cancel:int:{value}")],
+        };
+        let mut keys = Vec::with_capacity(candidates.len());
+        for occurrence in candidates {
+            let mut legacy = record.clone();
+            legacy.request_id =
+                OpaqueLabel::new(occurrence).map_err(|_| OrsError::InvalidField {
+                    field: "host_request_legacy_correlation",
+                    reason: "legacy correlation occurrence is not bounded opaque text",
+                })?;
+            legacy.correlation_projection = None;
+            if let Some(key) = Self::host_request_logical_key_for_record(&legacy)?
+                && !keys.contains(&key)
+            {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
     }
 
     /// Loads one host-request operation by logical key (issue #2571).
@@ -4393,6 +4508,7 @@ impl RedbRecoveryStore {
     ) -> bool {
         left.kind == right.kind
             && left.request_id == right.request_id
+            && left.correlation_projection == right.correlation_projection
             && left.idempotency_key == right.idempotency_key
             && left.cancellation_id == right.cancellation_id
             && left.parent_operation_id == right.parent_operation_id
@@ -20084,6 +20200,7 @@ mod host_request_result_tests {
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
+            correlation_projection: None,
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,

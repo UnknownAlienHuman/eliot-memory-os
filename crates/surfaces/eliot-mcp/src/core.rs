@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
+use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection, HostJsonRpcCorrelationId};
+use eliot_protocol::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_HOST_REQUEST_TEXT_BYTES};
 use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
 use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
@@ -635,6 +636,9 @@ pub enum PortFailure {
     /// Same idempotency identity was bound to different request bytes.
     #[error("IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
+    /// A pre-marker durable occurrence exists but cannot be assigned a typed owner.
+    #[error("LEGACY_CORRELATION_UNRESOLVED: reconcile the existing operation; no handle is issued")]
+    LegacyCorrelationUnresolved,
     /// Request deadline was reached by the semantic owner.
     #[error("DEADLINE_EXCEEDED")]
     DeadlineExceeded,
@@ -1879,11 +1883,9 @@ pub fn negotiate_wire_version(requested: &str) -> Result<NegotiatedWireVersion, 
 /// One preserved JSON-RPC correlation identity.
 ///
 /// The exact wire form is retained so responses echo the request identity
-/// bit-for-bit: strings cross verbatim, integers cross as integers. The
-/// derived `correlation_text` enters ELIOT correlation (as the opaque host
-/// correlation) under an explicitly type-qualified, injective encoding, so
-/// numeric `7` and string `"7"` never select the same retained operation or
-/// cancellation mark; it never becomes session, task, or authority identity.
+/// bit-for-bit. Durable ownership receives a closed typed projection that
+/// includes the request/cancellation domain; the derived text is only an
+/// opaque host correlation and never session, task, or authority identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JsonRpcId {
     /// String identity, echoed verbatim.
@@ -1891,22 +1893,6 @@ pub enum JsonRpcId {
     /// Integer identity, echoed as an integer.
     Int(i64),
 }
-
-/// Type tag qualifying a string wire identity inside opaque correlation text.
-///
-/// Client text is always wrapped under this tag, so a client string
-/// resembling a tag (for example `"int:7"` or `"cancel:int:7"`) encodes as
-/// `"str:int:7"` and can never alias an integer identity or a generated
-/// cancellation identity.
-const CORRELATION_STR_TAG: &str = "str:";
-/// Type tag qualifying an integer wire identity inside opaque correlation text.
-const CORRELATION_INT_TAG: &str = "int:";
-/// Domain tag qualifying a cancellation request inside opaque correlation text.
-///
-/// Cancellation correlations always start with this tag while request
-/// correlations always start with `str:` or `int:`, so the two correlation
-/// domains stay disjoint no matter what client text arrives.
-const CORRELATION_CANCEL_TAG: &str = "cancel:";
 
 impl JsonRpcId {
     /// Parses one wire identity; rejects null, boolean, float, and
@@ -1926,55 +1912,31 @@ impl JsonRpcId {
         }
     }
 
-    /// Returns the opaque correlation text carried into host requests.
-    ///
-    /// The encoding is deterministic and injective: integers cross as
-    /// `int:<decimal>` (including the `-` sign for negatives) and strings
-    /// cross as `str:<verbatim>`. Response envelopes still echo the original
-    /// wire form via `to_json`; only correlation crosses in this qualified
-    /// form, and the same mapping applies on both negotiated wire profiles.
-    ///
-    /// Compatibility: transport generations using the previous lossy
-    /// projection (bare `"7"` for both wire forms) key durable rows the new
-    /// encoding never matches directly, so a bare pre-upgrade row is never
-    /// silently reinterpreted as a qualified key — and replaying the same
-    /// wire presentation must not stage a second operation for it either.
-    /// The wire correlation is the durable logical-key occurrence and the
-    /// durable record's `request_id` (issue #2571), so the invocation replay
-    /// path consults the bounded legacy lookup
-    /// ([`legacy_bare_occurrence`]) before treating an authoritative
-    /// `Absent` as permission to submit. Within one admitted application
-    /// scope (same kernel-admitted session, capability, and payload
-    /// commitment — the scope the owner binds, restarted transports reuse
-    /// the explicit session/task binding per I7.7), a repeated admitted
-    /// logical request returns the original operation/result with no
-    /// second dispatch, and no pre-upgrade row is orphaned; the stored
-    /// result is verified against the record's own staged occurrence. A
-    /// legacy bare row is a shared ancestor — both `int:7` and `str:7`
-    /// resolve the same bare row, preserving the pre-upgrade sharing
-    /// exactly — while every row staged under the qualified encoding
-    /// stays distinct. A fresh kernel session is a new logical scope by
-    /// the owner's session binding: its authoritative `Absent` submits
-    /// exactly as a pre-upgrade generation did on the same miss, with no
-    /// reinterpretation and no eviction; cross-scope continuity is owned
-    /// by #2571's application-continuity keying, not by this projection.
-    /// Cancellation needs no legacy lookup: an absent qualified intent
-    /// falls back to the observation-only parent probe, which never
-    /// issues execution. Byte accounting: the qualifier reserves 4 bytes
-    /// of `MAX_HOST_CORRELATION_BYTES`, so at most 508 wire bytes cross
-    /// as invocation correlation (fewer under longer intent prefixes);
-    /// over-long wire strings fail closed at `HostCorrelationId::new`
-    /// instead of truncating. The legacy form is computed, never stored:
-    /// the probe is one extra bounded lookup with no lookup tables and
-    /// no new byte-limit surface.
+    /// Returns an explicit durable projection, preserving the wire type and
+    /// request/cancellation domain without parsing arbitrary text.
     #[must_use]
-    pub fn correlation_text(&self) -> String {
+    pub fn correlation_projection(
+        &self,
+        domain: HostCorrelationDomain,
+    ) -> HostCorrelationProjection {
         match self {
-            Self::Str(text) => format!("{CORRELATION_STR_TAG}{text}"),
-            Self::Int(number) => format!("{CORRELATION_INT_TAG}{number}"),
+            Self::Str(text) => HostCorrelationProjection::McpJsonRpc {
+                domain,
+                id: HostJsonRpcCorrelationId::String(text.clone()),
+            },
+            Self::Int(number) => HostCorrelationProjection::McpJsonRpc {
+                domain,
+                id: HostJsonRpcCorrelationId::Integer(*number),
+            },
         }
     }
 
+    /// Returns the bounded opaque host text corresponding to a durable
+    /// request projection. Responses still render the original JSON value.
+    #[must_use]
+    pub fn correlation_text(&self, domain: HostCorrelationDomain) -> String {
+        self.correlation_projection(domain).occurrence_text()
+    }
     /// Renders the exact wire identity for a response envelope.
     #[must_use]
     pub fn to_json(&self) -> Value {
@@ -1983,38 +1945,6 @@ impl JsonRpcId {
             Self::Int(number) => json!(*number),
         }
     }
-}
-
-/// Projects one qualified correlation back to the previous transport
-/// generation's bare occurrence (issue #2765 W4: the durable-compat
-/// lookup consulted by invocation replay before any fresh submit).
-///
-/// The pre-`int:`/`str:` projection carried the wire identity verbatim —
-/// integers as decimal text, strings verbatim — so the bare occurrence of
-/// `"int:7"` and `"str:7"` is `"7"`, and of `"str:int:7"` (a client string
-/// resembling the integer tag) is `"int:7"`. Exactly one leading type tag
-/// is stripped; input without a tag, with an empty or blank remainder,
-/// with control characters, or in the `cancel:` intent domain has no
-/// legacy invocation occurrence and yields `None`. The result borrows the
-/// input: no allocation, no table, at most one compat probe per replay
-/// miss. This is production lookup input for one bounded owner resolve
-/// exchange, not a test-only stub and not a behavior shim: the owner
-/// recomputes the durable key from the presented selectors and echoes it,
-/// and the hit is verified exactly like the primary lookup. Byte
-/// accounting: the bare form is the qualified form minus the 4-byte tag,
-/// so every admitted qualified correlation (bounded by
-/// `MAX_HOST_CORRELATION_BYTES` at `HostCorrelationId::new`, blank and
-/// control characters already rejected there) projects inside the same
-/// bound with room to spare.
-#[must_use]
-pub fn legacy_bare_occurrence(qualified: &str) -> Option<&str> {
-    let bare = qualified
-        .strip_prefix(CORRELATION_INT_TAG)
-        .or_else(|| qualified.strip_prefix(CORRELATION_STR_TAG))?;
-    if bare.trim().is_empty() || bare.chars().any(char::is_control) {
-        return None;
-    }
-    Some(bare)
 }
 
 /// One decoded MCP JSON-RPC frame: envelope only, no dispatch.
@@ -2243,11 +2173,11 @@ pub fn tools_list_result() -> Result<Value, WireRejection> {
     canonical_tool_schemas_for_list()
 }
 
-/// Rejects a blank string wire identity before qualified encoding.
+/// Rejects a blank string wire identity before typed projection.
 ///
 /// `HostCorrelationId::new` rejects blank and control-character text, but the
-/// `str:` qualifier would mask a blank wire string (`""` would encode as
-/// `"str:"` and pass). Integers are never blank. Control characters and
+/// qualified occurrence would otherwise hide a blank wire string from the
+/// host's opaque-text check. Integers are never blank. Control characters and
 /// over-long text keep failing closed at `HostCorrelationId::new` because the
 /// qualifier preserves them in the encoded form.
 fn reject_blank_wire_id(correlation: &JsonRpcId) -> Result<(), WireRejection> {
@@ -2266,10 +2196,10 @@ fn reject_blank_wire_id(correlation: &JsonRpcId) -> Result<(), WireRejection> {
 ///
 /// Only the eight advertised canonical tools are admitted; anything else is
 /// an explicit unadvertised-capability failure, never an empty success. The
-/// correlation crosses under the type-qualified injective encoding
-/// (`int:`/`str:` via [`JsonRpcId::correlation_text`]) as the opaque host
-/// correlation, so numeric and string wire identities stay distinct through
-/// invocation, handle retention, replay, and cancellation.
+/// correlation retains its original JSON type in an explicit owner-carried
+/// projection and uses a deterministic qualified occurrence in text slots,
+/// so numeric and string wire identities stay distinct through invocation,
+/// handle retention, replay, and cancellation.
 pub fn build_host_invocation(
     version: NegotiatedWireVersion,
     correlation: &JsonRpcId,
@@ -2301,15 +2231,19 @@ pub fn build_host_invocation(
         )
     })?;
     reject_blank_wire_id(correlation)?;
-    let correlation_id = HostCorrelationId::new(correlation.correlation_text()).map_err(|_| {
-        WireRejection::new(
-            WIRE_INVALID_PARAMS,
-            "request correlation exceeds the bounded opaque-correlation contract",
-        )
-    })?;
+    validate_correlation_text_budget(correlation)?;
+    let correlation_projection = correlation.correlation_projection(HostCorrelationDomain::Request);
+    let correlation_id =
+        HostCorrelationId::new(correlation_projection.occurrence_text()).map_err(|_| {
+            WireRejection::new(
+                WIRE_INVALID_PARAMS,
+                "request correlation exceeds the bounded opaque-correlation contract",
+            )
+        })?;
     let request = HostInvocationRequest {
         protocol_version: version.internal_profile(),
         correlation_id,
+        correlation_projection: Some(correlation_projection),
         client_capabilities: ClientCapabilities::default(),
         tool,
         deadline_preference_ms: None,
@@ -2329,12 +2263,9 @@ pub fn build_host_invocation(
 ///
 /// The handle must be the exact Kernel-issued handle retained for the
 /// cancelled correlation; the gateway echoes it back so a redirected result
-/// is detected instead of trusted. The cancellation correlation applies the
-/// `cancel:` domain tag to the same type-qualified encoding used at
-/// invocation, so cancelling an unsubmitted string `"7"` (key
-/// `cancel:str:7`) can never target numeric `7`'s retained operation (key
-/// `int:7`), and a client string resembling the tag still resolves under its
-/// own `str:`-qualified key.
+/// is detected instead of trusted. The cancellation carries a separate
+/// explicit domain marker and original JSON-RPC type, so it cannot alias an
+/// invocation key or a client string resembling an internal tag.
 pub fn build_host_cancellation(
     version: NegotiatedWireVersion,
     correlation: &JsonRpcId,
@@ -2352,19 +2283,20 @@ pub fn build_host_cancellation(
         ));
     }
     reject_blank_wire_id(correlation)?;
-    let cancel_correlation = HostCorrelationId::new(format!(
-        "{CORRELATION_CANCEL_TAG}{}",
-        correlation.correlation_text()
-    ))
-    .map_err(|_| {
-        WireRejection::new(
-            WIRE_INVALID_PARAMS,
-            "request correlation exceeds the bounded opaque-correlation contract",
-        )
-    })?;
+    validate_correlation_text_budget(correlation)?;
+    let correlation_projection =
+        correlation.correlation_projection(HostCorrelationDomain::Cancellation);
+    let cancel_correlation = HostCorrelationId::new(correlation_projection.occurrence_text())
+        .map_err(|_| {
+            WireRejection::new(
+                WIRE_INVALID_PARAMS,
+                "request correlation exceeds the bounded opaque-correlation contract",
+            )
+        })?;
     let request = HostCancellationRequest {
         protocol_version: version.internal_profile(),
         correlation_id: cancel_correlation,
+        correlation_projection: Some(correlation_projection),
         operation_handle: operation_handle.clone(),
         reason: reason.map(str::to_owned),
         deadline_preference_ms: None,
@@ -2377,6 +2309,28 @@ pub fn build_host_cancellation(
         )
     })?;
     Ok(request)
+}
+
+/// Ensures the request identity can also fit the owner's longest cancellation
+/// derivative. The cancellation intent adds `:cancel:cancel` (14 UTF-8 bytes)
+/// to its correlation text, the largest existing identity suffix; the owner
+/// contract bounds that full field by `MAX_HOST_REQUEST_TEXT_BYTES` (512).
+/// Checking both derivatives means an accepted invocation is always
+/// cancellable without truncation.
+fn validate_correlation_text_budget(correlation: &JsonRpcId) -> Result<(), WireRejection> {
+    let request_text = correlation.correlation_text(HostCorrelationDomain::Request);
+    let cancellation_text = correlation.correlation_text(HostCorrelationDomain::Cancellation);
+    let request_cancellation_bytes = request_text.len() + ":invoke:cancel".len();
+    let cancellation_identity_bytes = cancellation_text.len() + ":cancel:cancel".len();
+    if request_cancellation_bytes > MAX_HOST_REQUEST_TEXT_BYTES
+        || cancellation_identity_bytes > MAX_HOST_REQUEST_TEXT_BYTES
+    {
+        return Err(WireRejection::new(
+            WIRE_INVALID_PARAMS,
+            "request correlation cannot fit the bounded host cancellation identity",
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes `initialize` params to the exact requested version string.

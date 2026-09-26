@@ -26,6 +26,124 @@ pub use epoch_identity::*;
 /// The current wire revision of this foundation surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Maximum original correlation payload size, in UTF-8 bytes.
+pub const MAX_HOST_CORRELATION_PROJECTION_BYTES: usize = 512;
+
+/// The operation family whose client correlation is being projected.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCorrelationDomain {
+    /// A request invocation.
+    Request,
+    /// A cancellation request.
+    Cancellation,
+}
+
+/// Explicit wire identity for a host correlation.
+///
+/// `None` on the durable protocol carriers is reserved for historical rows.
+/// New MCP adapters carry the original JSON-RPC type; non-MCP adapters must
+/// deliberately select the opaque profile. The projection is data, never
+/// operation authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "profile", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostCorrelationProjection {
+    /// An explicitly opaque host-native occurrence.
+    Opaque {
+        /// Request or cancellation identity domain.
+        domain: HostCorrelationDomain,
+        /// Exact opaque host occurrence.
+        occurrence: String,
+    },
+    /// A typed JSON-RPC id supplied by the MCP adapter, never parsed from text.
+    McpJsonRpc {
+        /// Request or cancellation identity domain.
+        domain: HostCorrelationDomain,
+        /// Exact JSON-RPC string or signed integer identity.
+        id: HostJsonRpcCorrelationId,
+    },
+}
+
+/// The closed JSON-RPC identifier types admitted for durable correlation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum HostJsonRpcCorrelationId {
+    /// Exact JSON string value.
+    String(String),
+    /// Exact signed integer value.
+    Integer(i64),
+}
+
+impl HostCorrelationProjection {
+    /// Returns the explicit request/cancellation domain.
+    #[must_use]
+    pub const fn domain(&self) -> HostCorrelationDomain {
+        match self {
+            Self::Opaque { domain, .. } | Self::McpJsonRpc { domain, .. } => *domain,
+        }
+    }
+
+    /// Validates the closed projection's bounded text and typed value.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        match self {
+            Self::Opaque { occurrence, .. } => {
+                validate_text(occurrence, "host_correlation.occurrence")?;
+                if occurrence.len() > MAX_HOST_CORRELATION_PROJECTION_BYTES {
+                    return Err(ContractError::TooLong {
+                        field: "host_correlation.occurrence",
+                    });
+                }
+            }
+            Self::McpJsonRpc {
+                id: HostJsonRpcCorrelationId::String(value),
+                ..
+            } => {
+                if value.chars().any(char::is_control) {
+                    return Err(ContractError::ControlCharacter {
+                        field: "host_correlation.json_rpc_string",
+                    });
+                }
+                if value.len() > MAX_HOST_CORRELATION_PROJECTION_BYTES {
+                    return Err(ContractError::TooLong {
+                        field: "host_correlation.json_rpc_string",
+                    });
+                }
+            }
+            Self::McpJsonRpc {
+                id: HostJsonRpcCorrelationId::Integer(_),
+                ..
+            } => {}
+        }
+        Ok(())
+    }
+
+    /// Encodes the identity into the text occurrence used by the adapter.
+    /// Opaque adapters retain their exact host text; the durable projection
+    /// separately supplies the explicit profile and domain. MCP values use a
+    /// deterministic, injective, qualified form for existing text slots.
+    #[must_use]
+    pub fn occurrence_text(&self) -> String {
+        let domain = match self.domain() {
+            HostCorrelationDomain::Request => "request",
+            HostCorrelationDomain::Cancellation => "cancellation",
+        };
+        match self {
+            Self::Opaque { occurrence, .. } => occurrence.clone(),
+            Self::McpJsonRpc {
+                id: HostJsonRpcCorrelationId::String(value),
+                ..
+            } => {
+                format!("{domain}:mcp:str:{}:{value}", value.len())
+            }
+            Self::McpJsonRpc {
+                id: HostJsonRpcCorrelationId::Integer(value),
+                ..
+            } => {
+                format!("{domain}:mcp:int:{value}")
+            }
+        }
+    }
+}
 
 /// A validation failure for a contract primitive.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

@@ -14,7 +14,7 @@ use eliot_agent_bridge_core::{
     DemandId, FencingToken, Generation, HostEventEnvelope, ReconnectRequest, RecoveryDisposition,
     RecoveryView, SessionId,
 };
-use eliot_contracts::EpochId;
+use eliot_contracts::{EpochId, HostCorrelationDomain, HostCorrelationProjection};
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
@@ -1093,7 +1093,27 @@ fn decode_bounded_request(text: &str) -> Result<Request, String> {
     if let Err(reject) = check_request_envelope(text, REQUEST_INPUT_PROFILE) {
         return Err(reject.to_string());
     }
-    serde_json::from_str::<Request>(text).map_err(|error| classify_serde_error(&error).to_string())
+    let mut request = serde_json::from_str::<Request>(text)
+        .map_err(|error| classify_serde_error(&error).to_string())?;
+    // The private `op` profile has opaque host-native correlations. Persist
+    // that explicit profile while keeping its original wire presentation;
+    // never infer an MCP string/integer type from client text.
+    match &mut request {
+        Request::Invoke { request } | Request::DryRunInvoke { request } => {
+            request.correlation_projection = Some(HostCorrelationProjection::Opaque {
+                domain: HostCorrelationDomain::Request,
+                occurrence: request.correlation_id.as_str().to_owned(),
+            });
+        }
+        Request::Cancel { request } | Request::DryRunCancel { request } => {
+            request.correlation_projection = Some(HostCorrelationProjection::Opaque {
+                domain: HostCorrelationDomain::Cancellation,
+                occurrence: request.correlation_id.as_str().to_owned(),
+            });
+        }
+        _ => {}
+    }
+    Ok(request)
 }
 
 fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
@@ -1951,7 +1971,12 @@ fn host_gateway_error(error: &HostGatewayError) -> Response {
 }
 
 fn bridge_error(error: &BridgeError) -> Response {
-    if matches!(error, BridgeError::PlanGap(_)) {
+    if matches!(error, BridgeError::LegacyCorrelationUnresolved) {
+        Response::Error {
+            code: "LEGACY_CORRELATION_UNRESOLVED",
+            detail: "the retained pre-marker request cannot be mapped to a typed client correlation; reconcile the existing operation without issuing a new handle".to_owned(),
+        }
+    } else if matches!(error, BridgeError::PlanGap(_)) {
         Response::Error {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
@@ -2743,7 +2768,7 @@ fn handle_mcp_tools_call(
     id: &JsonRpcId,
     params: &Value,
 ) -> Value {
-    let correlation = id.correlation_text();
+    let correlation = id.correlation_text(eliot_contracts::HostCorrelationDomain::Request);
     if state.is_cancelled(&correlation) {
         return render_error(
             Some(id),
@@ -2934,7 +2959,7 @@ fn handle_mcp_cancelled(
             return;
         }
     };
-    let correlation = target.correlation_text();
+    let correlation = target.correlation_text(eliot_contracts::HostCorrelationDomain::Request);
     state.note_cancelled(&correlation);
     let handle = match state.find_handle(&correlation) {
         Some(handle) => handle.clone(),

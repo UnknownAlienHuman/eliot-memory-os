@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
@@ -220,6 +221,11 @@ pub struct HostInvocationRequest {
     pub protocol_version: McpProtocolVersion,
     /// Host-owned correlation echoed in the eventual response.
     pub correlation_id: HostCorrelationId,
+    /// Explicit typed wire identity used for owner-issued replay/cancel mapping.
+    /// `None` is accepted only when observing a pre-marker request.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_projection: Option<HostCorrelationProjection>,
     /// Presentation-only client capabilities.
     #[serde(default)]
     pub client_capabilities: ClientCapabilities,
@@ -236,6 +242,11 @@ pub struct HostInvocationRequest {
 impl HostInvocationRequest {
     /// Validates the host boundary without issuing or accepting ELIOT authority.
     pub fn validate(&self) -> Result<(), HostContractError> {
+        validate_correlation_projection(
+            self.correlation_projection.as_ref(),
+            &self.correlation_id,
+            HostCorrelationDomain::Request,
+        )?;
         validate_deadline_preference(self.deadline_preference_ms)?;
         self.observed_context.validate()?;
         self.tool.validate().map_err(contract_violation)
@@ -253,6 +264,10 @@ pub struct HostCancellationRequest {
     pub protocol_version: McpProtocolVersion,
     /// Correlation identity of this cancellation request.
     pub correlation_id: HostCorrelationId,
+    /// Explicit typed cancellation identity; historical requests have no marker.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_projection: Option<HostCorrelationProjection>,
     /// Opaque exact-operation handle returned after Kernel admission.
     pub operation_handle: HostOperationHandle,
     /// Optional public cancellation reason. Cancellation does not require prose.
@@ -268,6 +283,11 @@ pub struct HostCancellationRequest {
 impl HostCancellationRequest {
     /// Validates the cancellation shape without proving that the target is owned.
     pub fn validate(&self) -> Result<(), HostContractError> {
+        validate_correlation_projection(
+            self.correlation_projection.as_ref(),
+            &self.correlation_id,
+            HostCorrelationDomain::Cancellation,
+        )?;
         if let Some(reason) = &self.reason {
             bounded_text(
                 reason,
@@ -278,6 +298,23 @@ impl HostCancellationRequest {
         validate_deadline_preference(self.deadline_preference_ms)?;
         self.observed_context.validate()
     }
+}
+
+fn validate_correlation_projection(
+    projection: Option<&HostCorrelationProjection>,
+    correlation: &HostCorrelationId,
+    expected_domain: HostCorrelationDomain,
+) -> Result<(), HostContractError> {
+    if let Some(projection) = projection
+        && (projection.domain() != expected_domain
+            || projection.occurrence_text() != correlation.as_str())
+    {
+        return Err(HostContractError::InvalidField {
+            field: "host.correlation_projection",
+            reason: "must encode the exact correlation and request domain",
+        });
+    }
+    Ok(())
 }
 
 /// Host-facing contract validation failure before Kernel/Governor binding.

@@ -3299,6 +3299,8 @@ pub enum OrsError {
         operation_id: String,
         request_digest: String,
     },
+    #[error("legacy host-request correlation cannot be resolved to a typed identity")]
+    HostRequestLegacyCorrelationUnresolved,
     #[error("content-addressed campaign view {view_id} conflicts with retained ORS bytes")]
     CampaignLearningStateViewConflict { view_id: String },
     #[error("campaign source publication for {key} conflicts with its current owner head")]
@@ -4842,6 +4844,10 @@ pub struct HostRequestRecord {
     pub operation_id: OperationIdentity,
     pub kind: HostRequestKind,
     pub request_id: OpaqueLabel,
+    /// Explicit typed host-correlation identity; absent only on historical rows.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_projection: Option<eliot_contracts::HostCorrelationProjection>,
     pub idempotency_key: OpaqueLabel,
     pub cancellation_id: OpaqueLabel,
     pub parent_operation_id: Option<OpaqueLabel>,
@@ -4899,6 +4905,7 @@ impl HostRequestRecord {
         self.operation_id == other.operation_id
             && self.kind == other.kind
             && self.request_id == other.request_id
+            && self.correlation_projection == other.correlation_projection
             && self.idempotency_key == other.idempotency_key
             && self.cancellation_id == other.cancellation_id
             && self.parent_operation_id == other.parent_operation_id
@@ -4922,6 +4929,40 @@ impl HostRequestRecord {
         }
         validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
         validate_text(self.request_id.as_str(), "host_request_request_id")?;
+        if let Some(projection) = &self.correlation_projection {
+            projection.validate().map_err(|_| OrsError::InvalidField {
+                field: "host_request_correlation_projection",
+                reason: "must be a bounded explicit correlation projection",
+            })?;
+            if projection.occurrence_text() != self.request_id.as_str() {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_correlation_projection",
+                    reason: "must encode the exact request_id text",
+                });
+            }
+            if self.request_id.as_str().len() > 512 {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_request_id",
+                    reason: "marked correlation must fit the bounded host-correlation text limit",
+                });
+            }
+            let domain_matches = matches!(
+                (self.kind, projection.domain()),
+                (
+                    HostRequestKind::Invocation,
+                    eliot_contracts::HostCorrelationDomain::Request
+                ) | (
+                    HostRequestKind::Cancellation,
+                    eliot_contracts::HostCorrelationDomain::Cancellation
+                )
+            );
+            if !domain_matches {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_correlation_projection",
+                    reason: "must match the host-request kind domain",
+                });
+            }
+        }
         validate_text(
             self.idempotency_key.as_str(),
             "host_request_idempotency_key",

@@ -139,6 +139,7 @@ pub fn restore_reactive_runtime(
             PortFailure::IdempotencyConflict => BridgeError::InvalidTransition(
                 "restore idempotency identity is bound to different request bytes",
             ),
+            PortFailure::LegacyCorrelationUnresolved => BridgeError::LegacyCorrelationUnresolved,
             PortFailure::DeadlineExceeded => {
                 BridgeError::ProviderContract("restore deadline exceeded".to_owned())
             }

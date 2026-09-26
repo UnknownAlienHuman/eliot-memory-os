@@ -3490,6 +3490,8 @@ pub enum BridgeError {
     ActivationUnknownOutcome { operation: String },
     #[error("stale session, generation, or state fence")]
     StaleAuthority,
+    #[error("legacy host-request correlation cannot be resolved to a typed identity")]
+    LegacyCorrelationUnresolved,
     #[error("EXTERNAL_ATTACH_RECONCILIATION_REQUIRED")]
     ExternalAttachReconciliationRequired,
     #[error("external attach reconciliation denied: {0}")]

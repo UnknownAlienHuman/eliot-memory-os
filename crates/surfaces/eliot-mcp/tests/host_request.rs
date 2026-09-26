@@ -16,6 +16,7 @@ fn invocation() -> Result<HostInvocationRequest, HostContractError> {
     Ok(HostInvocationRequest {
         protocol_version: McpProtocolVersion::Final2026_07_28,
         correlation_id: HostCorrelationId::new("host-request-1")?,
+        correlation_projection: None,
         client_capabilities: ClientCapabilities { tasks: true },
         tool: ToolRequest::State(StateInput {
             include: vec!["task".to_owned(), "attention".to_owned()],
@@ -84,6 +85,7 @@ fn host_invoke_and_cancel_roundtrip() -> Result<(), Box<dyn Error>> {
     let cancel = HostCancellationRequest {
         protocol_version: McpProtocolVersion::Final2026_07_28,
         correlation_id: HostCorrelationId::new("host-cancel-1")?,
+        correlation_projection: None,
         operation_handle: HostOperationHandle::new("kernel-operation-handle-1")?,
         reason: None,
         deadline_preference_ms: Some(2_000),
@@ -163,6 +165,7 @@ fn cancellation_reason_is_optional_and_bounded() -> Result<(), Box<dyn Error>> {
     let mut cancel = HostCancellationRequest {
         protocol_version: McpProtocolVersion::Final2026_07_28,
         correlation_id: HostCorrelationId::new("host-cancel-2")?,
+        correlation_projection: None,
         operation_handle: HostOperationHandle::new("kernel-operation-handle-2")?,
         reason: None,
         deadline_preference_ms: None,
@@ -204,6 +207,7 @@ fn operation_handle_is_opaque_and_unknown_fields_fail_closed() -> Result<(), Box
     let cancel = HostCancellationRequest {
         protocol_version: McpProtocolVersion::Final2026_07_28,
         correlation_id: HostCorrelationId::new("host-cancel-forgery")?,
+        correlation_projection: None,
         operation_handle: HostOperationHandle::new("operation-forgery")?,
         reason: None,
         deadline_preference_ms: None,

@@ -7221,6 +7221,7 @@ mod local_read_dispatch_tests {
             identity: eliot_protocol::HostRequestIdentity {
                 request_id: eliot_contracts::RequestId::new("host-request-1")
                     .expect("valid request id"),
+                correlation_projection: None,
                 idempotency_key: "host-request-1:invoke".to_owned(),
                 cancellation_id: "host-request-1:invoke:cancel".to_owned(),
                 parent_operation_id: None,

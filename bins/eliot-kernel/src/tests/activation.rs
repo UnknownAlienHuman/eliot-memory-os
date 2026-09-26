@@ -350,6 +350,7 @@ fn activation_host_envelope(
         connection_id: connection_id.to_owned(),
         identity: HostRequestIdentity {
             request_id: RequestId::new("host-request-activation-test").expect("request id"),
+            correlation_projection: None,
             idempotency_key: "host-request-idempotency-test".to_owned(),
             cancellation_id: "host-request-cancellation-test".to_owned(),
             parent_operation_id: None,
