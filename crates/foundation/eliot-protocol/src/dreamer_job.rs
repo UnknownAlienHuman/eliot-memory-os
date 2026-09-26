@@ -751,6 +751,32 @@ impl MutationReconciliation {
     }
 }
 
+/// Ordering Scopes one closed Dreamer operation can prove it belongs to.
+///
+/// I5.5 requires the complete `ordering_scopes` set of a write envelope to be
+/// declared before staging, and I14.21 requires an unknown commit to pause the
+/// affected Ordering Scope instead of guessing a retry.  This value is the
+/// protocol's own statement of which ordering identities a closed operation
+/// carries, so an owner that has to fence, pause or display an ambiguous
+/// mutation reads it instead of inferring one.
+///
+/// Both members are existing closed identities rather than a new taxonomy:
+/// `work_scope` is the [`WorkScopeId`] the job's ledger record is ordered
+/// inside, and `job_ledger` is the exact `(TaskId, ArtifactId)` pair whose one
+/// ordered ledger record the operation is a compare-and-swap against.  This
+/// value deliberately renders neither of them: the canonical spelling of a
+/// Store ordering stream belongs to the Store contract, so no second name for
+/// the same stream is minted here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DreamerOrderingScopes<'a> {
+    /// The Work Scope this operation's ledger record is ordered inside, when
+    /// the closed kind carries that identity on the request itself.
+    pub work_scope: Option<&'a WorkScopeId>,
+    /// The exact job attempt whose single ordered ledger record this
+    /// operation mutates, when the closed kind binds one.
+    pub job_ledger: Option<(&'a TaskId, &'a ArtifactId)>,
+}
+
 /// Strictly typed operation payloads.  There is no arbitrary next-state or
 /// generic patch variant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -836,6 +862,71 @@ impl JobOperation {
             Self::Status { .. } => JobOperationKind::Status,
             Self::RequestCancel { .. } => JobOperationKind::RequestCancel,
             Self::Reconcile { .. } => JobOperationKind::Reconcile,
+        }
+    }
+
+    /// Returns the Ordering Scopes this closed operation proves it belongs to.
+    ///
+    /// Every kind of the closed vocabulary binds at least one, so no admitted
+    /// Dreamer mutation has to reach an Ordering Scope by guesswork:
+    ///
+    /// ```text
+    /// SUBMIT_JOB          -> work scope of the submission + its job/attempt
+    /// LEASE_NEXT          -> work scope of the selector
+    /// LEASE_EXACT         -> work scope of the selector
+    /// RENEW_LEASE         -> the leased job/attempt ledger
+    /// START_JOB           -> the leased job/attempt ledger
+    /// CHECKPOINT_JOB      -> the leased job/attempt ledger
+    /// RESUME_JOB          -> the leased job/attempt ledger
+    /// BEGIN_VERIFICATION  -> the leased job/attempt ledger
+    /// PUBLISH_OUTCOME     -> the leased job/attempt ledger
+    /// STATUS              -> the observed job/attempt ledger
+    /// REQUEST_CANCEL      -> the addressed job/attempt ledger
+    /// RECONCILE_MUTATION  -> the reconciled job/attempt ledger
+    /// ```
+    ///
+    /// `LEASE_EXACT` also names a `job_id`, but the attempt it will lease is
+    /// resolved by the Store and is not carried on the request — its selector
+    /// names the claiming worker, not the attempt — so it proves the selector's
+    /// work scope and never guesses a job ledger.  The kinds that bind only a
+    /// `JobLease` or a job id deliberately do not claim a work scope they do
+    /// not carry; the link from their job ledger up to the Work Scope belongs
+    /// to the record the Store already owns, not to the request.
+    #[must_use]
+    pub fn ordering_scopes(&self) -> DreamerOrderingScopes<'_> {
+        match self {
+            Self::Submit { submission } => DreamerOrderingScopes {
+                work_scope: Some(&submission.work_scope.scope_id),
+                job_ledger: Some((&submission.job_id, &submission.attempt_id)),
+            },
+            Self::LeaseNext { selector } | Self::LeaseExact { selector, .. } => {
+                DreamerOrderingScopes {
+                    work_scope: Some(&selector.scope_id),
+                    job_ledger: None,
+                }
+            }
+            Self::Renew { lease, .. }
+            | Self::Start { lease, .. }
+            | Self::Checkpoint { lease, .. }
+            | Self::Resume { lease, .. }
+            | Self::BeginVerification { lease, .. }
+            | Self::Publish { lease, .. } => DreamerOrderingScopes {
+                work_scope: None,
+                job_ledger: Some((&lease.job_id, &lease.attempt_id)),
+            },
+            Self::Status {
+                job_id, attempt_id, ..
+            }
+            | Self::RequestCancel {
+                job_id, attempt_id, ..
+            } => DreamerOrderingScopes {
+                work_scope: None,
+                job_ledger: Some((job_id, attempt_id)),
+            },
+            Self::Reconcile { mutation } => DreamerOrderingScopes {
+                work_scope: None,
+                job_ledger: Some((&mutation.job_id, &mutation.attempt_id)),
+            },
         }
     }
 

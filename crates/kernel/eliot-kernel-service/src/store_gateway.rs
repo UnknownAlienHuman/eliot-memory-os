@@ -32,7 +32,7 @@ use eliot_store_api::{
     PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_request_hash,
-    generated_operation_manifests, verify_canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, verify_canonical_request_hash,
 };
 
 use crate::commit_recovery::{
@@ -182,38 +182,31 @@ enum DreamerRetainedOutcome {
 /// The checked pause gate for one admitted Dreamer operation (#2763).
 ///
 /// A derived Ordering Scope is matched against the complete observed record
-/// set, so every open record covering the scope is considered. An operation
-/// that proves no Ordering Scope is not exempted: `OrderingScopeUnresolved`
-/// states the limitation and closes admission whenever any other open record
-/// exists, because an absent scope vector is not evidence of being unpaused.
+/// set, so every open record covering the scope is considered. Because every
+/// closed Dreamer kind now proves at least one scope, a pause is reported
+/// precisely for all of them: the refusal names the scope and the idempotency
+/// key holding it, which is what makes the pause displayable and actionable
+/// rather than a bare Problem State.
+///
+/// What remains unproven is the link *above* the proven set. The kinds that
+/// bind only a `JobLease` or a job id reach their own ordered job-attempt
+/// ledger but not the Work Scope that ledger is ordered inside, and a record
+/// opened by `Submit` or by a lease selection is indexed by work scope without
+/// having to name any job. For those kinds `OrderingScopeUnresolved` keeps the
+/// complete-record closure: an unproven link is not evidence of being
+/// unpaused, so admission stays closed while any other open record exists.
+/// This is a stated limitation, never a bypass.
 fn dreamer_pause_refusal(
     observed: &CheckedPauseObservation,
     identity: &OperationIdentity,
-    ordering_scopes: &[String],
+    proof: &DreamerOrderingScopeProof,
     effect: DreamerOperationEffect,
 ) -> Option<String> {
     if effect != DreamerOperationEffect::Mutation {
         return None;
     }
     let key = identity.idempotency_key.as_str();
-    if ordering_scopes.is_empty() {
-        if observed.any_open_except(key) {
-            return Some(
-                CommitRecoveryError::OrderingScopeUnresolved {
-                    operation: "dreamer-job".to_owned(),
-                    detail: format!(
-                        "no Ordering Scope is derivable for this operation, so its coverage by the \
-                         open unknown-commit record set observed at revision {} cannot be proven \
-                         and dependent durable admission stays closed",
-                        observed.binding().revision
-                    ),
-                }
-                .to_string(),
-            );
-        }
-        return None;
-    }
-    ordering_scopes.iter().find_map(|scope| {
+    let paused = proof.scopes.iter().find_map(|scope| {
         observed.pausing_key_for(scope, key).map(|pausing_key| {
             CommitRecoveryError::ScopePaused {
                 scope: scope.clone(),
@@ -221,7 +214,27 @@ fn dreamer_pause_refusal(
             }
             .to_string()
         })
-    })
+    });
+    if paused.is_some() {
+        return paused;
+    }
+    if !proof.work_scope_proven && observed.any_open_except(key) {
+        return Some(
+            CommitRecoveryError::OrderingScopeUnresolved {
+                operation: "dreamer-job".to_owned(),
+                detail: format!(
+                    "the Ordering Scopes this operation proves ({}) do not reach the Work Scope \
+                     its ledger record is ordered inside, so its coverage by the open \
+                     unknown-commit record set observed at revision {} cannot be proven and \
+                     dependent durable admission stays closed",
+                    proof.rendered(),
+                    observed.binding().revision
+                ),
+            }
+            .to_string(),
+        );
+    }
+    None
 }
 
 /// Renders an ORS failure as the fail-closed recovery refusal (I14.24).
@@ -274,9 +287,9 @@ fn dreamer_dispositioned(
 /// ledger contract defines as side-effect-free. An operation called
 /// `Reconcile` records a caller-declared disposition and an operation called
 /// `RequestCancel` transitions a job, so both are mutations here and are
-/// gated like any other. An empty derived scope list is NOT evidence that an
+/// gated like any other. A resolved Ordering Scope set is NOT evidence that an
 /// operation is read-only, which is why this classification does not consult
-/// [`dreamer_ordering_scopes`] at all.
+/// [`dreamer_ordering_scope_proof`] at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DreamerOperationEffect {
     /// A permitted read: the ledger contract defines no ledger transition.
@@ -307,28 +320,60 @@ fn dreamer_operation_effect(operation: &JobOperation) -> DreamerOperationEffect 
     }
 }
 
-/// Ordering Scopes one admitted Dreamer ledger mutation belongs to.
+/// Ordering Scope coverage of one admitted Dreamer mutation.
 ///
-/// A Dreamer ledger is ordered inside its Work Scope, and only the closed
-/// kinds that select a job by scope carry that identity on the request:
-/// `Submit` names its submission's work scope, and `LeaseNext`/`LeaseExact`
-/// name their selector's scope.
+/// The provable set comes from the Dreamer protocol itself
+/// (`JobOperation::ordering_scopes`), so no scope is inferred here, and each
+/// entry is spelled by the owner of that stream: a work scope by its own
+/// `WorkScopeId`, and the one ordered job-attempt ledger by the Store
+/// contract's canonical `dreamer_job_queue_key`. There is no second name for
+/// either stream and no scope-local alias table.
 ///
-/// The remaining closed kinds bind a lease, a job id, or a pure observation
-/// and therefore prove no Ordering Scope. That is now a *stated limitation*
-/// rather than a silent exemption: the caller turns an empty vector into a
-/// fail-closed gate over the complete observed record set rather than into
-/// admission. No scope is ever invented, and an absent scope is never used as
-/// a bypass.
-fn dreamer_ordering_scopes(request: &DurableJobRequest) -> Vec<String> {
-    let scope = match &request.operation {
-        JobOperation::Submit { submission } => submission.work_scope.scope_id.as_str(),
-        JobOperation::LeaseNext { selector } | JobOperation::LeaseExact { selector, .. } => {
-            selector.scope_id.as_str()
+/// `work_scope_proven` records whether the set also reaches the Work Scope the
+/// ledger record is ordered inside. That is the level at which an open record
+/// opened by `Submit` or a lease selection is indexed without naming this
+/// job, so it is exactly the link whose absence keeps the complete-record
+/// closure in force; see [`dreamer_pause_refusal`].
+struct DreamerOrderingScopeProof {
+    /// The complete provable Ordering Scope set, in canonical spelling.
+    scopes: Vec<String>,
+    /// Whether `scopes` also names the Work Scope the ledger is ordered
+    /// inside, as opposed to only this job's own ledger stream.
+    work_scope_proven: bool,
+}
+
+impl DreamerOrderingScopeProof {
+    /// Renders the proven set for a refusal message, never as an empty claim.
+    fn rendered(&self) -> String {
+        if self.scopes.is_empty() {
+            return "none".to_owned();
         }
-        _ => return Vec::new(),
-    };
-    vec![scope.to_owned()]
+        self.scopes.join(", ")
+    }
+}
+
+/// Resolves the Ordering Scopes one admitted Dreamer mutation belongs to.
+///
+/// Every kind of the closed Dreamer vocabulary now proves at least one scope,
+/// so an unknown commit on any of them records a durable, displayable pause
+/// instead of an empty vector that the scope-indexed
+/// [`KernelStoreGateway::paused_ordering_scopes`] view could not show. The
+/// kinds that bind only a `JobLease` or a job id resolve to their own ordered
+/// job-attempt ledger; `Submit` additionally carries its work scope, and the
+/// two lease selections carry their selector's.
+fn dreamer_ordering_scope_proof(request: &DurableJobRequest) -> DreamerOrderingScopeProof {
+    let proven = request.operation.ordering_scopes();
+    let mut scopes = Vec::new();
+    if let Some(work_scope) = proven.work_scope {
+        scopes.push(work_scope.as_str().to_owned());
+    }
+    if let Some((job_id, attempt_id)) = proven.job_ledger {
+        scopes.push(dreamer_job_queue_key(job_id, attempt_id));
+    }
+    DreamerOrderingScopeProof {
+        work_scope_proven: proven.work_scope.is_some(),
+        scopes,
+    }
 }
 
 /// The in-flight synchronization state for one canonical Store gateway.
@@ -2678,7 +2723,7 @@ impl KernelStoreGateway {
             idempotency_key: request.request_identity.operation.idempotency_key.clone(),
             canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
         };
-        let ordering_scopes = dreamer_ordering_scopes(&request);
+        let scope_proof = dreamer_ordering_scope_proof(&request);
         let effect = dreamer_operation_effect(&request.operation);
 
         // Durable recovery state must be available for mutating work even
@@ -2704,7 +2749,7 @@ impl KernelStoreGateway {
             }
         } {
             match self
-                .reconcile_retained_dreamer_operation(&identity, &ordering_scopes, record)
+                .reconcile_retained_dreamer_operation(&identity, &scope_proof.scopes, record)
                 .await
                 .map_err(|error| error.to_string())?
             {
@@ -2763,8 +2808,7 @@ impl KernelStoreGateway {
             if let Some(error) = observed.unavailable_error() {
                 return Err(error.to_string());
             }
-            if let Some(refusal) =
-                dreamer_pause_refusal(&observed, &identity, &ordering_scopes, effect)
+            if let Some(refusal) = dreamer_pause_refusal(&observed, &identity, &scope_proof, effect)
             {
                 return Err(refusal);
             }
@@ -2776,7 +2820,7 @@ impl KernelStoreGateway {
                 // record is resolved by reading its exact mutation receipt.
                 // A ledger `Status` alone could never settle it.
                 if retried_under_retained_record {
-                    self.settle_after_same_identity_retry(&identity, &ordering_scopes)
+                    self.settle_after_same_identity_retry(&identity, &scope_proof.scopes)
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -2784,10 +2828,10 @@ impl KernelStoreGateway {
             }
             Err(DreamerCommitEvidence::Refused(error)) => Err(error.to_string()),
             Err(DreamerCommitEvidence::Reconciled(receipt)) => Err(self
-                .reconcile_dreamer_commit(&identity, &ordering_scopes, &receipt)?
+                .reconcile_dreamer_commit(&identity, &scope_proof.scopes, &receipt)?
                 .to_string()),
             Err(DreamerCommitEvidence::Unknown) => Err(self
-                .preserve_dreamer_operation(&identity, &ordering_scopes)?
+                .preserve_dreamer_operation(&identity, &scope_proof.scopes)?
                 .to_string()),
         };
         drop(lease);
