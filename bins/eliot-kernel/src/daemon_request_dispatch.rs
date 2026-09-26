@@ -2231,21 +2231,12 @@ impl KernelComposition {
                 // changed binding under a known identity conflicts, an unknown
                 // parent is unknown, and an elapsed deadline times out there.
                 // Observe bytes ride this entry exactly like the bridge
-                // front-door submit arm (issue #2565): linkage before
-                // staging, retention enqueue after admission.
+                // front-door submit arm (issue #2565): linkage and a bounded
+                // queue reservation precede admission and payload handoff.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let observe_tool = payload.get("tool").cloned();
-                if let Some(ref tool) = observe_tool
-                    && envelope.identity.capability == host_request_route::OBSERVE_CAPABILITY
-                {
-                    host_request_route::check_observe_tool_linkage(&envelope, tool)?;
-                }
-                let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
-                self.maybe_enqueue_observe_pair_for_submit(
-                    &envelope,
-                    &record,
-                    observe_tool.as_ref(),
-                );
+                let (receipt, record) =
+                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
