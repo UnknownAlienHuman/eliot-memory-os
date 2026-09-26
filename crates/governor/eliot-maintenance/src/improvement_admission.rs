@@ -12,15 +12,19 @@
 //! Instrument (`#20`/`#1111`, handoff) and production activation stays with
 //! the Kernel generation/canary path (`#11`, handoff). Unknown external
 //! outcomes reconcile before retry; an exact canonical replay of a retained
-//! proposal commitment disposes as no-progress rather than improvement, and no
-//! caller-settable boolean can establish progress or clear an unknown external
-//! effect.
+//! proposal commitment disposes as no-progress rather than improvement, no
+//! caller-settable boolean and no caller-authored assessment can establish
+//! progress or clear an unknown external effect, and an absent or
+//! non-discriminating retained record establishes nothing at all.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::improvement_pipeline::{ImprovementReplayAssessment, ProposalCommitment};
+use super::improvement_pipeline::{
+    ImprovementCurrentProposal, ImprovementReplayAssessment, ProposalCommitment,
+    RetainedImprovementProposal, UnestablishedPriorCause, assess_improvement_progress,
+};
 
 /// Improvement closure cell identity (mirrors `meta.learning.closure`).
 pub const IMPROVEMENT_CLOSURE_MODULE: &str = "meta.learning.closure";
@@ -137,14 +141,15 @@ pub struct ImprovementEvidenceView {
     pub rollback_owner_id: String,
     /// Expiry ref; must bind the admitted operation.
     pub expiry_ref: Option<String>,
-    /// Retained prior proposal commitment this admission is compared against.
+    /// Retained prior proposal record this admission is compared against.
     ///
-    /// This is a retained record, never a verdict. The gate compares it with
-    /// the current canonical commitment the pipeline computes, so no caller can
-    /// assert a repeat, a new discriminator, or any progress by spelling a
-    /// boolean. `None` means no prior commitment was retained; it is not a
-    /// claim that the candidate is new, and it clears no external effect.
-    pub retained_prior_commitment: Option<ProposalCommitment>,
+    /// This is a retained record, never a verdict. The gate derives the
+    /// assessment itself from this record and the current record the pipeline
+    /// committed, so no caller can assert a repeat, a new discriminator, or any
+    /// progress by spelling a boolean or a verdict. `None` means no retained
+    /// record was supplied; that establishes nothing, is never read as novelty,
+    /// and clears no external effect.
+    pub retained_prior_proposal: Option<RetainedImprovementProposal>,
 }
 
 /// Policy governing improvement admission. No clock, I/O, or live query.
@@ -335,21 +340,24 @@ pub enum ImprovementAdmissionError {
 /// input. Admission is experiment-only; canary activation, production
 /// promotion, and rollback execution stay with their external owners.
 ///
-/// `replay` is the canonical-byte comparison of the current proposal commitment
-/// against a retained prior commitment, derived by the pipeline that computed
-/// both (`improvement_pipeline::compare_improvement_commitments`). The caller
-/// supplies the retained prior record; the gate owns the verdict, so no boolean
-/// can establish progress. Integrity stays separate from semantic progress: an
-/// exact replay is no progress, a changed content under one operation and
-/// idempotency key is a typed identity conflict that performs no transition, a
-/// prior written under another domain, encoding revision, or algorithm is
-/// unestablished and requires reconciliation, and a different logical operation
-/// is an ordinary new candidate rather than a progress claim.
+/// `current` is the record `improvement_pipeline` committed for the exact
+/// proposal bytes it checked, and the retained prior record travels on
+/// `evidence`. The gate owns the verdict: it derives the assessment from those
+/// two records itself and accepts no assessment, boolean, or reason from a
+/// caller, so no field of a record can manufacture progress. Integrity stays
+/// separate from semantic progress: an exact replay is no progress, changed
+/// content under one operation and idempotency key is a typed identity conflict
+/// that performs no transition, a retained record written under another domain,
+/// encoding revision, or algorithm is unestablished and requires reconciliation,
+/// a new proposal identity or a different digest establishes nothing on its
+/// own, and a new causal discriminator requires both a changed discriminator
+/// projection and owner-issued evidence the retained record did not declare.
+/// With no retained record at all, no progress is established.
 pub fn admit_improvement_candidate(
     candidate: &ImprovementCandidateView,
     evidence: &ImprovementEvidenceView,
     policy: &ImprovementAdmissionPolicy,
-    replay: Option<&ImprovementReplayAssessment>,
+    current: &ImprovementCurrentProposal,
 ) -> Result<ImprovementAdmissionDecision, ImprovementAdmissionError> {
     validate_candidate(candidate)?;
     validate_policy(policy, candidate)?;
@@ -423,27 +431,19 @@ pub fn admit_improvement_candidate(
             owner_id: policy.rollback_owner_id.clone(),
         });
     }
-    let Some(admitted_scope_ref) = candidate
-        .admitted_scope_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(ImprovementAdmissionDecision::Blocked {
-            cause: ImprovementBlockCause::MissingAdmittedScope,
-            reason: "missing-admitted-scope: owner-proved work scope required before experiment"
-                .to_string(),
-            owner_id: policy.external_owner_id.clone(),
-        });
+    let admitted_scope_ref = match require_admitted_scope(candidate, &policy.external_owner_id) {
+        Ok(scope) => scope,
+        Err(decision) => return Ok(decision),
     };
-    // Integrity, not a progress claim. `replay` is derived from the canonical
-    // bytes the pipeline computed for this proposal, so a caller can neither
-    // manufacture progress nor suppress a repeat by spelling a boolean. It is
-    // evaluated after the unknown-outcome branch above, which no prior
-    // commitment and no named rollback contract may clear.
-    if let Some(outcome) =
-        replay.and_then(|assessment| replay_forced_outcome(assessment, &policy.external_owner_id))
-    {
+    // Integrity, not a progress claim. The assessment is derived here from the
+    // record this run committed and the retained record the admission evidence
+    // carries, so a caller can neither manufacture progress nor suppress a
+    // repeat by omitting a field or spelling a boolean. It is evaluated after
+    // the unknown-outcome branch above, which no prior record, no new
+    // discriminator, and no named rollback contract may clear.
+    let assessment =
+        assess_improvement_progress(evidence.retained_prior_proposal.as_ref(), current);
+    if let Some(outcome) = replay_forced_outcome(&assessment, &policy.external_owner_id) {
         return outcome;
     }
     Ok(ImprovementAdmissionDecision::AdmitForExperiment {
@@ -455,55 +455,163 @@ pub fn admit_improvement_candidate(
     })
 }
 
-/// Maps one canonical replay assessment to the admission outcome it forces.
+/// Returns the owner-proved admitted scope, or the block the gap produces.
 ///
-/// `None` means the assessment constrains nothing on its own, so the candidate
-/// is admitted as an ordinary new candidate. That is the `NoProgressEstablished`
-/// case: a different logical operation establishes no progress either, and
-/// describing it as an improvement would manufacture one.
+/// The `Err` case is a disposition, not a failure: an absent binding stays a
+/// named gap with its typed cause and is never replaced by a default scope.
+fn require_admitted_scope<'a>(
+    candidate: &'a ImprovementCandidateView,
+    owner_id: &str,
+) -> Result<&'a str, ImprovementAdmissionDecision> {
+    match candidate
+        .admitted_scope_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(scope) => Ok(scope),
+        None => Err(ImprovementAdmissionDecision::Blocked {
+            cause: ImprovementBlockCause::MissingAdmittedScope,
+            reason: "missing-admitted-scope: owner-proved work scope required before experiment"
+                .to_string(),
+            owner_id: owner_id.to_owned(),
+        }),
+    }
+}
+
+/// Maps one derived replay assessment to the admission outcome it forces.
 ///
-/// Integrity stays separate from semantic progress. The assessment is computed
-/// from canonical proposal bytes, never from a caller assertion, so an exact
-/// repeat is no progress, a changed content under one operation and idempotency
-/// key is a typed identity conflict that performs no transition (I05.27:18), and
-/// a prior written under another domain, encoding revision, or algorithm is
-/// unestablished and must be reconciled rather than matched.
+/// `None` means the assessment establishes a new causal discriminator, so the
+/// candidate is released as an ordinary new candidate. That is the only case
+/// that proceeds, and it is never described as an improvement: it required both
+/// a changed discriminator projection and owner-issued evidence the retained
+/// record did not declare.
+///
+/// Every other case stops the transition. An exact replay, an absent retained
+/// record, and an unchanged discriminator are all no progress; a changed content
+/// under one operation and idempotency key is a typed identity conflict that
+/// performs no transition (I5.27); and a retained record written under another
+/// domain, encoding revision, or algorithm is unestablished and must be
+/// reconciled rather than matched.
 fn replay_forced_outcome(
     assessment: &ImprovementReplayAssessment,
     owner_id: &str,
 ) -> Option<Result<ImprovementAdmissionDecision, ImprovementAdmissionError>> {
     match assessment {
         ImprovementReplayAssessment::ExactReplay { commitment } => {
-            Some(Ok(ImprovementAdmissionDecision::NoProgress {
-                reason: format!(
-                    "exact-replay-of-retained-commitment: current {}/{} digest {} repeats the retained prior commitment under operation {}; an identical repeat is not improvement",
-                    commitment.algorithm,
-                    commitment.encoding_version,
-                    commitment.digest,
-                    commitment.operation_ref
-                ),
-                owner_id: owner_id.to_owned(),
-            }))
+            Some(Ok(no_progress(exact_replay_reason(commitment), owner_id)))
         }
         ImprovementReplayAssessment::IdentityConflict {
             operation_ref,
             idempotency_key,
-        } => Some(Err(ImprovementAdmissionError::IdentityMismatch {
-            detail: format!(
-                "proposal-commitment: operation {operation_ref} and idempotency key {idempotency_key} carry different current canonical content; an identity conflict performs no transition"
-            ),
-        })),
+        } => Some(Err(identity_conflict_error(operation_ref, idempotency_key))),
         ImprovementReplayAssessment::UnestablishedPrior {
+            cause,
             prior_domain,
             prior_encoding_version,
             prior_algorithm,
-        } => Some(Ok(ImprovementAdmissionDecision::RequiresReconciliation {
-            reason: format!(
-                "unestablished-prior-commitment: retained {prior_domain}/{prior_encoding_version}/{prior_algorithm} value is not a current-version commitment; reconcile it before retry"
-            ),
-            owner_id: owner_id.to_owned(),
-        })),
-        ImprovementReplayAssessment::NoProgressEstablished { .. } => None,
+        } => Some(Ok(requires_reconciliation(
+            unestablished_reason(cause, prior_domain, prior_encoding_version, prior_algorithm),
+            owner_id,
+        ))),
+        ImprovementReplayAssessment::NoRetainedPrior { commitment } => Some(Ok(no_progress(
+            no_retained_record_reason(commitment),
+            owner_id,
+        ))),
+        ImprovementReplayAssessment::NoProgressEstablished { commitment } => Some(Ok(no_progress(
+            unchanged_discriminator_reason(commitment),
+            owner_id,
+        ))),
+        ImprovementReplayAssessment::EstablishedNewDiscriminator {
+            new_evidence_refs, ..
+        } => {
+            // Only an established new discriminator proceeds, and it is an
+            // ordinary new candidate rather than a progress claim. An empty
+            // reference set is no evidence, and no evidence is no progress.
+            if new_evidence_refs.is_empty() {
+                Some(Ok(no_progress(
+                    "no-new-owner-evidence: an established discriminator with no owner-issued evidence reference establishes no progress"
+                        .to_string(),
+                    owner_id,
+                )))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Names the exact current commitment an exact replay reproduces.
+fn exact_replay_reason(commitment: &ProposalCommitment) -> String {
+    format!(
+        "exact-replay-of-retained-commitment: current {}/{} digest {} repeats the retained prior commitment under operation {}; an identical repeat is not improvement",
+        commitment.algorithm,
+        commitment.encoding_version,
+        commitment.digest,
+        commitment.operation_ref
+    )
+}
+
+/// Names the current commitment and the retained operation that conflict.
+fn identity_conflict_error(
+    operation_ref: &str,
+    idempotency_key: &str,
+) -> ImprovementAdmissionError {
+    ImprovementAdmissionError::IdentityMismatch {
+        detail: format!(
+            "proposal-commitment: operation {operation_ref} and idempotency key {idempotency_key} carry different current canonical content; an identity conflict performs no transition"
+        ),
+    }
+}
+
+/// Names the typed cause and the identity a retained record was written under.
+fn unestablished_reason(
+    cause: UnestablishedPriorCause,
+    prior_domain: &str,
+    prior_encoding_version: &str,
+    prior_algorithm: &str,
+) -> String {
+    format!(
+        "unestablished-prior-commitment: {} retained {prior_domain}/{prior_encoding_version}/{prior_algorithm} record is not a current-version value; its owner reconciles it before retry",
+        cause.label()
+    )
+}
+
+/// Names the current commitment that carries no retained record at all.
+fn no_retained_record_reason(commitment: &ProposalCommitment) -> String {
+    format!(
+        "no-retained-prior-commitment: current {}/{} digest {} carries no retained record under operation {}; an unestablished comparison is not novelty and establishes no progress",
+        commitment.algorithm,
+        commitment.encoding_version,
+        commitment.digest,
+        commitment.operation_ref
+    )
+}
+
+/// Names the current commitment whose discriminator is not new.
+fn unchanged_discriminator_reason(commitment: &ProposalCommitment) -> String {
+    format!(
+        "no-new-causal-discriminator: current {}/{} digest {} is not a new causal discriminator of the retained record under operation {}; a new proposal identity or a different digest is not evidence of improvement",
+        commitment.algorithm,
+        commitment.encoding_version,
+        commitment.digest,
+        commitment.operation_ref
+    )
+}
+
+/// Returns the no-progress decision that keeps the candidate out of experiment.
+fn no_progress(reason: String, owner_id: &str) -> ImprovementAdmissionDecision {
+    ImprovementAdmissionDecision::NoProgress {
+        reason,
+        owner_id: owner_id.to_owned(),
+    }
+}
+
+/// Returns the reconciliation decision for an unestablished retained record.
+fn requires_reconciliation(reason: String, owner_id: &str) -> ImprovementAdmissionDecision {
+    ImprovementAdmissionDecision::RequiresReconciliation {
+        reason,
+        owner_id: owner_id.to_owned(),
     }
 }
 
@@ -642,8 +750,9 @@ mod tests {
     use super::*;
 
     use crate::improvement_pipeline::{
+        IMPROVEMENT_DISCRIMINATOR_DOMAIN, IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION,
         IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN, IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
-        IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ProposalCommitment, compare_improvement_commitments,
+        IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ImprovementDiscriminatorProjection,
     };
 
     fn candidate() -> ImprovementCandidateView {
@@ -685,7 +794,7 @@ mod tests {
             reopen_ref: Some("reopen-1145-a".to_string()),
             rollback_owner_id: "rollback-1145".to_string(),
             expiry_ref: Some("op-1145-a".to_string()),
-            retained_prior_commitment: None,
+            retained_prior_proposal: None,
         }
     }
 
@@ -699,15 +808,15 @@ mod tests {
         }
     }
 
-    // `None` is the canonical "no retained prior commitment" input, so the
-    // fixtures below admit exactly as they did before the progress gate stopped
-    // reading a caller boolean. The replay test below passes a real assessment.
+    // `None` is the canonical "no retained prior record" input, so the fixtures
+    // below still describe a candidate that never reached a prior record. The
+    // replay test below supplies real records.
     fn decide(
         candidate: &ImprovementCandidateView,
         evidence: &ImprovementEvidenceView,
         policy: &ImprovementAdmissionPolicy,
     ) -> ImprovementAdmissionDecision {
-        match admit_improvement_candidate(candidate, evidence, policy, None) {
+        match admit_improvement_candidate(candidate, evidence, policy, &current()) {
             Ok(decision) => decision,
             Err(err) => panic!("admission must decide, got error {err:?}"),
         }
@@ -718,7 +827,7 @@ mod tests {
         evidence: &ImprovementEvidenceView,
         policy: &ImprovementAdmissionPolicy,
     ) -> ImprovementAdmissionError {
-        match admit_improvement_candidate(candidate, evidence, policy, None) {
+        match admit_improvement_candidate(candidate, evidence, policy, &current()) {
             Err(err) => err,
             Ok(decision) => panic!("admission must fail, got decision {decision:?}"),
         }
@@ -834,16 +943,45 @@ mod tests {
         }
     }
 
+    /// Discriminator projection of one fixture proposal content.
+    fn projection(hypothesis: &str, evidence_ref: &str) -> ImprovementDiscriminatorProjection {
+        ImprovementDiscriminatorProjection {
+            domain: IMPROVEMENT_DISCRIMINATOR_DOMAIN.to_string(),
+            encoding_version: IMPROVEMENT_DISCRIMINATOR_ENCODING_VERSION.to_string(),
+            source_identity: "source-1145-a".to_string(),
+            runtime_identity: "runtime-1145-a".to_string(),
+            data_identity: "data-1145-a".to_string(),
+            target_capability: "capability-1145-a".to_string(),
+            target_generation: "generation-1145-a".to_string(),
+            mechanism_id: "mechanism-1145-a".to_string(),
+            hypothesis: hypothesis.to_string(),
+            causal_link: "causal-link-1145-a".to_string(),
+            expected_delta: "expected-delta-1145-a".to_string(),
+            declared_evidence_refs: vec![evidence_ref.to_string()],
+        }
+    }
+
+    /// The one current checked record the gate is given: a single commitment
+    /// plus the discriminator projection of the same content.
+    fn current() -> ImprovementCurrentProposal {
+        ImprovementCurrentProposal {
+            commitment: prior_commitment("commitment-1145-a", "op-1145-a"),
+            discriminator: projection("hypothesis-1145-a", "evidence-1145-a"),
+        }
+    }
+
     #[test]
     fn exact_canonical_repeat_is_no_progress() {
         // Byte-identical canonical proposal: the retained prior and the current
         // commitment agree under one logical operation, which is an exact
         // replay and never progress.
-        let current = prior_commitment("commitment-1145-a", "op-1145-a");
-        let replay = compare_improvement_commitments(&current, &current);
+        let current = current();
         let mut ev = evidence();
-        ev.retained_prior_commitment = Some(current.clone());
-        match admit_improvement_candidate(&candidate(), &ev, &policy(), Some(&replay)) {
+        ev.retained_prior_proposal = Some(RetainedImprovementProposal {
+            commitment: current.commitment.clone(),
+            discriminator: current.discriminator.clone(),
+        });
+        match admit_improvement_candidate(&candidate(), &ev, &policy(), &current) {
             Ok(ImprovementAdmissionDecision::NoProgress { reason, .. }) => {
                 assert!(reason.contains("repeat"));
             }
@@ -851,13 +989,17 @@ mod tests {
         }
 
         // A different logical operation is an ordinary new candidate. It is
-        // admitted on its own evidence and is never described as progress.
-        let prior = prior_commitment("commitment-1144-z", "op-1144-z");
-        let replay = compare_improvement_commitments(&prior, &current);
+        // admitted on its own evidence and is never described as progress. The
+        // retained record below is a different proposal: it declares its own
+        // discriminator and its own evidence reference, so the current
+        // candidate's evidence is new relative to it.
         let mut fresh = evidence();
-        fresh.retained_prior_commitment = Some(prior);
+        fresh.retained_prior_proposal = Some(RetainedImprovementProposal {
+            commitment: prior_commitment("commitment-1144-z", "op-1144-z"),
+            discriminator: projection("hypothesis-1144-z", "evidence-1144-z"),
+        });
         assert!(matches!(
-            admit_improvement_candidate(&candidate(), &fresh, &policy(), Some(&replay)),
+            admit_improvement_candidate(&candidate(), &fresh, &policy(), &current),
             Ok(ImprovementAdmissionDecision::AdmitForExperiment { .. })
         ));
     }
