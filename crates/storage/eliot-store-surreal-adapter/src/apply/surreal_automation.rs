@@ -638,22 +638,36 @@ pub(crate) async fn resolve_automation_continuation(
         .map_err(AdapterError::Store)
 }
 
+/// The current read-side bindings a freshly issued continuation must echo.
+///
+/// These six are exactly the caller-owned fields of
+/// [`AutomationContinuationReadBinding`]. The owner supplies the other three
+/// itself, so they are not part of the request: `read_operation` is fixed to
+/// the named read this issuance belongs to, `order` is derived from `query`,
+/// and the issuer identity and generation are resolved from the adapter
+/// configuration. Grouping only what the caller owns keeps the derivation of
+/// the remaining fields on this side of the boundary, where the owner
+/// identity is resolved.
+#[derive(Clone, Copy)]
+pub(crate) struct ContinuationReadRequest<'a> {
+    pub(super) query: AutomationContinuationQuery,
+    pub(super) include_retired: bool,
+    pub(super) automation_id: &'a str,
+    pub(super) read_revision: &'a str,
+    pub(super) state_fence: &'a StateFence,
+    pub(super) max_records: u16,
+}
+
 /// Issues a durable continuation after the caller has fixed and sliced its
 /// eligible page. The quota guard serializes reclamation, capacity accounting,
 /// child creation, and parent-to-child linking in one Surreal transaction.
 /// Replaying a parent with an existing child returns that child's same opaque
 /// identifier after checking it against the just-produced page tail.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn issue_automation_continuation(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
-    query: AutomationContinuationQuery,
-    include_retired: bool,
-    automation_id: &str,
-    read_revision: &str,
-    state_fence: &StateFence,
+    request: ContinuationReadRequest<'_>,
     exclusive_returned_tail: &str,
-    max_records: u16,
     parent_identifier: Option<&str>,
     now_unix_ms: u64,
 ) -> Result<String, AdapterError> {
@@ -662,13 +676,13 @@ pub(crate) async fn issue_automation_continuation(
 
     let expected = AutomationContinuationReadBinding {
         read_operation: NamedReadOperation::GetUserAutomationState,
-        query,
-        include_retired,
-        automation_id,
-        read_revision,
-        state_fence,
-        order: continuation_order(query),
-        max_records,
+        query: request.query,
+        include_retired: request.include_retired,
+        automation_id: request.automation_id,
+        read_revision: request.read_revision,
+        state_fence: request.state_fence,
+        order: continuation_order(request.query),
+        max_records: request.max_records,
         issuer_identity: &issuer_identity,
         issuer_generation,
     };

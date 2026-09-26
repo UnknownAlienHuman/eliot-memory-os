@@ -2095,17 +2095,19 @@ async fn automation_history_payload(
             db,
             config,
             completeness,
-            eliot_store_api::AutomationContinuationQuery::History,
-            decoded.include_retired,
-            &automation_id,
-            read_heads,
-            state_fence,
-            page.last_row_id.as_deref(),
-            decoded.max_records,
-            decoded
-                .cursor
-                .as_ref()
-                .map(eliot_store_api::AutomationContinuationRef::identifier),
+            AutomationPageContinuation {
+                query: eliot_store_api::AutomationContinuationQuery::History,
+                include_retired: decoded.include_retired,
+                automation_id: &automation_id,
+                read_heads,
+                state_fence,
+                last_row_id: page.last_row_id.as_deref(),
+                max_records: decoded.max_records,
+                parent_identifier: decoded
+                    .cursor
+                    .as_ref()
+                    .map(eliot_store_api::AutomationContinuationRef::identifier),
+            },
         )
         .await?;
     }
@@ -2282,47 +2284,63 @@ async fn automation_verified_page_boundary(
     Ok(Some(verified.exclusive_returned_tail().to_owned()))
 }
 
+/// The already-sliced truncated page a payload mints its continuation from.
+///
+/// These eight all describe one page that has just been served: the closed
+/// denominator query and the selectors echoed on it, the automation whose
+/// denominator it is, the exact snapshot it was served under, and the row
+/// boundary, page bound and predecessor reference the continuation must resume
+/// strictly after. None of them is a property of the transport or of the
+/// payload being returned, so none belongs beside those two.
+#[derive(Clone, Copy)]
+struct AutomationPageContinuation<'a> {
+    query: eliot_store_api::AutomationContinuationQuery,
+    include_retired: bool,
+    automation_id: &'a str,
+    read_heads: &'a [RevisionHead],
+    state_fence: &'a StateFence,
+    last_row_id: Option<&'a str>,
+    max_records: u16,
+    parent_identifier: Option<&'a str>,
+}
+
 /// Mints and attaches the retained owner continuation for one already-sliced
 /// truncated page. Any write/capacity failure aborts this payload so no
 /// unresumable page can be published as `TRUNCATED`.
-#[allow(clippy::too_many_arguments)]
 async fn automation_page_with_continuation(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
     mut completeness: Value,
-    query: eliot_store_api::AutomationContinuationQuery,
-    include_retired: bool,
-    automation_id: &str,
-    read_heads: &[RevisionHead],
-    state_fence: &StateFence,
-    last_row_id: Option<&str>,
-    max_records: u16,
-    parent_identifier: Option<&str>,
+    page: AutomationPageContinuation<'_>,
 ) -> Result<Value, AdapterError> {
-    let last_row_id = last_row_id.ok_or(AdapterError::Store(StoreError::InvalidField {
-        field: "automation.page",
-        reason: "truncated automation page served no row to continue from",
-    }))?;
-    automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
-    let read_revision = automation_page_read_revision(read_heads)?;
+    let last_row_id = page
+        .last_row_id
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.page",
+            reason: "truncated automation page served no row to continue from",
+        }))?;
+    automation_verify_stable_page_snapshot(db, config, page.state_fence, page.read_heads).await?;
+    let read_revision = automation_page_read_revision(page.read_heads)?;
     let next_cursor = super::surreal_automation::issue_automation_continuation(
         db,
         config,
-        query,
-        include_retired,
-        automation_id,
-        &read_revision,
-        state_fence,
+        super::surreal_automation::ContinuationReadRequest {
+            query: page.query,
+            include_retired: page.include_retired,
+            automation_id: page.automation_id,
+            read_revision: &read_revision,
+            state_fence: page.state_fence,
+            max_records: page.max_records,
+        },
         last_row_id,
-        max_records,
-        parent_identifier,
+        page.parent_identifier,
         automation_now_unix_ms()?,
     )
     .await?;
     // The source snapshot could move while the durable continuation was
     // committed. In that case leave the unreachable record for bounded expiry
     // cleanup and refuse to publish its stale capability.
-    automation_verify_stable_page_snapshot(db, config, state_fence, read_heads).await?;
+    automation_verify_stable_page_snapshot(db, config, page.state_fence, page.read_heads).await?;
     completeness
         .as_object_mut()
         .ok_or(AdapterError::Store(StoreError::InvalidField {
@@ -2408,17 +2426,19 @@ async fn automation_invocations_payload(
             db,
             config,
             completeness,
-            eliot_store_api::AutomationContinuationQuery::Invocations,
-            decoded.include_retired,
-            &automation_id,
-            read_heads,
-            state_fence,
-            page.last_row_id.as_deref(),
-            decoded.max_records,
-            decoded
-                .cursor
-                .as_ref()
-                .map(eliot_store_api::AutomationContinuationRef::identifier),
+            AutomationPageContinuation {
+                query: eliot_store_api::AutomationContinuationQuery::Invocations,
+                include_retired: decoded.include_retired,
+                automation_id: &automation_id,
+                read_heads,
+                state_fence,
+                last_row_id: page.last_row_id.as_deref(),
+                max_records: decoded.max_records,
+                parent_identifier: decoded
+                    .cursor
+                    .as_ref()
+                    .map(eliot_store_api::AutomationContinuationRef::identifier),
+            },
         )
         .await?;
     }
