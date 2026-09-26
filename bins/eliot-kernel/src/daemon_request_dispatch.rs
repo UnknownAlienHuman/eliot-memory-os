@@ -488,6 +488,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
         "task_controller_result" => "task_controller_result",
+        "finish_claim" => "finish_claim",
+        "finish_result" => "finish_result",
         "agent_host_request_submit" => "agent_host_request_submit",
         "agent_host_request_cancel" => "agent_host_request_cancel",
         "publish_owner_bundle" => "publish_owner_bundle",
@@ -2443,6 +2445,72 @@ impl KernelComposition {
                     let body: TaskControllerResultBody = serde_json::from_value(result_value)
                         .map_err(|_| TransportError::SessionFenced)?;
                     match self.submit_task_controller_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            // F-LOG-KERNEL-1 (#897 T19): timeout after
+                            // possible work stays `unknown` in the diagnostic
+                            // stream alongside the folded expired response.
+                            // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "finish_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_finish_pair(session).map(|pair| match pair {
+                        Some((envelope, tool, attempt)) => serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "pair": {
+                                    "envelope": envelope,
+                                    "tool": tool,
+                                    "operation_id": attempt.operation_id,
+                                    "attempt": attempt,
+                                }
+                            },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "finish_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: eliot_protocol::FinishResultBody =
+                        serde_json::from_value(result_value)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_finish_result(session, &body) {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
