@@ -15,16 +15,25 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-cli.workspace = true
+eliot-context-assembly = { path = "../../crates/smart/eliot-context-assembly", version = "0.1.0" }
+eliot-context-candidates = { path = "../../crates/smart/eliot-context-candidates", version = "0.1.0" }
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-cue-activation = { path = "../../crates/smart/eliot-cue-activation", version = "0.1.0" }
+eliot-cue-contracts = { path = "../../crates/smart/eliot-cue-contracts", version = "0.1.0" }
 eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle", version = "0.1.0" }
 eliot-dreamer-contracts = { path = "../../crates/smart/eliot-dreamer-contracts", version = "0.1.0" }
 eliot-dreamer-curation = { path = "../../crates/smart/eliot-dreamer-curation", version = "0.1.0" }
 eliot-dreamer-cycle = { path = "../../crates/smart/eliot-dreamer-cycle", version = "0.1.0" }
 eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation", version = "0.1.0" }
 eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding", version = "0.1.0" }
+eliot-dreamer-classification = { path = "../../crates/smart/eliot-dreamer-classification", version = "0.1.0" }
+eliot-dreamer-conflict-analysis = { path = "../../crates/smart/eliot-dreamer-conflict-analysis", version = "0.1.0" }
 eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan", version = "0.1.0" }
 eliot-dreamer-orientation = { path = "../../crates/smart/eliot-dreamer-orientation", version = "0.1.0" }
 eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model", version = "0.1.0" }
+eliot-epistemic = { path = "../../crates/smart/eliot-epistemic", version = "0.1.0" }
+eliot-epistemic-contracts = { path = "../../crates/smart/eliot-epistemic-contracts", version = "0.1.0" }
 eliot-platform.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true
@@ -37,4 +46,3 @@ thiserror.workspace = true
 workspace = true
 
 [dev-dependencies]
-eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
