@@ -60,6 +60,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
 pub mod notification_board_attach;
 mod observation_adapters;
