@@ -11,12 +11,16 @@
 //! real Governor-side consumer. Experiment execution stays with Testd /
 //! Instrument (`#20`/`#1111`, handoff) and production activation stays with
 //! the Kernel generation/canary path (`#11`, handoff). Unknown external
-//! outcomes reconcile before retry; repeated materially identical failures
-//! without a new discriminator dispose as no-progress rather than improvement.
+//! outcomes reconcile before retry; an exact canonical replay of a retained
+//! proposal commitment disposes as no-progress rather than improvement, and no
+//! caller-settable boolean can establish progress or clear an unknown external
+//! effect.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::improvement_pipeline::{ImprovementReplayAssessment, ProposalCommitment};
 
 /// Improvement closure cell identity (mirrors `meta.learning.closure`).
 pub const IMPROVEMENT_CLOSURE_MODULE: &str = "meta.learning.closure";
@@ -133,10 +137,14 @@ pub struct ImprovementEvidenceView {
     pub rollback_owner_id: String,
     /// Expiry ref; must bind the admitted operation.
     pub expiry_ref: Option<String>,
-    /// Whether this evidence digest repeats a known prior admission.
-    pub repeat_of_known_digest: bool,
-    /// Whether the repeat carries a new hypothesis or input discriminator.
-    pub new_discriminator: bool,
+    /// Retained prior proposal commitment this admission is compared against.
+    ///
+    /// This is a retained record, never a verdict. The gate compares it with
+    /// the current canonical commitment the pipeline computes, so no caller can
+    /// assert a repeat, a new discriminator, or any progress by spelling a
+    /// boolean. `None` means no prior commitment was retained; it is not a
+    /// claim that the candidate is new, and it clears no external effect.
+    pub retained_prior_commitment: Option<ProposalCommitment>,
 }
 
 /// Policy governing improvement admission. No clock, I/O, or live query.
@@ -285,9 +293,11 @@ pub enum ImprovementAdmissionDecision {
         /// Owner holding the unresolved reconciliation debt.
         owner_id: String,
     },
-    /// Materially identical repeat without a new discriminator; not improvement.
+    /// The current canonical proposal bytes exactly replay a retained prior
+    /// commitment under the same logical operation. An exact repeat is not
+    /// progress, and no caller assertion can make it one.
     NoProgress {
-        /// Prior admission this repeats, with exact debt retained.
+        /// Prior commitment this exactly replays, with exact debt retained.
         reason: String,
         /// Owner holding the repeat-review debt.
         owner_id: String,
@@ -319,15 +329,27 @@ pub enum ImprovementAdmissionError {
 
 /// Admit one improvement candidate for bounded experiment or dispose it.
 ///
-/// Pure function of its three inputs: no ambient clock, I/O, or live query.
+/// Pure function of its four inputs: no ambient clock, I/O, or live query.
 /// Returns one [`ImprovementAdmissionDecision`] for well-formed input, or an
 /// [`ImprovementAdmissionError`] for malformed, self-promoting, or widening
 /// input. Admission is experiment-only; canary activation, production
 /// promotion, and rollback execution stay with their external owners.
+///
+/// `replay` is the canonical-byte comparison of the current proposal commitment
+/// against a retained prior commitment, derived by the pipeline that computed
+/// both (`improvement_pipeline::compare_improvement_commitments`). The caller
+/// supplies the retained prior record; the gate owns the verdict, so no boolean
+/// can establish progress. Integrity stays separate from semantic progress: an
+/// exact replay is no progress, a changed content under one operation and
+/// idempotency key is a typed identity conflict that performs no transition, a
+/// prior written under another domain, encoding revision, or algorithm is
+/// unestablished and requires reconciliation, and a different logical operation
+/// is an ordinary new candidate rather than a progress claim.
 pub fn admit_improvement_candidate(
     candidate: &ImprovementCandidateView,
     evidence: &ImprovementEvidenceView,
     policy: &ImprovementAdmissionPolicy,
+    replay: Option<&ImprovementReplayAssessment>,
 ) -> Result<ImprovementAdmissionDecision, ImprovementAdmissionError> {
     validate_candidate(candidate)?;
     validate_policy(policy, candidate)?;
@@ -414,12 +436,15 @@ pub fn admit_improvement_candidate(
             owner_id: policy.external_owner_id.clone(),
         });
     };
-    if evidence.repeat_of_known_digest && !evidence.new_discriminator {
-        return Ok(ImprovementAdmissionDecision::NoProgress {
-            reason: "repeat-without-discriminator: materially identical repeat is not improvement"
-                .to_string(),
-            owner_id: policy.external_owner_id.clone(),
-        });
+    // Integrity, not a progress claim. `replay` is derived from the canonical
+    // bytes the pipeline computed for this proposal, so a caller can neither
+    // manufacture progress nor suppress a repeat by spelling a boolean. It is
+    // evaluated after the unknown-outcome branch above, which no prior
+    // commitment and no named rollback contract may clear.
+    if let Some(outcome) =
+        replay.and_then(|assessment| replay_forced_outcome(assessment, &policy.external_owner_id))
+    {
+        return outcome;
     }
     Ok(ImprovementAdmissionDecision::AdmitForExperiment {
         candidate_id: candidate.candidate_id.clone(),
@@ -428,6 +453,58 @@ pub fn admit_improvement_candidate(
         evaluator_id: evidence.verifier_id.clone(),
         rollback_owner_id: policy.rollback_owner_id.clone(),
     })
+}
+
+/// Maps one canonical replay assessment to the admission outcome it forces.
+///
+/// `None` means the assessment constrains nothing on its own, so the candidate
+/// is admitted as an ordinary new candidate. That is the `NoProgressEstablished`
+/// case: a different logical operation establishes no progress either, and
+/// describing it as an improvement would manufacture one.
+///
+/// Integrity stays separate from semantic progress. The assessment is computed
+/// from canonical proposal bytes, never from a caller assertion, so an exact
+/// repeat is no progress, a changed content under one operation and idempotency
+/// key is a typed identity conflict that performs no transition (I05.27:18), and
+/// a prior written under another domain, encoding revision, or algorithm is
+/// unestablished and must be reconciled rather than matched.
+fn replay_forced_outcome(
+    assessment: &ImprovementReplayAssessment,
+    owner_id: &str,
+) -> Option<Result<ImprovementAdmissionDecision, ImprovementAdmissionError>> {
+    match assessment {
+        ImprovementReplayAssessment::ExactReplay { commitment } => {
+            Some(Ok(ImprovementAdmissionDecision::NoProgress {
+                reason: format!(
+                    "exact-replay-of-retained-commitment: current {}/{} digest {} repeats the retained prior commitment under operation {}; an identical repeat is not improvement",
+                    commitment.algorithm,
+                    commitment.encoding_version,
+                    commitment.digest,
+                    commitment.operation_ref
+                ),
+                owner_id: owner_id.to_owned(),
+            }))
+        }
+        ImprovementReplayAssessment::IdentityConflict {
+            operation_ref,
+            idempotency_key,
+        } => Some(Err(ImprovementAdmissionError::IdentityMismatch {
+            detail: format!(
+                "proposal-commitment: operation {operation_ref} and idempotency key {idempotency_key} carry different current canonical content; an identity conflict performs no transition"
+            ),
+        })),
+        ImprovementReplayAssessment::UnestablishedPrior {
+            prior_domain,
+            prior_encoding_version,
+            prior_algorithm,
+        } => Some(Ok(ImprovementAdmissionDecision::RequiresReconciliation {
+            reason: format!(
+                "unestablished-prior-commitment: retained {prior_domain}/{prior_encoding_version}/{prior_algorithm} value is not a current-version commitment; reconcile it before retry"
+            ),
+            owner_id: owner_id.to_owned(),
+        })),
+        ImprovementReplayAssessment::NoProgressEstablished { .. } => None,
+    }
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ImprovementAdmissionError> {
@@ -564,6 +641,11 @@ fn rollback_gap(
 mod tests {
     use super::*;
 
+    use crate::improvement_pipeline::{
+        IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN, IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
+        IMPROVEMENT_PROPOSAL_ENCODING_VERSION, ProposalCommitment, compare_improvement_commitments,
+    };
+
     fn candidate() -> ImprovementCandidateView {
         ImprovementCandidateView {
             candidate_id: "cand-1145-a".to_string(),
@@ -603,8 +685,7 @@ mod tests {
             reopen_ref: Some("reopen-1145-a".to_string()),
             rollback_owner_id: "rollback-1145".to_string(),
             expiry_ref: Some("op-1145-a".to_string()),
-            repeat_of_known_digest: false,
-            new_discriminator: false,
+            retained_prior_commitment: None,
         }
     }
 
@@ -618,12 +699,15 @@ mod tests {
         }
     }
 
+    // `None` is the canonical "no retained prior commitment" input, so the
+    // fixtures below admit exactly as they did before the progress gate stopped
+    // reading a caller boolean. The replay test below passes a real assessment.
     fn decide(
         candidate: &ImprovementCandidateView,
         evidence: &ImprovementEvidenceView,
         policy: &ImprovementAdmissionPolicy,
     ) -> ImprovementAdmissionDecision {
-        match admit_improvement_candidate(candidate, evidence, policy) {
+        match admit_improvement_candidate(candidate, evidence, policy, None) {
             Ok(decision) => decision,
             Err(err) => panic!("admission must decide, got error {err:?}"),
         }
@@ -634,7 +718,7 @@ mod tests {
         evidence: &ImprovementEvidenceView,
         policy: &ImprovementAdmissionPolicy,
     ) -> ImprovementAdmissionError {
-        match admit_improvement_candidate(candidate, evidence, policy) {
+        match admit_improvement_candidate(candidate, evidence, policy, None) {
             Err(err) => err,
             Ok(decision) => panic!("admission must fail, got decision {decision:?}"),
         }
@@ -736,24 +820,45 @@ mod tests {
         }
     }
 
+    /// One retained prior commitment fixture, shaped by the current identity
+    /// constants so it can never be mistaken for a legacy value.
+    fn prior_commitment(digest: &str, operation_ref: &str) -> ProposalCommitment {
+        ProposalCommitment {
+            domain: IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN.to_string(),
+            encoding_version: IMPROVEMENT_PROPOSAL_ENCODING_VERSION.to_string(),
+            algorithm: IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM.to_string(),
+            operation_ref: operation_ref.to_string(),
+            idempotency_key: "idem-1145-a".to_string(),
+            digest: digest.to_string(),
+            canonical_bytes: 512,
+        }
+    }
+
     #[test]
-    fn identical_repeat_without_discriminator_is_no_progress() {
+    fn exact_canonical_repeat_is_no_progress() {
+        // Byte-identical canonical proposal: the retained prior and the current
+        // commitment agree under one logical operation, which is an exact
+        // replay and never progress.
+        let current = prior_commitment("commitment-1145-a", "op-1145-a");
+        let replay = compare_improvement_commitments(&current, &current);
         let mut ev = evidence();
-        ev.repeat_of_known_digest = true;
-        ev.new_discriminator = false;
-        match decide(&candidate(), &ev, &policy()) {
-            ImprovementAdmissionDecision::NoProgress { reason, .. } => {
+        ev.retained_prior_commitment = Some(current.clone());
+        match admit_improvement_candidate(&candidate(), &ev, &policy(), Some(&replay)) {
+            Ok(ImprovementAdmissionDecision::NoProgress { reason, .. }) => {
                 assert!(reason.contains("repeat"));
             }
-            other => panic!("blind repeat must dispose as no-progress, got {other:?}"),
+            other => panic!("exact replay must dispose as no-progress, got {other:?}"),
         }
 
+        // A different logical operation is an ordinary new candidate. It is
+        // admitted on its own evidence and is never described as progress.
+        let prior = prior_commitment("commitment-1144-z", "op-1144-z");
+        let replay = compare_improvement_commitments(&prior, &current);
         let mut fresh = evidence();
-        fresh.repeat_of_known_digest = true;
-        fresh.new_discriminator = true;
+        fresh.retained_prior_commitment = Some(prior);
         assert!(matches!(
-            decide(&candidate(), &fresh, &policy()),
-            ImprovementAdmissionDecision::AdmitForExperiment { .. }
+            admit_improvement_candidate(&candidate(), &fresh, &policy(), Some(&replay)),
+            Ok(ImprovementAdmissionDecision::AdmitForExperiment { .. })
         ));
     }
 
