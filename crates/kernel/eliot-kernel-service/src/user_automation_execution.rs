@@ -931,24 +931,31 @@ impl UserAutomationNotificationDelivery {
 }
 
 /// Existing Durable Job owner used by the production runtime composition.
+///
+/// The admitted occurrence is the same typed projection the authenticated Host
+/// carrier holds, so the port accepts it owned or already boxed and the
+/// boundary keeps one payload shape either way.
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationDurableJobPort: Send + Sync {
     /// Admits one preflight-approved occurrence to the existing job lifecycle.
     async fn admit_occurrence(
         &self,
-        request: UserAutomationRuntimeAdmission,
+        request: impl Into<Box<UserAutomationRuntimeAdmission>>,
     ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError>;
 }
 
 /// Existing WakeIntent/Task Scheduler owner used by the production runtime
 /// composition.
+///
+/// Both wake payloads take the same owned-or-boxed form as
+/// [`UserAutomationDurableJobPort::admit_occurrence`].
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationWakePort: Send + Sync {
     /// Reads one exact persisted Pending wake from the existing owner.
     /// Implementations without a readback path fail closed.
     async fn read_pending_wake(
         &self,
-        _request: UserAutomationWakeReadRequest,
+        _request: impl Into<Box<UserAutomationWakeReadRequest>>,
     ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
         Err(UserAutomationRuntimeError::Unavailable(
             "UserAutomation wake readback is unavailable".to_owned(),
@@ -958,7 +965,7 @@ pub trait UserAutomationWakePort: Send + Sync {
     /// Cancels only unadmitted wakes for a retired revision.
     async fn cancel_pending_wakes(
         &self,
-        request: UserAutomationWakeCancellation,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError>;
 }
 
@@ -1694,8 +1701,9 @@ mod tests {
     impl UserAutomationDurableJobPort for RecordingRuntime {
         async fn admit_occurrence(
             &self,
-            request: UserAutomationRuntimeAdmission,
+            request: impl Into<Box<UserAutomationRuntimeAdmission>>,
         ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError> {
+            let request: Box<UserAutomationRuntimeAdmission> = request.into();
             let occurrence_id = request
                 .invocation
                 .occurrence_identity()
@@ -1703,7 +1711,7 @@ mod tests {
             self.admissions
                 .lock()
                 .expect("admissions lock")
-                .push(request);
+                .push(*request);
             self.events.lock().expect("events lock").push("admission");
             Ok(AutomationExecutionReference {
                 occurrence_id,
@@ -1717,7 +1725,7 @@ mod tests {
     impl UserAutomationWakePort for RecordingRuntime {
         async fn cancel_pending_wakes(
             &self,
-            _request: UserAutomationWakeCancellation,
+            _request: impl Into<Box<UserAutomationWakeCancellation>>,
         ) -> Result<Vec<String>, UserAutomationRuntimeError> {
             self.events.lock().expect("events lock").push("cancel");
             Ok(vec!["wake-automation-1".to_owned()])

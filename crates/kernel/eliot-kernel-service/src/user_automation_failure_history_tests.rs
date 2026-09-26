@@ -352,7 +352,7 @@ struct UnreachableWake;
 impl UserAutomationDurableJobPort for UnreachableJob {
     async fn admit_occurrence(
         &self,
-        _request: UserAutomationRuntimeAdmission,
+        _request: impl Into<Box<UserAutomationRuntimeAdmission>>,
     ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError> {
         Err(UserAutomationRuntimeError::Unavailable(
             "durable job must not be called on the failure path".to_owned(),
@@ -364,7 +364,7 @@ impl UserAutomationDurableJobPort for UnreachableJob {
 impl UserAutomationWakePort for UnreachableWake {
     async fn cancel_pending_wakes(
         &self,
-        _request: UserAutomationWakeCancellation,
+        _request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError> {
         Err(UserAutomationRuntimeError::Unavailable(
             "wake must not be called on the failure path".to_owned(),

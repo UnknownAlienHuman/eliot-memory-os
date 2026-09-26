@@ -35,8 +35,9 @@ impl<'a, B: JournalBackend> HostWakeIntentAdapter<'a, B> {
 impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> {
     async fn read_pending_wake(
         &self,
-        request: UserAutomationWakeReadRequest,
+        request: impl Into<Box<UserAutomationWakeReadRequest>>,
     ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeReadRequest> = request.into();
         let occurrence_id = request
             .validate()
             .map_err(|error| rejected(format!("Wake read: {error}")))?;
@@ -72,8 +73,9 @@ impl<B: JournalBackend> UserAutomationWakePort for HostWakeIntentAdapter<'_, B> 
 
     async fn cancel_pending_wakes(
         &self,
-        request: UserAutomationWakeCancellation,
+        request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        let request: Box<UserAutomationWakeCancellation> = request.into();
         request
             .validate()
             .map_err(|error| rejected(format!("Wake cancellation: {error}")))?;
