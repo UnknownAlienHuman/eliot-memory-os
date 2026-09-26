@@ -336,7 +336,26 @@ impl HostComposition {
         let trigger_class = PlatformHandle::new(trigger.as_str())
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let outcome = if state.drain_commit.is_some() {
-            self.queue_next_generation_wake(&activation, trigger, trigger_class, evidence)?;
+            let queued =
+                self.queue_next_generation_wake(&activation, trigger, trigger_class, evidence)?;
+            // W5 read side: the queued `WakeIntent` is read back out of the
+            // durable journal before the disposition is published. The
+            // append above only proves the write was accepted; this read is the
+            // single place that observes the *persisted* pending intent, so a
+            // journal that dropped or replaced the entry fails the trigger
+            // instead of reporting a queued next generation nothing can claim.
+            let persisted = self.pending_next_generation_wake()?.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery(
+                    "queued next-generation WakeIntent is absent from the durable journal"
+                        .to_owned(),
+                )
+            })?;
+            if persisted != queued {
+                return Err(HostError::OwnerLeaseRecovery(
+                    "queued next-generation WakeIntent is not the durable pending intent"
+                        .to_owned(),
+                ));
+            }
             DrainWakeOutcome::QueueNextGeneration
         } else if let Some(drain) = state.drain.as_ref().filter(|drain| {
             drain.state == DrainState::Draining
@@ -756,6 +775,26 @@ impl HostComposition {
         }))
     }
 
+    /// Returns the capability set this activation generation durably requires.
+    ///
+    /// I1.5 "start only the remaining capabilities required by the admitted
+    /// request": the set that may gate a process contour is the one the
+    /// activation record itself carries, read back from the journal. It is never
+    /// recomputed from the caller's intent, so a contour cannot be started
+    /// against a capability no admitted request ever required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state or the activation record
+    /// cannot be read.
+    pub fn required_generation_capabilities(&self) -> Result<Vec<PlatformHandle>, HostError> {
+        let state = self.snapshot()?;
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        Ok(activation.requested_capabilities.clone())
+    }
+
     /// Revalidates every queued `WakeIntent` against the current activation
     /// generation.
     ///
@@ -929,6 +968,34 @@ impl HostComposition {
         }))?;
         Ok(wake_id)
     }
+}
+
+/// The capability requirement of a fresh control-contour activation.
+///
+/// I1.5 startup: "Host starts/reconciles Kernel and requests the independent
+/// Watchdog service through SCM as sibling activation branches", and the
+/// canonical store branch belongs to the same contour because the Host
+/// readiness fence refuses `ControlReady` without a proven Store branch. This
+/// is the bootstrap requirement of a generation that has no narrower proven
+/// ingress; a narrower trigger class contributes its own set through
+/// [`ActivationTriggerClass::requested_capabilities`].
+#[must_use]
+pub const fn control_contour_capabilities() -> &'static [&'static str] {
+    &[
+        CAPABILITY_RUNTIME_SUPERVISION,
+        CAPABILITY_CANONICAL_STORE,
+        CAPABILITY_INDEPENDENT_SUPERVISION,
+    ]
+}
+
+/// Whether a durable activation-generation capability set requires `capability`.
+///
+/// The set carries handles spelled by the
+/// [`ActivationTriggerClass::requested_capabilities`] vocabulary, so the
+/// comparison is against that frozen spelling rather than a fresh literal.
+#[must_use]
+pub fn requires_capability(required: &[PlatformHandle], capability: &str) -> bool {
+    required.iter().any(|value| value.as_str() == capability)
 }
 
 fn activation_admission_from(state: &HostState) -> Result<ActivationAdmission, HostError> {

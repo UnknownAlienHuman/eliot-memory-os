@@ -120,12 +120,32 @@ pub(super) fn terminated_prior_kernel(
     }))
 }
 
+/// The proven ingress one fresh activation generation is created for.
+///
+/// I1.5 requires the durable `EliotActivationRecord` to carry the real
+/// `trigger_class`, `requester` and `requested_capabilities` of the request
+/// that started the contour. The creation append is the only place those fields
+/// may be established: `activation_transition` admits no same-state update, so
+/// every later value is inherited from the generation's creation record. Writing
+/// a fixed spelling here instead would make every generation claim the same
+/// ingress regardless of what actually started it.
+pub(super) struct ActivationIngress {
+    /// Durable I1.5 `trigger_class` spelling of the starting request.
+    pub(super) trigger_class: &'static str,
+    /// Durable I1.5 `requester_principal_session_or_scheduler` of that request.
+    pub(super) requester: String,
+    /// Capability requirement the starting request admitted, spelled by the
+    /// `ActivationTriggerClass` vocabulary.
+    pub(super) capabilities: &'static [&'static str],
+}
+
 pub(super) fn initial_activation_record(
     host: &HostInstallationEpoch,
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
     state: ActivationState,
     label: &str,
+    ingress: &ActivationIngress,
 ) -> Result<EliotActivationRecord, HostError> {
     let ready = matches!(
         state,
@@ -136,22 +156,32 @@ pub(super) fn initial_activation_record(
         ActivationState::Draining | ActivationState::StoppedClean
     )
     .then(|| activation_generation.clone());
+    if ingress.capabilities.is_empty() {
+        return Err(HostError::OwnerLeaseRecovery(format!(
+            "activation generation {label} has no proven ingress capability requirement"
+        )));
+    }
+    let mut requested_capabilities = Vec::with_capacity(ingress.capabilities.len());
+    for capability in ingress.capabilities {
+        let handle = PlatformHandle::new(*capability)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        if !requested_capabilities.contains(&handle) {
+            requested_capabilities.push(handle);
+        }
+    }
     Ok(EliotActivationRecord {
         fence: record_fence(host, activation_id, activation_generation),
         operation: operation(label)?,
         activation_id: activation_id.clone(),
-        trigger_class: PlatformHandle::new("host-runtime-lifecycle")
+        trigger_class: PlatformHandle::new(ingress.trigger_class)
             .map_err(|error| HostError::Platform(error.to_string()))?,
         trigger_evidence: vec![
             PlatformHandle::new("host-owner-lease-held")
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         ],
-        requester_principal_session_or_scheduler: PlatformHandle::new("host-composition")
+        requester_principal_session_or_scheduler: PlatformHandle::new(&ingress.requester)
             .map_err(|error| HostError::Platform(error.to_string()))?,
-        requested_capabilities: vec![
-            PlatformHandle::new("runtime-supervision")
-                .map_err(|error| HostError::Platform(error.to_string()))?,
-        ],
+        requested_capabilities,
         candidate_scope: host.installation.clone(),
         state,
         drain_generation,
@@ -631,6 +661,16 @@ pub(super) fn pending_activation_binding(
 }
 
 #[cfg(test)]
+pub(super) fn test_activation_ingress() -> ActivationIngress {
+    ActivationIngress {
+        trigger_class: crate::activation_lifecycle::ActivationTriggerClass::AgentBridgeAttach
+            .as_str(),
+        requester: "test-requester".to_owned(),
+        capabilities: crate::activation_lifecycle::control_contour_capabilities(),
+    }
+}
+
+#[cfg(test)]
 mod governance_profile_tests {
     use super::super::{fresh_host_epoch, root_epoch};
     use super::*;
@@ -648,6 +688,7 @@ mod governance_profile_tests {
             &activation_generation,
             ActivationState::Starting,
             "host-open",
+            &test_activation_ingress(),
         )?;
         assert_eq!(starting.governance_profile.as_str(), "runtime-degraded-v3");
         let active =
