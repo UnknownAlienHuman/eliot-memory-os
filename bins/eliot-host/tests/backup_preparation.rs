@@ -128,6 +128,8 @@ fn admission(op: &str, source_root: &Path, parent: &Path) -> DestinationAdmissio
         approved_generation: 7,
         authority_generation: 7,
         manifest_digest: HEX_A.to_owned(),
+        config_projection_digest: HEX_D.to_owned(),
+        audit_fence_note: None,
         authority_nonce: format!("nonce-958-{op}"),
         state_fence_digest: HEX_E.to_owned(),
     }
@@ -657,6 +659,8 @@ fn preparation_launch_readiness_and_effect_stay_distinct() {
         destination_id: "d".repeat(64),
         destination_epoch: 1,
         admission_digest: "e".repeat(64),
+        config_projection_digest: HEX_D.to_owned(),
+        audit_fence_note: None,
     })
     .expect("destination serializes");
     let presented_value = serde_json::to_value(PresentedPreparationRequest {
@@ -668,7 +672,10 @@ fn preparation_launch_readiness_and_effect_stay_distinct() {
         target_profile: "profile-958-restore".to_owned(),
         approved_generation: 7,
         authority_generation: 7,
+        owner_lease_ref: "lease-958-schema".to_owned(),
+        purge_ledger_revision: 3,
         build_digests: vec![HEX_A.to_owned()],
+        audit_fence_note: None,
         authority_nonce: "nonce-958-schema".to_owned(),
         state_fence_digest: HEX_E.to_owned(),
     })

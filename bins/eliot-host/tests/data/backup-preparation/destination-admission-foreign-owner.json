@@ -9,6 +9,8 @@
   "approved_generation": 7,
   "authority_generation": 7,
   "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "config_projection_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "audit_fence_note": null,
   "authority_nonce": "nonce-958-dest-06",
   "state_fence_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 }
