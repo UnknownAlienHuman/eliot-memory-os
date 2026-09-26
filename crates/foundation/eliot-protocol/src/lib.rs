@@ -3019,7 +3019,7 @@ pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID: &str =
 /// Current bridge process binding wire version.
 pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_VERSION: u16 = 1;
 /// Bounded length for host-request identity text fields.
-const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
+pub const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
 
 /// Closed P-04 host-request kinds admitted by the Kernel admission gate.
 ///
@@ -3069,6 +3069,10 @@ impl HostRequestKind {
 pub struct HostRequestIdentity {
     /// Exact request identity, unique per envelope.
     pub request_id: RequestId,
+    /// Explicit typed host correlation; absent only on historical envelopes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_projection: Option<eliot_contracts::HostCorrelationProjection>,
     /// Caller-provided idempotency key for exact replay.
     pub idempotency_key: String,
     /// Cancellation identity for the request lifecycle.
@@ -3248,6 +3252,20 @@ impl HostRequestIdentity {
             MAX_HOST_REQUEST_TEXT_BYTES,
         )?;
         lowercase_sha256(&self.payload_sha256, "host_request.payload_sha256")?;
+        if let Some(projection) = &self.correlation_projection {
+            projection
+                .validate()
+                .map_err(|_| ProtocolError::InvalidField {
+                    field: "host_request.correlation_projection",
+                    reason: "must be a bounded explicit correlation projection",
+                })?;
+            if projection.occurrence_text() != self.request_id.as_str() {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request.correlation_projection",
+                    reason: "must encode the exact request_id text",
+                });
+            }
+        }
         Ok(())
     }
 
@@ -3272,6 +3290,18 @@ impl HostRequestIdentity {
                 }
             }
             HostRequestKind::Invocation => {
+                if self
+                    .correlation_projection
+                    .as_ref()
+                    .is_some_and(|projection| {
+                        projection.domain() != eliot_contracts::HostCorrelationDomain::Request
+                    })
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "invocation projection must use request domain",
+                    });
+                }
                 if self.session_id.is_none() {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.session_id",
@@ -3282,6 +3312,16 @@ impl HostRequestIdentity {
             HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
+                if let Some(projection) = &self.correlation_projection
+                    && (kind != HostRequestKind::Cancellation
+                        || projection.domain()
+                            != eliot_contracts::HostCorrelationDomain::Cancellation)
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "only cancellations may carry a cancellation-domain projection",
+                    });
+                }
                 if self.parent_operation_id.is_none() {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.parent_operation_id",

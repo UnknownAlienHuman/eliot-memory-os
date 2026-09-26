@@ -523,6 +523,7 @@ mod tests {
         use eliot_protocol::{HostRequestEnvelope, HostRequestIdentity, HostRequestKind};
         let identity = HostRequestIdentity {
             request_id: must_request_id("hostreq-1956-1"),
+            correlation_projection: None,
             idempotency_key: "idem-1956-1".to_owned(),
             cancellation_id: "cancel-1956-1".to_owned(),
             parent_operation_id: None,
