@@ -42,12 +42,28 @@
 //! restorable). This module delegates to writer A's policy via `::of()` so
 //! there is exactly one source of truth; both mappings still only ever land
 //! `Forensic` or quarantined `Unresolved` here, never authority.
+//!
+//! Issue #269 adds the process-stream recovery family to that denominator and
+//! to the exported page itself. `RowFamilyKind::ProcessStreamRecovery` carries
+//! the whole `ors_process_stream_recovery_v1` family — durable key, digest of
+//! the row encoded through the existing ORS codec, and an activation-derived
+//! effect class — so a backup can no longer drop those rows silently. The
+//! family has no canonical operation order, so it is carried whole on the
+//! final page instead of being paged on the shared `after_order` window; an
+//! entry's `order` is therefore that family's own observation-time order and
+//! is never the operational-history cursor. It is never truncated: a decode
+//! failure is [`OrsError::IntegrityProblem`] and a family that does not fit
+//! the caller's page budget is [`OrsError::ProjectionLimitExceeded`]. Its
+//! durable import stays `import_process_stream_recovery_suspended`, which
+//! writes suspended recovery evidence only, so triage here still never returns
+//! `PerEntryOutcome::Imported` and never revives process, session or authority
+//! state.
 
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable};
 
-use super::persistence_codec::{decode_named, encode};
+use super::persistence_codec::{decode, decode_named, encode};
 use super::persistence_models::DurableOperationalRecord;
 use super::storage;
 use crate::backup_snapshot::{
@@ -56,7 +72,9 @@ use crate::backup_snapshot::{
     OrsBackupSnapshot, PerEntryOutcome, RowDisposition, RowFamilyDisposition, RowFamilyKind,
     StoredEffectClass, check_canonical_frozen, validate_import_binding,
 };
-use crate::{OperationalPhase, OrsError};
+use crate::{
+    OperationalPhase, OrsError, ProcessStreamRecoveryProjection, StreamRecoveryActivation,
+};
 
 /// Bounded full-scan cap for the identity-conflict lookup and the canonical
 /// freeze digest. Keeps quarantine reads from becoming unbounded scans;
@@ -96,6 +114,9 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         RowFamilyDisposition::of(RowFamilyKind::AuthorityHandoffs),
         // Process evidence is observational only.
         RowFamilyDisposition::of(RowFamilyKind::ProcessEvidence),
+        // Process-stream recovery re-imports as suspended evidence only, never
+        // a live process, session or authority owner (#269).
+        RowFamilyDisposition::of(RowFamilyKind::ProcessStreamRecovery),
         // Staged lease tickets never execute on restore.
         RowFamilyDisposition::of(RowFamilyKind::SupervisionLeaseStaged),
         // Lease heads are evidence; old leases never activate.
@@ -170,6 +191,100 @@ fn effect_class_for_export(phase: OperationalPhase) -> StoredEffectClass {
     }
 }
 
+/// Maps a durable process-stream recovery activation to its backup effect
+/// class.
+///
+/// An `Active` projection is in-flight recovery evidence (`Possible`),
+/// `Suspended` — the state the quarantined import always writes — is not yet
+/// committed for the destination (`Staged`), and `Retired` is terminal
+/// (`Terminal`). `Unknown` is never produced here: an unreadable or
+/// codec-incompatible row fails the export rather than being classified as
+/// reconciling, so no backup ever asserts an unknown outcome it did not read.
+fn effect_class_for_stream_recovery(activation: StreamRecoveryActivation) -> StoredEffectClass {
+    match activation {
+        StreamRecoveryActivation::Active => StoredEffectClass::Possible,
+        StreamRecoveryActivation::Suspended => StoredEffectClass::Staged,
+        StreamRecoveryActivation::Retired => StoredEffectClass::Terminal,
+    }
+}
+
+/// The family's own order value for one exported recovery entry.
+///
+/// The process-stream recovery family has no operation order, so its entry
+/// `order` is the row's own observation time in Unix milliseconds — a real
+/// retained field, not a synthesized rank. It is a reporting/ordering value
+/// only: the family is carried whole on the final page and is never selected
+/// by the shared `after_order` window. The projection's fail-closed
+/// `validate()` already rejects a non-positive observation time, so a
+/// non-representable value can only mean the row bypassed that gate.
+fn stream_recovery_entry_order(
+    projection: &ProcessStreamRecoveryProjection,
+) -> Result<u64, OrsError> {
+    u64::try_from(projection.observed_at_ms).map_err(|_| OrsError::IntegrityProblem {
+        record_type: "process_stream_recovery",
+        reason: "observation time is not a representable backup order".to_owned(),
+    })
+}
+
+/// Reads the whole process-stream recovery family under the caller's existing
+/// read transaction, in canonical durable-key order.
+///
+/// Each row is decoded through the same ORS codec the store writes with, so a
+/// codec-version mismatch or an unreadable row surfaces as the same
+/// [`OrsError::IntegrityProblem`] an operational-history row would, and the
+/// family is never partially read. Each row yields the durable key, the decoded
+/// projection, and the re-encoded payload whose digest becomes the entry digest.
+fn read_stream_recovery_rows(
+    read: &ReadTransaction,
+) -> Result<Vec<(String, ProcessStreamRecoveryProjection, String)>, OrsError> {
+    let table = read
+        .open_table(super::PROCESS_STREAM_RECOVERY)
+        .map_err(storage)?;
+    let mut rows: Vec<(String, ProcessStreamRecoveryProjection, String)> = Vec::new();
+    for entry in table.iter().map_err(storage)? {
+        let (key, value) = entry.map_err(storage)?;
+        let projection: ProcessStreamRecoveryProjection = decode(value.value())?;
+        let encoded = encode(&projection)?;
+        rows.push((key.value().to_owned(), projection, encoded));
+    }
+    drop(table);
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows)
+}
+
+/// Builds the whole process-stream recovery entry segment for the final page.
+///
+/// The family is atomic in a backup: a segment that does not fit the caller's
+/// remaining page budget fails with [`OrsError::ProjectionLimitExceeded`]
+/// instead of being truncated, because a truncated recovery family is exactly
+/// the silent drop this family must not suffer. Returns the entries and their
+/// summed encoded bytes; the caller charges that sum against
+/// `request.max_bytes` exactly like the operational-history segment.
+fn stream_recovery_entries(
+    rows: &[(String, ProcessStreamRecoveryProjection, String)],
+    budget: usize,
+) -> Result<(Vec<OrsBackupEntry>, u64), OrsError> {
+    if rows.len() > budget {
+        return Err(OrsError::ProjectionLimitExceeded);
+    }
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut total_bytes: u64 = 0;
+    for (record_id, projection, encoded) in rows {
+        let encoded_len = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        total_bytes = total_bytes
+            .checked_add(encoded_len)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        entries.push(OrsBackupEntry {
+            record_id: record_id.clone(),
+            family: RowFamilyKind::ProcessStreamRecovery,
+            order: stream_recovery_entry_order(projection)?,
+            payload_digest: crate::model::sha256_hex(encoded.as_bytes()),
+            effect_class: effect_class_for_stream_recovery(projection.activation),
+        });
+    }
+    Ok((entries, total_bytes))
+}
+
 /// Returns true for a 64-character lowercase hex digest; rejects uppercase,
 /// short, long, or non-hex input so malformed bindings fail with stable
 /// [`OrsError::InvalidField`] instead of passing silently.
@@ -227,6 +342,13 @@ fn canonical_state_digest(database: &Database) -> Result<String, OrsError> {
 /// a page is never fabricated from reference counts alone. Accumulated entry
 /// bytes are bounded by `request.max_bytes` (already `1..=MAX_BACKUP_BYTES`
 /// by the request constructor).
+///
+/// The operational-history window is unchanged. The process-stream recovery
+/// family (#269) has no operation order, so it is not paged on that window:
+/// it is read under the same transaction and carried whole on the final page
+/// in durable-key order, and it fails closed with
+/// [`OrsError::ProjectionLimitExceeded`] rather than being truncated when it
+/// does not fit the caller's page budget.
 pub(super) fn export_page(
     database: &Database,
     request: &OrsBackupRequest,
@@ -276,6 +398,19 @@ pub(super) fn export_page(
         }
     }
     drop(table);
+    // The operational-history segment decides which page is final, exactly as
+    // the post-truncation `entries.len()` check below does; deciding it here
+    // keeps the whole process-stream recovery read inside this one
+    // transaction and off every non-final page.
+    let final_page = selected.len() < usize::from(request.page_entries);
+    // Issue #269: the process-stream recovery family, read through the same ORS
+    // codec and under the same transaction. It is carried whole (see the
+    // module note), so it is enumerated once, on the final page only.
+    let recovery = if final_page {
+        read_stream_recovery_rows(&read)?
+    } else {
+        Vec::new()
+    };
     drop(read);
     selected.sort_by_key(|(order, _, _)| *order);
     selected.truncate(usize::from(request.page_entries));
@@ -298,6 +433,21 @@ pub(super) fn export_page(
         });
     }
     let is_last = entries.len() < usize::from(request.page_entries);
+    if is_last {
+        // The whole family or nothing: a partial recovery family in a backup
+        // would be exactly the silent drop this family must not suffer.
+        let budget = usize::from(request.page_entries)
+            .checked_sub(entries.len())
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let (segment, segment_bytes) = stream_recovery_entries(&recovery, budget)?;
+        total_bytes = total_bytes
+            .checked_add(segment_bytes)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if total_bytes > request.max_bytes {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        entries.extend(segment);
+    }
     let mut digest_material = String::new();
     for entry in &entries {
         digest_material.push_str(&entry.payload_digest);
@@ -324,7 +474,9 @@ pub(super) fn export_page(
 /// when every page decoded cleanly and at least one entry landed; an empty
 /// denominator reports `Partial` with a reason, and a decode failure reports
 /// [`OrsError::IntegrityProblem`], never a fabricated `Complete`. The
-/// denominator digest is the snapshot's own `snapshot_digest()` binding.
+/// denominator digest is the snapshot's own `snapshot_digest()` binding, which
+/// chains every exported entry's payload digest, so the process-stream recovery
+/// family carried on the final page is inside the denominator too.
 pub(super) fn export_snapshot(
     database: &Database,
     request: &OrsBackupRequest,

@@ -134,6 +134,16 @@ pub enum RowFamilyKind {
     ProcessStartReplay,
     AuthorityHandoffs,
     ProcessEvidence,
+    /// Immutable process-stream recovery projections (issue #269): one durable
+    /// row per `(operation_id, stream)` identity, carrying only the locator,
+    /// coverage, typed transport/persistence state and reconciliation owner.
+    ///
+    /// `Restorable` means eligible for the existing
+    /// `import_process_stream_recovery_suspended` quarantine only. It never
+    /// means a restored projection can revive process, session or authority
+    /// state: the import path discards the incoming activation and always
+    /// writes `Suspended` (or keeps an already `Retired` row `Retired`).
+    ProcessStreamRecovery,
     SupervisionLeaseStaged,
     SupervisionLeaseCurrent,
     SupervisionLeaseHistory,
@@ -183,6 +193,13 @@ impl RowFamilyKind {
             | Self::ActivationResultRetention
             | Self::NativeWorkerClaims
             | Self::CutoverOwnership => RowDisposition::NonrestorableHistorical,
+            // Everything else, including the #269 process-stream recovery
+            // family, is `Restorable`. That word only means eligible for the
+            // family's own quarantined import: the sole durable import for a
+            // process-stream recovery row is
+            // `RedbRecoveryStore::import_process_stream_recovery_suspended`,
+            // which always writes suspended recovery evidence and never
+            // revives process, session or authority state.
             _ => RowDisposition::Restorable,
         }
     }
