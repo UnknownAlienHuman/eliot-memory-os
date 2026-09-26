@@ -33,6 +33,16 @@ Legacy compatibility:
   except --help (exit 0) or configuration error (exit 2). It runs no Cargo
   command, claims no completion, mutates nothing. No work unit is accepted.
 
+Merge-boundary subcommand (#2965):
+  `python -m scripts.work_unit_gate doc-read-evidence --base <sha>
+   --candidate <sha-or-tree> --pr-body <file>` is the executable pre-merge
+  contract for documentation routing/read evidence. It is dispatched before any
+  other option parsing, so every other command, selector, proof kind and exit
+  code on this entrypoint is unchanged. The single authority and all of its
+  typed failures live in the frozen child module `doc_read_evidence`, which
+  reuses `docs_router_core` / `docs_read` as the only routing/reader
+  algorithms.
+
 Exits (per #857):
   0  explicitly requested proof satisfied (+ --help, no acceptance claimed)
   1  contract/incomplete failure (including missing implementation, discovery
@@ -75,12 +85,14 @@ try:  # exact frozen import paths when run as package module
     from . import assignment_source
     from . import descriptor_runner
     from . import case_binding
+    from . import doc_read_evidence
 except ImportError:  # fallback for direct file loading (delegate context)
     from scripts.work_unit_gate import contracts as c  # type: ignore[no-redef]
     from scripts.work_unit_gate import cohort  # type: ignore[no-redef]
     from scripts.work_unit_gate import assignment_source  # type: ignore[no-redef]
     from scripts.work_unit_gate import descriptor_runner  # type: ignore[no-redef]
     from scripts.work_unit_gate import case_binding  # type: ignore[no-redef]
+    from scripts.work_unit_gate import doc_read_evidence  # type: ignore[no-redef]
 
 # Frozen leaf-router byte identities (from test_work_unit_gate_cohort at base;
 # Windows CRLF checkout). Used only for the shared-repo freeze check, never
@@ -698,6 +710,11 @@ def _typed_from_decoded(data: dict):  # type: ignore[no-untyped-def]
 
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
+    # #2965 merge-boundary subcommand. Dispatched before any other parsing so
+    # the existing work-unit/legacy CLI contract below is byte-for-byte
+    # unchanged: no other option, selector, proof kind or exit code is touched.
+    if args_list[:1] == ["doc-read-evidence"]:
+        return doc_read_evidence.main(args_list[1:])
     dup = _reject_duplicates(args_list)
     if dup is not None:
         return dup
